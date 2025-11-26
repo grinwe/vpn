@@ -33,8 +33,8 @@ def _get_or_create_user(db: Session, telegram_id: str, email: str | None = None)
 
 def _create_subscription_for_user(db: Session, user: models.User, plan: models.Plan) -> models.Subscription:
     try:
-        sub = provision_subscription(db, user, plan)
-        db.commit()
+        with db.begin():
+            sub = provision_subscription(db, user, plan)
         db.refresh(sub)
         return sub
     except Exception as exc:  # noqa: BLE001
@@ -116,7 +116,7 @@ def disable_subscription(subscription_id: int, db: Session = Depends(get_db)):
     if sub.status != models.SubscriptionStatus.active:
         raise HTTPException(status_code=400, detail="Subscription is not active")
 
-    username = f"vpn-{sub.id}"
+    username = f"user-{sub.user_id}-{sub.id}"
     try:
         deprovision_shadowtls_ss_user(sub.server, username)
     except Exception as exc:  # noqa: BLE001
