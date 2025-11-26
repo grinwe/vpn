@@ -42,11 +42,13 @@ def _run_remote_command(server: models.Server, command: str) -> str:
         client.close()
 
 
-def provision_shadowtls_ss_user(server: models.Server, username: str) -> str:
-    password = secrets.token_urlsafe(12)
+def provision_shadowtls_ss_user(
+    server: models.Server, username: str, password: str | None = None
+) -> str:
+    vpn_password = password or secrets.token_urlsafe(12)
     command = (
         "/usr/local/sbin/manage_vpn_user.sh add-shadowtls-ss "
-        f"{username} {password} chacha20-ietf-poly1305 8388"
+        f"{username} {vpn_password} chacha20-ietf-poly1305 8388"
     )
     return _run_remote_command(server, command)
 
@@ -67,7 +69,7 @@ def provision_subscription(db: Session, user: models.User, plan: models.Plan) ->
     db.add(sub)
     db.flush()
 
-    username = f"vpn-{sub.id}"
+    username = f"user-{user.id}-{sub.id}"
     ss_url = provision_shadowtls_ss_user(server, username)
     cred = models.Credential(subscription_id=sub.id, proto="shadowtls+ss", config_text=ss_url)
     db.add(cred)
