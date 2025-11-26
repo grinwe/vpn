@@ -17,6 +17,17 @@ class SubscriptionCreate(BaseModel):
     email: Optional[str] = None
 
 
+class PlanOut(BaseModel):
+    id: int
+    name: str
+    duration_days: int
+    max_devices: int
+    price: float
+
+    class Config:
+        orm_mode = True
+
+
 class SubscriptionOut(BaseModel):
     id: int
     plan_name: str
@@ -65,3 +76,19 @@ class InvoiceOut(BaseModel):
 
     class Config:
         orm_mode = True
+
+
+class InvoiceListItem(BaseModel):
+    id: int
+    user_id: int
+    user_telegram_id: str | None
+    plan_id: int
+    plan_name: str
+    amount: float
+    currency: str
+    status: str
+    created_at: datetime
+
+
+class InvoicePaidOut(InvoiceListItem):
+    credentials: list[CredentialOut]

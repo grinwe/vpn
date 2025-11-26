@@ -43,6 +43,25 @@ def _create_subscription_for_user(db: Session, user: models.User, plan: models.P
         raise HTTPException(status_code=500, detail="Provisioning failed") from exc
 
 
+def _invoice_with_credentials(
+    invoice: models.Invoice,
+    credentials: list[models.Credential] | None = None,
+) -> schemas.InvoicePaidOut:
+    creds = credentials or []
+    return schemas.InvoicePaidOut(
+        id=invoice.id,
+        user_id=invoice.user_id,
+        user_telegram_id=invoice.user.telegram_id if invoice.user else None,
+        plan_id=invoice.plan_id,
+        plan_name=invoice.plan.name if invoice.plan else "",
+        amount=float(invoice.amount),
+        currency=invoice.currency,
+        status=invoice.status.value,
+        created_at=invoice.created_at,
+        credentials=[schemas.CredentialOut.from_orm(c) for c in creds],
+    )
+
+
 @router.post("/subscriptions", response_model=list[schemas.CredentialOut])
 def create_subscription(payload: schemas.SubscriptionCreate, db: Session = Depends(get_db)):
     plan = db.get(models.Plan, payload.plan_id)
@@ -165,14 +184,56 @@ def create_invoice(body: schemas.InvoiceCreate, db: Session = Depends(get_db)):
     return schemas.InvoiceOut.from_orm(invoice)
 
 
-@router.post("/invoices/{invoice_id}/mark_paid", response_model=schemas.InvoiceOut)
+@router.get("/plans", response_model=list[schemas.PlanOut])
+def list_plans(db: Session = Depends(get_db)):
+    plans = db.query(models.Plan).order_by(models.Plan.id).all()
+    return [schemas.PlanOut.from_orm(plan) for plan in plans]
+
+
+@router.get("/invoices", response_model=list[schemas.InvoiceListItem])
+def list_invoices(status: str | None = None, limit: int = 10, db: Session = Depends(get_db)):
+    query = db.query(models.Invoice).order_by(models.Invoice.created_at.desc())
+    if status:
+        try:
+            invoice_status = models.InvoiceStatus(status)
+        except ValueError as exc:  # noqa: BLE001
+            raise HTTPException(status_code=400, detail="Invalid status") from exc
+        query = query.filter(models.Invoice.status == invoice_status)
+
+    invoices = query.limit(limit).all()
+    result: list[schemas.InvoiceListItem] = []
+    for inv in invoices:
+        result.append(
+            schemas.InvoiceListItem(
+                id=inv.id,
+                user_id=inv.user_id,
+                user_telegram_id=inv.user.telegram_id if inv.user else None,
+                plan_id=inv.plan_id,
+                plan_name=inv.plan.name if inv.plan else "",
+                amount=float(inv.amount),
+                currency=inv.currency,
+                status=inv.status.value,
+                created_at=inv.created_at,
+            )
+        )
+    return result
+
+
+@router.post("/invoices/{invoice_id}/mark_paid", response_model=schemas.InvoicePaidOut)
 def mark_invoice_paid(invoice_id: int, db: Session = Depends(get_db)):
     invoice = db.get(models.Invoice, invoice_id)
     if not invoice:
         raise HTTPException(status_code=404, detail="Invoice not found")
 
     if invoice.status == models.InvoiceStatus.paid:
-        return schemas.InvoiceOut.from_orm(invoice)
+        subscription = (
+            db.query(models.Subscription)
+            .filter(models.Subscription.user_id == invoice.user_id)
+            .order_by(models.Subscription.created_at.desc())
+            .first()
+        )
+        credentials = subscription.credentials if subscription else []
+        return _invoice_with_credentials(invoice, credentials)
 
     invoice.status = models.InvoiceStatus.paid
     db.commit()
@@ -180,7 +241,9 @@ def mark_invoice_paid(invoice_id: int, db: Session = Depends(get_db)):
 
     plan = db.get(models.Plan, invoice.plan_id)
     user = db.get(models.User, invoice.user_id)
+    credentials: list[models.Credential] = []
     if plan and user:
-        _create_subscription_for_user(db, user, plan)
+        sub = _create_subscription_for_user(db, user, plan)
+        credentials = sub.credentials
 
-    return schemas.InvoiceOut.from_orm(invoice)
+    return _invoice_with_credentials(invoice, credentials)
