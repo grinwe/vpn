@@ -37,7 +37,7 @@ all:
       hosts:
         {name}:
     db_host:
-      hosts: {{} }
+      hosts: {{}}
 """.format(name=node.name, host=node.host, port=node.ssh_port, user=ansible_user)
     handle = tempfile.NamedTemporaryFile("w", delete=False, suffix="-inventory.yml")
     handle.write(inventory_content)

@@ -46,6 +46,7 @@ Backend и Ansible располагаются в одном репозитори
 - `POST /api/users/{id}/disable` — блокировка пользователя и его подписок.
 - `GET /api/users/{id}` — данные подписок и конфигов.
 - `POST /api/payments` — фиксация платежа (пока вручную).
+- `POST /api/subscriptions/{id}/traffic` — инкремент трафика подписки; при превышении лимита блокирует подписку и запускает отзыв устройств.
 - `GET /api/provisioning/tasks` — аудит задач провижининга.
 - `/metrics` и `/healthz` — минимальная наблюдаемость.
 
@@ -72,3 +73,8 @@ curl -X POST http://backend:8000/api/subscriptions \
 - Таблица `payments` со статусами `pending|paid|failed|refunded`.
 - Можно связать webhook платежного шлюза с `POST /api/payments` и обновлением статуса.
 - Telegram-бот пока использует ручное подтверждение, но в хендлерах оставлены места для интеграции.
+
+## Учёт трафика и лимиты
+- Backend принимает простые обновления потреблённого трафика через `POST /api/subscriptions/{subscription_id}/traffic` с телом `{ "used_mb": <integer> }`.
+- Значение суммируется с `traffic_used_mb`; при превышении `traffic_limit_mb` подписка помечается как `blocked`, вызывается отзыв устройств через ProvisioningTask и создаётся audit-запись.
+- Экспортёр/коллектор трафика можно подключить позже (например, по логам нод или NetFlow), сейчас требуется лишь HTTP-запрос на backend.

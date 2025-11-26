@@ -13,6 +13,7 @@ from prometheus_client import Counter
 from sqlalchemy.orm import Session
 
 from .. import models
+from ..db import SessionLocal
 from .ansible_runner import build_inventory_for_node, run_playbook
 
 logger = logging.getLogger(__name__)
@@ -116,8 +117,55 @@ class ProvisioningOrchestrator:
         return task
 
     def run_task_async(self, task: models.ProvisioningTask, node: models.VPNNode | None = None) -> None:
-        thread = threading.Thread(target=self.run_task, args=(task, node), daemon=True)
+        """Execute a provisioning task in a background thread with a fresh DB session.
+
+        The request-scoped session (`self.db`) must not be shared across threads, so we
+        pass lightweight identifiers to the worker and open a new `SessionLocal` there.
+        """
+
+        thread = threading.Thread(
+            target=self._run_task_in_new_session,
+            args=(task.id, node.id if node else None),
+            daemon=True,
+        )
         thread.start()
+
+    def _run_task_in_new_session(self, task_id: int, node_id: int | None = None) -> None:
+        session = SessionLocal()
+        try:
+            orchestrator = ProvisioningOrchestrator(session)
+            task = session.get(models.ProvisioningTask, task_id)
+            if not task:
+                logger.error("Provisioning task %s not found for async execution", task_id)
+                return
+
+            node: models.VPNNode | None = None
+            if node_id:
+                node = session.get(models.VPNNode, node_id)
+            elif task.target_type == "device":
+                device = session.get(models.Device, task.target_id)
+                if device:
+                    node = device.config.node if device.config else device.subscription.node
+
+            orchestrator.run_task(task, node=node)
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("Async provisioning task %s failed before completion", task_id)
+            if session.is_active:
+                session.rollback()
+            try:
+                task = session.get(models.ProvisioningTask, task_id)
+                if task:
+                    orchestrator = ProvisioningOrchestrator(session)
+                    orchestrator._mark_task(  # noqa: SLF001
+                        task,
+                        models.ProvisioningTaskStatus.failed,
+                        error=str(exc),
+                    )
+            except Exception:  # noqa: BLE001
+                logger.exception("Failed to mark task %s as failed", task_id)
+                session.rollback()
+        finally:
+            session.close()
 
     def reset_failed_task(self, task: models.ProvisioningTask) -> None:
         task.status = models.ProvisioningTaskStatus.pending

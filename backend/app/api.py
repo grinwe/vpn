@@ -456,6 +456,57 @@ def disable_subscription(
     }
 
 
+@router.post(
+    "/subscriptions/{subscription_id}/traffic",
+    response_model=schemas.SubscriptionTrafficOut,
+)
+def update_subscription_traffic(
+    subscription_id: int,
+    payload: schemas.SubscriptionTrafficUpdate,
+    db: Session = Depends(get_db),
+    admin_token: str = Depends(require_admin),
+    admin_actor: str | None = Header(default=None, alias=ADMIN_ACTOR_HEADER),
+):
+    """Increment traffic usage for a subscription and optionally block it when over limit."""
+
+    sub = db.get(models.Subscription, subscription_id)
+    if not sub:
+        raise HTTPException(status_code=404, detail="Subscription not found")
+
+    sub.traffic_used_mb = (sub.traffic_used_mb or 0) + payload.used_mb
+    over_limit = bool(sub.traffic_limit_mb is not None and sub.traffic_used_mb > sub.traffic_limit_mb)
+
+    revocation_task_ids: list[int] = []
+    if over_limit and sub.status != models.SubscriptionStatus.blocked:
+        sub.status = models.SubscriptionStatus.blocked
+        sub.notes = "traffic limit exceeded"
+        orchestrator = ProvisioningOrchestrator(db)
+        tasks = orchestrator.revoke_subscription_devices(sub, reason="traffic limit exceeded")
+        revocation_task_ids = [task.id for task in tasks]
+        actor, actor_type = _resolve_admin_actor(admin_actor)
+        _audit(
+            db,
+            actor,
+            "subscription_over_limit",
+            "subscription",
+            sub.id,
+            actor_type=actor_type,
+            metadata={"used_mb": sub.traffic_used_mb, "limit_mb": sub.traffic_limit_mb},
+        )
+    else:
+        db.commit()
+
+    db.refresh(sub)
+    return schemas.SubscriptionTrafficOut(
+        subscription_id=sub.id,
+        status=sub.status.value,
+        traffic_used_mb=sub.traffic_used_mb,
+        traffic_limit_mb=sub.traffic_limit_mb,
+        over_limit=over_limit,
+        revocation_task_ids=revocation_task_ids,
+    )
+
+
 @router.get("/subscriptions/{subscription_id}/status", response_model=schemas.SubscriptionStatusOut)
 def get_subscription_status(subscription_id: int, db: Session = Depends(get_db)):
     sub = db.get(models.Subscription, subscription_id)
