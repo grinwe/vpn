@@ -11,6 +11,12 @@
     dest: /usr/local/sbin/vless_reality_installer.sh
     mode: '0755'
 
+- name: Ensure VPN user management script present
+  copy:
+    src: manage_vpn_user.sh
+    dest: /usr/local/sbin/manage_vpn_user.sh
+    mode: '0755'
+
 - name: Run ShadowTLS + Shadowsocks installer
   command: /usr/local/sbin/shadowtls_power_script.sh
   args:
