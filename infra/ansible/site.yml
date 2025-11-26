@@ -2,8 +2,10 @@
 - hosts: vpn_nodes
   become: yes
   roles:
-    - base_node
-    - vpn_node
+    - bootstrap_node
+    - install_shadowtls_stack
+    - install_vless_reality
+    - check_node_health
 
 - hosts: db_host
   become: yes

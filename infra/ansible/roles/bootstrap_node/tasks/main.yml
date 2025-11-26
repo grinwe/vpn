@@ -1,0 +1,66 @@
+---
+- name: Ensure VPN system group
+  group:
+    name: "{{ vpn_system_group }}"
+    state: present
+
+- name: Ensure VPN system user
+  user:
+    name: "{{ vpn_system_user }}"
+    group: "{{ vpn_system_group }}"
+    shell: /usr/sbin/nologin
+    create_home: no
+    state: present
+
+- name: Ensure SSH keys installed
+  authorized_key:
+    user: root
+    key: "{{ item }}"
+    state: present
+  loop: "{{ ssh_public_keys | default([]) }}"
+
+- name: Install base packages
+  apt:
+    name:
+      - ufw
+      - curl
+      - htop
+      - jq
+    state: present
+    update_cache: yes
+
+- name: Configure UFW default policy
+  ufw:
+    state: enabled
+    policy: deny
+  notify: reload ufw
+
+- name: Allow firewall ports
+  ufw:
+    rule: allow
+    port: "{{ item }}"
+    proto: tcp
+  loop: "{{ firewall_allowed_ports | default([]) }}"
+
+- name: Disable password authentication in sshd
+  lineinfile:
+    path: /etc/ssh/sshd_config
+    regexp: '^#?PasswordAuthentication'
+    line: 'PasswordAuthentication no'
+    state: present
+  notify: restart ssh
+
+- name: Restrict root login with password
+  lineinfile:
+    path: /etc/ssh/sshd_config
+    regexp: '^#?PermitRootLogin'
+    line: 'PermitRootLogin prohibit-password'
+    state: present
+  notify: restart ssh
+
+- name: Set MOTD banner
+  copy:
+    dest: /etc/motd
+    content: |
+      Managed VPN node. Unauthorized access prohibited.
+      SSH key auth only. Contact NOC for access.
