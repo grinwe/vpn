@@ -59,7 +59,8 @@ class PaymentCreate(BaseModel):
 
 
 class InvoiceCreate(BaseModel):
-    telegram_id: str
+    user_id: int | None = None
+    telegram_id: str | None = None
     plan_id: int
     amount: float | None = None
     currency: str = "USD"
@@ -73,6 +74,7 @@ class InvoiceOut(BaseModel):
     currency: str
     status: str
     created_at: datetime
+    updated_at: datetime
 
     class Config:
         orm_mode = True

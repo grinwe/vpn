@@ -31,6 +31,21 @@ def _get_or_create_user(db: Session, telegram_id: str, email: str | None = None)
     return user
 
 
+def _get_user_from_payload(
+    db: Session, user_id: int | None, telegram_id: str | None, email: str | None = None
+) -> models.User:
+    if user_id is not None:
+        user = db.get(models.User, user_id)
+        if not user:
+            raise HTTPException(status_code=404, detail="User not found")
+        return user
+
+    if telegram_id:
+        return _get_or_create_user(db, telegram_id, email)
+
+    raise HTTPException(status_code=400, detail="user_id or telegram_id is required")
+
+
 def _create_subscription_for_user(db: Session, user: models.User, plan: models.Plan) -> models.Subscription:
     try:
         with db.begin():
@@ -170,7 +185,7 @@ def create_invoice(body: schemas.InvoiceCreate, db: Session = Depends(get_db)):
     if not plan:
         raise HTTPException(status_code=404, detail="Plan not found")
 
-    user = _get_or_create_user(db, body.telegram_id)
+    user = _get_user_from_payload(db, body.user_id, body.telegram_id)
     amount = body.amount if body.amount is not None else float(plan.price)
     invoice = models.Invoice(
         user_id=user.id,
