@@ -1,0 +1,15 @@
+---
+- name: Wait for expected ports
+  wait_for:
+    port: "{{ item }}"
+    timeout: 10
+  loop: "{{ vpn_health_ports | default([443,8443,9443]) }}"
+
+- name: Check running services
+  shell: "ss -tulpn | grep -E 'xray|shadowsocks' || true"
+  register: service_status
+  changed_when: false
+
+- name: Show service status
+  debug:
+    var: service_status.stdout_lines

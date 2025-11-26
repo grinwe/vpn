@@ -1,13 +1,14 @@
 from datetime import datetime
-from fastapi import APIRouter, Depends, HTTPException
-from sqlalchemy.orm import Session
 import logging
-from .db import SessionLocal
+from typing import Any
+
+from fastapi import APIRouter, Depends, HTTPException
+from sqlalchemy import text
+from sqlalchemy.orm import Session
+
 from . import models, schemas
-from .services.provisioning import (
-    deprovision_shadowtls_ss_user,
-    provision_subscription,
-)
+from .db import SessionLocal
+from .services.provisioning import ProvisioningOrchestrator
 
 router = APIRouter(prefix="/api")
 logger = logging.getLogger(__name__)
@@ -21,6 +22,29 @@ def get_db():
         db.close()
 
 
+def _audit(
+    db: Session,
+    actor: str,
+    action: str,
+    target_type: str,
+    target_id: int | None,
+    *,
+    metadata: dict[str, Any] | None = None,
+    actor_type: models.AuditActor = models.AuditActor.system,
+) -> models.AuditLog:
+    log = models.AuditLog(
+        actor=actor,
+        action=action,
+        target_type=target_type,
+        target_id=target_id,
+        metadata=metadata,
+        actor_type=actor_type,
+    )
+    db.add(log)
+    db.commit()
+    return log
+
+
 def _get_or_create_user(db: Session, telegram_id: str, email: str | None = None) -> models.User:
     user = db.query(models.User).filter_by(telegram_id=telegram_id).first()
     if not user:
@@ -28,6 +52,7 @@ def _get_or_create_user(db: Session, telegram_id: str, email: str | None = None)
         db.add(user)
         db.commit()
         db.refresh(user)
+        _audit(db, telegram_id, "user_created", "user", user.id)
     return user
 
 
@@ -46,11 +71,18 @@ def _get_user_from_payload(
     raise HTTPException(status_code=400, detail="user_id or telegram_id is required")
 
 
-def _create_subscription_for_user(db: Session, user: models.User, plan: models.Plan) -> models.Subscription:
+def _create_subscription_for_user(
+    db: Session,
+    user: models.User,
+    plan: models.Plan,
+    node_id: int | None = None,
+    device_name: str | None = None,
+) -> models.Subscription:
+    orchestrator = ProvisioningOrchestrator(db)
     try:
-        with db.begin():
-            sub = provision_subscription(db, user, plan)
+        sub = orchestrator.provision_subscription(user, plan, node_id=node_id, device_name=device_name)
         db.refresh(sub)
+        _audit(db, user.telegram_id or "unknown", "subscription_created", "subscription", sub.id)
         return sub
     except Exception as exc:  # noqa: BLE001
         logger.exception("Provisioning failed for user %s", user.telegram_id)
@@ -77,6 +109,104 @@ def _invoice_with_credentials(
     )
 
 
+@router.get("/healthz")
+def healthcheck(db: Session = Depends(get_db)):
+    try:
+        db.execute(text("SELECT 1"))
+    except Exception:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail="database not reachable")
+    return {"status": "ok"}
+
+
+@router.post("/nodes", response_model=schemas.VPNNodeOut)
+def create_node(payload: schemas.VPNNodeCreate, db: Session = Depends(get_db)):
+    node = models.VPNNode(
+        name=payload.name,
+        region=payload.region,
+        host=payload.host,
+        ssh_port=payload.ssh_port,
+        pool_id=payload.pool_id,
+        notes=payload.notes,
+        status=models.VPNNodeStatus.registering,
+    )
+    db.add(node)
+    db.commit()
+    db.refresh(node)
+    _audit(db, "system", "node_created", "vpn_node", node.id)
+    orchestrator = ProvisioningOrchestrator(db)
+    task = orchestrator.create_task("node", node.id, "bootstrap", {"pool_id": payload.pool_id})
+    db.commit()
+    orchestrator.run_task(task, node=node)
+    node.status = models.VPNNodeStatus.active if task.status == models.ProvisioningTaskStatus.success else models.VPNNodeStatus.error
+    db.commit()
+    db.refresh(node)
+    return node
+
+
+@router.get("/nodes", response_model=list[schemas.VPNNodeOut])
+def list_nodes(db: Session = Depends(get_db)):
+    nodes = db.query(models.VPNNode).order_by(models.VPNNode.created_at).all()
+    return [schemas.VPNNodeOut.from_orm(n) for n in nodes]
+
+
+@router.post("/nodes/{node_id}/configs", response_model=schemas.VPNConfigOut)
+def create_config(node_id: int, payload: schemas.VPNConfigCreate, db: Session = Depends(get_db)):
+    node = db.get(models.VPNNode, node_id)
+    if not node:
+        raise HTTPException(status_code=404, detail="Node not found")
+
+    try:
+        protocol = models.VPNConfigProtocol(payload.protocol)
+    except ValueError as exc:  # noqa: BLE001
+        raise HTTPException(status_code=400, detail="Unknown protocol") from exc
+
+    config = models.VPNConfig(
+        node_id=node.id,
+        name=payload.name,
+        protocol=protocol,
+        port=payload.port,
+        sni=payload.sni,
+        public_key=payload.public_key,
+        fallback=payload.fallback,
+        settings=payload.settings,
+        is_enabled=payload.is_enabled,
+    )
+    db.add(config)
+    db.commit()
+    db.refresh(config)
+    _audit(db, "system", "config_created", "vpn_config", config.id)
+    return config
+
+
+@router.get("/nodes/{node_id}/configs", response_model=list[schemas.VPNConfigOut])
+def list_configs(node_id: int, db: Session = Depends(get_db)):
+    configs = db.query(models.VPNConfig).filter(models.VPNConfig.node_id == node_id).all()
+    return [schemas.VPNConfigOut.from_orm(cfg) for cfg in configs]
+
+
+@router.get("/provisioning/tasks", response_model=list[schemas.ProvisioningTaskOut])
+def list_tasks(limit: int = 50, db: Session = Depends(get_db)):
+    tasks = (
+        db.query(models.ProvisioningTask)
+        .order_by(models.ProvisioningTask.created_at.desc())
+        .limit(limit)
+        .all()
+    )
+    return [schemas.ProvisioningTaskOut.from_orm(t) for t in tasks]
+
+
+@router.post("/provisioning/tasks/{task_id}/execute", response_model=schemas.ProvisioningTaskOut)
+def execute_task(task_id: int, db: Session = Depends(get_db)):
+    task = db.get(models.ProvisioningTask, task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+    orchestrator = ProvisioningOrchestrator(db)
+    node = db.get(models.VPNNode, task.target_id) if task.target_type == "node" else None
+    orchestrator.run_task(task, node=node)
+    db.refresh(task)
+    return schemas.ProvisioningTaskOut.from_orm(task)
+
+
 @router.post("/subscriptions", response_model=list[schemas.CredentialOut])
 def create_subscription(payload: schemas.SubscriptionCreate, db: Session = Depends(get_db)):
     plan = db.get(models.Plan, payload.plan_id)
@@ -84,7 +214,7 @@ def create_subscription(payload: schemas.SubscriptionCreate, db: Session = Depen
         raise HTTPException(status_code=404, detail="Plan not found")
 
     user = _get_or_create_user(db, payload.telegram_id, payload.email)
-    sub = _create_subscription_for_user(db, user, plan)
+    sub = _create_subscription_for_user(db, user, plan, node_id=payload.node_id, device_name=payload.device_name)
     return [schemas.CredentialOut.from_orm(cred) for cred in sub.credentials]
 
 
@@ -97,6 +227,7 @@ def disable_user(user_id: int, body: schemas.DisableRequest, db: Session = Depen
         sub.status = models.SubscriptionStatus.blocked
         sub.notes = body.reason
     db.commit()
+    _audit(db, str(user_id), "user_disabled", "user", user_id, metadata={"reason": body.reason})
     return {"disabled": len(subs)}
 
 
@@ -114,10 +245,12 @@ def get_user(user_id: int, db: Session = Depends(get_db)):
         item = schemas.SubscriptionOut(
             id=sub.id,
             plan_name=sub.plan.name,
-            server=sub.server.name,
+            node=sub.node.name,
+            region=sub.node.region,
             expires_at=sub.expires_at,
             status=sub.status.value,
             credentials=[schemas.CredentialOut.from_orm(c) for c in sub.credentials],
+            devices=[schemas.DeviceOut.from_orm(d) for d in sub.devices],
         )
         result.append(item)
     return result
@@ -131,16 +264,17 @@ def disable_subscription(subscription_id: int, db: Session = Depends(get_db)):
     if sub.status != models.SubscriptionStatus.active:
         raise HTTPException(status_code=400, detail="Subscription is not active")
 
-    username = f"user-{sub.user_id}-{sub.id}"
-    try:
-        deprovision_shadowtls_ss_user(sub.server, username)
-    except Exception as exc:  # noqa: BLE001
-        logger.exception("Deprovision failed for subscription %s", sub.id)
-        raise HTTPException(status_code=500, detail="Deprovision failed") from exc
-
+    orchestrator = ProvisioningOrchestrator(db)
+    device = sub.devices[0] if sub.devices else None
+    payload = {"subscription_id": subscription_id, "state": "absent"}
+    if device and device.access_username:
+        payload.update({"username": device.access_username, "port": device.config.port})
+    task = orchestrator.create_task("device", subscription_id, "revoke", payload)
     sub.status = models.SubscriptionStatus.blocked
     sub.expires_at = datetime.utcnow()
     db.commit()
+    orchestrator.run_task(task, node=sub.node)
+    _audit(db, str(sub.user_id), "subscription_disabled", "subscription", subscription_id)
     return {"subscription_id": sub.id, "status": sub.status.value}
 
 
@@ -153,7 +287,7 @@ def get_subscription_status(subscription_id: int, db: Session = Depends(get_db))
     is_active = sub.status == models.SubscriptionStatus.active and sub.expires_at > datetime.utcnow()
     return schemas.SubscriptionStatusOut(
         plan_name=sub.plan.name,
-        server_name=sub.server.name,
+        server_name=sub.node.name,
         expires_at=sub.expires_at,
         is_active=is_active,
         proto_configs=[schemas.CredentialOut.from_orm(c) for c in sub.credentials],

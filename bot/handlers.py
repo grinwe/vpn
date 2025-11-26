@@ -108,7 +108,9 @@ async def status(message: types.Message):
     lines = ["Твои подписки:"]
     for sub in data:
         lines.append(
-            f"План: {sub['plan_name']}\nСервер: {sub['server']}\nИстекает: {sub['expires_at']}\nСтатус: {sub['status']}"
+            f"План: {sub['plan_name']}\n"
+            f"Сервер: {sub.get('node') or sub.get('server', 'n/a')} ({sub.get('region', '??')})\n"
+            f"Истекает: {sub['expires_at']}\nСтатус: {sub['status']}"
         )
     await message.answer("\n\n".join(lines))
 
