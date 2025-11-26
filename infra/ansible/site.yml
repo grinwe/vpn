@@ -1,0 +1,11 @@
+---
+- hosts: vpn_nodes
+  become: yes
+  roles:
+    - base_node
+    - vpn_node
+
+- hosts: db_host
+  become: yes
+  roles:
+    - db_host

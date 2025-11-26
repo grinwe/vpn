@@ -1,0 +1,4 @@
+VPN node managed by Ansible
+Location: {{ hostvars[inventory_hostname].location | default('unknown') }}
+Protocols: ShadowTLS+Shadowsocks (443/8443), VLESS+Reality (443/9443 when enabled)
+Domain front: {{ domain_mask }}

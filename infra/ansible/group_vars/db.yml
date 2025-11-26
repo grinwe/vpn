@@ -1,0 +1,6 @@
+ansible_user: root
+db_docker_dir: /opt/vpn-db
+backend_docker_dir: /opt/vpn-backend
+postgres_password: "supersecret"
+backend_image: "vpn-backend:latest"
+backend_port: 8000
