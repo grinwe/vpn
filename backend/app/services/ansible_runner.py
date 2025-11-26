@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import tempfile
 from pathlib import Path
@@ -13,8 +14,12 @@ ANSIBLE_ROOT = Path(__file__).resolve().parents[3] / "infra" / "ansible"
 
 
 def _ensure_ansible_root() -> None:
-    if not ANSIBLE_ROOT.exists():
-        raise FileNotFoundError(f"Ansible root {ANSIBLE_ROOT} not found")
+    if not ANSIBLE_ROOT.exists() or not ANSIBLE_ROOT.is_dir():
+        raise FileNotFoundError(
+            f"Ansible root {ANSIBLE_ROOT} not found. Ensure infra/ansible is shipped alongside the backend."
+        )
+    if not os.access(ANSIBLE_ROOT, os.R_OK):
+        raise PermissionError(f"Ansible root {ANSIBLE_ROOT} is not readable by the backend process")
 
 
 def build_inventory_for_node(node: models.VPNNode, ansible_user: str = "root") -> Path:

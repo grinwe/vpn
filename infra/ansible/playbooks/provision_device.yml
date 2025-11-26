@@ -4,6 +4,11 @@
   vars:
     state: present
   tasks:
+    - name: Validate required username
+      fail:
+        msg: "username is required for provisioning"
+      when: username is not defined or username | length == 0
+
     - name: Ensure manage script exists
       stat:
         path: /usr/local/sbin/manage_vpn_user.sh
@@ -23,6 +28,8 @@
         {{ method | default('chacha20-ietf-poly1305') }}
         {{ port | default(8443) }}
       when: config_proto is not defined or config_proto.startswith('shadowtls')
+      register: manage_user
+      changed_when: "'updated' in manage_user.stdout or state == 'present'"
 
     - name: Log provisioning payload
       debug:

@@ -2,7 +2,7 @@ import aiohttp
 from aiogram import F, Router, types
 from aiogram.filters import Command
 
-from .config import ADMIN_IDS, BACKEND_URL
+from .config import ADMIN_API_TOKEN, ADMIN_IDS, BACKEND_URL
 from .keyboards import start_keyboard
 
 router = Router()
@@ -20,8 +20,24 @@ def _format_plan_button(plan: dict) -> str:
 
 async def _fetch_json(method: str, url: str, **kwargs):
     async with aiohttp.ClientSession() as session:
-        async with session.request(method, url, **kwargs) as resp:
-            return resp.status, await resp.json()
+        try:
+            async with session.request(method, url, **kwargs) as resp:
+                text = await resp.text()
+                try:
+                    payload = await resp.json()
+                except Exception:  # noqa: BLE001
+                    payload = {"message": text}
+                return resp.status, payload
+        except aiohttp.ClientError as exc:
+            return 0, {"message": f"backend unreachable: {exc}"}
+
+
+def _admin_headers(actor_id: int) -> dict[str, str]:
+    headers: dict[str, str] = {}
+    if ADMIN_API_TOKEN:
+        headers["X-Admin-Token"] = ADMIN_API_TOKEN
+    headers["X-Admin-Actor"] = str(actor_id)
+    return headers
 
 
 @router.message(Command("start"))
@@ -123,7 +139,10 @@ async def list_pending_invoices(message: types.Message):
 
     try:
         status, invoices = await _fetch_json(
-            "GET", f"{BACKEND_URL}/api/invoices", params={"status": "pending"}
+            "GET",
+            f"{BACKEND_URL}/api/invoices",
+            params={"status": "pending"},
+            headers=_admin_headers(message.from_user.id),
         )
     except aiohttp.ClientError:
         await message.answer("Бэкенд недоступен. Попробуйте позже.")
@@ -166,7 +185,9 @@ async def mark_invoice_paid(callback_query: types.CallbackQuery):
 
     try:
         status, invoice = await _fetch_json(
-            "POST", f"{BACKEND_URL}/api/invoices/{invoice_id}/mark_paid"
+            "POST",
+            f"{BACKEND_URL}/api/invoices/{invoice_id}/mark_paid",
+            headers=_admin_headers(callback_query.from_user.id),
         )
     except aiohttp.ClientError:
         await callback_query.answer("Бэкенд недоступен", show_alert=True)

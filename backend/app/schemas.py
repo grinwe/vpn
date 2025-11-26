@@ -127,6 +127,10 @@ class InvoiceCreate(BaseModel):
     currency: str = "USD"
 
 
+class InvoiceMarkPaidRequest(BaseModel):
+    payment_id: int | None = None
+
+
 class InvoiceOut(BaseModel):
     id: int
     user_id: int
@@ -164,6 +168,7 @@ class ProvisioningTaskOut(BaseModel):
     action: str
     status: str
     payload: dict[str, Any] | None
+    result: dict[str, Any] | None = None
     error_message: str | None
     created_at: datetime
     started_at: datetime | None
