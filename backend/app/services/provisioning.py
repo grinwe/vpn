@@ -108,9 +108,11 @@ class ProvisioningOrchestrator:
         except Exception as exc:  # noqa: BLE001
             logger.exception("Provisioning task %s failed", task.id)
             self._mark_task(task, models.ProvisioningTaskStatus.failed, error=str(exc), result=result_payload)
+            self._handle_task_outcome(task, success=False)
             return task
 
         self._mark_task(task, models.ProvisioningTaskStatus.success, result=result_payload)
+        self._handle_task_outcome(task, success=True)
         return task
 
     def run_task_async(self, task: models.ProvisioningTask, node: models.VPNNode | None = None) -> None:
@@ -124,6 +126,32 @@ class ProvisioningOrchestrator:
         task.started_at = None
         task.finished_at = None
         self.db.add(task)
+        self.db.commit()
+
+    def _handle_task_outcome(self, task: models.ProvisioningTask, *, success: bool) -> None:
+        if task.target_type != "device":
+            return
+
+        device = self.db.get(models.Device, task.target_id)
+        if not device:
+            return
+
+        if success:
+            if task.action == "apply":
+                device.status = models.DeviceStatus.active
+                for cred in device.credentials:
+                    cred.is_active = True
+                    cred.revoked_at = None
+            elif task.action == "revoke":
+                device.status = models.DeviceStatus.revoked
+                now = datetime.utcnow()
+                for cred in device.credentials:
+                    cred.is_active = False
+                    cred.revoked_at = cred.revoked_at or now
+        else:
+            device.status = models.DeviceStatus.failed
+        device.updated_at = datetime.utcnow()
+        self.db.add(device)
         self.db.commit()
 
     def _execute_task(self, task: models.ProvisioningTask, node: models.VPNNode | None = None) -> dict[str, Any]:
@@ -166,7 +194,7 @@ class ProvisioningOrchestrator:
         *,
         node_id: int | None = None,
         device_name: str | None = None,
-    ) -> models.Subscription:
+    ) -> tuple[models.Subscription, models.ProvisioningTask]:
         node = choose_node(self.db, plan, node_id=node_id)
         config = choose_config(node)
 
@@ -217,12 +245,44 @@ class ProvisioningOrchestrator:
             "port": config.port,
             "method": (config.settings or {}).get("method", "chacha20-ietf-poly1305"),
             "config_proto": config.protocol.value,
+            "state": "present",
         }
         task = self.create_task("device", device.id, "apply", task_payload)
         self.db.commit()
-        self.run_task(task, node=node)
-
-        device.status = models.DeviceStatus.active if task.status == models.ProvisioningTaskStatus.success else models.DeviceStatus.pending
-        self.db.commit()
+        self.run_task_async(task, node=node)
         self.db.refresh(subscription)
-        return subscription
+        return subscription, task
+
+    def revoke_device(
+        self, device: models.Device, *, reason: str | None = None, background: bool = True
+    ) -> models.ProvisioningTask:
+        payload = {
+            "username": device.access_username,
+            "port": device.config.port if device.config else None,
+            "config_proto": device.config.protocol.value if device.config else None,
+            "state": "absent",
+            "reason": reason,
+        }
+        task = self.create_task("device", device.id, "revoke", payload)
+        device.status = models.DeviceStatus.disabled
+        for cred in device.credentials:
+            cred.is_active = False
+            cred.revoked_at = cred.revoked_at or datetime.utcnow()
+        self.db.commit()
+        node = device.config.node if device.config else device.subscription.node
+        if background:
+            self.run_task_async(task, node=node)
+        else:
+            self.run_task(task, node=node)
+        return task
+
+    def revoke_subscription_devices(
+        self, subscription: models.Subscription, *, reason: str | None = None
+    ) -> list[models.ProvisioningTask]:
+        tasks: list[models.ProvisioningTask] = []
+        for device in subscription.devices:
+            tasks.append(self.revoke_device(device, reason=reason))
+        subscription.status = models.SubscriptionStatus.blocked
+        subscription.expires_at = datetime.utcnow()
+        self.db.commit()
+        return tasks

@@ -36,6 +36,11 @@ class InvoiceStatus(str, enum.Enum):
     failed = "failed"
 
 
+class InvoiceAction(str, enum.Enum):
+    new_subscription = "new_subscription"
+    renewal = "renewal"
+
+
 class VPNNodeStatus(str, enum.Enum):
     registering = "registering"
     active = "active"
@@ -50,6 +55,7 @@ class VPNConfigProtocol(str, enum.Enum):
 
 class DeviceStatus(str, enum.Enum):
     pending = "pending"
+    failed = "failed"
     active = "active"
     disabled = "disabled"
     revoked = "revoked"
@@ -240,14 +246,17 @@ class Invoice(Base):
     id = Column(Integer, primary_key=True)
     user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
     plan_id = Column(Integer, ForeignKey("plans.id"), nullable=False)
+    subscription_id = Column(Integer, ForeignKey("subscriptions.id"), nullable=True)
     amount = Column(Numeric(10, 2), default=0)
     currency = Column(String, default="USD")
     status = Column(Enum(InvoiceStatus), default=InvoiceStatus.pending)
+    action = Column(Enum(InvoiceAction), default=InvoiceAction.new_subscription)
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
     user = relationship("User", back_populates="invoices")
     plan = relationship("Plan")
+    subscription = relationship("Subscription")
 
 
 class ProvisioningTask(Base):

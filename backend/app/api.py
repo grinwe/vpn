@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import datetime, timedelta
 import logging
 from typing import Any
 
@@ -103,13 +103,15 @@ def _create_subscription_for_user(
     plan: models.Plan,
     node_id: int | None = None,
     device_name: str | None = None,
-) -> models.Subscription:
+) -> tuple[models.Subscription, models.ProvisioningTask]:
     orchestrator = ProvisioningOrchestrator(db)
     try:
-        sub = orchestrator.provision_subscription(user, plan, node_id=node_id, device_name=device_name)
+        sub, task = orchestrator.provision_subscription(
+            user, plan, node_id=node_id, device_name=device_name
+        )
         db.refresh(sub)
         _audit(db, user.telegram_id or "unknown", "subscription_created", "subscription", sub.id)
-        return sub
+        return sub, task
     except Exception as exc:  # noqa: BLE001
         logger.exception("Provisioning failed for user %s", user.telegram_id)
         db.rollback()
@@ -119,19 +121,55 @@ def _create_subscription_for_user(
 def _invoice_with_credentials(
     invoice: models.Invoice,
     credentials: list[models.Credential] | None = None,
+    subscription: models.Subscription | None = None,
+    task: models.ProvisioningTask | None = None,
 ) -> schemas.InvoicePaidOut:
     creds = credentials or []
+    device_id = None
+    if subscription and subscription.devices:
+        device_id = subscription.devices[0].id
     return schemas.InvoicePaidOut(
         id=invoice.id,
         user_id=invoice.user_id,
         user_telegram_id=invoice.user.telegram_id if invoice.user else None,
         plan_id=invoice.plan_id,
         plan_name=invoice.plan.name if invoice.plan else "",
+        subscription_id=invoice.subscription_id,
         amount=float(invoice.amount),
         currency=invoice.currency,
         status=invoice.status.value,
+        action=invoice.action.value,
         created_at=invoice.created_at,
         credentials=[schemas.CredentialOut.from_orm(c) for c in creds],
+        provisioning_task_id=task.id if task else None,
+        device_id=device_id,
+    )
+
+
+def _subscription_provision_response(
+    subscription: models.Subscription, task: models.ProvisioningTask
+) -> schemas.SubscriptionProvisionResponse:
+    device = subscription.devices[0] if subscription.devices else None
+    if not device:
+        raise HTTPException(status_code=500, detail="Subscription has no device")
+
+    return schemas.SubscriptionProvisionResponse(
+        subscription_id=subscription.id,
+        status=subscription.status.value,
+        expires_at=subscription.expires_at,
+        node_id=subscription.node_id,
+        plan_id=subscription.plan_id,
+        provisioning_task_id=task.id,
+        device=schemas.DeviceStatusOut(
+            id=device.id,
+            name=device.name,
+            status=device.status.value,
+            config_id=device.config_id,
+            access_username=device.access_username,
+            connection_uri=device.connection_uri,
+            credentials=[schemas.CredentialOut.from_orm(c) for c in device.credentials],
+            provisioning_task_id=task.id,
+        ),
     )
 
 
@@ -236,6 +274,14 @@ def list_tasks(limit: int = 50, db: Session = Depends(get_db), admin_token: str 
     return [schemas.ProvisioningTaskOut.from_orm(t) for t in tasks]
 
 
+@router.get("/provisioning/tasks/{task_id}", response_model=schemas.ProvisioningTaskOut)
+def get_task(task_id: int, db: Session = Depends(get_db)):
+    task = db.get(models.ProvisioningTask, task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+    return schemas.ProvisioningTaskOut.from_orm(task)
+
+
 @router.post("/provisioning/tasks/{task_id}/execute", response_model=schemas.ProvisioningTaskOut)
 def execute_task(task_id: int, db: Session = Depends(get_db), admin_token: str = Depends(require_admin)):
     task = db.get(models.ProvisioningTask, task_id)
@@ -263,15 +309,70 @@ def rerun_task(task_id: int, db: Session = Depends(get_db), admin_token: str = D
     return schemas.ProvisioningTaskOut.from_orm(task)
 
 
-@router.post("/subscriptions", response_model=list[schemas.CredentialOut])
+@router.post("/subscriptions", response_model=schemas.SubscriptionProvisionResponse)
 def create_subscription(payload: schemas.SubscriptionCreate, db: Session = Depends(get_db)):
     plan = db.get(models.Plan, payload.plan_id)
     if not plan:
         raise HTTPException(status_code=404, detail="Plan not found")
 
     user = _get_or_create_user(db, payload.telegram_id, payload.email)
-    sub = _create_subscription_for_user(db, user, plan, node_id=payload.node_id, device_name=payload.device_name)
-    return [schemas.CredentialOut.from_orm(cred) for cred in sub.credentials]
+    sub, task = _create_subscription_for_user(
+        db, user, plan, node_id=payload.node_id, device_name=payload.device_name
+    )
+    return _subscription_provision_response(sub, task)
+
+
+@router.get("/devices/{device_id}", response_model=schemas.DeviceStatusOut)
+def get_device(device_id: int, db: Session = Depends(get_db)):
+    device = db.get(models.Device, device_id)
+    if not device:
+        raise HTTPException(status_code=404, detail="Device not found")
+    task = (
+        db.query(models.ProvisioningTask)
+        .filter(
+            models.ProvisioningTask.target_type == "device",
+            models.ProvisioningTask.target_id == device_id,
+        )
+        .order_by(models.ProvisioningTask.created_at.desc())
+        .first()
+    )
+    return schemas.DeviceStatusOut(
+        id=device.id,
+        name=device.name,
+        status=device.status.value,
+        config_id=device.config_id,
+        access_username=device.access_username,
+        connection_uri=device.connection_uri,
+        credentials=[schemas.CredentialOut.from_orm(c) for c in device.credentials],
+        provisioning_task_id=task.id if task else None,
+    )
+
+
+@router.post("/devices/{device_id}/revoke", response_model=schemas.ProvisioningTaskOut)
+def revoke_device(
+    device_id: int,
+    body: schemas.DisableRequest | None = None,
+    db: Session = Depends(get_db),
+    admin_token: str = Depends(require_admin),
+    admin_actor: str | None = Header(default=None, alias=ADMIN_ACTOR_HEADER),
+):
+    device = db.get(models.Device, device_id)
+    if not device:
+        raise HTTPException(status_code=404, detail="Device not found")
+    orchestrator = ProvisioningOrchestrator(db)
+    task = orchestrator.revoke_device(device, reason=body.reason if body else None)
+    actor, actor_type = _resolve_admin_actor(admin_actor)
+    _audit(
+        db,
+        actor,
+        "device_revoked",
+        "device",
+        device_id,
+        metadata={"reason": body.reason if body else None},
+        actor_type=actor_type,
+    )
+    db.refresh(task)
+    return schemas.ProvisioningTaskOut.from_orm(task)
 
 
 @router.post("/users/{user_id}/disable")
@@ -285,9 +386,13 @@ def disable_user(
     subs = db.query(models.Subscription).filter(models.Subscription.user_id == user_id).all()
     if not subs:
         raise HTTPException(status_code=404, detail="User or subscriptions not found")
+    orchestrator = ProvisioningOrchestrator(db)
+    total_tasks = 0
     for sub in subs:
         sub.status = models.SubscriptionStatus.blocked
         sub.notes = body.reason
+        tasks = orchestrator.revoke_subscription_devices(sub, reason=body.reason)
+        total_tasks += len(tasks)
     db.commit()
     actor, actor_type = _resolve_admin_actor(admin_actor)
     _audit(
@@ -299,7 +404,7 @@ def disable_user(
         metadata={"reason": body.reason},
         actor_type=actor_type,
     )
-    return {"disabled": len(subs)}
+    return {"disabled": len(subs), "revocation_tasks": total_tasks}
 
 
 @router.get("/users/{user_id}", response_model=list[schemas.SubscriptionOut])
@@ -341,18 +446,14 @@ def disable_subscription(
         raise HTTPException(status_code=400, detail="Subscription is not active")
 
     orchestrator = ProvisioningOrchestrator(db)
-    device = sub.devices[0] if sub.devices else None
-    payload = {"subscription_id": subscription_id, "state": "absent"}
-    if device and device.access_username:
-        payload.update({"username": device.access_username, "port": device.config.port})
-    task = orchestrator.create_task("device", subscription_id, "revoke", payload)
-    sub.status = models.SubscriptionStatus.blocked
-    sub.expires_at = datetime.utcnow()
-    db.commit()
-    orchestrator.run_task_async(task, node=sub.node)
+    tasks = orchestrator.revoke_subscription_devices(sub, reason="disabled by admin")
     actor, actor_type = _resolve_admin_actor(admin_actor)
     _audit(db, actor, "subscription_disabled", "subscription", subscription_id, actor_type=actor_type)
-    return {"subscription_id": sub.id, "status": sub.status.value}
+    return {
+        "subscription_id": sub.id,
+        "status": sub.status.value,
+        "revocation_tasks": [task.id for task in tasks],
+    }
 
 
 @router.get("/subscriptions/{subscription_id}/status", response_model=schemas.SubscriptionStatusOut)
@@ -408,13 +509,26 @@ def create_invoice(
     if not plan:
         raise HTTPException(status_code=404, detail="Plan not found")
 
+    try:
+        action = models.InvoiceAction(body.action)
+    except ValueError as exc:  # noqa: BLE001
+        raise HTTPException(status_code=400, detail="Invalid invoice action") from exc
+
     user = _get_user_from_payload(db, body.user_id, body.telegram_id)
+    if body.subscription_id:
+        subscription = db.get(models.Subscription, body.subscription_id)
+        if not subscription:
+            raise HTTPException(status_code=404, detail="Subscription not found")
+        if subscription.user_id != user.id or subscription.plan_id != plan.id:
+            raise HTTPException(status_code=400, detail="Subscription does not match invoice data")
     amount = body.amount if body.amount is not None else float(plan.price)
     invoice = models.Invoice(
         user_id=user.id,
         plan_id=plan.id,
+        subscription_id=body.subscription_id,
         amount=amount,
         currency=body.currency,
+        action=action,
     )
     db.add(invoice)
     db.commit()
@@ -458,9 +572,11 @@ def list_invoices(
                 user_telegram_id=inv.user.telegram_id if inv.user else None,
                 plan_id=inv.plan_id,
                 plan_name=inv.plan.name if inv.plan else "",
+                subscription_id=inv.subscription_id,
                 amount=float(inv.amount),
                 currency=inv.currency,
                 status=inv.status.value,
+                action=inv.action.value,
                 created_at=inv.created_at,
             )
         )
@@ -479,23 +595,8 @@ def mark_invoice_paid(
     if not invoice:
         raise HTTPException(status_code=404, detail="Invoice not found")
 
-    if invoice.status == models.InvoiceStatus.paid:
-        subscription = (
-            db.query(models.Subscription)
-            .filter(
-                models.Subscription.user_id == invoice.user_id,
-                models.Subscription.plan_id == invoice.plan_id,
-            )
-            .order_by(models.Subscription.created_at.desc())
-            .first()
-        )
-        credentials = subscription.credentials if subscription else []
-        return _invoice_with_credentials(invoice, credentials)
-
-    plan = db.get(models.Plan, invoice.plan_id)
-    user = db.get(models.User, invoice.user_id)
-    if not plan or not user:
-        raise HTTPException(status_code=400, detail="Invoice is inconsistent: missing user or plan")
+    if invoice.status == models.InvoiceStatus.failed:
+        raise HTTPException(status_code=400, detail="Invoice is marked as failed")
 
     if body and body.payment_id:
         payment = db.get(models.Payment, body.payment_id)
@@ -506,21 +607,85 @@ def mark_invoice_paid(
         payment.status = models.PaymentStatus.paid
         db.add(payment)
 
+    latest_subscription = invoice.subscription
+    if invoice.status == models.InvoiceStatus.paid:
+        if not latest_subscription:
+            latest_subscription = (
+                db.query(models.Subscription)
+                .filter(
+                    models.Subscription.user_id == invoice.user_id,
+                    models.Subscription.plan_id == invoice.plan_id,
+                )
+                .order_by(models.Subscription.created_at.desc())
+                .first()
+            )
+        device = latest_subscription.devices[0] if latest_subscription and latest_subscription.devices else None
+        task = None
+        if device:
+            task = (
+                db.query(models.ProvisioningTask)
+                .filter(
+                    models.ProvisioningTask.target_type == "device",
+                    models.ProvisioningTask.target_id == device.id,
+                )
+                .order_by(models.ProvisioningTask.created_at.desc())
+                .first()
+            )
+        credentials = latest_subscription.credentials if latest_subscription else []
+        return _invoice_with_credentials(invoice, credentials, subscription=latest_subscription, task=task)
+
+    if invoice.status != models.InvoiceStatus.pending:
+        raise HTTPException(status_code=400, detail="Invoice cannot be paid in current status")
+
+    plan = db.get(models.Plan, invoice.plan_id)
+    user = db.get(models.User, invoice.user_id)
+    if not plan or not user:
+        raise HTTPException(status_code=400, detail="Invoice is inconsistent: missing user or plan")
+
+    credentials: list[models.Credential] = []
+    subscription: models.Subscription | None = None
+    task: models.ProvisioningTask | None = None
+    try:
+        if invoice.action == models.InvoiceAction.renewal:
+            if not invoice.subscription_id:
+                raise HTTPException(status_code=400, detail="Invoice missing subscription for renewal")
+            subscription = db.get(models.Subscription, invoice.subscription_id)
+            if not subscription:
+                raise HTTPException(status_code=404, detail="Subscription not found for renewal")
+            if subscription.user_id != invoice.user_id or subscription.plan_id != invoice.plan_id:
+                raise HTTPException(status_code=400, detail="Invoice does not match subscription")
+            now = datetime.utcnow()
+            base_time = subscription.expires_at if subscription.expires_at > now else now
+            subscription.expires_at = base_time + timedelta(days=plan.duration_days)
+            subscription.status = models.SubscriptionStatus.active
+            db.add(subscription)
+            invoice.subscription_id = subscription.id
+            credentials = subscription.credentials
+        else:
+            if invoice.subscription_id:
+                raise HTTPException(status_code=400, detail="Invoice already bound to subscription")
+            subscription, task = _create_subscription_for_user(db, user, plan)
+            credentials = subscription.credentials
+            invoice.subscription_id = subscription.id
+    except HTTPException:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("Failed to process invoice %s", invoice_id)
+        raise HTTPException(status_code=500, detail="Failed to create or update subscription") from exc
+
     invoice.status = models.InvoiceStatus.paid
     db.add(invoice)
     db.commit()
     db.refresh(invoice)
 
-    credentials: list[models.Credential] = []
-    try:
-        sub = _create_subscription_for_user(db, user, plan)
-        credentials = sub.credentials
-    except HTTPException:
-        raise
-    except Exception as exc:  # noqa: BLE001
-        logger.exception("Failed to create subscription for invoice %s", invoice_id)
-        raise HTTPException(status_code=500, detail="Failed to create subscription") from exc
-
     actor, actor_type = _resolve_admin_actor(admin_actor)
-    _audit(db, actor, "invoice_paid", "invoice", invoice.id, actor_type=actor_type)
-    return _invoice_with_credentials(invoice, credentials)
+    _audit(
+        db,
+        actor,
+        "invoice_paid",
+        "invoice",
+        invoice.id,
+        actor_type=actor_type,
+        metadata={"subscription_id": invoice.subscription_id},
+    )
+    return _invoice_with_credentials(invoice, credentials, subscription=subscription, task=task)

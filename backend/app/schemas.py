@@ -26,6 +26,11 @@ class DeviceOut(BaseModel):
         orm_mode = True
 
 
+class DeviceStatusOut(DeviceOut):
+    credentials: list[CredentialOut] = []
+    provisioning_task_id: int | None = None
+
+
 class VPNConfigCreate(BaseModel):
     name: str
     protocol: str
@@ -110,6 +115,16 @@ class SubscriptionStatusOut(BaseModel):
     proto_configs: List[CredentialOut]
 
 
+class SubscriptionProvisionResponse(BaseModel):
+    subscription_id: int
+    status: str
+    expires_at: datetime
+    node_id: int
+    plan_id: int
+    device: DeviceStatusOut
+    provisioning_task_id: int
+
+
 class PaymentCreate(BaseModel):
     subscription_id: int
     amount: float
@@ -123,8 +138,10 @@ class InvoiceCreate(BaseModel):
     user_id: int | None = None
     telegram_id: str | None = None
     plan_id: int
+    subscription_id: int | None = None
     amount: float | None = None
     currency: str = "USD"
+    action: str = "new_subscription"
 
 
 class InvoiceMarkPaidRequest(BaseModel):
@@ -135,9 +152,11 @@ class InvoiceOut(BaseModel):
     id: int
     user_id: int
     plan_id: int
+    subscription_id: int | None = None
     amount: float
     currency: str
     status: str
+    action: str
     created_at: datetime
     updated_at: datetime
 
@@ -151,14 +170,18 @@ class InvoiceListItem(BaseModel):
     user_telegram_id: str | None
     plan_id: int
     plan_name: str
+    subscription_id: int | None = None
     amount: float
     currency: str
     status: str
+    action: str
     created_at: datetime
 
 
 class InvoicePaidOut(InvoiceListItem):
     credentials: list[CredentialOut]
+    provisioning_task_id: int | None = None
+    device_id: int | None = None
 
 
 class ProvisioningTaskOut(BaseModel):
