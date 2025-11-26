@@ -3,6 +3,7 @@ from .db import Base, engine
 from . import models
 from .api import router as api_router
 
+# NOTE: In production, prefer migration tools (e.g., Alembic) over create_all.
 Base.metadata.create_all(bind=engine)
 
 app = FastAPI(title="VPN backend")

@@ -4,7 +4,10 @@ from sqlalchemy.orm import Session
 import logging
 from .db import SessionLocal
 from . import models, schemas
-from .services.provisioning import provision_subscription
+from .services.provisioning import (
+    deprovision_shadowtls_ss_user,
+    provision_subscription,
+)
 
 router = APIRouter(prefix="/api")
 logger = logging.getLogger(__name__)
@@ -18,28 +21,37 @@ def get_db():
         db.close()
 
 
+def _get_or_create_user(db: Session, telegram_id: str, email: str | None = None) -> models.User:
+    user = db.query(models.User).filter_by(telegram_id=telegram_id).first()
+    if not user:
+        user = models.User(telegram_id=telegram_id, email=email)
+        db.add(user)
+        db.commit()
+        db.refresh(user)
+    return user
+
+
+def _create_subscription_for_user(db: Session, user: models.User, plan: models.Plan) -> models.Subscription:
+    try:
+        sub = provision_subscription(db, user, plan)
+        db.commit()
+        db.refresh(sub)
+        return sub
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("Provisioning failed for user %s", user.telegram_id)
+        db.rollback()
+        raise HTTPException(status_code=500, detail="Provisioning failed") from exc
+
+
 @router.post("/subscriptions", response_model=list[schemas.CredentialOut])
 def create_subscription(payload: schemas.SubscriptionCreate, db: Session = Depends(get_db)):
     plan = db.get(models.Plan, payload.plan_id)
     if not plan:
         raise HTTPException(status_code=404, detail="Plan not found")
 
-    user = db.query(models.User).filter_by(telegram_id=payload.telegram_id).first()
-    if not user:
-        user = models.User(telegram_id=payload.telegram_id, email=payload.email)
-        db.add(user)
-        db.commit()
-        db.refresh(user)
-
-    try:
-        sub = provision_subscription(db, user, plan)
-        db.commit()
-        db.refresh(sub)
-        return [schemas.CredentialOut.from_orm(cred) for cred in sub.credentials]
-    except Exception as exc:  # noqa: BLE001
-        logger.exception("Provisioning failed for user %s", payload.telegram_id)
-        db.rollback()
-        raise HTTPException(status_code=500, detail="Provisioning failed") from exc
+    user = _get_or_create_user(db, payload.telegram_id, payload.email)
+    sub = _create_subscription_for_user(db, user, plan)
+    return [schemas.CredentialOut.from_orm(cred) for cred in sub.credentials]
 
 
 @router.post("/users/{user_id}/disable")
@@ -77,6 +89,43 @@ def get_user(user_id: int, db: Session = Depends(get_db)):
     return result
 
 
+@router.post("/subscriptions/{subscription_id}/disable")
+def disable_subscription(subscription_id: int, db: Session = Depends(get_db)):
+    sub = db.get(models.Subscription, subscription_id)
+    if not sub:
+        raise HTTPException(status_code=404, detail="Subscription not found")
+    if sub.status != models.SubscriptionStatus.active:
+        raise HTTPException(status_code=400, detail="Subscription is not active")
+
+    username = f"vpn-{sub.id}"
+    try:
+        deprovision_shadowtls_ss_user(sub.server, username)
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("Deprovision failed for subscription %s", sub.id)
+        raise HTTPException(status_code=500, detail="Deprovision failed") from exc
+
+    sub.status = models.SubscriptionStatus.blocked
+    sub.expires_at = datetime.utcnow()
+    db.commit()
+    return {"subscription_id": sub.id, "status": sub.status.value}
+
+
+@router.get("/subscriptions/{subscription_id}/status", response_model=schemas.SubscriptionStatusOut)
+def get_subscription_status(subscription_id: int, db: Session = Depends(get_db)):
+    sub = db.get(models.Subscription, subscription_id)
+    if not sub:
+        raise HTTPException(status_code=404, detail="Subscription not found")
+
+    is_active = sub.status == models.SubscriptionStatus.active and sub.expires_at > datetime.utcnow()
+    return schemas.SubscriptionStatusOut(
+        plan_name=sub.plan.name,
+        server_name=sub.server.name,
+        expires_at=sub.expires_at,
+        is_active=is_active,
+        proto_configs=[schemas.CredentialOut.from_orm(c) for c in sub.credentials],
+    )
+
+
 @router.post("/payments")
 def create_payment(body: schemas.PaymentCreate, db: Session = Depends(get_db)):
     sub = db.get(models.Subscription, body.subscription_id)
@@ -94,3 +143,44 @@ def create_payment(body: schemas.PaymentCreate, db: Session = Depends(get_db)):
     db.commit()
     db.refresh(payment)
     return {"id": payment.id, "status": payment.status.value}
+
+
+@router.post("/invoices", response_model=schemas.InvoiceOut)
+def create_invoice(body: schemas.InvoiceCreate, db: Session = Depends(get_db)):
+    plan = db.get(models.Plan, body.plan_id)
+    if not plan:
+        raise HTTPException(status_code=404, detail="Plan not found")
+
+    user = _get_or_create_user(db, body.telegram_id)
+    amount = body.amount if body.amount is not None else float(plan.price)
+    invoice = models.Invoice(
+        user_id=user.id,
+        plan_id=plan.id,
+        amount=amount,
+        currency=body.currency,
+    )
+    db.add(invoice)
+    db.commit()
+    db.refresh(invoice)
+    return schemas.InvoiceOut.from_orm(invoice)
+
+
+@router.post("/invoices/{invoice_id}/mark_paid", response_model=schemas.InvoiceOut)
+def mark_invoice_paid(invoice_id: int, db: Session = Depends(get_db)):
+    invoice = db.get(models.Invoice, invoice_id)
+    if not invoice:
+        raise HTTPException(status_code=404, detail="Invoice not found")
+
+    if invoice.status == models.InvoiceStatus.paid:
+        return schemas.InvoiceOut.from_orm(invoice)
+
+    invoice.status = models.InvoiceStatus.paid
+    db.commit()
+    db.refresh(invoice)
+
+    plan = db.get(models.Plan, invoice.plan_id)
+    user = db.get(models.User, invoice.user_id)
+    if plan and user:
+        _create_subscription_for_user(db, user, plan)
+
+    return schemas.InvoiceOut.from_orm(invoice)

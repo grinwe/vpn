@@ -29,6 +29,12 @@ class PaymentStatus(str, enum.Enum):
     refunded = "refunded"
 
 
+class InvoiceStatus(str, enum.Enum):
+    pending = "pending"
+    paid = "paid"
+    failed = "failed"
+
+
 plan_serverpool = Table(
     "plan_serverpool",
     Base.metadata,
@@ -84,6 +90,7 @@ class User(Base):
     telegram_id = Column(String, unique=True, index=True)
     email = Column(String, unique=True, index=True, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
+    invoices = relationship("Invoice", back_populates="user")
 
 
 class Subscription(Base):
@@ -131,3 +138,19 @@ class Payment(Base):
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
     subscription = relationship("Subscription", back_populates="payments")
+
+
+class Invoice(Base):
+    __tablename__ = "invoices"
+
+    id = Column(Integer, primary_key=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    plan_id = Column(Integer, ForeignKey("plans.id"), nullable=False)
+    amount = Column(Numeric(10, 2), default=0)
+    currency = Column(String, default="USD")
+    status = Column(Enum(InvoiceStatus), default=InvoiceStatus.pending)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    user = relationship("User", back_populates="invoices")
+    plan = relationship("Plan")
