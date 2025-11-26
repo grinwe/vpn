@@ -1,11 +1,13 @@
 from datetime import datetime
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
+import logging
 from .db import SessionLocal
 from . import models, schemas
 from .services.provisioning import provision_subscription
 
 router = APIRouter(prefix="/api")
+logger = logging.getLogger(__name__)
 
 
 def get_db():
@@ -29,10 +31,15 @@ def create_subscription(payload: schemas.SubscriptionCreate, db: Session = Depen
         db.commit()
         db.refresh(user)
 
-    sub = provision_subscription(db, user, plan)
-    db.commit()
-    db.refresh(sub)
-    return [schemas.CredentialOut.from_orm(cred) for cred in sub.credentials]
+    try:
+        sub = provision_subscription(db, user, plan)
+        db.commit()
+        db.refresh(sub)
+        return [schemas.CredentialOut.from_orm(cred) for cred in sub.credentials]
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("Provisioning failed for user %s", payload.telegram_id)
+        db.rollback()
+        raise HTTPException(status_code=500, detail="Provisioning failed") from exc
 
 
 @router.post("/users/{user_id}/disable")
