@@ -1,0 +1,59 @@
+---
+- name: Install Docker engine
+  apt:
+    name:
+      - docker.io
+      - docker-compose
+    state: present
+    update_cache: yes
+
+- name: Ensure compose directory exists
+  file:
+    path: "{{ db_docker_dir }}"
+    state: directory
+    mode: '0755'
+
+- name: Place docker-compose bundle
+  copy:
+    dest: "{{ db_docker_dir }}/docker-compose.yml"
+    content: |
+      version: "3.8"
+      services:
+        db:
+          image: postgres:16
+          environment:
+            POSTGRES_DB: vpn
+            POSTGRES_USER: vpn
+            POSTGRES_PASSWORD: {{ postgres_password }}
+          volumes:
+            - db_data:/var/lib/postgresql/data
+          restart: unless-stopped
+
+        backend:
+          image: {{ backend_image }}
+          environment:
+            DATABASE_URL: postgresql+psycopg2://vpn:{{ postgres_password }}@db:5432/vpn
+          ports:
+            - "{{ backend_port }}:8000"
+          depends_on:
+            - db
+          restart: unless-stopped
+
+      volumes:
+        db_data:
+
+- name: Sync backend sources
+  synchronize:
+    src: "{{ playbook_dir }}/../../backend/"
+    dest: "{{ backend_docker_dir }}/"
+    recursive: yes
+
+- name: Build backend image
+  command: docker build -t {{ backend_image }} .
+  args:
+    chdir: "{{ backend_docker_dir }}"
+
+- name: Start compose stack
+  command: docker-compose up -d
+  args:
+    chdir: "{{ db_docker_dir }}"

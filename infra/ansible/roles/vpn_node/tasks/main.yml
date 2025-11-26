@@ -1,0 +1,28 @@
+---
+- name: Ensure installers present
+  copy:
+    src: shadowtls_power_script.sh
+    dest: /usr/local/sbin/shadowtls_power_script.sh
+    mode: '0755'
+
+- name: Ensure vless installer present
+  copy:
+    src: vless_reality_installer.sh
+    dest: /usr/local/sbin/vless_reality_installer.sh
+    mode: '0755'
+
+- name: Run ShadowTLS + Shadowsocks installer
+  command: /usr/local/sbin/shadowtls_power_script.sh
+  args:
+    creates: /etc/shadowtls-ss/shadowsocks.json
+
+- name: Run VLESS + Reality installer (optional)
+  command: /usr/local/sbin/vless_reality_installer.sh
+  args:
+    creates: /usr/local/etc/xray/config.json
+  when: vless_enabled | default(true)
+
+- name: Render MOTD with endpoints
+  template:
+    src: motd.j2
+    dest: /etc/motd
