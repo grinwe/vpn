@@ -9,13 +9,17 @@ run_migrations()
 
 app = FastAPI(title="VPN backend")
 
-REQUEST_COUNTER = Counter("vpn_requests_total", "Total HTTP requests", ["path"])
+REQUEST_COUNTER = Counter("vpn_requests_total", "Total HTTP requests", ["path", "status"])
+ERROR_COUNTER = Counter("vpn_requests_errors_total", "HTTP errors", ["path", "status"])
 
 
 @app.middleware("http")
 async def add_metrics(request: Request, call_next):
     response = await call_next(request)
-    REQUEST_COUNTER.labels(path=request.url.path).inc()
+    status_code = response.status_code
+    REQUEST_COUNTER.labels(path=request.url.path, status=str(status_code)).inc()
+    if status_code >= 400:
+        ERROR_COUNTER.labels(path=request.url.path, status=str(status_code)).inc()
     return response
 
 

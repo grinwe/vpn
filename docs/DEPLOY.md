@@ -14,6 +14,12 @@ docker-compose up -d  # поднимет postgres + backend + бота
 ```
 Backend доступен на http://localhost:8000.
 
+### Переменные окружения и секреты
+- `ADMIN_API_TOKEN` — обязательный shared-secret для админских методов backend и Telegram-бота (передаётся в заголовке `X-Admin-Token`).
+- `DATABASE_URL` — строка подключения к PostgreSQL без дефолтных паролей.
+- `BOT_TOKEN`, `ADMIN_IDS`, `BACKEND_URL` — параметры бота; `ADMIN_API_TOKEN` должен совпадать с backend.
+Все секреты хранить в CI/CD Secrets или vault, не коммитить в git.
+
 ## Деплой инфраструктуры Ansible
 1. Заполнить `infra/ansible/inventories/prod/hosts.yml` реальными адресами.
 2. Заменить SSH ключи и пароли в `group_vars/vpn_nodes.yml` и `group_vars/db.yml`.
@@ -31,6 +37,7 @@ ansible-playbook -i inventories/prod/hosts.yml site.yml
 
 ### Провижининг устройств через Ansible
 Для создания/отзыва конкретного VPN-пользователя backend вызывает плейбук `infra/ansible/playbooks/provision_device.yml` с extra-vars, содержащими `username`, `password`, `port`, `method` и `state`. Плейбук заворачивает вызов `manage_vpn_user.sh` и может повторно запускаться без последствий (idempotent при одинаковых параметрах).
+Backend и Ansible располагаются в одном репозитории; раннер проверяет наличие каталога `infra/ansible` через `/healthz?deep=true`.
 
 ## Backend API (ключевые маршруты)
 - `POST /api/nodes`, `GET /api/nodes` — управление нодами; при создании автоматически ставится задача `ProvisioningTask` на bootstrap.

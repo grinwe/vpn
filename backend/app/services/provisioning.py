@@ -4,16 +4,19 @@ from __future__ import annotations
 import base64
 import logging
 import secrets
+import threading
 import uuid
 from datetime import datetime, timedelta
 from typing import Any
 
+from prometheus_client import Counter
 from sqlalchemy.orm import Session
 
 from .. import models
 from .ansible_runner import build_inventory_for_node, run_playbook
 
 logger = logging.getLogger(__name__)
+TASK_STATUS_COUNTER = Counter("vpn_provisioning_tasks_total", "Provisioning tasks processed", ["status"])
 
 
 def choose_node(db: Session, plan: models.Plan, node_id: int | None = None) -> models.VPNNode:
@@ -92,21 +95,36 @@ class ProvisioningOrchestrator:
         task.finished_at = datetime.utcnow()
         self.db.add(task)
         self.db.commit()
+        TASK_STATUS_COUNTER.labels(status=status.value).inc()
 
     def run_task(self, task: models.ProvisioningTask, node: models.VPNNode | None = None) -> models.ProvisioningTask:
         task.started_at = datetime.utcnow()
         task.status = models.ProvisioningTaskStatus.running
         self.db.commit()
 
+        result_payload: dict[str, Any] | None = None
         try:
-            result = self._execute_task(task, node=node)
+            result_payload = self._execute_task(task, node=node)
         except Exception as exc:  # noqa: BLE001
             logger.exception("Provisioning task %s failed", task.id)
-            self._mark_task(task, models.ProvisioningTaskStatus.failed, error=str(exc))
+            self._mark_task(task, models.ProvisioningTaskStatus.failed, error=str(exc), result=result_payload)
             return task
 
-        self._mark_task(task, models.ProvisioningTaskStatus.success, result=result)
+        self._mark_task(task, models.ProvisioningTaskStatus.success, result=result_payload)
         return task
+
+    def run_task_async(self, task: models.ProvisioningTask, node: models.VPNNode | None = None) -> None:
+        thread = threading.Thread(target=self.run_task, args=(task, node), daemon=True)
+        thread.start()
+
+    def reset_failed_task(self, task: models.ProvisioningTask) -> None:
+        task.status = models.ProvisioningTaskStatus.pending
+        task.error_message = None
+        task.result = None
+        task.started_at = None
+        task.finished_at = None
+        self.db.add(task)
+        self.db.commit()
 
     def _execute_task(self, task: models.ProvisioningTask, node: models.VPNNode | None = None) -> dict[str, Any]:
         payload = task.payload or {}
@@ -130,14 +148,16 @@ class ProvisioningOrchestrator:
         else:
             raise RuntimeError(f"Unsupported target type {task.target_type}")
 
-        if result.returncode != 0:
-            raise RuntimeError(result.stderr or result.stdout)
-
-        return {
+        payload = {
             "stdout": result.stdout,
             "stderr": result.stderr,
             "returncode": result.returncode,
         }
+
+        if result.returncode != 0:
+            raise RuntimeError(result.stderr or result.stdout or "ansible playbook failed")
+
+        return payload
 
     def provision_subscription(
         self,
