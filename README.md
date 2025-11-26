@@ -4,7 +4,7 @@
 
 ## Состав
 - **infra/** — Ansible-инфраструктура для узлов VPN и хоста с БД/backend.
-- **backend/** — FastAPI + PostgreSQL backend c моделями/эндпоинтами и заглушкой провижининга на ноды.
+- **backend/** — FastAPI + PostgreSQL backend c моделями/эндпоинтами и оркестратором провижининга нод и устройств (через Ansible, асинхронные задачи, метрики `/metrics`).
 - **bot/** — каркас Telegram-бота на aiogram.
 - **docker-compose.yml** — локальный стенд backend + Postgres + бот.
 - **docs/** — пошаговое развертывание и операции.

@@ -125,6 +125,19 @@ class SubscriptionProvisionResponse(BaseModel):
     provisioning_task_id: int
 
 
+class SubscriptionTrafficUpdate(BaseModel):
+    used_mb: int = Field(..., ge=0, description="Traffic to add to the subscription usage in MB")
+
+
+class SubscriptionTrafficOut(BaseModel):
+    subscription_id: int
+    status: str
+    traffic_used_mb: int
+    traffic_limit_mb: int | None = None
+    over_limit: bool = False
+    revocation_task_ids: list[int] = Field(default_factory=list)
+
+
 class PaymentCreate(BaseModel):
     subscription_id: int
     amount: float
