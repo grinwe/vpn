@@ -111,12 +111,12 @@ async def create_invoice(callback_query: types.CallbackQuery):
 @router.message(F.text == "Статус")
 async def status(message: types.Message):
     try:
-        async with aiohttp.ClientSession() as session:
-            resp = await session.get(f"{BACKEND_URL}/api/users/{message.from_user.id}")
-            if resp.status != 200:
-                await message.answer("Подписок не найдено")
-                return
-            data = await resp.json()
+        status_code, data = await _fetch_json(
+            "GET", f"{BACKEND_URL}/api/users/by_telegram/{message.from_user.id}"
+        )
+        if status_code != 200:
+            await message.answer("Подписок не найдено")
+            return
     except aiohttp.ClientError:
         await message.answer("Бэкенд недоступен. Попробуйте позже.")
         return

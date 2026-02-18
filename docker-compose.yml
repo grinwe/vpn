@@ -5,7 +5,7 @@ services:
     environment:
       POSTGRES_DB: vpn
       POSTGRES_USER: vpn
-      POSTGRES_PASSWORD: supersecret
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
     volumes:
       - db_data:/var/lib/postgresql/data
     restart: unless-stopped
@@ -13,7 +13,8 @@ services:
   backend:
     build: ./backend
     environment:
-      DATABASE_URL: postgresql+psycopg2://vpn:supersecret@db:5432/vpn
+      DATABASE_URL: ${DATABASE_URL}
+      ADMIN_API_TOKEN: ${ADMIN_API_TOKEN}
     ports:
       - "8000:8000"
     depends_on:
@@ -23,8 +24,10 @@ services:
   bot:
     build: ./bot
     environment:
-      BOT_TOKEN: "CHANGE_ME"
+      BOT_TOKEN: ${BOT_TOKEN}
       BACKEND_URL: "http://backend:8000"
+      ADMIN_API_TOKEN: ${ADMIN_API_TOKEN}
+      ADMIN_IDS: ${ADMIN_IDS}
     depends_on:
       - backend
     restart: unless-stopped

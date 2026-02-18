@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import base64
 import logging
+import os
 import secrets
 import threading
 import uuid
@@ -10,6 +11,7 @@ from datetime import datetime, timedelta
 from typing import Any
 
 from prometheus_client import Counter
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from .. import models
@@ -18,6 +20,9 @@ from .ansible_runner import build_inventory_for_node, run_playbook
 
 logger = logging.getLogger(__name__)
 TASK_STATUS_COUNTER = Counter("vpn_provisioning_tasks_total", "Provisioning tasks processed", ["status"])
+
+MAX_CONCURRENT_ANSIBLE = int(os.getenv("MAX_CONCURRENT_ANSIBLE", "3"))
+_ansible_semaphore = threading.Semaphore(MAX_CONCURRENT_ANSIBLE)
 
 
 def choose_node(db: Session, plan: models.Plan, node_id: int | None = None) -> models.VPNNode:
@@ -33,7 +38,19 @@ def choose_node(db: Session, plan: models.Plan, node_id: int | None = None) -> m
     if pools:
         pool_ids = [p.id for p in pools]
         query = query.filter(models.VPNNode.pool_id.in_(pool_ids))
-    node = query.order_by(models.VPNNode.created_at.asc()).first()
+
+    # Pick node with fewest active subscriptions
+    node = (
+        query
+        .outerjoin(
+            models.Subscription,
+            (models.Subscription.node_id == models.VPNNode.id)
+            & (models.Subscription.status == models.SubscriptionStatus.active),
+        )
+        .group_by(models.VPNNode.id)
+        .order_by(func.count(models.Subscription.id).asc())
+        .first()
+    )
     if not node:
         raise RuntimeError("No active VPN nodes available for plan")
     return node
@@ -204,25 +221,29 @@ class ProvisioningOrchestrator:
 
     def _execute_task(self, task: models.ProvisioningTask, node: models.VPNNode | None = None) -> dict[str, Any]:
         payload = task.payload or {}
-        if task.target_type == "node":
-            if not node:
-                node = self.db.get(models.VPNNode, task.target_id)
-            if not node:
-                raise RuntimeError("VPN node not found for provisioning")
-            inventory = build_inventory_for_node(node)
-            result = run_playbook("site.yml", inventory, limit=node.name)
-        elif task.target_type == "device":
-            if not node:
-                raise RuntimeError("Node is required to provision device")
-            inventory = build_inventory_for_node(node)
-            result = run_playbook(
-                "playbooks/provision_device.yml",
-                inventory,
-                limit=node.name,
-                extra_vars=payload,
-            )
-        else:
-            raise RuntimeError(f"Unsupported target type {task.target_type}")
+        _ansible_semaphore.acquire()
+        try:
+            if task.target_type == "node":
+                if not node:
+                    node = self.db.get(models.VPNNode, task.target_id)
+                if not node:
+                    raise RuntimeError("VPN node not found for provisioning")
+                inventory = build_inventory_for_node(node)
+                result = run_playbook("site.yml", inventory, limit=node.name)
+            elif task.target_type == "device":
+                if not node:
+                    raise RuntimeError("Node is required to provision device")
+                inventory = build_inventory_for_node(node)
+                result = run_playbook(
+                    "playbooks/provision_device.yml",
+                    inventory,
+                    limit=node.name,
+                    extra_vars=payload,
+                )
+            else:
+                raise RuntimeError(f"Unsupported target type {task.target_type}")
+        finally:
+            _ansible_semaphore.release()
 
         payload = {
             "stdout": result.stdout,
@@ -245,6 +266,20 @@ class ProvisioningOrchestrator:
     ) -> tuple[models.Subscription, models.ProvisioningTask]:
         node = choose_node(self.db, plan, node_id=node_id)
         config = choose_config(node)
+
+        # Enforce max_devices limit across all active subscriptions for this user/plan
+        active_device_count = (
+            self.db.query(models.Device)
+            .join(models.Subscription)
+            .filter(
+                models.Subscription.user_id == user.id,
+                models.Subscription.plan_id == plan.id,
+                models.Device.status.notin_([models.DeviceStatus.revoked, models.DeviceStatus.disabled]),
+            )
+            .count()
+        )
+        if active_device_count >= plan.max_devices:
+            raise RuntimeError(f"Device limit reached for this plan (max {plan.max_devices})")
 
         subscription = models.Subscription(
             user_id=user.id,
