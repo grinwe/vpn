@@ -1,4 +1,13 @@
 ---
+- name: Validate SSH public keys are not placeholders
+  fail:
+    msg: >
+      SSH public key is still a placeholder value.
+      Please replace 'ssh-ed25519 AAAA... your_key' in group_vars/vpn_nodes.yml
+      with your actual SSH public key.
+  when: item is match('.*AAAA\.\.\. your_key.*')
+  loop: "{{ ssh_public_keys | default([]) }}"
+
 - name: Ensure VPN system group
   group:
     name: "{{ vpn_system_group }}"

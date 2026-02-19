@@ -51,6 +51,7 @@ def run_playbook(
     *,
     limit: str | None = None,
     extra_vars: dict[str, Any] | None = None,
+    timeout: int = 300,
 ) -> subprocess.CompletedProcess:
     """Execute an Ansible playbook and return the completed process."""
     _ensure_ansible_root()
@@ -69,4 +70,7 @@ def run_playbook(
     if extra_vars:
         cmd.extend(["--extra-vars", json.dumps(extra_vars)])
 
-    return subprocess.run(cmd, check=False, capture_output=True, text=True)
+    try:
+        return subprocess.run(cmd, check=False, capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError("Ansible playbook timed out") from exc

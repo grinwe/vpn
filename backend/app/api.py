@@ -310,7 +310,11 @@ def rerun_task(task_id: int, db: Session = Depends(get_db), admin_token: str = D
 
 
 @router.post("/subscriptions", response_model=schemas.SubscriptionProvisionResponse)
-def create_subscription(payload: schemas.SubscriptionCreate, db: Session = Depends(get_db)):
+def create_subscription(
+    payload: schemas.SubscriptionCreate,
+    db: Session = Depends(get_db),
+    admin_token: str = Depends(require_admin),
+):
     plan = db.get(models.Plan, payload.plan_id)
     if not plan:
         raise HTTPException(status_code=404, detail="Plan not found")
@@ -323,10 +327,24 @@ def create_subscription(payload: schemas.SubscriptionCreate, db: Session = Depen
 
 
 @router.get("/devices/{device_id}", response_model=schemas.DeviceStatusOut)
-def get_device(device_id: int, db: Session = Depends(get_db)):
+def get_device(
+    device_id: int,
+    telegram_id: str | None = Query(default=None),
+    db: Session = Depends(get_db),
+    admin_token: str | None = Depends(optional_admin_token),
+):
     device = db.get(models.Device, device_id)
     if not device:
         raise HTTPException(status_code=404, detail="Device not found")
+
+    # Ownership check: must be admin or provide matching telegram_id
+    if not admin_token:
+        if not telegram_id:
+            raise HTTPException(status_code=403, detail="Forbidden")
+        owner = device.subscription.user if device.subscription else None
+        if not owner or owner.telegram_id != telegram_id:
+            raise HTTPException(status_code=403, detail="Forbidden")
+
     task = (
         db.query(models.ProvisioningTask)
         .filter(
@@ -407,8 +425,7 @@ def disable_user(
     return {"disabled": len(subs), "revocation_tasks": total_tasks}
 
 
-@router.get("/users/{user_id}", response_model=list[schemas.SubscriptionOut])
-def get_user(user_id: int, db: Session = Depends(get_db)):
+def _subscriptions_for_user(user_id: int, db: Session) -> list[schemas.SubscriptionOut]:
     subs = (
         db.query(models.Subscription)
         .filter(models.Subscription.user_id == user_id)
@@ -430,6 +447,19 @@ def get_user(user_id: int, db: Session = Depends(get_db)):
         )
         result.append(item)
     return result
+
+
+@router.get("/users/by_telegram/{telegram_id}", response_model=list[schemas.SubscriptionOut])
+def get_user_by_telegram(telegram_id: str, db: Session = Depends(get_db)):
+    user = db.query(models.User).filter_by(telegram_id=telegram_id).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    return _subscriptions_for_user(user.id, db)
+
+
+@router.get("/users/{user_id}", response_model=list[schemas.SubscriptionOut])
+def get_user(user_id: int, db: Session = Depends(get_db)):
+    return _subscriptions_for_user(user_id, db)
 
 
 @router.post("/subscriptions/{subscription_id}/disable")
@@ -642,7 +672,12 @@ def mark_invoice_paid(
     admin_token: str = Depends(require_admin),
     admin_actor: str | None = Header(default=None, alias=ADMIN_ACTOR_HEADER),
 ):
-    invoice = db.get(models.Invoice, invoice_id)
+    invoice = (
+        db.query(models.Invoice)
+        .filter(models.Invoice.id == invoice_id)
+        .with_for_update()
+        .first()
+    )
     if not invoice:
         raise HTTPException(status_code=404, detail="Invoice not found")
 
