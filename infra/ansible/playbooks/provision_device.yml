@@ -1,0 +1,36 @@
+---
+- hosts: vpn_nodes
+  become: yes
+  vars:
+    state: present
+  tasks:
+    - name: Validate required username
+      fail:
+        msg: "username is required for provisioning"
+      when: username is not defined or username | length == 0
+
+    - name: Ensure manage script exists
+      stat:
+        path: /usr/local/sbin/manage_vpn_user.sh
+      register: manage_script
+
+    - name: Fail if manage script missing
+      fail:
+        msg: "manage_vpn_user.sh not found on target"
+      when: not manage_script.stat.exists
+
+    - name: Add or remove ShadowTLS user
+      command: >-
+        /usr/local/sbin/manage_vpn_user.sh
+        {{ 'add-shadowtls-ss' if state == 'present' else 'del-shadowtls-ss' }}
+        {{ username }}
+        {{ password | default('') }}
+        {{ method | default('chacha20-ietf-poly1305') }}
+        {{ port | default(8443) }}
+      when: config_proto is not defined or config_proto.startswith('shadowtls')
+      register: manage_user
+      changed_when: "'updated' in manage_user.stdout or state == 'present'"
+
+    - name: Log provisioning payload
+      debug:
+        msg: "Provisioning payload: {{ username }} state={{ state }} port={{ port | default(8443) }}"

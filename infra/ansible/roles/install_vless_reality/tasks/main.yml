@@ -1,0 +1,12 @@
+---
+- name: Install VLESS + Reality script
+  copy:
+    src: vless_reality_installer.sh
+    dest: /usr/local/sbin/vless_reality_installer.sh
+    mode: '0755'
+
+- name: Execute VLESS + Reality installer
+  command: /usr/local/sbin/vless_reality_installer.sh
+  args:
+    creates: /usr/local/etc/xray/config.json
+  when: vless_enabled | default(true)

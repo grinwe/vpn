@@ -1,0 +1,13 @@
+ansible_user: root
+vpn_system_user: vpnsvc
+vpn_system_group: vpnsvc
+firewall_allowed_ports:
+  - 22
+  - 443
+  - 8443
+  - 9443
+# REQUIRED: Replace with your actual SSH public key
+ssh_public_keys:
+  - "ssh-ed25519 AAAA... your_key"
+domain_mask: "www.cloudflare.com"
+vless_enabled: true

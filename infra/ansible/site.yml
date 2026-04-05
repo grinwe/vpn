@@ -1,0 +1,13 @@
+---
+- hosts: vpn_nodes
+  become: yes
+  roles:
+    - bootstrap_node
+    - install_shadowtls_stack
+    - install_vless_reality
+    - check_node_health
+
+- hosts: db_host
+  become: yes
+  roles:
+    - db_host

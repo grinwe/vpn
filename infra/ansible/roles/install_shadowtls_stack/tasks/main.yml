@@ -1,0 +1,25 @@
+---
+- name: Install ShadowTLS + Shadowsocks stack via provided script
+  copy:
+    src: shadowtls_power_script.sh
+    dest: /usr/local/sbin/shadowtls_power_script.sh
+    mode: '0755'
+
+- name: Install VPN user management helper
+  copy:
+    src: manage_vpn_user.sh
+    dest: /usr/local/sbin/manage_vpn_user.sh
+    mode: '0755'
+
+- name: Execute ShadowTLS installer
+  command: /usr/local/sbin/shadowtls_power_script.sh
+  args:
+    creates: /etc/shadowtls-ss/shadowsocks.json
+
+- name: Ensure users directory exists
+  file:
+    path: /etc/shadowtls-ss/users.d
+    state: directory
+    mode: '0750'
+    owner: root
+    group: root
