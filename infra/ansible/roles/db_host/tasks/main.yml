@@ -14,8 +14,13 @@
     mode: '0755'
 
 - name: Place docker-compose bundle
+  # REAL fix, not cosmetic: this file embeds the DB password inline.
+  # Without an explicit mode ansible falls back to the remote umask,
+  # which on Ubuntu defaults to 0644 (world-readable). 0640 keeps it
+  # readable by the docker group / root only.
   copy:
     dest: "{{ db_docker_dir }}/docker-compose.yml"
+    mode: "0640"
     content: |
       version: "3.8"
       services:

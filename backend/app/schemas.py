@@ -13,6 +13,19 @@ class CredentialOut(BaseModel):
     class Config:
         orm_mode = True
 
+    @classmethod
+    def from_orm(cls, obj):  # type: ignore[override]
+        # Transparently decrypt config_text on read.
+        from .security import decrypt
+
+        return cls(
+            id=obj.id,
+            proto=obj.proto,
+            config_text=decrypt(obj.config_text) or "",
+            device_id=getattr(obj, "device_id", None),
+            config_id=getattr(obj, "config_id", None),
+        )
+
 
 class DeviceOut(BaseModel):
     id: int
@@ -24,6 +37,19 @@ class DeviceOut(BaseModel):
 
     class Config:
         orm_mode = True
+
+    @classmethod
+    def from_orm(cls, obj):  # type: ignore[override]
+        from .security import decrypt
+
+        return cls(
+            id=obj.id,
+            name=obj.name,
+            status=obj.status.value if hasattr(obj.status, "value") else obj.status,
+            config_id=obj.config_id,
+            access_username=obj.access_username,
+            connection_uri=decrypt(obj.connection_uri),
+        )
 
 
 class DeviceStatusOut(DeviceOut):
@@ -197,6 +223,164 @@ class InvoicePaidOut(InvoiceListItem):
     device_id: int | None = None
 
 
+class InvoiceCheckoutRequest(BaseModel):
+    provider: str | None = Field(default=None, description="Payment provider name; defaults to server default")
+    return_url: str | None = None
+
+
+class InvoiceCheckoutOut(BaseModel):
+    invoice_id: int
+    provider: str
+    external_id: str
+    pay_url: str
+    amount: float
+    currency: str
+
+
+class HealthProbeIn(BaseModel):
+    source_region: str = Field(..., description="Probe origin label, e.g. 'ru-mts', 'kz', 'eu'")
+    result: str = Field(..., description="ok|timeout|refused|tls_fail|unknown")
+    latency_ms: int | None = None
+    source_kind: str | None = None
+    details: dict[str, Any] | None = None
+
+
+class NodeTrafficSample(BaseModel):
+    access_username: str = Field(..., description="Device.access_username the counter belongs to")
+    uplink_bytes: int = Field(..., ge=0)
+    downlink_bytes: int = Field(..., ge=0)
+
+
+class NodeTrafficReport(BaseModel):
+    collected_at: datetime = Field(..., description="Node-side wallclock when counters were read")
+    window_seconds: int | None = Field(
+        default=None,
+        ge=1,
+        description="Length of the accounting window the samples cover, for diagnostics only",
+    )
+    samples: List[NodeTrafficSample]
+
+
+class NodeTrafficSubscriptionResult(BaseModel):
+    subscription_id: int
+    used_mb_delta: int
+    used_mb_total: int
+    over_limit: bool
+    revocation_task_ids: list[int] = Field(default_factory=list)
+
+
+class NodeTrafficIngestOut(BaseModel):
+    node_id: int
+    accepted_samples: int
+    unknown_usernames: list[str] = Field(default_factory=list)
+    subscriptions: list[NodeTrafficSubscriptionResult] = Field(default_factory=list)
+
+
+class ProbeTargetEndpoint(BaseModel):
+    # One port to check on a node. A node with both ShadowTLS and VLESS
+    # Reality will yield two endpoints. ``kind`` tells the agent which
+    # check routine to run: plain TCP connect, or TLS handshake (with
+    # ``sni`` as the expected SNI).
+    protocol: str
+    port: int
+    kind: str = Field(..., description="tcp|tls")
+    sni: str | None = None
+
+
+class ProbeTarget(BaseModel):
+    node_id: int
+    name: str
+    region: str
+    host: str
+    endpoints: list[ProbeTargetEndpoint]
+
+
+class ProbeTargetList(BaseModel):
+    generated_at: datetime
+    targets: list[ProbeTarget]
+
+
+class NodeHealthOut(BaseModel):
+    node_id: int
+    health_score: int
+    blocked_regions: list[str] = Field(default_factory=list)
+    overall_success_rate: float
+    per_region: dict[str, float]
+    migrated_subscriptions: list[int] = Field(default_factory=list)
+
+
+class CloudProviderCreate(BaseModel):
+    name: str
+    kind: str
+    api_token: str | None = None
+    default_image: str | None = None
+    default_region: str | None = None
+    default_plan: str | None = None
+    ssh_key_ids: list[str] | None = None
+    is_active: bool = True
+
+
+class CloudProviderOut(BaseModel):
+    id: int
+    name: str
+    kind: str
+    default_image: str | None
+    default_region: str | None
+    default_plan: str | None
+    ssh_key_ids: list[str] | None
+    is_active: bool
+    created_at: datetime
+
+    class Config:
+        orm_mode = True
+
+
+class PoolAutoscaleConfig(BaseModel):
+    autoscale_enabled: bool | None = None
+    autoscale_provider_id: int | None = None
+    autoscale_region: str | None = None
+    autoscale_plan: str | None = None
+    autoscale_image: str | None = None
+    autoscale_high_watermark: float | None = None
+    autoscale_max_nodes: int | None = None
+
+
+class PoolAutoscaleOut(BaseModel):
+    pool_id: int
+    pool_name: str
+    autoscale_enabled: bool
+    autoscale_provider_id: int | None
+    autoscale_region: str | None
+    autoscale_plan: str | None
+    autoscale_image: str | None
+    autoscale_high_watermark: float | None
+    autoscale_max_nodes: int | None
+
+
+class PoolDecisionOut(BaseModel):
+    pool_id: int
+    pool_name: str
+    utilization: float
+    total_capacity: int
+    active_subs: int
+    node_count: int
+    scaled_up: bool
+    new_node_id: int | None = None
+    reason: str | None = None
+
+
+class NodeSpawnRequest(BaseModel):
+    provider_id: int
+    name: str
+    region: str
+    plan: str
+    image: str | None = None
+    ssh_key_ids: list[str] | None = None
+    pool_id: int | None = None
+    user_data: str | None = None
+    notes: str | None = None
+
+
 class ProvisioningTaskOut(BaseModel):
     id: int
     target_type: str
@@ -209,6 +393,51 @@ class ProvisioningTaskOut(BaseModel):
     created_at: datetime
     started_at: datetime | None
     finished_at: datetime | None
+
+    class Config:
+        orm_mode = True
+
+
+class ApiTokenCreate(BaseModel):
+    name: str
+    scopes: list[str]
+
+
+class ApiTokenOut(BaseModel):
+    id: int
+    name: str
+    scopes: list[str]
+    is_active: bool
+    created_at: datetime
+    last_used_at: datetime | None = None
+
+    class Config:
+        orm_mode = True
+
+
+class ApiTokenCreatedOut(ApiTokenOut):
+    # Plaintext token, shown only on creation. Store it somewhere safe.
+    token: str
+
+
+class StatsOut(BaseModel):
+    users_total: int
+    subscriptions_active: int
+    subscriptions_total: int
+    invoices_pending: int
+    nodes_total: int
+    nodes_active: int
+    devices_active: int
+    provisioning_tasks_pending: int
+    provisioning_tasks_failed: int
+
+
+class UserOut(BaseModel):
+    id: int
+    telegram_id: str | None = None
+    email: str | None = None
+    created_at: datetime
+    subscription_count: int = 0
 
     class Config:
         orm_mode = True

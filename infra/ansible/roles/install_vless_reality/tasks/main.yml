@@ -1,12 +1,94 @@
 ---
-- name: Install VLESS + Reality script
-  copy:
-    src: vless_reality_installer.sh
-    dest: /usr/local/sbin/vless_reality_installer.sh
-    mode: '0755'
+# install_vless_reality
+#
+# Authoritative installer for xray-core serving VLESS+Reality. Unlike the
+# old stub, this role:
+#
+#   * actually installs xray from upstream (was previously a noop that
+#     assumed xray was somehow already there);
+#   * renders a real config.json from a template, with reality keys
+#     supplied by the backend as extra_vars (see services/vless.py). No
+#     state generation on the node itself;
+#   * enables xray's gRPC stats API bound to loopback, so the traffic
+#     collector can read per-user counters by email;
+#   * ships with an empty clients list. Users are added/removed by
+#     ``manage_vless_user.sh`` via jq, called from provision_device.yml.
+#
+# The role is a no-op unless the caller provides ``vless_reality_*``
+# vars. In the main site.yml we gate it on those being set, so nodes
+# that do not serve Reality (pure ShadowTLS) stay untouched.
+- name: Require Reality config variables
+  assert:
+    that:
+      - vless_reality_private_key is defined and vless_reality_private_key | length > 0
+      - vless_reality_public_key is defined and vless_reality_public_key | length > 0
+      - vless_reality_short_id is defined and vless_reality_short_id | length > 0
+      - vless_reality_port is defined
+      - vless_reality_sni is defined and vless_reality_sni | length > 0
+      - vless_reality_dest is defined and vless_reality_dest | length > 0
+    fail_msg: >-
+      install_vless_reality requires backend-supplied Reality parameters
+      (vless_reality_private_key, public_key, short_id, port, sni, dest).
+      The backend generates these in services/vless.py and passes them
+      as extra_vars when running site.yml for a node.
 
-- name: Execute VLESS + Reality installer
-  command: /usr/local/sbin/vless_reality_installer.sh
+- name: Ensure dependencies
+  apt:
+    name:
+      - curl
+      - unzip
+      - jq
+      - ca-certificates
+    state: present
+    update_cache: yes
+
+- name: Install xray-core from upstream (idempotent)
+  shell: |
+    set -euo pipefail
+    if command -v xray >/dev/null 2>&1; then
+      echo "xray already installed: $(xray version | head -n1)"
+      exit 0
+    fi
+    # Pinned upstream installer. Runs non-interactive; writes to
+    # /usr/local/bin/xray and installs a systemd unit.
+    bash -c "$(curl -fsSL https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install
   args:
-    creates: /usr/local/etc/xray/config.json
-  when: vless_enabled | default(true)
+    executable: /bin/bash
+  register: xray_install_result
+  changed_when: "'already installed' not in xray_install_result.stdout"
+
+- name: Ensure xray config directory
+  file:
+    path: /usr/local/etc/xray
+    state: directory
+    owner: root
+    group: root
+    mode: '0750'
+
+- name: Render xray config.json
+  template:
+    src: config.json.j2
+    dest: /usr/local/etc/xray/config.json
+    owner: root
+    group: root
+    mode: '0640'
+    # Back up the previous file so that a bad render leaves a recoverable
+    # copy — xray will refuse to start on invalid JSON and a manual revert
+    # is otherwise awkward.
+    backup: yes
+  notify: restart xray
+
+- name: Install VLESS user management helper
+  copy:
+    src: manage_vless_user.sh
+    dest: /usr/local/sbin/manage_vless_user.sh
+    owner: root
+    group: root
+    mode: '0750'
+
+- name: Ensure xray service enabled and running
+  systemd:
+    name: xray
+    enabled: yes
+    state: started
+    daemon_reload: yes

@@ -1,0 +1,79 @@
+---
+- name: Assert letsencrypt email is configured
+  assert:
+    that:
+      - deploy_web_frontend_letsencrypt_email | length > 0
+    fail_msg: >
+      deploy_web_frontend_letsencrypt_email must be set (set it in
+      group_vars or inventory for the web host).
+
+- name: Install nginx and certbot
+  apt:
+    name:
+      - nginx
+      - certbot
+      - python3-certbot-nginx
+    state: present
+    update_cache: true
+
+- name: Ensure UFW allows HTTP and HTTPS
+  ufw:
+    rule: allow
+    port: "{{ item }}"
+    proto: tcp
+  loop:
+    - "80"
+    - "443"
+
+- name: Remove default nginx site
+  file:
+    path: /etc/nginx/sites-enabled/default
+    state: absent
+  notify: reload nginx
+
+- name: Render nginx vhost
+  template:
+    src: nginx-site.conf.j2
+    dest: "/etc/nginx/sites-available/{{ deploy_web_frontend_site_name }}.conf"
+    mode: "0644"
+  notify: reload nginx
+
+- name: Enable nginx vhost
+  file:
+    src: "/etc/nginx/sites-available/{{ deploy_web_frontend_site_name }}.conf"
+    dest: "/etc/nginx/sites-enabled/{{ deploy_web_frontend_site_name }}.conf"
+    state: link
+  notify: reload nginx
+
+- name: Ensure nginx is running
+  service:
+    name: nginx
+    state: started
+    enabled: true
+
+# Flush now so nginx picks up the HTTP-only vhost before certbot runs.
+- name: Flush handlers before requesting certificate
+  meta: flush_handlers
+
+- name: Check for existing Let's Encrypt certificate
+  stat:
+    path: "/etc/letsencrypt/live/{{ deploy_web_frontend_domain }}/fullchain.pem"
+  register: le_cert
+
+- name: Request Let's Encrypt certificate (via nginx plugin)
+  command: >
+    certbot --nginx -n --agree-tos
+    --email {{ deploy_web_frontend_letsencrypt_email }}
+    -d {{ deploy_web_frontend_domain }}
+    --redirect
+  when:
+    - deploy_web_frontend_request_cert | bool
+    - not le_cert.stat.exists
+  notify: reload nginx
+
+- name: Enable certbot renewal timer
+  service:
+    name: certbot.timer
+    state: started
+    enabled: true
+  when: deploy_web_frontend_request_cert | bool

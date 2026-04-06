@@ -6,7 +6,12 @@
   loop: "{{ vpn_health_ports | default([443,8443,9443]) }}"
 
 - name: Check running services
-  shell: "ss -tulpn | grep -E 'xray|shadowsocks' || true"
+  # set -o pipefail so ``ss`` failing doesn't get silently masked by
+  # ``grep`` succeeding on empty input. Still ``|| true`` because an
+  # empty match is a legitimate "no relevant service" outcome.
+  shell: "set -o pipefail; ss -tulpn | grep -E 'xray|shadowsocks' || true"
+  args:
+    executable: /bin/bash
   register: service_status
   changed_when: false
 

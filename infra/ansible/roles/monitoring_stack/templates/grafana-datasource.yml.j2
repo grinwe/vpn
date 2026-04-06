@@ -1,0 +1,12 @@
+# Rendered by ansible role monitoring_stack. Do not edit by hand.
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    type: prometheus
+    access: proxy
+    # Container-to-container DNS: grafana reaches prometheus by service name
+    # over the compose default network.
+    url: http://prometheus:9090
+    isDefault: true
+    editable: false

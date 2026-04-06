@@ -1,5 +1,6 @@
-from datetime import datetime
 import enum
+
+from .time_utils import utcnow
 from sqlalchemy import (
     Boolean,
     Column,
@@ -12,7 +13,7 @@ from sqlalchemy import (
     Table,
     Text,
 )
-from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy.dialects.postgresql import ARRAY, JSONB
 from sqlalchemy.orm import relationship
 from .db import Base
 
@@ -74,6 +75,21 @@ class AuditActor(str, enum.Enum):
     system = "system"
 
 
+class ProbeResult(str, enum.Enum):
+    ok = "ok"
+    timeout = "timeout"
+    refused = "refused"
+    tls_fail = "tls_fail"
+    unknown = "unknown"
+
+
+class CloudProviderKind(str, enum.Enum):
+    hetzner = "hetzner"
+    vultr = "vultr"
+    digitalocean = "digitalocean"
+    manual = "manual"
+
+
 plan_serverpool = Table(
     "plan_serverpool",
     Base.metadata,
@@ -93,6 +109,22 @@ class ServerPool(Base):
     id = Column(Integer, primary_key=True)
     name = Column(String, unique=True, nullable=False)
     description = Column(Text)
+
+    # Autoscale configuration. ``autoscale_enabled`` acts as the master
+    # switch; when off, the scheduler ignores this pool entirely. The other
+    # fields are defaults passed to :func:`services.node_spawner.spawn_node`
+    # when a scale-up is triggered.
+    autoscale_enabled = Column(Boolean, default=False)
+    autoscale_provider_id = Column(Integer, ForeignKey("cloud_providers.id"), nullable=True)
+    autoscale_region = Column(String, nullable=True)
+    autoscale_plan = Column(String, nullable=True)
+    autoscale_image = Column(String, nullable=True)
+    # Trigger a scale-up when utilization (active_subs / total_capacity) is
+    # above this fraction (0..1). Leave null to use the service default.
+    autoscale_high_watermark = Column(Numeric(4, 3), nullable=True)
+    # Hard upper bound on the number of nodes this pool may have.
+    autoscale_max_nodes = Column(Integer, nullable=True)
+
     nodes = relationship("VPNNode", back_populates="pool")
     plans = relationship("Plan", secondary=plan_serverpool, back_populates="server_pools")
 
@@ -108,13 +140,33 @@ class VPNNode(Base):
     status = Column(Enum(VPNNodeStatus), default=VPNNodeStatus.registering)
     is_active = Column(Boolean, default=True)
     pool_id = Column(Integer, ForeignKey("server_pools.id"))
-    created_at = Column(DateTime, default=datetime.utcnow)
-    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    created_at = Column(DateTime, default=utcnow)
+    updated_at = Column(DateTime, default=utcnow, onupdate=utcnow)
     notes = Column(Text)
+
+    # Capacity / scheduling
+    max_users = Column(Integer, nullable=True)
+    max_bandwidth_mbps = Column(Integer, nullable=True)
+    # Health: 0..100, updated by health-checker/probing service
+    health_score = Column(Integer, default=100)
+    last_health_check_at = Column(DateTime, nullable=True)
+    # Regions in which this node is currently considered unreachable
+    # (populated from HealthProbe aggregation). Example: ["ru", "by"].
+    blocked_regions = Column(JSONB, nullable=True)
+    cooldown_until = Column(DateTime, nullable=True)
+
+    # Provisioning / cloud provider metadata
+    provider_id = Column(Integer, ForeignKey("cloud_providers.id"), nullable=True)
+    provider_external_id = Column(String, nullable=True)
+    provider_region = Column(String, nullable=True)
+    provider_plan = Column(String, nullable=True)
+    monthly_cost = Column(Numeric(10, 2), nullable=True)
 
     pool = relationship("ServerPool", back_populates="nodes")
     configs = relationship("VPNConfig", back_populates="node", cascade="all, delete-orphan")
     subscriptions = relationship("Subscription", back_populates="node")
+    provider = relationship("CloudProvider", back_populates="nodes")
+    probes = relationship("HealthProbe", back_populates="node", cascade="all, delete-orphan")
 
 
 class VPNConfig(Base):
@@ -130,8 +182,8 @@ class VPNConfig(Base):
     fallback = Column(String, nullable=True)
     settings = Column(JSONB, nullable=True)
     is_enabled = Column(Boolean, default=True)
-    created_at = Column(DateTime, default=datetime.utcnow)
-    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    created_at = Column(DateTime, default=utcnow)
+    updated_at = Column(DateTime, default=utcnow, onupdate=utcnow)
 
     node = relationship("VPNNode", back_populates="configs")
     credentials = relationship("Credential", back_populates="config")
@@ -156,7 +208,7 @@ class User(Base):
     id = Column(Integer, primary_key=True)
     telegram_id = Column(String, unique=True, index=True)
     email = Column(String, unique=True, index=True, nullable=True)
-    created_at = Column(DateTime, default=datetime.utcnow)
+    created_at = Column(DateTime, default=utcnow)
     invoices = relationship("Invoice", back_populates="user")
     devices = relationship("Device", back_populates="user")
 
@@ -168,8 +220,8 @@ class Subscription(Base):
     user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
     plan_id = Column(Integer, ForeignKey("plans.id"), nullable=False)
     node_id = Column(Integer, ForeignKey("vpn_nodes.id"), nullable=False)
-    created_at = Column(DateTime, default=datetime.utcnow)
-    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    created_at = Column(DateTime, default=utcnow)
+    updated_at = Column(DateTime, default=utcnow, onupdate=utcnow)
     expires_at = Column(DateTime, nullable=False)
     status = Column(Enum(SubscriptionStatus), default=SubscriptionStatus.active)
     notes = Column(Text)
@@ -196,8 +248,8 @@ class Device(Base):
     status = Column(Enum(DeviceStatus), default=DeviceStatus.pending)
     access_username = Column(String, nullable=True)
     connection_uri = Column(Text, nullable=True)
-    created_at = Column(DateTime, default=datetime.utcnow)
-    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    created_at = Column(DateTime, default=utcnow)
+    updated_at = Column(DateTime, default=utcnow, onupdate=utcnow)
     last_seen_at = Column(DateTime, nullable=True)
 
     user = relationship("User", back_populates="devices")
@@ -215,7 +267,7 @@ class Credential(Base):
     config_id = Column(Integer, ForeignKey("vpn_configs.id"), nullable=True)
     proto = Column(String, nullable=False)  # 'shadowtls+ss', 'vless-reality'
     config_text = Column(Text, nullable=False)  # vless://..., ss://..., yaml
-    created_at = Column(DateTime, default=datetime.utcnow)
+    created_at = Column(DateTime, default=utcnow)
     is_active = Column(Boolean, default=True)
     revoked_at = Column(DateTime, nullable=True)
 
@@ -228,16 +280,18 @@ class Payment(Base):
     __tablename__ = "payments"
 
     id = Column(Integer, primary_key=True)
-    subscription_id = Column(Integer, ForeignKey("subscriptions.id"), nullable=False)
+    subscription_id = Column(Integer, ForeignKey("subscriptions.id"), nullable=True)
+    invoice_id = Column(Integer, ForeignKey("invoices.id"), nullable=True, index=True)
     amount = Column(Numeric(10, 2), default=0)
     currency = Column(String, default="USD")
     status = Column(Enum(PaymentStatus), default=PaymentStatus.pending)
     provider = Column(String, default="manual")
     external_id = Column(String, nullable=True)
-    created_at = Column(DateTime, default=datetime.utcnow)
-    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    created_at = Column(DateTime, default=utcnow)
+    updated_at = Column(DateTime, default=utcnow, onupdate=utcnow)
 
     subscription = relationship("Subscription", back_populates="payments")
+    invoice = relationship("Invoice", foreign_keys=[invoice_id])
 
 
 class Invoice(Base):
@@ -251,8 +305,8 @@ class Invoice(Base):
     currency = Column(String, default="USD")
     status = Column(Enum(InvoiceStatus), default=InvoiceStatus.pending)
     action = Column(Enum(InvoiceAction), default=InvoiceAction.new_subscription)
-    created_at = Column(DateTime, default=datetime.utcnow)
-    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    created_at = Column(DateTime, default=utcnow)
+    updated_at = Column(DateTime, default=utcnow, onupdate=utcnow)
 
     user = relationship("User", back_populates="invoices")
     plan = relationship("Plan")
@@ -270,9 +324,64 @@ class ProvisioningTask(Base):
     payload = Column(JSONB, nullable=True)
     result = Column(JSONB, nullable=True)
     error_message = Column(Text, nullable=True)
-    created_at = Column(DateTime, default=datetime.utcnow)
+    created_at = Column(DateTime, default=utcnow)
     started_at = Column(DateTime, nullable=True)
     finished_at = Column(DateTime, nullable=True)
+
+
+class CloudProvider(Base):
+    __tablename__ = "cloud_providers"
+
+    id = Column(Integer, primary_key=True)
+    name = Column(String, unique=True, nullable=False)
+    kind = Column(Enum(CloudProviderKind), nullable=False)
+    # API token stored encrypted via app.security.crypto if key is configured,
+    # otherwise plain text (dev only).
+    api_token_enc = Column(Text, nullable=True)
+    default_image = Column(String, nullable=True)
+    ssh_key_ids = Column(JSONB, nullable=True)  # list of provider-side ssh key ids
+    default_region = Column(String, nullable=True)
+    default_plan = Column(String, nullable=True)
+    is_active = Column(Boolean, default=True)
+    created_at = Column(DateTime, default=utcnow)
+
+    nodes = relationship("VPNNode", back_populates="provider")
+
+
+class HealthProbe(Base):
+    __tablename__ = "health_probes"
+
+    id = Column(Integer, primary_key=True)
+    node_id = Column(Integer, ForeignKey("vpn_nodes.id", ondelete="CASCADE"), nullable=False, index=True)
+    # Where the probe came from. Free-form label, e.g. "ru-mobile-mts", "kz", "eu".
+    source_region = Column(String, nullable=False, index=True)
+    source_kind = Column(String, nullable=True)  # "active" / "passive" / "client"
+    result = Column(Enum(ProbeResult), nullable=False)
+    latency_ms = Column(Integer, nullable=True)
+    observed_at = Column(DateTime, default=utcnow, index=True)
+    details = Column(JSONB, nullable=True)
+
+    node = relationship("VPNNode", back_populates="probes")
+
+
+class ApiToken(Base):
+    """Scoped API token for non-admin callers (probe rigs, node collectors).
+
+    Only the SHA-256 hash of the token is stored — the plaintext is shown
+    once at creation time and never again. ``scopes`` is a list of string
+    capabilities (e.g. ``probe:read``, ``probe:write``, ``traffic:write``);
+    the admin token is treated as having all scopes without a row here.
+    """
+
+    __tablename__ = "api_tokens"
+
+    id = Column(Integer, primary_key=True)
+    name = Column(String, nullable=False, unique=True)
+    token_hash = Column(String, nullable=False, unique=True, index=True)
+    scopes = Column(ARRAY(String), nullable=False, default=list)
+    is_active = Column(Boolean, default=True, nullable=False)
+    created_at = Column(DateTime, default=utcnow, nullable=False)
+    last_used_at = Column(DateTime, nullable=True)
 
 
 class AuditLog(Base):
@@ -284,5 +393,7 @@ class AuditLog(Base):
     action = Column(String, nullable=False)
     target_type = Column(String, nullable=False)
     target_id = Column(Integer, nullable=True)
-    created_at = Column(DateTime, default=datetime.utcnow)
-    metadata = Column(JSONB, nullable=True)
+    created_at = Column(DateTime, default=utcnow)
+    # `metadata` is reserved by SQLAlchemy Declarative; expose as `extra`
+    # but keep the column name for backward compat with existing DBs.
+    extra = Column("metadata", JSONB, nullable=True)

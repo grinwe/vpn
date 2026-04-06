@@ -1,0 +1,48 @@
+---
+# ===========================================================================
+# monitoring_stack — defaults
+# ===========================================================================
+# Self-hosted Prometheus + Grafana deployed as a docker-compose stack on a
+# single host. Exposed only on 127.0.0.1 — operators access it through an
+# SSH tunnel (``ssh -L 3000:localhost:3000 root@<host>``). This avoids
+# publishing an attack surface, avoids TLS/cert plumbing, and doesn't
+# collide with whatever nginx the box may already be running.
+#
+# All vars are ``monitoring_stack_``-prefixed to satisfy ansible-lint's
+# var-naming rule and to make overrides in group_vars self-documenting.
+# ---------------------------------------------------------------------------
+
+# Where the stack lives on disk. All config + persistent volumes are here,
+# so ``rm -rf`` of this dir is the canonical "start over" operation.
+monitoring_stack_dir: /opt/vpn-monitoring
+
+# Image tags — pin so a silent upstream bump doesn't surprise us.
+monitoring_stack_prometheus_image: "prom/prometheus:v2.54.1"
+monitoring_stack_grafana_image: "grafana/grafana:11.2.2"
+
+# Bind addresses. 127.0.0.1 means "SSH tunnel only" — if you want LAN
+# access from a bastion, override to the bastion-facing IP and add a
+# firewall rule. Do NOT bind to 0.0.0.0 without fronting with TLS+auth.
+monitoring_stack_grafana_bind: "127.0.0.1:3000"
+monitoring_stack_prometheus_bind: "127.0.0.1:9090"
+
+# Grafana admin. Password MUST come from vault — the default here is a
+# hard-fail sentinel so ``ansible-playbook`` without vault refuses to
+# create a usable admin account.
+monitoring_stack_grafana_admin_user: admin
+monitoring_stack_grafana_admin_password: "CHANGE_ME_IN_VAULT"
+
+# Prometheus scrape targets.
+#
+# ``backend`` is the FastAPI service exposing /metrics. Override the URL
+# when the backend runs on a different host (the default assumes it sits
+# on the same box as the monitoring stack).
+monitoring_stack_backend_metrics_url: "host.docker.internal:8000"
+
+# Scrape interval — 15s is the Prometheus default and plenty for us.
+monitoring_stack_scrape_interval: "15s"
+
+# node_exporter targets are built dynamically from the ``vpn_nodes``
+# inventory group at template time. Each host must have node_exporter
+# running on this port (role ``node_exporter``).
+monitoring_stack_node_exporter_port: 9100

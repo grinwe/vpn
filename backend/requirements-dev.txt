@@ -1,0 +1,5 @@
+# Development/test-only dependencies. Kept out of the runtime image so
+# neither the API nor the worker container carries pytest.
+pytest>=8
+pytest-asyncio>=0.23
+httpx>=0.27

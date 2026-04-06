@@ -1,0 +1,21 @@
+---
+# Non-secret monitoring group vars. Secrets (admin password) live in
+# the sibling ``monitoring/vault.yml`` encrypted with ansible-vault.
+
+# Where the backend's /metrics lives as seen from *inside* the grafana
+# host's docker network. If the backend runs on the same physical box,
+# ``host.docker.internal`` + the backend port works out of the box (the
+# compose template adds the host-gateway alias). If the backend is on a
+# different host, set this to ``<ip>:<port>`` and open the firewall.
+monitoring_stack_backend_metrics_url: "host.docker.internal:8000"
+
+# Override default bind if you want LAN access from a specific bastion.
+# Leave on 127.0.0.1 for SSH-tunnel-only access (recommended).
+# monitoring_stack_grafana_bind: "127.0.0.1:3000"
+# monitoring_stack_prometheus_bind: "127.0.0.1:9090"
+
+# Fleet-wide: the public IP of this monitoring host. Each vpn_node's
+# install_node_exporter role uses this to build an iptables allowlist
+# for :9100. Keep in sync with the ansible_host above.
+node_exporter_allowed_ips:
+  - "45.14.244.140"

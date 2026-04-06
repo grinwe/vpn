@@ -1,0 +1,10 @@
+[Unit]
+Description=VPN per-user traffic collector (one-shot)
+After=network-online.target shadowtls.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/traffic_collect.sh
+# Timer restarts on next tick; no point hammering a failing backend.
+Nice=10

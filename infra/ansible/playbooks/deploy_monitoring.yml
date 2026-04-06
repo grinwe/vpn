@@ -1,0 +1,25 @@
+---
+# Deploy Prometheus + Grafana stack on the monitoring host and install
+# node_exporter on every VPN node so prometheus has something to scrape.
+#
+# Usage:
+#   ansible-playbook -i inventories/prod/hosts.yml playbooks/deploy_monitoring.yml \
+#       --ask-vault-pass
+#
+# Apply only the monitoring stack (skip touching vpn nodes):
+#   ansible-playbook ... playbooks/deploy_monitoring.yml --limit monitoring
+#
+# Apply only node_exporter fleet-wide (no grafana/prom changes):
+#   ansible-playbook ... playbooks/deploy_monitoring.yml --limit vpn_nodes
+
+- name: node_exporter on all VPN nodes
+  hosts: vpn_nodes
+  become: true
+  roles:
+    - node_exporter
+
+- name: Prometheus + Grafana on monitoring host
+  hosts: monitoring
+  become: true
+  roles:
+    - monitoring_stack

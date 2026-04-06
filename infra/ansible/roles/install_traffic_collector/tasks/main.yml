@@ -1,0 +1,75 @@
+---
+- name: Validate traffic collector config
+  assert:
+    that:
+      - traffic_collector_backend_url | length > 0
+      - traffic_collector_backend_token | length > 0
+      - traffic_collector_node_id | string | length > 0
+    fail_msg: >-
+      traffic_collector_backend_url, traffic_collector_backend_token and
+      traffic_collector_node_id must all be set before deploying the
+      collector. Pass them via group_vars or --extra-vars.
+
+- name: Ensure iptables is installed
+  package:
+    name: iptables
+    state: present
+
+- name: Install ShadowTLS traffic collector script
+  copy:
+    src: traffic_collect.sh
+    dest: /usr/local/sbin/traffic_collect.sh
+    mode: '0750'
+    owner: root
+    group: root
+
+- name: Install xray traffic collector script
+  copy:
+    src: traffic_collect_xray.sh
+    dest: /usr/local/sbin/traffic_collect_xray.sh
+    mode: '0750'
+    owner: root
+    group: root
+
+- name: Ensure collector config directory
+  file:
+    path: /etc/vpn-collector
+    state: directory
+    owner: root
+    group: root
+    mode: '0750'
+
+- name: Render collector env file
+  template:
+    src: collector.env.j2
+    dest: /etc/vpn-collector/collector.env
+    mode: '0600'
+    owner: root
+    group: root
+
+- name: Install collector systemd units
+  copy:
+    src: "{{ item }}"
+    dest: "/etc/systemd/system/{{ item }}"
+    mode: '0644'
+  loop:
+    - vpn-traffic-collect.service
+    - vpn-traffic-collect.timer
+    - vpn-traffic-collect-xray.service
+    - vpn-traffic-collect-xray.timer
+
+- name: Reload systemd
+  systemd:
+    daemon_reload: yes
+
+# Both timers are enabled unconditionally. Each script exits 0 if its
+# target stack is not installed on the node — the fleet runs a uniform
+# unit set regardless of protocol, which keeps provisioning simple.
+- name: Enable and start traffic collector timers
+  systemd:
+    name: "{{ item }}"
+    enabled: yes
+    state: started
+  loop:
+    - vpn-traffic-collect.timer
+    - vpn-traffic-collect-xray.timer

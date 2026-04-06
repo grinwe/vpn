@@ -1,0 +1,51 @@
+---
+# Controller-side path to the ``vpn/`` repo root. Computed relative
+# to this role's own location so it works no matter which playbook
+# entry point invoked the role. Override only if you're running from
+# a checkout that doesn't follow the standard layout.
+deploy_app_stack_repo_src: "{{ role_path }}/../../../.."
+
+# Where the repo is synced to on the target. Everything the compose
+# stack needs (backend/, bot/, admin/, infra/, docker-compose.yml)
+# lives under this directory; nothing is baked into images at build
+# time that the role would need to mutate later.
+deploy_app_stack_dir: "/opt/vpn"
+
+# Unix user that owns the synced tree. Kept as root for now — the
+# compose stack runs as root inside the daemon anyway, and the
+# provisioning SSH key needs root-readable perms.
+deploy_app_stack_owner: "root"
+deploy_app_stack_group: "root"
+
+# Path on the target where the provisioning SSH private key should
+# live. The worker container bind-mounts this read-only at
+# /run/secrets/provisioning_key. The role copies it there from the
+# controller-side path in ``deploy_app_stack_provisioning_key_src``.
+deploy_app_stack_provisioning_key_dst: "/opt/vpn/secrets/provisioning_key"
+deploy_app_stack_provisioning_key_src: ""
+
+# Whether to run ``docker compose build`` before ``up``. Turn off if
+# you prefer to pre-build images in CI and only pull here — in that
+# case, point the compose file at a registry instead.
+deploy_app_stack_build: true
+
+# Force a full recreate on every run (``--force-recreate``). Off by
+# default so idempotent re-runs are cheap; compose will recreate only
+# what changed. Flip to true via --extra-vars if you want a clean bounce.
+deploy_app_stack_force_recreate: false
+
+# --- Secrets expected from group_vars/vault ---
+# These MUST be supplied before the role will run. The role asserts
+# their presence up front so a half-templated .env never lands on disk.
+#
+#   deploy_app_stack_postgres_password
+#   deploy_app_stack_admin_api_token
+#   deploy_app_stack_app_secret_key
+#   deploy_app_stack_bot_token
+#   deploy_app_stack_admin_ids              (comma-separated telegram ids)
+#
+# Optional (leave empty string to disable the corresponding feature):
+#   deploy_app_stack_telegram_stars_webhook_secret
+#   deploy_app_stack_payment_provider        (default: "cryptobot")
+deploy_app_stack_payment_provider: "cryptobot"
+deploy_app_stack_telegram_stars_webhook_secret: ""

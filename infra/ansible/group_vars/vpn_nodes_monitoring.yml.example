@@ -1,0 +1,10 @@
+---
+# Example: apply the monitoring host's IP to all vpn_nodes so their
+# install_node_exporter firewall rule knows who's allowed to scrape.
+#
+# Copy to ``group_vars/vpn_nodes/monitoring.yml`` (create the directory
+# if needed) and adjust the IP if you move prometheus to a different
+# host. Kept as .example to avoid polluting the default inventory layout.
+
+node_exporter_allowed_ips:
+  - "45.14.244.140"

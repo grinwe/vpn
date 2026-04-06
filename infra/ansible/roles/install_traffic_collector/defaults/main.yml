@@ -1,0 +1,9 @@
+---
+# Backend coordinates. These MUST be overridden at the playbook level
+# (either via group_vars or --extra-vars). Defaults deliberately fail-fast
+# so that an unconfigured node will not silently stop reporting.
+traffic_collector_backend_url: ""
+traffic_collector_backend_token: ""
+# Default to the `node_id` host var that the provisioning playbook passes
+# in when it knows which VPNNode row this host corresponds to.
+traffic_collector_node_id: "{{ node_id | default('') }}"

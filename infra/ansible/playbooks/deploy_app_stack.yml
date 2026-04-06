@@ -1,0 +1,12 @@
+---
+# Standalone playbook that brings up just the application stack
+# (containers + .env) without touching nginx/TLS. Useful for code
+# deploys after the initial bootstrap.
+#
+#   ansible-playbook -i inventories/prod/hosts.yml \
+#       playbooks/deploy_app_stack.yml --ask-vault-pass
+- name: Deploy VPN application stack (backend + worker + bot + admin)
+  hosts: web
+  become: true
+  roles:
+    - deploy_app_stack

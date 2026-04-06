@@ -1,0 +1,4 @@
+# Extra dependencies only needed inside the provisioning worker container.
+# The base requirements.txt is installed first; this file must stay minimal
+# to keep the image small and the attack surface low.
+ansible-core>=2.16

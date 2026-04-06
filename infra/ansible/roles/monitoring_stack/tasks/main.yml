@@ -1,0 +1,106 @@
+---
+# ===========================================================================
+# monitoring_stack — Prometheus + Grafana via docker-compose
+# ===========================================================================
+# Idempotent, safe to re-run. Dashboards and datasources are provisioned
+# from files on disk (grafana reads them at startup from
+# /etc/grafana/provisioning) rather than through the HTTP API, so the
+# state is fully reproducible and survives a container wipe.
+# ---------------------------------------------------------------------------
+
+- name: Guard — grafana admin password must be set in vault
+  ansible.builtin.assert:
+    that:
+      - monitoring_stack_grafana_admin_password != "CHANGE_ME_IN_VAULT"
+      - monitoring_stack_grafana_admin_password | length >= 12
+    fail_msg: >
+      monitoring_stack_grafana_admin_password is unset or too short.
+      Put it in a vaulted group_vars file, e.g.
+      group_vars/monitoring/vault.yml with ansible-vault encrypt.
+
+- name: Install docker + compose plugin
+  ansible.builtin.apt:
+    name:
+      - docker.io
+      - docker-compose-plugin
+    state: present
+    update_cache: true
+
+- name: Ensure docker is running
+  ansible.builtin.systemd:
+    name: docker
+    state: started
+    enabled: true
+
+- name: Create stack directory tree
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    mode: "0755"
+  loop:
+    - "{{ monitoring_stack_dir }}"
+    - "{{ monitoring_stack_dir }}/prometheus"
+    - "{{ monitoring_stack_dir }}/grafana/provisioning/datasources"
+    - "{{ monitoring_stack_dir }}/grafana/provisioning/dashboards"
+    - "{{ monitoring_stack_dir }}/grafana/dashboards"
+    # Persistent volume dirs — bind-mounted into containers. Keeping them
+    # outside docker volumes makes backup (tar -czf) trivial.
+    - "{{ monitoring_stack_dir }}/data/prometheus"
+    - "{{ monitoring_stack_dir }}/data/grafana"
+
+- name: Fix ownership of grafana data dir
+  # grafana container runs as uid 472; without this chown it can't write
+  # grafana.db on first start and the container restart-loops.
+  ansible.builtin.file:
+    path: "{{ monitoring_stack_dir }}/data/grafana"
+    state: directory
+    owner: "472"
+    group: "472"
+    recurse: true
+
+- name: Render docker-compose.yml
+  ansible.builtin.template:
+    src: docker-compose.yml.j2
+    dest: "{{ monitoring_stack_dir }}/docker-compose.yml"
+    mode: "0644"
+  notify: restart monitoring stack
+
+- name: Render prometheus.yml
+  ansible.builtin.template:
+    src: prometheus.yml.j2
+    dest: "{{ monitoring_stack_dir }}/prometheus/prometheus.yml"
+    mode: "0644"
+  notify: reload prometheus
+
+- name: Render grafana datasource provisioning
+  ansible.builtin.template:
+    src: grafana-datasource.yml.j2
+    dest: "{{ monitoring_stack_dir }}/grafana/provisioning/datasources/prometheus.yml"
+    mode: "0644"
+  notify: restart monitoring stack
+
+- name: Copy grafana dashboard provider config
+  ansible.builtin.copy:
+    src: grafana-dashboards.yml
+    dest: "{{ monitoring_stack_dir }}/grafana/provisioning/dashboards/default.yml"
+    mode: "0644"
+  notify: restart monitoring stack
+
+- name: Copy dashboard JSONs
+  ansible.builtin.copy:
+    src: "dashboards/{{ item }}"
+    dest: "{{ monitoring_stack_dir }}/grafana/dashboards/{{ item }}"
+    mode: "0644"
+  loop:
+    - vpn-overview.json
+    - fleet.json
+  notify: restart monitoring stack
+
+- name: Bring the stack up
+  # ``docker compose up -d`` is idempotent: containers only recreate when
+  # config hashes change. Handlers take care of restart on config churn.
+  ansible.builtin.command:
+    cmd: docker compose up -d
+    chdir: "{{ monitoring_stack_dir }}"
+  register: compose_up
+  changed_when: "'Started' in compose_up.stderr or 'Created' in compose_up.stderr"

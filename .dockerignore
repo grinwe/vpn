@@ -1,0 +1,17 @@
+.git
+.github
+**/__pycache__
+**/*.pyc
+**/*.pyo
+**/.pytest_cache
+**/.mypy_cache
+**/.ruff_cache
+backend/.venv
+bot/.venv
+admin/node_modules
+admin/dist
+.env
+.env.*
+secrets/
+*.log
+.DS_Store

@@ -70,6 +70,7 @@
 - name: Set MOTD banner
   copy:
     dest: /etc/motd
+    mode: "0644"
     content: |
       Managed VPN node. Unauthorized access prohibited.
       SSH key auth only. Contact NOC for access.

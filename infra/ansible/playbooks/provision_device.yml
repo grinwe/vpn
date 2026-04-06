@@ -1,4 +1,14 @@
 ---
+# provision_device.yml
+#
+# Per-device apply/revoke. Backend passes one of two logical profiles via
+# extra_vars:
+#
+#   ShadowTLS+SS: username, password, method, port, config_proto=shadowtls+ss
+#   VLESS+Reality: username, uuid, config_proto=vless-reality
+#
+# The ``config_proto`` discriminator selects which management helper to
+# run; everything else is per-protocol noise.
 - hosts: vpn_nodes
   become: yes
   vars:
@@ -9,15 +19,19 @@
         msg: "username is required for provisioning"
       when: username is not defined or username | length == 0
 
-    - name: Ensure manage script exists
+    # ---- ShadowTLS branch ------------------------------------------------
+    - name: Ensure ShadowTLS manage script exists
       stat:
         path: /usr/local/sbin/manage_vpn_user.sh
-      register: manage_script
+      register: st_manage_script
+      when: config_proto is not defined or config_proto is match('shadowtls.*')
 
-    - name: Fail if manage script missing
+    - name: Fail if ShadowTLS manage script missing
       fail:
         msg: "manage_vpn_user.sh not found on target"
-      when: not manage_script.stat.exists
+      when:
+        - config_proto is not defined or config_proto is match('shadowtls.*')
+        - not st_manage_script.stat.exists
 
     - name: Add or remove ShadowTLS user
       command: >-
@@ -27,10 +41,51 @@
         {{ password | default('') }}
         {{ method | default('chacha20-ietf-poly1305') }}
         {{ port | default(8443) }}
-      when: config_proto is not defined or config_proto.startswith('shadowtls')
-      register: manage_user
-      changed_when: "'updated' in manage_user.stdout or state == 'present'"
+      when: config_proto is not defined or config_proto is match('shadowtls.*')
+      register: st_manage_user
+      changed_when: "'updated' in st_manage_user.stdout or state == 'present'"
+
+    # ---- VLESS+Reality branch -------------------------------------------
+    - name: Ensure VLESS manage script exists
+      stat:
+        path: /usr/local/sbin/manage_vless_user.sh
+      register: vless_manage_script
+      when: config_proto is defined and config_proto is match('vless.*')
+
+    - name: Fail if VLESS manage script missing
+      fail:
+        msg: "manage_vless_user.sh not found on target"
+      when:
+        - config_proto is defined and config_proto is match('vless.*')
+        - not vless_manage_script.stat.exists
+
+    - name: Fail if VLESS apply is missing UUID
+      fail:
+        msg: "vless provisioning requires uuid when state=present"
+      when:
+        - config_proto is defined and config_proto is match('vless.*')
+        - state == 'present'
+        - uuid is not defined or uuid | length == 0
+
+    - name: Add VLESS+Reality user
+      command: >-
+        /usr/local/sbin/manage_vless_user.sh add
+        {{ username }}
+        {{ uuid }}
+      when:
+        - config_proto is defined and config_proto is match('vless.*')
+        - state == 'present'
+
+    - name: Remove VLESS+Reality user
+      command: >-
+        /usr/local/sbin/manage_vless_user.sh del
+        {{ username }}
+      when:
+        - config_proto is defined and config_proto is match('vless.*')
+        - state == 'absent'
 
     - name: Log provisioning payload
       debug:
-        msg: "Provisioning payload: {{ username }} state={{ state }} port={{ port | default(8443) }}"
+        msg: >-
+          Provisioned {{ username }} proto={{ config_proto | default('shadowtls+ss') }}
+          state={{ state }}
