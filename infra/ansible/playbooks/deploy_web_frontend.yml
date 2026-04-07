@@ -1,0 +1,6 @@
+---
+- name: Deploy public nginx + TLS for grinwer.online
+  hosts: web
+  become: true
+  roles:
+    - deploy_web_frontend

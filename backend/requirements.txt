@@ -7,3 +7,7 @@ requests
 alembic
 paramiko
 prometheus-client
+cryptography
+redis>=5
+rq>=1.16
+slowapi>=0.1.9

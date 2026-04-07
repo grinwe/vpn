@@ -1,0 +1,112 @@
+{
+  "title": "VPN Fleet — Nodes",
+  "uid": "vpn-fleet",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "30s",
+  "time": { "from": "now-6h", "to": "now" },
+  "tags": ["vpn", "nodes"],
+  "panels": [
+    {
+      "id": 1,
+      "type": "stat",
+      "title": "Nodes up",
+      "gridPos": { "h": 6, "w": 6, "x": 0, "y": 0 },
+      "targets": [
+        { "expr": "sum(up{job=\"vpn-nodes\"})", "refId": "A", "legendFormat": "up" },
+        { "expr": "count(up{job=\"vpn-nodes\"})", "refId": "B", "legendFormat": "total" }
+      ],
+      "datasource": { "type": "prometheus", "uid": "prometheus" }
+    },
+    {
+      "id": 2,
+      "type": "table",
+      "title": "Nodes — status",
+      "gridPos": { "h": 6, "w": 18, "x": 6, "y": 0 },
+      "targets": [
+        {
+          "expr": "up{job=\"vpn-nodes\"}",
+          "refId": "A",
+          "format": "table",
+          "instant": true
+        }
+      ],
+      "datasource": { "type": "prometheus", "uid": "prometheus" }
+    },
+    {
+      "id": 3,
+      "type": "timeseries",
+      "title": "CPU busy % (1 - idle)",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 6 },
+      "targets": [
+        {
+          "expr": "100 * (1 - avg by (instance) (rate(node_cpu_seconds_total{mode=\"idle\",job=\"vpn-nodes\"}[5m])))",
+          "legendFormat": "{{instance}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "percent", "max": 100, "min": 0 }, "overrides": [] },
+      "datasource": { "type": "prometheus", "uid": "prometheus" }
+    },
+    {
+      "id": 4,
+      "type": "timeseries",
+      "title": "Memory used %",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 6 },
+      "targets": [
+        {
+          "expr": "100 * (1 - (node_memory_MemAvailable_bytes{job=\"vpn-nodes\"} / node_memory_MemTotal_bytes{job=\"vpn-nodes\"}))",
+          "legendFormat": "{{instance}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "percent", "max": 100, "min": 0 }, "overrides": [] },
+      "datasource": { "type": "prometheus", "uid": "prometheus" }
+    },
+    {
+      "id": 5,
+      "type": "timeseries",
+      "title": "Network RX (bytes/s)",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 14 },
+      "targets": [
+        {
+          "expr": "sum by (instance) (rate(node_network_receive_bytes_total{job=\"vpn-nodes\",device!~\"lo|docker.*|veth.*\"}[5m]))",
+          "legendFormat": "{{instance}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "Bps" }, "overrides": [] },
+      "datasource": { "type": "prometheus", "uid": "prometheus" }
+    },
+    {
+      "id": 6,
+      "type": "timeseries",
+      "title": "Network TX (bytes/s)",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 14 },
+      "targets": [
+        {
+          "expr": "sum by (instance) (rate(node_network_transmit_bytes_total{job=\"vpn-nodes\",device!~\"lo|docker.*|veth.*\"}[5m]))",
+          "legendFormat": "{{instance}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "Bps" }, "overrides": [] },
+      "datasource": { "type": "prometheus", "uid": "prometheus" }
+    },
+    {
+      "id": 7,
+      "type": "timeseries",
+      "title": "Disk used %",
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 22 },
+      "targets": [
+        {
+          "expr": "100 * (1 - (node_filesystem_avail_bytes{job=\"vpn-nodes\",fstype!~\"tmpfs|overlay|squashfs\"} / node_filesystem_size_bytes{job=\"vpn-nodes\",fstype!~\"tmpfs|overlay|squashfs\"}))",
+          "legendFormat": "{{instance}} {{mountpoint}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "percent", "max": 100, "min": 0 }, "overrides": [] },
+      "datasource": { "type": "prometheus", "uid": "prometheus" }
+    }
+  ]
+}

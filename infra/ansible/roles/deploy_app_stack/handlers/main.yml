@@ -1,0 +1,9 @@
+---
+# Used when something non-source changed (env file, secret, key) and
+# we want compose to re-read it. The main `up -d` step always runs
+# too, so this handler is belt-and-suspenders for the cases where
+# compose wouldn't otherwise notice the change.
+- name: recreate app stack
+  command: docker compose up -d --force-recreate
+  args:
+    chdir: "{{ deploy_app_stack_dir }}"

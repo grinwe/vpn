@@ -1,0 +1,42 @@
+# Rendered by ansible role monitoring_stack. Do not edit by hand.
+
+global:
+  scrape_interval: {{ monitoring_stack_scrape_interval }}
+  evaluation_interval: {{ monitoring_stack_scrape_interval }}
+  external_labels:
+    cluster: vpn
+
+scrape_configs:
+  # Prometheus scrapes itself — handy for "is it alive at all" checks
+  # before blaming a downstream target.
+  - job_name: prometheus
+    static_configs:
+      - targets: ["localhost:9090"]
+
+  # Backend FastAPI service. Exposes:
+  #   vpn_requests_total{path,status}
+  #   vpn_requests_errors_total{path,status}
+  #   vpn_provisioning_tasks_total{status}
+  - job_name: vpn-backend
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["{{ monitoring_stack_backend_metrics_url }}"]
+        labels:
+          service: backend
+
+  # node_exporter on every VPN node. Targets are rendered from the
+  # inventory at template time — re-run the role (or bump prometheus.yml)
+  # whenever you add or remove a node.
+  - job_name: vpn-nodes
+    static_configs:
+{% for host in groups.get('vpn_nodes', []) %}
+      - targets: ["{{ hostvars[host].ansible_host }}:{{ monitoring_stack_node_exporter_port }}"]
+        labels:
+          instance: "{{ host }}"
+          location: "{{ hostvars[host].location | default('unknown') }}"
+{% endfor %}
+{% if not groups.get('vpn_nodes', []) %}
+      # No vpn_nodes in inventory — block left empty on purpose so
+      # prometheus still loads the job.
+      []
+{% endif %}

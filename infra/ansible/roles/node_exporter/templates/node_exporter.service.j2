@@ -1,0 +1,24 @@
+[Unit]
+Description=Prometheus node_exporter
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=node_exporter
+Group=node_exporter
+Type=simple
+ExecStart=/usr/local/bin/node_exporter \
+    --web.listen-address=:{{ node_exporter_port }} \
+    --collector.systemd \
+    --collector.processes
+Restart=on-failure
+RestartSec=5
+# Harden: drop caps, read-only FS, no new privs. node_exporter needs none
+# of these, so this is free defense-in-depth.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

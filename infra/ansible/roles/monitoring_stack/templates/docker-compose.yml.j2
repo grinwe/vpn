@@ -1,0 +1,45 @@
+---
+# Rendered by ansible role monitoring_stack. Do not edit by hand.
+
+services:
+  prometheus:
+    image: {{ monitoring_stack_prometheus_image }}
+    container_name: vpn-prometheus
+    restart: unless-stopped
+    # host.docker.internal lets containers reach a service bound to
+    # 127.0.0.1 on the host — used for scraping the backend when it runs
+    # on the same box as the monitoring stack.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--storage.tsdb.retention.time=30d"
+      - "--web.enable-lifecycle"  # enables SIGHUP/reload handler
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./data/prometheus:/prometheus
+    ports:
+      - "{{ monitoring_stack_prometheus_bind }}:9090"
+
+  grafana:
+    image: {{ monitoring_stack_grafana_image }}
+    container_name: vpn-grafana
+    restart: unless-stopped
+    depends_on:
+      - prometheus
+    environment:
+      GF_SECURITY_ADMIN_USER: "{{ monitoring_stack_grafana_admin_user }}"
+      GF_SECURITY_ADMIN_PASSWORD: "{{ monitoring_stack_grafana_admin_password }}"
+      # Refuse anonymous access — this is a single-operator tool.
+      GF_AUTH_ANONYMOUS_ENABLED: "false"
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      # Disable telemetry/update checks so the instance doesn't phone home.
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - ./data/grafana:/var/lib/grafana
+    ports:
+      - "{{ monitoring_stack_grafana_bind }}:3000"

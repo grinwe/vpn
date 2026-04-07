@@ -8,6 +8,24 @@ services:
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
     volumes:
       - db_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U vpn -d vpn"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
     restart: unless-stopped
 
   backend:
@@ -15,10 +33,56 @@ services:
     environment:
       DATABASE_URL: ${DATABASE_URL}
       ADMIN_API_TOKEN: ${ADMIN_API_TOKEN}
+      APP_SECRET_KEY: ${APP_SECRET_KEY}
+      REDIS_URL: "redis://redis:6379/0"
+      QUEUE_BACKEND: "rq"
+    # Bind to loopback only. In prod the public nginx vhost
+    # (deploy_web_frontend) proxies /api/ here over the loopback, so
+    # 0.0.0.0 exposure would just add a second unprotected entrypoint.
+    # For local dev, access it from the host via 127.0.0.1:8000.
     ports:
-      - "8000:8000"
+      - "127.0.0.1:8000:8000"
     depends_on:
-      - db
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  worker:
+    build:
+      # Build from the repository root so the Dockerfile can COPY both
+      # `backend/` (the Python package) and `infra/` (the Ansible playbooks).
+      context: .
+      dockerfile: backend/Dockerfile.worker
+    environment:
+      DATABASE_URL: ${DATABASE_URL}
+      ADMIN_API_TOKEN: ${ADMIN_API_TOKEN}
+      APP_SECRET_KEY: ${APP_SECRET_KEY}
+      REDIS_URL: "redis://redis:6379/0"
+      QUEUE_BACKEND: "rq"
+      ANSIBLE_ROOT: /app/infra/ansible
+      # Tell ansible where the provisioning private key lives. The key MUST
+      # be provided via a read-only bind mount — do not bake it into the image.
+      ANSIBLE_PRIVATE_KEY_FILE: /run/secrets/provisioning_key
+    volumes:
+      # Read-only mount of the provisioning SSH private key. Point SSH_KEY
+      # at the key on the host (e.g. ~/.ssh/vpn_provisioning_ed25519).
+      - ${PROVISIONING_SSH_KEY:-/dev/null}:/run/secrets/provisioning_key:ro
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  admin:
+    build: ./admin
+    # Bind to loopback only — the public-facing nginx on the host
+    # terminates TLS and proxies /admin/ here. Nothing should touch the
+    # admin container directly from the public internet.
+    ports:
+      - "127.0.0.1:8080:80"
     restart: unless-stopped
 
   bot:
@@ -34,3 +98,4 @@ services:
 
 volumes:
   db_data:
+  redis_data:

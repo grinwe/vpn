@@ -4,10 +4,53 @@
   roles:
     - bootstrap_node
     - install_shadowtls_stack
-    - install_vless_reality
+    # Reality needs backend-generated x25519 keys + shortId. The backend
+    # passes them as extra_vars when it invokes site.yml for a node whose
+    # VPNConfig has protocol=vless-reality. When absent we skip the role
+    # entirely — a pure ShadowTLS node stays untouched.
+    - role: install_vless_reality
+      when: vless_reality_private_key is defined and vless_reality_private_key | length > 0
+    # Collector is opt-in: requires traffic_collector_backend_url/_token/
+    # _node_id to be set (usually via group_vars or --extra-vars). Skipping
+    # it leaves the node working exactly as before.
+    - role: install_traffic_collector
+      when: traffic_collector_backend_url | default('') | length > 0
     - check_node_health
 
 - hosts: db_host
   become: yes
   roles:
     - db_host
+
+# node_exporter fleet-wide. Safe to re-run; the role upgrades only when
+# the pinned version differs from what's installed on the host.
+- hosts: vpn_nodes
+  become: yes
+  tags: [monitoring]
+  roles:
+    - node_exporter
+
+# Prometheus + Grafana stack. Only touches the monitoring group.
+- hosts: monitoring
+  become: yes
+  tags: [monitoring]
+  roles:
+    - monitoring_stack
+
+# Full app stack on the web host: docker + compose, synced repo,
+# rendered .env from vault, all containers up (db, redis, backend,
+# worker, bot, admin). Runs before deploy_web_frontend so that nginx
+# has something to proxy to when it starts.
+- hosts: web
+  become: yes
+  tags: [web, app]
+  roles:
+    - deploy_app_stack
+
+# Public nginx + TLS for grinwer.online. Tagged so ``--tags web`` runs
+# just this play alongside the app stack.
+- hosts: web
+  become: yes
+  tags: [web, frontend]
+  roles:
+    - deploy_web_frontend

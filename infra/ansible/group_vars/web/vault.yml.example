@@ -1,0 +1,36 @@
+---
+# Copy this file to vault.yml in the same directory and encrypt it:
+#
+#     cd infra/ansible/group_vars/web
+#     cp vault.yml.example vault.yml
+#     # edit vault.yml with real values
+#     ansible-vault encrypt vault.yml
+#
+# Ansible merges group_vars/web.yml (plain config) with
+# group_vars/web/*.yml (secrets) — the .example suffix keeps this
+# template file out of the auto-load path. Do NOT commit the
+# unencrypted vault.yml.
+#
+# Run playbooks with --ask-vault-pass (or --vault-password-file).
+
+# Postgres password. At least 12 chars — the role asserts this.
+vault_postgres_password: "replace-me-with-a-long-random-string"
+
+# Token the admin UI, bot, and CI use to hit /api/*. At least 20
+# chars. Generate with: python -c 'import secrets; print(secrets.token_urlsafe(32))'
+vault_admin_api_token: "replace-me-urlsafe-32-bytes"
+
+# Fernet key used by backend.security.crypto to encrypt cloud-provider
+# API tokens at rest. Generate with:
+#   python -c 'from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())'
+vault_app_secret_key: "replace-me-fernet-key"
+
+# Telegram bot token from @BotFather.
+vault_bot_token: "123456:ABC-..."
+
+# Comma-separated telegram user IDs that can use admin bot commands.
+vault_admin_ids: "111111111,222222222"
+
+# Shared secret for Telegram Stars webhook HMAC. Leave empty if
+# you're not using Stars as a payment provider.
+vault_telegram_stars_webhook_secret: ""

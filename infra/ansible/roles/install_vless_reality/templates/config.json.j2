@@ -1,0 +1,80 @@
+{
+  "log": {
+    "loglevel": "warning"
+  },
+  "api": {
+    "tag": "api",
+    "services": ["StatsService"]
+  },
+  "stats": {},
+  "policy": {
+    "levels": {
+      "0": {
+        "statsUserUplink": true,
+        "statsUserDownlink": true
+      }
+    },
+    "system": {
+      "statsInboundUplink": true,
+      "statsInboundDownlink": true,
+      "statsOutboundUplink": true,
+      "statsOutboundDownlink": true
+    }
+  },
+  "routing": {
+    "rules": [
+      {
+        "type": "field",
+        "inboundTag": ["api-in"],
+        "outboundTag": "api"
+      }
+    ]
+  },
+  "inbounds": [
+    {
+      "tag": "api-in",
+      "listen": "127.0.0.1",
+      "port": {{ vless_reality_api_port | default(10085) }},
+      "protocol": "dokodemo-door",
+      "settings": {
+        "address": "127.0.0.1"
+      }
+    },
+    {
+      "tag": "vless-reality",
+      "listen": "0.0.0.0",
+      "port": {{ vless_reality_port | int }},
+      "protocol": "vless",
+      "settings": {
+        "clients": [],
+        "decryption": "none"
+      },
+      "streamSettings": {
+        "network": "tcp",
+        "security": "reality",
+        "realitySettings": {
+          "show": false,
+          "dest": "{{ vless_reality_dest }}",
+          "xver": 0,
+          "serverNames": ["{{ vless_reality_sni }}"],
+          "privateKey": "{{ vless_reality_private_key }}",
+          "shortIds": ["{{ vless_reality_short_id }}"]
+        }
+      },
+      "sniffing": {
+        "enabled": true,
+        "destOverride": ["http", "tls"]
+      }
+    }
+  ],
+  "outbounds": [
+    {
+      "protocol": "freedom",
+      "tag": "direct"
+    },
+    {
+      "protocol": "blackhole",
+      "tag": "block"
+    }
+  ]
+}

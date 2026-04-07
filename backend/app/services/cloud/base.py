@@ -1,0 +1,66 @@
+"""Base types for cloud provider drivers."""
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from typing import Protocol
+
+from ... import models
+from ...security import decrypt
+
+
+class DriverError(RuntimeError):
+    """Raised when a cloud provider operation fails."""
+
+
+@dataclass
+class CloudServer:
+    """Provider-agnostic representation of a created server."""
+
+    external_id: str
+    ipv4: str
+    ipv6: str | None = None
+    region: str | None = None
+    plan: str | None = None
+    monthly_cost: float | None = None
+    raw: dict | None = field(default=None, repr=False)
+
+
+class CloudDriver(Protocol):
+    """All cloud providers must implement this interface."""
+
+    kind: str
+
+    def create_server(
+        self,
+        *,
+        name: str,
+        region: str,
+        plan: str,
+        image: str,
+        ssh_key_ids: list[str] | None = None,
+        user_data: str | None = None,
+    ) -> CloudServer: ...
+
+    def destroy_server(self, external_id: str) -> None: ...
+
+    def list_regions(self) -> list[str]: ...
+
+
+def get_driver(provider: models.CloudProvider) -> CloudDriver:
+    """Instantiate a driver for the given provider record."""
+    token = decrypt(provider.api_token_enc) if provider.api_token_enc else None
+    kind = provider.kind.value if hasattr(provider.kind, "value") else str(provider.kind)
+
+    if kind == "hetzner":
+        from .hetzner import HetznerDriver
+
+        if not token:
+            raise DriverError("Hetzner provider has no API token configured")
+        return HetznerDriver(token=token)
+
+    if kind == "manual":
+        from .manual import ManualDriver
+
+        return ManualDriver()
+
+    raise DriverError(f"Unsupported cloud provider kind: {kind}")

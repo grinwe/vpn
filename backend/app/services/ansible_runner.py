@@ -10,7 +10,14 @@ from typing import Any
 
 from .. import models
 
-ANSIBLE_ROOT = Path(__file__).resolve().parents[3] / "infra" / "ansible"
+def _default_ansible_root() -> Path:
+    env = os.getenv("ANSIBLE_ROOT")
+    if env:
+        return Path(env)
+    return Path(__file__).resolve().parents[3] / "infra" / "ansible"
+
+
+ANSIBLE_ROOT = _default_ansible_root()
 
 
 def _ensure_ansible_root() -> None:
@@ -65,6 +72,12 @@ def run_playbook(
         "-i",
         str(inventory),
     ]
+    # ANSIBLE_PRIVATE_KEY_FILE is a first-class ansible env var, but we also
+    # pass it explicitly so that an operator running the worker outside
+    # docker-compose can just export a path and have it work.
+    private_key = os.getenv("ANSIBLE_PRIVATE_KEY_FILE")
+    if private_key:
+        cmd.extend(["--private-key", private_key])
     if limit:
         cmd.extend(["--limit", limit])
     if extra_vars:

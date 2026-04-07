@@ -1,0 +1,12 @@
+---
+- name: restart monitoring stack
+  ansible.builtin.command:
+    cmd: docker compose up -d --force-recreate
+    chdir: "{{ monitoring_stack_dir }}"
+
+- name: reload prometheus
+  # SIGHUP reloads prometheus config without dropping scrape state.
+  # Much cheaper than a full container restart on every target change.
+  ansible.builtin.command:
+    cmd: docker compose kill -s HUP prometheus
+    chdir: "{{ monitoring_stack_dir }}"

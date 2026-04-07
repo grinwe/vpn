@@ -1,0 +1,124 @@
+---
+# Pre-flight: refuse to run with placeholder secrets. Every one of
+# these ends up in the rendered .env or a bind-mounted file, so a bad
+# value means the stack comes up broken (or worse, comes up with a
+# known-default password).
+- name: Assert required secrets are set
+  assert:
+    that:
+      - deploy_app_stack_postgres_password | default('', true) | length >= 12
+      - deploy_app_stack_admin_api_token | default('', true) | length >= 20
+      - deploy_app_stack_app_secret_key | default('', true) | length >= 16
+      - deploy_app_stack_bot_token | default('', true) | length > 0
+      - deploy_app_stack_admin_ids | default('', true) | length > 0
+    fail_msg: >
+      Missing or too-short secret. Check group_vars/*/vault.yml —
+      every deploy_app_stack_* secret must be set and non-trivial.
+
+- name: Install docker engine and compose plugin
+  apt:
+    name:
+      - docker.io
+      - docker-compose-plugin
+      - rsync
+    state: present
+    update_cache: true
+
+- name: Ensure docker service is running
+  service:
+    name: docker
+    state: started
+    enabled: true
+
+- name: Ensure app directory exists
+  file:
+    path: "{{ deploy_app_stack_dir }}"
+    state: directory
+    owner: "{{ deploy_app_stack_owner }}"
+    group: "{{ deploy_app_stack_group }}"
+    mode: "0750"
+
+- name: Ensure secrets directory exists
+  file:
+    path: "{{ deploy_app_stack_dir }}/secrets"
+    state: directory
+    owner: "{{ deploy_app_stack_owner }}"
+    group: "{{ deploy_app_stack_group }}"
+    mode: "0700"
+
+# Sync the whole repo. We exclude vcs, build artefacts, and anything
+# that would bloat the transfer or leak controller-local secrets. The
+# list is conservative — if in doubt, exclude it.
+- name: Sync repository to target
+  synchronize:
+    src: "{{ deploy_app_stack_repo_src }}/"
+    dest: "{{ deploy_app_stack_dir }}/"
+    recursive: true
+    delete: true
+    rsync_opts:
+      - "--exclude=.git"
+      - "--exclude=.github"
+      - "--exclude=__pycache__"
+      - "--exclude=*.pyc"
+      - "--exclude=.pytest_cache"
+      - "--exclude=admin/node_modules"
+      - "--exclude=admin/dist"
+      - "--exclude=backend/.venv"
+      - "--exclude=bot/.venv"
+      - "--exclude=.env"
+      - "--exclude=.env.*"
+      - "--exclude=secrets/"
+  register: repo_sync
+  notify: recreate app stack
+
+- name: Render .env for docker-compose
+  template:
+    src: env.j2
+    dest: "{{ deploy_app_stack_dir }}/.env"
+    owner: "{{ deploy_app_stack_owner }}"
+    group: "{{ deploy_app_stack_group }}"
+    mode: "0600"
+  notify: recreate app stack
+
+# The worker container needs an SSH private key to reach VPN nodes.
+# We accept either (a) a controller-side path to the key file or
+# (b) nothing, in which case the worker comes up but provisioning
+# will fail loudly — fine for first-time bootstrap before the key
+# exists.
+- name: Install provisioning SSH key (if provided)
+  copy:
+    src: "{{ deploy_app_stack_provisioning_key_src }}"
+    dest: "{{ deploy_app_stack_provisioning_key_dst }}"
+    owner: "{{ deploy_app_stack_owner }}"
+    group: "{{ deploy_app_stack_group }}"
+    mode: "0600"
+  when: deploy_app_stack_provisioning_key_src | length > 0
+  notify: recreate app stack
+
+- name: Build docker images
+  # Rebuild only when the synced tree actually changed. Re-running the
+  # role against an unchanged repo is then essentially free.
+  command: docker compose build
+  args:
+    chdir: "{{ deploy_app_stack_dir }}"
+  when:
+    - deploy_app_stack_build | bool
+    - repo_sync.changed
+  changed_when: true
+
+- name: Bring the stack up
+  command: >
+    docker compose up -d
+    {{ '--force-recreate' if deploy_app_stack_force_recreate | bool else '' }}
+  args:
+    chdir: "{{ deploy_app_stack_dir }}"
+  changed_when: true
+
+- name: Wait for backend to be healthy
+  uri:
+    url: "http://127.0.0.1:8000/healthz"
+    status_code: 200
+  register: backend_health
+  retries: 30
+  delay: 2
+  until: backend_health.status == 200

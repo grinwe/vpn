@@ -48,5 +48,49 @@
 ## Planned fixes
 - Добавить полноценный сбор трафика с нод и синхронизацию лимитов с автоматическими действиями (блок/разблок).
 - Вынести ansible-runner в отдельный сервис/образ и добавить тестовый прогон playbook'ов в CI.
-- Ввести очередь задач с ретраями и мониторингом (Celery/RQ) для провижининга и отзыва устройств.
+- Ввести очередь задач с ретраями и мониторингом (Celery/RQ/ARQ) для провижининга и отзыва устройств. Сейчас используются фоновые `threading.Thread` — это блокирует горизонтальное масштабирование API.
 - Перевести миграции на Alembic и описывать изменения схемы декларативно.
+- Развернуть внешний пробер-рой (RU/KZ/EU), который вызывает `POST /api/nodes/{id}/probes` — сейчас API готов, но отдельный сервис-прошер ещё не написан.
+- Ротация IP (Hetzner rebuild / floating IP) при массовом бане.
+- Шифрование API-токенов CloudProvider через KMS (сейчас симметричный Fernet на `APP_SECRET_KEY`).
+
+## Recent changes (slim images, Alembic, autoscale, payments)
+- **Два образа вместо одного.** [backend/Dockerfile](../backend/Dockerfile) — slim API без ansible (только uvicorn + Python deps). [backend/Dockerfile.worker](../backend/Dockerfile.worker) — отдельный образ с `ansible-core`, `openssh-client`, `sshpass`, `rsync` и скопированным `infra/ansible`. В `docker-compose.yml` сервис `worker` теперь билдится из корня репо (`context: .`) и монтирует SSH-ключ read-only через `${PROVISIONING_SSH_KEY}:/run/secrets/provisioning_key:ro`, `ANSIBLE_PRIVATE_KEY_FILE` передаётся воркеру env-var'ом. API-контейнер больше не держит SSH-ключи и ansible binary — blast radius компрометации API драматически сужен.
+- **ansible_runner уважает `ANSIBLE_ROOT` env.** Раньше путь к плейбукам был вычислен относительно файла; теперь сначала проверяется env, что нужно для split-образа. Команда `ansible-playbook` получает `--private-key` если `ANSIBLE_PRIVATE_KEY_FILE` выставлен. 【F:backend/app/services/ansible_runner.py†L13-L90】
+- **`/healthz?deep=true` в API-образе** больше не дёргает `_ensure_ansible_root` (ansible'а в API-образе больше нет); вместо этого пробует получить RQ-очередь. 【F:backend/app/api.py†L176-L195】
+
+- **Alembic.** Хэнд-роллд раннер заменён на Alembic: [backend/alembic.ini](../backend/alembic.ini), [backend/app/alembic/env.py](../backend/app/alembic/env.py), ревизии `0001_initial` / `0002_health_and_cloud` / `0003_autoscale` в [backend/app/alembic/versions/](../backend/app/alembic/versions/). `0001` — делегирует `Base.metadata.create_all(checkfirst=True)` (модели — single source of truth для первого наката); последующие ревизии — explicit DDL с `IF NOT EXISTS`, чтобы ехать поверх уже существующих деплоев. `app/migrations.py` оставлен единой public entrypoint: на старте делает backfill из `schema_migrations` в `alembic_version` (stamp без перезаката) и зовёт `alembic upgrade head`. Если alembic не установлен — fallback на legacy create_all. `SKIP_MIGRATIONS=1` выключает автомиграции на бут.
+
+- **Автоскейл.** [services/autoscale.py](../backend/app/services/autoscale.py) — per-pool оценка: `utilization = active_subs / Σ max_users(healthy_nodes)`, если ≥ `autoscale_high_watermark` и `node_count < autoscale_max_nodes` — зовёт `spawn_node` с дефолтами пула. Нездоровые ноды и ноды в cooldown исключаются из знаменателя, иначе автоскейл "не увидит" реальное насыщение. Downscale не делается — шринк живого пула мигрирует пользователей и пока не стоит сложности.
+  - Новые колонки в `server_pools`: `autoscale_enabled`, `autoscale_provider_id`, `autoscale_region`, `autoscale_plan`, `autoscale_image`, `autoscale_high_watermark`, `autoscale_max_nodes` (ревизия `0003_autoscale`).
+  - Периодический запуск через RQ: воркер на старте делает одноразовый `enqueue_in(AUTOSCALE_INTERVAL)`, а сам job `run_autoscale_tick` в конце re-enqueue'ит себя — recurring без rq-scheduler.
+  - API: `PUT /api/pools/{id}/autoscale` для конфига, `POST /api/autoscale/tick` для ручного запуска с возвратом `PoolDecision[]`.
+
+- **Платёжный шлюз.** [services/payments/](../backend/app/services/payments/) — `PaymentProvider` Protocol, реализация `CryptoBotProvider` (Crypto Pay API @CryptoBot): `create_invoice` + `verify_webhook` с HMAC-SHA256 по спеке, поддерживает USD→USDT маппинг.
+  - `POST /api/invoices/{id}/checkout` — создаёт invoice у провайдера, возвращает `pay_url` для вставки в сообщение бота.
+  - `POST /api/payments/webhook/{provider_name}` — принимает колбэк, верифицирует подпись (auth не через admin token!), при `status=paid` дергает рефакторенную `_mark_invoice_paid_core` — тот же пайплайн что и у админского `mark_paid`.
+  - Админский `mark_invoice_paid` теперь тонкая обёртка над `_mark_invoice_paid_core`, вся логика провижининга шарится.
+  - Env: `PAYMENT_PROVIDER=cryptobot`, `CRYPTOBOT_TOKEN=...`.
+
+## Recent changes (task queue)
+- **RQ + Redis.** Добавлен сервис `redis` в [docker-compose.yml](../docker-compose.yml) и отдельный сервис `worker`, запускающий `python -m app.worker` из того же backend-образа. Провижининг теперь ходит через RQ с 3 ретраями и бэкофом `10s/30s/120s`. 【F:backend/app/queue.py†L1-L90】【F:backend/app/worker.py†L1-L95】
+- **Stateless API.** `ProvisioningOrchestrator.run_task_async` сначала пробует `enqueue_task()`; если Redis недоступен — откатывается на старый `threading.Thread` (для локального dev без Redis и для тестов). После переката на RQ воркер можно сделать единственным контейнером, где установлен `ansible` и лежит SSH-ключ — API-реплик это больше не касается. 【F:backend/app/services/provisioning.py†L136-L170】
+- **Recovery after restart.** `reset_stuck_tasks` теперь не просто помечает `running → failed`, а requeue'ит их в RQ и заодно переотправляет все `pending`-задачи — так перезапуск API/воркера не теряет работу. 【F:backend/app/main.py†L18-L60】
+- **Конфигурация через env.** `QUEUE_BACKEND=rq`, `REDIS_URL`, `RQ_QUEUE`, `RQ_JOB_TIMEOUT`, `RQ_FAILED_TTL`, `RQ_RESULT_TTL`. Если `QUEUE_BACKEND` не выставлен — провижининг работает как раньше (in-process threads), что удобно в юнит-тестах.
+
+## Recent changes (auto-scale + block-aware)
+- **Шифрование секретов в БД.** Добавлен `app.security` (Fernet, ключ из `APP_SECRET_KEY`). `Credential.config_text`, `Device.connection_uri`, `CloudProvider.api_token_enc` шифруются на запись и прозрачно расшифровываются в DTO (`CredentialOut`, `DeviceOut`). Если ключ не задан — работает в plaintext и логирует предупреждение. 【F:backend/app/security.py†L1-L84】【F:backend/app/schemas.py†L6-L68】
+- **Capacity/health-aware scheduling.** В `VPNNode` добавлены `max_users`, `max_bandwidth_mbps`, `health_score`, `blocked_regions`, `cooldown_until`. `choose_node` учитывает cooldown, health_score ≥ `MIN_HEALTHY_SCORE` (env, default 50), капасити по `max_users` и умеет исключать ноды через `exclude_node_ids` — это один и тот же код для покупки и для миграции при блокировке. 【F:backend/app/models.py†L100-L145】【F:backend/app/services/provisioning.py†L28-L100】
+- **Health probing + auto-migration.** Новая таблица `health_probes`, сервис `app.services.health`: агрегация по regions/result за скользящее окно (15 мин по умолчанию), расчёт `health_score`, список `blocked_regions` по порогу (default 30% success rate). Если нода считается dead (overall < 20%) — ставится cooldown и все активные подписки миграются на здоровую ноду через `migrate_subscriptions_off`. API: `POST /api/nodes/{id}/probes`, `GET /api/nodes/{id}/health`, `POST /api/nodes/{id}/migrate`. 【F:backend/app/services/health.py†L1-L180】【F:backend/app/api.py†L850-L950】
+- **Cloud provider abstraction + Hetzner.** Новый пакет `app.services.cloud` с интерфейсом `CloudDriver` и реализацией `HetznerDriver` (raw `requests`, poll до status=running). Модель `CloudProvider` хранит зашифрованный API-токен и дефолты. `app.services.node_spawner.spawn_node`: создаёт VM через драйвер → сохраняет `VPNNode` с `provider_*` полями → ставит задачу `bootstrap` в существующий оркестратор провижининга. API: `POST /api/cloud/providers`, `POST /api/nodes/spawn`, `POST /api/nodes/{id}/destroy`. 【F:backend/app/services/cloud/base.py†L1-L70】【F:backend/app/services/cloud/hetzner.py†L1-L130】【F:backend/app/services/node_spawner.py†L1-L110】
+- **Пагинация и фильтры** в `GET /api/nodes` (status, region, pool_id, is_active, limit/offset) и `GET /api/provisioning/tasks` (status, target_type, limit/offset). 【F:backend/app/api.py†L220-L320】
+- **Бот-HTTP-клиент.** Единый aiohttp session с keep-alive, 3 попытки с линейным бэкофом на 5xx и сетевых ошибках, закрытие сессии на shutdown. 【F:bot/handlers.py†L1-L75】【F:bot/bot.py†L1-L22】
+- **Миграция 0002.** Идемпотентный SQL-скрипт добавляет таблицы `cloud_providers`, `health_probes`, все новые колонки `vpn_nodes` через `IF NOT EXISTS`. 【F:backend/app/migrations.py†L24-L100】
+- **Фикс AuditLog.metadata.** `metadata` — зарезервированное имя в SQLAlchemy Declarative; переименовано в Python-атрибут `extra`, колонка в БД осталась `metadata` для back-compat. 【F:backend/app/models.py†L310-L325】【F:backend/app/api.py†L45-L66】
+
+## Что ещё не сделано, но важно
+- **Real probing rig.** API для приёма проб готов, но самих проберов (RU-MTS/МГТС, KZ, EU) пока нет. Нужны небольшие Go/Python-демоны, раскиданные по целевым провайдерам/симкам.
+- **Traffic collector.** На стороне ноды (xray stats API / ss-tproxy counters) → push на `/api/subscriptions/{id}/traffic`.
+- **Второй платёжный провайдер.** `PaymentProvider` абстракция готова, есть `CryptoBotProvider`. YooKassa/Telegram Stars — аккуратное добавление новых классов.
+- **Даунскейл пулов.** Автоскейл умеет только расти. Шринк требует миграции пользователей — отложено до наличия реальных данных об использовании.
+- **Integration тесты и прогон миграций в CI.** Сейчас только ruff/ansible-lint/compile; нужно поднимать postgres в CI и проверять `alembic upgrade head` + роллбэк.

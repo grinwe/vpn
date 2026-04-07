@@ -1,0 +1,16 @@
+---
+# node_exporter — standard host metrics for Prometheus.
+#
+# We install from the upstream tarball rather than apt so the version is
+# pinned across distros and old Debian/Ubuntu LTS don't ship ancient
+# builds missing half the collectors.
+
+node_exporter_version: "1.8.2"
+node_exporter_port: 9100
+
+# The exporter binds to 0.0.0.0 by default, then we restrict access at
+# the firewall layer. ``node_exporter_allowed_ips`` should be the public
+# IP of the monitoring host — override in group_vars or --extra-vars.
+# Leave as an empty list to skip the firewall step (useful if the host
+# is already behind a private network / wireguard mesh).
+node_exporter_allowed_ips: []

@@ -1,0 +1,9 @@
+[Unit]
+Description=VPN per-user traffic collector for xray (one-shot)
+After=network-online.target xray.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/traffic_collect_xray.sh
+Nice=10

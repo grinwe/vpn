@@ -1,0 +1,41 @@
+# Provisioning worker image.
+#
+# Unlike the API image, this one carries ansible, the SSH client and the
+# playbooks themselves. It MUST be the only container in the deployment with
+# access to the VPN nodes' SSH private key — mount it read-only at runtime,
+# don't bake it into the image.
+FROM python:3.11-slim
+
+# ansible needs openssh-client to talk to the nodes; rsync is handy for a
+# number of roles; gcc/libffi are kept out because ansible-core wheels ship
+# pure-python.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        openssh-client \
+        sshpass \
+        rsync \
+        ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+# Build context is the repository root (see docker-compose `worker.build`),
+# so all COPY paths are relative to it.
+COPY backend/requirements.txt backend/requirements-worker.txt ./
+RUN pip install --no-cache-dir -r requirements.txt -r requirements-worker.txt
+
+COPY backend/app ./app
+COPY backend/alembic.ini ./alembic.ini
+COPY infra /app/infra
+
+# The backend expects ANSIBLE_ROOT to resolve to `<backend>/../infra/ansible`
+# relative to the package location. We set it explicitly here so the worker
+# finds the playbooks regardless of the container layout.
+ENV ANSIBLE_ROOT=/app/infra/ansible \
+    ANSIBLE_HOST_KEY_CHECKING=False \
+    PYTHONUNBUFFERED=1
+
+# SSH config dir for the provisioning user. Mount the private key at
+# /root/.ssh/id_ed25519 (or configure via ANSIBLE_PRIVATE_KEY_FILE).
+RUN mkdir -p /root/.ssh && chmod 700 /root/.ssh
+
+CMD ["python", "-m", "app.worker"]
