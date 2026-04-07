@@ -1,14 +1,13 @@
 ---
 # provision_device.yml
 #
-# Per-device apply/revoke. Backend passes one of two logical profiles via
-# extra_vars:
+# Per-device apply/revoke. Backend passes one of four profiles via extra_vars:
 #
-#   ShadowTLS+SS: username, password, method, port, config_proto=shadowtls+ss
-#   VLESS+Reality: username, uuid, config_proto=vless-reality
+#   ShadowTLS+SS:     username, password, method, port, config_proto=shadowtls+shadowsocks
+#   VLESS+Reality:    username, uuid, config_proto=vless-reality
+#   VLESS+WS+CDN:    username, uuid, config_proto=vless-ws-cdn
+#   Hysteria2:        username, password, config_proto=hysteria2
 #
-# The ``config_proto`` discriminator selects which management helper to
-# run; everything else is per-protocol noise.
 - hosts: vpn_nodes
   become: yes
   vars:
@@ -46,44 +45,114 @@
       changed_when: "'updated' in st_manage_user.stdout or state == 'present'"
 
     # ---- VLESS+Reality branch -------------------------------------------
-    - name: Ensure VLESS manage script exists
+    - name: Ensure VLESS Reality manage script exists
       stat:
         path: /usr/local/sbin/manage_vless_user.sh
       register: vless_manage_script
-      when: config_proto is defined and config_proto is match('vless.*')
+      when: config_proto is defined and config_proto == 'vless-reality'
 
-    - name: Fail if VLESS manage script missing
+    - name: Fail if VLESS Reality manage script missing
       fail:
         msg: "manage_vless_user.sh not found on target"
       when:
-        - config_proto is defined and config_proto is match('vless.*')
+        - config_proto is defined and config_proto == 'vless-reality'
         - not vless_manage_script.stat.exists
 
-    - name: Fail if VLESS apply is missing UUID
+    - name: Fail if VLESS Reality apply is missing UUID
       fail:
         msg: "vless provisioning requires uuid when state=present"
       when:
-        - config_proto is defined and config_proto is match('vless.*')
+        - config_proto is defined and config_proto == 'vless-reality'
         - state == 'present'
         - uuid is not defined or uuid | length == 0
 
     - name: Add VLESS+Reality user
       command: >-
-        /usr/local/sbin/manage_vless_user.sh add
-        {{ username }}
-        {{ uuid }}
+        /usr/local/sbin/manage_vless_user.sh add {{ username }} {{ uuid }}
       when:
-        - config_proto is defined and config_proto is match('vless.*')
+        - config_proto is defined and config_proto == 'vless-reality'
         - state == 'present'
 
     - name: Remove VLESS+Reality user
       command: >-
-        /usr/local/sbin/manage_vless_user.sh del
-        {{ username }}
+        /usr/local/sbin/manage_vless_user.sh del {{ username }}
       when:
-        - config_proto is defined and config_proto is match('vless.*')
+        - config_proto is defined and config_proto == 'vless-reality'
         - state == 'absent'
 
+    # ---- VLESS+WS+CDN branch -------------------------------------------
+    - name: Ensure VLESS WS manage script exists
+      stat:
+        path: /usr/local/sbin/manage_vless_ws_user.sh
+      register: vless_ws_manage_script
+      when: config_proto is defined and config_proto == 'vless-ws-cdn'
+
+    - name: Fail if VLESS WS manage script missing
+      fail:
+        msg: "manage_vless_ws_user.sh not found on target"
+      when:
+        - config_proto is defined and config_proto == 'vless-ws-cdn'
+        - not vless_ws_manage_script.stat.exists
+
+    - name: Fail if VLESS WS apply is missing UUID
+      fail:
+        msg: "vless-ws-cdn provisioning requires uuid when state=present"
+      when:
+        - config_proto is defined and config_proto == 'vless-ws-cdn'
+        - state == 'present'
+        - uuid is not defined or uuid | length == 0
+
+    - name: Add VLESS+WS+CDN user
+      command: >-
+        /usr/local/sbin/manage_vless_ws_user.sh add {{ username }} {{ uuid }}
+      when:
+        - config_proto is defined and config_proto == 'vless-ws-cdn'
+        - state == 'present'
+
+    - name: Remove VLESS+WS+CDN user
+      command: >-
+        /usr/local/sbin/manage_vless_ws_user.sh del {{ username }}
+      when:
+        - config_proto is defined and config_proto == 'vless-ws-cdn'
+        - state == 'absent'
+
+    # ---- Hysteria2 branch -----------------------------------------------
+    - name: Ensure Hysteria2 manage script exists
+      stat:
+        path: /usr/local/sbin/manage_hy2_user.sh
+      register: hy2_manage_script
+      when: config_proto is defined and config_proto == 'hysteria2'
+
+    - name: Fail if Hysteria2 manage script missing
+      fail:
+        msg: "manage_hy2_user.sh not found on target"
+      when:
+        - config_proto is defined and config_proto == 'hysteria2'
+        - not hy2_manage_script.stat.exists
+
+    - name: Fail if Hysteria2 apply is missing password
+      fail:
+        msg: "hysteria2 provisioning requires password when state=present"
+      when:
+        - config_proto is defined and config_proto == 'hysteria2'
+        - state == 'present'
+        - password is not defined or password | length == 0
+
+    - name: Add Hysteria2 user
+      command: >-
+        /usr/local/sbin/manage_hy2_user.sh add {{ username }} {{ password }}
+      when:
+        - config_proto is defined and config_proto == 'hysteria2'
+        - state == 'present'
+
+    - name: Remove Hysteria2 user
+      command: >-
+        /usr/local/sbin/manage_hy2_user.sh del {{ username }}
+      when:
+        - config_proto is defined and config_proto == 'hysteria2'
+        - state == 'absent'
+
+    # ---- Log ----
     - name: Log provisioning payload
       debug:
         msg: >-

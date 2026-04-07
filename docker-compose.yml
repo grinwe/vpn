@@ -36,10 +36,11 @@ services:
       APP_SECRET_KEY: ${APP_SECRET_KEY}
       REDIS_URL: "redis://redis:6379/0"
       QUEUE_BACKEND: "rq"
-    # Bind to loopback only. In prod the public nginx vhost
-    # (deploy_web_frontend) proxies /api/ here over the loopback, so
-    # 0.0.0.0 exposure would just add a second unprotected entrypoint.
-    # For local dev, access it from the host via 127.0.0.1:8000.
+      PAYMENT_PROVIDER: ${PAYMENT_PROVIDER:-cryptobot}
+      CRYPTOBOT_TOKEN: ${CRYPTOBOT_TOKEN:-}
+      YOOKASSA_SHOP_ID: ${YOOKASSA_SHOP_ID:-}
+      YOOKASSA_SECRET_KEY: ${YOOKASSA_SECRET_KEY:-}
+      TELEGRAM_STARS_WEBHOOK_SECRET: ${TELEGRAM_STARS_WEBHOOK_SECRET:-}
     ports:
       - "127.0.0.1:8000:8000"
     depends_on:
@@ -51,8 +52,6 @@ services:
 
   worker:
     build:
-      # Build from the repository root so the Dockerfile can COPY both
-      # `backend/` (the Python package) and `infra/` (the Ansible playbooks).
       context: .
       dockerfile: backend/Dockerfile.worker
     environment:
@@ -62,12 +61,10 @@ services:
       REDIS_URL: "redis://redis:6379/0"
       QUEUE_BACKEND: "rq"
       ANSIBLE_ROOT: /app/infra/ansible
-      # Tell ansible where the provisioning private key lives. The key MUST
-      # be provided via a read-only bind mount — do not bake it into the image.
       ANSIBLE_PRIVATE_KEY_FILE: /run/secrets/provisioning_key
+      AUTOSCALE_INTERVAL: ${AUTOSCALE_INTERVAL:-300}
+      RENEWAL_CHECK_INTERVAL: ${RENEWAL_CHECK_INTERVAL:-3600}
     volumes:
-      # Read-only mount of the provisioning SSH private key. Point SSH_KEY
-      # at the key on the host (e.g. ~/.ssh/vpn_provisioning_ed25519).
       - ${PROVISIONING_SSH_KEY:-/dev/null}:/run/secrets/provisioning_key:ro
     depends_on:
       db:
@@ -78,9 +75,6 @@ services:
 
   admin:
     build: ./admin
-    # Bind to loopback only — the public-facing nginx on the host
-    # terminates TLS and proxies /admin/ here. Nothing should touch the
-    # admin container directly from the public internet.
     ports:
       - "127.0.0.1:8080:80"
     restart: unless-stopped
@@ -92,6 +86,10 @@ services:
       BACKEND_URL: "http://backend:8000"
       ADMIN_API_TOKEN: ${ADMIN_API_TOKEN}
       ADMIN_IDS: ${ADMIN_IDS}
+      PAYMENT_PROVIDER: ${PAYMENT_PROVIDER:-cryptobot}
+      TELEGRAM_STARS_WEBHOOK_SECRET: ${TELEGRAM_STARS_WEBHOOK_SECRET:-}
+      SUB_LINK_BASE_URL: ${SUB_LINK_BASE_URL:-}
+      NOTIFICATION_POLL_INTERVAL: ${NOTIFICATION_POLL_INTERVAL:-10}
     depends_on:
       - backend
     restart: unless-stopped
