@@ -113,9 +113,42 @@ class PlanOut(BaseModel):
     max_devices: int
     price: float
     traffic_limit_mb: int | None = None
+    is_visible: bool = True
 
     class Config:
         orm_mode = True
+
+    @classmethod
+    def from_orm(cls, obj):  # type: ignore[override]
+        # price is Numeric(10,2) → Decimal; coerce explicitly so Pydantic
+        # doesn't choke on the type mismatch.
+        return cls(
+            id=obj.id,
+            name=obj.name,
+            duration_days=obj.duration_days,
+            max_devices=obj.max_devices,
+            price=float(obj.price) if obj.price is not None else 0.0,
+            traffic_limit_mb=obj.traffic_limit_mb,
+            is_visible=bool(obj.is_visible) if obj.is_visible is not None else True,
+        )
+
+
+class PlanCreate(BaseModel):
+    name: str = Field(..., min_length=1, max_length=100)
+    duration_days: int = Field(..., gt=0)
+    max_devices: int = Field(1, ge=1)
+    price: float = Field(..., ge=0)
+    traffic_limit_mb: int | None = Field(None, ge=0)
+    is_visible: bool = True
+
+
+class PlanUpdate(BaseModel):
+    name: str | None = Field(None, min_length=1, max_length=100)
+    duration_days: int | None = Field(None, gt=0)
+    max_devices: int | None = Field(None, ge=1)
+    price: float | None = Field(None, ge=0)
+    traffic_limit_mb: int | None = Field(None, ge=0)
+    is_visible: bool | None = None
 
 
 class SubscriptionOut(BaseModel):
@@ -182,7 +215,7 @@ class InvoiceCreate(BaseModel):
     plan_id: int
     subscription_id: int | None = None
     amount: float | None = None
-    currency: str = "USD"
+    currency: str = "RUB"
     action: str = "new_subscription"
 
 
@@ -204,6 +237,22 @@ class InvoiceOut(BaseModel):
 
     class Config:
         orm_mode = True
+
+    @classmethod
+    def from_orm(cls, obj):  # type: ignore[override]
+        # amount is Numeric(10,2) → Decimal; coerce so Pydantic v2 doesn't trip.
+        return cls(
+            id=obj.id,
+            user_id=obj.user_id,
+            plan_id=obj.plan_id,
+            subscription_id=obj.subscription_id,
+            amount=float(obj.amount) if obj.amount is not None else 0.0,
+            currency=obj.currency,
+            status=obj.status.value if hasattr(obj.status, "value") else obj.status,
+            action=obj.action.value if hasattr(obj.action, "value") else obj.action,
+            created_at=obj.created_at,
+            updated_at=obj.updated_at,
+        )
 
 
 class InvoiceListItem(BaseModel):

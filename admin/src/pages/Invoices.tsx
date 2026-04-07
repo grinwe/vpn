@@ -24,6 +24,16 @@ export default function Invoices() {
       qc.invalidateQueries({ queryKey: ["invoices"] });
       qc.invalidateQueries({ queryKey: ["stats"] });
     },
+    onError: (e: Error) => alert(`Не удалось пометить как paid: ${e.message}`),
+  });
+
+  const markUnpaid = useMutation({
+    mutationFn: (id: number) => api.post(`/invoices/${id}/mark_unpaid`, {}),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["invoices"] });
+      qc.invalidateQueries({ queryKey: ["stats"] });
+    },
+    onError: (e: Error) => alert(`Не удалось вернуть в pending: ${e.message}`),
   });
 
   return (
@@ -109,6 +119,22 @@ export default function Invoices() {
                       className="text-xs px-2 py-1 rounded bg-emerald-700 hover:bg-emerald-600 disabled:opacity-50"
                     >
                       mark paid
+                    </button>
+                  )}
+                  {inv.status === "paid" && (
+                    <button
+                      disabled={markUnpaid.isPending}
+                      onClick={() => {
+                        if (
+                          confirm(
+                            `Вернуть инвойс #${inv.id} в pending?\n\nПодписка/девайсы НЕ будут отозваны — это только bookkeeping-фикс.`
+                          )
+                        )
+                          markUnpaid.mutate(inv.id);
+                      }}
+                      className="text-xs px-2 py-1 rounded bg-yellow-700 hover:bg-yellow-600 disabled:opacity-50"
+                    >
+                      mark unpaid
                     </button>
                   )}
                 </td>

@@ -219,6 +219,28 @@ def migrate_subscriptions_off(
                 expires_at_override=sub.expires_at,
             )
             migrated_ids.append(new_sub.id)
+            # Notify the user. The bot polls /notifications/pending for
+            # audit_log rows with action="migration_notice" and delivers
+            # them as Telegram messages (see api_extensions.py). Without
+            # telegram_id in extra the poller silently drops the row, so
+            # skip the write for non-Telegram users (e.g. email-only).
+            if sub.user and sub.user.telegram_id:
+                db.add(
+                    models.AuditLog(
+                        actor="health_monitor",
+                        actor_type=models.AuditActor.system,
+                        action="migration_notice",
+                        target_type="subscription",
+                        target_id=new_sub.id,
+                        extra={
+                            "telegram_id": sub.user.telegram_id,
+                            "old_node": node.name,
+                            "new_node": target.name,
+                            "reason": reason,
+                        },
+                    )
+                )
+                db.commit()
         except Exception:  # noqa: BLE001
             logger.exception("Failed to re-provision sub %s on node %s", sub.id, target.id)
 

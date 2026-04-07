@@ -10,7 +10,24 @@ import logging
 import os
 import sys
 
+from prometheus_client import Counter, Gauge
+
 logger = logging.getLogger(__name__)
+
+# Heartbeat metrics — Grafana alerts on "no increment for >2× interval".
+RENEWAL_RUNS = Counter(
+    "vpn_renewal_check_runs_total", "Renewal cron tick count", ["outcome"]
+)
+RENEWAL_LAST_RUN = Gauge(
+    "vpn_renewal_check_last_run_timestamp", "Unix ts of last successful renewal tick"
+)
+RENEWAL_REVOKED = Counter(
+    "vpn_renewal_revoked_total", "Subscriptions auto-revoked after grace period"
+)
+
+# Grace window after expires_at before we actually rip the user off the node.
+# Default: 24h. Set to 0 for instant revoke.
+RENEWAL_GRACE_HOURS = int(os.getenv("RENEWAL_GRACE_HOURS", "24"))
 
 
 def run_autoscale_tick() -> list[dict]:
@@ -55,15 +72,20 @@ def run_renewal_check() -> dict:
     from .db import SessionLocal
     from .queue import get_queue
     from . import models
+    from .services.provisioning import ProvisioningOrchestrator
     from .time_utils import utcnow
 
     session = SessionLocal()
-    stats = {"reminded": 0, "expired": 0, "errors": 0}
+    stats = {"reminded": 0, "expired": 0, "revoked": 0, "errors": 0}
     try:
         now = utcnow()
         remind_horizon = now + timedelta(days=3)
+        revoke_cutoff = now - timedelta(hours=RENEWAL_GRACE_HOURS)
 
-        # ── Expire overdue subscriptions ──
+        # ── Mark overdue subscriptions as expired (status flip only). ──
+        # The /sub/{token} endpoint already 403s on expired+blocked, so the
+        # client stops getting fresh configs immediately. The hard revoke
+        # below kicks in after the grace window.
         overdue = (
             session.query(models.Subscription)
             .filter(
@@ -77,6 +99,38 @@ def run_renewal_check() -> dict:
             session.add(sub)
             stats["expired"] += 1
         session.commit()
+
+        # ── Hard revoke: drop the user from the node after grace window ──
+        to_revoke = (
+            session.query(models.Subscription)
+            .filter(
+                models.Subscription.status == models.SubscriptionStatus.expired,
+                models.Subscription.expires_at < revoke_cutoff,
+            )
+            .all()
+        )
+        if to_revoke:
+            orch = ProvisioningOrchestrator(session)
+            for sub in to_revoke:
+                # Skip if all devices are already disabled — re-runs are
+                # cheap but Ansible noise on a thousand-sub backlog isn't.
+                live = [
+                    d for d in sub.devices
+                    if d.status not in (
+                        models.DeviceStatus.revoked, models.DeviceStatus.disabled,
+                    )
+                ]
+                if not live:
+                    continue
+                try:
+                    orch.revoke_subscription_devices(
+                        sub, reason=f"expired {sub.expires_at.isoformat()}"
+                    )
+                    stats["revoked"] += 1
+                    RENEWAL_REVOKED.inc()
+                except Exception:  # noqa: BLE001
+                    logger.exception("Failed to revoke expired sub %s", sub.id)
+                    stats["errors"] += 1
 
         # ── Create renewal invoices for auto_renew subscriptions ──
         expiring_soon = (
@@ -176,9 +230,12 @@ def run_renewal_check() -> dict:
                 session.add(log)
         session.commit()
 
-    except Exception as exc:  # noqa: BLE001
+        RENEWAL_RUNS.labels(outcome="ok").inc()
+        RENEWAL_LAST_RUN.set(now.timestamp())
+    except Exception:  # noqa: BLE001
         logger.exception("Renewal check failed")
         stats["errors"] += 1
+        RENEWAL_RUNS.labels(outcome="error").inc()
         if session.is_active:
             session.rollback()
     finally:

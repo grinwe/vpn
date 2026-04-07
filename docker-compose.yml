@@ -63,7 +63,8 @@ services:
       ANSIBLE_ROOT: /app/infra/ansible
       ANSIBLE_PRIVATE_KEY_FILE: /run/secrets/provisioning_key
       AUTOSCALE_INTERVAL: ${AUTOSCALE_INTERVAL:-300}
-      RENEWAL_CHECK_INTERVAL: ${RENEWAL_CHECK_INTERVAL:-3600}
+      RENEWAL_CHECK_INTERVAL: ${RENEWAL_CHECK_INTERVAL:-300}
+      RENEWAL_GRACE_HOURS: ${RENEWAL_GRACE_HOURS:-24}
     volumes:
       - ${PROVISIONING_SSH_KEY:-/dev/null}:/run/secrets/provisioning_key:ro
     depends_on:

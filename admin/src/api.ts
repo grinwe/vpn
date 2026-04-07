@@ -55,6 +55,7 @@ async function request<T>(
 export const api = {
   get: <T>(path: string) => request<T>("GET", path),
   post: <T>(path: string, body?: unknown) => request<T>("POST", path, body),
+  put: <T>(path: string, body?: unknown) => request<T>("PUT", path, body),
   del: <T>(path: string) => request<T>("DELETE", path),
 };
 
@@ -116,6 +117,25 @@ export interface VPNNodeOut {
   is_active: boolean;
   created_at: string;
   updated_at: string;
+}
+
+export interface PlanOut {
+  id: number;
+  name: string;
+  duration_days: number;
+  max_devices: number;
+  price: number;
+  traffic_limit_mb: number | null;
+  is_visible: boolean;
+}
+
+export interface PlanCreateIn {
+  name: string;
+  duration_days: number;
+  max_devices: number;
+  price: number;
+  traffic_limit_mb: number | null;
+  is_visible: boolean;
 }
 
 export interface ApiTokenOut {

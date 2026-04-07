@@ -516,7 +516,13 @@ class ProvisioningOrchestrator:
         expires_at_override: datetime | None = None,
     ) -> tuple[models.Subscription, models.ProvisioningTask]:
         node = choose_node(self.db, plan, node_id=node_id)
-        config = choose_config(node)
+
+        # All enabled configs become credentials under one subscription so
+        # the dynamic sub-link returns every protocol the node serves and
+        # the client picks whichever currently works.
+        enabled_configs = [cfg for cfg in node.configs if cfg.is_enabled]
+        if not enabled_configs:
+            raise RuntimeError("No enabled VPN configs found for node")
 
         active_device_count = (
             self.db.query(models.Device)
@@ -545,66 +551,78 @@ class ProvisioningOrchestrator:
         self.db.flush()
 
         device_label = device_name or "primary"
+        # One identity shared across all protocols on this device — the node
+        # accounts traffic by access_username, so we want a single key.
         username = f"user-{user.id}-{subscription.id}"
         password = secrets.token_urlsafe(12)
-        user_uuid: uuid.UUID | None = None
-        credential_text: str
+        user_uuid = uuid.uuid4()
 
-        # ── Build credential based on protocol ──
-        if config.protocol == models.VPNConfigProtocol.shadowtls_ss:
-            credential_text = _build_shadowtls_credential(node, config, username, password)
-        elif config.protocol == models.VPNConfigProtocol.vless_reality:
-            user_uuid = uuid.uuid4()
-            credential_text = _build_vless_reality_credential(node, config, str(user_uuid))
-        elif config.protocol == models.VPNConfigProtocol.vless_ws_cdn:
-            user_uuid = uuid.uuid4()
-            credential_text = _build_vless_ws_cdn_credential(node, config, str(user_uuid))
-        elif config.protocol == models.VPNConfigProtocol.hysteria2:
-            credential_text = _build_hysteria2_credential(node, config, password)
+        # Device.connection_uri now stores the public sub-link, not a raw
+        # protocol URI — admin UI shows one stable URL per device.
+        sub_base = os.getenv("SUB_LINK_BASE_URL", "").rstrip("/")
+        if sub_base:
+            device_uri = f"{sub_base}/{subscription.sub_token}"
         else:
-            raise RuntimeError(f"Unsupported protocol: {config.protocol}")
+            device_uri = f"/api/sub/{subscription.sub_token}"
 
-        credential_enc = encrypt(credential_text)
+        # Pick a representative config for Device.config_id (FK is NOT NULL).
+        # ShadowTLS preferred, otherwise the first enabled config.
+        primary_config = next(
+            (c for c in enabled_configs if c.protocol == models.VPNConfigProtocol.shadowtls_ss),
+            enabled_configs[0],
+        )
 
         device = models.Device(
             user_id=user.id,
             subscription_id=subscription.id,
-            config_id=config.id,
+            config_id=primary_config.id,
             name=device_label,
             status=models.DeviceStatus.pending,
             access_username=username,
-            connection_uri=credential_enc,
+            connection_uri=encrypt(device_uri),
         )
         self.db.add(device)
         self.db.flush()
 
-        credential = models.Credential(
-            subscription_id=subscription.id,
-            device_id=device.id,
-            config_id=config.id,
-            proto=config.protocol.value,
-            config_text=credential_enc,
-        )
-        self.db.add(credential)
+        protocols_payload: list[dict[str, Any]] = []
+        for cfg in enabled_configs:
+            if cfg.protocol == models.VPNConfigProtocol.shadowtls_ss:
+                cred_text = _build_shadowtls_credential(node, cfg, username, password)
+            elif cfg.protocol == models.VPNConfigProtocol.vless_reality:
+                cred_text = _build_vless_reality_credential(node, cfg, str(user_uuid))
+            elif cfg.protocol == models.VPNConfigProtocol.vless_ws_cdn:
+                cred_text = _build_vless_ws_cdn_credential(node, cfg, str(user_uuid))
+            elif cfg.protocol == models.VPNConfigProtocol.hysteria2:
+                cred_text = _build_hysteria2_credential(node, cfg, password)
+            else:
+                logger.warning("Skipping unsupported protocol %s on node %s", cfg.protocol, node.id)
+                continue
+
+            self.db.add(
+                models.Credential(
+                    subscription_id=subscription.id,
+                    device_id=device.id,
+                    config_id=cfg.id,
+                    proto=cfg.protocol.value,
+                    config_text=encrypt(cred_text),
+                )
+            )
+
+            entry: dict[str, Any] = {"proto": cfg.protocol.value, "port": cfg.port}
+            if cfg.protocol == models.VPNConfigProtocol.shadowtls_ss:
+                entry["method"] = (cfg.settings or {}).get("method", "chacha20-ietf-poly1305")
+            protocols_payload.append(entry)
+
+        if not protocols_payload:
+            raise RuntimeError("No supported protocols among enabled configs")
 
         task_payload: dict[str, Any] = {
             "username": username,
-            "port": config.port,
-            "config_proto": config.protocol.value,
+            "uuid": str(user_uuid),
+            "password": password,
+            "protocols": protocols_payload,
             "state": "present",
         }
-        if config.protocol == models.VPNConfigProtocol.shadowtls_ss:
-            task_payload["password"] = password
-            task_payload["method"] = (config.settings or {}).get(
-                "method", "chacha20-ietf-poly1305"
-            )
-        elif config.protocol in (
-            models.VPNConfigProtocol.vless_reality,
-            models.VPNConfigProtocol.vless_ws_cdn,
-        ):
-            task_payload["uuid"] = str(user_uuid)
-        elif config.protocol == models.VPNConfigProtocol.hysteria2:
-            task_payload["password"] = password
 
         task = self.create_task("device", device.id, "apply", task_payload)
         self.db.commit()
@@ -615,10 +633,21 @@ class ProvisioningOrchestrator:
     def revoke_device(
         self, device: models.Device, *, reason: str | None = None, background: bool = True
     ) -> models.ProvisioningTask:
+        # Revoke every protocol the device was provisioned into.
+        protocols_payload: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for cred in device.credentials:
+            if cred.proto in seen:
+                continue
+            seen.add(cred.proto)
+            entry: dict[str, Any] = {"proto": cred.proto}
+            if cred.config is not None:
+                entry["port"] = cred.config.port
+            protocols_payload.append(entry)
+
         payload = {
             "username": device.access_username,
-            "port": device.config.port if device.config else None,
-            "config_proto": device.config.protocol.value if device.config else None,
+            "protocols": protocols_payload,
             "state": "absent",
             "reason": reason,
         }

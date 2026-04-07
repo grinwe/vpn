@@ -1,6 +1,7 @@
 import asyncio
 import logging
 from aiogram import Bot, Dispatcher
+from aiogram.client.default import DefaultBotProperties
 from .config import BOT_TOKEN, BACKEND_URL, ADMIN_API_TOKEN, NOTIFICATION_POLL_INTERVAL
 from .handlers import close_session, router, get_session, onboarding_keyboard
 
@@ -54,7 +55,7 @@ async def notification_poller(bot: Bot):
                         async with session.post(
                             f"{BACKEND_URL}/api/notifications/{notif_id}/ack",
                             headers=headers,
-                        ) as ack_resp:
+                        ):
                             pass  # Best-effort ack
                 except Exception:
                     logger.exception("Failed to deliver notification to %s", telegram_id)
@@ -67,7 +68,7 @@ async def notification_poller(bot: Bot):
 
 async def main():
     logging.basicConfig(level="INFO")
-    bot = Bot(token=BOT_TOKEN, parse_mode="HTML")
+    bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
     dp = Dispatcher()
     dp.include_router(router)
 

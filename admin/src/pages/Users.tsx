@@ -1,8 +1,9 @@
 import { useEffect, useState } from "react";
-import { useQuery } from "@tanstack/react-query";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api, UserOut, SubscriptionOut } from "../api";
 
 export default function Users() {
+  const qc = useQueryClient();
   const [search, setSearch] = useState("");
   // Debounce the search input so we don't hammer the backend on every
   // keystroke — 300ms is the sweet spot between "feels instant" and
@@ -26,6 +27,17 @@ export default function Users() {
     queryKey: ["user-subs", selected?.id],
     queryFn: () => api.get(`/users/${selected!.id}`),
     enabled: selected !== null,
+  });
+
+  const revokeNow = useMutation({
+    mutationFn: (subId: number) =>
+      api.post(`/subscriptions/${subId}/disable`, {}),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["user-subs"] });
+      qc.invalidateQueries({ queryKey: ["users"] });
+      qc.invalidateQueries({ queryKey: ["stats"] });
+    },
+    onError: (e: Error) => alert(`Не удалось отозвать подписку: ${e.message}`),
   });
 
   return (
@@ -99,6 +111,22 @@ export default function Users() {
                       <div className="text-slate-500 text-xs">
                         до {new Date(s.expires_at).toLocaleDateString()}
                       </div>
+                      {s.status !== "blocked" && s.status !== "expired" && (
+                        <button
+                          disabled={revokeNow.isPending}
+                          onClick={() => {
+                            if (
+                              confirm(
+                                `Отозвать подписку #${s.id} прямо сейчас?\n\nЮзер будет отключён от ноды через Ansible (1–2 мин).`
+                              )
+                            )
+                              revokeNow.mutate(s.id);
+                          }}
+                          className="mt-2 text-xs px-2 py-1 rounded bg-red-700 hover:bg-red-600 disabled:opacity-50"
+                        >
+                          revoke now
+                        </button>
+                      )}
                     </li>
                   ))}
                 </ul>

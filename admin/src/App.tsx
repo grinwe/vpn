@@ -5,6 +5,7 @@ import Dashboard from "./pages/Dashboard";
 import Users from "./pages/Users";
 import Invoices from "./pages/Invoices";
 import Nodes from "./pages/Nodes";
+import Plans from "./pages/Plans";
 import ApiTokens from "./pages/ApiTokens";
 
 function Layout({ children }: { children: React.ReactNode }) {
@@ -19,6 +20,7 @@ function Layout({ children }: { children: React.ReactNode }) {
           <NavLink to="/" end className={linkCls}>Dashboard</NavLink>
           <NavLink to="/users" className={linkCls}>Users</NavLink>
           <NavLink to="/invoices" className={linkCls}>Invoices</NavLink>
+          <NavLink to="/plans" className={linkCls}>Plans</NavLink>
           <NavLink to="/nodes" className={linkCls}>Nodes</NavLink>
           <NavLink to="/tokens" className={linkCls}>API tokens</NavLink>
         </nav>
@@ -51,6 +53,7 @@ export default function App() {
       <Route path="/" element={<Protected><Dashboard /></Protected>} />
       <Route path="/users" element={<Protected><Users /></Protected>} />
       <Route path="/invoices" element={<Protected><Invoices /></Protected>} />
+      <Route path="/plans" element={<Protected><Plans /></Protected>} />
       <Route path="/nodes" element={<Protected><Nodes /></Protected>} />
       <Route path="/tokens" element={<Protected><ApiTokens /></Protected>} />
       <Route path="*" element={<Navigate to="/" replace />} />

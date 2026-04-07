@@ -11,24 +11,20 @@ This module adds endpoints for:
 """
 from __future__ import annotations
 
-import json
 import logging
 import secrets
-from datetime import timedelta
 
-from .time_utils import utcnow
-from typing import Any
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Request, status
+from fastapi import APIRouter, Depends, Header, HTTPException
 from fastapi.responses import PlainTextResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
-from . import models, schemas
-from .auth import AuthPrincipal, require_scope, SCOPE_PROBE_WRITE
+from . import models
 from .config import get_settings
 from .db import SessionLocal
 from .security import decrypt as _decrypt
+from .time_utils import utcnow
 
 logger = logging.getLogger(__name__)
 settings = get_settings()
@@ -89,6 +85,9 @@ def dynamic_sub_link(token: str, db: Session = Depends(get_db)):
     if sub.status != models.SubscriptionStatus.active:
         raise HTTPException(status_code=403, detail="Subscription is not active")
 
+    if sub.expires_at and sub.expires_at < utcnow():
+        raise HTTPException(status_code=403, detail="Subscription expired")
+
     configs = []
     for cred in sub.credentials:
         if not cred.is_active:
@@ -102,6 +101,19 @@ def dynamic_sub_link(token: str, db: Session = Depends(get_db)):
     import base64
     uris = "\n".join(c.uri for c in configs)
     encoded = base64.b64encode(uris.encode()).decode()
+
+    # Cheap analytics: track which subscriptions are actually being polled.
+    db.add(
+        models.AuditLog(
+            actor=str(sub.user_id),
+            actor_type=models.AuditActor.user,
+            action="subscription_fetch",
+            target_type="subscription",
+            target_id=sub.id,
+            extra={"protocols": [c.protocol for c in configs]},
+        )
+    )
+    db.commit()
 
     # Return based on Accept header
     return PlainTextResponse(

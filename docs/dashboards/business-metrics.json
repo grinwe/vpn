@@ -56,6 +56,44 @@
         "targets": [
           {"expr": "rate(vpn_requests_errors_total[5m])", "legendFormat": "{{path}} {{status}}"}
         ]
+      },
+      {
+        "title": "Renewal worker — seconds since last tick",
+        "description": "If this climbs above 2× RENEWAL_CHECK_INTERVAL the cron is dead — expired subs are NOT being revoked. Alert > 900s.",
+        "type": "stat",
+        "gridPos": {"h": 4, "w": 8, "x": 0, "y": 20},
+        "targets": [
+          {"expr": "time() - vpn_renewal_check_last_run_timestamp", "legendFormat": "lag"}
+        ],
+        "fieldConfig": {
+          "defaults": {
+            "unit": "s",
+            "thresholds": {
+              "mode": "absolute",
+              "steps": [
+                {"color": "green", "value": null},
+                {"color": "yellow", "value": 600},
+                {"color": "red", "value": 900}
+              ]
+            }
+          }
+        }
+      },
+      {
+        "title": "Renewal ticks (ok / error)",
+        "type": "timeseries",
+        "gridPos": {"h": 4, "w": 8, "x": 8, "y": 20},
+        "targets": [
+          {"expr": "rate(vpn_renewal_check_runs_total[15m])", "legendFormat": "{{outcome}}"}
+        ]
+      },
+      {
+        "title": "Auto-revoked subs (rate)",
+        "type": "timeseries",
+        "gridPos": {"h": 4, "w": 8, "x": 16, "y": 20},
+        "targets": [
+          {"expr": "rate(vpn_renewal_revoked_total[1h])", "legendFormat": "revoked/h"}
+        ]
       }
     ],
     "time": {"from": "now-24h", "to": "now"},

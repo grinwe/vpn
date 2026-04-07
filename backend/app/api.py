@@ -944,6 +944,71 @@ def list_plans(db: Session = Depends(get_db)):
     return [schemas.PlanOut.from_orm(plan) for plan in plans]
 
 
+@router.post("/plans", response_model=schemas.PlanOut, status_code=201)
+def create_plan(
+    payload: schemas.PlanCreate,
+    db: Session = Depends(get_db),
+    admin_token: str = Depends(require_admin),
+):
+    existing = db.query(models.Plan).filter(models.Plan.name == payload.name).first()
+    if existing:
+        raise HTTPException(status_code=409, detail="Plan with this name already exists")
+    plan = models.Plan(**payload.model_dump())
+    db.add(plan)
+    db.commit()
+    db.refresh(plan)
+    return schemas.PlanOut.from_orm(plan)
+
+
+@router.put("/plans/{plan_id}", response_model=schemas.PlanOut)
+def update_plan(
+    plan_id: int,
+    payload: schemas.PlanUpdate,
+    db: Session = Depends(get_db),
+    admin_token: str = Depends(require_admin),
+):
+    plan = db.get(models.Plan, plan_id)
+    if not plan:
+        raise HTTPException(status_code=404, detail="Plan not found")
+    updates = payload.model_dump(exclude_unset=True)
+    if "name" in updates and updates["name"] != plan.name:
+        clash = db.query(models.Plan).filter(models.Plan.name == updates["name"]).first()
+        if clash:
+            raise HTTPException(status_code=409, detail="Plan with this name already exists")
+    for field, value in updates.items():
+        setattr(plan, field, value)
+    db.commit()
+    db.refresh(plan)
+    return schemas.PlanOut.from_orm(plan)
+
+
+@router.delete("/plans/{plan_id}", status_code=204)
+def delete_plan(
+    plan_id: int,
+    db: Session = Depends(get_db),
+    admin_token: str = Depends(require_admin),
+):
+    plan = db.get(models.Plan, plan_id)
+    if not plan:
+        raise HTTPException(status_code=404, detail="Plan not found")
+    # Refuse to delete a plan that still has subscriptions — soft-hide with
+    # is_visible=false instead. This is cheaper than cascading and avoids
+    # orphaning historical records.
+    has_subs = (
+        db.query(models.Subscription)
+        .filter(models.Subscription.plan_id == plan_id)
+        .first()
+    )
+    if has_subs:
+        raise HTTPException(
+            status_code=409,
+            detail="Plan has existing subscriptions; set is_visible=false instead",
+        )
+    db.delete(plan)
+    db.commit()
+    return None
+
+
 @router.get("/invoices", response_model=list[schemas.InvoiceListItem])
 def list_invoices(
     status: str | None = None,
@@ -1114,6 +1179,31 @@ def mark_invoice_paid(
         actor_type=actor_type,
         payment_id=body.payment_id if body else None,
     )
+
+
+@router.post("/invoices/{invoice_id}/mark_unpaid", response_model=schemas.InvoiceOut)
+def mark_invoice_unpaid(
+    invoice_id: int,
+    db: Session = Depends(get_db),
+    admin_token: str = Depends(require_admin),
+    admin_actor: str | None = Header(default=None, alias=ADMIN_ACTOR_HEADER),
+):
+    """Revert a mistakenly marked invoice back to pending.
+
+    Does NOT touch the provisioned subscription/devices — if you also need
+    to revoke access, do that separately. This is a bookkeeping fix.
+    """
+    invoice = db.get(models.Invoice, invoice_id)
+    if not invoice:
+        raise HTTPException(status_code=404, detail="Invoice not found")
+    if invoice.status == models.InvoiceStatus.pending:
+        return schemas.InvoiceOut.from_orm(invoice)
+    invoice.status = models.InvoiceStatus.pending
+    db.commit()
+    db.refresh(invoice)
+    actor, actor_type = _resolve_admin_actor(admin_actor)
+    _audit(db, actor, "invoice_marked_unpaid", "invoice", invoice.id, actor_type=actor_type)
+    return schemas.InvoiceOut.from_orm(invoice)
 
 
 # ---------------------------------------------------------------------------

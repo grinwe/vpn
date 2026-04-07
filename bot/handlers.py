@@ -45,12 +45,14 @@ def _format_plan_button(plan: dict) -> str:
     price = plan.get("price", "?")
     duration = plan.get("duration_days", "?")
     name = plan.get("name", "")
+    devices = plan.get("max_devices")
+    devices_label = f" · до {devices} устр." if devices else ""
     if duration >= 365:
-        return f"{name} — {price}$ / год"
+        return f"{name} — {price}₽ / год{devices_label}"
     elif duration >= 28:
         months = duration // 30
-        return f"{name} — {price}$ / {months}мес"
-    return f"{name} — {price}$ / {duration}д"
+        return f"{name} — {price}₽ / {months}мес{devices_label}"
+    return f"{name} — {price}₽ / {duration}д{devices_label}"
 
 
 async def _fetch_json(method: str, url: str, **kwargs):
@@ -174,22 +176,83 @@ async def list_plans(message: types.Message):
         await message.answer("Не удалось получить список тарифов. Попробуйте позже.")
         return
 
-    plans = data or []
+    plans = [p for p in (data or []) if p.get("is_visible", True)]
     if not plans:
         await message.answer("Тарифы пока не настроены. Попробуйте позже.")
         return
 
-    keyboard = types.InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                types.InlineKeyboardButton(
-                    text=_format_plan_button(plan), callback_data=f"plan:{plan['id']}"
-                )
-            ]
-            for plan in plans
-        ]
+    # Group monthly vs yearly so it's obvious there are two billing cycles
+    # of the same tier; sort by max_devices so cheap → premium reads top-down.
+    monthly = sorted(
+        [p for p in plans if p.get("duration_days", 0) < 365],
+        key=lambda p: p.get("max_devices") or 0,
     )
-    await message.answer("Выберите тариф:", reply_markup=keyboard)
+    yearly = sorted(
+        [p for p in plans if p.get("duration_days", 0) >= 365],
+        key=lambda p: p.get("max_devices") or 0,
+    )
+
+    lines: list[str] = [
+        "<b>Все тарифы дают одно и то же:</b>",
+        "• безлимитный трафик",
+        "• автоматическое переключение между протоколами",
+        "• работают на iOS, Android, Windows, macOS, Linux",
+        "",
+        "<b>Отличие — только в количестве устройств одновременно.</b>",
+        "",
+    ]
+    def _row(p: dict) -> str:
+        star = " ⭐" if (p.get("max_devices") == 3) else ""
+        return (
+            f"• <b>{p['name']}</b>{star} — до {p.get('max_devices', '?')} устр. "
+            f"— {p.get('price', '?')}₽"
+        )
+
+    if monthly:
+        lines.append("<b>Месяц:</b>")
+        for p in monthly:
+            lines.append(_row(p))
+        lines.append("")
+    if yearly:
+        lines.append("<b>Год (выгоднее ~20%):</b>")
+        for p in yearly:
+            lines.append(_row(p))
+        lines.append("")
+    lines.append("⭐ — самый популярный")
+    lines.append("Выберите тариф ⬇️")
+
+    rows = [
+        [
+            types.InlineKeyboardButton(
+                text=_format_plan_button(plan), callback_data=f"plan:{plan['id']}"
+            )
+        ]
+        for plan in monthly + yearly
+    ]
+    rows.append(
+        [types.InlineKeyboardButton(text="🤔 Какой выбрать?", callback_data="plans:help")]
+    )
+    keyboard = types.InlineKeyboardMarkup(inline_keyboard=rows)
+    await message.answer("\n".join(lines), reply_markup=keyboard)
+
+
+@router.callback_query(F.data == "plans:help")
+async def plans_help(callback_query: types.CallbackQuery):
+    await callback_query.answer()
+    text = (
+        "<b>Какой тариф выбрать?</b>\n\n"
+        "• <b>Solo</b> — 1 устройство. Берите, если VPN нужен только на телефоне "
+        "<i>или</i> только на ноутбуке.\n\n"
+        "• <b>Family</b> ⭐ — 3 устройства. Самый ходовой: телефон + ноут + "
+        "планшет, или вы делитесь с близкими.\n\n"
+        "• <b>Pro</b> — 5 устройств. Если у вас много техники или нужно покрыть "
+        "всю семью (родители, дети, партнёр).\n\n"
+        "<b>Месяц или год?</b>\n"
+        "Годовой ~на 20% дешевле в пересчёте на месяц. Берите год, если уже "
+        "пользовались VPN раньше и точно знаете, что он вам нужен надолго.\n\n"
+        "Передумаете — список устройств можно перезаписать в любой момент."
+    )
+    await callback_query.message.answer(text)
 
 
 @router.callback_query(F.data.startswith("plan:"))
@@ -269,7 +332,7 @@ async def _stars_successful_payment(message: types.Message) -> None:
     }
 
     try:
-        status, result = await _fetch_json(
+        status, _ = await _fetch_json(
             "POST",
             f"{BACKEND_URL}/api/payments/webhook/telegram_stars",
             json=forward,
@@ -277,7 +340,6 @@ async def _stars_successful_payment(message: types.Message) -> None:
         )
     except aiohttp.ClientError:
         status = 0
-        result = {}
 
     if status != 200:
         logger.error("failed to forward Stars payment (status=%s)", status)
@@ -342,7 +404,7 @@ async def cmd_config(message: types.Message):
     sub_token = active_sub.get("sub_token")
     if sub_token and SUB_LINK_BASE_URL:
         sub_url = f"{SUB_LINK_BASE_URL.rstrip('/')}/{sub_token}"
-        lines.append(f"🔗 <b>Ссылка подписки</b> (автообновляется при смене сервера):")
+        lines.append("🔗 <b>Ссылка подписки</b> (автообновляется при смене сервера):")
         lines.append(f"<code>{sub_url}</code>\n")
 
     lines.append(

@@ -2,10 +2,15 @@
 
 Revision ID: 0006_protocols_referrals_subtoken
 Revises: 0005_api_tokens
+
+Every DDL here is idempotent (``IF NOT EXISTS`` / ``DO $$ ... $$`` guards)
+because ``0001_initial`` delegates to ``Base.metadata.create_all()``. On a
+fresh database that means the entire *current* model schema — including
+the columns this revision is nominally responsible for — already exists
+by the time we get here. The guards let Alembic stamp 0006 on both fresh
+and legacy databases without blowing up on duplicate columns/indexes.
 """
 from alembic import op
-import sqlalchemy as sa
-from sqlalchemy.dialects import postgresql
 
 revision = "0006_protocols_referrals_subtoken"
 down_revision = "0005_api_tokens"
@@ -15,35 +20,58 @@ depends_on = None
 
 def upgrade() -> None:
     # --- Extend VPNConfigProtocol enum with new values ---
-    # Postgres enums need explicit ALTER TYPE for new values.
     op.execute("ALTER TYPE vpnconfigprotocol ADD VALUE IF NOT EXISTS 'vless-ws-cdn'")
     op.execute("ALTER TYPE vpnconfigprotocol ADD VALUE IF NOT EXISTS 'hysteria2'")
 
     # --- Subscription: add sub_token for dynamic links ---
-    op.add_column("subscriptions", sa.Column("sub_token", sa.String(), nullable=True))
-    op.create_index("ix_subscriptions_sub_token", "subscriptions", ["sub_token"], unique=True)
+    op.execute("ALTER TABLE subscriptions ADD COLUMN IF NOT EXISTS sub_token VARCHAR")
+    op.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS ix_subscriptions_sub_token "
+        "ON subscriptions (sub_token)"
+    )
 
     # --- Plan: add is_visible flag ---
-    op.add_column("plans", sa.Column("is_visible", sa.Boolean(), server_default="true", nullable=True))
+    op.execute(
+        "ALTER TABLE plans ADD COLUMN IF NOT EXISTS is_visible BOOLEAN DEFAULT true"
+    )
 
-    # --- User: add referred_by_id ---
-    op.add_column("users", sa.Column("referred_by_id", sa.Integer(), nullable=True))
-    op.create_foreign_key("fk_users_referred_by", "users", "users", ["referred_by_id"], ["id"])
+    # --- User: add referred_by_id + self-FK ---
+    op.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS referred_by_id INTEGER")
+    op.execute(
+        """
+        DO $$
+        BEGIN
+            IF NOT EXISTS (
+                SELECT 1 FROM pg_constraint WHERE conname = 'fk_users_referred_by'
+            ) THEN
+                ALTER TABLE users
+                    ADD CONSTRAINT fk_users_referred_by
+                    FOREIGN KEY (referred_by_id) REFERENCES users(id);
+            END IF;
+        END $$;
+        """
+    )
 
     # --- Referral codes table ---
-    op.create_table(
-        "referral_codes",
-        sa.Column("id", sa.Integer(), primary_key=True),
-        sa.Column("owner_id", sa.Integer(), sa.ForeignKey("users.id", ondelete="CASCADE"), nullable=False),
-        sa.Column("code", sa.String(32), nullable=False),
-        sa.Column("bonus_days", sa.Integer(), server_default="3"),
-        sa.Column("reward_days", sa.Integer(), server_default="3"),
-        sa.Column("uses", sa.Integer(), server_default="0"),
-        sa.Column("max_uses", sa.Integer(), nullable=True),
-        sa.Column("is_active", sa.Boolean(), server_default="true"),
-        sa.Column("created_at", sa.DateTime(), server_default=sa.func.now()),
+    op.execute(
+        """
+        CREATE TABLE IF NOT EXISTS referral_codes (
+            id SERIAL PRIMARY KEY,
+            owner_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            code VARCHAR(32) NOT NULL,
+            bonus_days INTEGER DEFAULT 3,
+            reward_days INTEGER DEFAULT 3,
+            uses INTEGER DEFAULT 0,
+            max_uses INTEGER,
+            is_active BOOLEAN DEFAULT true,
+            created_at TIMESTAMP DEFAULT now()
+        )
+        """
     )
-    op.create_index("ix_referral_codes_code", "referral_codes", ["code"], unique=True)
+    op.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS ix_referral_codes_code "
+        "ON referral_codes (code)"
+    )
 
 
 def downgrade() -> None:
