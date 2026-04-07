@@ -11,6 +11,8 @@ deploy_web_frontend_letsencrypt_email: ""
 # publishes 127.0.0.1:8000 via compose port mapping.
 deploy_web_frontend_admin_upstream: "127.0.0.1:8080"
 deploy_web_frontend_api_upstream: "127.0.0.1:8000"
+# Telegram WebApp SPA container — published on 127.0.0.1:8081 by compose.
+deploy_web_frontend_webapp_upstream: "127.0.0.1:8081"
 
 # nginx vhost file name under /etc/nginx/sites-available.
 deploy_web_frontend_site_name: "grinwer"

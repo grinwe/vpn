@@ -41,6 +41,9 @@ services:
       YOOKASSA_SHOP_ID: ${YOOKASSA_SHOP_ID:-}
       YOOKASSA_SECRET_KEY: ${YOOKASSA_SECRET_KEY:-}
       TELEGRAM_STARS_WEBHOOK_SECRET: ${TELEGRAM_STARS_WEBHOOK_SECRET:-}
+      BOT_TOKEN: ${BOT_TOKEN}
+      WEBAPP_JWT_SECRET: ${WEBAPP_JWT_SECRET}
+      WEBAPP_JWT_TTL_SECONDS: ${WEBAPP_JWT_TTL_SECONDS:-1800}
     ports:
       - "127.0.0.1:8000:8000"
     depends_on:
@@ -80,6 +83,12 @@ services:
       - "127.0.0.1:8080:80"
     restart: unless-stopped
 
+  webapp:
+    build: ./webapp
+    ports:
+      - "127.0.0.1:8081:80"
+    restart: unless-stopped
+
   bot:
     build: ./bot
     environment:
@@ -90,6 +99,7 @@ services:
       PAYMENT_PROVIDER: ${PAYMENT_PROVIDER:-cryptobot}
       TELEGRAM_STARS_WEBHOOK_SECRET: ${TELEGRAM_STARS_WEBHOOK_SECRET:-}
       SUB_LINK_BASE_URL: ${SUB_LINK_BASE_URL:-}
+      WEBAPP_BASE_URL: ${WEBAPP_BASE_URL:-}
       NOTIFICATION_POLL_INTERVAL: ${NOTIFICATION_POLL_INTERVAL:-10}
     depends_on:
       - backend

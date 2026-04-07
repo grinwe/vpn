@@ -12,6 +12,7 @@ from .config import get_settings
 from .migrations import run_migrations
 from .api import router as api_router, require_admin
 from .api_extensions import ext_router
+from .api_webapp import webapp_router
 
 run_migrations()
 
@@ -102,6 +103,7 @@ async def add_metrics(request: Request, call_next):
 
 app.include_router(api_router)
 app.include_router(ext_router)
+app.include_router(webapp_router)
 
 
 @app.get("/")

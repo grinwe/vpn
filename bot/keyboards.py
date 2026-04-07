@@ -1,4 +1,12 @@
+import os
+
 from aiogram import types
+
+# Public HTTPS URL of the Telegram WebApp. Used to build the inline
+# "Личный кабинет" button on /start. The persistent entry point is the
+# Menu Button configured in BotFather (Bot Settings → Menu Button), so
+# this URL is only needed for the one-tap launch right after onboarding.
+WEBAPP_BASE_URL = os.getenv("WEBAPP_BASE_URL", "").rstrip("/")
 
 
 def start_keyboard() -> types.ReplyKeyboardMarkup:
@@ -9,6 +17,26 @@ def start_keyboard() -> types.ReplyKeyboardMarkup:
             [types.KeyboardButton(text="Реферальная ссылка")],
         ],
         resize_keyboard=True,
+    )
+
+
+def webapp_inline_keyboard() -> types.InlineKeyboardMarkup | None:
+    """Inline button that opens the WebApp in a single tap.
+
+    Returns None if WEBAPP_BASE_URL is unset or non-HTTPS so callers can
+    fall back to text-only replies in dev.
+    """
+    if not WEBAPP_BASE_URL.startswith("https://"):
+        return None
+    return types.InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                types.InlineKeyboardButton(
+                    text="🔐 Открыть личный кабинет",
+                    web_app=types.WebAppInfo(url=WEBAPP_BASE_URL),
+                )
+            ]
+        ]
     )
 
 

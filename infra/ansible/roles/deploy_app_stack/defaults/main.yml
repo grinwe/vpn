@@ -49,3 +49,19 @@ deploy_app_stack_force_recreate: false
 #   deploy_app_stack_payment_provider        (default: "cryptobot")
 deploy_app_stack_payment_provider: "cryptobot"
 deploy_app_stack_telegram_stars_webhook_secret: ""
+
+# Telegram WebApp / Mini App.
+#
+#   deploy_app_stack_webapp_jwt_secret  — REQUIRED, min 32 chars.
+#                                         Generate once on the controller:
+#                                           python3 -c 'import secrets; print(secrets.token_urlsafe(32))'
+#                                         then store in group_vars/<group>/vault.yml.
+#                                         Rotating it invalidates all live WebApp sessions
+#                                         (users will re-auth via Telegram on next open).
+#
+#   deploy_app_stack_webapp_base_url    — public HTTPS URL of the WebApp,
+#                                         e.g. https://grinwer.online/app.
+#                                         Used by the bot to construct
+#                                         WebAppInfo / Direct Link buttons.
+deploy_app_stack_webapp_base_url: "https://{{ deploy_web_frontend_domain | default('grinwer.online') }}/app"
+deploy_app_stack_webapp_jwt_ttl_seconds: 1800

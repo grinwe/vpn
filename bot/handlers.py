@@ -13,7 +13,7 @@ from .config import (
     SUB_LINK_BASE_URL,
     TELEGRAM_STARS_WEBHOOK_SECRET,
 )
-from .keyboards import start_keyboard, onboarding_keyboard
+from .keyboards import start_keyboard, onboarding_keyboard, webapp_inline_keyboard
 
 router = Router()
 logger = logging.getLogger(__name__)
@@ -159,6 +159,16 @@ async def cmd_start(message: types.Message):
         "/referral — реферальная ссылка",
         reply_markup=start_keyboard(),
     )
+
+    # One-tap entry into the WebApp right after onboarding. The persistent
+    # Menu Button (configured in BotFather) covers all subsequent visits;
+    # this inline button just shortens the very first interaction.
+    webapp_kb = webapp_inline_keyboard()
+    if webapp_kb is not None:
+        await message.answer(
+            "🔐 Личный кабинет — все подписки, конфиги и оплата в одном окне.",
+            reply_markup=webapp_kb,
+        )
 
 
 # ── /plans ──

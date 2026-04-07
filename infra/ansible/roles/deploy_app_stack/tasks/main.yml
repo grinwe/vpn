@@ -11,6 +11,7 @@
       - deploy_app_stack_app_secret_key | default('', true) | length >= 16
       - deploy_app_stack_bot_token | default('', true) | length > 0
       - deploy_app_stack_admin_ids | default('', true) | length > 0
+      - deploy_app_stack_webapp_jwt_secret | default('', true) | length >= 32
     fail_msg: >
       Missing or too-short secret. Check group_vars/*/vault.yml —
       every deploy_app_stack_* secret must be set and non-trivial.
