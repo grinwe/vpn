@@ -1,0 +1,81 @@
+---
+# install_vless_ws_cdn
+#
+# Installs xray-core configured for VLESS+WebSocket inbound, designed
+# to sit behind Cloudflare CDN. TLS termination is handled either by
+# Cloudflare (Full Strict mode with origin cert) or locally with
+# certbot. The WebSocket transport allows Cloudflare to proxy traffic,
+# making the origin IP invisible to TSPU.
+#
+# The role is a no-op unless ``vless_ws_cdn_domain`` is defined.
+
+- name: Require WS+CDN config variables
+  assert:
+    that:
+      - vless_ws_cdn_domain is defined and vless_ws_cdn_domain | length > 0
+      - vless_ws_cdn_port is defined
+      - vless_ws_cdn_path is defined and vless_ws_cdn_path | length > 0
+    fail_msg: >-
+      install_vless_ws_cdn requires vless_ws_cdn_domain, vless_ws_cdn_port,
+      and vless_ws_cdn_path.
+
+- name: Ensure dependencies
+  apt:
+    name: [curl, unzip, jq, ca-certificates]
+    state: present
+    update_cache: yes
+
+- name: Install xray-core (idempotent)
+  shell: |
+    set -euo pipefail
+    if command -v xray >/dev/null 2>&1; then
+      echo "xray already installed"
+      exit 0
+    fi
+    bash -c "$(curl -fsSL https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install
+  args:
+    executable: /bin/bash
+  register: xray_ws_install
+  changed_when: "'already installed' not in xray_ws_install.stdout"
+
+- name: Ensure xray config directory
+  file:
+    path: /usr/local/etc/xray
+    state: directory
+    owner: root
+    group: root
+    mode: '0750'
+
+- name: Render xray WS+CDN config
+  template:
+    src: config_ws_cdn.json.j2
+    dest: /usr/local/etc/xray/config_ws_cdn.json
+    owner: root
+    group: root
+    mode: '0640'
+    backup: yes
+  notify: restart xray ws cdn
+
+- name: Install VLESS WS user management helper
+  copy:
+    src: manage_vless_ws_user.sh
+    dest: /usr/local/sbin/manage_vless_ws_user.sh
+    owner: root
+    group: root
+    mode: '0750'
+
+- name: Install xray WS+CDN systemd unit
+  template:
+    src: xray-ws-cdn.service.j2
+    dest: /etc/systemd/system/xray-ws-cdn.service
+    owner: root
+    group: root
+    mode: '0644'
+  notify: restart xray ws cdn
+
+- name: Enable and start xray WS+CDN service
+  systemd:
+    name: xray-ws-cdn
+    enabled: yes
+    state: started
+    daemon_reload: yes

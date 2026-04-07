@@ -1,0 +1,64 @@
+{
+  "dashboard": {
+    "title": "VPN Business Metrics",
+    "uid": "vpn-business",
+    "description": "MRR, Churn, LTV, Active Users, Revenue",
+    "tags": ["vpn", "business"],
+    "timezone": "browser",
+    "panels": [
+      {
+        "title": "Active Subscriptions",
+        "type": "stat",
+        "gridPos": {"h": 4, "w": 6, "x": 0, "y": 0},
+        "targets": [{"expr": "vpn_subscriptions_active", "legendFormat": "Active"}]
+      },
+      {
+        "title": "Total Users",
+        "type": "stat",
+        "gridPos": {"h": 4, "w": 6, "x": 6, "y": 0},
+        "targets": [{"expr": "vpn_users_total", "legendFormat": "Users"}]
+      },
+      {
+        "title": "Pending Invoices",
+        "type": "stat",
+        "gridPos": {"h": 4, "w": 6, "x": 12, "y": 0},
+        "targets": [{"expr": "vpn_invoices_pending", "legendFormat": "Pending"}]
+      },
+      {
+        "title": "Nodes Active / Total",
+        "type": "stat",
+        "gridPos": {"h": 4, "w": 6, "x": 18, "y": 0},
+        "targets": [
+          {"expr": "vpn_nodes_active", "legendFormat": "Active"},
+          {"expr": "vpn_nodes_total", "legendFormat": "Total"}
+        ]
+      },
+      {
+        "title": "HTTP Request Rate",
+        "type": "timeseries",
+        "gridPos": {"h": 8, "w": 12, "x": 0, "y": 4},
+        "targets": [
+          {"expr": "rate(vpn_requests_total[5m])", "legendFormat": "{{path}} {{status}}"}
+        ]
+      },
+      {
+        "title": "Provisioning Tasks",
+        "type": "timeseries",
+        "gridPos": {"h": 8, "w": 12, "x": 12, "y": 4},
+        "targets": [
+          {"expr": "rate(vpn_provisioning_tasks_total[5m])", "legendFormat": "{{status}}"}
+        ]
+      },
+      {
+        "title": "Error Rate",
+        "type": "timeseries",
+        "gridPos": {"h": 8, "w": 24, "x": 0, "y": 12},
+        "targets": [
+          {"expr": "rate(vpn_requests_errors_total[5m])", "legendFormat": "{{path}} {{status}}"}
+        ]
+      }
+    ],
+    "time": {"from": "now-24h", "to": "now"},
+    "refresh": "30s"
+  }
+}

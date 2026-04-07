@@ -579,10 +579,13 @@ def _subscriptions_for_user(user_id: int, db: Session) -> list[schemas.Subscript
         item = schemas.SubscriptionOut(
             id=sub.id,
             plan_name=sub.plan.name,
+            plan_id=sub.plan_id,
             node=sub.node.name,
             region=sub.node.region,
             expires_at=sub.expires_at,
             status=sub.status.value,
+            auto_renew=sub.auto_renew or False,
+            sub_token=sub.sub_token,
             credentials=[schemas.CredentialOut.from_orm(c) for c in sub.credentials],
             devices=[schemas.DeviceOut.from_orm(d) for d in sub.devices],
         )
@@ -893,6 +896,7 @@ def create_payment(
 
 @router.post("/invoices", response_model=schemas.InvoiceOut)
 def create_invoice(
+    request: Request,
     body: schemas.InvoiceCreate,
     db: Session = Depends(get_db),
     admin_token: str | None = Depends(optional_admin_token),

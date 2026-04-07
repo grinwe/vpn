@@ -121,10 +121,13 @@ class PlanOut(BaseModel):
 class SubscriptionOut(BaseModel):
     id: int
     plan_name: str
+    plan_id: int = 0
     node: str
     region: str
     expires_at: datetime
     status: str
+    auto_renew: bool = False
+    sub_token: str | None = None
     credentials: List[CredentialOut]
     devices: List[DeviceOut] = []
 

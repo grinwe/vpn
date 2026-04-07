@@ -8,6 +8,7 @@ import secrets
 import threading
 import uuid
 from datetime import datetime, timedelta
+from urllib.parse import quote as urlquote
 
 from ..time_utils import utcnow
 from typing import Any
@@ -27,9 +28,10 @@ TASK_STATUS_COUNTER = Counter("vpn_provisioning_tasks_total", "Provisioning task
 MAX_CONCURRENT_ANSIBLE = int(os.getenv("MAX_CONCURRENT_ANSIBLE", "3"))
 _ansible_semaphore = threading.Semaphore(MAX_CONCURRENT_ANSIBLE)
 
-
 MIN_HEALTHY_SCORE = int(os.getenv("MIN_HEALTHY_SCORE", "50"))
 
+
+# ── Node selection ────────────────────────────────────────────────────
 
 def choose_node(
     db: Session,
@@ -40,14 +42,8 @@ def choose_node(
 ) -> models.VPNNode:
     """Pick a VPN node, respecting plan pools, capacity, health and cooldown.
 
-    Selection criteria (applied in order):
-      - explicit ``node_id`` wins if given (but must still be active);
-      - node must be ``is_active`` and have a status that permits traffic;
-      - node must not be in cooldown (``cooldown_until`` in the future);
-      - ``health_score`` must be >= ``MIN_HEALTHY_SCORE``;
-      - node must not be at capacity (active subs < ``max_users``);
-      - among the remaining, pick the one with the fewest active subs —
-        this gives us an even, load-aware spread without needing live metrics.
+    Uses SELECT FOR UPDATE SKIP LOCKED to prevent concurrent provisioners
+    from over-committing a single node.
     """
     now = utcnow()
     query = db.query(models.VPNNode).filter(models.VPNNode.is_active.is_(True))
@@ -96,10 +92,6 @@ def choose_node(
     for node, subs in rows:
         if node.max_users is not None and subs >= node.max_users:
             continue
-        # Re-acquire the row with a row-level lock so concurrent provisioners
-        # can't both pick the same node right at its capacity limit. We also
-        # re-check the live subscription count under the lock; if the node
-        # filled up between the aggregate query and the lock, skip it.
         locked = (
             db.query(models.VPNNode)
             .filter(models.VPNNode.id == node.id)
@@ -125,7 +117,9 @@ def choose_node(
     raise RuntimeError("No healthy VPN nodes available for plan")
 
 
-def choose_config(node: models.VPNNode, preferred_protocol: models.VPNConfigProtocol | None = None) -> models.VPNConfig:
+def choose_config(
+    node: models.VPNNode, preferred_protocol: models.VPNConfigProtocol | None = None
+) -> models.VPNConfig:
     configs = [cfg for cfg in node.configs if cfg.is_enabled]
     if preferred_protocol:
         filtered = [cfg for cfg in configs if cfg.protocol == preferred_protocol]
@@ -136,14 +130,20 @@ def choose_config(node: models.VPNNode, preferred_protocol: models.VPNConfigProt
     return configs[0]
 
 
-def _build_shadowtls_credential(node: models.VPNNode, config: models.VPNConfig, username: str, password: str) -> str:
+# ── Credential builders ──────────────────────────────────────────────
+
+def _build_shadowtls_credential(
+    node: models.VPNNode, config: models.VPNConfig, username: str, password: str
+) -> str:
     method = (config.settings or {}).get("method", "chacha20-ietf-poly1305")
     payload = f"{method}:{password}@{node.host}:{config.port}"
     encoded = base64.urlsafe_b64encode(payload.encode()).decode().rstrip("=")
     return f"ss://{encoded}#shadowtls-{username}"
 
 
-def _build_vless_reality_credential(node: models.VPNNode, config: models.VPNConfig, user_id: str) -> str:
+def _build_vless_reality_credential(
+    node: models.VPNNode, config: models.VPNConfig, user_id: str
+) -> str:
     settings = config.settings or {}
     sni = config.sni or settings.get("server_name", "")
     params = {
@@ -159,38 +159,109 @@ def _build_vless_reality_credential(node: models.VPNNode, config: models.VPNConf
     return f"vless://{user_id}@{node.host}:{config.port}?{query}#reality-{node.region}"
 
 
+def _build_vless_ws_cdn_credential(
+    node: models.VPNNode, config: models.VPNConfig, user_id: str
+) -> str:
+    """Build a VLESS+WebSocket+TLS connection URI routed through Cloudflare CDN.
+
+    The ``host`` header is set to the CDN domain (from config.sni) so
+    Cloudflare routes the WebSocket to the origin. The actual IP in the
+    URI is the CDN edge — clients never see the real server IP.
+    """
+    settings = config.settings or {}
+    cdn_domain = config.sni or settings.get("cdn_domain", "")
+    path = settings.get("ws_path", "/ws")
+    params = {
+        "security": "tls",
+        "sni": cdn_domain,
+        "fp": "chrome",
+        "type": "ws",
+        "host": cdn_domain,
+        "path": urlquote(path),
+    }
+    query = "&".join([f"{k}={v}" for k, v in params.items() if v])
+    return f"vless://{user_id}@{cdn_domain}:{config.port}?{query}#ws-cdn-{node.region}"
+
+
+def _build_hysteria2_credential(
+    node: models.VPNNode, config: models.VPNConfig, password: str
+) -> str:
+    """Build a Hysteria2 URI.
+
+    Format: ``hy2://password@host:port?sni=...&insecure=0#tag``
+    """
+    settings = config.settings or {}
+    sni = config.sni or settings.get("sni", node.host)
+    obfs = settings.get("obfs", "")
+    obfs_password = settings.get("obfs_password", "")
+    params = {"sni": sni}
+    if obfs:
+        params["obfs"] = obfs
+        params["obfs-password"] = obfs_password
+    query = "&".join([f"{k}={v}" for k, v in params.items() if v])
+    return f"hy2://{password}@{node.host}:{config.port}?{query}#hy2-{node.region}"
+
+
+# ── Extra vars collection for Ansible site.yml ────────────────────────
+
 def _collect_site_extra_vars(node: models.VPNNode) -> dict[str, Any]:
     """Build extra_vars for a node-level site.yml run.
 
-    Currently only Reality is variable; ShadowTLS has no secrets the
-    playbook needs to know (the manage script generates credentials at
-    device-apply time). If we add more protocols this is the single place
-    to extend.
+    Inspects all enabled VPNConfig rows on the node and surfaces the
+    backend-authoritative secrets for each protocol to the installer roles.
     """
     extra: dict[str, Any] = {}
     for cfg in node.configs:
-        if cfg.protocol != models.VPNConfigProtocol.vless_reality:
-            continue
         if not cfg.is_enabled:
             continue
         settings = cfg.settings or {}
-        priv_enc = settings.get("private_key_enc")
-        if not priv_enc or not cfg.public_key:
-            # Config is half-formed; let the role's own assert fail loudly.
-            continue
-        extra.update(
-            {
+
+        # ── VLESS Reality ──
+        if cfg.protocol == models.VPNConfigProtocol.vless_reality:
+            priv_enc = settings.get("private_key_enc")
+            if not priv_enc or not cfg.public_key:
+                continue
+            extra.update({
                 "vless_reality_private_key": decrypt(priv_enc),
                 "vless_reality_public_key": cfg.public_key,
                 "vless_reality_short_id": settings.get("short_id", ""),
                 "vless_reality_port": cfg.port,
                 "vless_reality_sni": cfg.sni or "",
                 "vless_reality_dest": settings.get("dest") or cfg.fallback or "",
-            }
-        )
-        break  # one Reality inbound per node
+            })
+
+        # ── VLESS+WS+CDN ──
+        elif cfg.protocol == models.VPNConfigProtocol.vless_ws_cdn:
+            extra.update({
+                "vless_ws_cdn_port": cfg.port,
+                "vless_ws_cdn_domain": cfg.sni or "",
+                "vless_ws_cdn_path": settings.get("ws_path", "/ws"),
+                "vless_ws_cdn_cert_path": settings.get("cert_path", ""),
+                "vless_ws_cdn_key_path": settings.get("key_path", ""),
+            })
+
+        # ── Hysteria2 ──
+        elif cfg.protocol == models.VPNConfigProtocol.hysteria2:
+            extra.update({
+                "hysteria2_port": cfg.port,
+                "hysteria2_domain": cfg.sni or node.host,
+                "hysteria2_obfs": settings.get("obfs", ""),
+                "hysteria2_obfs_password": settings.get("obfs_password", ""),
+                "hysteria2_cert_path": settings.get("cert_path", ""),
+                "hysteria2_key_path": settings.get("key_path", ""),
+                "hysteria2_up_mbps": settings.get("up_mbps", 100),
+                "hysteria2_down_mbps": settings.get("down_mbps", 100),
+            })
+
     return extra
 
+
+def _generate_sub_token() -> str:
+    """Generate a stable 22-char URL-safe subscription token."""
+    return secrets.token_urlsafe(16)
+
+
+# ── Orchestrator ─────────────────────────────────────────────────────
 
 class ProvisioningOrchestrator:
     """Coordinates provisioning tasks and Ansible execution."""
@@ -198,7 +269,9 @@ class ProvisioningOrchestrator:
     def __init__(self, db: Session):
         self.db = db
 
-    def create_task(self, target_type: str, target_id: int, action: str, payload: dict[str, Any] | None) -> models.ProvisioningTask:
+    def create_task(
+        self, target_type: str, target_id: int, action: str, payload: dict[str, Any] | None
+    ) -> models.ProvisioningTask:
         task = models.ProvisioningTask(
             target_type=target_type,
             target_id=target_id,
@@ -210,7 +283,14 @@ class ProvisioningOrchestrator:
         self.db.flush()
         return task
 
-    def _mark_task(self, task: models.ProvisioningTask, status: models.ProvisioningTaskStatus, *, error: str | None = None, result: dict[str, Any] | None = None) -> None:
+    def _mark_task(
+        self,
+        task: models.ProvisioningTask,
+        status: models.ProvisioningTaskStatus,
+        *,
+        error: str | None = None,
+        result: dict[str, Any] | None = None,
+    ) -> None:
         task.status = status
         task.error_message = error
         task.result = result
@@ -219,7 +299,9 @@ class ProvisioningOrchestrator:
         self.db.commit()
         TASK_STATUS_COUNTER.labels(status=status.value).inc()
 
-    def run_task(self, task: models.ProvisioningTask, node: models.VPNNode | None = None) -> models.ProvisioningTask:
+    def run_task(
+        self, task: models.ProvisioningTask, node: models.VPNNode | None = None
+    ) -> models.ProvisioningTask:
         task.started_at = utcnow()
         task.status = models.ProvisioningTaskStatus.running
         self.db.commit()
@@ -229,7 +311,10 @@ class ProvisioningOrchestrator:
             result_payload = self._execute_task(task, node=node)
         except Exception as exc:  # noqa: BLE001
             logger.exception("Provisioning task %s failed", task.id)
-            self._mark_task(task, models.ProvisioningTaskStatus.failed, error=str(exc), result=result_payload)
+            self._mark_task(
+                task, models.ProvisioningTaskStatus.failed,
+                error=str(exc), result=result_payload,
+            )
             self._handle_task_outcome(task, success=False)
             return task
 
@@ -237,19 +322,10 @@ class ProvisioningOrchestrator:
         self._handle_task_outcome(task, success=True)
         return task
 
-    def run_task_async(self, task: models.ProvisioningTask, node: models.VPNNode | None = None) -> None:
-        """Dispatch a provisioning task off the request thread.
-
-        Preferred path is the RQ queue (``QUEUE_BACKEND=rq`` + ``REDIS_URL``):
-        the job is picked up by ``app.worker`` in a separate container, which
-        means a crashing API replica does not lose in-flight work and the API
-        image does not have to carry ``ansible`` or SSH keys at all.
-
-        If the queue is unavailable we fall back to the legacy in-process
-        thread runner so that ``docker-compose up`` without Redis (and unit
-        tests) keep working. The request-scoped ``self.db`` session is never
-        shared across threads — the worker opens its own ``SessionLocal``.
-        """
+    def run_task_async(
+        self, task: models.ProvisioningTask, node: models.VPNNode | None = None
+    ) -> None:
+        """Dispatch a provisioning task off the request thread via RQ."""
         from ..queue import enqueue_task
 
         job_id = enqueue_task(task.id, node.id if node else None)
@@ -257,14 +333,9 @@ class ProvisioningOrchestrator:
             logger.info("Task %s enqueued as RQ job %s", task.id, job_id)
             return
 
-        # Queue unavailable. Allowing the API process to execute the playbook
-        # inline would undo the image split (API doesn't ship ansible or SSH
-        # keys) and hide broken infra behind "it works in dev". Require an
-        # explicit opt-in env var for the dev/test fallback.
         if os.getenv("ALLOW_INPROCESS_PROVISIONING", "").lower() not in {"1", "true", "yes"}:
             raise RuntimeError(
-                "Provisioning queue is unavailable and ALLOW_INPROCESS_PROVISIONING is not set; "
-                "refusing to run ansible inside the API process."
+                "Provisioning queue is unavailable and ALLOW_INPROCESS_PROVISIONING is not set"
             )
 
         thread = threading.Thread(
@@ -301,9 +372,7 @@ class ProvisioningOrchestrator:
                 if task:
                     orchestrator = ProvisioningOrchestrator(session)
                     orchestrator._mark_task(  # noqa: SLF001
-                        task,
-                        models.ProvisioningTaskStatus.failed,
-                        error=str(exc),
+                        task, models.ProvisioningTaskStatus.failed, error=str(exc),
                     )
             except Exception:  # noqa: BLE001
                 logger.exception("Failed to mark task %s as failed", task_id)
@@ -346,7 +415,54 @@ class ProvisioningOrchestrator:
         self.db.add(device)
         self.db.commit()
 
-    def _execute_task(self, task: models.ProvisioningTask, node: models.VPNNode | None = None) -> dict[str, Any]:
+        # ── Post-provision callback: notify bot ──
+        if success and task.action == "apply":
+            self._notify_bot_config_ready(device)
+
+    def _notify_bot_config_ready(self, device: models.Device) -> None:
+        """Push a notification to the bot that config is ready for delivery.
+
+        We POST to the backend's internal /api/bot/notify_config endpoint,
+        which the bot polls or which triggers a direct Telegram message.
+        Instead of coupling worker→bot, we write a lightweight callback
+        record that the bot's polling loop picks up.
+        """
+        try:
+            sub = device.subscription
+            if not sub:
+                return
+            user = sub.user
+            if not user or not user.telegram_id:
+                return
+            # Store the notification in the task result so the bot can read it
+            # via the existing task polling mechanism, or via the new callback API.
+            task_result = (
+                self.db.query(models.ProvisioningTask)
+                .filter(
+                    models.ProvisioningTask.target_type == "device",
+                    models.ProvisioningTask.target_id == device.id,
+                    models.ProvisioningTask.action == "apply",
+                    models.ProvisioningTask.status == models.ProvisioningTaskStatus.success,
+                )
+                .order_by(models.ProvisioningTask.id.desc())
+                .first()
+            )
+            if task_result and task_result.result:
+                result = dict(task_result.result)
+                result["_notify"] = {
+                    "telegram_id": user.telegram_id,
+                    "subscription_id": sub.id,
+                    "device_id": device.id,
+                }
+                task_result.result = result
+                self.db.add(task_result)
+                self.db.commit()
+        except Exception:  # noqa: BLE001
+            logger.exception("Failed to store bot notification for device %s", device.id)
+
+    def _execute_task(
+        self, task: models.ProvisioningTask, node: models.VPNNode | None = None
+    ) -> dict[str, Any]:
         payload = task.payload or {}
         _ansible_semaphore.acquire()
         inventory = None
@@ -357,16 +473,9 @@ class ProvisioningOrchestrator:
                 if not node:
                     raise RuntimeError("VPN node not found for provisioning")
                 inventory = build_inventory_for_node(node)
-                # Surface backend-authoritative Reality parameters to the
-                # install_vless_reality role. We decrypt the private key
-                # only for the duration of the ansible invocation — it is
-                # never persisted in cleartext on the backend disk.
                 site_vars = _collect_site_extra_vars(node)
                 result = run_playbook(
-                    "site.yml",
-                    inventory,
-                    limit=node.name,
-                    extra_vars=site_vars,
+                    "site.yml", inventory, limit=node.name, extra_vars=site_vars,
                 )
             elif task.target_type == "device":
                 if not node:
@@ -374,17 +483,12 @@ class ProvisioningOrchestrator:
                 inventory = build_inventory_for_node(node)
                 result = run_playbook(
                     "playbooks/provision_device.yml",
-                    inventory,
-                    limit=node.name,
-                    extra_vars=payload,
+                    inventory, limit=node.name, extra_vars=payload,
                 )
             else:
                 raise RuntimeError(f"Unsupported target type {task.target_type}")
         finally:
             _ansible_semaphore.release()
-            # Always remove the temp inventory — ansible_runner creates it
-            # with delete=False so it survives the subprocess, but it has
-            # no owner after that.
             if inventory is not None:
                 try:
                     inventory.unlink()
@@ -414,14 +518,15 @@ class ProvisioningOrchestrator:
         node = choose_node(self.db, plan, node_id=node_id)
         config = choose_config(node)
 
-        # Enforce max_devices limit across all active subscriptions for this user/plan
         active_device_count = (
             self.db.query(models.Device)
             .join(models.Subscription)
             .filter(
                 models.Subscription.user_id == user.id,
                 models.Subscription.plan_id == plan.id,
-                models.Device.status.notin_([models.DeviceStatus.revoked, models.DeviceStatus.disabled]),
+                models.Device.status.notin_([
+                    models.DeviceStatus.revoked, models.DeviceStatus.disabled
+                ]),
             )
             .count()
         )
@@ -434,6 +539,7 @@ class ProvisioningOrchestrator:
             node_id=node.id,
             expires_at=expires_at_override or (utcnow() + timedelta(days=plan.duration_days)),
             traffic_limit_mb=plan.traffic_limit_mb,
+            sub_token=_generate_sub_token(),
         )
         self.db.add(subscription)
         self.db.flush()
@@ -443,16 +549,21 @@ class ProvisioningOrchestrator:
         password = secrets.token_urlsafe(12)
         user_uuid: uuid.UUID | None = None
         credential_text: str
+
+        # ── Build credential based on protocol ──
         if config.protocol == models.VPNConfigProtocol.shadowtls_ss:
             credential_text = _build_shadowtls_credential(node, config, username, password)
-        else:
+        elif config.protocol == models.VPNConfigProtocol.vless_reality:
             user_uuid = uuid.uuid4()
             credential_text = _build_vless_reality_credential(node, config, str(user_uuid))
+        elif config.protocol == models.VPNConfigProtocol.vless_ws_cdn:
+            user_uuid = uuid.uuid4()
+            credential_text = _build_vless_ws_cdn_credential(node, config, str(user_uuid))
+        elif config.protocol == models.VPNConfigProtocol.hysteria2:
+            credential_text = _build_hysteria2_credential(node, config, password)
+        else:
+            raise RuntimeError(f"Unsupported protocol: {config.protocol}")
 
-        # Encrypt connection URI at rest. We still keep the cleartext in memory
-        # so that the HTTP response returned to the caller (e.g. the bot) can
-        # render it to the user. Readers must pass DB values through
-        # `security.decrypt` before using them.
         credential_enc = encrypt(credential_text)
 
         device = models.Device(
@@ -487,12 +598,14 @@ class ProvisioningOrchestrator:
             task_payload["method"] = (config.settings or {}).get(
                 "method", "chacha20-ietf-poly1305"
             )
-        elif config.protocol == models.VPNConfigProtocol.vless_reality:
-            # ``username`` doubles as the xray ``email`` (and therefore
-            # the stats key in the traffic collector) — keep them
-            # identical so Device.access_username remains the single
-            # lookup key across probes, traffic, and audit.
+        elif config.protocol in (
+            models.VPNConfigProtocol.vless_reality,
+            models.VPNConfigProtocol.vless_ws_cdn,
+        ):
             task_payload["uuid"] = str(user_uuid)
+        elif config.protocol == models.VPNConfigProtocol.hysteria2:
+            task_payload["password"] = password
+
         task = self.create_task("device", device.id, "apply", task_payload)
         self.db.commit()
         self.run_task_async(task, node=node)
@@ -529,9 +642,5 @@ class ProvisioningOrchestrator:
         for device in subscription.devices:
             tasks.append(self.revoke_device(device, reason=reason))
         subscription.status = models.SubscriptionStatus.blocked
-        # Preserve original expiry — the user still owns the time they paid
-        # for. Status=blocked is what gates access; clobbering expires_at
-        # would lose accounting data and break any "remaining time" logic
-        # (e.g. migration between nodes).
         self.db.commit()
         return tasks

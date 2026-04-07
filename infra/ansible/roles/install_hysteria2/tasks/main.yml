@@ -1,0 +1,71 @@
+---
+# install_hysteria2
+#
+# Installs Hysteria2 server — a UDP-based proxy using QUIC.
+# Works well on fixed broadband, less stable on mobile (TSPU
+# can throttle UDP). Acts as a secondary fallback protocol.
+#
+# No-op unless ``hysteria2_port`` is defined.
+
+- name: Require Hysteria2 config variables
+  assert:
+    that:
+      - hysteria2_port is defined
+      - hysteria2_domain is defined and hysteria2_domain | length > 0
+    fail_msg: >-
+      install_hysteria2 requires hysteria2_port and hysteria2_domain.
+
+- name: Install Hysteria2 from upstream
+  shell: |
+    set -euo pipefail
+    if command -v hysteria >/dev/null 2>&1; then
+      echo "hysteria already installed: $(hysteria version 2>&1 | head -n1)"
+      exit 0
+    fi
+    bash <(curl -fsSL https://get.hy2.sh/)
+  args:
+    executable: /bin/bash
+  register: hy2_install
+  changed_when: "'already installed' not in hy2_install.stdout"
+
+- name: Ensure Hysteria2 config directory
+  file:
+    path: /etc/hysteria
+    state: directory
+    owner: root
+    group: root
+    mode: '0750'
+
+- name: Render Hysteria2 server config
+  template:
+    src: config.yaml.j2
+    dest: /etc/hysteria/config.yaml
+    owner: root
+    group: root
+    mode: '0640'
+    backup: yes
+  notify: restart hysteria2
+
+- name: Install Hysteria2 user management helper
+  copy:
+    src: manage_hy2_user.sh
+    dest: /usr/local/sbin/manage_hy2_user.sh
+    owner: root
+    group: root
+    mode: '0750'
+
+- name: Ensure hysteria-server systemd unit
+  template:
+    src: hysteria-server.service.j2
+    dest: /etc/systemd/system/hysteria-server.service
+    owner: root
+    group: root
+    mode: '0644'
+  notify: restart hysteria2
+
+- name: Enable and start Hysteria2
+  systemd:
+    name: hysteria-server
+    enabled: yes
+    state: started
+    daemon_reload: yes

@@ -1,0 +1,29 @@
+listen: :{{ hysteria2_port | int }}
+
+{% if hysteria2_cert_path | default('') | length > 0 %}
+tls:
+  cert: {{ hysteria2_cert_path }}
+  key: {{ hysteria2_key_path }}
+{% else %}
+# ACME auto-cert
+acme:
+  domains:
+    - {{ hysteria2_domain }}
+  email: admin@{{ hysteria2_domain }}
+{% endif %}
+
+{% if hysteria2_obfs | default('') | length > 0 %}
+obfs:
+  type: {{ hysteria2_obfs }}
+  salamander:
+    password: {{ hysteria2_obfs_password }}
+{% endif %}
+
+bandwidth:
+  up: {{ hysteria2_up_mbps | default(100) }} mbps
+  down: {{ hysteria2_down_mbps | default(100) }} mbps
+
+# Auth via password file — managed by manage_hy2_user.sh
+auth:
+  type: userpass
+  userpass: {}

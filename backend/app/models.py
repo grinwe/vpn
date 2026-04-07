@@ -52,6 +52,8 @@ class VPNNodeStatus(str, enum.Enum):
 class VPNConfigProtocol(str, enum.Enum):
     shadowtls_ss = "shadowtls+shadowsocks"
     vless_reality = "vless-reality"
+    vless_ws_cdn = "vless-ws-cdn"
+    hysteria2 = "hysteria2"
 
 
 class DeviceStatus(str, enum.Enum):
@@ -110,19 +112,12 @@ class ServerPool(Base):
     name = Column(String, unique=True, nullable=False)
     description = Column(Text)
 
-    # Autoscale configuration. ``autoscale_enabled`` acts as the master
-    # switch; when off, the scheduler ignores this pool entirely. The other
-    # fields are defaults passed to :func:`services.node_spawner.spawn_node`
-    # when a scale-up is triggered.
     autoscale_enabled = Column(Boolean, default=False)
     autoscale_provider_id = Column(Integer, ForeignKey("cloud_providers.id"), nullable=True)
     autoscale_region = Column(String, nullable=True)
     autoscale_plan = Column(String, nullable=True)
     autoscale_image = Column(String, nullable=True)
-    # Trigger a scale-up when utilization (active_subs / total_capacity) is
-    # above this fraction (0..1). Leave null to use the service default.
     autoscale_high_watermark = Column(Numeric(4, 3), nullable=True)
-    # Hard upper bound on the number of nodes this pool may have.
     autoscale_max_nodes = Column(Integer, nullable=True)
 
     nodes = relationship("VPNNode", back_populates="pool")
@@ -144,18 +139,13 @@ class VPNNode(Base):
     updated_at = Column(DateTime, default=utcnow, onupdate=utcnow)
     notes = Column(Text)
 
-    # Capacity / scheduling
     max_users = Column(Integer, nullable=True)
     max_bandwidth_mbps = Column(Integer, nullable=True)
-    # Health: 0..100, updated by health-checker/probing service
     health_score = Column(Integer, default=100)
     last_health_check_at = Column(DateTime, nullable=True)
-    # Regions in which this node is currently considered unreachable
-    # (populated from HealthProbe aggregation). Example: ["ru", "by"].
     blocked_regions = Column(JSONB, nullable=True)
     cooldown_until = Column(DateTime, nullable=True)
 
-    # Provisioning / cloud provider metadata
     provider_id = Column(Integer, ForeignKey("cloud_providers.id"), nullable=True)
     provider_external_id = Column(String, nullable=True)
     provider_region = Column(String, nullable=True)
@@ -199,6 +189,7 @@ class Plan(Base):
     max_devices = Column(Integer, default=1)
     price = Column(Numeric(10, 2), default=0)
     traffic_limit_mb = Column(Integer, nullable=True)
+    is_visible = Column(Boolean, default=True)
     server_pools = relationship("ServerPool", secondary=plan_serverpool, back_populates="plans")
 
 
@@ -209,8 +200,13 @@ class User(Base):
     telegram_id = Column(String, unique=True, index=True)
     email = Column(String, unique=True, index=True, nullable=True)
     created_at = Column(DateTime, default=utcnow)
+    referred_by_id = Column(Integer, ForeignKey("users.id"), nullable=True)
+
     invoices = relationship("Invoice", back_populates="user")
     devices = relationship("Device", back_populates="user")
+    referral_codes = relationship(
+        "ReferralCode", back_populates="owner", foreign_keys="ReferralCode.owner_id"
+    )
 
 
 class Subscription(Base):
@@ -228,6 +224,8 @@ class Subscription(Base):
     traffic_limit_mb = Column(Integer, nullable=True)
     traffic_used_mb = Column(Integer, default=0)
     auto_renew = Column(Boolean, default=False)
+    # Stable token for the dynamic subscription link — survives migrations.
+    sub_token = Column(String, unique=True, index=True, nullable=True)
 
     user = relationship("User")
     plan = relationship("Plan")
@@ -265,8 +263,8 @@ class Credential(Base):
     subscription_id = Column(Integer, ForeignKey("subscriptions.id"), nullable=False)
     device_id = Column(Integer, ForeignKey("devices.id"), nullable=True)
     config_id = Column(Integer, ForeignKey("vpn_configs.id"), nullable=True)
-    proto = Column(String, nullable=False)  # 'shadowtls+ss', 'vless-reality'
-    config_text = Column(Text, nullable=False)  # vless://..., ss://..., yaml
+    proto = Column(String, nullable=False)
+    config_text = Column(Text, nullable=False)
     created_at = Column(DateTime, default=utcnow)
     is_active = Column(Boolean, default=True)
     revoked_at = Column(DateTime, nullable=True)
@@ -335,11 +333,9 @@ class CloudProvider(Base):
     id = Column(Integer, primary_key=True)
     name = Column(String, unique=True, nullable=False)
     kind = Column(Enum(CloudProviderKind), nullable=False)
-    # API token stored encrypted via app.security.crypto if key is configured,
-    # otherwise plain text (dev only).
     api_token_enc = Column(Text, nullable=True)
     default_image = Column(String, nullable=True)
-    ssh_key_ids = Column(JSONB, nullable=True)  # list of provider-side ssh key ids
+    ssh_key_ids = Column(JSONB, nullable=True)
     default_region = Column(String, nullable=True)
     default_plan = Column(String, nullable=True)
     is_active = Column(Boolean, default=True)
@@ -353,9 +349,8 @@ class HealthProbe(Base):
 
     id = Column(Integer, primary_key=True)
     node_id = Column(Integer, ForeignKey("vpn_nodes.id", ondelete="CASCADE"), nullable=False, index=True)
-    # Where the probe came from. Free-form label, e.g. "ru-mobile-mts", "kz", "eu".
     source_region = Column(String, nullable=False, index=True)
-    source_kind = Column(String, nullable=True)  # "active" / "passive" / "client"
+    source_kind = Column(String, nullable=True)
     result = Column(Enum(ProbeResult), nullable=False)
     latency_ms = Column(Integer, nullable=True)
     observed_at = Column(DateTime, default=utcnow, index=True)
@@ -365,14 +360,6 @@ class HealthProbe(Base):
 
 
 class ApiToken(Base):
-    """Scoped API token for non-admin callers (probe rigs, node collectors).
-
-    Only the SHA-256 hash of the token is stored — the plaintext is shown
-    once at creation time and never again. ``scopes`` is a list of string
-    capabilities (e.g. ``probe:read``, ``probe:write``, ``traffic:write``);
-    the admin token is treated as having all scopes without a row here.
-    """
-
     __tablename__ = "api_tokens"
 
     id = Column(Integer, primary_key=True)
@@ -394,6 +381,26 @@ class AuditLog(Base):
     target_type = Column(String, nullable=False)
     target_id = Column(Integer, nullable=True)
     created_at = Column(DateTime, default=utcnow)
-    # `metadata` is reserved by SQLAlchemy Declarative; expose as `extra`
-    # but keep the column name for backward compat with existing DBs.
     extra = Column("metadata", JSONB, nullable=True)
+
+
+class ReferralCode(Base):
+    """Referral invite code owned by a user.
+
+    When a new user registers via a referral link containing this code,
+    the invitee gets ``bonus_days`` added to their first subscription and
+    the owner gets ``reward_days`` added to their active subscription.
+    """
+    __tablename__ = "referral_codes"
+
+    id = Column(Integer, primary_key=True)
+    owner_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    code = Column(String(32), unique=True, nullable=False, index=True)
+    bonus_days = Column(Integer, default=3)
+    reward_days = Column(Integer, default=3)
+    uses = Column(Integer, default=0)
+    max_uses = Column(Integer, nullable=True)
+    is_active = Column(Boolean, default=True)
+    created_at = Column(DateTime, default=utcnow)
+
+    owner = relationship("User", back_populates="referral_codes", foreign_keys=[owner_id])
