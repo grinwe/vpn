@@ -1,7 +1,11 @@
-ansible_user: root
-db_docker_dir: /opt/vpn-db
-backend_docker_dir: /opt/vpn-backend
-# REQUIRED: Replace with a strong password or use ansible-vault
-postgres_password: "{{ vault_postgres_password | default('CHANGE_ME') }}"
-backend_image: "vpn-backend:latest"
-backend_port: 8000
+# Dead legacy group_vars. Matches a non-existent "db" group — the real
+# DB lives inside the app-stack docker-compose on the web host now, so
+# these variables are not consumed by any play. Kept commented out as
+# a reference in case we split the DB onto a dedicated host later.
+#
+# ansible_user: root
+# db_docker_dir: /opt/vpn-db
+# backend_docker_dir: /opt/vpn-backend
+# postgres_password: "{{ vault_postgres_password | default('CHANGE_ME') }}"
+# backend_image: "vpn-backend:latest"
+# backend_port: 8000

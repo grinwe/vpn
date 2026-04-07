@@ -70,7 +70,22 @@ del_shadowtls_ss() {
     exit 1
   fi
 
+  # Read PORT before removing the file so we can drop active sockets.
+  local port
+  port=$(awk -F= '/^PORT=/{print $2}' "${user_file}" | tr -d '\r\n')
+
   rm -f "${user_file}"
+
+  # Force-disconnect everyone currently connected to that listening port.
+  # This kills the *port*, not just the user — but other valid users will
+  # immediately reconnect with their cached creds, while the just-removed
+  # user's keys are gone from disk and will be rejected. Without this an
+  # already-established TCP session for a paid-up user could outlive their
+  # subscription by hours/days, depending on idle timeouts.
+  if [[ -n "${port}" ]] && command -v ss >/dev/null 2>&1; then
+    ss -K dst ":${port}" 2>/dev/null || true
+    ss -K src ":${port}" 2>/dev/null || true
+  fi
 }
 
 main() {

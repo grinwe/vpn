@@ -1,0 +1,19 @@
+# {{ ansible_managed }}
+#
+# Tell nginx to trust Cloudflare's edge IPs as proxies and to read the
+# real client IP from the CF-Connecting-IP header. Without this every
+# log line and slowapi/limit_req bucket is keyed by a CF edge address,
+# which is useless for abuse tracking and tanks per-user rate limits.
+#
+# The CIDR lists are fetched from cloudflare.com/ips-v{4,6} by the
+# ansible role at deploy time. Re-run the role to refresh them.
+
+{% for cidr in cf_ipv4.content.splitlines() if cidr | trim | length > 0 %}
+set_real_ip_from {{ cidr | trim }};
+{% endfor %}
+{% for cidr in cf_ipv6.content.splitlines() if cidr | trim | length > 0 %}
+set_real_ip_from {{ cidr | trim }};
+{% endfor %}
+
+real_ip_header CF-Connecting-IP;
+real_ip_recursive on;

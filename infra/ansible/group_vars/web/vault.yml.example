@@ -34,3 +34,9 @@ vault_admin_ids: "111111111,222222222"
 # Shared secret for Telegram Stars webhook HMAC. Leave empty if
 # you're not using Stars as a payment provider.
 vault_telegram_stars_webhook_secret: ""
+
+# Cloudflare API token used by certbot-dns-cloudflare for the DNS-01
+# ACME challenge. Scope it to Zone → DNS → Edit on the target zone
+# only (do NOT use a Global API Key). Create at
+# https://dash.cloudflare.com/profile/api-tokens.
+vault_cloudflare_api_token: "replace-me-cf-dns-edit-token"

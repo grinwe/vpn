@@ -4,6 +4,10 @@
 deploy_web_frontend_domain: "grinwer.online"
 deploy_web_frontend_letsencrypt_email: "adept38@gmail.com"
 
+# Cloudflare API token for DNS-01 ACME challenge. Needs
+# Zone → DNS → Edit on the grinwer.online zone. Stored in the vault.
+deploy_web_frontend_cloudflare_api_token: "{{ vault_cloudflare_api_token | default('') }}"
+
 # App stack lives on the same host for now. Override any of the
 # deploy_app_stack_* defaults here; secrets come from vault.yml next
 # to this file.
