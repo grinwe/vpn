@@ -1,142 +1,178 @@
 # Deployment Guide
 
+Порядок выкатки с нуля на prod-хост: backend+bot+webapp+admin в docker-compose, публичный nginx+TLS через Ansible, и первая VPN-нода через Admin UI.
+
 ## Prerequisites
 
-- Docker + Docker Compose v2
-- Domain with Cloudflare DNS (for VLESS+WS+CDN)
-- SSH access to VPN nodes
-- PostgreSQL 16+
-- Redis 7+
+- Docker + Docker Compose v2 на управляющем хосте (там, где крутится бэкенд)
+- Отдельная VPN-нода (или несколько) — чистая Ubuntu 22.04/24.04, root-доступ по SSH
+- Домен с DNS, которым ты управляешь (для backend API + отдельный хост для каждой ноды, если используешь `SUB_LINK_BASE_URL`)
+- PostgreSQL 16+ и Redis 7+ — они подняты compose'ом, если не выносишь в managed
 
-## Initial Setup
-
-### 1. Clone and configure
+## 1. Clone and configure
 
 ```bash
-git clone <repo-url> vpn
-cd vpn
+git clone <repo-url> /opt/vpn
+cd /opt/vpn
 cp .env.example .env
-# Edit .env with your secrets
 ```
 
-### 2. Generate encryption key
+Отредактируй `.env` — минимально обязательные секреты см. в [README.md](../README.md#environment-variables). Критично не пропустить:
+
+| Переменная | Почему критично |
+|------------|-----------------|
+| `APP_SECRET_KEY` | Fernet-ключ, которым шифруются секреты (credentials, provider tokens). Если сгенерируешь заново на уже живой БД — старые секреты не расшифруются. **Бэкапь**. |
+| `ADMIN_API_TOKEN` | Единый общий токен. Его же использует бот для походов в бэкенд. Для людей-админов сразу после старта заведи отдельные scoped tokens через страницу `/admin/tokens`. |
+| `WEBAPP_JWT_SECRET` | HMAC для WebApp-сессии. Если ротируешь — все открытые WebApp'ы выкинет в re-auth. |
+| `BOT_TOKEN` | От @BotFather |
+| `PROVISIONING_SSH_KEY` | **См. раздел «Provisioning SSH key» ниже.** Без него create-node сработает, а bootstrap упадёт. |
+
+### 1a. Генерация `APP_SECRET_KEY`
 
 ```bash
 python3 -c "import secrets; print(secrets.token_urlsafe(32))"
-# Set as APP_SECRET_KEY in .env
 ```
 
-### 3. Start services
+## 2. Provisioning SSH key
+
+Backend и worker ходят на VPN-ноды по SSH, чтобы гонять ansible. Нужен отдельный ed25519 keypair:
 
 ```bash
-docker-compose up -d
+mkdir -p /opt/vpn/secrets
+chmod 700 /opt/vpn/secrets
+ssh-keygen -t ed25519 -f /opt/vpn/secrets/provisioning_key -N '' -C 'provisioning@grinwer'
+chmod 600 /opt/vpn/secrets/provisioning_key
 ```
 
-### 4. Create initial plan
+В `.env`:
+
+```
+PROVISIONING_SSH_KEY=/opt/vpn/secrets/provisioning_key
+```
+
+Он монтируется в **worker**-контейнер как `/run/secrets/provisioning_key` (см. `docker-compose.yml`). Если переменная не выставлена — compose по умолчанию маунтит `/dev/null` и ansible упадёт на первом же запуске без внятной ошибки.
+
+Публичная часть ключа (`provisioning_key.pub`) должна быть прописана в `authorized_keys` каждой VPN-ноды. Первичная установка — руками при заказе ноды, дальше роль `bootstrap_node` сама держит список из [infra/ansible/group_vars/vpn_nodes.yml](../infra/ansible/group_vars/vpn_nodes.yml) (`ssh_public_keys`) в актуальном состоянии.
+
+Проверка, что ключ реально виден worker'ом:
 
 ```bash
-curl -X POST http://localhost:8000/api/plans \
-  -H "X-Admin-Token: $ADMIN_API_TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{"name": "Basic 1m", "duration_days": 30, "price": 2.15, "max_devices": 2}'
+docker compose exec worker sh -c 'ls -la /run/secrets/provisioning_key && ssh -i /run/secrets/provisioning_key -o StrictHostKeyChecking=no root@<node-ip> echo OK'
 ```
 
-### 5. Create annual plan (with discount)
+## 3. Start services
 
 ```bash
-curl -X POST http://localhost:8000/api/plans \
-  -H "X-Admin-Token: $ADMIN_API_TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{"name": "Basic 12m", "duration_days": 365, "price": 16.00, "max_devices": 2}'
+docker compose up -d
+docker compose logs -f backend worker
 ```
 
-## Adding a VPN Node
+Backend применяет Alembic миграции на старте автоматически. Если что-то падает — смотри этот лог до того как идти дальше.
 
-### 1. Register the node
+## 4. Public nginx + TLS
+
+Поверх compose'а, на том же хосте, Ansible роль `deploy_web_frontend` ставит системный nginx с Let's Encrypt и проксирует:
+
+- `/api/*` → `127.0.0.1:8000` (backend)
+- `/admin/*` → `127.0.0.1:8080` (admin SPA)
+- `/app/*` → `127.0.0.1:8082` (webapp SPA)
 
 ```bash
-curl -X POST http://localhost:8000/api/nodes \
-  -H "X-Admin-Token: $ADMIN_API_TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "name": "nl-hetzner-01",
-    "region": "eu",
-    "host": "1.2.3.4",
-    "ssh_port": 22,
-    "pool_id": 1
-  }'
+cd infra/ansible
+ansible-playbook -i inventories/prod/hosts.yml site.yml --tags web
 ```
 
-### 2. Add VPN configs (protocols)
+Перед этим убедись, что `deploy_web_frontend_letsencrypt_email` в `group_vars/web.yml` корректен и DNS публичного домена (например `grinwer.online`) уже указывает на этот хост — иначе certbot упадёт.
 
-```bash
-# VLESS Reality (generate keys first via backend)
-curl -X POST http://localhost:8000/api/nodes/1/configs \
-  -H "X-Admin-Token: $ADMIN_API_TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "name": "vless-reality",
-    "protocol": "vless-reality",
-    "port": 47443,
-    "sni": "www.asus.com",
-    "settings": {"dest": "www.asus.com:443"}
-  }'
+**DNS-режим backend-домена:** `grinwer.online` (или аналог) — **Proxied** в Cloudflare (оранжевое облачко). Это HTTP(S)-трафик, CF даёт DDoS-защиту и кеширует статику admin/webapp.
 
-# VLESS+WS+CDN (requires Cloudflare setup)
-curl -X POST http://localhost:8000/api/nodes/1/configs \
-  -H "X-Admin-Token: $ADMIN_API_TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "name": "vless-ws-cdn",
-    "protocol": "vless-ws-cdn",
-    "port": 443,
-    "sni": "vpn.example.com",
-    "settings": {"ws_path": "/ws", "cdn_domain": "vpn.example.com"}
-  }'
+## 5. Create initial plans
 
-# Hysteria2
-curl -X POST http://localhost:8000/api/nodes/1/configs \
-  -H "X-Admin-Token: $ADMIN_API_TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "name": "hysteria2",
-    "protocol": "hysteria2",
-    "port": 8443,
-    "sni": "vpn.example.com",
-    "settings": {"obfs": "salamander", "obfs_password": "your-secret"}
-  }'
-```
+Через Admin UI: открой `https://<your-domain>/admin/`, залогинься по `ADMIN_API_TOKEN`, перейди в **Plans** → кнопка «+ Добавить тариф».
 
-### 3. Provision the node
+Минимум один visible 30-day план нужен для работы **trial-системы** (она читает из БД цену самого дешёвого visible 30-day плана — см. [TRIAL_SYSTEM.md](TRIAL_SYSTEM.md#activation-flow)).
 
-```bash
-# Run site.yml against the node
-ansible-playbook -i inventories/prod infra/ansible/site.yml --limit nl-hetzner-01
-```
+Рекомендуемая стартовая сетка:
 
-## Cloudflare Setup (for VLESS+WS+CDN)
+| Name | duration_days | price (₽) | max_devices | is_visible |
+|------|---------------|-----------|-------------|------------|
+| Basic 1m | 30 | 150 | 2 | ✓ |
+| Basic 12m | 365 | 1200 | 2 | ✓ |
 
-1. Add your domain to Cloudflare
-2. Create A record pointing to VPN node IP (proxied / orange cloud)
-3. SSL/TLS → Full (Strict)
-4. Create origin certificate in Cloudflare → install on node
-5. Network → WebSockets → Enabled
+## 6. Adding a VPN Node (Admin UI)
 
-## Auto-Renewal Setup
+**Весь процесс — через Admin UI**, никаких curl. Backend сам enqueue'ит provisioning-таску в worker'а, которая гоняет `site.yml` против ноды.
 
-The worker automatically:
-- Checks for expiring subscriptions every hour (configurable: `RENEWAL_CHECK_INTERVAL`)
-- Creates renewal invoices for auto-renew subscribers 3 days before expiry
-- Sends reminders to non-auto-renew users
-- Expires overdue subscriptions
+### Pre-flight на ноде
 
-## Dynamic Subscription Links
+1. Чистая Ubuntu 22.04/24.04, root SSH, **публичный ключ из `/opt/vpn/secrets/provisioning_key.pub` уже в `/root/.ssh/authorized_keys`**.
+2. DNS для этой ноды (например `n1.grinwer.online`) указывает A-записью на IP. **Для VPN-нод это должно быть DNS-only (серое облачко в Cloudflare), не Proxied.** Cloudflare проксирует только HTTP(S), а ShadowTLS/VLESS Reality/Hysteria2 он либо заблокирует, либо MITM'нет TLS. Единственное исключение — протокол **VLESS+WS+CDN**, который специально живёт через CF proxy; но и тогда на этой ноде должен быть отдельный DNS-ресурс в Proxied режиме, а SSH/основной хост — DNS-only.
+3. Порты, которые нужно открыть на файрволле провайдера: `22` (SSH), `443`, `8443`, `9443` (см. [group_vars/vpn_nodes.yml](../infra/ansible/group_vars/vpn_nodes.yml) `firewall_allowed_ports`). Роль `bootstrap_node` также ставит ufw на самой ноде.
 
-Set `SUB_LINK_BASE_URL` (e.g., `https://vpn.example.com/sub`) and users get a stable
-URL that auto-updates when their server changes. Compatible with Hiddify, v2rayNG,
-Streisand, and other clients that support subscription import.
+### Регистрация ноды
 
-## Monitoring
+1. `/admin/nodes` → **+ Добавить ноду**.
+2. Заполни форму:
+   - **Имя** — уникальное, kebab-case: `fr-pq-01`, `nl-hetzner-02`
+   - **Регион** — логический тег: `eu-west`, `eu-north`. Используется в UI при выборе тарифа.
+   - **Host** — IP или DNS-имя
+   - **SSH port** — обычно `22`
+   - **Pool ID** — опционально, если используешь autoscale-пулы (см. [ROADMAP_WEBAPP.md](ROADMAP_WEBAPP.md#этап-5))
+3. **Создать + bootstrap**. Статус ноды: `registering` → (через 3-5 минут) → `active`. Таблица авто-рефрешится раз в 5 секунд.
+4. Если застряло в `error` — открой `/admin/tasks` (TODO: этап 2.75) или `docker compose logs worker --tail 200`, ищи traceback от ansible-runner.
 
-Business metrics are available via the Grafana dashboard at `docs/dashboards/business-metrics.json`.
-Import it into your Grafana instance to track MRR, churn, LTV, and other KPIs.
+### Добавить конфиги протоколов
+
+В той же таблице `/admin/nodes` клик на строку ноды разворачивает панель «Конфиги протоколов». Кнопка **+ Добавить конфиг**:
+
+- **shadowtls+shadowsocks** — основной протокол, порт `8443`, SNI `www.cloudflare.com`. Ничего больше заполнять не нужно — роль `install_shadowtls_stack` генерит пароли сама.
+- **vless-reality** — порт `9443`, SNI `www.asus.com` (по дефолту). Ключи генерятся бэкендом автоматически, если оставить `public_key` пустым.
+- **vless-ws-cdn** — порт `443`, требует отдельного Cloudflare-сетапа (см. ниже). Подходит для случаев, когда DPI режет всё остальное.
+- **hysteria2** — UDP/QUIC, порт `8443`. На мобильных бывает нестабилен.
+
+Рекомендованный минимум на каждой ноде: **shadowtls+shadowsocks** (primary). Остальные — по мере необходимости.
+
+После добавления конфига warm-pool инвалидируется для этой ноды, и warmer'у нужно несколько тиков, чтобы пересобрать предсгенерированные credential-бандлы под новый набор протоколов ([см. warm pool](../README.md#key-features)).
+
+## 7. Cloudflare setup для VLESS+WS+CDN (опционально)
+
+Только если хочешь поднять `vless-ws-cdn` конфиг — т.е. трафик через CF-прокси:
+
+1. Добавь домен в Cloudflare (если ещё нет).
+2. Создай отдельную A-запись для этой ноды (например `cdn-n1.grinwer.online`) → IP ноды, **Proxied (оранжевое облачко)**.
+3. SSL/TLS → **Full (Strict)**.
+4. Сгенерируй Origin certificate в Cloudflare (Origin Server → Create Certificate) и установи на ноду — роль `install_vless_ws_cdn` умеет это, если прокинуть сертификат через vault.
+5. Network → WebSockets → **Enabled**.
+
+**Важно:** основной SSH/admin-хост ноды (`n1.grinwer.online`) всё равно должен быть DNS-only. Proxied режим — только для отдельной CDN-записи.
+
+## 8. Auto-renewal и balance billing
+
+Worker автоматически:
+
+- **Hourly balance tick** (`BALANCE_CHARGE_INTERVAL`, default 3600s) — для каждой активной подписки списывает `daily_rate × devices / 24`. Anchor-based, не дрейфует при пропущенных тиках. Подписки с балансом ≤ 0 фризятся.
+- **Trial expiry tick** — warning за `TRIAL_EXPIRY_WARN_DAYS` до истечения триала, clawback на истечении если юзер не стал платящим. Полная механика — [TRIAL_SYSTEM.md](TRIAL_SYSTEM.md).
+- **Legacy renewal cron** (`RENEWAL_CHECK_INTERVAL`) — создаёт auto-renewal инвойсы для старой модели подписок на 3 дня до истечения. Новые юзеры идут через balance-billing, но старые подписки ещё живы на этом пути.
+- **Autoscale tick** (`AUTOSCALE_INTERVAL`) — если `AUTOSCALE_DOWNSCALE_ENABLED=1`, дополнительно drain-tick (`DRAIN_TICK_INTERVAL`).
+
+Всё это живёт в [backend/app/worker.py](../backend/app/worker.py) — один `run_balance_charge_tick()` + отдельные phase'ы.
+
+## 9. Dynamic subscription links
+
+Выстави `SUB_LINK_BASE_URL=https://<domain>/sub` в `.env`. Пользователи получают стабильный URL, который auto-update'ится при миграции юзера на другую ноду (drain, downscale, auto-migration). Совместимо с Hiddify, v2rayNG, Streisand, Nekoray, Shadowrocket.
+
+## 10. Monitoring
+
+- **Prometheus metrics**: `GET /metrics` на backend'е. Основные: `vpn_autoscale_*`, `vpn_warm_pool_*`, `vpn_balance_*`, стандартные FastAPI/HTTP метрики.
+- **Grafana dashboard**: `docs/dashboards/business-metrics.json` — импортируй в Grafana, тянет MRR, churn, LTV, warm-pool depth.
+- **Audit log**: `audit_log` таблица в БД. Каждое админ-действие, trial activation, referral attribution, provisioning-таска, revoke.
+
+## Troubleshooting
+
+| Симптом | Где смотреть |
+|---------|--------------|
+| Nodes list даёт 500 | `docker compose logs backend --tail 200` + `docker compose exec backend python -c "..."` прямой pydantic-тест |
+| Create node → statuses stuck `registering` | `docker compose logs worker --tail 200` — ищи ansible traceback. Чаще всего — `PROVISIONING_SSH_KEY` не примонтирован или pub-key не в authorized_keys ноды. |
+| WebApp показывает «Откройте через бота заново» | JWT протух (30 мин) или `WEBAPP_JWT_SECRET` сменился — нужно перезайти из бот-кнопки. |
+| Bot не доставляет trial warning | `SELECT * FROM audit_log WHERE action LIKE 'trial_expiry_warning%' ORDER BY id DESC LIMIT 5` — если там нет новых, tick не отработал; если есть `:delivered` — уже доставил. |
+| Balance charge не списывает | `SELECT * FROM balance_transactions ORDER BY id DESC LIMIT 20` — смотри когда последний spend; tick живёт в `worker` контейнере, не в backend. |

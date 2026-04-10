@@ -66,11 +66,13 @@ export default function CheckoutPending({ invoiceId }: { invoiceId: number }) {
               ? "Долго отвечаем"
               : "Активируем подписку…"}
       </h1>
-      <Steps stage={stage} />
+      <div className="card w-full mt-4">
+        <Steps stage={stage} />
+      </div>
       {stage === "ready" && (
         <button
           onClick={() => navigate({ name: "home" })}
-          className="mt-6 w-full py-3 rounded-xl bg-tg-button text-tg-buttonText font-semibold"
+          className="btn-primary w-full mt-6"
         >
           Открыть мой кабинет
         </button>
@@ -84,7 +86,7 @@ export default function CheckoutPending({ invoiceId }: { invoiceId: number }) {
           </p>
           <button
             onClick={() => navigate({ name: "home" })}
-            className="mt-4 text-tg-link"
+            className="btn-ghost w-full mt-4"
           >
             Вернуться на главную
           </button>
@@ -113,7 +115,7 @@ function Steps({ stage }: { stage: Stage }) {
     },
   ];
   return (
-    <ul className="text-left space-y-2 mt-4">
+    <ul className="text-left space-y-2">
       {items.map((it) => (
         <li key={it.label} className="flex items-center gap-2 text-sm">
           <span>

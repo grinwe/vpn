@@ -13,7 +13,17 @@ from .config import (
     SUB_LINK_BASE_URL,
     TELEGRAM_STARS_WEBHOOK_SECRET,
 )
-from .keyboards import start_keyboard, onboarding_keyboard, webapp_inline_keyboard
+from .keyboards import (
+    BTN_HELP,
+    BTN_INVITE,
+    BTN_MAIN_MENU,
+    help_back_keyboard,
+    help_keyboard,
+    onboarding_keyboard,
+    start_keyboard,
+    webapp_inline_keyboard,
+    welcome_action_keyboard,
+)
 
 router = Router()
 logger = logging.getLogger(__name__)
@@ -125,6 +135,28 @@ ONBOARDING_INSTRUCTIONS = {
 
 # ── /start ──
 
+_TRIAL_LINE = "🎁 Первый месяц — в подарок. Забери в личном кабинете.\n\n"
+
+
+def format_welcome(name: str, is_new: bool, trial_available: bool) -> str:
+    if is_new:
+        body = (
+            f"👋 Привет, {name}!\n\n"
+            "🚀 Быстрый VPN без танцев с настройками:\n"
+            "• Работает там, где другие отвалились — обход блокировок на уровне протокола\n"
+            "• Оплата прямо в Telegram, без карт и регистраций\n"
+            "• Один тариф — до 5 устройств одновременно\n"
+            "• Поддержка отвечает в чате, не роботом\n\n"
+        )
+    else:
+        body = f"👋 Рад снова видеть, {name}!\n\n"
+    if trial_available:
+        body += _TRIAL_LINE
+    body += "Выбери действие ниже 👇"
+    return body
+
+
+@router.message(F.text == BTN_MAIN_MENU)
 @router.message(CommandStart())
 async def cmd_start(message: types.Message):
     # Check for referral deep link: /start ref_XXXXX
@@ -133,42 +165,43 @@ async def cmd_start(message: types.Message):
     if len(args) > 1 and args[1].startswith("ref_"):
         referral_code = args[1][4:]
 
-    # Register user (and apply referral if present)
+    # Register user (and apply referral if present). Backend returns
+    # {"created": bool} so we can pick a new-vs-returning welcome copy.
+    # Failures are still best-effort — worst case we greet them as
+    # returning; they'll be created on first purchase anyway.
     register_payload = {"telegram_id": str(message.from_user.id)}
     if referral_code:
         register_payload["referral_code"] = referral_code
 
+    is_new = False
+    trial_available = False
     try:
-        await _fetch_json(
+        _status, data = await _fetch_json(
             "POST",
             f"{BACKEND_URL}/api/users/register",
             json=register_payload,
             headers=_admin_headers(message.from_user.id),
         )
+        is_new = bool(data and data.get("created"))
+        trial_available = bool(data and data.get("trial_available"))
     except Exception:
-        pass  # Registration is best-effort; user will be created on first purchase
+        pass
 
-    await message.answer(
-        "Привет! Это VPN-сервис.\n\n"
-        "Доступные протоколы: VLESS Reality, VLESS+WS+CDN, ShadowTLS+SS, Hysteria2.\n\n"
-        "Используй кнопки ниже или команды:\n"
-        "/plans — выбрать тариф\n"
-        "/config — получить конфиг\n"
-        "/status — статус подписки\n"
-        "/renew — продлить подписку\n"
-        "/referral — реферальная ссылка",
-        reply_markup=start_keyboard(),
+    first_name = message.from_user.first_name or "друг"
+    welcome = format_welcome(first_name, is_new, trial_available)
+
+    # Telegram allows only one reply_markup per message, so we send two:
+    #   1) Welcome + inline action keyboard (WebApp button + quick actions)
+    #   2) Tiny nudge + persistent reply keyboard (always at the bottom,
+    #      for both new and returning users — returning users complained
+    #      the bottom buttons disappeared).
+    await message.answer(welcome, reply_markup=welcome_action_keyboard())
+    hint = (
+        "⌨️ Кнопки внизу всегда под рукой. Если что-то сломалось — жми /help."
+        if is_new
+        else "⌨️ Кнопки внизу всегда под рукой."
     )
-
-    # One-tap entry into the WebApp right after onboarding. The persistent
-    # Menu Button (configured in BotFather) covers all subsequent visits;
-    # this inline button just shortens the very first interaction.
-    webapp_kb = webapp_inline_keyboard()
-    if webapp_kb is not None:
-        await message.answer(
-            "🔐 Личный кабинет — все подписки, конфиги и оплата в одном окне.",
-            reply_markup=webapp_kb,
-        )
+    await message.answer(hint, reply_markup=start_keyboard())
 
 
 # ── /plans ──
@@ -572,8 +605,80 @@ async def toggle_auto_renew(callback_query: types.CallbackQuery):
         await callback_query.answer("Не удалось включить автопродление", show_alert=True)
 
 
+# ── /balance — текущий баланс и runway ──
+
+@router.message(F.text == "Баланс")
+@router.message(Command("balance"))
+async def cmd_balance(message: types.Message):
+    """Show balance + days remaining + a deep-link into the WebApp.
+
+    Stage 4: this is the primary "how much money do I have" surface
+    outside the WebApp. Topup happens through the WebApp because Stars
+    invoice flow is much smoother there than via inline buttons.
+    """
+    try:
+        status_code, data = await _fetch_json(
+            "GET",
+            f"{BACKEND_URL}/api/users/by_telegram/{message.from_user.id}/balance",
+            headers=_admin_headers(message.from_user.id),
+        )
+    except aiohttp.ClientError:
+        await message.answer("Бэкенд недоступен.")
+        return
+
+    if status_code == 404:
+        await message.answer(
+            "У вас ещё нет аккаунта — нажмите /start, потом выберите тариф."
+        )
+        return
+    if status_code != 200 or not data:
+        await message.answer("Не удалось получить баланс. Попробуйте позже.")
+        return
+
+    balance_rub = data.get("balance_rub", 0)
+    min_days = data.get("min_days_remaining")
+    subs = data.get("subscriptions", [])
+
+    lines = [f"💰 <b>Баланс: {balance_rub:.0f} ₽</b>"]
+    if min_days is not None:
+        if min_days <= 3:
+            lines.append(f"⚠️ Хватит на <b>{min_days} дн.</b> — пора пополнить!")
+        else:
+            lines.append(f"Хватит примерно на <b>{min_days} дн.</b>")
+    lines.append("")
+
+    if subs:
+        lines.append("<b>Активные подписки:</b>")
+        for s in subs:
+            cost = s.get("daily_cost_kopecks")
+            next_charge = s.get("next_charge_at")
+            status = s.get("status")
+            badge = "🟢" if status == "active" else "❄️" if status == "frozen" else "•"
+            cost_str = f"{cost / 100:.0f} ₽/день" if cost else "—"
+            if next_charge and status == "active":
+                from datetime import datetime as _dt
+                try:
+                    nxt = _dt.fromisoformat(next_charge)
+                    charge_str = f" · след. списание {nxt.strftime('%d.%m %H:%M')}"
+                except (ValueError, TypeError):
+                    charge_str = ""
+            else:
+                charge_str = ""
+            lines.append(f"{badge} {s['plan_name']} — {cost_str}{charge_str}")
+    else:
+        lines.append("Нет активных подписок. Нажмите /plans, чтобы выбрать тариф.")
+
+    webapp_kb = webapp_inline_keyboard()
+    await message.answer(
+        "\n".join(lines),
+        parse_mode="HTML",
+        reply_markup=webapp_kb,
+    )
+
+
 # ── /referral — реферальная ссылка ──
 
+@router.message(F.text == BTN_INVITE)
 @router.message(F.text == "Реферальная ссылка")
 @router.message(Command("referral"))
 async def cmd_referral(message: types.Message):
@@ -597,10 +702,12 @@ async def cmd_referral(message: types.Message):
     bot_info = await message.bot.get_me()
     ref_link = f"https://t.me/{bot_info.username}?start=ref_{code}"
 
+    # Stage 4: реферал теперь через денежный бонус, не через дни.
+    # Сумма берётся из бэкенда (REFERRAL_BONUS_KOPECKS, дефолт 50 ₽).
     await message.answer(
         f"🎁 <b>Твоя реферальная ссылка:</b>\n\n"
         f"<code>{ref_link}</code>\n\n"
-        f"Приглашённый получает +3 дня бесплатно, ты тоже получаешь +3 дня.\n"
+        f"Приглашённый получает <b>+50 ₽ на баланс</b>, ты — <b>+50 ₽</b>.\n"
         f"Приглашено: {uses} чел.",
         parse_mode="HTML",
     )
@@ -724,3 +831,120 @@ async def mark_invoice_paid(callback_query: types.CallbackQuery):
             chat_id=user_id,
             text="✅ Счет оплачен! Конфиг будет готов через минуту. Используй /config.",
         )
+
+
+# ── /help — support and FAQ ──
+
+_HELP_INTRO = (
+    "🛟 Чем помочь?\n\n"
+    "Выбери раздел ниже — там пошаговые инструкции. "
+    "Если ничего не помогло, напиши в поддержку, мы отвечаем живыми людьми."
+)
+
+_HELP_CABINET = (
+    "🔐 Кабинет не открывается — попробуй по порядку:\n\n"
+    "👉 Если ты на Wi-Fi — выключи его и зайди через мобильный интернет (или наоборот)\n"
+    "👉 Попробуй открыть кабинет с включённым VPN — иногда провайдер режет наш домен\n"
+    "👉 Длинное нажатие на кнопку «Открыть личный кабинет» → «Открыть в браузере» — откроется в Chrome/Safari\n"
+    "👉 Обнови страницу (меню браузера → ⟳)\n"
+    "👉 Полностью закрой Telegram и открой заново\n\n"
+    "Если не помогло — жми «Связаться с поддержкой» внизу."
+)
+
+_HELP_VPN = (
+    "🌐 VPN не подключается или тормозит — чек-лист:\n\n"
+    "👉 Проверь баланс в личном кабинете — при 0 ₽ доступ блокируется\n"
+    "👉 Обнови клиент (Hiddify / v2rayNG / Streisand) до последней версии в сторе\n"
+    "👉 В настройках устройства выключи другие VPN-профили — два VPN одновременно работать не будут\n"
+    "👉 Перезагрузи телефон — помогает чаще, чем кажется\n"
+    "👉 В клиенте удали старый профиль и импортируй конфиг заново из кабинета\n"
+    "👉 Проверь, что у тебя активна подписка (в кабинете — раздел «Мои подписки»)\n\n"
+    "Если прошёл все шаги и всё ещё не работает — жми «Связаться с поддержкой», "
+    "приложи скриншот клиента и модель телефона."
+)
+
+
+@router.message(F.text == BTN_HELP)
+@router.message(Command("help"))
+async def cmd_help(message: types.Message):
+    await message.answer(_HELP_INTRO, reply_markup=help_keyboard())
+
+
+@router.callback_query(F.data == "help:cabinet")
+async def help_cabinet(callback_query: types.CallbackQuery):
+    await callback_query.answer()
+    await callback_query.message.answer(
+        _HELP_CABINET, reply_markup=help_back_keyboard()
+    )
+
+
+@router.callback_query(F.data == "help:vpn")
+async def help_vpn(callback_query: types.CallbackQuery):
+    await callback_query.answer()
+    await callback_query.message.answer(
+        _HELP_VPN, reply_markup=help_back_keyboard()
+    )
+
+
+# help:support handled by support_router in bot/support.py — it owns
+# the FSM state machine for the forward-to-admin / reply-back flow.
+
+
+@router.callback_query(F.data == "help:back")
+async def help_back(callback_query: types.CallbackQuery):
+    await callback_query.answer()
+    await callback_query.message.answer(_HELP_INTRO, reply_markup=help_keyboard())
+
+
+# ── Inline shortcuts from the /start welcome action keyboard ──
+
+@router.callback_query(F.data == "go:help")
+async def go_help(callback_query: types.CallbackQuery):
+    await callback_query.answer()
+    await callback_query.message.answer(_HELP_INTRO, reply_markup=help_keyboard())
+
+
+@router.callback_query(F.data == "go:start")
+async def go_start(callback_query: types.CallbackQuery):
+    """«🏠 Главное меню» из любого inline-меню — шорткат на /start."""
+    await callback_query.answer()
+    await cmd_start(callback_query.message.model_copy(update={
+        "from_user": callback_query.from_user,
+        "text": "/start",
+    }))
+
+
+@router.callback_query(F.data == "go:referral")
+async def go_referral(callback_query: types.CallbackQuery):
+    """Run the /referral flow from an inline button on the welcome msg.
+
+    cmd_referral reads message.from_user; from a callback that'd be the
+    bot itself, so we re-implement the same 3-line backend call here
+    against callback_query.from_user instead of refactoring the command.
+    """
+    await callback_query.answer()
+    user = callback_query.from_user
+    try:
+        status_code, data = await _fetch_json(
+            "POST",
+            f"{BACKEND_URL}/api/referral/code",
+            json={"telegram_id": str(user.id)},
+            headers=_admin_headers(user.id),
+        )
+    except aiohttp.ClientError:
+        await callback_query.message.answer("Бэкенд недоступен.")
+        return
+    if status_code != 200 or not data:
+        await callback_query.message.answer("Не удалось получить реферальную ссылку.")
+        return
+    code = data.get("code", "")
+    uses = data.get("uses", 0)
+    bot_info = await callback_query.bot.get_me()
+    ref_link = f"https://t.me/{bot_info.username}?start=ref_{code}"
+    await callback_query.message.answer(
+        f"🎁 <b>Твоя реферальная ссылка:</b>\n\n"
+        f"<code>{ref_link}</code>\n\n"
+        f"Приглашённый получает <b>+50 ₽ на баланс</b>, ты — <b>+50 ₽</b>.\n"
+        f"Приглашено: {uses} чел.",
+        parse_mode="HTML",
+    )

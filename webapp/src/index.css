@@ -4,21 +4,165 @@
 
 :root {
   /* Sensible dark defaults; overridden at runtime by Telegram themeParams. */
-  --tg-bg: #17212b;
+  --tg-bg: #0f1621;
   --tg-text: #f5f5f5;
   --tg-hint: #708499;
   --tg-link: #6ab3f3;
   --tg-button: #5288c1;
   --tg-button-text: #ffffff;
-  --tg-secondary-bg: #232e3c;
+  --tg-secondary-bg: #1a2533;
+
+  /* Accents used by the custom components below. Picked to look good on
+     top of --tg-bg without depending on the Telegram palette. If Telegram
+     pushes a wildly different theme at runtime these still read fine
+     because they're layered with low alpha. */
+  --accent-from: #5b8def;
+  --accent-to: #7c5bef;
+  --glow: rgba(91, 141, 239, 0.35);
 }
 
-html, body, #root {
-  height: 100%;
+/* Base dark color lives on <html> so it fills the whole scroll height
+   and any overscroll / safe-area zones. Body and #root are transparent
+   so the fixed aurora layer below can bleed through on every scroll
+   position. height:100% on body + z-index:-1 on ::before degrades on
+   iOS/Telegram WebView — the pseudo silently disappears behind body's
+   own background and the bottom of long pages goes flat dark. This
+   layout (html bg + stacking ::before above it, content on z-index 1)
+   works everywhere. */
+html {
+  min-height: 100%;
+  background: var(--tg-bg);
 }
 
 body {
   margin: 0;
+  min-height: 100%;
   font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
   -webkit-font-smoothing: antialiased;
+  color: var(--tg-text);
+  background: transparent;
+  position: relative;
+}
+
+body::before {
+  content: "";
+  position: fixed;
+  inset: 0;
+  z-index: 0;
+  pointer-events: none;
+  /* Sized in vw/vh so the radials always cover the actual viewport on
+     every device. Previous px-sized radials were small and pinned to
+     the corners (10%/-10%, 110%/10%, 50%/120%), which left the middle
+     of the viewport uncovered — user perceived it as "gradient only at
+     the top". Four overlapping blobs positioned across the whole
+     viewport guarantee the middle is also tinted. */
+  background:
+    radial-gradient(120vw 90vh at 0% 0%, rgba(91, 141, 239, 0.30), transparent 65%),
+    radial-gradient(120vw 90vh at 100% 25%, rgba(124, 91, 239, 0.25), transparent 65%),
+    radial-gradient(130vw 80vh at 50% 100%, rgba(91, 141, 239, 0.22), transparent 65%),
+    radial-gradient(100vw 100vh at 50% 50%, rgba(124, 91, 239, 0.10), transparent 70%);
+}
+
+#root {
+  position: relative;
+  z-index: 1;
+  min-height: 100%;
+}
+
+/* ── Reusable component classes ────────────────────────────────────
+   Named with `@layer components` so Tailwind utilities can still
+   override them per-instance (e.g. `className="card mt-6"`). */
+
+@layer components {
+  /* Card with subtle glass effect: dark translucent fill, soft inner
+     border, and a gentle shadow under. Replaces the flat
+     bg-tg-secondaryBg look. */
+  .card {
+    @apply rounded-2xl p-4;
+    background: linear-gradient(180deg, rgba(255, 255, 255, 0.04), rgba(255, 255, 255, 0.015));
+    border: 1px solid rgba(255, 255, 255, 0.06);
+    box-shadow:
+      0 1px 0 rgba(255, 255, 255, 0.04) inset,
+      0 8px 24px rgba(0, 0, 0, 0.25);
+    backdrop-filter: blur(6px);
+    -webkit-backdrop-filter: blur(6px);
+  }
+
+  /* Hero balance card — same base as .card but with a colored glow
+     behind it so the balance number feels like the centre of gravity. */
+  .card-hero {
+    @apply card relative overflow-hidden;
+  }
+  .card-hero::before {
+    content: "";
+    position: absolute;
+    inset: -40% -20% auto auto;
+    width: 280px;
+    height: 280px;
+    background: radial-gradient(circle, var(--glow), transparent 70%);
+    pointer-events: none;
+    z-index: 0;
+  }
+  .card-hero > * {
+    position: relative;
+    z-index: 1;
+  }
+
+  /* Danger variant: red glow for low-balance state. */
+  .card-hero.card-danger::before {
+    background: radial-gradient(circle, rgba(239, 68, 68, 0.35), transparent 70%);
+  }
+  .card-hero.card-danger {
+    border-color: rgba(239, 68, 68, 0.4);
+  }
+
+  /* Primary button: gradient fill with a soft glow underneath. */
+  .btn-primary {
+    @apply rounded-xl px-4 py-2.5 font-semibold transition-all;
+    background: linear-gradient(135deg, var(--accent-from), var(--accent-to));
+    color: var(--tg-button-text);
+    box-shadow: 0 6px 18px rgba(91, 141, 239, 0.35);
+  }
+  .btn-primary:hover {
+    transform: translateY(-1px);
+    box-shadow: 0 10px 24px rgba(91, 141, 239, 0.45);
+  }
+  .btn-primary:active {
+    transform: translateY(0);
+  }
+  .btn-primary:disabled {
+    opacity: 0.5;
+    transform: none;
+    box-shadow: none;
+  }
+
+  /* Ghost button: transparent with a thin border. Pairs with btn-primary. */
+  .btn-ghost {
+    @apply rounded-xl px-4 py-2.5 font-semibold transition-all;
+    background: rgba(255, 255, 255, 0.04);
+    border: 1px solid rgba(255, 255, 255, 0.1);
+    color: var(--tg-text);
+  }
+  .btn-ghost:hover {
+    background: rgba(255, 255, 255, 0.08);
+  }
+  .btn-ghost:disabled {
+    opacity: 0.5;
+  }
+
+  /* Tiny chip used for status badges. */
+  .chip {
+    @apply text-xs px-2 py-0.5 rounded-full font-medium;
+    border: 1px solid rgba(255, 255, 255, 0.08);
+  }
+}
+
+/* Soft fade-in for the page on first load — no layout shift, just a
+   quick polish to avoid the "hard pop" when Telegram opens the WebApp. */
+@keyframes fadeUp {
+  from { opacity: 0; transform: translateY(6px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+#root > * {
+  animation: fadeUp 280ms ease-out both;
 }

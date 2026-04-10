@@ -94,6 +94,50 @@
         "targets": [
           {"expr": "rate(vpn_renewal_revoked_total[1h])", "legendFormat": "revoked/h"}
         ]
+      },
+      {
+        "title": "Warm pool depth (per node)",
+        "description": "Stage 2.5 — number of warm credential bundles waiting on each node. Should hover near WARM_POOL_TARGET. If a node line drops to 0 and stays there, the warmer is failing (check ansible/SSH).",
+        "type": "timeseries",
+        "gridPos": {"h": 6, "w": 12, "x": 0, "y": 24},
+        "targets": [
+          {"expr": "vpn_warm_pool_depth", "legendFormat": "{{node}}"}
+        ],
+        "fieldConfig": {
+          "defaults": {
+            "thresholds": {
+              "mode": "absolute",
+              "steps": [
+                {"color": "red", "value": null},
+                {"color": "yellow", "value": 1},
+                {"color": "green", "value": 5}
+              ]
+            }
+          }
+        }
+      },
+      {
+        "title": "Warm pool: hits vs misses (rate)",
+        "description": "A miss means a paying user fell back to cold provisioning (60-120s wait). Sustained misses mean the pool can't keep up — raise WARM_POOL_TARGET or WARM_POOL_BATCH_PER_TICK.",
+        "type": "timeseries",
+        "gridPos": {"h": 6, "w": 12, "x": 12, "y": 24},
+        "targets": [
+          {"expr": "rate(vpn_warm_pool_hits_total[5m])", "legendFormat": "hits {{node}}"},
+          {"expr": "rate(vpn_warm_pool_misses_total[5m])", "legendFormat": "misses {{node}}"}
+        ]
+      },
+      {
+        "title": "Warm credential provisioning (p50/p95)",
+        "description": "How long the warmer takes to push one bundle to a node. p95 should stay under 60s — if it climbs, ansible/SSH is degrading.",
+        "type": "timeseries",
+        "gridPos": {"h": 6, "w": 24, "x": 0, "y": 30},
+        "targets": [
+          {"expr": "histogram_quantile(0.5, rate(vpn_warm_credential_provision_seconds_bucket[10m]))", "legendFormat": "p50 {{node}}"},
+          {"expr": "histogram_quantile(0.95, rate(vpn_warm_credential_provision_seconds_bucket[10m]))", "legendFormat": "p95 {{node}}"}
+        ],
+        "fieldConfig": {
+          "defaults": {"unit": "s"}
+        }
       }
     ],
     "time": {"from": "now-24h", "to": "now"},

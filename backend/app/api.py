@@ -1,11 +1,11 @@
 from datetime import timedelta
-import hmac
 import logging
 
 from .time_utils import utcnow
 from typing import Any
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, status
+from pydantic import BaseModel, Field
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
@@ -17,6 +17,8 @@ from .auth import (
     ALL_SCOPES,
     AuthPrincipal,
     generate_token,
+    optional_admin as optional_admin_token,
+    require_admin,
     require_scope,
 )
 from .config import get_settings
@@ -41,25 +43,6 @@ def get_db():
         yield db
     finally:
         db.close()
-
-
-def require_admin(x_admin_token: str | None = Header(default=None)) -> str:
-    """Simple admin authentication based on shared token header."""
-    if not settings.admin_api_token:
-        logger.error("ADMIN_API_TOKEN is not configured")
-        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="admin token missing")
-    if not x_admin_token or not hmac.compare_digest(
-        x_admin_token.encode("utf-8"),
-        settings.admin_api_token.encode("utf-8"),
-    ):
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="invalid admin token")
-    return x_admin_token
-
-
-def optional_admin_token(x_admin_token: str | None = Header(default=None)) -> str | None:
-    if x_admin_token:
-        return require_admin(x_admin_token)
-    return None
 
 
 def _audit(
@@ -345,6 +328,121 @@ def list_nodes(
     return [schemas.VPNNodeOut.from_orm(n) for n in nodes]
 
 
+@router.post("/nodes/{node_id}/resync")
+def resync_node_clients(
+    node_id: int,
+    db: Session = Depends(get_db),
+    admin_token: str = Depends(require_admin),
+    admin_actor: str | None = Header(default=None, alias=ADMIN_ACTOR_HEADER),
+):
+    """Force re-push of all active VLESS+Reality users onto a node.
+
+    Safety net for the "empty clients after site.yml" class of bugs:
+    if an operator suspects the node has drifted from the backend's
+    view of who's provisioned (e.g. after a manual config edit, a
+    restore-from-backup, or a half-broken bootstrap), this endpoint
+    enqueues a resync task that re-adds every active credential via
+    manage_vless_user.sh. The helper is idempotent so running this
+    in any node state is safe.
+    """
+    node = db.get(models.VPNNode, node_id)
+    if not node:
+        raise HTTPException(status_code=404, detail="Node not found")
+    orchestrator = ProvisioningOrchestrator(db)
+    task = orchestrator.resync_node_vless_clients(node)
+    actor, actor_type = _resolve_admin_actor(admin_actor)
+    _audit(
+        db,
+        actor,
+        "node_resync",
+        "vpn_node",
+        node.id,
+        metadata={"task_id": task.id if task else None},
+        actor_type=actor_type,
+    )
+    if not task:
+        return {"node_id": node.id, "task_id": None, "clients": 0}
+    return {
+        "node_id": node.id,
+        "task_id": task.id,
+        "clients": len((task.payload or {}).get("clients", [])),
+    }
+
+
+@router.post("/nodes/{node_id}/bootstrap")
+def rebootstrap_node(
+    node_id: int,
+    db: Session = Depends(get_db),
+    admin_token: str = Depends(require_admin),
+    admin_actor: str | None = Header(default=None, alias=ADMIN_ACTOR_HEADER),
+):
+    """Re-run site.yml against an existing node from scratch.
+
+    Use when you want to reapply the full ansible role stack to a node
+    — rolling out role changes, recovering from a half-broken manual
+    edit, rotating keys, etc. Creates a fresh ``bootstrap`` task (same
+    action the initial node creation uses) and hands it to the
+    orchestrator. The install_vless_reality role preserves existing
+    clients across re-renders, and the post-site.yml auto-resync
+    covers the edge case where it can't (see NODES.md § VLESS client
+    resync), so running this on a node with active users is safe.
+    """
+    node = db.get(models.VPNNode, node_id)
+    if not node:
+        raise HTTPException(status_code=404, detail="Node not found")
+    orchestrator = ProvisioningOrchestrator(db)
+    task = orchestrator.create_task(
+        "node", node.id, "bootstrap", {"pool_id": node.pool_id, "rerun": True}
+    )
+    db.commit()
+    orchestrator.run_task_async(task, node=node)
+    actor, actor_type = _resolve_admin_actor(admin_actor)
+    _audit(
+        db,
+        actor,
+        "node_bootstrap_rerun",
+        "vpn_node",
+        node.id,
+        actor_type=actor_type,
+        metadata={"task_id": task.id},
+    )
+    return {"node_id": node.id, "task_id": task.id}
+
+
+@router.post("/nodes/{node_id}/active", response_model=schemas.VPNNodeOut)
+def set_node_active(
+    node_id: int,
+    body: dict,
+    db: Session = Depends(get_db),
+    admin_token: str = Depends(require_admin),
+    admin_actor: str | None = Header(default=None, alias=ADMIN_ACTOR_HEADER),
+):
+    """Toggle ``is_active``. A node with ``is_active=False`` stays up but
+    is excluded from the scheduler in :func:`services.provisioning._pick_node`,
+    so new subscriptions won't land on it. Existing subs keep working.
+    Useful for staging a freshly-added node for manual testing before it
+    starts taking real traffic.
+    """
+    node = db.get(models.VPNNode, node_id)
+    if not node:
+        raise HTTPException(404, "Node not found")
+    if "is_active" not in body:
+        raise HTTPException(400, "is_active required")
+    node.is_active = bool(body["is_active"])
+    db.add(node)
+    db.commit()
+    db.refresh(node)
+    actor, actor_type = _resolve_admin_actor(admin_actor)
+    _audit(
+        db, actor, "node_set_active",
+        "vpn_node", node.id,
+        actor_type=actor_type,
+        metadata={"is_active": node.is_active},
+    )
+    db.commit()
+    return schemas.VPNNodeOut.from_orm(node)
+
+
 @router.post("/nodes/{node_id}/configs", response_model=schemas.VPNConfigOut)
 def create_config(
     node_id: int,
@@ -362,23 +460,146 @@ def create_config(
     except ValueError as exc:  # noqa: BLE001
         raise HTTPException(status_code=400, detail="Unknown protocol") from exc
 
-    config = models.VPNConfig(
-        node_id=node.id,
-        name=payload.name,
-        protocol=protocol,
-        port=payload.port,
-        sni=payload.sni,
-        public_key=payload.public_key,
-        fallback=payload.fallback,
-        settings=payload.settings,
-        is_enabled=payload.is_enabled,
+    # Only one config per protocol per node — the extra_vars collector
+    # and the ansible roles both assume this. Silently returning the
+    # existing row (as the idempotent helpers used to do) made the
+    # admin form look broken: operators hit "+ Добавить" and nothing
+    # changed. Fail loud instead; to replace a config, delete first.
+    existing_same_protocol = (
+        db.query(models.VPNConfig)
+        .filter(
+            models.VPNConfig.node_id == node.id,
+            models.VPNConfig.protocol == protocol,
+        )
+        .first()
     )
-    db.add(config)
-    db.commit()
-    db.refresh(config)
+    if existing_same_protocol is not None:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"Config for protocol {protocol.value} already exists on this node "
+                f"(id={existing_same_protocol.id}). Delete it first to replace."
+            ),
+        )
+
+    # VLESS Reality: if the admin left public_key empty we generate the
+    # whole keypair + short_id backend-side via the shared helper. The
+    # add-config form in the admin UI relies on this behavior (see
+    # admin/src/pages/Nodes.tsx comment on AddConfigForm).
+    if protocol == models.VPNConfigProtocol.vless_reality and not payload.public_key:
+        from .services.node_spawner import ensure_reality_config
+        config = ensure_reality_config(
+            db, node,
+            port=payload.port or None,
+            sni=payload.sni or None,
+            dest=payload.fallback or None,
+        )
+    # ShadowTLS+SS: backend owns both secrets (outer shadow-tls password
+    # and inner ss-rust PSK). The admin form only supplies port + SNI;
+    # passwords are generated here and stored encrypted.
+    elif protocol == models.VPNConfigProtocol.shadowtls_ss and not (
+        payload.settings or {}
+    ).get("ss_password_enc"):
+        from .services.node_spawner import ensure_shadowtls_config
+        config = ensure_shadowtls_config(
+            db, node,
+            port=payload.port or None,
+            handshake_domain=payload.sni or None,
+            name=payload.name or None,
+        )
+    else:
+        config = models.VPNConfig(
+            node_id=node.id,
+            name=payload.name,
+            protocol=protocol,
+            port=payload.port,
+            sni=payload.sni,
+            public_key=payload.public_key,
+            fallback=payload.fallback,
+            settings=payload.settings,
+            is_enabled=payload.is_enabled,
+        )
+        db.add(config)
+        db.commit()
+        db.refresh(config)
     actor, actor_type = _resolve_admin_actor(admin_actor)
     _audit(db, actor, "config_created", "vpn_config", config.id, actor_type=actor_type)
+    # Existing warm bundles were built against the previous protocol set;
+    # drop them so the warmer rebuilds with the new config included.
+    from .services import warm_pool
+    warm_pool.invalidate_node_warm_pool(db, node.id, reason="config added")
     return config
+
+
+@router.delete("/nodes/{node_id}/configs/{config_id}", status_code=204)
+def delete_config(
+    node_id: int,
+    config_id: int,
+    db: Session = Depends(get_db),
+    admin_token: str = Depends(require_admin),
+    admin_actor: str | None = Header(default=None, alias=ADMIN_ACTOR_HEADER),
+):
+    """Delete a VPN protocol config from a node.
+
+    Refuses if any Device still points at this config — those devices
+    would instantly break, and the admin should rotate them to another
+    node first. To force-delete, disable the config instead (clients
+    stop getting fresh URIs but existing ones keep working until the
+    node itself is reprovisioned).
+    """
+    config = db.get(models.VPNConfig, config_id)
+    if not config or config.node_id != node_id:
+        raise HTTPException(status_code=404, detail="Config not found")
+    # Only *live* devices block the delete. A revoked/disabled device
+    # still has ``config_id`` set (we never null it out on unbind) but
+    # it's terminal — the user is already off the node, so keeping the
+    # VPNConfig around for its sake is pointless.
+    device_count = (
+        db.query(models.Device)
+        .filter(
+            models.Device.config_id == config.id,
+            models.Device.status.notin_(
+                [models.DeviceStatus.revoked, models.DeviceStatus.disabled]
+            ),
+        )
+        .count()
+    )
+    if device_count > 0:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"{device_count} device(s) still bound to this config. "
+                "Rotate them to another node first, or disable the config."
+            ),
+        )
+    # Hard-delete terminal devices + their credentials that still point
+    # at this config. devices.config_id is NOT NULL so we can't just
+    # null it; and the 409 gate above already guarantees everything
+    # left here is revoked/disabled, so losing the rows is safe.
+    # Also null out any orphan Credential rows whose FK is nullable —
+    # no need to delete history, just unlink.
+    dead_devices = (
+        db.query(models.Device)
+        .filter(models.Device.config_id == config.id)
+        .all()
+    )
+    for dev in dead_devices:
+        db.query(models.Credential).filter(
+            models.Credential.device_id == dev.id
+        ).delete(synchronize_session=False)
+        db.delete(dev)
+    db.query(models.Credential).filter(
+        models.Credential.config_id == config.id
+    ).update({models.Credential.config_id: None}, synchronize_session=False)
+    db.flush()
+
+    db.delete(config)
+    db.commit()
+    actor, actor_type = _resolve_admin_actor(admin_actor)
+    _audit(db, actor, "config_deleted", "vpn_config", config_id, actor_type=actor_type)
+    from .services import warm_pool
+    warm_pool.invalidate_node_warm_pool(db, node_id, reason="config removed")
+    return None
 
 
 @router.get("/nodes/{node_id}/configs", response_model=list[schemas.VPNConfigOut])
@@ -387,12 +608,61 @@ def list_configs(node_id: int, db: Session = Depends(get_db), admin_token: str =
     return [schemas.VPNConfigOut.from_orm(cfg) for cfg in configs]
 
 
+def _enrich_task_telegram(
+    db: Session, tasks: list[models.ProvisioningTask]
+) -> dict[int, str | None]:
+    """Resolve owning telegram_id for each task in one batched pass.
+
+    Walks device and subscription targets up to their user. Done as
+    two bulk SELECTs (one per target type) rather than a per-row
+    lookup, so the Tasks admin page stays cheap even with 200 rows.
+    Node tasks return None (no owner concept).
+    """
+    device_ids = [t.target_id for t in tasks if t.target_type == "device"]
+    sub_ids = [t.target_id for t in tasks if t.target_type == "subscription"]
+
+    device_owner: dict[int, str | None] = {}
+    if device_ids:
+        rows = (
+            db.query(models.Device.id, models.User.telegram_id)
+            .join(models.Subscription, models.Device.subscription_id == models.Subscription.id)
+            .join(models.User, models.Subscription.user_id == models.User.id)
+            .filter(models.Device.id.in_(device_ids))
+            .all()
+        )
+        device_owner = {row[0]: row[1] for row in rows}
+
+    sub_owner: dict[int, str | None] = {}
+    if sub_ids:
+        rows = (
+            db.query(models.Subscription.id, models.User.telegram_id)
+            .join(models.User, models.Subscription.user_id == models.User.id)
+            .filter(models.Subscription.id.in_(sub_ids))
+            .all()
+        )
+        sub_owner = {row[0]: row[1] for row in rows}
+
+    out: dict[int, str | None] = {}
+    for t in tasks:
+        if t.target_type == "device":
+            out[t.id] = device_owner.get(t.target_id)
+        elif t.target_type == "subscription":
+            out[t.id] = sub_owner.get(t.target_id)
+        else:
+            out[t.id] = None
+    return out
+
+
 @router.get("/provisioning/tasks", response_model=list[schemas.ProvisioningTaskOut])
 def list_tasks(
     limit: int = Query(default=50, ge=1, le=500),
     offset: int = Query(default=0, ge=0),
     status_filter: str | None = Query(default=None, alias="status"),
     target_type: str | None = None,
+    telegram_id: str | None = Query(
+        default=None,
+        description="Filter tasks to ones owned by this telegram_id (via device→sub→user chain)",
+    ),
     db: Session = Depends(get_db),
     admin_token: str = Depends(require_admin),
 ):
@@ -406,13 +676,84 @@ def list_tasks(
             raise HTTPException(status_code=400, detail="Invalid status") from exc
     if target_type:
         query = query.filter(models.ProvisioningTask.target_type == target_type)
+
+    if telegram_id:
+        # Narrow by telegram_id: collect the device/subscription ids
+        # owned by that user, then constrain the task query to those.
+        user = db.query(models.User).filter_by(telegram_id=telegram_id).first()
+        if user is None:
+            return []
+        sub_ids = [
+            s.id for s in db.query(models.Subscription.id)
+            .filter(models.Subscription.user_id == user.id).all()
+        ]
+        dev_ids: list[int] = []
+        if sub_ids:
+            dev_ids = [
+                d.id for d in db.query(models.Device.id)
+                .filter(models.Device.subscription_id.in_(sub_ids)).all()
+            ]
+        from sqlalchemy import or_, and_
+        conds = []
+        if sub_ids:
+            conds.append(
+                and_(
+                    models.ProvisioningTask.target_type == "subscription",
+                    models.ProvisioningTask.target_id.in_(sub_ids),
+                )
+            )
+        if dev_ids:
+            conds.append(
+                and_(
+                    models.ProvisioningTask.target_type == "device",
+                    models.ProvisioningTask.target_id.in_(dev_ids),
+                )
+            )
+        if not conds:
+            return []
+        query = query.filter(or_(*conds))
+
     tasks = (
         query.order_by(models.ProvisioningTask.created_at.desc())
         .offset(offset)
         .limit(limit)
         .all()
     )
-    return [schemas.ProvisioningTaskOut.from_orm(t) for t in tasks]
+    tg_map = _enrich_task_telegram(db, tasks)
+    out: list[schemas.ProvisioningTaskOut] = []
+    for t in tasks:
+        dto = schemas.ProvisioningTaskOut.from_orm(t)
+        dto.telegram_id = tg_map.get(t.id)
+        out.append(dto)
+    return out
+
+
+@router.delete("/provisioning/tasks/{task_id}", status_code=204)
+def delete_task(
+    task_id: int,
+    db: Session = Depends(get_db),
+    admin_token: str = Depends(require_admin),
+    admin_actor: str | None = Header(default=None, alias=ADMIN_ACTOR_HEADER),
+):
+    """Delete a single ProvisioningTask row.
+
+    Refuses ``running`` tasks — those are in-flight and the orchestrator
+    still holds a reference to them. Terminal states (success, failed,
+    pending) are free to remove; the history lives in AuditLog anyway.
+    """
+    task = db.get(models.ProvisioningTask, task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+    if task.status == models.ProvisioningTaskStatus.running:
+        raise HTTPException(
+            status_code=409,
+            detail="Task is running; wait for it to finish before deleting",
+        )
+    db.delete(task)
+    db.commit()
+    actor, actor_type = _resolve_admin_actor(admin_actor)
+    _audit(db, actor, "task_deleted", "provisioning_task", task_id, actor_type=actor_type)
+    return None
 
 
 @router.get("/provisioning/tasks/{task_id}", response_model=schemas.ProvisioningTaskOut)
@@ -440,14 +781,75 @@ def rerun_task(task_id: int, db: Session = Depends(get_db), admin_token: str = D
     task = db.get(models.ProvisioningTask, task_id)
     if not task:
         raise HTTPException(status_code=404, detail="Task not found")
-    if task.status not in {models.ProvisioningTaskStatus.failed, models.ProvisioningTaskStatus.pending}:
-        raise HTTPException(status_code=400, detail="Task is not failed or pending")
+    # Allow rerun on success too: "re-run bootstrap" is a legitimate
+    # way to ship updated ansible roles to an already-live node
+    # without a round trip through node delete + spawn. Refuse only
+    # the still-in-flight states so we don't stomp on a running job.
+    if task.status in {
+        models.ProvisioningTaskStatus.running,
+    }:
+        raise HTTPException(
+            status_code=409,
+            detail="Task is currently running; wait for it to finish",
+        )
     orchestrator = ProvisioningOrchestrator(db)
     orchestrator.reset_failed_task(task)
-    node = db.get(models.VPNNode, task.target_id) if task.target_type == "node" else None
-    orchestrator.run_task_async(task, node=node)
+    orchestrator.run_task_async(task, node=None)
     db.refresh(task)
     return schemas.ProvisioningTaskOut.from_orm(task)
+
+
+@router.post("/provisioning/tasks/batch")
+def batch_tasks(
+    body: dict,
+    db: Session = Depends(get_db),
+    admin_token: str = Depends(require_admin),
+    admin_actor: str | None = Header(default=None, alias=ADMIN_ACTOR_HEADER),
+):
+    """Batch action on multiple provisioning tasks.
+
+    Body: ``{ "ids": [1,2,3], "action": "delete" | "rerun" }``
+    """
+    ids = body.get("ids", [])
+    action = body.get("action", "")
+    if not ids or action not in ("delete", "rerun"):
+        raise HTTPException(
+            status_code=400,
+            detail="ids (list) and action (delete|rerun) required",
+        )
+
+    actor, actor_type = _resolve_admin_actor(admin_actor)
+    results: dict[str, list[int]] = {"ok": [], "skipped": [], "not_found": []}
+    orchestrator = ProvisioningOrchestrator(db)
+
+    for tid in ids:
+        task = db.get(models.ProvisioningTask, tid)
+        if not task:
+            results["not_found"].append(tid)
+            continue
+
+        if action == "delete":
+            if task.status == models.ProvisioningTaskStatus.running:
+                results["skipped"].append(tid)
+                continue
+            db.delete(task)
+            results["ok"].append(tid)
+
+        elif action == "rerun":
+            if task.status == models.ProvisioningTaskStatus.running:
+                results["skipped"].append(tid)
+                continue
+            orchestrator.reset_failed_task(task)
+            orchestrator.run_task_async(task, node=None)
+            results["ok"].append(tid)
+
+    db.commit()
+    _audit(
+        db, actor, f"tasks_batch_{action}", "provisioning_task", None,
+        actor_type=actor_type,
+        metadata={"ids": ids, "results": results},
+    )
+    return results
 
 
 @router.post("/subscriptions", response_model=schemas.SubscriptionProvisionResponse)
@@ -626,6 +1028,7 @@ def list_users(
             email=u.email,
             created_at=u.created_at,
             subscription_count=counts.get(u.id, 0),
+            balance_kopecks=u.balance_kopecks or 0,
         )
         for u in users
     ]
@@ -641,6 +1044,163 @@ def get_user_by_telegram(
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
     return _subscriptions_for_user(user.id, db)
+
+
+@router.get("/users/by_telegram/{telegram_id}/balance")
+def get_balance_by_telegram(
+    telegram_id: str,
+    db: Session = Depends(get_db),
+    admin_token: str = Depends(require_admin),
+):
+    """Bot-side balance lookup (stage 4).
+
+    Returns the user's current balance + per-active-sub days_remaining
+    so the bot can render ``/balance`` without re-implementing the
+    daily-cost math. Admin-token gated because the bot speaks
+    server-to-server with the API token, not WebApp JWT.
+    """
+    from .services import balance as balance_svc
+
+    user = db.query(models.User).filter_by(telegram_id=telegram_id).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    subs = (
+        db.query(models.Subscription)
+        .filter(
+            models.Subscription.user_id == user.id,
+            models.Subscription.status.in_(
+                [
+                    models.SubscriptionStatus.active,
+                    models.SubscriptionStatus.frozen,
+                ]
+            ),
+        )
+        .all()
+    )
+
+    sub_summaries: list[dict] = []
+    min_days: int | None = None
+    for sub in subs:
+        plan = sub.plan
+        device_count = sum(
+            1 for d in sub.devices
+            if d.status not in (
+                models.DeviceStatus.revoked, models.DeviceStatus.disabled,
+            )
+        )
+        billable = max(device_count, 1)
+        try:
+            daily = balance_svc._daily_cost_kopecks(plan, billable) if plan else None
+        except RuntimeError:
+            daily = None
+        days = (
+            balance_svc.days_remaining(user, plan, billable)
+            if plan and plan.daily_rate_kopecks
+            else None
+        )
+        sub_summaries.append({
+            "id": sub.id,
+            "plan_name": plan.name if plan else "",
+            "status": sub.status.value,
+            "daily_cost_kopecks": daily,
+            "days_remaining": days,
+            "next_charge_at": sub.next_charge_at.isoformat() if sub.next_charge_at else None,
+            "frozen_until": sub.frozen_until.isoformat() if sub.frozen_until else None,
+        })
+        if days is not None and sub.status == models.SubscriptionStatus.active:
+            min_days = days if min_days is None else min(min_days, days)
+
+    return {
+        "user_id": user.id,
+        "balance_kopecks": user.balance_kopecks or 0,
+        "balance_rub": round((user.balance_kopecks or 0) / 100, 2),
+        "min_days_remaining": min_days,
+        "subscriptions": sub_summaries,
+    }
+
+
+class AdminTopupRequest(BaseModel):
+    # Kopecks (integer), positive only. We route through balance_svc.topup
+    # which enforces >0 — no negatives here. For debits/clawbacks there
+    # should be a separate explicit endpoint, it's a much rarer operation
+    # and we want the intent to be obvious in audit logs.
+    amount_kopecks: int = Field(gt=0, le=10_000_000)
+    note: str | None = Field(default=None, max_length=200)
+
+
+class AdminTopupResponse(BaseModel):
+    user_id: int
+    telegram_id: str | None
+    balance_kopecks: int
+    tx_id: int
+
+
+@router.post(
+    "/users/by_telegram/{telegram_id}/topup",
+    response_model=AdminTopupResponse,
+)
+def admin_topup_by_telegram(
+    telegram_id: str,
+    body: AdminTopupRequest,
+    db: Session = Depends(get_db),
+    admin_token: str = Depends(require_admin),
+    actor_header: str | None = Header(default=None, alias=ADMIN_ACTOR_HEADER),
+):
+    """Credit a user's balance from the admin panel.
+
+    Intended for test accounts, comped friend accounts, compensating a
+    failed payment we confirmed out-of-band, etc. Writes a
+    ``kind=adjust`` ledger row with a unique ``admin_topup:<user>:<ts>``
+    reference (so repeated clicks create distinct transactions — this is
+    not an idempotent upsert, each click is a real new credit) and an
+    audit log entry attributing the action to the admin token that made
+    the call.
+    """
+    from .services import balance as balance_svc
+
+    user = db.query(models.User).filter_by(telegram_id=telegram_id).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    ts = int(utcnow().timestamp())
+    reference = f"admin_topup:{user.id}:{ts}"
+    try:
+        tx = balance_svc.topup(
+            db,
+            user.id,
+            body.amount_kopecks,
+            reference=reference,
+            kind=models.BalanceTxKind.adjust,
+            note=body.note or "admin topup",
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    actor, actor_type = _resolve_admin_actor(actor_header)
+    db.add(
+        models.AuditLog(
+            actor=actor,
+            actor_type=actor_type,
+            action="admin_topup",
+            target_type="user",
+            target_id=user.id,
+            extra={
+                "telegram_id": user.telegram_id,
+                "amount_kopecks": body.amount_kopecks,
+                "reference": reference,
+                "note": body.note,
+            },
+        )
+    )
+    db.commit()
+    db.refresh(user)
+    return AdminTopupResponse(
+        user_id=user.id,
+        telegram_id=user.telegram_id,
+        balance_kopecks=user.balance_kopecks or 0,
+        tx_id=tx.id,
+    )
 
 
 @router.get("/users/{user_id}", response_model=list[schemas.SubscriptionOut])
@@ -667,12 +1227,135 @@ def disable_subscription(
 
     orchestrator = ProvisioningOrchestrator(db)
     tasks = orchestrator.revoke_subscription_devices(sub, reason="disabled by admin")
+    # NB: we do NOT refund ``sub.prepaid_kopecks`` on disable — the
+    # bucket stays intact so an /enable call resumes billing from where
+    # it left off. A separate /cancel action (refund + terminate) can
+    # be added later; this keeps disable ↔ enable symmetric.
     actor, actor_type = _resolve_admin_actor(admin_actor)
     _audit(db, actor, "subscription_disabled", "subscription", subscription_id, actor_type=actor_type)
     return {
         "subscription_id": sub.id,
         "status": sub.status.value,
         "revocation_tasks": [task.id for task in tasks],
+    }
+
+
+@router.post("/subscriptions/{subscription_id}/devices", response_model=schemas.ProvisioningTaskOut)
+def admin_add_device(
+    subscription_id: int,
+    db: Session = Depends(get_db),
+    admin_token: str = Depends(require_admin),
+    admin_actor: str | None = Header(default=None, alias=ADMIN_ACTOR_HEADER),
+):
+    """Admin counterpart to webapp add-device — no wallet/prepaid gate.
+
+    The webapp endpoint guards on ``sub.prepaid_kopecks`` so a user
+    can't silently over-provision past their paid runway. For admin
+    we skip that check entirely: operators may need to re-bind a
+    device that was revoked by mistake, or manually add a slot for a
+    friend account. The resulting extra device still burns the
+    prepaid bucket faster; the admin is expected to know that.
+    """
+    sub = db.get(models.Subscription, subscription_id)
+    if not sub:
+        raise HTTPException(status_code=404, detail="Subscription not found")
+    if sub.status != models.SubscriptionStatus.active:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Subscription is {sub.status.value}, must be active",
+        )
+
+    current = (
+        db.query(models.Device)
+        .filter(
+            models.Device.subscription_id == sub.id,
+            models.Device.status.notin_(
+                [models.DeviceStatus.revoked, models.DeviceStatus.disabled]
+            ),
+        )
+        .count()
+    )
+    new_count = current + 1
+    orchestrator = ProvisioningOrchestrator(db)
+    try:
+        _device, task = orchestrator.reprovision_subscription(
+            sub, device_name=f"device-{new_count}"
+        )
+    except RuntimeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    actor, actor_type = _resolve_admin_actor(admin_actor)
+    _audit(
+        db,
+        actor,
+        "admin_device_added",
+        "subscription",
+        sub.id,
+        actor_type=actor_type,
+        metadata={"new_device_count": new_count},
+    )
+    db.refresh(task)
+    return schemas.ProvisioningTaskOut.from_orm(task)
+
+
+@router.post("/subscriptions/{subscription_id}/enable")
+def enable_subscription(
+    subscription_id: int,
+    db: Session = Depends(get_db),
+    admin_token: str = Depends(require_admin),
+    admin_actor: str | None = Header(default=None, alias=ADMIN_ACTOR_HEADER),
+):
+    """Resume a non-active subscription.
+
+    * ``frozen`` → routes through ``balance.unfreeze_subscription`` so
+      the year-budget accounting runs and the original sub_token is
+      preserved.
+    * ``blocked`` / ``expired`` → flipped back to ``active`` and
+      reprovisioned. Caller is responsible for having topped up the
+      balance first — we don't gate on it, just resume.
+    """
+    from .services import balance as balance_svc
+
+    sub = db.get(models.Subscription, subscription_id)
+    if not sub:
+        raise HTTPException(status_code=404, detail="Subscription not found")
+    if sub.status == models.SubscriptionStatus.active:
+        raise HTTPException(status_code=400, detail="Subscription is already active")
+
+    if sub.status == models.SubscriptionStatus.frozen:
+        try:
+            balance_svc.unfreeze_subscription(db, sub, auto=False)
+        except RuntimeError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+    else:
+        sub.status = models.SubscriptionStatus.active
+        sub.notes = None
+        sub.next_charge_at = utcnow()
+        db.add(sub)
+        db.flush()
+        orchestrator = ProvisioningOrchestrator(db)
+        try:
+            orchestrator.reprovision_subscription(sub)
+        except Exception:
+            logger.exception(
+                "enable_subscription: reprovision failed sub=%s — left active w/o device",
+                sub.id,
+            )
+
+    db.commit()
+    db.refresh(sub)
+    actor, actor_type = _resolve_admin_actor(admin_actor)
+    _audit(
+        db,
+        actor,
+        "subscription_enabled",
+        "subscription",
+        subscription_id,
+        actor_type=actor_type,
+    )
+    return {
+        "subscription_id": sub.id,
+        "status": sub.status.value,
     }
 
 
@@ -1110,6 +1793,86 @@ def _mark_invoice_paid_core(
     if invoice.status != models.InvoiceStatus.pending:
         raise HTTPException(status_code=400, detail="Invoice cannot be paid in current status")
 
+    # ── Stage 4: balance topup branch ───────────────────────────────
+    # ``kind=topup`` means this invoice is just a wallet load — no
+    # subscription provisioning, no plan to honor. Credit the user's
+    # balance, mark the invoice paid, and return early. The legacy
+    # path below still services ``kind=subscription`` invoices for
+    # any in-flight purchases or admin-created plan invoices.
+    if invoice.kind == "topup":
+        from .services import balance as balance_svc
+
+        amount_kopecks = int(round(float(invoice.amount) * 100))
+        if amount_kopecks <= 0:
+            raise HTTPException(status_code=400, detail="Topup invoice has non-positive amount")
+
+        # Referrer payout: runs strictly BEFORE we write the user's own
+        # topup row so "first kind=topup" detection is unambiguous. If
+        # the user was attributed to a referrer (via /users/register)
+        # and has never completed a real topup before, credit
+        # REFERRAL_BONUS_KOPECKS to the referrer. Idempotent by
+        # reference — a retried webhook can't double-pay.
+        topup_user = db.get(models.User, invoice.user_id)
+        if topup_user and topup_user.referred_by_id is not None:
+            prior = (
+                db.query(models.BalanceTransaction)
+                .filter_by(
+                    user_id=topup_user.id,
+                    kind=models.BalanceTxKind.topup,
+                )
+                .first()
+            )
+            if prior is None:
+                ref_key = f"referral_payout:{topup_user.id}"
+                already = (
+                    db.query(models.BalanceTransaction)
+                    .filter_by(reference=ref_key)
+                    .first()
+                )
+                if already is None:
+                    try:
+                        balance_svc.referral_bonus(
+                            db,
+                            topup_user.referred_by_id,
+                            reference=ref_key,
+                        )
+                    except Exception:
+                        # Don't fail the whole topup over a referral
+                        # bonus write — log and move on. Payout will
+                        # be retried by a nightly reconciliation if we
+                        # ever add one; for now it's fire-and-forget.
+                        logger.exception(
+                            "referral payout failed for user=%s",
+                            topup_user.id,
+                        )
+
+        try:
+            balance_svc.topup(
+                db,
+                invoice.user_id,
+                amount_kopecks,
+                reference=f"invoice:{invoice.id}",
+                kind=models.BalanceTxKind.topup,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("Failed to topup balance for invoice %s", invoice_id)
+            raise HTTPException(status_code=500, detail="Failed to credit balance") from exc
+
+        invoice.status = models.InvoiceStatus.paid
+        db.add(invoice)
+        db.commit()
+        db.refresh(invoice)
+        _audit(
+            db,
+            actor,
+            "invoice_paid",
+            "invoice",
+            invoice.id,
+            actor_type=actor_type,
+            metadata={"kind": "topup", "amount_kopecks": amount_kopecks},
+        )
+        return _invoice_with_credentials(invoice, [])
+
     plan = db.get(models.Plan, invoice.plan_id)
     user = db.get(models.User, invoice.user_id)
     if not plan or not user:
@@ -1179,6 +1942,89 @@ def mark_invoice_paid(
         actor_type=actor_type,
         payment_id=body.payment_id if body else None,
     )
+
+
+@router.post("/invoices/{invoice_id}/cancel", response_model=schemas.InvoiceOut)
+def cancel_invoice(
+    invoice_id: int,
+    db: Session = Depends(get_db),
+    admin_token: str = Depends(require_admin),
+    admin_actor: str | None = Header(default=None, alias=ADMIN_ACTOR_HEADER),
+):
+    """Mark a stale pending invoice as failed (cancelled).
+
+    Only works on pending invoices — paid ones should be mark_unpaid'd
+    first if you truly need to void them.
+    """
+    invoice = db.get(models.Invoice, invoice_id)
+    if not invoice:
+        raise HTTPException(status_code=404, detail="Invoice not found")
+    if invoice.status != models.InvoiceStatus.pending:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Can only cancel pending invoices, this one is {invoice.status.value}",
+        )
+    invoice.status = models.InvoiceStatus.failed
+    db.commit()
+    db.refresh(invoice)
+    actor, actor_type = _resolve_admin_actor(admin_actor)
+    _audit(db, actor, "invoice_cancelled", "invoice", invoice.id, actor_type=actor_type)
+    return schemas.InvoiceOut.from_orm(invoice)
+
+
+@router.post("/invoices/batch")
+def batch_invoices(
+    body: dict,
+    db: Session = Depends(get_db),
+    admin_token: str = Depends(require_admin),
+    admin_actor: str | None = Header(default=None, alias=ADMIN_ACTOR_HEADER),
+):
+    """Batch action on multiple invoices.
+
+    Body: ``{ "ids": [1,2,3], "action": "cancel" | "mark_paid" | "mark_unpaid" }``
+    """
+    ids = body.get("ids", [])
+    action = body.get("action", "")
+    if not ids or action not in ("cancel", "mark_paid", "mark_unpaid"):
+        raise HTTPException(status_code=400, detail="ids (list) and action (cancel|mark_paid|mark_unpaid) required")
+
+    actor, actor_type = _resolve_admin_actor(admin_actor)
+    results: dict[str, list[int]] = {"ok": [], "skipped": [], "not_found": []}
+
+    for inv_id in ids:
+        invoice = db.get(models.Invoice, inv_id)
+        if not invoice:
+            results["not_found"].append(inv_id)
+            continue
+
+        if action == "cancel":
+            if invoice.status != models.InvoiceStatus.pending:
+                results["skipped"].append(inv_id)
+                continue
+            invoice.status = models.InvoiceStatus.failed
+            _audit(db, actor, "invoice_cancelled", "invoice", inv_id, actor_type=actor_type)
+
+        elif action == "mark_paid":
+            if invoice.status != models.InvoiceStatus.pending:
+                results["skipped"].append(inv_id)
+                continue
+            try:
+                _mark_invoice_paid_core(db, inv_id, actor=actor, actor_type=actor_type)
+            except HTTPException:
+                results["skipped"].append(inv_id)
+                continue
+
+        elif action == "mark_unpaid":
+            if invoice.status == models.InvoiceStatus.pending:
+                results["skipped"].append(inv_id)
+                continue
+            invoice.status = models.InvoiceStatus.pending
+            _audit(db, actor, "invoice_marked_unpaid", "invoice", inv_id, actor_type=actor_type)
+
+        results["ok"].append(inv_id)
+
+    db.commit()
+    return results
 
 
 @router.post("/invoices/{invoice_id}/mark_unpaid", response_model=schemas.InvoiceOut)
@@ -1452,7 +2298,8 @@ def migrate_node_route(
     node = db.get(models.VPNNode, node_id)
     if not node:
         raise HTTPException(status_code=404, detail="Node not found")
-    migrated = migrate_subscriptions_off(db, node, reason="manual migration")
+    result = migrate_subscriptions_off(db, node, reason="manual migration")
+    migrated = result["subscription_ids"]
     actor, actor_type = _resolve_admin_actor(admin_actor)
     _audit(
         db,
@@ -1461,9 +2308,29 @@ def migrate_node_route(
         "vpn_node",
         node.id,
         actor_type=actor_type,
-        metadata={"migrated_count": len(migrated)},
+        metadata={
+            "migrated_count": len(migrated),
+            "device_task_ids": result["device_task_ids"],
+            "resync_task_ids": result["resync_task_ids"],
+        },
     )
-    return {"node_id": node.id, "migrated_subscriptions": migrated}
+    # Combined task id list — admin UI polls /api/provisioning/tasks
+    # and filters by these to render a grouped progress banner.
+    # Revokes go first (old node, best-effort), then device applies
+    # (new node), then resync mops up any drift.
+    task_ids = (
+        result["revoke_task_ids"]
+        + result["device_task_ids"]
+        + result["resync_task_ids"]
+    )
+    return {
+        "node_id": node.id,
+        "migrated_subscriptions": migrated,
+        "task_ids": task_ids,
+        "revoke_task_ids": result["revoke_task_ids"],
+        "device_task_ids": result["device_task_ids"],
+        "resync_task_ids": result["resync_task_ids"],
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -1586,7 +2453,7 @@ def checkout_invoice(
             invoice_id=invoice.id,
             amount=float(invoice.amount),
             currency=invoice.currency,
-            description=f"VPN subscription #{invoice.id}",
+            description=f"Order #{invoice.id}",
             return_url=(body.return_url if body else None),
         )
     except ProviderError as exc:

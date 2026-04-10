@@ -11,7 +11,7 @@ class CredentialOut(BaseModel):
     config_id: int | None = None
 
     class Config:
-        orm_mode = True
+        from_attributes = True
 
     @classmethod
     def from_orm(cls, obj):  # type: ignore[override]
@@ -36,7 +36,7 @@ class DeviceOut(BaseModel):
     connection_uri: str | None = None
 
     class Config:
-        orm_mode = True
+        from_attributes = True
 
     @classmethod
     def from_orm(cls, obj):  # type: ignore[override]
@@ -75,7 +75,7 @@ class VPNConfigOut(VPNConfigCreate):
     updated_at: datetime
 
     class Config:
-        orm_mode = True
+        from_attributes = True
 
 
 class VPNNodeCreate(BaseModel):
@@ -95,7 +95,7 @@ class VPNNodeOut(VPNNodeCreate):
     updated_at: datetime
 
     class Config:
-        orm_mode = True
+        from_attributes = True
 
 
 class SubscriptionCreate(BaseModel):
@@ -116,7 +116,7 @@ class PlanOut(BaseModel):
     is_visible: bool = True
 
     class Config:
-        orm_mode = True
+        from_attributes = True
 
     @classmethod
     def from_orm(cls, obj):  # type: ignore[override]
@@ -236,7 +236,7 @@ class InvoiceOut(BaseModel):
     updated_at: datetime
 
     class Config:
-        orm_mode = True
+        from_attributes = True
 
     @classmethod
     def from_orm(cls, obj):  # type: ignore[override]
@@ -259,8 +259,8 @@ class InvoiceListItem(BaseModel):
     id: int
     user_id: int
     user_telegram_id: str | None
-    plan_id: int
-    plan_name: str
+    plan_id: int | None = None
+    plan_name: str | None = None
     subscription_id: int | None = None
     amount: float
     currency: str
@@ -384,7 +384,7 @@ class CloudProviderOut(BaseModel):
     created_at: datetime
 
     class Config:
-        orm_mode = True
+        from_attributes = True
 
 
 class PoolAutoscaleConfig(BaseModel):
@@ -445,9 +445,14 @@ class ProvisioningTaskOut(BaseModel):
     created_at: datetime
     started_at: datetime | None
     finished_at: datetime | None
+    # Best-effort lookup: for device/subscription tasks we resolve the
+    # owning user's telegram_id so the admin Tasks table can show who
+    # the job belongs to without a second round-trip. None for node
+    # tasks and for orphan rows whose FK chain got nulled.
+    telegram_id: str | None = None
 
     class Config:
-        orm_mode = True
+        from_attributes = True
 
 
 class ApiTokenCreate(BaseModel):
@@ -464,7 +469,7 @@ class ApiTokenOut(BaseModel):
     last_used_at: datetime | None = None
 
     class Config:
-        orm_mode = True
+        from_attributes = True
 
 
 class ApiTokenCreatedOut(ApiTokenOut):
@@ -490,6 +495,7 @@ class UserOut(BaseModel):
     email: str | None = None
     created_at: datetime
     subscription_count: int = 0
+    balance_kopecks: int = 0
 
     class Config:
-        orm_mode = True
+        from_attributes = True

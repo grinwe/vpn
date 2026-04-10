@@ -1,0 +1,48 @@
+---
+# resync_node.yml
+#
+# Re-apply a full set of VLESS+Reality clients to an existing node.
+#
+# Context: the install_vless_reality role now preserves clients across
+# re-renders (slurp + re-inject), but that only works if the previous
+# /usr/local/etc/xray/config.json exists and is parseable. On a fresh
+# bootstrap, or after an operator manually wiped the file, the rendered
+# config is empty and every previously-provisioned user gets kicked
+# with "invalid request user id" until someone re-adds them.
+#
+# This playbook is the "re-add" step. Backend calls it from
+# ProvisioningOrchestrator.resync_node_vless_clients() with payload:
+#
+#   clients: [ {username: <email>, uuid: <uuid>}, ... ]
+#
+# It loops manage_vless_user.sh add for each entry — the script is
+# idempotent (drops any existing entry with the same email before
+# re-appending) so running this twice is safe.
+- hosts: vpn_nodes
+  become: yes
+  vars:
+    clients: []
+  tasks:
+    - name: Ensure VLESS Reality manage script exists
+      stat:
+        path: /usr/local/sbin/manage_vless_user.sh
+      register: vless_manage_script
+
+    - name: Fail if manage script is missing
+      fail:
+        msg: >-
+          manage_vless_user.sh not found on {{ inventory_hostname }}.
+          Run the install_vless_reality role first (site.yml).
+      when: not vless_manage_script.stat.exists
+
+    - name: Resync VLESS+Reality clients
+      command: >-
+        /usr/local/sbin/manage_vless_user.sh add {{ item.username }} {{ item.uuid }}
+      loop: "{{ clients }}"
+      loop_control:
+        label: "{{ item.username }}"
+      when: clients | length > 0
+
+    - name: Log resync payload
+      debug:
+        msg: "Resynced {{ clients | length }} vless client(s) on {{ inventory_hostname }}"

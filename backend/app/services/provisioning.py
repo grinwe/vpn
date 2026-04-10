@@ -4,6 +4,7 @@ from __future__ import annotations
 import base64
 import logging
 import os
+import re
 import secrets
 import threading
 import uuid
@@ -76,21 +77,33 @@ def choose_node(
         | (models.VPNNode.health_score >= MIN_HEALTHY_SCORE)
     )
 
-    active_sub_count = func.count(models.Subscription.id).label("active_subs")
+    # Stage 7 — capacity is counted in **devices**, not subscriptions.
+    # A Family sub with 3 active devices puts 3× the load on the node
+    # vs. a Solo sub with 1 device, so ``max_users`` must be the device
+    # ceiling (the column name is historical). Devices in revoked /
+    # disabled state don't consume node resources and are excluded.
+    active_device_count = func.count(models.Device.id).label("active_devices")
     rows = (
         query.outerjoin(
             models.Subscription,
             (models.Subscription.node_id == models.VPNNode.id)
             & (models.Subscription.status == models.SubscriptionStatus.active),
         )
+        .outerjoin(
+            models.Device,
+            (models.Device.subscription_id == models.Subscription.id)
+            & (models.Device.status.notin_(
+                [models.DeviceStatus.revoked, models.DeviceStatus.disabled]
+            )),
+        )
         .group_by(models.VPNNode.id)
-        .order_by(active_sub_count.asc())
-        .with_entities(models.VPNNode, active_sub_count)
+        .order_by(active_device_count.asc())
+        .with_entities(models.VPNNode, active_device_count)
         .all()
     )
 
-    for node, subs in rows:
-        if node.max_users is not None and subs >= node.max_users:
+    for node, devs in rows:
+        if node.max_users is not None and devs >= node.max_users:
             continue
         locked = (
             db.query(models.VPNNode)
@@ -101,16 +114,23 @@ def choose_node(
         if locked is None:
             continue
         if locked.max_users is not None:
-            live_subs = (
-                db.query(func.count(models.Subscription.id))
+            live_devices = (
+                db.query(func.count(models.Device.id))
+                .join(
+                    models.Subscription,
+                    models.Subscription.id == models.Device.subscription_id,
+                )
                 .filter(
                     models.Subscription.node_id == locked.id,
                     models.Subscription.status == models.SubscriptionStatus.active,
+                    models.Device.status.notin_(
+                        [models.DeviceStatus.revoked, models.DeviceStatus.disabled]
+                    ),
                 )
                 .scalar()
                 or 0
             )
-            if live_subs >= locked.max_users:
+            if live_devices >= locked.max_users:
                 continue
         return locked
 
@@ -135,10 +155,31 @@ def choose_config(
 def _build_shadowtls_credential(
     node: models.VPNNode, config: models.VPNConfig, username: str, password: str
 ) -> str:
-    method = (config.settings or {}).get("method", "chacha20-ietf-poly1305")
-    payload = f"{method}:{password}@{node.host}:{config.port}"
-    encoded = base64.urlsafe_b64encode(payload.encode()).decode().rstrip("=")
-    return f"ss://{encoded}#shadowtls-{username}"
+    """Build a Hiddify-importable ShadowTLS+SS2022 URI.
+
+    ``username``/``password`` are kept in the signature for parity with
+    other credential builders but are not embedded — the v1 node layout
+    uses a single shared SS password + shadow-tls password per node,
+    both read from ``config.settings`` (encrypted at rest). When we move
+    to SS2022 EIH multi-user, ``password`` will become the per-device
+    identity key and this builder will append it to the userinfo blob.
+    """
+    from . import shadowtls as _stls
+    settings = config.settings or {}
+    ss_password_enc = settings.get("ss_password_enc")
+    stls_password_enc = settings.get("shadowtls_password_enc")
+    if not ss_password_enc or not stls_password_enc:
+        raise RuntimeError(
+            "ShadowTLS config is missing node-level secrets; reprovision the node"
+        )
+    return _stls.build_credential(
+        host=node.host,
+        port=config.port,
+        ss_password=decrypt(ss_password_enc),
+        shadowtls_password=decrypt(stls_password_enc),
+        handshake_domain=config.sni or _stls.DEFAULT_HANDSHAKE_DOMAIN,
+        name=f"shadowtls-{node.region}-{username}",
+    )
 
 
 def _build_vless_reality_credential(
@@ -147,6 +188,7 @@ def _build_vless_reality_credential(
     settings = config.settings or {}
     sni = config.sni or settings.get("server_name", "")
     params = {
+        "encryption": "none",
         "security": "reality",
         "sni": sni,
         "pbk": config.public_key or settings.get("public_key", ""),
@@ -211,13 +253,35 @@ def _collect_site_extra_vars(node: models.VPNNode) -> dict[str, Any]:
     backend-authoritative secrets for each protocol to the installer roles.
     """
     extra: dict[str, Any] = {}
+    # Ports the health-check role must see listening after site.yml
+    # finishes. Built from the set of enabled VPNConfig rows so adding
+    # or removing a protocol on the node automatically adjusts which
+    # ports are considered "must be up". The default in the role is
+    # [443, 8443, 9443] and was wrong for nodes that don't run every
+    # protocol — those ports would never open and bootstrap failed.
+    health_ports: list[int] = []
     for cfg in node.configs:
         if not cfg.is_enabled:
             continue
         settings = cfg.settings or {}
 
+        # ── ShadowTLS v3 + shadowsocks-rust ──
+        if cfg.protocol == models.VPNConfigProtocol.shadowtls_ss:
+            from . import shadowtls as _stls
+            ss_pwd_enc = settings.get("ss_password_enc")
+            stls_pwd_enc = settings.get("shadowtls_password_enc")
+            if not ss_pwd_enc or not stls_pwd_enc:
+                continue
+            extra.update({
+                "shadowtls_port": cfg.port,
+                "shadowtls_password": decrypt(stls_pwd_enc),
+                "shadowtls_ss_password": decrypt(ss_pwd_enc),
+                "shadowtls_handshake_domain": cfg.sni or _stls.DEFAULT_HANDSHAKE_DOMAIN,
+            })
+            health_ports.append(cfg.port)
+
         # ── VLESS Reality ──
-        if cfg.protocol == models.VPNConfigProtocol.vless_reality:
+        elif cfg.protocol == models.VPNConfigProtocol.vless_reality:
             priv_enc = settings.get("private_key_enc")
             if not priv_enc or not cfg.public_key:
                 continue
@@ -229,6 +293,7 @@ def _collect_site_extra_vars(node: models.VPNNode) -> dict[str, Any]:
                 "vless_reality_sni": cfg.sni or "",
                 "vless_reality_dest": settings.get("dest") or cfg.fallback or "",
             })
+            health_ports.append(cfg.port)
 
         # ── VLESS+WS+CDN ──
         elif cfg.protocol == models.VPNConfigProtocol.vless_ws_cdn:
@@ -239,6 +304,7 @@ def _collect_site_extra_vars(node: models.VPNNode) -> dict[str, Any]:
                 "vless_ws_cdn_cert_path": settings.get("cert_path", ""),
                 "vless_ws_cdn_key_path": settings.get("key_path", ""),
             })
+            health_ports.append(cfg.port)
 
         # ── Hysteria2 ──
         elif cfg.protocol == models.VPNConfigProtocol.hysteria2:
@@ -252,6 +318,12 @@ def _collect_site_extra_vars(node: models.VPNNode) -> dict[str, Any]:
                 "hysteria2_up_mbps": settings.get("up_mbps", 100),
                 "hysteria2_down_mbps": settings.get("down_mbps", 100),
             })
+            # NB: Hysteria2 is UDP — ansible's wait_for module only does
+            # TCP, so we intentionally skip adding it to vpn_health_ports.
+            # Coverage for UDP liveness needs a separate check.
+
+    if health_ports:
+        extra["vpn_health_ports"] = sorted(set(health_ports))
 
     return extra
 
@@ -262,6 +334,34 @@ def _generate_sub_token() -> str:
 
 
 # ── Orchestrator ─────────────────────────────────────────────────────
+
+_VLESS_UUID_RE = re.compile(
+    r"vless://([0-9a-fA-F-]{36})@",
+)
+
+
+def _node_has_vless_reality(node: models.VPNNode) -> bool:
+    for cfg in node.configs:
+        if cfg.is_enabled and cfg.protocol == models.VPNConfigProtocol.vless_reality:
+            return True
+    return False
+
+
+def _extract_vless_uuid(config_text_enc: str) -> str | None:
+    """Pull the user UUID out of an encrypted VLESS credential blob.
+
+    Credentials are stored as encrypted ``vless://<uuid>@host:port?...``
+    URIs — we don't have a dedicated column for the UUID, so the resync
+    path has to parse it back out. Returns ``None`` if decryption or
+    parsing fails, so a single corrupt row doesn't sink the whole batch.
+    """
+    try:
+        uri = decrypt(config_text_enc)
+    except Exception:  # noqa: BLE001
+        return None
+    match = _VLESS_UUID_RE.match(uri)
+    return match.group(1) if match else None
+
 
 class ProvisioningOrchestrator:
     """Coordinates provisioning tasks and Ansible execution."""
@@ -310,10 +410,38 @@ class ProvisioningOrchestrator:
         try:
             result_payload = self._execute_task(task, node=node)
         except Exception as exc:  # noqa: BLE001
+            # Unexpected error BEFORE or AFTER ansible (setup/teardown,
+            # inventory build, semaphore, etc). Ansible non-zero exit is
+            # *not* raised here anymore — _execute_task returns the payload
+            # with returncode and we branch below, so the stdout is always
+            # visible in the Tasks UI.
             logger.exception("Provisioning task %s failed", task.id)
             self._mark_task(
                 task, models.ProvisioningTaskStatus.failed,
                 error=str(exc), result=result_payload,
+            )
+            self._handle_task_outcome(task, success=False)
+            return task
+
+        rc = (result_payload or {}).get("returncode", 0)
+        if rc != 0:
+            # Ansible exited non-zero. Previously we raised RuntimeError
+            # with only stderr, which for UNREACHABLE hosts is a single
+            # [WARNING] line while the real "Permission denied" output
+            # lives in stdout. Keep the full payload so /admin/tasks can
+            # show stdout+stderr+rc in the result pane.
+            stderr = (result_payload or {}).get("stderr") or ""
+            stdout = (result_payload or {}).get("stdout") or ""
+            # Prefer the last few non-empty lines of stdout/stderr as the
+            # summary — that's where ansible writes the PLAY RECAP and the
+            # fatal: block. Full output stays in result.
+            tail_source = stderr.strip() or stdout.strip()
+            tail = "\n".join(tail_source.splitlines()[-20:]) if tail_source else (
+                f"ansible exited with rc={rc}"
+            )
+            self._mark_task(
+                task, models.ProvisioningTaskStatus.failed,
+                error=tail, result=result_payload,
             )
             self._handle_task_outcome(task, success=False)
             return task
@@ -390,7 +518,54 @@ class ProvisioningOrchestrator:
         self.db.commit()
 
     def _handle_task_outcome(self, task: models.ProvisioningTask, *, success: bool) -> None:
-        if task.target_type != "device":
+        # ── Node-level outcome: flip registering → active on success ──
+        #
+        # Bootstrap/re-bootstrap tasks are how a freshly-spawned node
+        # proves it can host traffic. Until check_node_health passes
+        # the node stays in "registering" and the scheduler refuses
+        # to hand it subscriptions; on success we promote it, on
+        # failure we mark it unhealthy (but keep it around for rerun).
+        if task.target_type == "node":
+            node = self.db.get(models.VPNNode, task.target_id)
+            if not node:
+                return
+            # Resync tasks are a post-site.yml helper — they neither
+            # promote a registering node nor demote an already-active
+            # one, so bypass the status transitions entirely. Errors are
+            # visible via the task row.
+            if task.action == "resync_vless":
+                return
+            if success:
+                node.status = models.VPNNodeStatus.active
+                node.last_health_check_at = utcnow()
+                # Auto-trigger a VLESS resync after any successful
+                # node-level site.yml run. The install_vless_reality
+                # role now preserves existing clients across re-renders,
+                # but that only covers the happy path (old config exists
+                # and parses). On first bootstrap or after a manual
+                # wipe, config.json ships empty and previously-active
+                # subs get "invalid request user id" until we re-add
+                # them. The resync is idempotent (manage_vless_user.sh
+                # drops duplicates by email) so running it on every
+                # success is cheap and keeps the node in a known-good
+                # state. Skipped for nodes that don't serve vless.
+                if _node_has_vless_reality(node):
+                    try:
+                        self.resync_node_vless_clients(node)
+                    except Exception:  # noqa: BLE001
+                        logger.exception(
+                            "Auto-resync after site.yml failed for node %s",
+                            node.id,
+                        )
+            else:
+                # Don't downgrade an already-active node on a transient
+                # rerun failure — leave it active, surface the task
+                # error via the /admin/tasks UI. Only freshly-registering
+                # nodes get marked failed.
+                if node.status == models.VPNNodeStatus.registering:
+                    node.status = models.VPNNodeStatus.error
+            self.db.add(node)
+            self.db.commit()
             return
 
         device = self.db.get(models.Device, task.target_id)
@@ -404,11 +579,16 @@ class ProvisioningOrchestrator:
                     cred.is_active = True
                     cred.revoked_at = None
             elif task.action == "revoke":
-                device.status = models.DeviceStatus.revoked
-                now = utcnow()
-                for cred in device.credentials:
-                    cred.is_active = False
-                    cred.revoked_at = cred.revoked_at or now
+                # The device has been removed from the VPN node via ansible.
+                # Delete the row and its credentials from the DB entirely —
+                # keeping revoked devices around was polluting both the admin
+                # UI and the user's subscription card after multiple
+                # migrations. The ProvisioningTask row survives for audit.
+                for cred in list(device.credentials):
+                    self.db.delete(cred)
+                self.db.delete(device)
+                self.db.commit()
+                return
         else:
             device.status = models.DeviceStatus.failed
         device.updated_at = utcnow()
@@ -473,13 +653,44 @@ class ProvisioningOrchestrator:
                 if not node:
                     raise RuntimeError("VPN node not found for provisioning")
                 inventory = build_inventory_for_node(node)
-                site_vars = _collect_site_extra_vars(node)
-                result = run_playbook(
-                    "site.yml", inventory, limit=node.name, extra_vars=site_vars,
-                )
+                if task.action == "resync_vless":
+                    # Lightweight follow-up to site.yml: re-add every
+                    # active vless_reality credential via the node's
+                    # manage_vless_user.sh so users survive a config
+                    # re-render or manual /usr/local/etc/xray/config.json
+                    # wipe. Payload is already the full client list,
+                    # built by resync_node_vless_clients().
+                    result = run_playbook(
+                        "playbooks/resync_node.yml",
+                        inventory,
+                        limit=node.name,
+                        extra_vars=payload,
+                    )
+                else:
+                    site_vars = _collect_site_extra_vars(node)
+                    result = run_playbook(
+                        "site.yml", inventory, limit=node.name, extra_vars=site_vars,
+                    )
             elif task.target_type == "device":
+                # Fallback node resolution: callers that don't pre-load
+                # the node (rerun from /admin/tasks, RQ worker with no
+                # node_id, etc.) pass ``node=None``. We derive it from
+                # the device row itself so every code path produces a
+                # valid inventory.
                 if not node:
-                    raise RuntimeError("Node is required to provision device")
+                    device = self.db.get(models.Device, task.target_id)
+                    if device:
+                        node = (
+                            device.config.node if device.config
+                            else (device.subscription.node
+                                  if device.subscription else None)
+                        )
+                if not node:
+                    raise RuntimeError(
+                        "Node is required to provision device "
+                        f"(device_id={task.target_id}); "
+                        "device has no config/subscription pointing at a node"
+                    )
                 inventory = build_inventory_for_node(node)
                 result = run_playbook(
                     "playbooks/provision_device.yml",
@@ -495,16 +706,103 @@ class ProvisioningOrchestrator:
                 except OSError:
                     logger.warning("Failed to remove temp inventory %s", inventory)
 
-        payload = {
+        # Return full ansible output regardless of exit code. run_task()
+        # branches on returncode and marks the task failed without losing
+        # stdout — for UNREACHABLE hosts the real error (Permission denied,
+        # bad key perms, etc) is in stdout, not stderr.
+        return {
             "stdout": result.stdout,
             "stderr": result.stderr,
             "returncode": result.returncode,
         }
 
-        if result.returncode != 0:
-            raise RuntimeError(result.stderr or result.stdout or "ansible playbook failed")
+    def _wire_warm_bundle(
+        self,
+        user: models.User,
+        subscription: models.Subscription,
+        bundle: list[models.Credential],
+        device_name: str | None,
+    ) -> tuple[models.Device, models.ProvisioningTask]:
+        """Bind an already-warmed credential bundle to a fresh subscription.
 
-        return payload
+        Builds a Device row pointing at one of the bundle's protocols
+        (ShadowTLS preferred, otherwise the first one) and back-links
+        every credential to that device. The user's connection URI is
+        the dynamic sub-link, identical to the cold path. No Ansible —
+        the credentials are already live on the node.
+
+        Returns the new Device and a synthetic ProvisioningTask in
+        ``success`` state so the API surface stays compatible with
+        callers that expect a task back.
+        """
+        if not bundle:
+            raise RuntimeError("warm bundle is empty")
+
+        # All credentials in a bundle share node_id and access_username.
+        node = bundle[0].config.node if bundle[0].config else None
+        if node is None:
+            raise RuntimeError("warm bundle has no node — corrupted state")
+
+        # Pick the device-anchor config: ShadowTLS first, else any.
+        primary = next(
+            (c for c in bundle if c.proto == models.VPNConfigProtocol.shadowtls_ss.value),
+            bundle[0],
+        )
+        if primary.config_id is None:
+            raise RuntimeError("warm bundle anchor has no config_id")
+
+        device_label = device_name or "primary"
+        sub_base = os.getenv("SUB_LINK_BASE_URL", "").rstrip("/")
+        if sub_base:
+            device_uri = f"{sub_base}/{subscription.sub_token}"
+        else:
+            device_uri = f"/api/sub/{subscription.sub_token}"
+
+        device = models.Device(
+            user_id=user.id,
+            subscription_id=subscription.id,
+            config_id=primary.config_id,
+            name=device_label,
+            status=models.DeviceStatus.active,  # already live on the node
+            access_username=bundle[0].access_username,
+            connection_uri=encrypt(device_uri),
+        )
+        self.db.add(device)
+        self.db.flush()
+
+        # Back-link each credential to the new device. subscription_id
+        # was already set by try_assign_bundle().
+        for cred in bundle:
+            cred.device_id = device.id
+
+        # Synthetic task — the API needs *something* with .id to return
+        # in SubscriptionProvisionResponse. status=success makes the
+        # WebApp's checkout polling immediately resolve.
+        task = self.create_task(
+            "device",
+            device.id,
+            "assign_warm",
+            {
+                "username": bundle[0].access_username,
+                "node_id": node.id,
+                "protocols": [c.proto for c in bundle],
+                "warm_pool_hit": True,
+            },
+        )
+        task.status = models.ProvisioningTaskStatus.success
+        task.started_at = utcnow()
+        task.finished_at = utcnow()
+        task.result = {
+            "warm_pool_hit": True,
+            "credential_ids": [c.id for c in bundle],
+        }
+        self.db.flush()
+
+        # Counter so the synthetic task shows up in the same metric the
+        # cold path uses — operators only need to look at one chart.
+        TASK_STATUS_COUNTER.labels(status=models.ProvisioningTaskStatus.success.value).inc()
+
+        return device, task
 
     def provision_subscription(
         self,
@@ -550,6 +848,34 @@ class ProvisioningOrchestrator:
         self.db.add(subscription)
         self.db.flush()
 
+        # ── Warm-pool fast path (stage 2.5) ─────────────────────────────
+        # Try to grab a pre-provisioned bundle on this node before doing
+        # any ansible work. On success the subscription is live in
+        # milliseconds; on miss we fall through to the cold path below
+        # and the warmer catches up on the next tick.
+        from . import warm_pool
+
+        warm_bundle = warm_pool.try_assign_bundle(self.db, node.id, subscription.id)
+        if warm_bundle:
+            try:
+                device, task = self._wire_warm_bundle(
+                    user, subscription, warm_bundle, device_name
+                )
+                self.db.refresh(subscription)
+                return subscription, task
+            except Exception:
+                # If wiring blew up after we marked the bundle assigned,
+                # the bundle is now in a half-state. Roll back so the
+                # outer transaction is clean and the warmer will pick
+                # the bundle back up next tick (it'll see assigned but
+                # no Subscription pointing to it — TODO: GC).
+                logger.exception("warm-pool wiring failed, rolling back")
+                self.db.rollback()
+                raise
+        else:
+            warm_pool.record_pool_miss(self.db, node.id)
+
+        # ── Cold path (original implementation) ─────────────────────────
         device_label = device_name or "primary"
         # One identity shared across all protocols on this device — the node
         # accounts traffic by access_username, so we want a single key.
@@ -630,6 +956,289 @@ class ProvisioningOrchestrator:
         self.db.refresh(subscription)
         return subscription, task
 
+    def resync_node_vless_clients(
+        self, node: models.VPNNode
+    ) -> models.ProvisioningTask | None:
+        """Push every active vless_reality credential onto ``node``.
+
+        Called automatically after a successful node-level site.yml (to
+        repair the "empty clients after re-render" class of bugs) and
+        exposed via ``POST /api/nodes/{id}/resync`` for manual use.
+
+        Queries all credentials for the node where the owning
+        subscription is still active, parses the UUID out of the
+        encrypted config_text, and enqueues a single resync task that
+        runs ``playbooks/resync_node.yml`` with the full client list.
+        The underlying ``manage_vless_user.sh add`` is idempotent so
+        re-running is safe.
+
+        Returns the created task, or ``None`` if nothing to resync.
+        """
+        # Query through Subscription.node_id rather than Credential.node_id
+        # — the latter is only populated by the warm pool path; cold-path
+        # credentials (pre-stage-2.5, and still the default for legacy
+        # subs) have Credential.node_id=NULL and would silently get
+        # filtered out. Going via the subscription side catches both.
+        rows = (
+            self.db.query(models.Credential, models.Device)
+            .join(
+                models.Subscription,
+                models.Subscription.id == models.Credential.subscription_id,
+            )
+            .outerjoin(
+                models.Device,
+                models.Device.id == models.Credential.device_id,
+            )
+            .filter(
+                models.Subscription.node_id == node.id,
+                models.Subscription.status == models.SubscriptionStatus.active,
+                models.Credential.proto == models.VPNConfigProtocol.vless_reality.value,
+                models.Credential.is_active.is_(True),
+            )
+            .all()
+        )
+
+        clients: list[dict[str, str]] = []
+        seen: set[str] = set()
+        for cred, device in rows:
+            # access_username lives on Device for cold-path rows and on
+            # Credential for warm-pool rows — fall back across both so a
+            # mixed-vintage node still resyncs cleanly.
+            username = (
+                cred.access_username
+                or (device.access_username if device else None)
+            )
+            if not username or username in seen:
+                continue
+            user_uuid = _extract_vless_uuid(cred.config_text)
+            if not user_uuid:
+                logger.warning(
+                    "resync: skipping credential %s (no UUID parsed)", cred.id
+                )
+                continue
+            clients.append({"username": username, "uuid": user_uuid})
+            seen.add(username)
+
+        if not clients:
+            logger.info("resync: no active vless clients on node %s", node.id)
+            return None
+
+        task = self.create_task(
+            "node",
+            node.id,
+            "resync_vless",
+            {"clients": clients},
+        )
+        self.db.commit()
+        self.run_task_async(task, node=node)
+        return task
+
+    def reprovision_subscription(
+        self,
+        subscription: models.Subscription,
+        *,
+        device_name: str | None = None,
+    ) -> tuple[models.Device, models.ProvisioningTask]:
+        """Add a fresh device to an existing subscription.
+
+        Used by ``services.balance.unfreeze_subscription`` to restore
+        connectivity after a freeze. The original ``sub_token`` is
+        preserved so the user's dynamic sub-link keeps working — that's
+        the only persistent identifier our clients keep, rotating it
+        would silently break every installed device.
+
+        Reuses the warm-pool fast path when possible. On a miss, walks
+        the cold path: creates one Device + matching Credentials + an
+        ansible apply task. Skips device-limit checks because the
+        caller has already validated state (frozen subs have zero
+        live devices by construction).
+        """
+        user = subscription.user
+        node = subscription.node
+        if node is None:
+            raise RuntimeError("subscription has no node — cannot reprovision")
+        if not node.is_active:
+            raise RuntimeError(f"node {node.id} is not active")
+
+        enabled_configs = [cfg for cfg in node.configs if cfg.is_enabled]
+        if not enabled_configs:
+            raise RuntimeError("No enabled VPN configs found for node")
+
+        # ── Warm-pool fast path ─────────────────────────────────────────
+        from . import warm_pool
+
+        warm_bundle = warm_pool.try_assign_bundle(self.db, node.id, subscription.id)
+        if warm_bundle:
+            try:
+                device, task = self._wire_warm_bundle(
+                    user, subscription, warm_bundle, device_name
+                )
+                self.db.refresh(subscription)
+                return device, task
+            except Exception:
+                logger.exception("warm-pool wiring failed during reprovision, rolling back")
+                self.db.rollback()
+                raise
+        else:
+            warm_pool.record_pool_miss(self.db, node.id)
+
+        # ── Cold path ───────────────────────────────────────────────────
+        device_label = device_name or "primary"
+        # Suffix with the current epoch second so a freeze→unfreeze cycle
+        # doesn't reuse the previous access_username (which the node may
+        # still have in its TTL window after the absent run).
+        username = f"user-{user.id}-{subscription.id}-{int(utcnow().timestamp())}"
+        password = secrets.token_urlsafe(12)
+        user_uuid = uuid.uuid4()
+
+        sub_base = os.getenv("SUB_LINK_BASE_URL", "").rstrip("/")
+        if sub_base:
+            device_uri = f"{sub_base}/{subscription.sub_token}"
+        else:
+            device_uri = f"/api/sub/{subscription.sub_token}"
+
+        primary_config = next(
+            (c for c in enabled_configs if c.protocol == models.VPNConfigProtocol.shadowtls_ss),
+            enabled_configs[0],
+        )
+
+        device = models.Device(
+            user_id=user.id,
+            subscription_id=subscription.id,
+            config_id=primary_config.id,
+            name=device_label,
+            status=models.DeviceStatus.pending,
+            access_username=username,
+            connection_uri=encrypt(device_uri),
+        )
+        self.db.add(device)
+        self.db.flush()
+
+        protocols_payload: list[dict[str, Any]] = []
+        for cfg in enabled_configs:
+            if cfg.protocol == models.VPNConfigProtocol.shadowtls_ss:
+                cred_text = _build_shadowtls_credential(node, cfg, username, password)
+            elif cfg.protocol == models.VPNConfigProtocol.vless_reality:
+                cred_text = _build_vless_reality_credential(node, cfg, str(user_uuid))
+            elif cfg.protocol == models.VPNConfigProtocol.vless_ws_cdn:
+                cred_text = _build_vless_ws_cdn_credential(node, cfg, str(user_uuid))
+            elif cfg.protocol == models.VPNConfigProtocol.hysteria2:
+                cred_text = _build_hysteria2_credential(node, cfg, password)
+            else:
+                logger.warning("Skipping unsupported protocol %s on node %s", cfg.protocol, node.id)
+                continue
+
+            self.db.add(
+                models.Credential(
+                    subscription_id=subscription.id,
+                    device_id=device.id,
+                    config_id=cfg.id,
+                    proto=cfg.protocol.value,
+                    config_text=encrypt(cred_text),
+                )
+            )
+
+            entry: dict[str, Any] = {"proto": cfg.protocol.value, "port": cfg.port}
+            if cfg.protocol == models.VPNConfigProtocol.shadowtls_ss:
+                entry["method"] = (cfg.settings or {}).get("method", "chacha20-ietf-poly1305")
+            protocols_payload.append(entry)
+
+        if not protocols_payload:
+            raise RuntimeError("No supported protocols among enabled configs")
+
+        task_payload: dict[str, Any] = {
+            "username": username,
+            "uuid": str(user_uuid),
+            "password": password,
+            "protocols": protocols_payload,
+            "state": "present",
+        }
+
+        task = self.create_task("device", device.id, "apply", task_payload)
+        self.db.commit()
+        self.run_task_async(task, node=node)
+        self.db.refresh(subscription)
+        return device, task
+
+    def migrate_subscription_to_new_node(
+        self,
+        subscription: models.Subscription,
+        *,
+        exclude_node_ids: list[int] | None = None,
+    ) -> tuple[models.VPNNode, models.Device, models.ProvisioningTask]:
+        """Move a subscription from its current node to a freshly chosen one.
+
+        Used by stage 5 downscale: when a node is marked ``draining``, the
+        drain tick walks its active subscriptions and calls this helper
+        to relocate each one. ``sub_token`` is preserved (same as freeze
+        → unfreeze) so installed clients keep working — they just refetch
+        ``/sub/{token}`` and pick up URIs pointing at the new host on the
+        next profile-update interval.
+
+        Steps:
+            1. Pick a target node via ``choose_node``, excluding the
+               current node (and any caller-supplied extras — used by
+               the drain tick to skip other draining nodes in the pool).
+            2. Revoke every live device on the old node in the background
+               (single ansible call per device, fire-and-forget).
+            3. Switch ``subscription.node_id`` to the target.
+            4. Reuse ``reprovision_subscription`` to provision a fresh
+               device on the new node — that path already handles
+               warm-pool fast path + cold-fallback + access_username
+               suffix to avoid TTL collisions.
+
+        Raises ``RuntimeError`` if no eligible target node exists in the
+        plan's pools — the caller (drain tick) catches this and just
+        leaves the sub on the old node, retrying on the next tick.
+        """
+        old_node = subscription.node
+        if old_node is None:
+            raise RuntimeError("subscription has no node — cannot migrate")
+        plan = subscription.plan
+        if plan is None:
+            raise RuntimeError("subscription has no plan — cannot migrate")
+
+        excluded = list(exclude_node_ids or [])
+        if old_node.id not in excluded:
+            excluded.append(old_node.id)
+
+        target = choose_node(self.db, plan, exclude_node_ids=excluded)
+        if target.id == old_node.id:
+            # Defensive: choose_node should never return an excluded node,
+            # but bail loudly if it does — silently re-provisioning on
+            # the same draining node would deadlock the drain forever.
+            raise RuntimeError("choose_node returned the same draining node")
+
+        # Revoke old devices first so the slot frees up on the old node
+        # before the drain tick re-evaluates capacity. Background is fine:
+        # the new device on the target node is the user-visible thing.
+        for device in list(subscription.devices):
+            if device.status in (
+                models.DeviceStatus.disabled,
+                models.DeviceStatus.revoked,
+            ):
+                continue
+            try:
+                self.revoke_device(
+                    device, reason=f"migrate from node {old_node.id}", background=True
+                )
+            except Exception:  # noqa: BLE001
+                logger.exception(
+                    "revoke_device failed during migration of sub %s device %s",
+                    subscription.id,
+                    device.id,
+                )
+
+        subscription.node_id = target.id
+        self.db.add(subscription)
+        self.db.flush()
+        # SQLAlchemy needs the relationship reloaded so reprovision sees
+        # the new node when it walks ``subscription.node.configs``.
+        self.db.refresh(subscription)
+
+        device, task = self.reprovision_subscription(subscription)
+        return target, device, task
+
     def revoke_device(
         self, device: models.Device, *, reason: str | None = None, background: bool = True
     ) -> models.ProvisioningTask:
@@ -656,6 +1265,11 @@ class ProvisioningOrchestrator:
         for cred in device.credentials:
             cred.is_active = False
             cred.revoked_at = cred.revoked_at or utcnow()
+            # Stage 2.5: explicitly transition pool state so warm-pool
+            # bookkeeping stays consistent. Credentials that were never
+            # in the pool get the same flag — harmless, ``revoked`` is
+            # the terminal state for any cred regardless of origin.
+            cred.pool_state = models.CredentialPoolState.revoked
         self.db.commit()
         node = device.config.node if device.config else device.subscription.node
         if background:

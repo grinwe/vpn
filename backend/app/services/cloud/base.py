@@ -58,6 +58,20 @@ def get_driver(provider: models.CloudProvider) -> CloudDriver:
             raise DriverError("Hetzner provider has no API token configured")
         return HetznerDriver(token=token)
 
+    if kind == "vultr":
+        from .vultr import VultrDriver
+
+        if not token:
+            raise DriverError("Vultr provider has no API token configured")
+        return VultrDriver(token=token)
+
+    if kind == "digitalocean":
+        from .digitalocean import DigitalOceanDriver
+
+        if not token:
+            raise DriverError("DigitalOcean provider has no API token configured")
+        return DigitalOceanDriver(token=token)
+
     if kind == "manual":
         from .manual import ManualDriver
 

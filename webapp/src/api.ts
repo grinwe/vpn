@@ -27,9 +27,71 @@ export interface User {
   subscription_count: number;
 }
 
+export interface BalanceInfo {
+  balance_kopecks: number;
+  balance_rub: number;
+  min_days_remaining: number | null;
+  has_active_balance_sub: boolean;
+  trial_available: boolean;
+  trial_amount_kopecks: number;
+}
+
+export interface TrialActivateResponse {
+  trial_amount_kopecks: number;
+  referral_bonus_kopecks: number;
+  balance_kopecks: number;
+  trial_expires_at: string;
+}
+
+export async function activateTrial() {
+  return request<TrialActivateResponse>("/api/webapp/trial/activate", {
+    method: "POST",
+  });
+}
+
+export interface DeviceSummary {
+  id: number;
+  name: string;
+  status: string;
+  created_at: string | null;
+}
+
+export interface SubscriptionExtra {
+  subscription_id: number;
+  plan_name: string | null;
+  daily_rate_kopecks: number | null;
+  daily_cost_kopecks: number | null;
+  days_remaining: number | null;
+  next_charge_at: string | null;
+  frozen_until: string | null;
+  can_freeze: boolean;
+  freeze_days_left_in_year: number;
+  device_count: number;
+  bundled_devices: number;
+  extra_device_daily_kopecks: number;
+  devices: DeviceSummary[];
+}
+
+export interface AddDeviceResponse {
+  subscription_id: number;
+  device_id: number;
+  device_count: number;
+  new_daily_cost_kopecks: number;
+}
+
+export async function addDevice(subscriptionId: number) {
+  return request<AddDeviceResponse>(
+    `/api/webapp/subscriptions/${subscriptionId}/devices`,
+    { method: "POST" },
+  );
+}
+
 export interface MeResponse {
   user: User;
   subscriptions: Subscription[];
+  balance: BalanceInfo;
+  subscription_extras: SubscriptionExtra[];
+  sub_link_base_url: string;
 }
 
 let token: string | null = null;
@@ -108,4 +170,117 @@ export interface InvoiceStatusResponse {
 
 export async function fetchInvoiceStatus(id: number) {
   return request<InvoiceStatusResponse>(`/api/webapp/invoices/${id}`);
+}
+
+// ── Stage 4: balance billing ───────────────────────────────────────
+
+export interface TopupResponse {
+  invoice_id: number;
+  provider: string;
+  pay_url: string;
+  amount: number;
+  currency: string;
+}
+
+export async function createTopup(amountKopecks: number, provider = "telegram_stars") {
+  return request<TopupResponse>("/api/webapp/topup", {
+    method: "POST",
+    body: JSON.stringify({ amount_kopecks: amountKopecks, provider }),
+  });
+}
+
+export interface ActivateResponse {
+  subscription_id: number;
+  sub_token: string | null;
+  days_remaining: number;
+  balance_kopecks: number;
+  daily_cost_kopecks: number;
+  next_charge_at: string | null;
+}
+
+export interface InsufficientBalanceDetail {
+  code: "insufficient_balance";
+  balance_kopecks: number;
+  required_kopecks: number;
+  suggested_topup_kopecks: number;
+}
+
+export async function activateSubscription(planId: number) {
+  return request<ActivateResponse>("/api/webapp/subscriptions/activate", {
+    method: "POST",
+    body: JSON.stringify({ plan_id: planId }),
+  });
+}
+
+export interface FreezeResponse {
+  subscription_id: number;
+  status: string;
+  frozen_until: string | null;
+  freeze_days_left_in_year: number;
+}
+
+export async function freezeSubscription(id: number) {
+  return request<FreezeResponse>(`/api/webapp/subscriptions/${id}/freeze`, {
+    method: "POST",
+  });
+}
+
+export interface UnfreezeResponse {
+  subscription_id: number;
+  status: string;
+  next_charge_at: string | null;
+}
+
+export async function unfreezeSubscription(id: number) {
+  return request<UnfreezeResponse>(`/api/webapp/subscriptions/${id}/unfreeze`, {
+    method: "POST",
+  });
+}
+
+export interface CancelSubscriptionResponse {
+  subscription_id: number;
+  status: string;
+  refunded_kopecks: number;
+  balance_kopecks: number;
+}
+
+export async function cancelSubscription(id: number) {
+  return request<CancelSubscriptionResponse>(
+    `/api/webapp/subscriptions/${id}/cancel`,
+    { method: "POST" },
+  );
+}
+
+// ── Stage 5.5: history + referral ──────────────────────────────────
+
+export interface TransactionRow {
+  id: number;
+  amount_kopecks: number;
+  kind: "topup" | "spend" | "refund" | "bonus" | "adjust";
+  reference: string | null;
+  note: string | null;
+  created_at: string;
+}
+
+export interface TransactionsResponse {
+  items: TransactionRow[];
+  has_more: boolean;
+}
+
+export async function fetchTransactions(limit = 50, offset = 0) {
+  return request<TransactionsResponse>(
+    `/api/webapp/transactions?limit=${limit}&offset=${offset}`,
+  );
+}
+
+export interface ReferralInfo {
+  code: string | null;
+  bonus_kopecks: number;
+  invited_count: number;
+  earned_kopecks: number;
+  share_url: string | null;
+}
+
+export async function fetchReferral() {
+  return request<ReferralInfo>("/api/webapp/referral");
 }

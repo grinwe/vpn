@@ -15,7 +15,9 @@ import logging
 import secrets
 
 
-from fastapi import APIRouter, Depends, Header, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
+
+from .auth import optional_admin, require_admin  # noqa: F401 — re-exported for legacy imports
 from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
@@ -38,23 +40,6 @@ def get_db():
         yield db
     finally:
         db.close()
-
-
-def require_admin(x_admin_token: str | None = Header(default=None)) -> str:
-    import hmac
-    if not settings.admin_api_token:
-        raise HTTPException(status_code=503, detail="admin token missing")
-    if not x_admin_token or not hmac.compare_digest(
-        x_admin_token.encode(), settings.admin_api_token.encode(),
-    ):
-        raise HTTPException(status_code=401, detail="invalid admin token")
-    return x_admin_token
-
-
-def optional_admin(x_admin_token: str | None = Header(default=None)) -> str | None:
-    if x_admin_token:
-        return require_admin(x_admin_token)
-    return None
 
 
 # ── Dynamic subscription link ──
@@ -218,7 +203,14 @@ def register_user(
         db.flush()
         created = True
 
-    if body.referral_code and not user.referred_by_id and created:
+    # Trial-flow rework: /register no longer credits bonuses. It only
+    # attaches the referral when the field is still NULL — this means a
+    # user who accidentally /start'ed before ever getting a ref link can
+    # still be attributed the next time they click one. The actual
+    # referee-side bonus is handed out on /trial/activate, and the
+    # referrer-side bonus lands on the first confirmed kind=topup (see
+    # _mark_invoice_paid_core in api.py).
+    if body.referral_code and not user.referred_by_id:
         ref = (
             db.query(models.ReferralCode)
             .filter_by(code=body.referral_code, is_active=True)
@@ -229,9 +221,70 @@ def register_user(
                 user.referred_by_id = ref.owner_id
                 ref.uses += 1
                 db.add(ref)
+                db.flush()
 
     db.commit()
-    return {"id": user.id, "telegram_id": user.telegram_id, "created": created}
+    return {
+        "id": user.id,
+        "telegram_id": user.telegram_id,
+        "created": created,
+        # Always false under the trial-flow model — retained for
+        # backward compat with older bot builds that still read it.
+        "referral_bonus_credited": False,
+        # Bot reads this to decide whether to include the "first month
+        # on us" line in the welcome copy. True iff the user hasn't
+        # activated their trial yet — works retroactively for users
+        # who registered before this column existed.
+        "trial_available": user.trial_activated_at is None,
+    }
+
+
+# ── Free trial activation ──
+
+class TrialActivateRequest(BaseModel):
+    telegram_id: str
+
+
+class TrialActivateResponse(BaseModel):
+    trial_amount_kopecks: int
+    referral_bonus_kopecks: int
+    balance_kopecks: int
+    trial_expires_at: str  # ISO-8601, serialized from datetime
+
+
+@ext_router.post("/trial/activate", response_model=TrialActivateResponse)
+def activate_trial(
+    body: TrialActivateRequest,
+    db: Session = Depends(get_db),
+    admin_token: str | None = Depends(optional_admin),
+):
+    """Grant the one-time trial bonus to a user identified by telegram_id.
+
+    Gated on ``User.trial_activated_at IS NULL``. Returns 409 on a
+    repeat call so the client knows to hide the banner, 404 if the
+    user row doesn't exist yet (the bot should /register first), and
+    503 if no visible 30-day plan is configured (nothing to size the
+    trial against). Bonus amounts read from the Plan table at call
+    time — no hardcoded rubles.
+    """
+    from .services import trial as trial_svc
+
+    user = db.query(models.User).filter_by(telegram_id=body.telegram_id).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    try:
+        result = trial_svc.activate_trial(db, user.id)
+    except trial_svc.TrialAlreadyActivated:
+        raise HTTPException(status_code=409, detail="Trial already activated")
+    except trial_svc.NoTrialPlan:
+        raise HTTPException(status_code=503, detail="No trial plan configured")
+    db.commit()
+    return TrialActivateResponse(
+        trial_amount_kopecks=result.trial_amount_kopecks,
+        referral_bonus_kopecks=result.referral_bonus_kopecks,
+        balance_kopecks=result.balance_kopecks,
+        trial_expires_at=result.trial_expires_at.isoformat(),
+    )
 
 
 # ── Self-service: regenerate config ──
@@ -312,6 +365,7 @@ def get_pending_notifications(
     """
     notif_actions = [
         "renewal_reminder", "expiry_reminder", "config_ready", "migration_notice",
+        "low_balance_warning", "trial_expiry_warning",
     ]
     logs = (
         db.query(models.AuditLog)
@@ -353,6 +407,19 @@ def get_pending_notifications(
                 "🔄 Твой VPN-сервер был перемещён.\n"
                 "Новый конфиг доступен по /config.\n"
                 "Если у тебя ссылка подписки — она обновилась автоматически."
+            )
+        elif log.action == "low_balance_warning":
+            days = extra.get("days_remaining", "?")
+            balance_rub = extra.get("balance_rub", "?")
+            text = (
+                f"⚠️ Низкий баланс: {balance_rub} ₽ — хватит на {days} дн.\n"
+                "Пополни через /balance, иначе подписка отключится."
+            )
+        elif log.action == "trial_expiry_warning":
+            text = (
+                "⏳ Твой пробный месяц кончается через 3 дня.\n"
+                "Пополни баланс, чтобы подписка не отключилась — "
+                "реферальные 50 ₽ (если есть) остаются при тебе."
             )
         else:
             continue

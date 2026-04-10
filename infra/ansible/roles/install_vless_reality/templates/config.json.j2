@@ -46,7 +46,7 @@
       "port": {{ vless_reality_port | int }},
       "protocol": "vless",
       "settings": {
-        "clients": [],
+        "clients": {{ vless_reality_existing_clients | default([]) | to_json }},
         "decryption": "none"
       },
       "streamSettings": {

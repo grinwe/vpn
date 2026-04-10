@@ -3,6 +3,7 @@ import { authWithInitData, fetchMe, MeResponse, setToken } from "./api";
 import Home from "./pages/Home";
 import Plans from "./pages/Plans";
 import CheckoutPending from "./pages/CheckoutPending";
+import History from "./pages/History";
 import { useRoute } from "./router";
 import { getTg } from "./telegram";
 
@@ -43,18 +44,30 @@ export default function App() {
     fetchMe().then(setMe).catch(() => undefined);
   }, [route.name, status]);
 
-  if (status === "loading") return <Centered>Загрузка…</Centered>;
+  if (status === "loading")
+    return (
+      <Centered>
+        <div className="card animate-pulse text-tg-hint">Загрузка…</div>
+      </Centered>
+    );
   if (status === "error")
     return (
       <Centered>
-        <div className="text-red-400 mb-2">Ошибка</div>
-        <div className="text-tg-hint text-sm">{error}</div>
+        <div className="card border-red-500/40 text-red-200">
+          <div className="font-semibold mb-1">Ошибка</div>
+          <div className="text-tg-hint text-sm">{error}</div>
+        </div>
       </Centered>
     );
 
-  if (route.name === "plans") return <Plans />;
+  const refreshMe = () => {
+    fetchMe().then(setMe).catch(() => undefined);
+  };
+
+  if (route.name === "plans") return <Plans onActivated={refreshMe} />;
+  if (route.name === "history") return <History />;
   if (route.name === "checkout") return <CheckoutPending invoiceId={route.invoiceId} />;
-  return <Home me={me!} />;
+  return <Home me={me!} onRefresh={refreshMe} />;
 }
 
 function Centered({ children }: { children: React.ReactNode }) {

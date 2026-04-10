@@ -2,8 +2,11 @@ import asyncio
 import logging
 from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
+from aiogram.fsm.storage.memory import MemoryStorage
 from .config import BOT_TOKEN, BACKEND_URL, ADMIN_API_TOKEN, NOTIFICATION_POLL_INTERVAL
 from .handlers import close_session, router, get_session, onboarding_keyboard
+from .keyboards import DEFAULT_COMMANDS
+from .support import support_router
 
 logger = logging.getLogger(__name__)
 
@@ -69,8 +72,25 @@ async def notification_poller(bot: Bot):
 async def main():
     logging.basicConfig(level="INFO")
     bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
-    dp = Dispatcher()
+    # MemoryStorage powers the support-ticket FSM in support.py. In-
+    # memory is fine for a single-instance bot; if we go multi-instance
+    # this becomes RedisStorage.
+    dp = Dispatcher(storage=MemoryStorage())
+    # Support router must be included FIRST so its StateFilter handlers
+    # get priority over the generic text/command matchers in the main
+    # handlers router — otherwise admin's typed reply would hit /start
+    # or other button handlers before reaching the support relay.
+    dp.include_router(support_router)
     dp.include_router(router)
+
+    # Register the slash-command menu so the "/" button appears next to
+    # the text input. Telegram caches this list client-side, so one call
+    # on startup is enough. Best-effort: network hiccups shouldn't keep
+    # the bot from booting.
+    try:
+        await bot.set_my_commands(DEFAULT_COMMANDS)
+    except Exception:
+        logger.exception("set_my_commands failed")
 
     # Start notification poller as background task
     poller_task = None

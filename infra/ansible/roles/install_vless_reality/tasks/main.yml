@@ -11,8 +11,10 @@
 #     state generation on the node itself;
 #   * enables xray's gRPC stats API bound to loopback, so the traffic
 #     collector can read per-user counters by email;
-#   * ships with an empty clients list. Users are added/removed by
-#     ``manage_vless_user.sh`` via jq, called from provision_device.yml.
+#   * preserves any clients previously added by manage_vless_user.sh
+#     across re-runs (slurp + re-inject), so a routine site.yml run
+#     no longer wipes every VLESS user on the node. On first bootstrap
+#     the list is empty and the backend fills it via provision_device.
 #
 # The role is a no-op unless the caller provides ``vless_reality_*``
 # vars. In the main site.yml we gate it on those being set, so nodes
@@ -57,12 +59,56 @@
   register: xray_install_result
   changed_when: "'already installed' not in xray_install_result.stdout"
 
+# Preserve clients added dynamically by manage_vless_user.sh across
+# re-runs of this role. The template ships `clients: []` by design
+# (the backend is authoritative for user state), but a plain re-render
+# during a routine `site.yml` run would wipe every VLESS user on the
+# node — existing clients would start getting "invalid request user id"
+# until the backend re-provisions them. We avoid that by slurping the
+# previous config (if any), pulling the current client list out of the
+# vless-reality inbound, and injecting it into the new render.
+- name: Check for existing xray config
+  stat:
+    path: /usr/local/etc/xray/config.json
+  register: vless_reality_existing_config
+
+- name: Slurp existing xray config
+  slurp:
+    src: /usr/local/etc/xray/config.json
+  register: vless_reality_existing_config_raw
+  when: vless_reality_existing_config.stat.exists
+
+- name: Extract existing vless-reality clients
+  set_fact:
+    vless_reality_existing_clients: >-
+      {{
+        (vless_reality_existing_config_raw.content | b64decode | from_json).inbounds
+        | selectattr('tag', 'equalto', 'vless-reality')
+        | map(attribute='settings.clients')
+        | list
+        | first
+        | default([])
+      }}
+  when: vless_reality_existing_config.stat.exists
+  # If the existing file is unparseable (half-written, truncated) we'd
+  # rather fall through to an empty list than abort the whole play —
+  # the backend resync path will re-add users after the render anyway.
+  ignore_errors: true
+
+- name: Default to empty clients list on first bootstrap
+  set_fact:
+    vless_reality_existing_clients: []
+  when: vless_reality_existing_clients is not defined
+
 - name: Ensure xray config directory
   file:
     path: /usr/local/etc/xray
     state: directory
     owner: root
-    group: root
+    # Same reason as config.json below: xray runs as nobody:nogroup
+    # under systemd. Without group-traverse on the parent dir, even a
+    # world-readable config.json would be unreachable.
+    group: nogroup
     mode: '0750'
 
 - name: Render xray config.json
@@ -70,13 +116,32 @@
     src: config.json.j2
     dest: /usr/local/etc/xray/config.json
     owner: root
-    group: root
+    # xtls-installer's xray.service runs `User=nobody`, whose primary
+    # group is `nogroup` on Debian/Ubuntu. If we leave group=root with
+    # mode 0640 the nobody process can't read config.json and xray
+    # exits 23 ("failed to read config") within 70ms. Combined with
+    # `RestartPreventExitStatus=23` in the unit, systemd never retries
+    # and the node silently has no :443. Root in a foreground run
+    # obviously ignores this — which is what masked the bug.
+    group: nogroup
     mode: '0640'
     # Back up the previous file so that a bad render leaves a recoverable
     # copy — xray will refuse to start on invalid JSON and a manual revert
     # is otherwise awkward.
     backup: yes
   notify: restart xray
+
+- name: Validate xray config.json before starting
+  # Catch bad renders up front so the role fails loudly with the real
+  # xray error text instead of a silent systemd 203/EXEC further down.
+  # Nodes often ship with volatile journald (journalctl shows "no
+  # entries"), so by the time check_node_health runs there is no way
+  # left to reconstruct *why* xray refused to start. Running -test here
+  # prints the error into the ansible output where we can actually see it.
+  command: /usr/local/bin/xray -test -config /usr/local/etc/xray/config.json
+  register: xray_config_test
+  changed_when: false
+  failed_when: xray_config_test.rc != 0
 
 - name: Install VLESS user management helper
   copy:
@@ -92,3 +157,14 @@
     enabled: yes
     state: started
     daemon_reload: yes
+
+# Flush handlers now instead of waiting for end-of-play. The upstream
+# xray install script starts xray with its own default (empty) config
+# BEFORE we render config.json, so by the time check_node_health (a
+# later role in the same play) opens a socket, xray is "running" but
+# NOT yet bound to the Reality port — our `notify: restart xray` is
+# still queued and won't fire until end of play. Flushing here makes
+# the restart happen immediately so health checks see the real
+# listener.
+- name: Flush xray handlers before leaving the role
+  meta: flush_handlers

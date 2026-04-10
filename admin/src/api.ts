@@ -68,6 +68,34 @@ export interface UserOut {
   email: string | null;
   created_at: string;
   subscription_count: number;
+  balance_kopecks: number;
+}
+
+export interface AdminTopupResponse {
+  user_id: number;
+  telegram_id: string | null;
+  balance_kopecks: number;
+  tx_id: number;
+}
+
+export function adminTopupByTelegram(
+  telegramId: string,
+  amountKopecks: number,
+  note?: string,
+): Promise<AdminTopupResponse> {
+  return api.post<AdminTopupResponse>(
+    `/users/by_telegram/${encodeURIComponent(telegramId)}/topup`,
+    { amount_kopecks: amountKopecks, note: note || null },
+  );
+}
+
+export interface DeviceOut {
+  id: number;
+  name: string;
+  status: string;
+  config_id: number;
+  access_username: string | null;
+  connection_uri: string | null;
 }
 
 export interface SubscriptionOut {
@@ -77,6 +105,7 @@ export interface SubscriptionOut {
   region: string;
   expires_at: string;
   status: string;
+  devices?: DeviceOut[];
 }
 
 export interface StatsOut {
@@ -119,6 +148,49 @@ export interface VPNNodeOut {
   updated_at: string;
 }
 
+export interface VPNNodeCreateIn {
+  name: string;
+  region: string;
+  host: string;
+  ssh_port: number;
+  pool_id: number | null;
+  notes: string | null;
+}
+
+// Протоколы должны быть в синке с VPNConfigProtocol enum в
+// backend/app/models.py — backend ругнётся 400 на неизвестный.
+export type VPNConfigProtocol =
+  | "shadowtls+shadowsocks"
+  | "vless-reality"
+  | "vless-ws-cdn"
+  | "hysteria2";
+
+export interface VPNConfigOut {
+  id: number;
+  node_id: number;
+  name: string;
+  protocol: VPNConfigProtocol;
+  port: number;
+  sni: string | null;
+  public_key: string | null;
+  fallback: string | null;
+  settings: Record<string, unknown> | null;
+  is_enabled: boolean;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface VPNConfigCreateIn {
+  name: string;
+  protocol: VPNConfigProtocol;
+  port: number;
+  sni?: string | null;
+  public_key?: string | null;
+  fallback?: string | null;
+  settings?: Record<string, unknown> | null;
+  is_enabled?: boolean;
+}
+
 export interface PlanOut {
   id: number;
   name: string;
@@ -149,4 +221,19 @@ export interface ApiTokenOut {
 
 export interface ApiTokenCreatedOut extends ApiTokenOut {
   token: string;
+}
+
+export interface ProvisioningTaskOut {
+  id: number;
+  target_type: string;
+  target_id: number;
+  action: string;
+  status: "pending" | "running" | "success" | "failed" | string;
+  payload: Record<string, unknown> | null;
+  result: Record<string, unknown> | null;
+  error_message: string | null;
+  created_at: string;
+  started_at: string | null;
+  finished_at: string | null;
+  telegram_id: string | null;
 }

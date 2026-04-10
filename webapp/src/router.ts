@@ -8,12 +8,14 @@ import { useEffect, useState } from "react";
 export type Route =
   | { name: "home" }
   | { name: "plans" }
+  | { name: "history" }
   | { name: "checkout"; invoiceId: number };
 
 function parseHash(): Route {
   const raw = window.location.hash.replace(/^#/, "");
   if (raw === "" || raw === "/") return { name: "home" };
   if (raw === "plans" || raw === "/plans") return { name: "plans" };
+  if (raw === "history" || raw === "/history") return { name: "history" };
   const m = raw.match(/^\/?checkout\/(\d+)$/);
   if (m) return { name: "checkout", invoiceId: Number(m[1]) };
   return { name: "home" };
@@ -25,7 +27,9 @@ export function navigate(route: Route): void {
       ? "/"
       : route.name === "plans"
         ? "/plans"
-        : `/checkout/${route.invoiceId}`;
+        : route.name === "history"
+          ? "/history"
+          : `/checkout/${route.invoiceId}`;
   window.location.hash = path;
 }
 

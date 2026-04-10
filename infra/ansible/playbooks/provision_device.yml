@@ -30,11 +30,18 @@
       register: st_manage_script
 
     - name: Add or remove ShadowTLS user
+      # Placeholder 'x' for password: the legacy shadowtls manage
+      # script is a no-op logger (shared-node credential model) but
+      # still enforces exactly 4 positional args. On revoke we don't
+      # have a per-user password, and ansible's `command:` module
+      # silently drops empty-string args — which would leave 3 and
+      # trip the arg-count check in the script. The value is never
+      # used, so a literal 'x' is the simplest way to keep the count.
       command: >-
         /usr/local/sbin/manage_vpn_user.sh
         {{ 'add-shadowtls-ss' if state == 'present' else 'del-shadowtls-ss' }}
         {{ username }}
-        {{ password | default('') }}
+        {{ password | default('x') }}
         {{ item.method | default('chacha20-ietf-poly1305') }}
         {{ item.port | default(8443) }}
       loop: "{{ protocols }}"

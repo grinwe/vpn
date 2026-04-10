@@ -7,6 +7,7 @@ import Invoices from "./pages/Invoices";
 import Nodes from "./pages/Nodes";
 import Plans from "./pages/Plans";
 import ApiTokens from "./pages/ApiTokens";
+import Tasks from "./pages/Tasks";
 
 function Layout({ children }: { children: React.ReactNode }) {
   const { logout } = useAuth();
@@ -22,6 +23,7 @@ function Layout({ children }: { children: React.ReactNode }) {
           <NavLink to="/invoices" className={linkCls}>Invoices</NavLink>
           <NavLink to="/plans" className={linkCls}>Plans</NavLink>
           <NavLink to="/nodes" className={linkCls}>Nodes</NavLink>
+          <NavLink to="/tasks" className={linkCls}>Tasks</NavLink>
           <NavLink to="/tokens" className={linkCls}>API tokens</NavLink>
         </nav>
         <button
@@ -55,6 +57,7 @@ export default function App() {
       <Route path="/invoices" element={<Protected><Invoices /></Protected>} />
       <Route path="/plans" element={<Protected><Plans /></Protected>} />
       <Route path="/nodes" element={<Protected><Nodes /></Protected>} />
+      <Route path="/tasks" element={<Protected><Tasks /></Protected>} />
       <Route path="/tokens" element={<Protected><ApiTokens /></Protected>} />
       <Route path="*" element={<Navigate to="/" replace />} />
     </Routes>

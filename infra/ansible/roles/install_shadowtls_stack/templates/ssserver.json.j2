@@ -1,0 +1,9 @@
+{
+  "server": "127.0.0.1",
+  "server_port": {{ shadowtls_ss_loopback_port | int }},
+  "password": "{{ shadowtls_ss_password }}",
+  "method": "{{ shadowtls_ss_method }}",
+  "mode": "tcp_and_udp",
+  "fast_open": false,
+  "no_delay": true
+}

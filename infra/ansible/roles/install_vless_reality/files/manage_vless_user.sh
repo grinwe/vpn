@@ -23,6 +23,7 @@ set -euo pipefail
 
 CONFIG="/usr/local/etc/xray/config.json"
 INBOUND_TAG="vless-reality"
+LOCKFILE="/var/lock/manage_vless_user.lock"
 
 usage() {
   cat >&2 <<'USAGE'
@@ -72,6 +73,10 @@ cmd_add() {
   fi
 
   mv "${tmp}" "${CONFIG}"
+  # `mv` from /tmp carries root:root ownership, wiping the `nogroup`
+  # group that xray (running as `nobody`) needs to read the file. Without
+  # this chown the service exits 23 "permission denied" on next reload.
+  chown root:nogroup "${CONFIG}"
   chmod 0640 "${CONFIG}"
   reload_xray
   echo "added vless user ${email}"
@@ -98,6 +103,10 @@ cmd_del() {
   fi
 
   mv "${tmp}" "${CONFIG}"
+  # `mv` from /tmp carries root:root ownership, wiping the `nogroup`
+  # group that xray (running as `nobody`) needs to read the file. Without
+  # this chown the service exits 23 "permission denied" on next reload.
+  chown root:nogroup "${CONFIG}"
   chmod 0640 "${CONFIG}"
   reload_xray
   echo "removed vless user ${email}"
@@ -122,4 +131,17 @@ main() {
   esac
 }
 
+# Serialize concurrent calls with flock. Without this, parallel
+# ansible device-apply tasks on the same node race each other:
+#   task A reads config.json  (users [X])
+#   task B reads config.json  (users [X])
+#   task A writes config.json (users [X, A])
+#   task B writes config.json (users [X, B])  ← user A lost!
+# The symptom is "invalid request user id" / EOF for one of the
+# users until a manual resync re-adds them. flock(1) is POSIX,
+# available on every Debian/Ubuntu, and the held time is <50ms
+# (jq parse + write + systemctl restart), so there's no meaningful
+# serialization overhead.
+exec 200>"${LOCKFILE}"
+flock 200
 main "$@"

@@ -37,13 +37,38 @@ services:
       REDIS_URL: "redis://redis:6379/0"
       QUEUE_BACKEND: "rq"
       PAYMENT_PROVIDER: ${PAYMENT_PROVIDER:-cryptobot}
+      # Stage 9a: comma-separated rotation pool. If set, the backend
+      # picks one provider per checkout (random). Falls back to
+      # PAYMENT_PROVIDER above when unset.
+      PAYMENT_PROVIDERS: ${PAYMENT_PROVIDERS:-}
       CRYPTOBOT_TOKEN: ${CRYPTOBOT_TOKEN:-}
       YOOKASSA_SHOP_ID: ${YOOKASSA_SHOP_ID:-}
       YOOKASSA_SECRET_KEY: ${YOOKASSA_SECRET_KEY:-}
       TELEGRAM_STARS_WEBHOOK_SECRET: ${TELEGRAM_STARS_WEBHOOK_SECRET:-}
       BOT_TOKEN: ${BOT_TOKEN}
+      # Needed by /api/webapp/referral to build the full t.me share link.
+      # Without it share_url comes back None and the webapp falls back to
+      # showing the bare referral code.
+      BOT_USERNAME: ${BOT_USERNAME:-}
       WEBAPP_JWT_SECRET: ${WEBAPP_JWT_SECRET}
       WEBAPP_JWT_TTL_SECONDS: ${WEBAPP_JWT_TTL_SECONDS:-1800}
+      # Stage 2.5 — read by ProvisioningOrchestrator to bypass the warm
+      # pool entirely when set to "0". Worker has its own copy because
+      # it also reads the var to gate the periodic warmer.
+      WARM_POOL_ENABLED: ${WARM_POOL_ENABLED:-1}
+      # Stage 4 — balance billing. Backend reads these for the
+      # WebApp endpoints (freeze caps, min topup, referral bonus).
+      MAX_FREEZE_DAYS_PER_PERIOD: ${MAX_FREEZE_DAYS_PER_PERIOD:-14}
+      FREEZE_YEAR_BUDGET_DAYS: ${FREEZE_YEAR_BUDGET_DAYS:-30}
+      REFERRAL_BONUS_KOPECKS: ${REFERRAL_BONUS_KOPECKS:-5000}
+      MIN_TOPUP_KOPECKS: ${MIN_TOPUP_KOPECKS:-10000}
+      EXTRA_DEVICE_KOPECKS_PER_MONTH: ${EXTRA_DEVICE_KOPECKS_PER_MONTH:-10000}
+      # Stage 8 — public base URL for the dynamic sub link. When set,
+      # provisioning bakes <SUB_LINK_BASE_URL>/<token> into Device rows
+      # and the WebApp surfaces it for copy/QR. Point this at a "boring"
+      # CDN-fronted domain (Cloudflare Worker proxy etc.) so an RKN
+      # block on grinwer.online does not kill installed clients.
+      SUB_LINK_BASE_URL: ${SUB_LINK_BASE_URL:-}
     ports:
       - "127.0.0.1:8000:8000"
     depends_on:
@@ -63,13 +88,54 @@ services:
       APP_SECRET_KEY: ${APP_SECRET_KEY}
       REDIS_URL: "redis://redis:6379/0"
       QUEUE_BACKEND: "rq"
+      # Migrations are owned by the backend service — it runs
+      # `alembic upgrade head` on startup. If the worker also tries to
+      # run them, both processes race on the alembic_version advisory
+      # lock and whichever loses hangs forever before ever reaching
+      # `Worker.work()`, which in turn leaves every provisioning task
+      # stuck in `pending` with no one to execute it. Keep this pinned.
+      SKIP_MIGRATIONS: "1"
       ANSIBLE_ROOT: /app/infra/ansible
       ANSIBLE_PRIVATE_KEY_FILE: /run/secrets/provisioning_key
       AUTOSCALE_INTERVAL: ${AUTOSCALE_INTERVAL:-300}
+      # Stage 5 — downscale. Master switch is OFF by default; flip to 1
+      # after watching the metrics for a cycle. The drain tick runs
+      # regardless so manually-flipped draining nodes still get cleaned up.
+      AUTOSCALE_DOWNSCALE_ENABLED: ${AUTOSCALE_DOWNSCALE_ENABLED:-0}
+      AUTOSCALE_LOW_WATERMARK: ${AUTOSCALE_LOW_WATERMARK:-0.3}
+      AUTOSCALE_MIN_NODES: ${AUTOSCALE_MIN_NODES:-1}
+      AUTOSCALE_DRAIN_GRACE_HOURS: ${AUTOSCALE_DRAIN_GRACE_HOURS:-24}
+      DRAIN_TICK_INTERVAL: ${DRAIN_TICK_INTERVAL:-600}
+      DRAIN_MIGRATE_BATCH: ${DRAIN_MIGRATE_BATCH:-10}
       RENEWAL_CHECK_INTERVAL: ${RENEWAL_CHECK_INTERVAL:-300}
       RENEWAL_GRACE_HOURS: ${RENEWAL_GRACE_HOURS:-24}
+      # Stage 2.5 — warm credential pool. Worker tops up each active
+      # node to WARM_POOL_TARGET bundles every WARM_POOL_CHECK_INTERVAL
+      # seconds, capped to WARM_POOL_BATCH_PER_TICK provisions per node
+      # per tick. Set WARM_POOL_ENABLED=0 to fully disable and force
+      # the cold ansible path on every purchase.
+      WARM_POOL_ENABLED: ${WARM_POOL_ENABLED:-1}
+      WARM_POOL_TARGET: ${WARM_POOL_TARGET:-10}
+      WARM_POOL_BATCH_PER_TICK: ${WARM_POOL_BATCH_PER_TICK:-3}
+      WARM_POOL_CHECK_INTERVAL: ${WARM_POOL_CHECK_INTERVAL:-120}
+      WARM_POOL_MAX_CONCURRENT: ${WARM_POOL_MAX_CONCURRENT:-2}
+      # Stage 4 — balance billing. Hourly tick charges due subs and
+      # auto-unfreezes paused ones whose frozen_until lapsed. Tunables
+      # cover the freeze caps, referral bonus and minimum topup.
+      BALANCE_CHARGE_INTERVAL: ${BALANCE_CHARGE_INTERVAL:-3600}
+      MAX_FREEZE_DAYS_PER_PERIOD: ${MAX_FREEZE_DAYS_PER_PERIOD:-14}
+      FREEZE_YEAR_BUDGET_DAYS: ${FREEZE_YEAR_BUDGET_DAYS:-30}
+      REFERRAL_BONUS_KOPECKS: ${REFERRAL_BONUS_KOPECKS:-5000}
+      MIN_TOPUP_KOPECKS: ${MIN_TOPUP_KOPECKS:-10000}
+      EXTRA_DEVICE_KOPECKS_PER_MONTH: ${EXTRA_DEVICE_KOPECKS_PER_MONTH:-10000}
+      # Stage 8 — same SUB_LINK_BASE_URL the backend reads, propagated to
+      # the worker because the warm-pool / migration code paths in
+      # provisioning.py also bake the sub URL into Device.connection_uri
+      # when running off the queue.
+      SUB_LINK_BASE_URL: ${SUB_LINK_BASE_URL:-}
+      LOW_BALANCE_WARN_DAYS: ${LOW_BALANCE_WARN_DAYS:-3}
     volumes:
-      - ${PROVISIONING_SSH_KEY:-/dev/null}:/run/secrets/provisioning_key:ro
+      - ${PROVISIONING_SSH_KEY:-ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIE8IrzyHuBdSXDnBCE9XthETlDDrD4nsOqeubIt6oMkS provisioning@grinwer}:/run/secrets/provisioning_key:ro
     depends_on:
       db:
         condition: service_healthy
@@ -86,7 +152,7 @@ services:
   webapp:
     build: ./webapp
     ports:
-      - "127.0.0.1:8081:80"
+      - "127.0.0.1:8082:80"
     restart: unless-stopped
 
   bot:
@@ -97,6 +163,10 @@ services:
       ADMIN_API_TOKEN: ${ADMIN_API_TOKEN}
       ADMIN_IDS: ${ADMIN_IDS}
       PAYMENT_PROVIDER: ${PAYMENT_PROVIDER:-cryptobot}
+      # Stage 9a: comma-separated rotation pool. If set, the backend
+      # picks one provider per checkout (random). Falls back to
+      # PAYMENT_PROVIDER above when unset.
+      PAYMENT_PROVIDERS: ${PAYMENT_PROVIDERS:-}
       TELEGRAM_STARS_WEBHOOK_SECRET: ${TELEGRAM_STARS_WEBHOOK_SECRET:-}
       SUB_LINK_BASE_URL: ${SUB_LINK_BASE_URL:-}
       WEBAPP_BASE_URL: ${WEBAPP_BASE_URL:-}

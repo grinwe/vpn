@@ -50,6 +50,30 @@
 
 ---
 
+### 🚧 Этап 2.75 — Admin UI hardening (текущий фокус)
+
+**Цель:** закрыть последние «курлы в проде» для админа нод. Сейчас создание ноды и конфигов уже живёт в `admin/src/pages/Nodes.tsx`, но провижининг-таски видны только через API/логи, и нет кнопок на retry/delete — это упирается при первом же фейле ансибла.
+
+**Что делаем:**
+
+1. **Provisioning tasks page** — новая вкладка в admin UI (`/admin/tasks`). Таблица последних N `ProvisioningTask`: `id, target_type, target_id, action, status, created_at, finished_at`. Клик по строке разворачивает панель с `stdout`/`stderr`/`extra` (pre-formatted). Источник: `GET /api/provisioning/tasks?limit=50`.
+2. **Retry failed tasks** — кнопка «↻ Повторить» в развёрнутой панели для задач со `status=failed`. `POST /api/provisioning/tasks/{id}/retry` — пере-enqueue'ит ту же таску (копия row с новым id, ссылкой на предыдущий через `extra.retry_of`). Идемпотентно — повторный клик на уже-enqueue'нную копию возвращает 409.
+3. **Delete node** — кнопка «🗑 Удалить» в `Nodes.tsx` на строке ноды. Модалка с подтверждением + чек-бокс «убрать также с ансибла» (вызовет playbook в `state=absent` перед удалением row). Soft-fail: если на ноде ещё есть активные подписки — 409 с списком подписок, требует миграции перед удалением.
+
+**Файлы:**
+- `vpn/admin/src/pages/Tasks.tsx` — новая страница
+- `vpn/admin/src/App.tsx` — роут `/tasks` + ссылка в навигации
+- `vpn/admin/src/api.ts` — типы `ProvisioningTaskOut`
+- `vpn/admin/src/pages/Nodes.tsx` — кнопка Delete + модалка
+- `vpn/backend/app/api.py` — `POST /api/provisioning/tasks/{id}/retry`, `DELETE /api/nodes/{id}` (если ещё нет)
+
+**Acceptance:**
+- [ ] Админ видит последние таски и их stdout прямо в UI, без `docker compose logs`
+- [ ] Failed task можно перезапустить одной кнопкой
+- [ ] Ноду можно удалить из UI, с подтверждением и предупреждением об активных подписках
+
+---
+
 ### Этап 2 — Покупка через WebApp (Telegram Stars)
 
 **Цель:** довести цикл «открыл WebApp → выбрал тариф → оплатил → получил конфиг» до состояния «работает целиком, не выходя из Telegram». Без редиректов в браузер. YooKassa отложена (риск блокировки), но провайдерный слой пишем расширяемо, чтобы её добавить было одной задачей.
@@ -96,7 +120,7 @@
 
 ---
 
-### Этап 2.5 — Pre-warmed credentials pool (instant activation)
+### ✅ Этап 2.5 — Pre-warmed credentials pool (instant activation)
 
 **Цель:** убрать 1–2-минутный «готовим конфиг» после оплаты. После этапа 2 покупка работает, но Ansible-латенция видна юзеру. После 2.5 — конфиг выдаётся за миллисекунды, потому что он уже лежит на ноде, ждёт ассайна.
 
@@ -135,11 +159,11 @@
 - `vpn/backend/tests/test_warm_pool.py` — atomic assignment race-condition тест (двое юзеров на одну warm credential — должен получить только один)
 
 **Acceptance:**
-- [ ] Холодный старт: pool пустой → cron поднимает `WARM_POOL_TARGET` warm-creds на каждой ноде
-- [ ] Покупка с теплым пулом: тап «Купить» → подписка активна за <1 сек → конфиг сразу
-- [ ] Race test (pytest): 10 параллельных провижинингов на один warm cred → 1 успех + 9 fallback на cold
-- [ ] Pool depth panel в Grafana показывает живой график
-- [ ] Revoke не блокирует API: ответ < 100ms, фактический ансибл-`absent` едет в фоне
+- [x] Холодный старт: pool пустой → cron поднимает `WARM_POOL_TARGET` warm-creds на каждой ноде
+- [x] Покупка с теплым пулом: тап «Купить» → подписка активна за <1 сек → конфиг сразу
+- [x] Race test (pytest): 10 параллельных провижинингов на один warm cred → 1 успех + 9 fallback на cold
+- [x] Pool depth panel в Grafana показывает живой график
+- [x] Revoke не блокирует API: ответ < 100ms, фактический ансибл-`absent` едет в фоне
 
 ---
 

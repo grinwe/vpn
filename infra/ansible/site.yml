@@ -3,7 +3,11 @@
   become: yes
   roles:
     - bootstrap_node
-    - install_shadowtls_stack
+    # ShadowTLS v3 + shadowsocks-rust. Needs backend-supplied passwords
+    # + handshake domain; gate on presence so nodes that serve only
+    # other protocols (Reality / WS+CDN) don't attempt the install.
+    - role: install_shadowtls_stack
+      when: shadowtls_password is defined and shadowtls_password | length > 0
     # VLESS Reality — needs backend-generated x25519 keys + shortId.
     - role: install_vless_reality
       when: vless_reality_private_key is defined and vless_reality_private_key | length > 0

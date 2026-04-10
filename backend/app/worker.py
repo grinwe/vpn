@@ -14,7 +14,15 @@ from prometheus_client import Counter, Gauge
 
 logger = logging.getLogger(__name__)
 
-# Heartbeat metrics — Grafana alerts on "no increment for >2× interval".
+# NB: this module MUST be imported under its canonical name `app.worker`, not
+# as `__main__`. RQ executes jobs by calling importlib.import_module("app.worker"),
+# and if the module was originally loaded as `__main__` (via `python -m app.worker`),
+# Python re-executes this file on the RQ side — re-registering the metrics
+# below into the global CollectorRegistry and crashing every single job with
+# "Duplicated timeseries in CollectorRegistry". The container entrypoint
+# (Dockerfile.worker) therefore uses `python -c "from app.worker import main; main()"`
+# so sys.modules has `app.worker` from the first import and RQ's re-import
+# is a no-op. Do NOT revert to `python -m app.worker`.
 RENEWAL_RUNS = Counter(
     "vpn_renewal_check_runs_total", "Renewal cron tick count", ["outcome"]
 )
@@ -59,6 +67,141 @@ def run_autoscale_tick() -> list[dict]:
             except Exception:  # noqa: BLE001
                 logger.exception("Failed to re-enqueue autoscale tick")
     return result
+
+
+def run_drain_tick() -> dict:
+    """Stage 5 — drive the downscale path.
+
+    Two phases per tick:
+
+    1. Mark phase: ``evaluate_all_downscale`` walks every pool and may
+       flip one node per pool to ``draining`` (gated by hysteresis +
+       min_nodes + the master switch).
+
+    2. Migrate / destroy phase: for every node currently in ``draining``
+       state, walk a batch of its active subscriptions and call
+       ``migrate_subscription_to_new_node`` on each. If the migration
+       leaves the node with zero active subs AND ``draining_at`` was
+       set more than ``DRAIN_GRACE_HOURS`` ago, call ``destroy_node``
+       to actually delete the VM.
+
+    Self-rescheduling via ``DRAIN_TICK_INTERVAL`` (default 600s).
+    """
+    from datetime import timedelta
+
+    from .db import SessionLocal
+    from .queue import get_queue
+    from . import models
+    from .services import autoscale
+    from .services.node_spawner import NodeSpawnError, destroy_node
+    from .services.provisioning import ProvisioningOrchestrator
+    from .time_utils import utcnow
+
+    stats: dict = {
+        "marked": 0,
+        "migrated": 0,
+        "migration_errors": 0,
+        "destroyed": 0,
+        "destroy_errors": 0,
+    }
+    session = SessionLocal()
+    try:
+        # Phase 1 — mark.
+        try:
+            decisions = autoscale.evaluate_all_downscale(session)
+            stats["marked"] = sum(1 for d in decisions if d.marked_node_id is not None)
+        except Exception:  # noqa: BLE001
+            logger.exception("evaluate_all_downscale failed")
+
+        # Phase 2 — migrate + destroy. Re-query each tick so we pick up
+        # nodes marked by phase 1 in this same run.
+        draining_nodes = (
+            session.query(models.VPNNode)
+            .filter(models.VPNNode.status == models.VPNNodeStatus.draining)
+            .all()
+        )
+        batch_size = int(os.getenv("DRAIN_MIGRATE_BATCH", "10"))
+        grace_hours = int(os.getenv("AUTOSCALE_DRAIN_GRACE_HOURS", "24"))
+        orchestrator = ProvisioningOrchestrator(session)
+
+        for node in draining_nodes:
+            live_subs = (
+                session.query(models.Subscription)
+                .filter(
+                    models.Subscription.node_id == node.id,
+                    models.Subscription.status == models.SubscriptionStatus.active,
+                )
+                .order_by(models.Subscription.id.asc())
+                .limit(batch_size)
+                .all()
+            )
+            autoscale.DRAIN_SUBS_REMAINING.labels(
+                pool=node.pool.name if node.pool else "unknown",
+                node=node.name,
+            ).set(len(live_subs))
+
+            for sub in live_subs:
+                try:
+                    orchestrator.migrate_subscription_to_new_node(sub)
+                    stats["migrated"] += 1
+                except Exception:  # noqa: BLE001
+                    logger.exception(
+                        "migrate_subscription failed for sub %s on node %s",
+                        sub.id,
+                        node.id,
+                    )
+                    stats["migration_errors"] += 1
+
+            # Re-count after the batch — if any subs survive, defer
+            # destroy to a later tick.
+            remaining = (
+                session.query(models.Subscription)
+                .filter(
+                    models.Subscription.node_id == node.id,
+                    models.Subscription.status == models.SubscriptionStatus.active,
+                )
+                .count()
+            )
+            autoscale.DRAIN_SUBS_REMAINING.labels(
+                pool=node.pool.name if node.pool else "unknown",
+                node=node.name,
+            ).set(remaining)
+            if remaining > 0:
+                continue
+
+            # Grace check: use ``updated_at`` as a proxy for "when we
+            # last touched this node". The status flip in
+            # evaluate_pool_downscale stamps it, and so does the final
+            # migrate batch — meaning we wait for ``grace_hours`` of
+            # quiet, not from the original mark.
+            if node.updated_at and (utcnow() - node.updated_at) < timedelta(hours=grace_hours):
+                continue
+
+            try:
+                destroy_node(session, node)
+                stats["destroyed"] += 1
+                logger.warning(
+                    "Drain tick: destroyed node %s after grace window", node.name
+                )
+            except NodeSpawnError:
+                logger.exception("destroy_node failed for %s", node.name)
+                stats["destroy_errors"] += 1
+    finally:
+        session.close()
+
+    interval = int(os.getenv("DRAIN_TICK_INTERVAL", "600"))
+    if interval > 0:
+        queue = get_queue()
+        if queue is not None:
+            try:
+                queue.enqueue_in(
+                    timedelta(seconds=interval),
+                    "app.worker.run_drain_tick",
+                    result_ttl=3600,
+                )
+            except Exception:  # noqa: BLE001
+                logger.exception("Failed to re-enqueue drain tick")
+    return stats
 
 
 def run_renewal_check() -> dict:
@@ -259,6 +402,383 @@ def run_renewal_check() -> dict:
     return stats
 
 
+def run_warm_pool_check() -> dict:
+    """Periodic job — top up warm credential pools on every active node.
+
+    Stage 2.5 of the WebApp roadmap. Reads ``WARM_POOL_TARGET`` /
+    ``WARM_POOL_BATCH_PER_TICK`` for sizing, ``WARM_POOL_CHECK_INTERVAL``
+    for scheduling. Self-reschedules at the end so a single startup
+    ``enqueue_in`` produces a recurring tick without depending on
+    rq-scheduler.
+
+    Returns a ``{node_id: warmed_count}`` summary so the RQ result
+    backend captures a useful audit trail per tick.
+    """
+    from datetime import timedelta
+
+    from .db import SessionLocal
+    from .queue import get_queue
+    from .services import warm_pool
+
+    session = SessionLocal()
+    summary: dict = {}
+    try:
+        summary = warm_pool.ensure_pool(session)
+    except Exception:  # noqa: BLE001
+        logger.exception("warm_pool: ensure_pool failed")
+    finally:
+        session.close()
+
+    interval = int(os.getenv("WARM_POOL_CHECK_INTERVAL", "120"))
+    if interval > 0:
+        queue = get_queue()
+        if queue is not None:
+            try:
+                queue.enqueue_in(
+                    timedelta(seconds=interval),
+                    "app.worker.run_warm_pool_check",
+                    result_ttl=3600,
+                )
+            except Exception:  # noqa: BLE001
+                logger.exception("warm_pool: failed to re-enqueue tick")
+    return summary
+
+
+_LOW_BALANCE_THRESHOLD_DAYS = int(os.getenv("LOW_BALANCE_WARN_DAYS", "3"))
+
+
+def _maybe_emit_low_balance_warning(session, sub) -> None:
+    """Write an AuditLog notification when runway drops below 3 days.
+
+    Idempotent per calendar day: we only fire if there's no existing
+    ``low_balance_warning`` log for this user dated today. The bot's
+    notification poller picks the row up and renders it via the
+    standard ``/notifications/pending`` channel.
+    """
+    from . import models
+    from .services import balance as balance_svc
+    from .time_utils import utcnow
+
+    plan = sub.plan
+    if not plan or not plan.daily_rate_kopecks:
+        return
+    user = sub.user
+    if not user or not user.telegram_id:
+        return
+
+    devices = sum(
+        1 for d in sub.devices
+        if d.status not in (models.DeviceStatus.revoked, models.DeviceStatus.disabled)
+    )
+    # Runway = prepaid bucket + wallet fallback (charge pulls from the
+    # wallet once the bucket is drained).
+    days = balance_svc.sub_days_remaining(
+        sub, max(devices, 1), user.balance_kopecks or 0
+    )
+    if days > _LOW_BALANCE_THRESHOLD_DAYS:
+        return
+
+    today = utcnow().date().isoformat()
+    existing = (
+        session.query(models.AuditLog)
+        .filter(
+            models.AuditLog.action == "low_balance_warning",
+            models.AuditLog.target_type == "user",
+            models.AuditLog.target_id == user.id,
+            models.AuditLog.created_at >= utcnow().replace(hour=0, minute=0, second=0, microsecond=0),
+        )
+        .first()
+    )
+    if existing:
+        return
+
+    session.add(
+        models.AuditLog(
+            actor="system",
+            actor_type=models.AuditActor.system,
+            action="low_balance_warning",
+            target_type="user",
+            target_id=user.id,
+            extra={
+                "telegram_id": user.telegram_id,
+                "days_remaining": days,
+                "balance_rub": round((user.balance_kopecks or 0) / 100, 2),
+                "subscription_id": sub.id,
+                "date": today,
+            },
+        )
+    )
+
+
+def _run_trial_expiry_pass(session, stats: dict) -> None:
+    """Trial expiry: T-3 warning, T=0 clawback for non-paying users.
+
+    Called once per ``run_balance_charge_tick``. Idempotent:
+      * Warnings dedup on existing ``trial_expiry_warning[:delivered]``
+        AuditLog for the user — we never fire twice for the same trial.
+      * Clawbacks dedup on the ``trial_expiry_clawback:<uid>`` reference
+        and additionally clear ``trial_expires_at`` so the next tick
+        doesn't even enter the loop.
+    Users with at least one ``kind=topup`` are considered "earned" —
+    they keep the bonus and we just clear ``trial_expires_at``.
+    """
+    from datetime import timedelta
+
+    from . import models
+    from .services import balance as balance_svc
+    from .time_utils import utcnow
+
+    now = utcnow()
+    warn_cutoff = now + timedelta(days=balance_svc.TRIAL_EXPIRY_WARN_DAYS)
+
+    # ── 3a. Warnings ──────────────────────────────────────────────────
+    pending_warn = (
+        session.query(models.User)
+        .filter(
+            models.User.trial_expires_at.isnot(None),
+            models.User.trial_expires_at <= warn_cutoff,
+            models.User.trial_expires_at > now,
+            models.User.telegram_id.isnot(None),
+        )
+        .limit(200)
+        .all()
+    )
+    for u in pending_warn:
+        already = (
+            session.query(models.AuditLog)
+            .filter(
+                models.AuditLog.target_type == "user",
+                models.AuditLog.target_id == u.id,
+                models.AuditLog.action.in_(
+                    ["trial_expiry_warning", "trial_expiry_warning:delivered"]
+                ),
+            )
+            .first()
+        )
+        if already:
+            continue
+        session.add(
+            models.AuditLog(
+                actor="system",
+                actor_type=models.AuditActor.system,
+                action="trial_expiry_warning",
+                target_type="user",
+                target_id=u.id,
+                extra={
+                    "telegram_id": u.telegram_id,
+                    "expires_at": u.trial_expires_at.isoformat(),
+                },
+            )
+        )
+        stats["trial_warned"] = stats.get("trial_warned", 0) + 1
+    session.commit()
+
+    # ── 3b. Clawbacks ─────────────────────────────────────────────────
+    expired = (
+        session.query(models.User)
+        .filter(
+            models.User.trial_expires_at.isnot(None),
+            models.User.trial_expires_at <= now,
+            models.User.trial_activated_at.isnot(None),
+        )
+        .limit(200)
+        .all()
+    )
+    for u in expired:
+        # Paying customer? Keep the bonus, just clear the timer so we
+        # don't revisit this user every tick.
+        has_topup = (
+            session.query(models.BalanceTransaction)
+            .filter_by(user_id=u.id, kind=models.BalanceTxKind.topup)
+            .first()
+        )
+        if has_topup is not None:
+            u.trial_expires_at = None
+            session.add(u)
+            stats["trial_kept"] = stats.get("trial_kept", 0) + 1
+            continue
+
+        ref = f"trial_expiry_clawback:{u.id}"
+        prior = (
+            session.query(models.BalanceTransaction)
+            .filter_by(reference=ref)
+            .first()
+        )
+        if prior is not None:
+            u.trial_expires_at = None
+            session.add(u)
+            continue
+
+        # Clawback sized to the trial amount that's currently live, but
+        # capped at the user's balance so we can't push them negative.
+        # adjustment() already floors at balance, but we also compute
+        # the trial amount here so the ledger note matches what we
+        # meant to take.
+        trial_amount = balance_svc_trial_amount(session)
+        take = min(trial_amount, u.balance_kopecks or 0)
+        if take > 0:
+            balance_svc.adjustment(
+                session,
+                u.id,
+                -take,
+                reference=ref,
+                note="trial_expiry_clawback",
+            )
+            stats["trial_clawback"] = stats.get("trial_clawback", 0) + 1
+        u.trial_expires_at = None
+        session.add(u)
+    session.commit()
+
+
+def balance_svc_trial_amount(session) -> int:
+    """Thin wrapper around ``services.trial.trial_amount_kopecks``.
+
+    Defined at module scope (rather than inlined) so mocking it in
+    tests is trivial. Imports lazily to dodge the circular-import risk
+    between ``worker`` and ``services.trial`` (both pull ``models``).
+    """
+    from .services import trial as trial_svc
+
+    return trial_svc.trial_amount_kopecks(session)
+
+
+def run_balance_charge_tick() -> dict:
+    """Periodic job — daily-billing tick for balance subscriptions.
+
+    Two passes per tick, both bounded so a backlog can't lock the
+    worker for an entire interval:
+
+      1. **Charge.** ``SELECT ... WHERE status='active' AND
+         next_charge_at <= now FOR UPDATE SKIP LOCKED LIMIT 500``.
+         Each row goes through ``balance.charge_subscription``. On
+         insufficient balance the sub flips to ``expired`` so the next
+         ``run_renewal_check`` revoke pass picks it up — we don't
+         duplicate the revoke logic here, just hand the sub off.
+
+      2. **Auto-unfreeze.** ``SELECT ... WHERE status='frozen' AND
+         frozen_until <= now FOR UPDATE SKIP LOCKED LIMIT 100``.
+         ``balance.unfreeze_subscription(..., auto=True)`` re-provisions
+         a device and resumes billing.
+
+    Self-reschedules at the end (mirror of ``run_warm_pool_check``).
+    Operators can fall back to a manual cron by setting
+    ``BALANCE_CHARGE_INTERVAL=0`` and dispatching the job externally.
+    """
+    from datetime import timedelta
+
+    from . import models
+    from .db import SessionLocal
+    from .queue import get_queue
+    from .services import balance
+    from .time_utils import utcnow
+
+    session = SessionLocal()
+    stats = {"charged": 0, "insufficient": 0, "unfrozen": 0, "errors": 0}
+    try:
+        now = utcnow()
+
+        # ── Pass 1: charge due active subs ─────────────────────────────
+        due = (
+            session.query(models.Subscription)
+            .filter(
+                models.Subscription.status == models.SubscriptionStatus.active,
+                models.Subscription.next_charge_at.isnot(None),
+                models.Subscription.next_charge_at <= now,
+            )
+            .with_for_update(skip_locked=True)
+            .limit(500)
+            .all()
+        )
+        for sub in due:
+            try:
+                ok = balance.charge_subscription(session, sub)
+            except Exception:
+                logger.exception("balance: charge failed for sub %s", sub.id)
+                stats["errors"] += 1
+                session.rollback()
+                continue
+            if ok:
+                stats["charged"] += 1
+                # Low-balance warning: after a successful charge, check
+                # whether the user's runway just dropped below 3 days.
+                # We emit at most one warning per (user, day) by writing
+                # an AuditLog the bot polls — duplicate-prevention is on
+                # the bot side via the `:delivered` rename.
+                _maybe_emit_low_balance_warning(session, sub)
+            else:
+                # Insufficient balance — flip to expired so the renewal
+                # cron's hard-revoke pass takes the device down after
+                # its grace window.
+                sub.status = models.SubscriptionStatus.expired
+                sub.next_charge_at = None
+                session.add(sub)
+                stats["insufficient"] += 1
+            session.commit()
+
+        # ── Pass 2: auto-unfreeze expired pauses ───────────────────────
+        expired_freezes = (
+            session.query(models.Subscription)
+            .filter(
+                models.Subscription.status == models.SubscriptionStatus.frozen,
+                models.Subscription.frozen_until.isnot(None),
+                models.Subscription.frozen_until <= now,
+            )
+            .with_for_update(skip_locked=True)
+            .limit(100)
+            .all()
+        )
+        for sub in expired_freezes:
+            try:
+                balance.unfreeze_subscription(session, sub, auto=True)
+                stats["unfrozen"] += 1
+                session.commit()
+            except Exception:
+                logger.exception("balance: auto-unfreeze failed for sub %s", sub.id)
+                stats["errors"] += 1
+                session.rollback()
+
+        # ── Pass 3: trial expiry — warn T-3 days, clawback at T=0 ──────
+        # Two sub-passes, both idempotent:
+        #   3a. Write a trial_expiry_warning AuditLog for any user whose
+        #       trial expires within TRIAL_EXPIRY_WARN_DAYS but hasn't
+        #       been warned yet (dedup on existing action lookup).
+        #   3b. For any user whose trial has already expired and who
+        #       never made a real kind=topup, write a compensating
+        #       kind=adjust transaction clawing back up to the trial
+        #       amount (capped at the current balance so we never go
+        #       negative). Paying customers keep the bonus — rule is
+        #       "became a customer ⇒ trial is earned". In either branch
+        #       we clear trial_expires_at so the tick never revisits.
+        try:
+            _run_trial_expiry_pass(session, stats)
+        except Exception:
+            logger.exception("balance: trial expiry pass failed")
+            stats["errors"] += 1
+            if session.is_active:
+                session.rollback()
+    except Exception:
+        logger.exception("balance charge tick failed")
+        stats["errors"] += 1
+        if session.is_active:
+            session.rollback()
+    finally:
+        session.close()
+
+    interval = int(os.getenv("BALANCE_CHARGE_INTERVAL", "3600"))
+    if interval > 0:
+        queue = get_queue()
+        if queue is not None:
+            try:
+                queue.enqueue_in(
+                    timedelta(seconds=interval),
+                    "app.worker.run_balance_charge_tick",
+                    result_ttl=3600,
+                )
+            except Exception:  # noqa: BLE001
+                logger.exception("Failed to re-enqueue balance charge tick")
+    return stats
+
+
 def run_provisioning_task(task_id: int, node_id: int | None = None) -> dict:
     """RQ job — executed by the worker process."""
     from .db import SessionLocal
@@ -345,6 +865,65 @@ def main() -> None:
             logger.info("Renewal check bootstrapped: first run in 60s (interval=%ss)", renewal_interval)
         except Exception:  # noqa: BLE001
             logger.exception("Failed to schedule renewal check")
+
+    # Schedule warm-pool check (default: every 2 min). Stage 2.5 of the
+    # WebApp roadmap — keeps each active node's pool topped up so user
+    # purchases hit a warm bundle instead of paying the Ansible cost.
+    warm_interval = int(os.getenv("WARM_POOL_CHECK_INTERVAL", "120"))
+    warm_enabled = os.getenv("WARM_POOL_ENABLED", "1").lower() not in {"0", "false", "no"}
+    if warm_interval > 0 and warm_enabled:
+        try:
+            from datetime import timedelta
+            queue.enqueue_in(
+                timedelta(seconds=min(warm_interval, 30)),
+                "app.worker.run_warm_pool_check",
+                result_ttl=3600,
+            )
+            logger.info(
+                "Warm pool check bootstrapped: first run in 30s (interval=%ss, target=%s)",
+                warm_interval, os.getenv("WARM_POOL_TARGET", "10"),
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("Failed to schedule warm pool check")
+
+    # Schedule balance charge tick (default: hourly). Stage 4 — drives
+    # daily-billing ticks for balance subscriptions and auto-unfreezes
+    # paused ones whose frozen_until has lapsed.
+    balance_interval = int(os.getenv("BALANCE_CHARGE_INTERVAL", "3600"))
+    if balance_interval > 0:
+        try:
+            from datetime import timedelta
+            queue.enqueue_in(
+                timedelta(seconds=min(balance_interval, 60)),
+                "app.worker.run_balance_charge_tick",
+                result_ttl=3600,
+            )
+            logger.info(
+                "Balance charge tick bootstrapped: first run in 60s (interval=%ss)",
+                balance_interval,
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("Failed to schedule balance charge tick")
+
+    # Schedule drain tick (default: every 10 min). Stage 5 — drives the
+    # downscale path. Even when ``AUTOSCALE_DOWNSCALE_ENABLED=0`` the
+    # tick still runs so already-draining nodes (set manually by an
+    # operator via the admin) get migrated + destroyed.
+    drain_interval = int(os.getenv("DRAIN_TICK_INTERVAL", "600"))
+    if drain_interval > 0:
+        try:
+            from datetime import timedelta
+            queue.enqueue_in(
+                timedelta(seconds=min(drain_interval, 60)),
+                "app.worker.run_drain_tick",
+                result_ttl=3600,
+            )
+            logger.info(
+                "Drain tick bootstrapped: first run in 60s (interval=%ss)",
+                drain_interval,
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("Failed to schedule drain tick")
 
     worker = Worker([queue], connection=connection)
     logger.info("Starting RQ worker on queue %s", queue_name)

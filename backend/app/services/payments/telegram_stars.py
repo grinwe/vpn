@@ -57,14 +57,14 @@ class TelegramStarsProvider:
         # Stars are strictly integer units. Round up so we never undercharge
         # the user on fractional plans (0.5 Stars → 1 Star).
         stars = max(1, int(amount + 0.999))
-        title = description or f"VPN invoice #{invoice_id}"
+        title = description or f"Order #{invoice_id}"
         # Title has a 32-char limit in Bot API; chop so the call doesn't 400.
         if len(title) > 32:
             title = title[:32]
 
         body = {
             "title": title,
-            "description": description or f"VPN invoice #{invoice_id}",
+            "description": description or f"Order #{invoice_id}",
             # ``payload`` round-trips verbatim in ``successful_payment`` →
             # we use it to recover the internal invoice id on the webhook.
             "payload": str(invoice_id),
@@ -150,10 +150,15 @@ class TelegramStarsProvider:
 
 
 def _load_from_env() -> tuple[str, str]:
-    token = os.getenv("TELEGRAM_BOT_TOKEN")
+    # Accept both BOT_TOKEN (the canonical name used by the bot service +
+    # docker-compose) and TELEGRAM_BOT_TOKEN (a legacy alias kept for back
+    # compat). If neither is set, the provider can't talk to Bot API.
+    token = os.getenv("BOT_TOKEN") or os.getenv("TELEGRAM_BOT_TOKEN")
     secret = os.getenv("TELEGRAM_STARS_WEBHOOK_SECRET")
     if not token:
-        raise ProviderError("TELEGRAM_BOT_TOKEN env var is required for telegram_stars provider")
+        raise ProviderError(
+            "BOT_TOKEN env var is required for telegram_stars provider"
+        )
     if not secret:
         raise ProviderError(
             "TELEGRAM_STARS_WEBHOOK_SECRET env var is required for telegram_stars provider"

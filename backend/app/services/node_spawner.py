@@ -25,6 +25,12 @@ from ..security import encrypt
 from ..time_utils import utcnow
 from .cloud import DriverError, get_driver
 from .provisioning import ProvisioningOrchestrator
+from .shadowtls import (
+    DEFAULT_HANDSHAKE_DOMAIN as SHADOWTLS_DEFAULT_SNI,
+    DEFAULT_PORT as SHADOWTLS_DEFAULT_PORT,
+    generate_shadowtls_password,
+    generate_ss_password,
+)
 from .vless import generate_reality_keypair, generate_short_id
 
 # Reality's "borrowed" SNI. Must be a real TLS 1.3 host that is NOT
@@ -43,6 +49,106 @@ logger = logging.getLogger(__name__)
 
 class NodeSpawnError(RuntimeError):
     pass
+
+
+def ensure_reality_config(
+    db: Session,
+    node: models.VPNNode,
+    *,
+    port: int | None = None,
+    sni: str | None = None,
+    dest: str | None = None,
+) -> models.VPNConfig:
+    """Create a VLESS Reality VPNConfig for ``node`` if it has none yet.
+
+    Used both by the auto-spawner and by the admin endpoint that bootstraps
+    Reality on manually-registered nodes. Keys are generated here so every
+    caller goes through the same authoritative path (see services/vless.py).
+    Idempotent: if the node already has a Reality config, returns it as-is.
+    """
+    existing = (
+        db.query(models.VPNConfig)
+        .filter(
+            models.VPNConfig.node_id == node.id,
+            models.VPNConfig.protocol == models.VPNConfigProtocol.vless_reality,
+        )
+        .first()
+    )
+    if existing is not None:
+        return existing
+
+    public_key, private_key = generate_reality_keypair()
+    short_id = generate_short_id()
+    sni_value = sni or DEFAULT_REALITY_SNI
+    dest_value = dest or (f"{sni_value}:443" if sni else DEFAULT_REALITY_DEST)
+    cfg = models.VPNConfig(
+        node_id=node.id,
+        name=f"{node.name}-vless-reality",
+        protocol=models.VPNConfigProtocol.vless_reality,
+        port=port or DEFAULT_REALITY_PORT,
+        sni=sni_value,
+        public_key=public_key,
+        fallback=dest_value,
+        settings={
+            "private_key_enc": encrypt(private_key),
+            "short_id": short_id,
+            "dest": dest_value,
+        },
+        is_enabled=True,
+    )
+    db.add(cfg)
+    db.commit()
+    db.refresh(cfg)
+    return cfg
+
+
+def ensure_shadowtls_config(
+    db: Session,
+    node: models.VPNNode,
+    *,
+    port: int | None = None,
+    handshake_domain: str | None = None,
+    name: str | None = None,
+) -> models.VPNConfig:
+    """Create a ShadowTLS+SS VPNConfig for ``node`` if it has none yet.
+
+    Mirrors :func:`ensure_reality_config`: generates both the outer
+    shadow-tls password and the inner ss-rust PSK, stores them
+    encrypted in ``settings``, and exposes only the handshake domain
+    + port via the plain columns. The ansible role decrypts them via
+    ``_collect_site_extra_vars`` on every site.yml run.
+    """
+    existing = (
+        db.query(models.VPNConfig)
+        .filter(
+            models.VPNConfig.node_id == node.id,
+            models.VPNConfig.protocol == models.VPNConfigProtocol.shadowtls_ss,
+        )
+        .first()
+    )
+    if existing is not None:
+        return existing
+
+    ss_password = generate_ss_password()
+    stls_password = generate_shadowtls_password()
+    cfg = models.VPNConfig(
+        node_id=node.id,
+        name=name or f"{node.name}-shadowtls",
+        protocol=models.VPNConfigProtocol.shadowtls_ss,
+        port=port or SHADOWTLS_DEFAULT_PORT,
+        sni=handshake_domain or SHADOWTLS_DEFAULT_SNI,
+        public_key=None,
+        fallback=None,
+        settings={
+            "ss_password_enc": encrypt(ss_password),
+            "shadowtls_password_enc": encrypt(stls_password),
+        },
+        is_enabled=True,
+    )
+    db.add(cfg)
+    db.commit()
+    db.refresh(cfg)
+    return cfg
 
 
 def spawn_node(
@@ -102,32 +208,9 @@ def spawn_node(
     db.commit()
     db.refresh(node)
 
-    # Auto-provision a VLESS+Reality VPNConfig for this node. Keys are
-    # authoritative in the backend — see services/vless.py for the
-    # rationale. The private key is stored encrypted in ``settings``
-    # (never exposed over the API), public key and shortId live in
-    # dedicated columns since they are client-visible anyway.
-    public_key, private_key = generate_reality_keypair()
-    short_id = generate_short_id()
-    sni_value = reality_sni or DEFAULT_REALITY_SNI
-    dest_value = reality_dest or (f"{sni_value}:443" if reality_sni else DEFAULT_REALITY_DEST)
-    vless_config = models.VPNConfig(
-        node_id=node.id,
-        name=f"{name}-vless-reality",
-        protocol=models.VPNConfigProtocol.vless_reality,
-        port=DEFAULT_REALITY_PORT,
-        sni=sni_value,
-        public_key=public_key,
-        fallback=dest_value,
-        settings={
-            "private_key_enc": encrypt(private_key),
-            "short_id": short_id,
-            "dest": dest_value,
-        },
-        is_enabled=True,
-    )
-    db.add(vless_config)
-    db.commit()
+    # Auto-provision a VLESS+Reality VPNConfig for this node via the shared
+    # helper so manual and automated registration go through the same path.
+    ensure_reality_config(db, node, sni=reality_sni, dest=reality_dest)
 
     orchestrator = ProvisioningOrchestrator(db)
     task = orchestrator.create_task(

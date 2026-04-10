@@ -64,7 +64,7 @@ class YooKassaProvider:
                 "currency": currency.upper(),
             },
             "capture": True,
-            "description": description or f"VPN invoice #{invoice_id}",
+            "description": description or f"Order #{invoice_id}",
             # ``metadata`` round-trips back on the webhook so we can find the
             # original Invoice row without guessing from the external id.
             "metadata": {"invoice_id": str(invoice_id)},

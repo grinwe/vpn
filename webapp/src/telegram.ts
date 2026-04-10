@@ -21,6 +21,9 @@ export interface TelegramWebApp {
   ready(): void;
   onEvent(event: string, cb: () => void): void;
   openInvoice(url: string, callback: (status: InvoiceStatus) => void): void;
+  // Opens a t.me link inside the Telegram client without leaving the app.
+  // Used by the referral block on Home.tsx to fire a forward-share sheet.
+  openTelegramLink(url: string): void;
   HapticFeedback?: {
     notificationOccurred(type: "error" | "success" | "warning"): void;
   };
