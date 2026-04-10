@@ -72,6 +72,13 @@ def get_driver(provider: models.CloudProvider) -> CloudDriver:
             raise DriverError("DigitalOcean provider has no API token configured")
         return DigitalOceanDriver(token=token)
 
+    if kind == "aeza":
+        from .aeza import AezaDriver
+
+        if not token:
+            raise DriverError("Aeza provider has no API token configured")
+        return AezaDriver(token=token)
+
     if kind == "manual":
         from .manual import ManualDriver
 

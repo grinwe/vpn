@@ -56,6 +56,7 @@ export const api = {
   get: <T>(path: string) => request<T>("GET", path),
   post: <T>(path: string, body?: unknown) => request<T>("POST", path, body),
   put: <T>(path: string, body?: unknown) => request<T>("PUT", path, body),
+  patch: <T>(path: string, body?: unknown) => request<T>("PATCH", path, body),
   del: <T>(path: string) => request<T>("DELETE", path),
 };
 
@@ -141,11 +142,23 @@ export interface VPNNodeOut {
   host: string;
   ssh_port: number;
   pool_id: number | null;
+  provider_id: number | null;
   notes: string | null;
   status: string;
   is_active: boolean;
+  health_score: number;
+  blocked_regions: string[];
   created_at: string;
   updated_at: string;
+}
+
+export interface NodeHealthOut {
+  node_id: number;
+  health_score: number;
+  blocked_regions: string[];
+  overall_success_rate: number;
+  per_region: Record<string, number>;
+  migrated_subscriptions: number[];
 }
 
 export interface VPNNodeCreateIn {
@@ -163,7 +176,8 @@ export type VPNConfigProtocol =
   | "shadowtls+shadowsocks"
   | "vless-reality"
   | "vless-ws-cdn"
-  | "hysteria2";
+  | "hysteria2"
+  | "vless-xhttp";
 
 export interface VPNConfigOut {
   id: number;

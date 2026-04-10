@@ -1,0 +1,16 @@
+---
+- name: syncconf wg0
+  shell: |
+    wg syncconf wg0 <(wg-quick strip wg0)
+  args:
+    executable: /bin/bash
+
+- name: persist iptables
+  shell: |
+    if command -v netfilter-persistent >/dev/null 2>&1; then
+      netfilter-persistent save
+    elif command -v iptables-save >/dev/null 2>&1; then
+      iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
+    fi
+  args:
+    executable: /bin/bash

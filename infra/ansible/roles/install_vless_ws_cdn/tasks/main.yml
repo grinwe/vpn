@@ -9,6 +9,18 @@
 #
 # The role is a no-op unless ``vless_ws_cdn_domain`` is defined.
 
+- name: Stop xray-ws-cdn when VLESS WS+CDN is removed
+  systemd:
+    name: xray-ws-cdn
+    state: stopped
+    enabled: no
+  when: vless_ws_cdn_domain is not defined or vless_ws_cdn_domain | length == 0
+  failed_when: false
+
+- name: Skip role when VLESS WS+CDN is not configured
+  meta: end_role
+  when: vless_ws_cdn_domain is not defined or vless_ws_cdn_domain | length == 0
+
 - name: Require WS+CDN config variables
   assert:
     that:

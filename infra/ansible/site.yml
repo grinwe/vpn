@@ -3,24 +3,36 @@
   become: yes
   roles:
     - bootstrap_node
-    # ShadowTLS v3 + shadowsocks-rust. Needs backend-supplied passwords
-    # + handshake domain; gate on presence so nodes that serve only
-    # other protocols (Reality / WS+CDN) don't attempt the install.
-    - role: install_shadowtls_stack
-      when: shadowtls_password is defined and shadowtls_password | length > 0
-    # VLESS Reality — needs backend-generated x25519 keys + shortId.
-    - role: install_vless_reality
-      when: vless_reality_private_key is defined and vless_reality_private_key | length > 0
-    # VLESS+WS+CDN — WebSocket transport through Cloudflare.
-    - role: install_vless_ws_cdn
-      when: vless_ws_cdn_domain is defined and vless_ws_cdn_domain | length > 0
-    # Hysteria2 — UDP/QUIC fallback protocol.
-    - role: install_hysteria2
-      when: hysteria2_port is defined
+    # Protocol roles: always included so they can clean up removed
+    # protocols.  Each role handles its own gating internally and
+    # stops+disables its services when the config vars are absent.
+    - install_shadowtls_stack
+    - install_vless_reality
+    - install_vless_ws_cdn
+    - install_vless_xhttp
+    - install_hysteria2
+    # Relay: WG tunnel to foreign exit node. Patches Xray outbound with
+    # sockopt.interface: wg0 so user traffic exits via the tunnel while
+    # management traffic stays on the main interface.
+    - role: relay_jump_node
+      when: relay_wg_private_key is defined and relay_wg_private_key | length > 0
     # Traffic collector (opt-in).
     - role: install_traffic_collector
       when: traffic_collector_backend_url | default('') | length > 0
+    # Node-to-node probe agent (opt-in). Nodes probe each other and
+    # report back to the backend — catches RU-internal blocking that
+    # external probers miss.
+    - role: install_probe_agent
+      when: probe_agent_backend_url | default('') | length > 0
     - check_node_health
+
+# ── WireGuard exit nodes (foreign, non-RU) ──────────────────────────
+- hosts: wg_exit_nodes
+  become: yes
+  tags: [relay, wg-exit]
+  roles:
+    - role: wg_exit_node
+      when: wg_exit_private_key is defined and wg_exit_private_key | length > 0
 
 - hosts: db_host
   become: yes

@@ -22,7 +22,7 @@ import time
 from datetime import datetime
 from urllib.parse import parse_qsl
 
-from fastapi import APIRouter, Depends, Header, HTTPException
+from fastapi import APIRouter, Depends, Header, HTTPException, Request
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
@@ -30,6 +30,7 @@ from . import models, schemas
 from .api import _subscriptions_for_user
 from .config import get_settings
 from .db import SessionLocal
+from .rate_limit import limiter
 from .services.payments.base import ProviderError, get_provider
 
 webapp_router = APIRouter(prefix="/api/webapp", tags=["webapp"])
@@ -146,7 +147,8 @@ class AuthResponse(BaseModel):
 
 
 @webapp_router.post("/auth", response_model=AuthResponse)
-def webapp_auth(body: AuthRequest, db: Session = Depends(get_db)):
+@limiter.limit("10/minute")
+def webapp_auth(request: Request, body: AuthRequest, db: Session = Depends(get_db)):
     settings = get_settings()
     if not settings.bot_token:
         raise HTTPException(status_code=500, detail="BOT_TOKEN not set")
@@ -212,21 +214,17 @@ class DeviceSummary(BaseModel):
 
 
 class SubscriptionWebAppExtra(BaseModel):
-    """Per-subscription balance fields the canonical SubscriptionOut
-    doesn't carry. Returned alongside it as a parallel list keyed by
-    subscription id so we don't churn the schema."""
+    """Per-subscription balance/UI fields."""
     subscription_id: int
     plan_name: str | None
-    daily_rate_kopecks: int | None
-    daily_cost_kopecks: int | None
-    days_remaining: int | None
-    next_charge_at: datetime | None
+    plan_price_kopecks: int
+    plan_duration_days: int
+    expires_at: datetime | None
+    auto_renew: bool
     frozen_until: datetime | None
     can_freeze: bool
-    freeze_days_left_in_year: int
     device_count: int
     bundled_devices: int
-    extra_device_daily_kopecks: int
     devices: list[DeviceSummary]
 
 
@@ -239,23 +237,19 @@ class MeResponse(BaseModel):
     # rendering the sub link to copy / show as QR. Empty string means
     # "fall back to the relative /api/sub/<token> on the same origin".
     sub_link_base_url: str
+    bot_username: str
 
 
 def _build_subscription_extras(
     db: Session, user: models.User
 ) -> tuple[list[SubscriptionWebAppExtra], int | None]:
-    """Compute per-sub balance metadata for the WebApp.
+    """Compute per-sub metadata for the WebApp.
 
-    Returns ``(extras, min_days_remaining)`` so the caller can populate
-    both fields without re-walking the sub list. ``min_days_remaining``
-    is None when the user has no balance-billed subs at all (i.e. only
-    legacy invoice subs or none).
+    Returns ``(extras, min_days_remaining)``.
     """
     from .services import balance as balance_svc
 
-    # Active or frozen — frozen subs aren't burning balance but the
-    # user still wants to see "осталось N дней в году заморозки" on
-    # their card. Expired/blocked are excluded — that's done.
+    now = utcnow_aware()
     subs = (
         db.query(models.Subscription)
         .filter(
@@ -286,61 +280,38 @@ def _build_subscription_extras(
             .all()
         )
         live_devices = len(live_device_rows)
-        # Treat zero-device subs as 1-device for cost preview, mirroring
-        # _daily_cost_kopecks. Otherwise the UI would show "∞ days" for
-        # a freshly-created sub before its first device lands.
-        billable_devices = max(live_devices, 1)
-        daily_rate = plan.daily_rate_kopecks if plan else None
-        # Use the canonical formula so the UI matches what the worker
-        # tick will actually charge — base + extras over plan cap.
-        try:
-            daily_cost = (
-                balance_svc._daily_cost_kopecks(plan, billable_devices) if plan else None
-            )
-        except RuntimeError:
-            daily_cost = None
-        # Runway = prepaid bucket + wallet fallback. charge_subscription
-        # drains prepaid first, then pulls from the wallet as kind=spend,
-        # so the UI needs to reflect both. For the typical 1-sub user
-        # this is exact; multi-sub users will see a slightly optimistic
-        # number since the wallet is shared, good enough for a hint.
-        days = (
-            balance_svc.sub_days_remaining(
-                sub, billable_devices, user.balance_kopecks or 0
-            )
-            if plan and daily_rate
-            else None
-        )
+        price = balance_svc.plan_price_kopecks(plan) if plan else 0
+        duration = plan.duration_days if plan else 30
 
-        # Year-budget remaining for the freeze button copy
-        current_year = utcnow_aware().year
-        used = sub.frozen_days_used or 0
+        # Days until expires_at.
+        days_left = None
+        if sub.expires_at:
+            delta = (sub.expires_at - now).total_seconds()
+            days_left = max(int(delta // 86400), 0)
+
+        # Can freeze: active + auto_renew on + hasn't frozen this year.
+        current_year = now.year
+        already_froze = sub.has_frozen_this_year or False
         if sub.frozen_year != current_year:
-            used = 0
-        days_left_in_year = max(
-            balance_svc.FREEZE_YEAR_BUDGET_DAYS - used, 0
-        )
-        # Can freeze: only active subs with budget left for one full
-        # period. Frozen subs can't be re-frozen until they unfreeze.
+            already_froze = False
         can_freeze = (
             sub.status == models.SubscriptionStatus.active
-            and days_left_in_year >= balance_svc.MAX_FREEZE_DAYS_PER_PERIOD
+            and sub.auto_renew
+            and not already_froze
         )
 
         extras.append(
             SubscriptionWebAppExtra(
                 subscription_id=sub.id,
                 plan_name=plan.name if plan else None,
-                daily_rate_kopecks=daily_rate,
-                daily_cost_kopecks=daily_cost,
-                days_remaining=days,
-                next_charge_at=sub.next_charge_at,
+                plan_price_kopecks=price,
+                plan_duration_days=duration,
+                expires_at=sub.expires_at,
+                auto_renew=bool(sub.auto_renew),
                 frozen_until=sub.frozen_until,
                 can_freeze=can_freeze,
-                freeze_days_left_in_year=days_left_in_year,
                 device_count=live_devices,
                 bundled_devices=(plan.max_devices if plan else 1) or 1,
-                extra_device_daily_kopecks=balance_svc.EXTRA_DEVICE_DAILY_KOPECKS,
                 devices=[
                     DeviceSummary(
                         id=d.id,
@@ -353,8 +324,8 @@ def _build_subscription_extras(
             )
         )
 
-        if days is not None and sub.status == models.SubscriptionStatus.active:
-            min_days = days if min_days is None else min(min_days, days)
+        if days_left is not None and sub.status == models.SubscriptionStatus.active:
+            min_days = days_left if min_days is None else min(min_days, days_left)
 
     return extras, min_days
 
@@ -400,7 +371,7 @@ def webapp_me(
         balance_kopecks=balance_kopecks,
         balance_rub=round(balance_kopecks / 100, 2),
         min_days_remaining=min_days,
-        has_active_balance_sub=any(e.daily_rate_kopecks for e in extras),
+        has_active_balance_sub=any(e.plan_price_kopecks > 0 for e in extras),
         trial_available=trial_available,
         trial_amount_kopecks=trial_amount,
     )
@@ -417,6 +388,7 @@ def webapp_me(
         balance=balance,
         subscription_extras=extras,
         sub_link_base_url=os.getenv("SUB_LINK_BASE_URL", "").rstrip("/"),
+        bot_username=os.getenv("BOT_USERNAME", ""),
     )
 
 
@@ -709,7 +681,9 @@ class TopupResponse(BaseModel):
 
 
 @webapp_router.post("/topup", response_model=TopupResponse)
+@limiter.limit("10/minute")
 def webapp_topup(
+    request: Request,
     body: TopupRequest,
     user: models.User = Depends(require_webapp_user),
     db: Session = Depends(get_db),
@@ -802,7 +776,9 @@ class TrialActivateWebAppResponse(BaseModel):
 
 
 @webapp_router.post("/trial/activate", response_model=TrialActivateWebAppResponse)
+@limiter.limit("5/minute")
 def webapp_activate_trial(
+    request: Request,
     user: models.User = Depends(require_webapp_user),
     db: Session = Depends(get_db),
 ):
@@ -833,46 +809,30 @@ def webapp_activate_trial(
 class ActivateResponse(BaseModel):
     subscription_id: int
     sub_token: str | None
-    days_remaining: int
+    expires_at: datetime
     balance_kopecks: int
-    daily_cost_kopecks: int
-    next_charge_at: datetime | None
+    plan_price_kopecks: int
+    plan_duration_days: int
 
 
 @webapp_router.post("/subscriptions/activate", response_model=ActivateResponse)
+@limiter.limit("5/minute")
 def webapp_activate(
+    request: Request,
     body: ActivateRequest,
     user: models.User = Depends(require_webapp_user),
     db: Session = Depends(get_db),
 ):
-    """Buy a plan: upfront-debit the full price into ``sub.prepaid_kopecks``.
+    """Buy a plan: debit plan.price from wallet, set expires_at.
 
-    Flow:
-      1. Validate the plan is balance-billable (has a daily rate).
-      2. Pre-flight: wallet must cover the *full* plan price (not just
-         one day). Daily-only buys are gone — user commits for the
-         whole plan window, freeze still lets them pause mid-window.
-      3. Provision the subscription.
-      4. Call ``balance.activate_prepaid`` which debits the wallet and
-         credits ``sub.prepaid_kopecks`` in a single row-locked tx.
-      5. Charge day 1 out of the fresh bucket so the tick anchors at
-         now+24h.
-
-    On insufficient balance returns 402 with the suggested topup
-    amount so the WebApp can pre-fill the topup modal.
+    V2 monthly billing — one charge per period, no daily tick.
     """
     from .services import balance as balance_svc
     from .services.provisioning import ProvisioningOrchestrator
-    from .time_utils import utcnow
 
     plan = db.get(models.Plan, body.plan_id)
     if not plan or not plan.is_visible:
         raise HTTPException(status_code=404, detail="Plan not found")
-    if not plan.daily_rate_kopecks or plan.daily_rate_kopecks <= 0:
-        raise HTTPException(
-            status_code=400,
-            detail="This plan has no daily rate; use /checkout for one-shot billing",
-        )
 
     plan_price = balance_svc.plan_price_kopecks(plan)
     if plan_price <= 0:
@@ -880,12 +840,9 @@ def webapp_activate(
             status_code=400, detail="Plan has no price configured"
         )
 
-    # Pre-flight: need the FULL plan price, not just one day. The actual
-    # debit runs under a row lock inside activate_prepaid so concurrent
-    # purchases can't double-spend.
     if (user.balance_kopecks or 0) < plan_price:
         shortfall = plan_price - (user.balance_kopecks or 0)
-        suggested = max(balance_svc.MIN_TOPUP_KOPECKS, shortfall)
+        suggested = max(balance_svc.min_topup_kopecks(db), shortfall)
         raise HTTPException(
             status_code=402,
             detail={
@@ -896,34 +853,37 @@ def webapp_activate(
             },
         )
 
+    # Cancel active subscriptions on other plans so the user doesn't
+    # end up with multiple parallel subscriptions after a plan change.
+    existing_subs = (
+        db.query(models.Subscription)
+        .filter(
+            models.Subscription.user_id == user.id,
+            models.Subscription.status == models.SubscriptionStatus.active,
+            models.Subscription.plan_id != plan.id,
+        )
+        .all()
+    )
+    for old_sub in existing_subs:
+        old_sub.auto_renew = False
+
     orchestrator = ProvisioningOrchestrator(db)
     try:
         sub, _task = orchestrator.provision_subscription(user, plan)
     except RuntimeError as exc:
         raise HTTPException(status_code=409, detail=str(exc))
 
-    # Commit the prepaid debit + anchor + day-1 charge together. If
-    # activate_prepaid raises (someone drained the wallet between the
-    # pre-flight and here) we have to unwind the provisioned sub.
-    sub.next_charge_at = utcnow()
-    db.add(sub)
     try:
-        balance_svc.activate_prepaid(
+        balance_svc.activate_subscription(
             db, user.id, sub, reference=f"activate:{sub.id}"
         )
     except ValueError as exc:
         db.rollback()
-        # Don't leave an orphaned sub — revoke its device and mark
-        # expired so run_renewal_check cleans up.
         sub.status = models.SubscriptionStatus.expired
-        sub.next_charge_at = None
-        sub.prepaid_kopecks = 0
         db.add(sub)
         db.commit()
         raise HTTPException(status_code=402, detail=str(exc))
 
-    # Day 1 charge out of the fresh bucket.
-    balance_svc.charge_subscription(db, sub)
     db.commit()
     db.refresh(user)
     db.refresh(sub)
@@ -931,10 +891,140 @@ def webapp_activate(
     return ActivateResponse(
         subscription_id=sub.id,
         sub_token=sub.sub_token,
-        days_remaining=balance_svc.sub_days_remaining(sub, 1, user.balance_kopecks or 0),
+        expires_at=sub.expires_at,
         balance_kopecks=user.balance_kopecks or 0,
-        daily_cost_kopecks=plan.daily_rate_kopecks,
-        next_charge_at=sub.next_charge_at,
+        plan_price_kopecks=plan_price,
+        plan_duration_days=plan.duration_days,
+    )
+
+
+# ── Toggle auto-renew ────────────────────────────────────────────────
+
+class AutoRenewToggleRequest(BaseModel):
+    auto_renew: bool
+
+
+class AutoRenewToggleResponse(BaseModel):
+    subscription_id: int
+    auto_renew: bool
+
+
+@webapp_router.post(
+    "/subscriptions/{subscription_id}/auto_renew",
+    response_model=AutoRenewToggleResponse,
+)
+def webapp_toggle_auto_renew(
+    subscription_id: int,
+    body: AutoRenewToggleRequest,
+    user: models.User = Depends(require_webapp_user),
+    db: Session = Depends(get_db),
+):
+    """Toggle auto-renewal. Off = subscription expires at paid_until, no charge."""
+    sub = db.get(models.Subscription, subscription_id)
+    if not sub or sub.user_id != user.id:
+        raise HTTPException(status_code=404, detail="Subscription not found")
+    if sub.status not in (
+        models.SubscriptionStatus.active,
+        models.SubscriptionStatus.frozen,
+    ):
+        raise HTTPException(
+            status_code=400, detail="Cannot change auto-renew for this subscription"
+        )
+
+    sub.auto_renew = body.auto_renew
+    db.add(sub)
+    db.commit()
+
+    return AutoRenewToggleResponse(
+        subscription_id=sub.id,
+        auto_renew=sub.auto_renew,
+    )
+
+
+# ── Change plan (proration) ──────────────────────────────────────────
+
+class ChangePlanRequest(BaseModel):
+    plan_id: int
+
+
+class ChangePlanResponse(BaseModel):
+    subscription_id: int
+    new_plan_name: str
+    expires_at: datetime
+    refunded_kopecks: int
+    charged_kopecks: int
+    balance_kopecks: int
+
+
+@webapp_router.post(
+    "/subscriptions/{subscription_id}/change_plan",
+    response_model=ChangePlanResponse,
+)
+def webapp_change_plan(
+    subscription_id: int,
+    body: ChangePlanRequest,
+    user: models.User = Depends(require_webapp_user),
+    db: Session = Depends(get_db),
+):
+    """Switch plan with proration: refund remaining old, charge full new."""
+    from .services import balance as balance_svc
+
+    sub = db.get(models.Subscription, subscription_id)
+    if not sub or sub.user_id != user.id:
+        raise HTTPException(status_code=404, detail="Subscription not found")
+    if sub.status != models.SubscriptionStatus.active:
+        raise HTTPException(status_code=400, detail="Subscription is not active")
+    if sub.plan_id == body.plan_id:
+        raise HTTPException(status_code=400, detail="Already on this plan")
+
+    new_plan = db.get(models.Plan, body.plan_id)
+    if not new_plan or not new_plan.is_visible:
+        raise HTTPException(status_code=404, detail="Plan not found")
+
+    new_price = balance_svc.plan_price_kopecks(new_plan)
+
+    # Pre-flight: estimate proration refund to check if balance is enough.
+    old_price = balance_svc.plan_price_kopecks(sub.plan)
+    now = utcnow_aware()
+    refund_estimate = 0
+    if old_price > 0 and sub.expires_at and sub.expires_at > now:
+        import math
+        remaining_secs = (sub.expires_at - now).total_seconds()
+        remaining_days = max(remaining_secs / 86400, 0)
+        refund_estimate = int(math.floor(old_price * remaining_days / sub.plan.duration_days))
+
+    projected_balance = (user.balance_kopecks or 0) + refund_estimate
+    if projected_balance < new_price:
+        shortfall = new_price - projected_balance
+        raise HTTPException(
+            status_code=402,
+            detail={
+                "code": "insufficient_balance",
+                "balance_kopecks": user.balance_kopecks or 0,
+                "required_kopecks": new_price,
+                "refund_estimate_kopecks": refund_estimate,
+                "suggested_topup_kopecks": max(
+                    balance_svc.min_topup_kopecks(db), shortfall
+                ),
+            },
+        )
+
+    try:
+        result = balance_svc.change_plan(db, sub, new_plan)
+    except ValueError as exc:
+        raise HTTPException(status_code=402, detail=str(exc))
+
+    db.commit()
+    db.refresh(user)
+    db.refresh(sub)
+
+    return ChangePlanResponse(
+        subscription_id=sub.id,
+        new_plan_name=new_plan.name,
+        expires_at=sub.expires_at,
+        refunded_kopecks=result["refunded_kopecks"],
+        charged_kopecks=result["charged_kopecks"],
+        balance_kopecks=user.balance_kopecks or 0,
     )
 
 
@@ -942,7 +1032,7 @@ class FreezeResponse(BaseModel):
     subscription_id: int
     status: str
     frozen_until: datetime | None
-    freeze_days_left_in_year: int
+    can_freeze_again: bool
 
 
 @webapp_router.post("/subscriptions/{subscription_id}/freeze", response_model=FreezeResponse)
@@ -951,7 +1041,7 @@ def webapp_freeze(
     user: models.User = Depends(require_webapp_user),
     db: Session = Depends(get_db),
 ):
-    """Pause a subscription. See ``services.balance.freeze_subscription``."""
+    """Pause a subscription for FREEZE_DAYS days. 1 per calendar year."""
     from .services import balance as balance_svc
 
     sub = db.get(models.Subscription, subscription_id)
@@ -965,21 +1055,18 @@ def webapp_freeze(
     db.commit()
     db.refresh(sub)
 
-    used = sub.frozen_days_used or 0
     return FreezeResponse(
         subscription_id=sub.id,
         status=sub.status.value,
         frozen_until=sub.frozen_until,
-        freeze_days_left_in_year=max(
-            balance_svc.FREEZE_YEAR_BUDGET_DAYS - used, 0
-        ),
+        can_freeze_again=False,  # just froze — can't freeze again this year
     )
 
 
 class UnfreezeResponse(BaseModel):
     subscription_id: int
     status: str
-    next_charge_at: datetime | None
+    expires_at: datetime | None
 
 
 @webapp_router.post("/subscriptions/{subscription_id}/unfreeze", response_model=UnfreezeResponse)
@@ -988,7 +1075,7 @@ def webapp_unfreeze(
     user: models.User = Depends(require_webapp_user),
     db: Session = Depends(get_db),
 ):
-    """Resume a frozen subscription."""
+    """Resume a frozen subscription. Early unfreeze blocks re-freeze until next year."""
     from .services import balance as balance_svc
 
     sub = db.get(models.Subscription, subscription_id)
@@ -1005,15 +1092,14 @@ def webapp_unfreeze(
     return UnfreezeResponse(
         subscription_id=sub.id,
         status=sub.status.value,
-        next_charge_at=sub.next_charge_at,
+        expires_at=sub.expires_at,
     )
 
 
 class CancelSubscriptionResponse(BaseModel):
     subscription_id: int
-    status: str
-    refunded_kopecks: int
-    balance_kopecks: int
+    auto_renew: bool
+    expires_at: datetime | None
 
 
 @webapp_router.post(
@@ -1025,10 +1111,7 @@ def webapp_cancel_subscription(
     user: models.User = Depends(require_webapp_user),
     db: Session = Depends(get_db),
 ):
-    """Cancel (unsubscribe): revoke devices, refund prepaid remainder, expire."""
-    from .services import balance as balance_svc
-    from .services.provisioning import ProvisioningOrchestrator
-
+    """Cancel = turn off auto_renew. Access continues until expires_at."""
     sub = db.get(models.Subscription, subscription_id)
     if not sub or sub.user_id != user.id:
         raise HTTPException(status_code=404, detail="Subscription not found")
@@ -1041,39 +1124,15 @@ def webapp_cancel_subscription(
             detail=f"Cannot cancel subscription in status {sub.status.value}",
         )
 
-    # Revoke all live devices on the node.
-    orchestrator = ProvisioningOrchestrator(db)
-    for device in list(sub.devices):
-        if device.status in (
-            models.DeviceStatus.revoked,
-            models.DeviceStatus.disabled,
-        ):
-            continue
-        try:
-            orchestrator.revoke_device(
-                device, reason=f"user cancelled sub {sub.id}", background=True
-            )
-        except Exception:
-            pass  # best-effort; device will be cleaned up by worker
-
-    # Refund unused prepaid back to wallet.
-    refunded = balance_svc.refund_prepaid(
-        db, sub, reference=f"cancel:{sub.id}"
-    )
-
-    sub.status = models.SubscriptionStatus.expired
-    sub.next_charge_at = None
-    sub.frozen_at = None
-    sub.frozen_until = None
+    sub.auto_renew = False
     db.add(sub)
     db.commit()
-    db.refresh(user)
+    db.refresh(sub)
 
     return CancelSubscriptionResponse(
         subscription_id=sub.id,
-        status=sub.status.value,
-        refunded_kopecks=refunded,
-        balance_kopecks=user.balance_kopecks or 0,
+        auto_renew=sub.auto_renew,
+        expires_at=sub.expires_at,
     )
 
 
@@ -1153,6 +1212,96 @@ def webapp_add_device(
         device_id=device.id,
         device_count=new_device_count,
         new_daily_cost_kopecks=new_daily_cost,
+    )
+
+
+# ── Device management (rename / remove) ──────────────────────────
+
+
+class RenameDeviceRequest(BaseModel):
+    name: str
+
+
+class RenameDeviceResponse(BaseModel):
+    device_id: int
+    name: str
+
+
+@webapp_router.patch(
+    "/devices/{device_id}",
+    response_model=RenameDeviceResponse,
+)
+def webapp_rename_device(
+    device_id: int,
+    body: RenameDeviceRequest,
+    user: models.User = Depends(require_webapp_user),
+    db: Session = Depends(get_db),
+):
+    """Rename a device (user-facing label only, no infra changes)."""
+    device = db.get(models.Device, device_id)
+    if not device or device.user_id != user.id:
+        raise HTTPException(status_code=404, detail="Device not found")
+
+    name = body.name.strip()[:64]
+    if not name:
+        raise HTTPException(status_code=400, detail="Name must not be empty")
+
+    device.name = name
+    db.commit()
+    return RenameDeviceResponse(device_id=device.id, name=device.name)
+
+
+class RemoveDeviceResponse(BaseModel):
+    device_id: int
+    device_count: int
+    new_daily_cost_kopecks: int
+
+
+@webapp_router.delete(
+    "/devices/{device_id}",
+    response_model=RemoveDeviceResponse,
+)
+def webapp_remove_device(
+    device_id: int,
+    user: models.User = Depends(require_webapp_user),
+    db: Session = Depends(get_db),
+):
+    """Revoke a device and its credential on the VPN node.
+
+    The last device on a subscription cannot be removed — that's
+    effectively a subscription cancel, handled separately.
+    """
+    from .services import balance as balance_svc
+    from .services.provisioning import ProvisioningOrchestrator
+
+    device = db.get(models.Device, device_id)
+    if not device or device.user_id != user.id:
+        raise HTTPException(status_code=404, detail="Device not found")
+    if device.status == models.DeviceStatus.revoked:
+        raise HTTPException(status_code=400, detail="Device already revoked")
+
+    sub = device.subscription
+    if not sub:
+        raise HTTPException(status_code=400, detail="No linked subscription")
+
+    live_count = balance_svc._live_device_count(db, sub.id)
+    if live_count <= 1:
+        raise HTTPException(
+            status_code=400,
+            detail="Cannot remove the last device — cancel the subscription instead",
+        )
+
+    orchestrator = ProvisioningOrchestrator(db)
+    orchestrator.revoke_device(device, reason="user_removed", background=True)
+    db.commit()
+
+    new_count = live_count - 1
+    new_daily = balance_svc._daily_cost_kopecks(sub.plan, new_count) if sub.plan else 0
+
+    return RemoveDeviceResponse(
+        device_id=device.id,
+        device_count=new_count,
+        new_daily_cost_kopecks=new_daily,
     )
 
 

@@ -25,6 +25,7 @@ export interface TelegramWebApp {
   // Used by the referral block on Home.tsx to fire a forward-share sheet.
   openTelegramLink(url: string): void;
   HapticFeedback?: {
+    impactOccurred(style: "light" | "medium" | "heavy" | "rigid" | "soft"): void;
     notificationOccurred(type: "error" | "success" | "warning"): void;
   };
 }

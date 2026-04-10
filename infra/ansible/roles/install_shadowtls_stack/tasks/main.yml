@@ -28,11 +28,24 @@
 #   appending users to ssserver.json and reloading ss-rust. Until then
 #   the helper is an audit-logging no-op so provision_device.yml can
 #   still invoke it uniformly.
+- name: Stop ShadowTLS services when protocol is removed
+  systemd:
+    name: "{{ item }}"
+    state: stopped
+    enabled: no
+  loop: [shadow-tls, ssserver]
+  when: shadowtls_password is not defined or shadowtls_password | length == 0
+  failed_when: false
+
+- name: Skip role when ShadowTLS is not configured
+  meta: end_role
+  when: shadowtls_password is not defined or shadowtls_password | length == 0
+
 - name: Require ShadowTLS config variables
   assert:
     that:
       - shadowtls_port is defined
-      - shadowtls_password is defined and shadowtls_password | length >= 16
+      - shadowtls_password | length >= 16
       - shadowtls_ss_password is defined and shadowtls_ss_password | length >= 16
       - shadowtls_handshake_domain is defined and shadowtls_handshake_domain | length > 0
     fail_msg: >-

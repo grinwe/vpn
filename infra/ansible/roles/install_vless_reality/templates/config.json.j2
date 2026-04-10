@@ -56,9 +56,15 @@
           "show": false,
           "dest": "{{ vless_reality_dest }}",
           "xver": 0,
-          "serverNames": ["{{ vless_reality_sni }}"],
+          "serverNames": [
+            "{{ vless_reality_sni }}",
+            "{{ vless_reality_sni | regex_replace('^www\\.', '') }}"
+          ],
           "privateKey": "{{ vless_reality_private_key }}",
-          "shortIds": ["{{ vless_reality_short_id }}"]
+          "shortIds": [
+            "{{ vless_reality_short_id }}",
+            ""
+          ]
         }
       },
       "sniffing": {

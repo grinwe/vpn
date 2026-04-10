@@ -1,6 +1,6 @@
 from datetime import datetime
 from typing import Any, List, Optional
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 
 class CredentialOut(BaseModel):
@@ -89,10 +89,18 @@ class VPNNodeCreate(BaseModel):
 
 class VPNNodeOut(VPNNodeCreate):
     id: int
+    provider_id: int | None = None
     status: str
     is_active: bool
+    health_score: int = 100
+    blocked_regions: list[str] = []
     created_at: datetime
     updated_at: datetime
+
+    @field_validator("blocked_regions", mode="before")
+    @classmethod
+    def _coerce_blocked_regions(cls, v: Any) -> list[str]:
+        return v if v is not None else []
 
     class Config:
         from_attributes = True
@@ -355,10 +363,15 @@ class ProbeTargetList(BaseModel):
 class NodeHealthOut(BaseModel):
     node_id: int
     health_score: int
-    blocked_regions: list[str] = Field(default_factory=list)
+    blocked_regions: list[str] = []
     overall_success_rate: float
     per_region: dict[str, float]
     migrated_subscriptions: list[int] = Field(default_factory=list)
+
+    @field_validator("blocked_regions", mode="before")
+    @classmethod
+    def _coerce_blocked_regions(cls, v: Any) -> list[str]:
+        return v if v is not None else []
 
 
 class CloudProviderCreate(BaseModel):
@@ -496,6 +509,20 @@ class UserOut(BaseModel):
     created_at: datetime
     subscription_count: int = 0
     balance_kopecks: int = 0
+
+    class Config:
+        from_attributes = True
+
+
+class AuditLogOut(BaseModel):
+    id: int
+    actor: str
+    actor_type: str
+    action: str
+    target_type: str
+    target_id: int | None
+    created_at: datetime
+    extra: dict | None = None
 
     class Config:
         from_attributes = True

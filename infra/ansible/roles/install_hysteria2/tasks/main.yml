@@ -7,6 +7,18 @@
 #
 # No-op unless ``hysteria2_port`` is defined.
 
+- name: Stop Hysteria2 when protocol is removed
+  systemd:
+    name: hysteria-server
+    state: stopped
+    enabled: no
+  when: hysteria2_port is not defined
+  failed_when: false
+
+- name: Skip role when Hysteria2 is not configured
+  meta: end_role
+  when: hysteria2_port is not defined
+
 - name: Require Hysteria2 config variables
   assert:
     that:

@@ -4,6 +4,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   api,
   ApiError,
+  NodeHealthOut,
   ProvisioningTaskOut,
   VPNConfigCreateIn,
   VPNConfigOut,
@@ -18,7 +19,7 @@ import {
 // is the full set to poll; the sub-arrays break down by phase.
 
 type TrackedOp = {
-  kind: "migration" | "bootstrap" | "resync";
+  kind: "migration" | "bootstrap" | "resync" | "diagnose";
   nodeId: number;
   nodeName: string;
   taskIds: number[];
@@ -60,6 +61,73 @@ function removeTrackedOp(kind: string, nodeId: number, startedAt: number) {
     (o) => !(o.kind === kind && o.nodeId === nodeId && o.startedAt === startedAt),
   );
   saveTrackedOps(ops);
+}
+
+function HealthBadge({ score, blocked }: { score: number | null; blocked: string[] }) {
+  if (score == null) return <span className="text-slate-500">—</span>;
+  const color =
+    score >= 80 ? "bg-emerald-600" : score >= 50 ? "bg-yellow-600" : "bg-red-600";
+  return (
+    <span className="inline-flex items-center gap-1">
+      <span className={`text-xs px-1.5 py-0.5 rounded font-mono ${color}`}>{score}</span>
+      {blocked.length > 0 && (
+        <span className="text-xs px-1 py-0.5 rounded bg-red-900 text-red-300">
+          {blocked.length} blocked
+        </span>
+      )}
+    </span>
+  );
+}
+
+function NodeHealth({ nodeId }: { nodeId: number }) {
+  const { data, isLoading, error } = useQuery<NodeHealthOut>({
+    queryKey: ["node-health", nodeId],
+    queryFn: () => api.get(`/nodes/${nodeId}/health`),
+  });
+
+  if (isLoading) return <div className="text-xs text-slate-400">Загрузка health…</div>;
+  if (error) return <div className="text-xs text-red-400">{(error as Error).message}</div>;
+  if (!data) return null;
+
+  const regions = Object.entries(data.per_region).sort(([, a], [, b]) => a - b);
+
+  return (
+    <div className="rounded border border-slate-700 p-3 text-xs">
+      <div className="flex items-center gap-4 mb-2">
+        <span className="text-slate-400">Health score:</span>
+        <HealthBadge score={data.health_score} blocked={data.blocked_regions} />
+        <span className="text-slate-400 ml-4">Overall success rate:</span>
+        <span className="font-mono">{(data.overall_success_rate * 100).toFixed(1)}%</span>
+      </div>
+      {data.blocked_regions.length > 0 && (
+        <div className="mb-2">
+          <span className="text-red-400">Blocked regions: </span>
+          <span className="font-mono text-red-300">{data.blocked_regions.join(", ")}</span>
+        </div>
+      )}
+      {regions.length > 0 && (
+        <div>
+          <div className="text-slate-400 mb-1">Per-region success rate:</div>
+          <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 gap-x-4 gap-y-1">
+            {regions.map(([region, rate]) => (
+              <div key={region} className="flex items-center gap-2">
+                <span className="text-slate-300 w-20 truncate">{region}</span>
+                <div className="flex-1 h-2 bg-slate-800 rounded overflow-hidden">
+                  <div
+                    className={`h-full ${rate >= 0.8 ? "bg-emerald-600" : rate >= 0.5 ? "bg-yellow-600" : "bg-red-600"}`}
+                    style={{ width: `${rate * 100}%` }}
+                  />
+                </div>
+                <span className="font-mono text-slate-400 w-12 text-right">
+                  {(rate * 100).toFixed(0)}%
+                </span>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+    </div>
+  );
 }
 
 function statusColor(status: string) {
@@ -203,6 +271,42 @@ export default function Nodes() {
     onError: (e: Error) => alert(`Не удалось запустить bootstrap: ${e.message}`),
   });
 
+  const deleteNode = useMutation({
+    mutationFn: (node: { id: number; provider_id: number | null }) =>
+      node.provider_id
+        ? api.post<{ node_id: number }>(`/nodes/${node.id}/destroy`, {})
+        : api.del<{ node_id: number; deleted: boolean }>(`/nodes/${node.id}`),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["nodes"] });
+      alert("Нода удалена.");
+    },
+    onError: (e: Error) => alert(`Не удалось удалить: ${e.message}`),
+  });
+
+  const diagnose = useMutation({
+    mutationFn: (node: { id: number; name: string }) =>
+      api
+        .post<{ node_id: number; task_id: number }>(
+          `/nodes/${node.id}/diagnose`,
+          {},
+        )
+        .then((res) => ({ ...res, nodeName: node.name })),
+    onSuccess: (res) => {
+      qc.invalidateQueries({ queryKey: ["provisioning-tasks"] });
+      addOp({
+        kind: "diagnose",
+        nodeId: res.node_id,
+        nodeName: res.nodeName,
+        taskIds: [res.task_id],
+        revokeTaskIds: [],
+        deviceTaskIds: [],
+        resyncTaskIds: [],
+        startedAt: Date.now(),
+      });
+    },
+    onError: (e: Error) => alert(`Не удалось запустить диагностику: ${e.message}`),
+  });
+
   const { data, isLoading, error, refetch, isFetching } = useQuery<VPNNodeOut[]>({
     queryKey: ["nodes"],
     queryFn: () => api.get("/nodes"),
@@ -280,6 +384,7 @@ export default function Nodes() {
             <th>Host</th>
             <th>Pool</th>
             <th>Статус</th>
+            <th>Health</th>
             <th>Активна</th>
             <th>Обновлена</th>
             <th></th>
@@ -302,6 +407,9 @@ export default function Nodes() {
                   <td className="font-mono text-slate-400">{n.host}</td>
                   <td>{n.pool_id ?? "—"}</td>
                   <td className={statusColor(n.status)}>{n.status}</td>
+                  <td>
+                    <HealthBadge score={n.health_score} blocked={n.blocked_regions} />
+                  </td>
                   <td>{n.is_active ? "✓" : "✕"}</td>
                   <td>{new Date(n.updated_at).toLocaleString()}</td>
                   <td onClick={(e) => e.stopPropagation()}>
@@ -370,12 +478,43 @@ export default function Nodes() {
                       >
                         resync
                       </button>
+                      <button
+                        disabled={diagnose.isPending}
+                        onClick={() => {
+                          diagnose.mutate({ id: n.id, name: n.name });
+                        }}
+                        className="text-xs px-2 py-1 rounded bg-teal-700 hover:bg-teal-600 disabled:opacity-50"
+                      >
+                        диагностика
+                      </button>
+                      <button
+                        disabled={deleteNode.isPending}
+                        onClick={() => {
+                          if (
+                            confirm(
+                              `Удалить ноду #${n.id} (${n.name})?\n\n` +
+                                (n.provider_id
+                                  ? "Cloud-нода — VM будет уничтожена через API провайдера."
+                                  : "Manual-нода — запись будет удалена из БД.") +
+                                "\n\nЕсли на ноде есть активные подписки — сначала переселите их.",
+                            )
+                          )
+                            deleteNode.mutate({
+                              id: n.id,
+                              provider_id: n.provider_id,
+                            });
+                        }}
+                        className="text-xs px-2 py-1 rounded bg-red-800 hover:bg-red-700 disabled:opacity-50"
+                      >
+                        удалить
+                      </button>
                     </div>
                   </td>
                 </tr>
                 {expanded && (
                   <tr className="border-b border-slate-800 bg-slate-900/60">
-                    <td colSpan={10} className="p-4">
+                    <td colSpan={11} className="p-4 space-y-4">
+                      <NodeHealth nodeId={n.id} />
                       <NodeConfigs nodeId={n.id} nodeHost={n.host} />
                     </td>
                   </tr>
@@ -385,7 +524,7 @@ export default function Nodes() {
           })}
           {data && data.length === 0 && (
             <tr>
-              <td colSpan={10} className="py-4 text-slate-500 text-center">
+              <td colSpan={11} className="py-4 text-slate-500 text-center">
                 Нод нет
               </td>
             </tr>
@@ -643,6 +782,7 @@ const PROTOCOL_DEFAULTS: Record<
   "vless-reality": { port: 9443, sni: "www.asus.com", name: "vless-reality" },
   "vless-ws-cdn": { port: 443, sni: "", name: "vless-ws-cdn" },
   "hysteria2": { port: 8443, sni: "", name: "hysteria2" },
+  "vless-xhttp": { port: 443, sni: "", name: "vless-xhttp" },
 };
 
 function AddConfigForm({
@@ -708,6 +848,7 @@ function AddConfigForm({
           <option value="vless-reality">vless-reality</option>
           <option value="vless-ws-cdn">vless-ws-cdn</option>
           <option value="hysteria2">hysteria2</option>
+          <option value="vless-xhttp">vless-xhttp</option>
         </select>
       </label>
       <label className="flex flex-col">
@@ -768,6 +909,7 @@ const KIND_LABELS: Record<string, string> = {
   migration: "Миграция",
   bootstrap: "Bootstrap",
   resync: "Resync",
+  diagnose: "Диагностика",
 };
 
 function OperationProgressBanner({

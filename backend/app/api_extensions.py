@@ -80,6 +80,11 @@ def dynamic_sub_link(token: str, db: Session = Depends(get_db)):
         decrypted = _decrypt(cred.config_text)
         if decrypted:
             configs.append(SubLinkConfig(protocol=cred.proto, uri=decrypted))
+        else:
+            logger.warning(
+                "sub-link: decrypt returned empty for credential %s (proto=%s, sub=%s)",
+                cred.id, cred.proto, sub.id,
+            )
 
     # Also return as plain text for Hiddify/v2rayNG subscription import
     # format: one URI per line

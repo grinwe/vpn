@@ -1,0 +1,120 @@
+---
+# install_vless_xhttp
+#
+# Installs xray-core configured for VLESS+XHTTP inbound with TLS.
+# XHTTP multiplexes VPN traffic through standard HTTP requests,
+# bypassing ТСПУ's 16KB curtain that kills raw TLS/TCP tunnels.
+# Requires a valid domain pointing at the server and TLS certs
+# (ACME/certbot or pre-provisioned).
+#
+# The role is a no-op unless ``vless_xhttp_domain`` is defined.
+
+- name: Stop xray-xhttp when VLESS XHTTP is removed
+  systemd:
+    name: xray-xhttp
+    state: stopped
+    enabled: no
+  when: vless_xhttp_domain is not defined or vless_xhttp_domain | length == 0
+  failed_when: false
+
+- name: Skip role when VLESS XHTTP is not configured
+  meta: end_role
+  when: vless_xhttp_domain is not defined or vless_xhttp_domain | length == 0
+
+- name: Require XHTTP config variables
+  assert:
+    that:
+      - vless_xhttp_domain is defined and vless_xhttp_domain | length > 0
+      - vless_xhttp_port is defined
+    fail_msg: >-
+      install_vless_xhttp requires vless_xhttp_domain and vless_xhttp_port.
+
+- name: Ensure dependencies
+  apt:
+    name: [curl, unzip, jq, ca-certificates]
+    state: present
+    update_cache: yes
+
+- name: Install xray-core (idempotent)
+  shell: |
+    set -euo pipefail
+    if command -v xray >/dev/null 2>&1; then
+      echo "xray already installed"
+      exit 0
+    fi
+    bash -c "$(curl -fsSL https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install
+  args:
+    executable: /bin/bash
+  register: xray_xhttp_install
+  changed_when: "'already installed' not in xray_xhttp_install.stdout"
+
+- name: Ensure xray config directory
+  file:
+    path: /usr/local/etc/xray
+    state: directory
+    owner: root
+    group: root
+    mode: '0750'
+
+- name: Obtain TLS certificate via certbot (if no cert path provided)
+  when: (vless_xhttp_cert_path | default('')) == ''
+  block:
+    - name: Install certbot
+      apt:
+        name: [certbot]
+        state: present
+
+    - name: Issue certificate (standalone)
+      command: >-
+        certbot certonly --standalone
+        --non-interactive --agree-tos
+        --email {{ vless_xhttp_acme_email | default('admin@' + vless_xhttp_domain) }}
+        -d {{ vless_xhttp_domain }}
+        --preferred-challenges http
+      args:
+        creates: /etc/letsencrypt/live/{{ vless_xhttp_domain }}/fullchain.pem
+
+    - name: Set cert paths from certbot
+      set_fact:
+        _xhttp_cert_path: /etc/letsencrypt/live/{{ vless_xhttp_domain }}/fullchain.pem
+        _xhttp_key_path: /etc/letsencrypt/live/{{ vless_xhttp_domain }}/privkey.pem
+
+- name: Set cert paths from variables (if provided)
+  when: (vless_xhttp_cert_path | default('')) != ''
+  set_fact:
+    _xhttp_cert_path: "{{ vless_xhttp_cert_path }}"
+    _xhttp_key_path: "{{ vless_xhttp_key_path }}"
+
+- name: Render xray XHTTP config
+  template:
+    src: config_xhttp.json.j2
+    dest: /usr/local/etc/xray/config_xhttp.json
+    owner: root
+    group: root
+    mode: '0640'
+    backup: yes
+  notify: restart xray xhttp
+
+- name: Install VLESS XHTTP user management helper
+  copy:
+    src: manage_vless_xhttp_user.sh
+    dest: /usr/local/sbin/manage_vless_xhttp_user.sh
+    owner: root
+    group: root
+    mode: '0750'
+
+- name: Install xray XHTTP systemd unit
+  template:
+    src: xray-xhttp.service.j2
+    dest: /etc/systemd/system/xray-xhttp.service
+    owner: root
+    group: root
+    mode: '0644'
+  notify: restart xray xhttp
+
+- name: Enable and start xray XHTTP service
+  systemd:
+    name: xray-xhttp
+    enabled: yes
+    state: started
+    daemon_reload: yes

@@ -110,21 +110,6 @@ def get_provider(name: str | None = None) -> PaymentProvider:
             raise ProviderError("CRYPTOBOT_TOKEN env var is required for cryptobot provider")
         return CryptoBotProvider(token=token)
 
-    if name == "yookassa":
-        from .yookassa import YooKassaProvider, _load_allowed_ips
-
-        shop_id = os.getenv("YOOKASSA_SHOP_ID")
-        secret_key = os.getenv("YOOKASSA_SECRET_KEY")
-        if not shop_id or not secret_key:
-            raise ProviderError(
-                "YOOKASSA_SHOP_ID and YOOKASSA_SECRET_KEY env vars are required for yookassa provider"
-            )
-        return YooKassaProvider(
-            shop_id=shop_id,
-            secret_key=secret_key,
-            allowed_ips=_load_allowed_ips(),
-        )
-
     if name in ("telegram_stars", "stars"):
         from .telegram_stars import TelegramStarsProvider, _load_from_env
 

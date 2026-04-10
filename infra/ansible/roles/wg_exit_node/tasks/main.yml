@@ -1,0 +1,90 @@
+---
+# wg_exit_node
+#
+# Sets up a WireGuard server on a foreign (non-RU) node that acts as
+# the traffic exit point in the relay architecture:
+#
+#   Client → VLESS Reality (RU:443) → WG tunnel → exit node → Internet
+#
+# The exit node:
+#   - Listens on wg_exit_port (default 51820)
+#   - Accepts peers defined in wg_exit_peers list
+#   - Enables IPv4/IPv6 forwarding + NAT masquerade
+#   - Uses wg syncconf for non-disruptive peer updates
+#
+# Required variables:
+#   wg_exit_port:        WireGuard listen port (default: 51820)
+#   wg_exit_address_v4:  Interface address (default: 10.77.0.1/24)
+#   wg_exit_address_v6:  Interface address (default: fd77::1/64)
+#   wg_exit_private_key: Server private key (generate with `wg genkey`)
+#   wg_exit_peers:       List of peer dicts:
+#     - { name: "ru-01", public_key: "...", allowed_ips_v4: "10.77.0.2/32",
+#         allowed_ips_v6: "fd77::2/128" }
+
+- name: Require WireGuard exit node variables
+  assert:
+    that:
+      - wg_exit_private_key is defined and wg_exit_private_key | length > 0
+      - wg_exit_peers is defined and wg_exit_peers | length > 0
+    fail_msg: >-
+      wg_exit_node requires wg_exit_private_key and wg_exit_peers.
+
+- name: Install WireGuard
+  apt:
+    name: [wireguard, wireguard-tools]
+    state: present
+    update_cache: yes
+
+- name: Enable IPv4 forwarding
+  sysctl:
+    name: net.ipv4.ip_forward
+    value: "1"
+    sysctl_set: yes
+    reload: yes
+
+- name: Enable IPv6 forwarding
+  sysctl:
+    name: net.ipv6.conf.all.forwarding
+    value: "1"
+    sysctl_set: yes
+    reload: yes
+
+- name: Render WireGuard server config
+  template:
+    src: wg0.conf.j2
+    dest: /etc/wireguard/wg0.conf
+    owner: root
+    group: root
+    mode: '0600'
+  notify: syncconf wg0
+
+- name: Enable and start WireGuard
+  systemd:
+    name: wg-quick@wg0
+    enabled: yes
+    state: started
+
+- name: Setup NAT masquerade for tunnel traffic
+  iptables:
+    table: nat
+    chain: POSTROUTING
+    source: "{{ wg_exit_address_v4 | default('10.77.0.1/24') | ansible.utils.ipaddr('network/prefix') }}"
+    out_interface: "{{ ansible_default_ipv4.interface }}"
+    jump: MASQUERADE
+  notify: persist iptables
+
+- name: Allow forwarding from wg0
+  iptables:
+    chain: FORWARD
+    in_interface: wg0
+    jump: ACCEPT
+  notify: persist iptables
+
+- name: Allow forwarding to wg0
+  iptables:
+    chain: FORWARD
+    out_interface: wg0
+    match: conntrack
+    ctstate: ESTABLISHED,RELATED
+    jump: ACCEPT
+  notify: persist iptables

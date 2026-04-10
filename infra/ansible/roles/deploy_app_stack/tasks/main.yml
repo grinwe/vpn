@@ -119,7 +119,7 @@
 - name: Build docker images
   # Rebuild only when the synced tree actually changed. Re-running the
   # role against an unchanged repo is then essentially free.
-  command: docker compose build
+  command: docker compose build --no-cache
   args:
     chdir: "{{ deploy_app_stack_dir }}"
   when:

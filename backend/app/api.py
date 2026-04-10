@@ -23,6 +23,7 @@ from .auth import (
 )
 from .config import get_settings
 from .db import SessionLocal
+from .rate_limit import limiter
 from .security import decrypt as _decrypt
 from .security import encrypt as _encrypt
 from .services.autoscale import evaluate_all_pools
@@ -409,6 +410,34 @@ def rebootstrap_node(
     return {"node_id": node.id, "task_id": task.id}
 
 
+@router.post("/nodes/{node_id}/diagnose")
+def diagnose_node(
+    node_id: int,
+    db: Session = Depends(get_db),
+    admin_token: str = Depends(require_admin),
+    admin_actor: str | None = Header(default=None, alias=ADMIN_ACTOR_HEADER),
+):
+    """Run check_node_health against the node without touching configs."""
+    node = db.get(models.VPNNode, node_id)
+    if not node:
+        raise HTTPException(status_code=404, detail="Node not found")
+    orchestrator = ProvisioningOrchestrator(db)
+    task = orchestrator.create_task("node", node.id, "diagnose", {})
+    db.commit()
+    orchestrator.run_task_async(task, node=node)
+    actor, actor_type = _resolve_admin_actor(admin_actor)
+    _audit(
+        db,
+        actor,
+        "node_diagnose",
+        "vpn_node",
+        node.id,
+        actor_type=actor_type,
+        metadata={"task_id": task.id},
+    )
+    return {"node_id": node.id, "task_id": task.id}
+
+
 @router.post("/nodes/{node_id}/active", response_model=schemas.VPNNodeOut)
 def set_node_active(
     node_id: int,
@@ -527,7 +556,16 @@ def create_config(
     # Existing warm bundles were built against the previous protocol set;
     # drop them so the warmer rebuilds with the new config included.
     from .services import warm_pool
+    from .services.provisioning import ProvisioningOrchestrator
     warm_pool.invalidate_node_warm_pool(db, node.id, reason="config added")
+    # Run site.yml so Ansible installs the new protocol on the node.
+    orchestrator = ProvisioningOrchestrator(db)
+    task = orchestrator.create_task(
+        "node", node.id, "bootstrap",
+        {"pool_id": node.pool_id, "config_change": True},
+    )
+    db.commit()
+    orchestrator.run_task_async(task, node=node)
     return config
 
 
@@ -598,7 +636,18 @@ def delete_config(
     actor, actor_type = _resolve_admin_actor(admin_actor)
     _audit(db, actor, "config_deleted", "vpn_config", config_id, actor_type=actor_type)
     from .services import warm_pool
+    from .services.provisioning import ProvisioningOrchestrator
     warm_pool.invalidate_node_warm_pool(db, node_id, reason="config removed")
+    # Re-run site.yml so Ansible stops/removes the deleted protocol's service.
+    node = db.get(models.VPNNode, node_id)
+    if node:
+        orchestrator = ProvisioningOrchestrator(db)
+        task = orchestrator.create_task(
+            "node", node.id, "bootstrap",
+            {"pool_id": node.pool_id, "config_change": True},
+        )
+        db.commit()
+        orchestrator.run_task_async(task, node=node)
     return None
 
 
@@ -1079,37 +1128,31 @@ def get_balance_by_telegram(
         .all()
     )
 
+    from .time_utils import utcnow
+    now = utcnow()
+
     sub_summaries: list[dict] = []
     min_days: int | None = None
     for sub in subs:
         plan = sub.plan
-        device_count = sum(
-            1 for d in sub.devices
-            if d.status not in (
-                models.DeviceStatus.revoked, models.DeviceStatus.disabled,
-            )
-        )
-        billable = max(device_count, 1)
-        try:
-            daily = balance_svc._daily_cost_kopecks(plan, billable) if plan else None
-        except RuntimeError:
-            daily = None
-        days = (
-            balance_svc.days_remaining(user, plan, billable)
-            if plan and plan.daily_rate_kopecks
-            else None
-        )
+        price = balance_svc.plan_price_kopecks(plan) if plan else 0
+        days_left = None
+        if sub.expires_at:
+            delta = (sub.expires_at - now).total_seconds()
+            days_left = max(int(delta // 86400), 0)
+
         sub_summaries.append({
             "id": sub.id,
             "plan_name": plan.name if plan else "",
             "status": sub.status.value,
-            "daily_cost_kopecks": daily,
-            "days_remaining": days,
-            "next_charge_at": sub.next_charge_at.isoformat() if sub.next_charge_at else None,
+            "plan_price_kopecks": price,
+            "plan_duration_days": plan.duration_days if plan else 30,
+            "expires_at": sub.expires_at.isoformat() if sub.expires_at else None,
+            "auto_renew": bool(sub.auto_renew),
             "frozen_until": sub.frozen_until.isoformat() if sub.frozen_until else None,
         })
-        if days is not None and sub.status == models.SubscriptionStatus.active:
-            min_days = days if min_days is None else min(min_days, days)
+        if days_left is not None and sub.status == models.SubscriptionStatus.active:
+            min_days = days_left if min_days is None else min(min_days, days_left)
 
     return {
         "user_id": user.id,
@@ -2119,6 +2162,73 @@ def list_cloud_providers(
     ]
 
 
+class CloudProviderUpdate(BaseModel):
+    name: str | None = None
+    default_image: str | None = None
+    default_region: str | None = None
+    default_plan: str | None = None
+    ssh_key_ids: list[str] | None = None
+    is_active: bool | None = None
+    api_token: str | None = None
+
+
+@router.patch("/cloud/providers/{provider_id}", response_model=schemas.CloudProviderOut)
+def update_cloud_provider(
+    provider_id: int,
+    payload: CloudProviderUpdate,
+    db: Session = Depends(get_db),
+    admin_token: str = Depends(require_admin),
+    admin_actor: str | None = Header(default=None, alias=ADMIN_ACTOR_HEADER),
+):
+    prov = db.get(models.CloudProvider, provider_id)
+    if not prov:
+        raise HTTPException(status_code=404, detail="Provider not found")
+    if payload.name is not None:
+        prov.name = payload.name
+    if payload.default_image is not None:
+        prov.default_image = payload.default_image
+    if payload.default_region is not None:
+        prov.default_region = payload.default_region
+    if payload.default_plan is not None:
+        prov.default_plan = payload.default_plan
+    if payload.ssh_key_ids is not None:
+        prov.ssh_key_ids = payload.ssh_key_ids
+    if payload.is_active is not None:
+        prov.is_active = payload.is_active
+    if payload.api_token is not None:
+        prov.api_token_enc = _encrypt(payload.api_token)
+    db.commit()
+    db.refresh(prov)
+    actor, actor_type = _resolve_admin_actor(admin_actor)
+    _audit(db, actor, "cloud_provider_updated", "cloud_provider", prov.id, actor_type=actor_type)
+    return schemas.CloudProviderOut(
+        id=prov.id, name=prov.name, kind=prov.kind.value,
+        default_image=prov.default_image, default_region=prov.default_region,
+        default_plan=prov.default_plan, ssh_key_ids=prov.ssh_key_ids,
+        is_active=prov.is_active, created_at=prov.created_at,
+    )
+
+
+@router.delete("/cloud/providers/{provider_id}", status_code=200)
+def delete_cloud_provider(
+    provider_id: int,
+    db: Session = Depends(get_db),
+    admin_token: str = Depends(require_admin),
+    admin_actor: str | None = Header(default=None, alias=ADMIN_ACTOR_HEADER),
+):
+    prov = db.get(models.CloudProvider, provider_id)
+    if not prov:
+        raise HTTPException(status_code=404, detail="Provider not found")
+    linked = db.query(models.VPNNode).filter(models.VPNNode.provider_id == prov.id).count()
+    if linked > 0:
+        raise HTTPException(status_code=409, detail=f"Provider has {linked} linked node(s)")
+    actor, actor_type = _resolve_admin_actor(admin_actor)
+    _audit(db, actor, "cloud_provider_deleted", "cloud_provider", prov.id, actor_type=actor_type)
+    db.delete(prov)
+    db.commit()
+    return {"provider_id": provider_id, "deleted": True}
+
+
 @router.post("/nodes/spawn", response_model=schemas.VPNNodeOut)
 def spawn_node_route(
     payload: schemas.NodeSpawnRequest,
@@ -2178,15 +2288,57 @@ def destroy_node_route(
     return {"node_id": node.id, "status": node.status.value}
 
 
+@router.delete("/nodes/{node_id}", status_code=200)
+def delete_node(
+    node_id: int,
+    db: Session = Depends(get_db),
+    admin_token: str = Depends(require_admin),
+    admin_actor: str | None = Header(default=None, alias=ADMIN_ACTOR_HEADER),
+):
+    """Remove a node from the database.
+
+    Refuses if the node still has active/frozen subscriptions — migrate
+    them first. For cloud-provisioned nodes use POST /destroy instead.
+    """
+    node = db.get(models.VPNNode, node_id)
+    if not node:
+        raise HTTPException(status_code=404, detail="Node not found")
+
+    active_subs = (
+        db.query(models.Subscription)
+        .filter(
+            models.Subscription.node_id == node.id,
+            models.Subscription.status.in_([
+                models.SubscriptionStatus.active,
+                models.SubscriptionStatus.frozen,
+            ]),
+        )
+        .count()
+    )
+    if active_subs > 0:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Node has {active_subs} active subscription(s). Migrate them first.",
+        )
+
+    actor, actor_type = _resolve_admin_actor(admin_actor)
+    _audit(db, actor, "node_deleted", "vpn_node", node.id, actor_type=actor_type)
+    db.delete(node)
+    db.commit()
+    return {"node_id": node_id, "deleted": True}
+
+
 # ---------------------------------------------------------------------------
 # Health probes / auto-migration
 # ---------------------------------------------------------------------------
 
 
 @router.post("/nodes/{node_id}/probes", response_model=schemas.NodeHealthOut)
+@limiter.limit("120/minute")
 def submit_probe(
     node_id: int,
     payload: schemas.HealthProbeIn,
+    request: Request,
     db: Session = Depends(get_db),
     principal: AuthPrincipal = Depends(require_scope(SCOPE_PROBE_WRITE)),
 ):
@@ -2485,6 +2637,7 @@ def checkout_invoice(
 
 
 @router.post("/payments/webhook/{provider_name}")
+@limiter.limit("30/minute")
 async def payment_webhook(
     provider_name: str,
     request: Request,
@@ -2640,3 +2793,40 @@ def revoke_api_token(
         actor_type=models.AuditActor.admin,
     )
     db.commit()
+
+
+# ---------------------------------------------------------------------------
+# Audit log
+# ---------------------------------------------------------------------------
+
+
+class AuditLogListResponse(BaseModel):
+    items: list[schemas.AuditLogOut]
+    total: int
+    has_more: bool
+
+
+@router.get("/audit-logs", response_model=AuditLogListResponse)
+def list_audit_logs(
+    action: str | None = Query(default=None),
+    target_type: str | None = Query(default=None),
+    actor: str | None = Query(default=None),
+    limit: int = Query(default=50, le=200),
+    offset: int = Query(default=0, ge=0),
+    db: Session = Depends(get_db),
+    admin_token: str = Depends(require_admin),
+):
+    q = db.query(models.AuditLog)
+    if action:
+        q = q.filter(models.AuditLog.action == action)
+    if target_type:
+        q = q.filter(models.AuditLog.target_type == target_type)
+    if actor:
+        q = q.filter(models.AuditLog.actor.ilike(f"%{actor}%"))
+    total = q.count()
+    rows = q.order_by(models.AuditLog.created_at.desc()).offset(offset).limit(limit).all()
+    return AuditLogListResponse(
+        items=rows,
+        total=total,
+        has_more=(offset + limit) < total,
+    )

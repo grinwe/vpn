@@ -29,3 +29,7 @@ deploy_app_stack_bot_token: "{{ vault_bot_token | default('') }}"
 deploy_app_stack_bot_username: "{{ vault_bot_username | default('') }}"
 deploy_app_stack_admin_ids: "{{ vault_admin_ids | default('') }}"
 deploy_app_stack_telegram_stars_webhook_secret: "{{ vault_telegram_stars_webhook_secret | default('') }}"
+
+# Autoscale downscale — set to 1 after verifying drain/destroy loop on staging.
+# Code is ready (evaluate_pool_downscale + run_drain_tick), this is the kill switch.
+deploy_app_stack_autoscale_downscale_enabled: 0

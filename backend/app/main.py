@@ -1,15 +1,16 @@
 import os
 
 from fastapi import Depends, FastAPI, Request
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import PlainTextResponse
 from prometheus_client import Counter, generate_latest
-from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi import _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 from slowapi.middleware import SlowAPIMiddleware
-from slowapi.util import get_remote_address
 
 from .config import get_settings
 from .migrations import run_migrations
+from .rate_limit import limiter
 from .api import router as api_router, require_admin
 from .api_extensions import ext_router
 from .api_webapp import webapp_router
@@ -68,19 +69,21 @@ reset_stuck_tasks()
 
 app = FastAPI(title="VPN backend")
 
-# Rate limiter. Defaults are conservative blanket limits to stop abuse;
-# per-route limits (login/auth, webhooks) can be declared on individual
-# handlers via ``@limiter.limit(...)``. Storage is in-memory — good for
-# single-process; wire to Redis via SLOWAPI_STORAGE_URI when scaling out.
-_storage_uri = os.getenv("SLOWAPI_STORAGE_URI", "memory://")
-limiter = Limiter(
-    key_func=get_remote_address,
-    default_limits=["300/minute", "60/second"],
-    storage_uri=_storage_uri,
-)
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 app.add_middleware(SlowAPIMiddleware)
+
+# CORS — restrict to explicit origins. WEBAPP_ORIGIN env controls which
+# frontend domains may call the API. Falls back to same-origin only (empty
+# list = no cross-origin requests allowed).
+_cors_origins = [o.strip() for o in os.getenv("CORS_ALLOWED_ORIGINS", "").split(",") if o.strip()]
+if _cors_origins:
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=_cors_origins,
+        allow_methods=["GET", "POST", "PUT", "DELETE"],
+        allow_headers=["Authorization", "Content-Type"],
+    )
 
 REQUEST_COUNTER = Counter("vpn_requests_total", "Total HTTP requests", ["path", "status"])
 ERROR_COUNTER = Counter("vpn_requests_errors_total", "HTTP errors", ["path", "status"])

@@ -9,6 +9,7 @@ export type Route =
   | { name: "home" }
   | { name: "plans" }
   | { name: "history" }
+  | { name: "help" }
   | { name: "checkout"; invoiceId: number };
 
 function parseHash(): Route {
@@ -16,6 +17,7 @@ function parseHash(): Route {
   if (raw === "" || raw === "/") return { name: "home" };
   if (raw === "plans" || raw === "/plans") return { name: "plans" };
   if (raw === "history" || raw === "/history") return { name: "history" };
+  if (raw === "help" || raw === "/help") return { name: "help" };
   const m = raw.match(/^\/?checkout\/(\d+)$/);
   if (m) return { name: "checkout", invoiceId: Number(m[1]) };
   return { name: "home" };
@@ -29,7 +31,9 @@ export function navigate(route: Route): void {
         ? "/plans"
         : route.name === "history"
           ? "/history"
-          : `/checkout/${route.invoiceId}`;
+          : route.name === "help"
+            ? "/help"
+            : `/checkout/${route.invoiceId}`;
   window.location.hash = path;
 }
 

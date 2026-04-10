@@ -18,11 +18,19 @@ services:
 
   redis:
     image: redis:7-alpine
-    command: ["redis-server", "--appendonly", "yes"]
+    command:
+      - redis-server
+      - --appendonly
+      - "yes"
+      - --requirepass
+      - ${REDIS_PASSWORD}
+      # NOTE: cannot rename-command EVAL/EVALSHA — RQ uses Lua scripts
+      # internally (register_script in queue.py). requirepass + network
+      # isolation (Docker internal network) is the primary defence.
     volumes:
       - redis_data:/data
     healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
+      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD}", "ping"]
       interval: 5s
       timeout: 3s
       retries: 10
@@ -34,7 +42,7 @@ services:
       DATABASE_URL: ${DATABASE_URL}
       ADMIN_API_TOKEN: ${ADMIN_API_TOKEN}
       APP_SECRET_KEY: ${APP_SECRET_KEY}
-      REDIS_URL: "redis://redis:6379/0"
+      REDIS_URL: "redis://:${REDIS_PASSWORD}@redis:6379/0"
       QUEUE_BACKEND: "rq"
       PAYMENT_PROVIDER: ${PAYMENT_PROVIDER:-cryptobot}
       # Stage 9a: comma-separated rotation pool. If set, the backend
@@ -42,8 +50,6 @@ services:
       # PAYMENT_PROVIDER above when unset.
       PAYMENT_PROVIDERS: ${PAYMENT_PROVIDERS:-}
       CRYPTOBOT_TOKEN: ${CRYPTOBOT_TOKEN:-}
-      YOOKASSA_SHOP_ID: ${YOOKASSA_SHOP_ID:-}
-      YOOKASSA_SECRET_KEY: ${YOOKASSA_SECRET_KEY:-}
       TELEGRAM_STARS_WEBHOOK_SECRET: ${TELEGRAM_STARS_WEBHOOK_SECRET:-}
       BOT_TOKEN: ${BOT_TOKEN}
       # Needed by /api/webapp/referral to build the full t.me share link.
@@ -86,7 +92,7 @@ services:
       DATABASE_URL: ${DATABASE_URL}
       ADMIN_API_TOKEN: ${ADMIN_API_TOKEN}
       APP_SECRET_KEY: ${APP_SECRET_KEY}
-      REDIS_URL: "redis://redis:6379/0"
+      REDIS_URL: "redis://:${REDIS_PASSWORD}@redis:6379/0"
       QUEUE_BACKEND: "rq"
       # Migrations are owned by the backend service — it runs
       # `alembic upgrade head` on startup. If the worker also tries to

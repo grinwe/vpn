@@ -21,28 +21,28 @@ from app.services.payments.generic_sbp import GenericSBPProvider, load_sbp_insta
 
 
 def test_list_available_providers_reads_plural_env(monkeypatch):
-    monkeypatch.setenv("PAYMENT_PROVIDERS", "cryptobot, yookassa ,telegram_stars")
+    monkeypatch.setenv("PAYMENT_PROVIDERS", "cryptobot, telegram_stars ,sbp:sber")
     monkeypatch.delenv("PAYMENT_PROVIDER", raising=False)
-    assert list_available_providers() == ["cryptobot", "yookassa", "telegram_stars"]
+    assert list_available_providers() == ["cryptobot", "telegram_stars", "sbp:sber"]
 
 
 def test_list_available_providers_falls_back_to_singular(monkeypatch):
     monkeypatch.delenv("PAYMENT_PROVIDERS", raising=False)
-    monkeypatch.setenv("PAYMENT_PROVIDER", "yookassa")
-    assert list_available_providers() == ["yookassa"]
+    monkeypatch.setenv("PAYMENT_PROVIDER", "cryptobot")
+    assert list_available_providers() == ["cryptobot"]
 
 
 def test_list_available_providers_dedupes(monkeypatch):
-    monkeypatch.setenv("PAYMENT_PROVIDERS", "cryptobot,cryptobot,yookassa")
-    assert list_available_providers() == ["cryptobot", "yookassa"]
+    monkeypatch.setenv("PAYMENT_PROVIDERS", "cryptobot,cryptobot,telegram_stars")
+    assert list_available_providers() == ["cryptobot", "telegram_stars"]
 
 
 def test_pick_provider_name_deterministic_with_seeded_rng(monkeypatch):
-    monkeypatch.setenv("PAYMENT_PROVIDERS", "cryptobot,yookassa,telegram_stars")
+    monkeypatch.setenv("PAYMENT_PROVIDERS", "cryptobot,telegram_stars,sbp:sber")
     rng = random.Random(0)
     picks = {pick_provider_name(rng) for _ in range(50)}
     # All three names appear at least once across 50 picks → rotation works.
-    assert picks == {"cryptobot", "yookassa", "telegram_stars"}
+    assert picks == {"cryptobot", "telegram_stars", "sbp:sber"}
 
 
 def test_pick_provider_name_single_pool_no_rng(monkeypatch):

@@ -59,16 +59,14 @@ export interface DeviceSummary {
 export interface SubscriptionExtra {
   subscription_id: number;
   plan_name: string | null;
-  daily_rate_kopecks: number | null;
-  daily_cost_kopecks: number | null;
-  days_remaining: number | null;
-  next_charge_at: string | null;
+  plan_price_kopecks: number;
+  plan_duration_days: number;
+  expires_at: string | null;
+  auto_renew: boolean;
   frozen_until: string | null;
   can_freeze: boolean;
-  freeze_days_left_in_year: number;
   device_count: number;
   bundled_devices: number;
-  extra_device_daily_kopecks: number;
   devices: DeviceSummary[];
 }
 
@@ -86,12 +84,37 @@ export async function addDevice(subscriptionId: number) {
   );
 }
 
+export interface RenameDeviceResponse {
+  device_id: number;
+  name: string;
+}
+
+export async function renameDevice(deviceId: number, name: string) {
+  return request<RenameDeviceResponse>(`/api/webapp/devices/${deviceId}`, {
+    method: "PATCH",
+    body: JSON.stringify({ name }),
+  });
+}
+
+export interface RemoveDeviceResponse {
+  device_id: number;
+  device_count: number;
+  new_daily_cost_kopecks: number;
+}
+
+export async function removeDevice(deviceId: number) {
+  return request<RemoveDeviceResponse>(`/api/webapp/devices/${deviceId}`, {
+    method: "DELETE",
+  });
+}
+
 export interface MeResponse {
   user: User;
   subscriptions: Subscription[];
   balance: BalanceInfo;
   subscription_extras: SubscriptionExtra[];
   sub_link_base_url: string;
+  bot_username: string;
 }
 
 let token: string | null = null;
@@ -172,7 +195,7 @@ export async function fetchInvoiceStatus(id: number) {
   return request<InvoiceStatusResponse>(`/api/webapp/invoices/${id}`);
 }
 
-// ── Stage 4: balance billing ───────────────────────────────────────
+// ── Balance billing ──────────────────────────────────────────────────
 
 export interface TopupResponse {
   invoice_id: number;
@@ -192,10 +215,10 @@ export async function createTopup(amountKopecks: number, provider = "telegram_st
 export interface ActivateResponse {
   subscription_id: number;
   sub_token: string | null;
-  days_remaining: number;
+  expires_at: string;
   balance_kopecks: number;
-  daily_cost_kopecks: number;
-  next_charge_at: string | null;
+  plan_price_kopecks: number;
+  plan_duration_days: number;
 }
 
 export interface InsufficientBalanceDetail {
@@ -216,7 +239,7 @@ export interface FreezeResponse {
   subscription_id: number;
   status: string;
   frozen_until: string | null;
-  freeze_days_left_in_year: number;
+  can_freeze_again: boolean;
 }
 
 export async function freezeSubscription(id: number) {
@@ -228,7 +251,7 @@ export async function freezeSubscription(id: number) {
 export interface UnfreezeResponse {
   subscription_id: number;
   status: string;
-  next_charge_at: string | null;
+  expires_at: string | null;
 }
 
 export async function unfreezeSubscription(id: number) {
@@ -239,9 +262,8 @@ export async function unfreezeSubscription(id: number) {
 
 export interface CancelSubscriptionResponse {
   subscription_id: number;
-  status: string;
-  refunded_kopecks: number;
-  balance_kopecks: number;
+  auto_renew: boolean;
+  expires_at: string | null;
 }
 
 export async function cancelSubscription(id: number) {
@@ -251,7 +273,41 @@ export async function cancelSubscription(id: number) {
   );
 }
 
-// ── Stage 5.5: history + referral ──────────────────────────────────
+export interface AutoRenewToggleResponse {
+  subscription_id: number;
+  auto_renew: boolean;
+}
+
+export async function toggleAutoRenew(id: number, autoRenew: boolean) {
+  return request<AutoRenewToggleResponse>(
+    `/api/webapp/subscriptions/${id}/auto_renew`,
+    {
+      method: "POST",
+      body: JSON.stringify({ auto_renew: autoRenew }),
+    },
+  );
+}
+
+export interface ChangePlanResponse {
+  subscription_id: number;
+  new_plan_name: string;
+  expires_at: string;
+  refunded_kopecks: number;
+  charged_kopecks: number;
+  balance_kopecks: number;
+}
+
+export async function changePlan(subscriptionId: number, planId: number) {
+  return request<ChangePlanResponse>(
+    `/api/webapp/subscriptions/${subscriptionId}/change_plan`,
+    {
+      method: "POST",
+      body: JSON.stringify({ plan_id: planId }),
+    },
+  );
+}
+
+// ── History + referral ───────────────────────────────────────────────
 
 export interface TransactionRow {
   id: number;

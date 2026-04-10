@@ -115,6 +115,38 @@
         - state == 'absent'
         - vless_ws_manage_script.stat.exists
 
+    # ---- VLESS+XHTTP branch ---------------------------------------------
+    - name: Ensure VLESS XHTTP manage script exists
+      stat:
+        path: /usr/local/sbin/manage_vless_xhttp_user.sh
+      register: vless_xhttp_manage_script
+
+    - name: Fail if VLESS XHTTP apply is missing UUID
+      fail:
+        msg: "vless-xhttp provisioning requires uuid when state=present"
+      when:
+        - state == 'present'
+        - protocols | selectattr('proto', 'equalto', 'vless-xhttp') | list | length > 0
+        - uuid is not defined or uuid | length == 0
+
+    - name: Add VLESS+XHTTP user
+      command: >-
+        /usr/local/sbin/manage_vless_xhttp_user.sh add {{ username }} {{ uuid }}
+      loop: "{{ protocols }}"
+      when:
+        - item.proto == 'vless-xhttp'
+        - state == 'present'
+        - vless_xhttp_manage_script.stat.exists
+
+    - name: Remove VLESS+XHTTP user
+      command: >-
+        /usr/local/sbin/manage_vless_xhttp_user.sh del {{ username }}
+      loop: "{{ protocols }}"
+      when:
+        - item.proto == 'vless-xhttp'
+        - state == 'absent'
+        - vless_xhttp_manage_script.stat.exists
+
     # ---- Hysteria2 branch -----------------------------------------------
     - name: Ensure Hysteria2 manage script exists
       stat:

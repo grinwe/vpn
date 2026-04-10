@@ -7,11 +7,15 @@ import {
   ReferralInfo,
   Subscription,
   SubscriptionExtra,
+  DeviceSummary,
   addDevice,
+  renameDevice,
+  removeDevice,
   createTopup,
+  cancelSubscription,
   freezeSubscription,
   unfreezeSubscription,
-  cancelSubscription,
+  toggleAutoRenew,
 } from "../api";
 import { navigate } from "../router";
 import { getTg } from "../telegram";
@@ -146,12 +150,20 @@ export default function Home({
         )}
       </section>
 
-      <button
-        className="btn-primary w-full py-3"
-        onClick={() => navigate({ name: "plans" })}
-      >
-        {me.subscriptions.length === 0 ? "Выбрать подписку" : "Добавить подписку"}
-      </button>
+      <div className="flex gap-2">
+        <button
+          className="btn-primary flex-1 py-3"
+          onClick={() => navigate({ name: "plans" })}
+        >
+          {me.subscriptions.length === 0 ? "Выбрать подписку" : "Добавить подписку"}
+        </button>
+        <button
+          className="btn-ghost py-3 px-4"
+          onClick={() => navigate({ name: "help" })}
+        >
+          Помощь
+        </button>
+      </div>
 
       {/* ── Referral block ── */}
       {referral && referral.code && (
@@ -318,42 +330,38 @@ function SubscriptionCard({
     }
   }
 
-  async function handleCancel() {
-    if (
-      !confirm(
-        "Отписаться? Доступ будет отключён, остаток предоплаты вернётся на баланс.",
-      )
-    )
+  async function handleToggleAutoRenew() {
+    const newValue = !extra?.auto_renew;
+    if (!newValue && !confirm("Отключить автопродление? Подписка будет активна до конца оплаченного периода."))
       return;
     setBusy(true);
     try {
-      const res = await cancelSubscription(sub.id);
-      const refundRub = (res.refunded_kopecks / 100).toFixed(0);
-      alert(
-        res.refunded_kopecks > 0
-          ? `Подписка отменена. ${refundRub} ₽ возвращено на баланс.`
-          : "Подписка отменена.",
-      );
+      await toggleAutoRenew(sub.id, newValue);
       onAction();
     } catch (e) {
-      alert(`Не удалось отписаться: ${(e as Error).message}`);
+      alert(`Не удалось изменить автопродление: ${(e as Error).message}`);
     } finally {
       setBusy(false);
     }
   }
 
+  const priceRub = extra ? (extra.plan_price_kopecks / 100).toFixed(0) : null;
+  const expiresDate = extra?.expires_at
+    ? new Date(extra.expires_at).toLocaleDateString("ru-RU", { day: "numeric", month: "long" })
+    : null;
+
   return (
     <div className="card">
       <div className="flex justify-between items-start mb-1">
         <div className="font-semibold">{sub.plan_name}</div>
-        <StatusBadge status={sub.status} />
+        <StatusBadge status={sub.status} autoRenew={extra?.auto_renew} />
       </div>
       <div className="text-tg-hint text-sm">{sub.region}</div>
-      {extra && extra.daily_cost_kopecks !== null && (
+      {extra && priceRub && (
         <div className="text-tg-hint text-xs mt-1">
-          {(extra.daily_cost_kopecks / 100).toFixed(0)} ₽/день
-          {extra.next_charge_at && !isFrozen && (
-            <> · списание {new Date(extra.next_charge_at).toLocaleDateString("ru-RU", { day: "numeric", month: "short", hour: "2-digit", minute: "2-digit" })}</>
+          {priceRub} ₽/мес
+          {expiresDate && !isFrozen && (
+            <> · {extra.auto_renew ? "до" : "истекает"} {expiresDate}</>
           )}
         </div>
       )}
@@ -363,33 +371,72 @@ function SubscriptionCard({
         </div>
       )}
 
+      {/* Config link + copy + QR */}
+      {subUrl && !isFrozen && (
+        <div className="mt-3">
+          <div
+            className="flex items-center gap-2 bg-tg-bg rounded-xl px-3 py-2 cursor-pointer"
+            onClick={async () => {
+              try {
+                await navigator.clipboard.writeText(subUrl);
+                getTg()?.HapticFeedback?.notificationOccurred("success");
+                setCopied(true);
+                setTimeout(() => setCopied(false), 1500);
+              } catch {
+                const ta = document.createElement("textarea");
+                ta.value = subUrl;
+                document.body.appendChild(ta);
+                ta.select();
+                try { document.execCommand("copy"); } catch { /* empty */ }
+                document.body.removeChild(ta);
+                setCopied(true);
+                setTimeout(() => setCopied(false), 1500);
+              }
+            }}
+          >
+            <span className="flex-1 text-xs font-mono text-tg-hint truncate">
+              {subUrl.length > 40 ? subUrl.slice(0, 40) + "…" : subUrl}
+            </span>
+            <span className="text-tg-link text-xs font-semibold whitespace-nowrap">
+              {copied ? "✓" : "📋"}
+            </span>
+          </div>
+          <button
+            onClick={() => {
+              setShowQR((v) => !v);
+              getTg()?.HapticFeedback?.notificationOccurred("success");
+            }}
+            className="mt-2 w-full py-2 rounded-xl bg-tg-secondaryBg ring-1 ring-tg-link text-tg-link text-xs font-semibold"
+          >
+            {showQR ? "Скрыть QR" : "Показать QR"}
+          </button>
+          {showQR && (
+            <div className="mt-3 flex justify-center bg-white rounded-xl p-3">
+              <canvas ref={qrCanvasRef} />
+            </div>
+          )}
+        </div>
+      )}
+
       {/* Devices list + Add button */}
       {extra && !isFrozen && (
         <div className="mt-3">
           <div className="text-tg-hint text-xs uppercase tracking-wide mb-1">
             Устройства {extra.device_count}/{extra.bundled_devices}
-            {extra.device_count > extra.bundled_devices && (
-              <> · +{(extra.extra_device_daily_kopecks / 100 * 30).toFixed(0)} ₽/мес за каждое сверх</>
-            )}
           </div>
           <ul className="space-y-1">
-            {extra.devices.map((d, i) => (
-              <li
+            {extra.devices.map((d) => (
+              <DeviceRow
                 key={d.id}
-                className="flex items-center justify-between bg-tg-bg rounded px-2 py-1 text-xs"
-              >
-                <span>Устройство {i + 1}</span>
-                <span className="text-tg-hint">{d.status}</span>
-              </li>
+                device={d}
+                canRemove={extra.device_count > 1}
+                onAction={onAction}
+              />
             ))}
           </ul>
           <button
             onClick={async () => {
-              const extraCost =
-                extra.device_count + 1 > extra.bundled_devices
-                  ? ` (+${(extra.extra_device_daily_kopecks / 100 * 30).toFixed(0)} ₽/мес)`
-                  : "";
-              if (!confirm(`Добавить ещё одно устройство?${extraCost}`)) return;
+              if (!confirm("Добавить ещё одно устройство?")) return;
               setBusy(true);
               try {
                 await addDevice(sub.id);
@@ -417,51 +464,28 @@ function SubscriptionCard({
         </div>
       )}
 
-      {subUrl && !isFrozen && (
-        <>
-          <div className="mt-3 flex gap-2">
-            <button
-              onClick={async () => {
-                try {
-                  await navigator.clipboard.writeText(subUrl);
-                  getTg()?.HapticFeedback?.notificationOccurred("success");
-                  setCopied(true);
-                  setTimeout(() => setCopied(false), 1500);
-                } catch {
-                  // Fallback: старые WebView без Clipboard API
-                  const ta = document.createElement("textarea");
-                  ta.value = subUrl;
-                  document.body.appendChild(ta);
-                  ta.select();
-                  try { document.execCommand("copy"); } catch { /* empty */ }
-                  document.body.removeChild(ta);
-                  setCopied(true);
-                  setTimeout(() => setCopied(false), 1500);
-                }
-              }}
-              className="flex-1 py-2 rounded-xl bg-tg-secondaryBg ring-1 ring-tg-link text-tg-link text-sm font-semibold"
-            >
-              {copied ? "Скопировано ✓" : "Скопировать"}
-            </button>
-            <button
-              onClick={() => {
-                setShowQR((v) => !v);
-                getTg()?.HapticFeedback?.notificationOccurred("success");
-              }}
-              className="flex-1 py-2 rounded-xl bg-tg-secondaryBg ring-1 ring-tg-link text-tg-link text-sm font-semibold"
-            >
-              {showQR ? "Скрыть QR" : "Показать QR"}
-            </button>
+      {/* Auto-renew toggle */}
+      {extra && !isFrozen && (
+        <div
+          className="mt-3 flex items-center justify-between cursor-pointer"
+          onClick={handleToggleAutoRenew}
+        >
+          <span className="text-sm">Автопродление</span>
+          <div
+            className={`w-10 h-6 rounded-full relative transition-colors ${
+              extra.auto_renew ? "bg-tg-button" : "bg-slate-600"
+            }`}
+          >
+            <div
+              className={`absolute top-1 w-4 h-4 rounded-full bg-white transition-transform ${
+                extra.auto_renew ? "translate-x-5" : "translate-x-1"
+              }`}
+            />
           </div>
-          {showQR && (
-            <div className="mt-3 flex justify-center bg-white rounded-xl p-3">
-              <canvas ref={qrCanvasRef} />
-            </div>
-          )}
-        </>
+        </div>
       )}
 
-      {/* Freeze / unfreeze / cancel controls */}
+      {/* Freeze / unfreeze + change plan */}
       {extra && (
         <div className="mt-3 flex gap-2">
           {isFrozen ? (
@@ -473,40 +497,95 @@ function SubscriptionCard({
               {busy ? "…" : "Разморозить"}
             </button>
           ) : (
-            extra.can_freeze && (
+            <>
+              {extra.can_freeze && (
+                <button
+                  onClick={handleFreeze}
+                  disabled={busy}
+                  className="flex-1 py-2 rounded-xl bg-tg-secondaryBg ring-1 ring-tg-hint text-tg-text text-sm disabled:opacity-50"
+                >
+                  {busy ? "…" : "Заморозить на 7 дн."}
+                </button>
+              )}
               <button
-                onClick={handleFreeze}
-                disabled={busy}
-                className="flex-1 py-2 rounded-xl bg-tg-secondaryBg ring-1 ring-tg-hint text-tg-text text-sm disabled:opacity-50"
+                onClick={() => navigate({ name: "plans" })}
+                className="flex-1 py-2 rounded-xl bg-tg-secondaryBg ring-1 ring-tg-hint text-tg-text text-sm"
               >
-                {busy ? "…" : "Заморозить на 7 дн."}
+                Сменить тариф
               </button>
-            )
+            </>
           )}
-          <button
-            onClick={handleCancel}
-            disabled={busy}
-            className="py-2 px-4 rounded-xl text-red-400 ring-1 ring-red-400/30 text-sm disabled:opacity-50"
-          >
-            {busy ? "…" : "Отписаться"}
-          </button>
         </div>
+      )}
+
+      {/* Cancel / restore subscription */}
+      {extra && !isFrozen && extra.auto_renew && (
+        <button
+          onClick={async () => {
+            const date = sub.expires_at
+              ? new Date(sub.expires_at).toLocaleDateString("ru-RU")
+              : "окончания срока";
+            if (
+              !confirm(
+                `Подписка продолжит работать до ${date}, но не будет продлена. Отменить?`,
+              )
+            )
+              return;
+            setBusy(true);
+            try {
+              await cancelSubscription(sub.id);
+              getTg()?.HapticFeedback?.notificationOccurred("success");
+              onAction();
+            } catch (e) {
+              alert(`Ошибка: ${(e as Error).message}`);
+            } finally {
+              setBusy(false);
+            }
+          }}
+          disabled={busy}
+          className="mt-2 w-full py-2 rounded-xl text-red-400 text-xs disabled:opacity-50"
+        >
+          Отменить подписку
+        </button>
+      )}
+      {extra && !isFrozen && !extra.auto_renew && sub.status === "active" && (
+        <button
+          onClick={async () => {
+            setBusy(true);
+            try {
+              await toggleAutoRenew(sub.id, true);
+              getTg()?.HapticFeedback?.notificationOccurred("success");
+              onAction();
+            } catch (e) {
+              alert(`Ошибка: ${(e as Error).message}`);
+            } finally {
+              setBusy(false);
+            }
+          }}
+          disabled={busy}
+          className="mt-2 w-full py-2 rounded-xl bg-tg-button text-tg-buttonText text-sm font-semibold disabled:opacity-50"
+        >
+          Восстановить подписку
+        </button>
       )}
     </div>
   );
 }
 
-function StatusBadge({ status }: { status: string }) {
-  const color =
-    status === "active"
+function StatusBadge({ status, autoRenew }: { status: string; autoRenew?: boolean }) {
+  const isCancelled = status === "active" && autoRenew === false;
+  const color = isCancelled
+    ? "bg-yellow-500/15 text-yellow-300 border-yellow-500/30"
+    : status === "active"
       ? "bg-green-500/15 text-green-300 border-green-500/30"
       : status === "frozen"
         ? "bg-blue-500/15 text-blue-300 border-blue-500/30"
         : status === "expired"
           ? "bg-yellow-500/15 text-yellow-300 border-yellow-500/30"
           : "bg-red-500/15 text-red-300 border-red-500/30";
-  const label =
-    status === "active"
+  const label = isCancelled
+    ? "отменена"
+    : status === "active"
       ? "активна"
       : status === "frozen"
         ? "заморожена"
@@ -594,5 +673,101 @@ function TopupModal({ onClose }: { onClose: () => void }) {
         </button>
       </div>
     </div>
+  );
+}
+
+function DeviceRow({
+  device,
+  canRemove,
+  onAction,
+}: {
+  device: DeviceSummary;
+  canRemove: boolean;
+  onAction: () => void;
+}) {
+  const [editing, setEditing] = useState(false);
+  const [name, setName] = useState(device.name);
+  const [busy, setBusy] = useState(false);
+  const inputRef = useRef<HTMLInputElement>(null);
+
+  useEffect(() => {
+    if (editing) inputRef.current?.focus();
+  }, [editing]);
+
+  async function saveName() {
+    const trimmed = name.trim();
+    if (!trimmed || trimmed === device.name) {
+      setName(device.name);
+      setEditing(false);
+      return;
+    }
+    setBusy(true);
+    try {
+      await renameDevice(device.id, trimmed);
+      setEditing(false);
+      onAction();
+    } catch (e) {
+      alert(`Ошибка: ${(e as Error).message}`);
+      setName(device.name);
+      setEditing(false);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function handleRemove() {
+    if (!confirm(`Удалить устройство «${device.name}»? Доступ будет отозван.`)) return;
+    setBusy(true);
+    try {
+      await removeDevice(device.id);
+      getTg()?.HapticFeedback?.notificationOccurred("success");
+      onAction();
+    } catch (e) {
+      alert(`Ошибка: ${(e as Error).message}`);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <li className="flex items-center gap-2 bg-tg-bg rounded px-2 py-1.5 text-xs">
+      {editing ? (
+        <input
+          ref={inputRef}
+          value={name}
+          onChange={(e) => setName(e.target.value)}
+          onBlur={saveName}
+          onKeyDown={(e) => {
+            if (e.key === "Enter") saveName();
+            if (e.key === "Escape") {
+              setName(device.name);
+              setEditing(false);
+            }
+          }}
+          maxLength={64}
+          disabled={busy}
+          className="flex-1 bg-transparent border-b border-tg-link outline-none text-tg-text"
+        />
+      ) : (
+        <span
+          className="flex-1 truncate cursor-pointer"
+          onClick={() => setEditing(true)}
+          title="Нажми, чтобы переименовать"
+        >
+          {device.name}
+        </span>
+      )}
+      <span className="text-tg-hint shrink-0">{device.status}</span>
+      {canRemove && (
+        <button
+          onClick={handleRemove}
+          disabled={busy}
+          className="text-red-400 hover:text-red-300 shrink-0 disabled:opacity-50"
+          title="Удалить устройство"
+        >
+          ✕
+        </button>
+      )}
+    </li>
   );
 }

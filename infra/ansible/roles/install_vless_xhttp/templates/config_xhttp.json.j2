@@ -1,0 +1,84 @@
+{
+  "log": {
+    "loglevel": "warning"
+  },
+  "api": {
+    "tag": "api",
+    "services": ["StatsService"]
+  },
+  "stats": {},
+  "policy": {
+    "levels": {
+      "0": {
+        "statsUserUplink": true,
+        "statsUserDownlink": true
+      }
+    },
+    "system": {
+      "statsInboundUplink": true,
+      "statsInboundDownlink": true
+    }
+  },
+  "routing": {
+    "rules": [
+      {
+        "type": "field",
+        "inboundTag": ["api-in"],
+        "outboundTag": "api"
+      }
+    ]
+  },
+  "inbounds": [
+    {
+      "tag": "api-in",
+      "listen": "127.0.0.1",
+      "port": {{ vless_xhttp_api_port | default(10087) }},
+      "protocol": "dokodemo-door",
+      "settings": {
+        "address": "127.0.0.1"
+      }
+    },
+    {
+      "tag": "vless-xhttp",
+      "listen": "0.0.0.0",
+      "port": {{ vless_xhttp_port | int }},
+      "protocol": "vless",
+      "settings": {
+        "clients": [],
+        "decryption": "none"
+      },
+      "streamSettings": {
+        "network": "xhttp",
+        "xhttpSettings": {
+          "path": "{{ vless_xhttp_path | default('/xh') }}",
+          "mode": "{{ vless_xhttp_mode | default('auto') }}"
+        },
+        "security": "tls",
+        "tlsSettings": {
+          "serverName": "{{ vless_xhttp_domain }}",
+          "certificates": [
+            {
+              "certificateFile": "{{ _xhttp_cert_path }}",
+              "keyFile": "{{ _xhttp_key_path }}"
+            }
+          ],
+          "alpn": ["h2", "http/1.1"]
+        }
+      },
+      "sniffing": {
+        "enabled": true,
+        "destOverride": ["http", "tls"]
+      }
+    }
+  ],
+  "outbounds": [
+    {
+      "protocol": "freedom",
+      "tag": "direct"
+    },
+    {
+      "protocol": "blackhole",
+      "tag": "block"
+    }
+  ]
+}

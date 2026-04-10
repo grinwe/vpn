@@ -19,6 +19,18 @@
 # The role is a no-op unless the caller provides ``vless_reality_*``
 # vars. In the main site.yml we gate it on those being set, so nodes
 # that do not serve Reality (pure ShadowTLS) stay untouched.
+- name: Stop xray when VLESS Reality is removed
+  systemd:
+    name: xray
+    state: stopped
+    enabled: no
+  when: vless_reality_private_key is not defined or vless_reality_private_key | length == 0
+  failed_when: false
+
+- name: Skip role when VLESS Reality is not configured
+  meta: end_role
+  when: vless_reality_private_key is not defined or vless_reality_private_key | length == 0
+
 - name: Require Reality config variables
   assert:
     that:

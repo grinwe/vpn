@@ -4,6 +4,7 @@ import logging
 import aiohttp
 from aiogram import F, Router, types
 from aiogram.filters import Command, CommandStart
+from aiogram.fsm.context import FSMContext
 
 from .config import (
     ADMIN_API_TOKEN,
@@ -158,9 +159,25 @@ def format_welcome(name: str, is_new: bool, trial_available: bool) -> str:
 
 @router.message(F.text == BTN_MAIN_MENU)
 @router.message(CommandStart())
-async def cmd_start(message: types.Message):
-    # Check for referral deep link: /start ref_XXXXX
+async def cmd_start(message: types.Message, state: FSMContext):
+    # Check for deep link arguments: /start ref_XXXXX or /start support
     args = message.text.split(maxsplit=1)
+
+    # Deep link from webapp: /start support → jump straight to support flow
+    if len(args) > 1 and args[1].strip() == "support":
+        from .support import SupportStates
+        from .config import ADMIN_IDS
+        if not ADMIN_IDS:
+            await message.answer("Поддержка пока не настроена.")
+            return
+        await state.set_state(SupportStates.waiting_user_message)
+        await message.answer(
+            "💬 Опиши проблему одним сообщением — текст, фото или голосовое. "
+            "Мы передадим админу, ответ придёт сюда же.\n\n"
+            "Отменить — /cancel.",
+        )
+        return
+
     referral_code = None
     if len(args) > 1 and args[1].startswith("ref_"):
         referral_code = args[1][4:]
@@ -642,29 +659,31 @@ async def cmd_balance(message: types.Message):
     lines = [f"💰 <b>Баланс: {balance_rub:.0f} ₽</b>"]
     if min_days is not None:
         if min_days <= 3:
-            lines.append(f"⚠️ Хватит на <b>{min_days} дн.</b> — пора пополнить!")
+            lines.append(f"⚠️ Подписка истекает через <b>{min_days} дн.</b> — пора пополнить!")
         else:
-            lines.append(f"Хватит примерно на <b>{min_days} дн.</b>")
+            lines.append(f"Подписка активна ещё <b>{min_days} дн.</b>")
     lines.append("")
 
     if subs:
         lines.append("<b>Активные подписки:</b>")
         for s in subs:
-            cost = s.get("daily_cost_kopecks")
-            next_charge = s.get("next_charge_at")
+            price = s.get("plan_price_kopecks")
+            expires_at = s.get("expires_at")
+            auto_renew = s.get("auto_renew", True)
             status = s.get("status")
             badge = "🟢" if status == "active" else "❄️" if status == "frozen" else "•"
-            cost_str = f"{cost / 100:.0f} ₽/день" if cost else "—"
-            if next_charge and status == "active":
+            price_str = f"{price / 100:.0f} ₽/мес" if price else "—"
+            if expires_at and status == "active":
                 from datetime import datetime as _dt
                 try:
-                    nxt = _dt.fromisoformat(next_charge)
-                    charge_str = f" · след. списание {nxt.strftime('%d.%m %H:%M')}"
+                    exp = _dt.fromisoformat(expires_at)
+                    exp_str = f" · до {exp.strftime('%d.%m')}"
                 except (ValueError, TypeError):
-                    charge_str = ""
+                    exp_str = ""
             else:
-                charge_str = ""
-            lines.append(f"{badge} {s['plan_name']} — {cost_str}{charge_str}")
+                exp_str = ""
+            renew_str = " · автопродление" if auto_renew else ""
+            lines.append(f"{badge} {s['plan_name']} — {price_str}{exp_str}{renew_str}")
     else:
         lines.append("Нет активных подписок. Нажмите /plans, чтобы выбрать тариф.")
 

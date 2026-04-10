@@ -448,35 +448,29 @@ _LOW_BALANCE_THRESHOLD_DAYS = int(os.getenv("LOW_BALANCE_WARN_DAYS", "3"))
 
 
 def _maybe_emit_low_balance_warning(session, sub) -> None:
-    """Write an AuditLog notification when runway drops below 3 days.
+    """Write an AuditLog notification when the next renewal can't be covered.
 
-    Idempotent per calendar day: we only fire if there's no existing
-    ``low_balance_warning`` log for this user dated today. The bot's
-    notification poller picks the row up and renders it via the
-    standard ``/notifications/pending`` channel.
+    V2: after a successful renew, check whether the user's wallet can
+    afford at least one more renewal. If not, warn them to top up.
+    Idempotent per calendar day.
     """
     from . import models
     from .services import balance as balance_svc
     from .time_utils import utcnow
 
     plan = sub.plan
-    if not plan or not plan.daily_rate_kopecks:
+    if not plan:
         return
     user = sub.user
     if not user or not user.telegram_id:
         return
 
-    devices = sum(
-        1 for d in sub.devices
-        if d.status not in (models.DeviceStatus.revoked, models.DeviceStatus.disabled)
-    )
-    # Runway = prepaid bucket + wallet fallback (charge pulls from the
-    # wallet once the bucket is drained).
-    days = balance_svc.sub_days_remaining(
-        sub, max(devices, 1), user.balance_kopecks or 0
-    )
-    if days > _LOW_BALANCE_THRESHOLD_DAYS:
+    price = balance_svc.plan_price_kopecks(plan)
+    if price <= 0:
         return
+    wallet = user.balance_kopecks or 0
+    if wallet >= price:
+        return  # can afford at least one more renewal
 
     today = utcnow().date().isoformat()
     existing = (
@@ -492,6 +486,11 @@ def _maybe_emit_low_balance_warning(session, sub) -> None:
     if existing:
         return
 
+    days_until_expire = 0
+    if sub.expires_at:
+        delta = (sub.expires_at - utcnow()).total_seconds()
+        days_until_expire = max(int(delta // 86400), 0)
+
     session.add(
         models.AuditLog(
             actor="system",
@@ -501,8 +500,8 @@ def _maybe_emit_low_balance_warning(session, sub) -> None:
             target_id=user.id,
             extra={
                 "telegram_id": user.telegram_id,
-                "days_remaining": days,
-                "balance_rub": round((user.balance_kopecks or 0) / 100, 2),
+                "days_remaining": days_until_expire,
+                "balance_rub": round(wallet / 100, 2),
                 "subscription_id": sub.id,
                 "date": today,
             },
@@ -643,26 +642,23 @@ def balance_svc_trial_amount(session) -> int:
 
 
 def run_balance_charge_tick() -> dict:
-    """Periodic job — daily-billing tick for balance subscriptions.
+    """Periodic job — V2 monthly billing tick.
 
-    Two passes per tick, both bounded so a backlog can't lock the
-    worker for an entire interval:
+    Three passes per tick:
 
-      1. **Charge.** ``SELECT ... WHERE status='active' AND
-         next_charge_at <= now FOR UPDATE SKIP LOCKED LIMIT 500``.
-         Each row goes through ``balance.charge_subscription``. On
-         insufficient balance the sub flips to ``expired`` so the next
-         ``run_renewal_check`` revoke pass picks it up — we don't
-         duplicate the revoke logic here, just hand the sub off.
+      1. **Renew.** Active subs with ``expires_at <= now`` and
+         ``auto_renew = True``. Debit ``plan.price`` from wallet,
+         extend ``expires_at += plan.duration_days``. On insufficient
+         balance → expire.
 
-      2. **Auto-unfreeze.** ``SELECT ... WHERE status='frozen' AND
-         frozen_until <= now FOR UPDATE SKIP LOCKED LIMIT 100``.
-         ``balance.unfreeze_subscription(..., auto=True)`` re-provisions
-         a device and resumes billing.
+      2. **Expire non-renewing.** Active subs with ``expires_at <= now``
+         and ``auto_renew = False`` → flip to expired.
 
-    Self-reschedules at the end (mirror of ``run_warm_pool_check``).
-    Operators can fall back to a manual cron by setting
-    ``BALANCE_CHARGE_INTERVAL=0`` and dispatching the job externally.
+      3. **Auto-unfreeze.** Frozen subs with ``frozen_until <= now``.
+
+      4. **Trial expiry.** T-3 warning + T=0 clawback.
+
+    Self-reschedules at the end.
     """
     from datetime import timedelta
 
@@ -673,49 +669,62 @@ def run_balance_charge_tick() -> dict:
     from .time_utils import utcnow
 
     session = SessionLocal()
-    stats = {"charged": 0, "insufficient": 0, "unfrozen": 0, "errors": 0}
+    stats = {"renewed": 0, "insufficient": 0, "expired_norenew": 0,
+             "unfrozen": 0, "errors": 0}
     try:
         now = utcnow()
 
-        # ── Pass 1: charge due active subs ─────────────────────────────
-        due = (
+        # ── Pass 1: renew due active subs (auto_renew=True) ───────────
+        due_renew = (
             session.query(models.Subscription)
             .filter(
                 models.Subscription.status == models.SubscriptionStatus.active,
-                models.Subscription.next_charge_at.isnot(None),
-                models.Subscription.next_charge_at <= now,
+                models.Subscription.auto_renew.is_(True),
+                models.Subscription.expires_at.isnot(None),
+                models.Subscription.expires_at <= now,
             )
             .with_for_update(skip_locked=True)
             .limit(500)
             .all()
         )
-        for sub in due:
+        for sub in due_renew:
             try:
-                ok = balance.charge_subscription(session, sub)
+                ok = balance.renew_subscription(session, sub)
             except Exception:
-                logger.exception("balance: charge failed for sub %s", sub.id)
+                logger.exception("balance: renew failed for sub %s", sub.id)
                 stats["errors"] += 1
                 session.rollback()
                 continue
             if ok:
-                stats["charged"] += 1
-                # Low-balance warning: after a successful charge, check
-                # whether the user's runway just dropped below 3 days.
-                # We emit at most one warning per (user, day) by writing
-                # an AuditLog the bot polls — duplicate-prevention is on
-                # the bot side via the `:delivered` rename.
+                stats["renewed"] += 1
                 _maybe_emit_low_balance_warning(session, sub)
             else:
-                # Insufficient balance — flip to expired so the renewal
-                # cron's hard-revoke pass takes the device down after
-                # its grace window.
                 sub.status = models.SubscriptionStatus.expired
-                sub.next_charge_at = None
                 session.add(sub)
                 stats["insufficient"] += 1
             session.commit()
 
-        # ── Pass 2: auto-unfreeze expired pauses ───────────────────────
+        # ── Pass 2: expire non-renewing subs ──────────────────────────
+        due_expire = (
+            session.query(models.Subscription)
+            .filter(
+                models.Subscription.status == models.SubscriptionStatus.active,
+                models.Subscription.auto_renew.is_(False),
+                models.Subscription.expires_at.isnot(None),
+                models.Subscription.expires_at <= now,
+            )
+            .with_for_update(skip_locked=True)
+            .limit(500)
+            .all()
+        )
+        for sub in due_expire:
+            sub.status = models.SubscriptionStatus.expired
+            session.add(sub)
+            stats["expired_norenew"] += 1
+        if due_expire:
+            session.commit()
+
+        # ── Pass 3: auto-unfreeze expired pauses ─────────────────────
         expired_freezes = (
             session.query(models.Subscription)
             .filter(
@@ -737,18 +746,7 @@ def run_balance_charge_tick() -> dict:
                 stats["errors"] += 1
                 session.rollback()
 
-        # ── Pass 3: trial expiry — warn T-3 days, clawback at T=0 ──────
-        # Two sub-passes, both idempotent:
-        #   3a. Write a trial_expiry_warning AuditLog for any user whose
-        #       trial expires within TRIAL_EXPIRY_WARN_DAYS but hasn't
-        #       been warned yet (dedup on existing action lookup).
-        #   3b. For any user whose trial has already expired and who
-        #       never made a real kind=topup, write a compensating
-        #       kind=adjust transaction clawing back up to the trial
-        #       amount (capped at the current balance so we never go
-        #       negative). Paying customers keep the bonus — rule is
-        #       "became a customer ⇒ trial is earned". In either branch
-        #       we clear trial_expires_at so the tick never revisits.
+        # ── Pass 4: trial expiry ──────────────────────────────────────
         try:
             _run_trial_expiry_pass(session, stats)
         except Exception:

@@ -66,6 +66,7 @@ class VPNConfigProtocol(str, enum.Enum):
     vless_reality = "vless-reality"
     vless_ws_cdn = "vless-ws-cdn"
     hysteria2 = "hysteria2"
+    vless_xhttp = "vless-xhttp"
 
 
 class DeviceStatus(str, enum.Enum):
@@ -101,6 +102,7 @@ class CloudProviderKind(str, enum.Enum):
     hetzner = "hetzner"
     vultr = "vultr"
     digitalocean = "digitalocean"
+    aeza = "aeza"
     manual = "manual"
 
 
@@ -199,6 +201,11 @@ class VPNNode(Base):
     last_health_check_at = Column(DateTime, nullable=True)
     blocked_regions = Column(JSONB, nullable=True)
     cooldown_until = Column(DateTime, nullable=True)
+    # Relay config: when set, this node is a jump node that tunnels
+    # traffic through a WireGuard tunnel to a foreign exit node.
+    # Keys: wg_private_key, wg_address_v4, wg_address_v6,
+    #        wg_endpoint, wg_exit_public_key
+    relay_config = Column(JSONB, nullable=True)
 
     provider_id = Column(Integer, ForeignKey("cloud_providers.id"), nullable=True)
     provider_external_id = Column(String, nullable=True)
@@ -329,6 +336,10 @@ class Subscription(Base):
         Integer, nullable=False, server_default="0", default=0
     )
     frozen_year = Column(Integer, nullable=True)
+    # V2: simple "1 freeze per year" flag. True = already used this year.
+    has_frozen_this_year = Column(
+        Boolean, nullable=False, server_default="false", default=False
+    )
 
     user = relationship("User")
     plan = relationship("Plan")

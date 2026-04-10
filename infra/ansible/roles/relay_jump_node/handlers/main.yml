@@ -1,0 +1,15 @@
+---
+- name: restart wg0 client
+  systemd:
+    name: wg-quick@wg0
+    state: restarted
+
+- name: restart all xray services
+  shell: |
+    for svc in xray xray-ws-cdn xray-xhttp; do
+      if systemctl is-active --quiet "${svc}" 2>/dev/null; then
+        systemctl restart "${svc}"
+      fi
+    done
+  args:
+    executable: /bin/bash

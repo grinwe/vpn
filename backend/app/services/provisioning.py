@@ -244,6 +244,32 @@ def _build_hysteria2_credential(
     return f"hy2://{password}@{node.host}:{config.port}?{query}#hy2-{node.region}"
 
 
+def _build_vless_xhttp_credential(
+    node: models.VPNNode, config: models.VPNConfig, user_id: str
+) -> str:
+    """Build a VLESS+XHTTP+TLS connection URI.
+
+    XHTTP multiplexes VPN traffic through standard HTTP requests,
+    bypassing ТСПУ's 16KB curtain on raw TLS tunnels.
+    """
+    settings = config.settings or {}
+    domain = config.sni or settings.get("domain", node.host)
+    path = settings.get("xhttp_path", "/xh")
+    mode = settings.get("xhttp_mode", "auto")
+    params = {
+        "encryption": "none",
+        "security": "tls",
+        "sni": domain,
+        "fp": "chrome",
+        "type": "xhttp",
+        "host": domain,
+        "path": urlquote(path),
+        "mode": mode,
+    }
+    query = "&".join([f"{k}={v}" for k, v in params.items() if v])
+    return f"vless://{user_id}@{domain}:{config.port}?{query}#xhttp-{node.region}"
+
+
 # ── Extra vars collection for Ansible site.yml ────────────────────────
 
 def _collect_site_extra_vars(node: models.VPNNode) -> dict[str, Any]:
@@ -306,6 +332,18 @@ def _collect_site_extra_vars(node: models.VPNNode) -> dict[str, Any]:
             })
             health_ports.append(cfg.port)
 
+        # ── VLESS+XHTTP ──
+        elif cfg.protocol == models.VPNConfigProtocol.vless_xhttp:
+            extra.update({
+                "vless_xhttp_port": cfg.port,
+                "vless_xhttp_domain": cfg.sni or "",
+                "vless_xhttp_path": settings.get("xhttp_path", "/xh"),
+                "vless_xhttp_mode": settings.get("xhttp_mode", "auto"),
+                "vless_xhttp_cert_path": settings.get("cert_path", ""),
+                "vless_xhttp_key_path": settings.get("key_path", ""),
+            })
+            health_ports.append(cfg.port)
+
         # ── Hysteria2 ──
         elif cfg.protocol == models.VPNConfigProtocol.hysteria2:
             extra.update({
@@ -324,6 +362,17 @@ def _collect_site_extra_vars(node: models.VPNNode) -> dict[str, Any]:
 
     if health_ports:
         extra["vpn_health_ports"] = sorted(set(health_ports))
+
+    # ── Relay (jump node → WG tunnel → exit) ──
+    rc = node.relay_config
+    if rc:
+        extra.update({
+            "relay_wg_private_key": rc.get("wg_private_key", ""),
+            "relay_wg_address_v4": rc.get("wg_address_v4", ""),
+            "relay_wg_address_v6": rc.get("wg_address_v6", ""),
+            "relay_wg_endpoint": rc.get("wg_endpoint", ""),
+            "relay_wg_exit_public_key": rc.get("wg_exit_public_key", ""),
+        })
 
     return extra
 
@@ -666,6 +715,13 @@ class ProvisioningOrchestrator:
                         limit=node.name,
                         extra_vars=payload,
                     )
+                elif task.action == "diagnose":
+                    result = run_playbook(
+                        "playbooks/diagnose_node.yml",
+                        inventory,
+                        limit=node.name,
+                        extra_vars=payload,
+                    )
                 else:
                     site_vars = _collect_site_extra_vars(node)
                     result = run_playbook(
@@ -918,6 +974,8 @@ class ProvisioningOrchestrator:
                 cred_text = _build_vless_reality_credential(node, cfg, str(user_uuid))
             elif cfg.protocol == models.VPNConfigProtocol.vless_ws_cdn:
                 cred_text = _build_vless_ws_cdn_credential(node, cfg, str(user_uuid))
+            elif cfg.protocol == models.VPNConfigProtocol.vless_xhttp:
+                cred_text = _build_vless_xhttp_credential(node, cfg, str(user_uuid))
             elif cfg.protocol == models.VPNConfigProtocol.hysteria2:
                 cred_text = _build_hysteria2_credential(node, cfg, password)
             else:
@@ -929,8 +987,11 @@ class ProvisioningOrchestrator:
                     subscription_id=subscription.id,
                     device_id=device.id,
                     config_id=cfg.id,
+                    node_id=node.id,
                     proto=cfg.protocol.value,
                     config_text=encrypt(cred_text),
+                    access_username=username,
+                    is_active=False,  # activated by _handle_task_outcome on ansible success
                 )
             )
 
@@ -1122,6 +1183,8 @@ class ProvisioningOrchestrator:
                 cred_text = _build_vless_reality_credential(node, cfg, str(user_uuid))
             elif cfg.protocol == models.VPNConfigProtocol.vless_ws_cdn:
                 cred_text = _build_vless_ws_cdn_credential(node, cfg, str(user_uuid))
+            elif cfg.protocol == models.VPNConfigProtocol.vless_xhttp:
+                cred_text = _build_vless_xhttp_credential(node, cfg, str(user_uuid))
             elif cfg.protocol == models.VPNConfigProtocol.hysteria2:
                 cred_text = _build_hysteria2_credential(node, cfg, password)
             else:
@@ -1133,8 +1196,11 @@ class ProvisioningOrchestrator:
                     subscription_id=subscription.id,
                     device_id=device.id,
                     config_id=cfg.id,
+                    node_id=node.id,
                     proto=cfg.protocol.value,
                     config_text=encrypt(cred_text),
+                    access_username=username,
+                    is_active=False,  # activated by _handle_task_outcome on ansible success
                 )
             )
 

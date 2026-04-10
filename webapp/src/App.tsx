@@ -4,6 +4,7 @@ import Home from "./pages/Home";
 import Plans from "./pages/Plans";
 import CheckoutPending from "./pages/CheckoutPending";
 import History from "./pages/History";
+import Help from "./pages/Help";
 import { useRoute } from "./router";
 import { getTg } from "./telegram";
 
@@ -64,8 +65,9 @@ export default function App() {
     fetchMe().then(setMe).catch(() => undefined);
   };
 
-  if (route.name === "plans") return <Plans onActivated={refreshMe} />;
+  if (route.name === "plans") return <Plans onActivated={refreshMe} subLinkBase={me?.sub_link_base_url ?? ""} />;
   if (route.name === "history") return <History />;
+  if (route.name === "help") return <Help botUsername={me?.bot_username} />;
   if (route.name === "checkout") return <CheckoutPending invoiceId={route.invoiceId} />;
   return <Home me={me!} onRefresh={refreshMe} />;
 }
