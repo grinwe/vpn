@@ -336,21 +336,26 @@ def resync_node_clients(
     admin_token: str = Depends(require_admin),
     admin_actor: str | None = Header(default=None, alias=ADMIN_ACTOR_HEADER),
 ):
-    """Force re-push of all active VLESS+Reality users onto a node.
+    """Force re-push of all vless-family users onto a node.
 
     Safety net for the "empty clients after site.yml" class of bugs:
     if an operator suspects the node has drifted from the backend's
     view of who's provisioned (e.g. after a manual config edit, a
     restore-from-backup, or a half-broken bootstrap), this endpoint
     enqueues a resync task that re-adds every active credential via
-    manage_vless_user.sh. The helper is idempotent so running this
+    manage_vless_*_user.sh. The helper is idempotent so running this
     in any node state is safe.
+
+    Covers vless_reality, vless_xhttp and vless_ws_cdn — anything
+    that shares the "invalid request user id" failure mode — and
+    also pushes warm-pool bundles that are bound to the node but
+    not yet assigned to a subscription.
     """
     node = db.get(models.VPNNode, node_id)
     if not node:
         raise HTTPException(status_code=404, detail="Node not found")
     orchestrator = ProvisioningOrchestrator(db)
-    task = orchestrator.resync_node_vless_clients(node)
+    task = orchestrator.resync_node_clients(node)
     actor, actor_type = _resolve_admin_actor(admin_actor)
     _audit(
         db,
@@ -363,10 +368,18 @@ def resync_node_clients(
     )
     if not task:
         return {"node_id": node.id, "task_id": None, "clients": 0}
+    payload = task.payload or {}
+    clients_by_proto = payload.get("clients_by_proto") or {}
+    total = sum(len(v) for v in clients_by_proto.values()) if clients_by_proto else len(
+        payload.get("clients", [])
+    )
     return {
         "node_id": node.id,
         "task_id": task.id,
-        "clients": len((task.payload or {}).get("clients", [])),
+        "clients": total,
+        "clients_by_proto": {
+            proto: len(v) for proto, v in clients_by_proto.items()
+        },
     }
 
 

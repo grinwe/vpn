@@ -389,9 +389,32 @@ _VLESS_UUID_RE = re.compile(
 )
 
 
-def _node_has_vless_reality(node: models.VPNNode) -> bool:
+# Protocols whose server-side client list lives in an xray config.json we can
+# patch idempotently via manage_vless_*_user.sh. These all share the "invalid
+# request user id" failure class when the DB and the node drift: if the user's
+# UUID is in our DB as is_active/warm but missing from the node's config,
+# xray rejects incoming handshakes. The resync pipeline must cover every
+# entry in this set — omitting one is how the original single-protocol
+# resync silently let xhttp/ws_cdn drift.
+_VLESS_FAMILY_PROTOS: frozenset[str] = frozenset({
+    models.VPNConfigProtocol.vless_reality.value,
+    models.VPNConfigProtocol.vless_xhttp.value,
+    models.VPNConfigProtocol.vless_ws_cdn.value,
+})
+
+
+def _node_has_vless_family(node: models.VPNNode) -> bool:
+    """True iff the node serves at least one vless-family protocol.
+
+    Gates the auto-resync after site.yml: nodes that only serve e.g.
+    pure ShadowTLS don't need the resync helper playbook invoked on
+    them (it would be a no-op but the extra ansible run is still wasted
+    time on a success path).
+    """
     for cfg in node.configs:
-        if cfg.is_enabled and cfg.protocol == models.VPNConfigProtocol.vless_reality:
+        if not cfg.is_enabled:
+            continue
+        if cfg.protocol.value in _VLESS_FAMILY_PROTOS:
             return True
     return False
 
@@ -587,20 +610,22 @@ class ProvisioningOrchestrator:
             if success:
                 node.status = models.VPNNodeStatus.active
                 node.last_health_check_at = utcnow()
-                # Auto-trigger a VLESS resync after any successful
-                # node-level site.yml run. The install_vless_reality
-                # role now preserves existing clients across re-renders,
-                # but that only covers the happy path (old config exists
-                # and parses). On first bootstrap or after a manual
-                # wipe, config.json ships empty and previously-active
-                # subs get "invalid request user id" until we re-add
-                # them. The resync is idempotent (manage_vless_user.sh
-                # drops duplicates by email) so running it on every
-                # success is cheap and keeps the node in a known-good
-                # state. Skipped for nodes that don't serve vless.
-                if _node_has_vless_reality(node):
+                # Auto-trigger a vless-family resync after any successful
+                # node-level site.yml run. install_vless_reality has
+                # slurp+re-inject and install_vless_xhttp/ws_cdn now do
+                # too, but that only covers the happy path (old config
+                # exists and parses). On first bootstrap, after a manual
+                # wipe, or when the template re-render raced with the
+                # helper script, previously-active subs get "invalid
+                # request user id" until we re-add them. The resync is
+                # idempotent (manage_vless_*_user.sh drops duplicates by
+                # email) so running it on every success is cheap and
+                # keeps the node in a known-good state. Skipped for
+                # nodes that don't serve any vless-family protocol
+                # (pure ShadowTLS nodes need nothing here).
+                if _node_has_vless_family(node):
                     try:
-                        self.resync_node_vless_clients(node)
+                        self.resync_node_clients(node)
                     except Exception:  # noqa: BLE001
                         logger.exception(
                             "Auto-resync after site.yml failed for node %s",
@@ -704,11 +729,12 @@ class ProvisioningOrchestrator:
                 inventory = build_inventory_for_node(node)
                 if task.action == "resync_vless":
                     # Lightweight follow-up to site.yml: re-add every
-                    # active vless_reality credential via the node's
-                    # manage_vless_user.sh so users survive a config
-                    # re-render or manual /usr/local/etc/xray/config.json
-                    # wipe. Payload is already the full client list,
-                    # built by resync_node_vless_clients().
+                    # known vless-family credential (reality/xhttp/ws_cdn)
+                    # via the node's manage_vless_*_user.sh helpers so
+                    # users survive a config re-render or manual
+                    # /usr/local/etc/xray/config*.json wipe. Payload is
+                    # already the full per-protocol client map, built
+                    # by resync_node_clients().
                     result = run_playbook(
                         "playbooks/resync_node.yml",
                         inventory,
@@ -1017,30 +1043,47 @@ class ProvisioningOrchestrator:
         self.db.refresh(subscription)
         return subscription, task
 
-    def resync_node_vless_clients(
+    def resync_node_clients(
         self, node: models.VPNNode
     ) -> models.ProvisioningTask | None:
-        """Push every active vless_reality credential onto ``node``.
+        """Push every known vless-family client onto ``node``.
 
         Called automatically after a successful node-level site.yml (to
         repair the "empty clients after re-render" class of bugs) and
         exposed via ``POST /api/nodes/{id}/resync`` for manual use.
 
-        Queries all credentials for the node where the owning
-        subscription is still active, parses the UUID out of the
-        encrypted config_text, and enqueues a single resync task that
-        runs ``playbooks/resync_node.yml`` with the full client list.
-        The underlying ``manage_vless_user.sh add`` is idempotent so
-        re-running is safe.
+        Covers every protocol in ``_VLESS_FAMILY_PROTOS``
+        (vless_reality, vless_xhttp, vless_ws_cdn). Each has its own
+        xray config file + ``manage_vless_*_user.sh`` helper and must
+        be resynced independently; the original single-protocol version
+        silently let xhttp/ws_cdn drift after a re-render.
+
+        Client set is the union of:
+
+          * **assigned** credentials — rows tied to an active subscription
+            via ``Subscription.node_id`` (catches both warm-assigned and
+            cold-path legacy rows). Filtered by ``is_active=True`` because
+            revoked bundles shouldn't be re-added to the node.
+          * **warm pool** credentials — pre-provisioned bundles that carry
+            ``Credential.node_id`` but no subscription yet (pool_state=warm,
+            is_active=False). If these drift off the node they stay broken
+            silently until assignment, at which point the user's client
+            gets "invalid request user id" because try_assign_bundle
+            flips is_active in the DB only and never re-runs ansible.
+
+        The underlying ``manage_vless_*_user.sh add`` calls are
+        idempotent, so re-running the resync is safe.
 
         Returns the created task, or ``None`` if nothing to resync.
         """
+        # ── 1. Assigned credentials (via subscription) ─────────────────
+        #
         # Query through Subscription.node_id rather than Credential.node_id
         # — the latter is only populated by the warm pool path; cold-path
         # credentials (pre-stage-2.5, and still the default for legacy
         # subs) have Credential.node_id=NULL and would silently get
         # filtered out. Going via the subscription side catches both.
-        rows = (
+        assigned_rows = (
             self.db.query(models.Credential, models.Device)
             .join(
                 models.Subscription,
@@ -1053,15 +1096,56 @@ class ProvisioningOrchestrator:
             .filter(
                 models.Subscription.node_id == node.id,
                 models.Subscription.status == models.SubscriptionStatus.active,
-                models.Credential.proto == models.VPNConfigProtocol.vless_reality.value,
+                models.Credential.proto.in_(_VLESS_FAMILY_PROTOS),
                 models.Credential.is_active.is_(True),
             )
             .all()
         )
 
-        clients: list[dict[str, str]] = []
-        seen: set[str] = set()
-        for cred, device in rows:
+        # ── 2. Warm pool bundles (not yet assigned) ────────────────────
+        #
+        # These live on the node via Credential.node_id but have
+        # subscription_id=NULL and pool_state=warm. They MUST be kept on
+        # the node even though is_active=False — otherwise the assign
+        # step (which is DB-only, no ansible) hands the user a UUID
+        # that's not in xray's config and the client can't connect.
+        warm_rows = (
+            self.db.query(models.Credential)
+            .filter(
+                models.Credential.node_id == node.id,
+                models.Credential.pool_state == models.CredentialPoolState.warm,
+                models.Credential.subscription_id.is_(None),
+                models.Credential.proto.in_(_VLESS_FAMILY_PROTOS),
+            )
+            .all()
+        )
+
+        # Accumulate per-protocol client lists. Dedup by (proto, username)
+        # because manage_vless_*_user.sh keys on email; the same user
+        # showing up twice is harmless but wasteful.
+        clients_by_proto: dict[str, list[dict[str, str]]] = {
+            proto: [] for proto in _VLESS_FAMILY_PROTOS
+        }
+        seen: set[tuple[str, str]] = set()
+
+        def _emit(cred: models.Credential, username: str | None) -> None:
+            if not username:
+                return
+            key = (cred.proto, username)
+            if key in seen:
+                return
+            user_uuid = _extract_vless_uuid(cred.config_text)
+            if not user_uuid:
+                logger.warning(
+                    "resync: skipping credential %s (no UUID parsed)", cred.id
+                )
+                return
+            clients_by_proto[cred.proto].append(
+                {"username": username, "uuid": user_uuid}
+            )
+            seen.add(key)
+
+        for cred, device in assigned_rows:
             # access_username lives on Device for cold-path rows and on
             # Credential for warm-pool rows — fall back across both so a
             # mixed-vintage node still resyncs cleanly.
@@ -1069,26 +1153,32 @@ class ProvisioningOrchestrator:
                 cred.access_username
                 or (device.access_username if device else None)
             )
-            if not username or username in seen:
-                continue
-            user_uuid = _extract_vless_uuid(cred.config_text)
-            if not user_uuid:
-                logger.warning(
-                    "resync: skipping credential %s (no UUID parsed)", cred.id
-                )
-                continue
-            clients.append({"username": username, "uuid": user_uuid})
-            seen.add(username)
+            _emit(cred, username)
 
-        if not clients:
-            logger.info("resync: no active vless clients on node %s", node.id)
+        for cred in warm_rows:
+            _emit(cred, cred.access_username)
+
+        total = sum(len(v) for v in clients_by_proto.values())
+        if total == 0:
+            logger.info("resync: no vless-family clients on node %s", node.id)
             return None
 
         task = self.create_task(
             "node",
             node.id,
             "resync_vless",
-            {"clients": clients},
+            {
+                # clients_by_proto is the authoritative payload the new
+                # resync_node.yml reads per-protocol. The flat `clients`
+                # list is kept as a backwards-compat shim for any
+                # in-flight task rows enqueued by the previous version
+                # of this method — it carries only the reality subset
+                # because that's what the old playbook expected.
+                "clients_by_proto": clients_by_proto,
+                "clients": clients_by_proto[
+                    models.VPNConfigProtocol.vless_reality.value
+                ],
+            },
         )
         self.db.commit()
         self.run_task_async(task, node=node)

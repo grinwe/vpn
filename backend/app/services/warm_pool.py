@@ -119,11 +119,18 @@ def _build_credential_text(
     password: str,
     user_uuid: str,
 ) -> str | None:
+    # NB: this dispatch MUST cover every protocol that the cold path
+    # (provision_subscription / reprovision_subscription) can build,
+    # otherwise the warm bundle comes out with holes and a later
+    # try_assign_bundle hands the user an incomplete sub-link. The
+    # missing vless_xhttp branch was exactly how xhttp-only users
+    # ended up with empty configs after the warm path kicked in.
     from .provisioning import (
         _build_hysteria2_credential,
         _build_shadowtls_credential,
         _build_vless_reality_credential,
         _build_vless_ws_cdn_credential,
+        _build_vless_xhttp_credential,
     )
 
     if cfg.protocol == models.VPNConfigProtocol.shadowtls_ss:
@@ -132,6 +139,8 @@ def _build_credential_text(
         return _build_vless_reality_credential(node, cfg, user_uuid)
     if cfg.protocol == models.VPNConfigProtocol.vless_ws_cdn:
         return _build_vless_ws_cdn_credential(node, cfg, user_uuid)
+    if cfg.protocol == models.VPNConfigProtocol.vless_xhttp:
+        return _build_vless_xhttp_credential(node, cfg, user_uuid)
     if cfg.protocol == models.VPNConfigProtocol.hysteria2:
         return _build_hysteria2_credential(node, cfg, password)
     logger.warning("warm_pool: unsupported protocol %s on node %s", cfg.protocol, node.id)

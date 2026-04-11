@@ -85,6 +85,45 @@
     _xhttp_cert_path: "{{ vless_xhttp_cert_path }}"
     _xhttp_key_path: "{{ vless_xhttp_key_path }}"
 
+# Preserve clients added dynamically by manage_vless_xhttp_user.sh across
+# re-runs of this role. Without the slurp+re-inject the template's
+# hardcoded ``clients: []`` would wipe every xhttp user on the node on
+# every routine site.yml run — the xhttp and ws_cdn variants are exactly
+# where the "invalid request user id" bug was reproducible, because the
+# original role had no preservation logic at all.
+- name: Check for existing xray xhttp config
+  stat:
+    path: /usr/local/etc/xray/config_xhttp.json
+  register: vless_xhttp_existing_config
+
+- name: Slurp existing xray xhttp config
+  slurp:
+    src: /usr/local/etc/xray/config_xhttp.json
+  register: vless_xhttp_existing_config_raw
+  when: vless_xhttp_existing_config.stat.exists
+
+- name: Extract existing vless-xhttp clients
+  set_fact:
+    vless_xhttp_existing_clients: >-
+      {{
+        (vless_xhttp_existing_config_raw.content | b64decode | from_json).inbounds
+        | selectattr('tag', 'equalto', 'vless-xhttp')
+        | map(attribute='settings.clients')
+        | list
+        | first
+        | default([])
+      }}
+  when: vless_xhttp_existing_config.stat.exists
+  # If the existing file is unparseable (half-written, truncated) we'd
+  # rather fall through to an empty list than abort the whole play —
+  # the backend resync path will re-add users after the render anyway.
+  ignore_errors: true
+
+- name: Default to empty xhttp clients list on first bootstrap
+  set_fact:
+    vless_xhttp_existing_clients: []
+  when: vless_xhttp_existing_clients is not defined
+
 - name: Render xray XHTTP config
   template:
     src: config_xhttp.json.j2

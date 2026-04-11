@@ -44,7 +44,7 @@
       "port": {{ vless_ws_cdn_port | int }},
       "protocol": "vless",
       "settings": {
-        "clients": [],
+        "clients": {{ vless_ws_cdn_existing_clients | default([]) | to_json }},
         "decryption": "none"
       },
       "streamSettings": {

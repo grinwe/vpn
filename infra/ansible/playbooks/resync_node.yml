@@ -1,48 +1,100 @@
 ---
 # resync_node.yml
 #
-# Re-apply a full set of VLESS+Reality clients to an existing node.
+# Re-apply a full set of vless-family clients to an existing node.
 #
-# Context: the install_vless_reality role now preserves clients across
+# Context: the install_vless_* roles now preserve clients across
 # re-renders (slurp + re-inject), but that only works if the previous
-# /usr/local/etc/xray/config.json exists and is parseable. On a fresh
+# /usr/local/etc/xray/config*.json exists and is parseable. On a fresh
 # bootstrap, or after an operator manually wiped the file, the rendered
 # config is empty and every previously-provisioned user gets kicked
-# with "invalid request user id" until someone re-adds them.
+# with "invalid request user id" until someone re-adds them. Same
+# thing happens when a template re-render races the per-user
+# manage_vless_*_user.sh script and overwrites a client that was
+# added in the same tick.
 #
 # This playbook is the "re-add" step. Backend calls it from
-# ProvisioningOrchestrator.resync_node_vless_clients() with payload:
+# ProvisioningOrchestrator.resync_node_clients() with payload:
 #
-#   clients: [ {username: <email>, uuid: <uuid>}, ... ]
+#   clients_by_proto:
+#     vless-reality: [ {username, uuid}, ... ]
+#     vless-xhttp:   [ {username, uuid}, ... ]
+#     vless-ws-cdn:  [ {username, uuid}, ... ]
 #
-# It loops manage_vless_user.sh add for each entry — the script is
-# idempotent (drops any existing entry with the same email before
-# re-appending) so running this twice is safe.
+#   clients: [ ... ]   # backwards-compat flat list (reality only) for
+#                     # any in-flight tasks enqueued before the rewrite
+#
+# Each protocol has its own config file + manage_vless_*_user.sh helper
+# and must be resynced independently. The helpers are idempotent (drop
+# any existing entry with the same email before re-appending) so
+# running this twice is safe.
 - hosts: vpn_nodes
   become: yes
   vars:
+    clients_by_proto: {}
     clients: []
+    # Legacy flat `clients` list is treated as vless-reality for
+    # backwards-compat with tasks enqueued by the old backend code.
+    _reality_clients: >-
+      {{ clients_by_proto.get('vless-reality', clients) }}
+    _xhttp_clients: >-
+      {{ clients_by_proto.get('vless-xhttp', []) }}
+    _ws_cdn_clients: >-
+      {{ clients_by_proto.get('vless-ws-cdn', []) }}
   tasks:
-    - name: Ensure VLESS Reality manage script exists
+    # ---- VLESS+Reality branch ------------------------------------
+    - name: Stat VLESS Reality manage script
       stat:
         path: /usr/local/sbin/manage_vless_user.sh
-      register: vless_manage_script
-
-    - name: Fail if manage script is missing
-      fail:
-        msg: >-
-          manage_vless_user.sh not found on {{ inventory_hostname }}.
-          Run the install_vless_reality role first (site.yml).
-      when: not vless_manage_script.stat.exists
+      register: vless_reality_manage_script
 
     - name: Resync VLESS+Reality clients
       command: >-
         /usr/local/sbin/manage_vless_user.sh add {{ item.username }} {{ item.uuid }}
-      loop: "{{ clients }}"
+      loop: "{{ _reality_clients }}"
       loop_control:
         label: "{{ item.username }}"
-      when: clients | length > 0
+      when:
+        - vless_reality_manage_script.stat.exists
+        - _reality_clients | length > 0
 
+    # ---- VLESS+XHTTP branch --------------------------------------
+    - name: Stat VLESS XHTTP manage script
+      stat:
+        path: /usr/local/sbin/manage_vless_xhttp_user.sh
+      register: vless_xhttp_manage_script
+
+    - name: Resync VLESS+XHTTP clients
+      command: >-
+        /usr/local/sbin/manage_vless_xhttp_user.sh add {{ item.username }} {{ item.uuid }}
+      loop: "{{ _xhttp_clients }}"
+      loop_control:
+        label: "{{ item.username }}"
+      when:
+        - vless_xhttp_manage_script.stat.exists
+        - _xhttp_clients | length > 0
+
+    # ---- VLESS+WS+CDN branch -------------------------------------
+    - name: Stat VLESS WS+CDN manage script
+      stat:
+        path: /usr/local/sbin/manage_vless_ws_user.sh
+      register: vless_ws_manage_script
+
+    - name: Resync VLESS+WS+CDN clients
+      command: >-
+        /usr/local/sbin/manage_vless_ws_user.sh add {{ item.username }} {{ item.uuid }}
+      loop: "{{ _ws_cdn_clients }}"
+      loop_control:
+        label: "{{ item.username }}"
+      when:
+        - vless_ws_manage_script.stat.exists
+        - _ws_cdn_clients | length > 0
+
+    # ---- Log -----------------------------------------------------
     - name: Log resync payload
       debug:
-        msg: "Resynced {{ clients | length }} vless client(s) on {{ inventory_hostname }}"
+        msg: >-
+          Resynced on {{ inventory_hostname }}:
+          reality={{ _reality_clients | length }}
+          xhttp={{ _xhttp_clients | length }}
+          ws_cdn={{ _ws_cdn_clients | length }}

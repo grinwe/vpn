@@ -44,7 +44,7 @@
       "port": {{ vless_xhttp_port | int }},
       "protocol": "vless",
       "settings": {
-        "clients": [],
+        "clients": {{ vless_xhttp_existing_clients | default([]) | to_json }},
         "decryption": "none"
       },
       "streamSettings": {

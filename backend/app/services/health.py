@@ -182,7 +182,11 @@ def migrate_subscriptions_off(
     surfaces ``task_ids`` so the UI can render a grouped progress
     banner for the batch.
     """
-    from .provisioning import ProvisioningOrchestrator, choose_node
+    from .provisioning import (
+        ProvisioningOrchestrator,
+        _node_has_vless_family,
+        choose_node,
+    )
 
     subs: Iterable[models.Subscription] = (
         db.query(models.Subscription)
@@ -269,19 +273,16 @@ def migrate_subscriptions_off(
     # node's config.json is in a degraded state (partial wipe, stale
     # cache, race with another provisioning task on the same node) the
     # resync re-pushes the full authoritative client list via
-    # manage_vless_user.sh. Idempotent, so re-running after the
-    # individual applies is safe and costs one extra ansible run per
-    # target node — cheap vs. hunting down flakiness.
+    # manage_vless_*_user.sh. Covers every vless-family protocol
+    # (reality / xhttp / ws_cdn) in one shot. Idempotent, so re-running
+    # after the individual applies is safe and costs one extra ansible
+    # run per target node — cheap vs. hunting down flakiness.
     resync_task_ids: list[int] = []
     for target_node in resync_targets.values():
         try:
-            if not any(
-                cfg.is_enabled
-                and cfg.protocol == models.VPNConfigProtocol.vless_reality
-                for cfg in target_node.configs
-            ):
+            if not _node_has_vless_family(target_node):
                 continue
-            resync_task = orchestrator.resync_node_vless_clients(target_node)
+            resync_task = orchestrator.resync_node_clients(target_node)
             if resync_task is not None:
                 resync_task_ids.append(resync_task.id)
         except Exception:  # noqa: BLE001

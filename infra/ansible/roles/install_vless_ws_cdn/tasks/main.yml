@@ -58,6 +58,45 @@
     group: root
     mode: '0750'
 
+# Preserve clients added dynamically by manage_vless_ws_user.sh across
+# re-runs of this role. Without the slurp+re-inject the template's
+# hardcoded ``clients: []`` would wipe every ws-cdn user on the node on
+# every routine site.yml run — the xhttp and ws_cdn variants are exactly
+# where the "invalid request user id" bug was reproducible, because the
+# original role had no preservation logic at all.
+- name: Check for existing xray ws-cdn config
+  stat:
+    path: /usr/local/etc/xray/config_ws_cdn.json
+  register: vless_ws_cdn_existing_config
+
+- name: Slurp existing xray ws-cdn config
+  slurp:
+    src: /usr/local/etc/xray/config_ws_cdn.json
+  register: vless_ws_cdn_existing_config_raw
+  when: vless_ws_cdn_existing_config.stat.exists
+
+- name: Extract existing vless-ws-cdn clients
+  set_fact:
+    vless_ws_cdn_existing_clients: >-
+      {{
+        (vless_ws_cdn_existing_config_raw.content | b64decode | from_json).inbounds
+        | selectattr('tag', 'equalto', 'vless-ws-cdn')
+        | map(attribute='settings.clients')
+        | list
+        | first
+        | default([])
+      }}
+  when: vless_ws_cdn_existing_config.stat.exists
+  # If the existing file is unparseable (half-written, truncated) we'd
+  # rather fall through to an empty list than abort the whole play —
+  # the backend resync path will re-add users after the render anyway.
+  ignore_errors: true
+
+- name: Default to empty ws-cdn clients list on first bootstrap
+  set_fact:
+    vless_ws_cdn_existing_clients: []
+  when: vless_ws_cdn_existing_clients is not defined
+
 - name: Render xray WS+CDN config
   template:
     src: config_ws_cdn.json.j2
