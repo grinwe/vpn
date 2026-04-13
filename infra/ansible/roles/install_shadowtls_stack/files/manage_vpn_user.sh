@@ -21,10 +21,6 @@
 #   log each call to /var/log/shadowtls-users.log so operators have
 #   a trail of who was granted access at the node level.
 #
-# v2 ROADMAP:
-#   Switch to SS2022 EIH multi-user, append users to ssserver.json
-#   here, and reload ss-rust. Until then this script is intentionally
-#   stateless.
 #
 set -euo pipefail
 

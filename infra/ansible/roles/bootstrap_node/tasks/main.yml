@@ -19,6 +19,14 @@
     state: present
   loop: "{{ ssh_public_keys | default([]) }}"
 
+- name: Wait for unattended-upgrades to finish
+  shell: >-
+    while fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1; do
+      sleep 5;
+    done
+  changed_when: false
+  timeout: 300
+
 - name: Install base packages
   apt:
     name:
@@ -80,6 +88,7 @@
     owner: nobody
     group: nogroup
     mode: '0750'
+    recurse: yes
 
 - name: Install xray access log rotation
   copy:

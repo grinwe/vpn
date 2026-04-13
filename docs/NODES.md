@@ -12,7 +12,7 @@
 | `active` | Bootstrap прошёл, ansible отработал, ноду можно ассайнить | worker при успехе `site.yml` |
 | `error` | Bootstrap упал — нужно смотреть `ProvisioningTask.stderr` | worker при фейле |
 | `disabled` | Админ временно вывел из ротации, на existing subs не влияет | Admin UI |
-| `draining` | Идёт миграция подписок на другие ноды, после completion VM удаляется | Downscale drain tick ([ROADMAP_WEBAPP этап 5](ROADMAP_WEBAPP.md)) |
+| `draining` | Идёт миграция подписок на другие ноды, после completion VM удаляется | Downscale drain tick |
 
 Флаги `is_active: bool` — master-switch поверх статуса. `False` выключает ноду из любых выборов (warm pool, choose_node для покупок, health migration target) независимо от status. Переключается из Admin UI кнопкой **исключить** / **вернуть в пул** (см. [§ Admin actions](#admin-actions)) или напрямую через `POST /api/nodes/{id}/active {is_active: bool}`. Существующие подписки на исключённой ноде **продолжают работать** — нода выпадает только из будущих назначений.
 
@@ -33,12 +33,13 @@
 
 По состоянию на April 2026 (см. таблицу TSPU status в [README.md](../README.md#supported-protocols)):
 
-1. **Primary: ShadowTLS+Shadowsocks** — самый устойчивый против DPI на данный момент, живёт везде, включая мобильные операторы. Бэкенд по умолчанию предпочитает его при выдаче конфига (см. `provisioning.py:557, 706, 833` — hard-coded lookups `next(c for c in bundle if c.proto == shadowtls_ss)`).
-2. **Fallback 1: VLESS Reality** на нестандартном high port (9443+, ещё лучше 47000+). Под активной атакой TSPU, но на high-port пока работает.
-3. **Fallback 2: Hysteria2** — UDP/QUIC. На мобильных нестабилен (пакет-лосс режет соединение), на broadband отлично.
-4. **Fallback 3: VLESS+WS+CDN** — через Cloudflare. Работает, пока CF IP'шники в whitelist'е, но это moving target и каждая нода требует отдельного domain-setup'а.
+1. **Primary: VLESS Reality** — основной протокол, per-user isolation + sharing enforcer. Порт 9443 (или high-port 47000+).
+2. **VLESS XHTTP** — основной TCP-протокол, обход 16KB curtain ТСПУ.
+3. **Fallback: Hysteria2** — UDP/QUIC. На мобильных нестабилен (пакет-лосс режет соединение), на broadband отлично.
+4. **Fallback: VLESS+WS+CDN** — через Cloudflare. Работает, пока CF IP'шники в whitelist'е, но это moving target и каждая нода требует отдельного domain-setup'а.
+5. **Legacy: ShadowTLS+Shadowsocks** — нет per-user isolation (общий пароль на ноду), sharing enforcer не покрывает.
 
-**Минимум на каждой ноде:** shadowtls+ss. Остальные — по потребности/региону.
+**Минимум на каждой ноде:** vless-reality. Остальные — по потребности/региону.
 
 ## Config selection (code truth)
 
@@ -69,7 +70,7 @@ return configs[0]
 - **Upscale**: при `utilization > AUTOSCALE_HIGH_WATERMARK` — bootstrap новой ноды через провайдер API (Hetzner и т.д.)
 - **Downscale** (опционально, `AUTOSCALE_DOWNSCALE_ENABLED=1`): при `utilization < AUTOSCALE_LOW_WATERMARK` — флип младшей auto-spawned ноды в `draining`, миграция подписок, destroy VM через `AUTOSCALE_DRAIN_GRACE_HOURS`.
 
-См. [ROADMAP_WEBAPP этап 5](ROADMAP_WEBAPP.md) для подробностей и env vars в [README.md](../README.md#environment-variables).
+Env vars — см. [README.md](../README.md#environment-variables).
 
 ## Health monitoring
 
@@ -125,7 +126,7 @@ Probe-agent ([probes/](../probes)) бежит из нескольких реги
 | Симптом | Чекпоинт |
 |---------|----------|
 | Нода в `error` сразу после создания | `docker compose logs worker --tail 200` — ищи ansible traceback. 90% случаев: pub-key не в `authorized_keys`, или `PROVISIONING_SSH_KEY` монтирован в `/dev/null`. |
-| Нода в `active`, но новые подписки не выдаются | Проверь, что у ноды есть **enabled** `shadowtls+shadowsocks` конфиг — провижининг hard-code'ит его lookup в трёх местах. |
+| Нода в `active`, но новые подписки не выдаются | Проверь, что у ноды есть **enabled** `vless-reality` конфиг — это основной протокол. |
 | `/api/nodes` даёт 500 | Недавно ловили такой случай: Pydantic v2 + `from_orm()` без `from_attributes=True` в schema config. Если появится снова — см. [backend/app/schemas.py](../backend/app/schemas.py) на предмет новых `class Config: orm_mode = True`. |
 | Health score на 100, но юзеры жалуются | Probe-agent, возможно, бежит только из здорового региона. Проверь `health_probes.region` distribution — нужны probes из RU/KZ, чтобы ловить TSPU-блоки. |
 | Warm pool не наполняется после добавления конфига | Это by design: при смене набора протоколов на ноде warm-bundles инвалидируются (`invalidate_node_warm_pool`), warmer'у нужно несколько тиков, чтобы пересобрать. Проверь `vpn_warm_pool_depth{node="..."}` в Grafana. |

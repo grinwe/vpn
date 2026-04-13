@@ -11,9 +11,15 @@ Restart=always
 RestartSec=5
 
 Environment=ENFORCER_CHECK_INTERVAL={{ enforcer_check_interval | default(10) }}
-Environment=ENFORCER_WINDOW_SECONDS={{ enforcer_window_seconds | default(120) }}
+Environment=ENFORCER_WINDOW_SECONDS={{ enforcer_window_seconds | default(300) }}
 Environment=ENFORCER_MAX_IPS={{ enforcer_max_ips | default(1) }}
 Environment=ENFORCER_RECONNECT_DELAY={{ enforcer_reconnect_delay | default(2) }}
+Environment=ENFORCER_SLOT_SECONDS={{ enforcer_slot_seconds | default(120) }}
+Environment=ENFORCER_WARNING_THRESHOLD={{ enforcer_warning_threshold | default(3) }}
+Environment=ENFORCER_WARNING_WINDOW={{ enforcer_warning_window | default(3600) }}
+Environment=ENFORCER_KICK_COOLDOWN={{ enforcer_kick_cooldown | default(120) }}
+Environment=ENFORCER_BLOCK_THRESHOLD={{ enforcer_block_threshold | default(3) }}
+Environment=ENFORCER_BLOCK_WINDOW={{ enforcer_block_window | default(43200) }}
 
 # Logging goes to journald
 StandardOutput=journal

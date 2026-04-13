@@ -209,8 +209,15 @@ def run_drain_tick() -> dict:
 
 
 def run_renewal_check() -> dict:
-    """Periodic job — find subscriptions expiring within 3 days and create
-    renewal invoices + notify users. Also expire overdue subscriptions.
+    """Periodic job — find subscriptions expiring within 3 days / 1 day
+    and create renewal invoices + notify users. Also expire overdue subs.
+
+    Two reminder horizons:
+      - 3 days: ``renewal_reminder`` / ``expiry_reminder`` (first nudge)
+      - 1 day:  ``renewal_reminder_1d`` / ``expiry_reminder_1d`` (urgent)
+
+    Respects ``User.notify_renewals`` — users who opted out receive no
+    renewal/expiry notifications at all.
 
     Returns summary stats for the RQ result backend.
     """
@@ -223,16 +230,14 @@ def run_renewal_check() -> dict:
     from .time_utils import utcnow
 
     session = SessionLocal()
-    stats = {"reminded": 0, "expired": 0, "revoked": 0, "errors": 0}
+    stats = {"reminded": 0, "reminded_1d": 0, "expired": 0, "revoked": 0, "errors": 0}
     try:
         now = utcnow()
         remind_horizon = now + timedelta(days=3)
+        remind_horizon_1d = now + timedelta(days=1)
         revoke_cutoff = now - timedelta(hours=RENEWAL_GRACE_HOURS)
 
         # ── Mark overdue subscriptions as expired (status flip only). ──
-        # The /sub/{token} endpoint already 403s on expired+blocked, so the
-        # client stops getting fresh configs immediately. The hard revoke
-        # below kicks in after the grace window.
         overdue = (
             session.query(models.Subscription)
             .filter(
@@ -259,8 +264,6 @@ def run_renewal_check() -> dict:
         if to_revoke:
             orch = ProvisioningOrchestrator(session)
             for sub in to_revoke:
-                # Skip if all devices are already disabled — re-runs are
-                # cheap but Ansible noise on a thousand-sub backlog isn't.
                 live = [
                     d for d in sub.devices
                     if d.status not in (
@@ -279,7 +282,7 @@ def run_renewal_check() -> dict:
                     logger.exception("Failed to revoke expired sub %s", sub.id)
                     stats["errors"] += 1
 
-        # ── Create renewal invoices for auto_renew subscriptions ──
+        # ── Create renewal invoices for auto_renew subscriptions (3-day) ──
         expiring_soon = (
             session.query(models.Subscription)
             .filter(
@@ -291,7 +294,6 @@ def run_renewal_check() -> dict:
             .all()
         )
         for sub in expiring_soon:
-            # Check if a pending renewal invoice already exists
             existing = (
                 session.query(models.Invoice)
                 .filter(
@@ -317,9 +319,8 @@ def run_renewal_check() -> dict:
             session.add(invoice)
             session.flush()
 
-            # Store notification marker in a lightweight way
             user = session.get(models.User, sub.user_id)
-            if user and user.telegram_id:
+            if user and user.telegram_id and user.notify_renewals:
                 log = models.AuditLog(
                     actor="system",
                     actor_type=models.AuditActor.system,
@@ -336,7 +337,48 @@ def run_renewal_check() -> dict:
             stats["reminded"] += 1
         session.commit()
 
-        # ── Remind non-auto-renew users about expiration ──
+        # ── 1-day urgent reminder for auto_renew subs ──
+        expiring_1d = (
+            session.query(models.Subscription)
+            .filter(
+                models.Subscription.status == models.SubscriptionStatus.active,
+                models.Subscription.auto_renew.is_(True),
+                models.Subscription.expires_at <= remind_horizon_1d,
+                models.Subscription.expires_at > now,
+            )
+            .all()
+        )
+        for sub in expiring_1d:
+            user = session.get(models.User, sub.user_id)
+            if not user or not user.telegram_id or not user.notify_renewals:
+                continue
+            existing_log = (
+                session.query(models.AuditLog)
+                .filter(
+                    models.AuditLog.action == "renewal_reminder_1d",
+                    models.AuditLog.target_type == "subscription",
+                    models.AuditLog.target_id == sub.id,
+                )
+                .first()
+            )
+            if existing_log:
+                continue
+            session.add(models.AuditLog(
+                actor="system",
+                actor_type=models.AuditActor.system,
+                action="renewal_reminder_1d",
+                target_type="subscription",
+                target_id=sub.id,
+                extra={
+                    "telegram_id": user.telegram_id,
+                    "subscription_id": sub.id,
+                    "expires_at": sub.expires_at.isoformat(),
+                },
+            ))
+            stats["reminded_1d"] += 1
+        session.commit()
+
+        # ── Remind non-auto-renew users about expiration (3-day) ──
         expiring_manual = (
             session.query(models.Subscription)
             .filter(
@@ -349,32 +391,72 @@ def run_renewal_check() -> dict:
         )
         for sub in expiring_manual:
             user = session.get(models.User, sub.user_id)
-            if user and user.telegram_id:
-                # Check if we already sent a reminder
-                existing_log = (
-                    session.query(models.AuditLog)
-                    .filter(
-                        models.AuditLog.action == "expiry_reminder",
-                        models.AuditLog.target_type == "subscription",
-                        models.AuditLog.target_id == sub.id,
-                    )
-                    .first()
+            if not user or not user.telegram_id or not user.notify_renewals:
+                continue
+            existing_log = (
+                session.query(models.AuditLog)
+                .filter(
+                    models.AuditLog.action == "expiry_reminder",
+                    models.AuditLog.target_type == "subscription",
+                    models.AuditLog.target_id == sub.id,
                 )
-                if existing_log:
-                    continue
-                log = models.AuditLog(
-                    actor="system",
-                    actor_type=models.AuditActor.system,
-                    action="expiry_reminder",
-                    target_type="subscription",
-                    target_id=sub.id,
-                    extra={
-                        "telegram_id": user.telegram_id,
-                        "subscription_id": sub.id,
-                        "expires_at": sub.expires_at.isoformat(),
-                    },
+                .first()
+            )
+            if existing_log:
+                continue
+            session.add(models.AuditLog(
+                actor="system",
+                actor_type=models.AuditActor.system,
+                action="expiry_reminder",
+                target_type="subscription",
+                target_id=sub.id,
+                extra={
+                    "telegram_id": user.telegram_id,
+                    "subscription_id": sub.id,
+                    "expires_at": sub.expires_at.isoformat(),
+                },
+            ))
+        session.commit()
+
+        # ── 1-day urgent reminder for non-auto-renew subs ──
+        expiring_manual_1d = (
+            session.query(models.Subscription)
+            .filter(
+                models.Subscription.status == models.SubscriptionStatus.active,
+                models.Subscription.auto_renew.is_(False),
+                models.Subscription.expires_at <= remind_horizon_1d,
+                models.Subscription.expires_at > now,
+            )
+            .all()
+        )
+        for sub in expiring_manual_1d:
+            user = session.get(models.User, sub.user_id)
+            if not user or not user.telegram_id or not user.notify_renewals:
+                continue
+            existing_log = (
+                session.query(models.AuditLog)
+                .filter(
+                    models.AuditLog.action == "expiry_reminder_1d",
+                    models.AuditLog.target_type == "subscription",
+                    models.AuditLog.target_id == sub.id,
                 )
-                session.add(log)
+                .first()
+            )
+            if existing_log:
+                continue
+            session.add(models.AuditLog(
+                actor="system",
+                actor_type=models.AuditActor.system,
+                action="expiry_reminder_1d",
+                target_type="subscription",
+                target_id=sub.id,
+                extra={
+                    "telegram_id": user.telegram_id,
+                    "subscription_id": sub.id,
+                    "expires_at": sub.expires_at.isoformat(),
+                },
+            ))
+            stats["reminded_1d"] += 1
         session.commit()
 
         RENEWAL_RUNS.labels(outcome="ok").inc()
@@ -466,10 +548,12 @@ def _maybe_emit_low_balance_warning(session, sub) -> None:
     if not plan:
         return
     user = sub.user
-    if not user or not user.telegram_id:
+    if not user or not user.telegram_id or not user.notify_renewals:
         return
 
-    price = balance_svc.plan_price_kopecks(plan)
+    base_price = balance_svc.plan_price_kopecks(plan)
+    extra_slots = sub.extra_device_slots or 0
+    price = base_price + extra_slots * balance_svc.EXTRA_DEVICE_MONTHLY_KOPECKS
     if price <= 0:
         return
     wallet = user.balance_kopecks or 0
@@ -863,6 +947,11 @@ def run_user_health_ping_tick() -> dict:
     batch = int(os.getenv("USER_HEALTH_PING_BATCH", "50"))
     debounce_hours = int(os.getenv("USER_HEALTH_PING_DEBOUNCE_HOURS", "24"))
 
+    # Only send health pings during MSK lunch window (11:00–14:00)
+    # to avoid waking users at night. Configurable via env.
+    ping_hour_start = int(os.getenv("HEALTH_PING_HOUR_START", "11"))
+    ping_hour_end = int(os.getenv("HEALTH_PING_HOUR_END", "14"))
+
     summary = {"queued": 0, "skipped": 0}
     session = SessionLocal()
     try:
@@ -870,6 +959,17 @@ def run_user_health_ping_tick() -> dict:
             return summary
 
         now = utcnow()
+
+        # MSK = UTC+3. Check current hour in MSK.
+        msk_hour = (now.hour + 3) % 24
+        if not (ping_hour_start <= msk_hour < ping_hour_end):
+            logger.debug(
+                "user_health_ping: outside MSK window (%02d:00–%02d:00), "
+                "current MSK hour=%02d — skipping",
+                ping_hour_start, ping_hour_end, msk_hour,
+            )
+            return summary
+
         debounce_cutoff = now - timedelta(hours=debounce_hours)
 
         # Pick users who:

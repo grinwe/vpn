@@ -101,12 +101,15 @@ def dynamic_sub_link(token: str, db: Session = Depends(get_db)):
 
         uris = "\n".join(c.uri for c in configs)
         encoded = base64.b64encode(uris.encode()).decode()
+        title = "V8-VPN"
         return PlainTextResponse(
             content=encoded,
             media_type="text/plain",
             headers={
                 "subscription-userinfo": f"expire={int(sub.expires_at.timestamp())}",
                 "profile-update-interval": "6",
+                "profile-title": title,
+                "content-disposition": f'attachment; filename="{title}"',
             },
         )
 
@@ -149,12 +152,15 @@ def dynamic_sub_link(token: str, db: Session = Depends(get_db)):
     )
     db.commit()
 
+    title = "V8-VPN"
     return PlainTextResponse(
         content=encoded,
         media_type="text/plain",
         headers={
             "subscription-userinfo": f"expire={int(sub.expires_at.timestamp())}",
             "profile-update-interval": "6",
+            "profile-title": title,
+            "content-disposition": f'attachment; filename="{title}"',
         },
     )
 
@@ -417,8 +423,11 @@ def get_pending_notifications(
     health-triggered migrations) and stored in AuditLog with special actions.
     """
     notif_actions = [
-        "renewal_reminder", "expiry_reminder", "config_ready", "migration_notice",
+        "renewal_reminder", "expiry_reminder",
+        "renewal_reminder_1d", "expiry_reminder_1d",
+        "config_ready", "migration_notice",
         "low_balance_warning", "trial_expiry_warning", "health_ping_request",
+        "sharing_warning", "sharing_kick", "sharing_block",
     ]
     logs = (
         db.query(models.AuditLog)
@@ -440,15 +449,27 @@ def get_pending_notifications(
 
         if log.action == "renewal_reminder":
             text = (
-                "⏰ Подписка истекает скоро!\n"
+                "⏰ Подписка истекает через 3 дня!\n"
                 f"Дата: {extra.get('expires_at', '?')[:10]}\n"
-                "Используй /renew для продления."
+                "Пополни баланс, чтобы автопродление сработало."
+            )
+        elif log.action == "renewal_reminder_1d":
+            text = (
+                "🚨 Подписка истекает завтра!\n"
+                f"Дата: {extra.get('expires_at', '?')[:10]}\n"
+                "Пополни баланс сейчас — иначе подписка отключится."
             )
         elif log.action == "expiry_reminder":
             text = (
-                "⚠️ Твоя подписка скоро истекает.\n"
+                "⚠️ Твоя подписка истекает через 3 дня.\n"
                 f"Дата: {extra.get('expires_at', '?')[:10]}\n"
-                "Используй /renew или /plans."
+                "Используй /renew или /plans для продления."
+            )
+        elif log.action == "expiry_reminder_1d":
+            text = (
+                "🚨 Подписка истекает завтра!\n"
+                f"Дата: {extra.get('expires_at', '?')[:10]}\n"
+                "Продли сейчас через /renew, иначе VPN отключится."
             )
         elif log.action == "config_ready":
             text = (
@@ -475,16 +496,40 @@ def get_pending_notifications(
                 "реферальные 50 ₽ (если есть) остаются при тебе."
             )
         elif log.action == "health_ping_request":
-            # Phase C — friendly framing matters. People hate "наш бот
-            # хочет тебя опросить" but tolerate "помоги нам бороться с
-            # блокировками". The opt-out button on the message itself
-            # is the safety valve.
             text = (
                 "🛟 Помогите нам улучшить сервис!\n\n"
-                "Мы боремся с блокировками — подскажите, как сейчас "
-                "работает VPN на вашем устройстве? Это займёт одну "
-                "секунду и поможет нам быстрее ловить проблемы.\n\n"
+                "Подскажите, как сейчас работает VPN на вашем "
+                "устройстве? Это займёт одну секунду и поможет нам "
+                "быстрее находить и устранять проблемы.\n\n"
                 "Спасибо, что вы с нами! 💛"
+            )
+        elif log.action == "sharing_warning":
+            text = (
+                "Привет! 👋 Мы заметили, что к твоему аккаунту "
+                "подключаются с нескольких устройств одновременно. "
+                "Напоминаем, что передача конфигурации другим людям "
+                "запрещена правилами сервиса — это влияет на качество "
+                "и скорость для всех пользователей. Если это ошибка — "
+                "просто проигнорируй это сообщение."
+            )
+        elif log.action == "sharing_kick":
+            text = (
+                "Привет! Нам очень жаль, но мы снова зафиксировали "
+                "одновременное подключение к твоему аккаунту с нескольких "
+                "устройств. Соединение было временно разорвано. Передача "
+                "конфигурации снижает качество сервиса для всех, поэтому "
+                "мы вынуждены реагировать. Пожалуйста, убедись, что "
+                "конфигурацию используешь только ты."
+            )
+        elif log.action == "sharing_block":
+            text = (
+                "Привет 😔 Нам очень жаль, но мы вынуждены временно "
+                "заблокировать доступ к VPN — мы зафиксировали "
+                "систематическое использование аккаунта с нескольких "
+                "устройств. Это негативно влияет на качество услуги "
+                "для других пользователей, поэтому мы не можем это "
+                "игнорировать. Напиши в поддержку — мы разберёмся "
+                "и поможем восстановить доступ."
             )
         else:
             continue
@@ -595,6 +640,81 @@ def opt_out_health_ping(
     )
     db.commit()
     return {"ok": True, "opted_out": True}
+
+
+# ── Per-user notification preferences ──
+
+class NotificationPrefsRequest(BaseModel):
+    telegram_id: str
+    notify_renewals: bool | None = None
+    notify_migrations: bool | None = None
+    health_ping_opt_out: bool | None = None
+
+
+class NotificationPrefsOut(BaseModel):
+    notify_renewals: bool
+    notify_migrations: bool
+    health_ping_opt_out: bool
+
+
+@ext_router.get("/users/notification-prefs")
+def get_notification_prefs(
+    telegram_id: str,
+    db: Session = Depends(get_db),
+    admin_token: str = Depends(require_admin),
+):
+    """Return current notification preferences for a user."""
+    user = db.query(models.User).filter_by(telegram_id=telegram_id).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    return NotificationPrefsOut(
+        notify_renewals=user.notify_renewals,
+        notify_migrations=user.notify_migrations,
+        health_ping_opt_out=user.health_ping_opt_out,
+    )
+
+
+@ext_router.post("/users/notification-prefs")
+def update_notification_prefs(
+    body: NotificationPrefsRequest,
+    db: Session = Depends(get_db),
+    admin_token: str = Depends(require_admin),
+):
+    """Update notification preferences. Only provided fields are changed."""
+    user = db.query(models.User).filter_by(telegram_id=body.telegram_id).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    changed: dict[str, bool] = {}
+    if body.notify_renewals is not None:
+        user.notify_renewals = body.notify_renewals
+        changed["notify_renewals"] = body.notify_renewals
+    if body.notify_migrations is not None:
+        user.notify_migrations = body.notify_migrations
+        changed["notify_migrations"] = body.notify_migrations
+    if body.health_ping_opt_out is not None:
+        user.health_ping_opt_out = body.health_ping_opt_out
+        changed["health_ping_opt_out"] = body.health_ping_opt_out
+
+    if changed:
+        db.add(user)
+        db.add(
+            models.AuditLog(
+                actor=str(user.id),
+                actor_type=models.AuditActor.user,
+                action="notification_prefs_updated",
+                target_type="user",
+                target_id=user.id,
+                extra={"telegram_id": body.telegram_id, **changed},
+            )
+        )
+        db.commit()
+
+    return NotificationPrefsOut(
+        notify_renewals=user.notify_renewals,
+        notify_migrations=user.notify_migrations,
+        health_ping_opt_out=user.health_ping_opt_out,
+    )
 
 
 @ext_router.post("/notifications/{notif_id}/ack")

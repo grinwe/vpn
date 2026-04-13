@@ -14,22 +14,18 @@ WEBAPP_BASE_URL = os.getenv("WEBAPP_BASE_URL", "").rstrip("/")
 # strings between files.
 BTN_MAIN_MENU = "🏠 Главное меню"
 BTN_BUY = "💎 Подписка"
+BTN_TOPUP = "💳 Пополнить"
 BTN_INVITE = "🤝 Пригласить"
 BTN_HELP = "❓ Помощь"
 
 
 def start_keyboard() -> types.ReplyKeyboardMarkup:
-    """Minimal always-on reply keyboard: menu, invite, help.
-
-    The old «Купить VPN / Мой конфиг / Статус / Продлить» buttons
-    duplicated functionality now handled by the WebApp and the slash
-    command menu, so they're gone. These three are the only entry
-    points users need to see at all times.
-    """
+    """Always-on reply keyboard at the bottom of the chat."""
     return types.ReplyKeyboardMarkup(
         keyboard=[
             [types.KeyboardButton(text=BTN_MAIN_MENU), types.KeyboardButton(text=BTN_BUY)],
-            [types.KeyboardButton(text=BTN_INVITE), types.KeyboardButton(text=BTN_HELP)],
+            [types.KeyboardButton(text=BTN_TOPUP), types.KeyboardButton(text=BTN_INVITE)],
+            [types.KeyboardButton(text=BTN_HELP)],
         ],
         resize_keyboard=True,
     )
@@ -45,6 +41,7 @@ DEFAULT_COMMANDS: list[types.BotCommand] = [
     types.BotCommand(command="balance", description="Баланс и подписки"),
     types.BotCommand(command="config", description="Получить конфиг"),
     types.BotCommand(command="referral", description="Пригласить друга"),
+    types.BotCommand(command="settings", description="Настройки уведомлений"),
     types.BotCommand(command="help", description="Помощь и поддержка"),
 ]
 
@@ -139,6 +136,14 @@ def welcome_action_keyboard() -> types.InlineKeyboardMarkup:
                 web_app=types.WebAppInfo(url=WEBAPP_BASE_URL),
             )
         ])
+    rows.append([
+        types.InlineKeyboardButton(
+            text="💎 Подписка", callback_data="go:plans"
+        ),
+        types.InlineKeyboardButton(
+            text="💳 Пополнить", callback_data="go:topup"
+        ),
+    ])
     rows.append([
         types.InlineKeyboardButton(
             text="❓ Проблема с ЛК", callback_data="help:cabinet"

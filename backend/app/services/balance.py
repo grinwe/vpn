@@ -271,7 +271,10 @@ def renew_subscription(db: Session, sub: models.Subscription) -> bool:
     if sub.plan is None:
         raise RuntimeError(f"subscription {sub.id} has no plan loaded")
 
-    price = plan_price_kopecks(sub.plan)
+    base_price = plan_price_kopecks(sub.plan)
+    extra_slots = sub.extra_device_slots or 0
+    device_surcharge = extra_slots * EXTRA_DEVICE_MONTHLY_KOPECKS
+    price = base_price + device_surcharge
     if price <= 0:
         logger.warning("renew: plan %s has no price, skipping sub %s", sub.plan_id, sub.id)
         return True  # free plan, nothing to charge
@@ -280,8 +283,9 @@ def renew_subscription(db: Session, sub: models.Subscription) -> bool:
     if (user.balance_kopecks or 0) < price:
         CHARGES_TOTAL.labels(result="insufficient").inc()
         logger.info(
-            "balance.renew insufficient user=%s sub=%s price=%s balance=%s",
-            user.id, sub.id, price, user.balance_kopecks,
+            "balance.renew insufficient user=%s sub=%s price=%s (base=%s + %s slots * %s) balance=%s",
+            user.id, sub.id, price, base_price, extra_slots,
+            EXTRA_DEVICE_MONTHLY_KOPECKS, user.balance_kopecks,
         )
         return False
 
@@ -290,7 +294,7 @@ def renew_subscription(db: Session, sub: models.Subscription) -> bool:
         amount_kopecks=-price,
         kind=models.BalanceTxKind.spend,
         reference=f"renew:{sub.id}",
-        note=f"renew {sub.plan.name} (sub {sub.id})",
+        note=f"renew {sub.plan.name} (sub {sub.id}){f' +{extra_slots} devices' if extra_slots else ''}",
     )
 
     # Extend from the current expires_at (not from now) so we don't
@@ -303,8 +307,8 @@ def renew_subscription(db: Session, sub: models.Subscription) -> bool:
     CHARGES_TOTAL.labels(result="success").inc()
     CHARGE_AMOUNT_TOTAL.inc(price)
     logger.info(
-        "balance.renew ok user=%s sub=%s price=%s -> expires=%s balance=%s",
-        user.id, sub.id, price, sub.expires_at, user.balance_kopecks,
+        "balance.renew ok user=%s sub=%s price=%s (base=%s +devices=%s) -> expires=%s balance=%s",
+        user.id, sub.id, price, base_price, device_surcharge, sub.expires_at, user.balance_kopecks,
     )
     return True
 
@@ -363,19 +367,40 @@ def change_plan(
     sub.plan_id = new_plan.id
     sub.expires_at = now + timedelta(days=new_plan.duration_days)
     sub.auto_renew = True
-    # New plan, new bundle — reset paid extra slots. Existing devices
-    # stay alive; any that exceed the new plan's bundled capacity will
-    # incur the extra-device fee on the next "add device" action.
-    sub.extra_device_slots = 0
+
+    # Count live devices and set extra_device_slots for any that exceed
+    # the new plan's bundle. This avoids "free" devices lingering after
+    # a downgrade (e.g. Family 3 → Solo 1 keeps 3 live devices).
+    live_devices = _live_device_count(db, sub.id)
+    new_bundled = new_plan.max_devices or 1
+    overflow = max(live_devices - new_bundled, 0)
+    sub.extra_device_slots = overflow
+
+    # Charge for overflow slots (pro-rated for the full new period = full price).
+    device_surcharge = overflow * EXTRA_DEVICE_MONTHLY_KOPECKS
+    if device_surcharge > 0:
+        if (user.balance_kopecks or 0) < device_surcharge:
+            raise ValueError(
+                f"insufficient balance for {overflow} extra device(s): "
+                f"need {device_surcharge}, have {user.balance_kopecks or 0}"
+            )
+        _record_tx(
+            db, user,
+            amount_kopecks=-device_surcharge,
+            kind=models.BalanceTxKind.spend,
+            reference=f"change_plan_devices:{sub.id}",
+            note=f"{overflow} extra device(s) on {new_plan.name}",
+        )
+
     db.add(sub)
     db.flush()
 
     logger.info(
-        "balance.change_plan user=%s sub=%s %s->%s refund=%s charge=%s -> balance=%s",
+        "balance.change_plan user=%s sub=%s %s->%s refund=%s charge=%s device_surcharge=%s (%s overflow) -> balance=%s",
         sub.user_id, sub.id, old_plan.name, new_plan.name,
-        refund, new_price, user.balance_kopecks,
+        refund, new_price, device_surcharge, overflow, user.balance_kopecks,
     )
-    return {"refunded_kopecks": refund, "charged_kopecks": new_price}
+    return {"refunded_kopecks": refund, "charged_kopecks": new_price + device_surcharge}
 
 
 # ── Freeze / unfreeze (V2: 1 per year, 7 days) ──────────────────────

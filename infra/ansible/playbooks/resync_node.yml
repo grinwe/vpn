@@ -42,6 +42,26 @@
     _ws_cdn_clients: >-
       {{ clients_by_proto.get('vless-ws-cdn', []) }}
   tasks:
+    # ---- Read enforcer blocklist (sharing-blocked users) ---------
+    - name: Read enforcer blocklist
+      slurp:
+        src: /var/log/xray/enforcer_blocklist.txt
+      register: _enforcer_blocklist_raw
+      failed_when: false
+      changed_when: false
+
+    - name: Parse enforcer blocklist
+      set_fact:
+        _enforcer_blocklist: >-
+          {{ (_enforcer_blocklist_raw.content | default('') | b64decode).split('\n')
+             | map('trim') | select | list }}
+      when: _enforcer_blocklist_raw.content is defined
+
+    - name: Default empty blocklist
+      set_fact:
+        _enforcer_blocklist: []
+      when: _enforcer_blocklist_raw.content is not defined
+
     # ---- VLESS+Reality branch ------------------------------------
     - name: Stat VLESS Reality manage script
       stat:
@@ -63,6 +83,7 @@
       when:
         - vless_reality_manage_script.stat.exists
         - _reality_clients | length > 0
+        - item.username not in _enforcer_blocklist
 
     - name: Restart xray after reality resync
       systemd:
@@ -89,6 +110,7 @@
       when:
         - vless_xhttp_manage_script.stat.exists
         - _xhttp_clients | length > 0
+        - item.username not in _enforcer_blocklist
 
     - name: Restart xray-xhttp after resync
       systemd:
@@ -115,6 +137,7 @@
       when:
         - vless_ws_manage_script.stat.exists
         - _ws_cdn_clients | length > 0
+        - item.username not in _enforcer_blocklist
 
     - name: Restart xray-ws-cdn after resync
       systemd:

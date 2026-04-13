@@ -102,6 +102,16 @@ export default function Users() {
     onError: (e: Error) => alert(`Не удалось привязать девайс: ${e.message}`),
   });
 
+  const unblockSharing = useMutation({
+    mutationFn: (subId: number) =>
+      api.post(`/subscriptions/${subId}/unblock-sharing`, {}),
+    onSuccess: () => {
+      alert("Unblock отправлен на ноду. Enforcer подхватит в течение 10 секунд.");
+      qc.invalidateQueries({ queryKey: ["user-subs"] });
+    },
+    onError: (e: Error) => alert(`Не удалось разблокировать: ${e.message}`),
+  });
+
   return (
     <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
       <div className="lg:col-span-2">
@@ -292,6 +302,20 @@ export default function Users() {
                             enable
                           </button>
                         )}
+                        <button
+                          disabled={unblockSharing.isPending}
+                          onClick={() => {
+                            if (
+                              confirm(
+                                `Снять sharing-бан для подписки #${s.id}?\n\nEnforcer заблокировал юзера за раздачу конфига. Команда unblock будет отправлена на ноду.`
+                              )
+                            )
+                              unblockSharing.mutate(s.id);
+                          }}
+                          className="text-xs px-2 py-1 rounded bg-amber-700 hover:bg-amber-600 disabled:opacity-50"
+                        >
+                          снять sharing-бан
+                        </button>
                       </div>
                     </li>
                   ))}

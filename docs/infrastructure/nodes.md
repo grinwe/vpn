@@ -41,11 +41,11 @@ class VPNConfig(Base):
 
 Протоколы в enum'е `VPNConfigProtocol`:
 
-- `shadowtls_ss` — ShadowTLS v3 + shadowsocks-rust (основной)
-- `vless_reality` — VLESS + Reality (опциональный)
+- `vless_reality` — VLESS + Reality (основной)
+- `vless_xhttp` — VLESS + XHTTP (основной TCP, обход 16KB curtain ТСПУ)
 - `vless_ws_cdn` — VLESS + WebSocket за Cloudflare
-- `vless_xhttp` — VLESS + XHTTP (обход 16KB curtain ТСПУ)
 - `hysteria2` — UDP через QUIC (fallback на стабильных сетях)
+- `shadowtls_ss` — ShadowTLS v3 + shadowsocks-rust (legacy, без per-user isolation)
 
 **Одна нода может отдавать несколько протоколов одновременно.** `_collect_site_extra_vars` (`provisioning.py`) читает все `VPNConfig` ноды, расшифровывает их `settings` и передаёт всем протокольным ролям как `extra_vars` за один прогон `site.yml`. Если VPNConfig нет — роль встречает пустой `*_password`/`*_domain` переменную, срабатывает guard `meta: end_role` и тихо пропускает себя.
 
@@ -210,7 +210,7 @@ Helper-скрипты на нодах (устанавливаются соотв
 
 | скрипт | протокол | механизм |
 |---|---|---|
-| `manage_vpn_user.sh` | ShadowTLS+SS | v1 **no-op с audit-логом** — все девайсы делят один ss-rust password. Persist нет, логирование в `/var/log/shadowtls-users.log`. v2 roadmap: SS2022 EIH. |
+| `manage_vpn_user.sh` | ShadowTLS+SS | **no-op с audit-логом** — все девайсы делят один ss-rust password. Persist нет, логирование в `/var/log/shadowtls-users.log`. Legacy-протокол, без per-user isolation. |
 | `manage_vless_user.sh` | VLESS Reality | `jq` patch `/usr/local/etc/xray/config.json` → `settings.clients` (add/del by email) → `systemctl restart xray`. Поддерживает `NO_RESTART=1` для batch-операций. |
 | `manage_vless_ws_user.sh` | VLESS WS+CDN | аналогично, но для `config_ws_cdn.json` + restart unit `xray-ws-cdn`. `NO_RESTART=1`. |
 | `manage_vless_xhttp_user.sh` | VLESS XHTTP | аналогично, `config_xhttp.json` + `xray-xhttp`. `NO_RESTART=1`. |
@@ -293,7 +293,7 @@ for provider_id in [primary] + fallbacks:
 - **Автовосстановления из `error` нет.** Нода, попавшая в error (единичный сбой API провайдера во время destroy, например), остаётся там до ручного вмешательства. Нет self-heal'а, который бы через X часов попробовал снова.
 - **Promote `registering → active` требует и ansible-success, и health pass.** Если ansible прошёл, а health-probe стабильно падает (например, UFW неправильно настроен), нода остаётся в `registering` надолго. `choose_node` её всё ещё берёт (registering в whitelist). Это компромисс «лучше отдать свежую ноду, чем задержать подписку», но клинические случаи возможны.
 - **Grace-таймер draining'а использует `updated_at`.** Любая операция, которая трогает ноду (даже миграция одной подписки), перезапускает таймер. В пуле с постоянным drip'ом миграций destroy может не случиться никогда.
-- **ShadowTLS `manage_vpn_user.sh` — no-op.** Единственный общий пароль per node. Revoke одного устройства **не удаляет его фактический доступ** — пользователь продолжает ходить, пока не ротируется node password для всех сразу. Real per-device isolation ждёт SS2022 EIH.
+- **ShadowTLS `manage_vpn_user.sh` — no-op.** Единственный общий пароль per node. Revoke одного устройства **не удаляет его фактический доступ** — пользователь продолжает ходить, пока не ротируется node password для всех сразу. Legacy-протокол, sharing enforcer его не покрывает.
 
 ## Sharing enforcer — защита от расшаривания
 

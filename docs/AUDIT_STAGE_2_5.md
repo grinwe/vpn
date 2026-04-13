@@ -2,7 +2,7 @@
 
 Этот документ описывает, что было сделано в этом цикле работы над платформой:
 аудит существующих этапов 1-2 + полная реализация этапа 2.5
-(pre-warmed credentials pool) из `ROADMAP_WEBAPP.md`.
+(pre-warmed credentials pool).
 
 ## TL;DR
 

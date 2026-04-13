@@ -71,6 +71,7 @@ export interface SubscriptionExtra {
   extra_device_slots: number;
   extra_device_monthly_kopecks: number;
   next_extra_fee_kopecks: number;
+  total_monthly_kopecks: number;
   devices: DeviceSummary[];
 }
 

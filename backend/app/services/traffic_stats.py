@@ -98,6 +98,7 @@ class SharingViolation:
     ips: list[str]
     ip_count: int
     action: str
+    severity: str  # "warning" | "kick" | "block"
 
 
 @dataclass
@@ -309,6 +310,7 @@ def collect_node_stats(node) -> NodeStatsResult:
                             ips=row.get("ips", []),
                             ip_count=row.get("ip_count", 0),
                             action=row.get("action", ""),
+                            severity=row.get("severity", "warning"),
                         ))
                     except (json.JSONDecodeError, KeyError):
                         continue
@@ -354,21 +356,53 @@ def collect_and_persist(session, node, interval_seconds: int) -> dict[str, Any] 
     )
     session.add(sample)
 
-    # Ingest sharing violations into AuditLog for admin visibility.
+    # Ingest sharing violations into AuditLog for admin visibility
+    # and user-facing notifications (via bot notification poller).
+    # Deduplicate: only one AuditLog per (email, severity) per batch.
+    # The enforcer may fire dozens of violations per email between
+    # collection ticks — the user should get at most one notification
+    # per severity level per tick.
+    _SEVERITY_ACTION_MAP = {
+        "warning": "sharing_warning",
+        "kick": "sharing_kick",
+        "block": "sharing_block",
+    }
+    _seen_violations: set[tuple[str, str]] = set()  # (email, severity)
     for v in result.sharing_violations:
+        dedup_key = (v.email, v.severity)
+        if dedup_key in _seen_violations:
+            continue
+        _seen_violations.add(dedup_key)
+
+        audit_action = _SEVERITY_ACTION_MAP.get(v.severity, "sharing_warning")
+
+        # Resolve email (access_username) → Device → User → telegram_id
+        telegram_id = None
+        user_id = None
+        device = (
+            session.query(models.Device)
+            .filter_by(access_username=v.email)
+            .first()
+        )
+        if device and device.user:
+            user_id = device.user_id
+            telegram_id = str(device.user.telegram_id) if device.user.telegram_id else None
+
         session.add(models.AuditLog(
             actor="system",
             actor_type=models.AuditActor.system,
-            action="sharing_violation",
-            target_type="node",
-            target_id=node.id,
+            action=audit_action,
+            target_type="user" if user_id else "node",
+            target_id=user_id or node.id,
             extra={
                 "node_name": node.name,
                 "email": v.email,
                 "ips": v.ips,
                 "ip_count": v.ip_count,
                 "action": v.action,
+                "severity": v.severity,
                 "enforcer_ts": v.ts,
+                "telegram_id": telegram_id,
             },
         ))
     if result.sharing_violations:

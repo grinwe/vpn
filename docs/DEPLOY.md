@@ -117,7 +117,7 @@ ansible-playbook -i inventories/prod/hosts.yml site.yml --tags web
    - **Регион** — логический тег: `eu-west`, `eu-north`. Используется в UI при выборе тарифа.
    - **Host** — IP или DNS-имя
    - **SSH port** — обычно `22`
-   - **Pool ID** — опционально, если используешь autoscale-пулы (см. [ROADMAP_WEBAPP.md](ROADMAP_WEBAPP.md#этап-5))
+   - **Pool ID** — опционально, если используешь autoscale-пулы (autoscale-пулы)
 3. **Создать + bootstrap**. Статус ноды: `registering` → (через 3-5 минут) → `active`. Таблица авто-рефрешится раз в 5 секунд.
 4. Если застряло в `error` — открой `/admin/tasks` (TODO: этап 2.75) или `docker compose logs worker --tail 200`, ищи traceback от ansible-runner.
 
@@ -125,12 +125,13 @@ ansible-playbook -i inventories/prod/hosts.yml site.yml --tags web
 
 В той же таблице `/admin/nodes` клик на строку ноды разворачивает панель «Конфиги протоколов». Кнопка **+ Добавить конфиг**:
 
-- **shadowtls+shadowsocks** — основной протокол, порт `8443`, SNI `www.cloudflare.com`. Ничего больше заполнять не нужно — роль `install_shadowtls_stack` генерит пароли сама.
-- **vless-reality** — порт `9443`, SNI `www.asus.com` (по дефолту). Ключи генерятся бэкендом автоматически, если оставить `public_key` пустым.
+- **vless-reality** — основной протокол, порт `9443`, SNI `www.asus.com` (по дефолту). Ключи генерятся бэкендом автоматически, если оставить `public_key` пустым. Per-user isolation + sharing enforcer.
+- **vless-xhttp** — основной TCP-протокол, обход 16KB curtain ТСПУ.
 - **vless-ws-cdn** — порт `443`, требует отдельного Cloudflare-сетапа (см. ниже). Подходит для случаев, когда DPI режет всё остальное.
 - **hysteria2** — UDP/QUIC, порт `8443`. На мобильных бывает нестабилен.
+- **shadowtls+shadowsocks** — legacy-протокол, порт `8443`. Нет per-user isolation (общий пароль на ноду), sharing enforcer не покрывает.
 
-Рекомендованный минимум на каждой ноде: **shadowtls+shadowsocks** (primary). Остальные — по мере необходимости.
+Рекомендованный минимум на каждой ноде: **vless-reality**. Остальные — по мере необходимости.
 
 После добавления конфига warm-pool инвалидируется для этой ноды, и warmer'у нужно несколько тиков, чтобы пересобрать предсгенерированные credential-бандлы под новый набор протоколов ([см. warm pool](../README.md#key-features)).
 

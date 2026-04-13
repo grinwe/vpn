@@ -253,7 +253,7 @@ def migrate_subscriptions_off(
             # them as Telegram messages (see api_extensions.py). Without
             # telegram_id in extra the poller silently drops the row, so
             # skip the write for non-Telegram users (e.g. email-only).
-            if sub.user and sub.user.telegram_id:
+            if sub.user and sub.user.telegram_id and sub.user.notify_migrations:
                 db.add(
                     models.AuditLog(
                         actor="health_monitor",

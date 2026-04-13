@@ -262,6 +262,9 @@ class SubscriptionWebAppExtra(BaseModel):
     # device still fits in the already-paid envelope (e.g. user had
     # bought a slot then removed a device).
     next_extra_fee_kopecks: int
+    # Total monthly cost including extra device surcharge. UI should
+    # display this instead of plan_price_kopecks when showing "N ₽/мес".
+    total_monthly_kopecks: int
     devices: list[DeviceSummary]
 
 
@@ -363,6 +366,7 @@ def _build_subscription_extras(
                 extra_device_slots=slots,
                 extra_device_monthly_kopecks=balance_svc.EXTRA_DEVICE_MONTHLY_KOPECKS,
                 next_extra_fee_kopecks=next_extra_fee,
+                total_monthly_kopecks=price + slots * balance_svc.EXTRA_DEVICE_MONTHLY_KOPECKS,
                 devices=[
                     DeviceSummary(
                         id=d.id,
@@ -1143,16 +1147,26 @@ def webapp_change_plan(
         remaining_days = max(remaining_secs / 86400, 0)
         refund_estimate = int(math.floor(old_price * remaining_days / sub.plan.duration_days))
 
+    # Account for extra device surcharge on downgrade: if the user has
+    # more live devices than the new plan bundles, those devices become
+    # paid slots immediately.
+    live_devices = balance_svc._live_device_count(db, sub.id)
+    new_bundled = new_plan.max_devices or 1
+    overflow = max(live_devices - new_bundled, 0)
+    device_surcharge = overflow * balance_svc.EXTRA_DEVICE_MONTHLY_KOPECKS
+
+    total_required = new_price + device_surcharge
     projected_balance = (user.balance_kopecks or 0) + refund_estimate
-    if projected_balance < new_price:
-        shortfall = new_price - projected_balance
+    if projected_balance < total_required:
+        shortfall = total_required - projected_balance
         raise HTTPException(
             status_code=402,
             detail={
                 "code": "insufficient_balance",
                 "balance_kopecks": user.balance_kopecks or 0,
-                "required_kopecks": new_price,
+                "required_kopecks": total_required,
                 "refund_estimate_kopecks": refund_estimate,
+                "device_surcharge_kopecks": device_surcharge,
                 "suggested_topup_kopecks": max(
                     balance_svc.min_topup_kopecks(db), shortfall
                 ),
@@ -1545,13 +1559,10 @@ def webapp_remove_device(
 ):
     """Revoke a device and its credential on the VPN node.
 
-    Important (V2): removing a physical device does **not** refund
-    money and does **not** free up the paid slot. If the user bought
-    an extra slot on this subscription, they continue to pay for it on
-    every renewal until they change plan or cancel. That's by design —
-    the frontend warns the user in the confirm dialog, and the /me
-    response exposes ``extra_device_slots`` so the UI can show the
-    user how many paid slots are attached to the sub.
+    V3: removing a device also decrements ``extra_device_slots`` (if the
+    device was in the paid overflow zone), so the monthly renewal cost
+    goes down. No refund for the current period — the slot was already
+    paid — but future renewals no longer include the surcharge.
 
     The last device on a subscription cannot be removed — that's
     effectively a subscription cancel, handled separately.
@@ -1578,6 +1589,12 @@ def webapp_remove_device(
 
     orchestrator = ProvisioningOrchestrator(db)
     orchestrator.revoke_device(device, reason="user_removed", background=True)
+
+    # Free a paid slot if the removed device was in the overflow zone.
+    bundled = (sub.plan.max_devices if sub.plan else 1) or 1
+    if (sub.extra_device_slots or 0) > 0 and live_count > bundled:
+        sub.extra_device_slots -= 1
+        db.add(sub)
 
     db.commit()
     db.refresh(user)

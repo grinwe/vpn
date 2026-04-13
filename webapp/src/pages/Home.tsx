@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 import QRCode from "qrcode";
 import {
   activateTrial,
@@ -83,9 +84,9 @@ export default function Home({
           </div>
           <button
             onClick={() => setShowSetup(true)}
-            className="px-3 py-2 rounded-xl bg-tg-button text-tg-buttonText text-sm font-semibold"
+            className="btn-ghost px-3 py-2 text-sm"
           >
-            Как настроить
+            ⚙️ Настройки
           </button>
         </div>
       </header>
@@ -232,8 +233,8 @@ export default function Home({
         </section>
       )}
 
-      {showSetup && <SetupSheet onClose={() => setShowSetup(false)} />}
-      {topupOpen && <TopupModal onClose={() => setTopupOpen(false)} />}
+      {showSetup && createPortal(<SetupSheet onClose={() => setShowSetup(false)} />, document.body)}
+      {topupOpen && createPortal(<TopupModal onClose={() => setTopupOpen(false)} />, document.body)}
     </div>
   );
 }
@@ -324,7 +325,7 @@ function SubscriptionCard({
     }
   }
 
-  const priceRub = extra ? (extra.plan_price_kopecks / 100).toFixed(0) : null;
+  const priceRub = extra ? (extra.total_monthly_kopecks / 100).toFixed(0) : null;
   const expiresDate = extra?.expires_at
     ? new Date(extra.expires_at).toLocaleDateString("ru-RU", { day: "numeric", month: "long" })
     : null;
@@ -353,42 +354,37 @@ function SubscriptionCard({
       {/* Config link + copy + QR */}
       {subUrl && !isFrozen && (
         <div className="mt-3">
-          <div
-            className="flex items-center gap-2 bg-tg-bg rounded-xl px-3 py-2 cursor-pointer"
-            onClick={async () => {
-              try {
-                await navigator.clipboard.writeText(subUrl);
+          <div className="flex gap-2">
+            <button
+              onClick={async () => {
+                try {
+                  await navigator.clipboard.writeText(subUrl);
+                } catch {
+                  const ta = document.createElement("textarea");
+                  ta.value = subUrl;
+                  document.body.appendChild(ta);
+                  ta.select();
+                  try { document.execCommand("copy"); } catch { /* empty */ }
+                  document.body.removeChild(ta);
+                }
                 getTg()?.HapticFeedback?.notificationOccurred("success");
                 setCopied(true);
                 setTimeout(() => setCopied(false), 1500);
-              } catch {
-                const ta = document.createElement("textarea");
-                ta.value = subUrl;
-                document.body.appendChild(ta);
-                ta.select();
-                try { document.execCommand("copy"); } catch { /* empty */ }
-                document.body.removeChild(ta);
-                setCopied(true);
-                setTimeout(() => setCopied(false), 1500);
-              }
-            }}
-          >
-            <span className="flex-1 text-xs font-mono text-tg-hint truncate">
-              {subUrl.length > 40 ? subUrl.slice(0, 40) + "…" : subUrl}
-            </span>
-            <span className="text-tg-link text-xs font-semibold whitespace-nowrap">
-              {copied ? "✓" : "📋"}
-            </span>
+              }}
+              className="flex-1 py-2 rounded-xl bg-tg-secondaryBg ring-1 ring-tg-link text-tg-link text-xs font-semibold"
+            >
+              {copied ? "✓ Скопировано" : "📋 Копировать ссылку"}
+            </button>
+            <button
+              onClick={() => {
+                setShowQR((v) => !v);
+                getTg()?.HapticFeedback?.notificationOccurred("success");
+              }}
+              className="flex-1 py-2 rounded-xl bg-tg-secondaryBg ring-1 ring-tg-link text-tg-link text-xs font-semibold"
+            >
+              {showQR ? "Скрыть QR" : "Показать QR"}
+            </button>
           </div>
-          <button
-            onClick={() => {
-              setShowQR((v) => !v);
-              getTg()?.HapticFeedback?.notificationOccurred("success");
-            }}
-            className="mt-2 w-full py-2 rounded-xl bg-tg-secondaryBg ring-1 ring-tg-link text-tg-link text-xs font-semibold"
-          >
-            {showQR ? "Скрыть QR" : "Показать QR"}
-          </button>
           {showQR && (
             <div className="mt-3 flex justify-center bg-white rounded-xl p-3">
               <canvas ref={qrCanvasRef} />
@@ -410,6 +406,8 @@ function SubscriptionCard({
                 device={d}
                 subLinkBase={subLinkBase}
                 canRemove={extra.device_count > 1}
+                isPaidSlot={extra.device_count > extra.bundled_devices}
+                extraDeviceMonthly={extra.extra_device_monthly_kopecks}
                 onAction={onAction}
               />
             ))}
@@ -592,8 +590,6 @@ const SETUP_PLATFORMS = [
 function SetupSheet({ onClose }: { onClose: () => void }) {
   const [open, setOpen] = useState<number | null>(null);
 
-  useEffect(() => { getTg()?.expand(); }, []);
-
   return (
     <div className="fixed inset-0 bg-black/60 flex items-end justify-center z-50 animate-fadeIn" onClick={onClose}>
       <div
@@ -632,8 +628,6 @@ const TOPUP_PRESETS = [10000, 30000, 60000, 150000]; // kopecks: 100/300/600/150
 function TopupModal({ onClose }: { onClose: () => void }) {
   const [busy, setBusy] = useState(false);
   const [customRub, setCustomRub] = useState<string>("");
-
-  useEffect(() => { getTg()?.expand(); }, []);
 
   async function pay(amountKopecks: number) {
     const tg = getTg();
@@ -717,11 +711,15 @@ function DeviceRow({
   device,
   subLinkBase,
   canRemove,
+  isPaidSlot,
+  extraDeviceMonthly,
   onAction,
 }: {
   device: DeviceSummary;
   subLinkBase: string;
   canRemove: boolean;
+  isPaidSlot: boolean;
+  extraDeviceMonthly: number;
   onAction: () => void;
 }) {
   const [editing, setEditing] = useState(false);
@@ -762,7 +760,10 @@ function DeviceRow({
   }
 
   async function handleRemove() {
-    if (!confirm(`Удалить устройство «${device.name}»?\n\nДоступ будет отозван. Если устройство было платным, ежемесячная стоимость снизится.`)) return;
+    const costNote = isPaidSlot
+      ? `\n\nЕжемесячная стоимость уменьшится на ${(extraDeviceMonthly / 100).toFixed(0)} ₽.`
+      : "";
+    if (!confirm(`Удалить устройство «${device.name}»?\n\nДоступ будет отозван.${costNote}`)) return;
     setBusy(true);
     try {
       await removeDevice(device.id);
@@ -842,11 +843,6 @@ function DeviceRow({
           </button>
         )}
       </div>
-      {deviceUrl && (
-        <div className="mt-1 text-[10px] font-mono text-tg-hint truncate">
-          {deviceUrl}
-        </div>
-      )}
     </li>
   );
 }

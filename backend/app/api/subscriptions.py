@@ -299,6 +299,102 @@ def enable_subscription(
     }
 
 
+@router.post("/subscriptions/{subscription_id}/unblock-sharing")
+def unblock_sharing(
+    subscription_id: int,
+    db: Session = Depends(get_db),
+    admin_token: str = Depends(require_admin),
+    admin_actor: str | None = Header(default=None, alias=ADMIN_ACTOR_HEADER),
+):
+    """Unblock a user whose sharing enforcer blocked them on the node.
+
+    Writes the device access_username(s) into the node's
+    ``enforcer_unblock.txt`` file via SSH.  The enforcer daemon picks
+    it up on the next tick (≤10s), removes the block from its state
+    and re-adds the user to xray.
+    """
+    import os
+
+    sub = db.get(models.Subscription, subscription_id)
+    if not sub:
+        raise HTTPException(status_code=404, detail="Subscription not found")
+
+    node = sub.node
+    if not node:
+        raise HTTPException(status_code=400, detail="Subscription has no node")
+
+    # Collect access_username(s) for all live devices on this sub
+    devices = (
+        db.query(models.Device)
+        .filter(
+            models.Device.subscription_id == sub.id,
+            models.Device.status.notin_(
+                [models.DeviceStatus.revoked, models.DeviceStatus.disabled]
+            ),
+        )
+        .all()
+    )
+    emails = {d.access_username for d in devices if d.access_username}
+    if not emails:
+        raise HTTPException(status_code=400, detail="No active devices with access_username")
+
+    # SSH to node and append emails to unblock file
+    try:
+        import paramiko
+    except ImportError as exc:
+        raise HTTPException(status_code=500, detail="paramiko not available") from exc
+
+    key_path = (
+        os.getenv("ANSIBLE_PRIVATE_KEY_FILE")
+        or os.getenv("PROVISIONING_SSH_KEY")
+        or "/run/secrets/provisioning_key"
+    )
+    if not os.path.exists(key_path):
+        raise HTTPException(status_code=500, detail="SSH key not found")
+
+    pkey = paramiko.Ed25519Key.from_private_key_file(key_path)
+    client = paramiko.SSHClient()
+    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    try:
+        client.connect(
+            hostname=node.host,
+            port=node.ssh_port or 22,
+            username="root",
+            pkey=pkey,
+            timeout=10,
+            allow_agent=False,
+            look_for_keys=False,
+        )
+        # Append each email on a separate line
+        email_lines = "\\n".join(sorted(emails))
+        cmd = f'printf "{email_lines}\\n" >> /var/log/xray/enforcer_unblock.txt'
+        stdin, stdout, stderr = client.exec_command(cmd, timeout=10)
+        exit_status = stdout.channel.recv_exit_status()
+        if exit_status != 0:
+            err = stderr.read().decode("utf-8", errors="replace")
+            raise HTTPException(status_code=500, detail=f"SSH command failed: {err}")
+    except paramiko.SSHException as exc:
+        raise HTTPException(status_code=502, detail=f"SSH error: {exc}") from exc
+    finally:
+        client.close()
+
+    actor, actor_type = _resolve_admin_actor(admin_actor)
+    _audit(
+        db,
+        actor,
+        "sharing_unblock",
+        "subscription",
+        subscription_id,
+        actor_type=actor_type,
+        metadata={"emails": sorted(emails), "node": node.name},
+    )
+    return {
+        "subscription_id": sub.id,
+        "emails_unblocked": sorted(emails),
+        "node": node.name,
+    }
+
+
 @router.get(
     "/subscriptions/{subscription_id}/status",
     response_model=schemas.SubscriptionStatusOut,

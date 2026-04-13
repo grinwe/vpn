@@ -4,7 +4,7 @@ from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
 from aiogram.fsm.storage.memory import MemoryStorage
 from .config import BOT_TOKEN, BACKEND_URL, ADMIN_API_TOKEN, NOTIFICATION_POLL_INTERVAL, BOT_WEBHOOK_PORT
-from .handlers import close_session, router, get_session, onboarding_keyboard
+from .handlers import close_session, router, get_session, onboarding_keyboard, health_ping_keyboard
 from .keyboards import DEFAULT_COMMANDS
 from .support import support_router
 
@@ -47,6 +47,8 @@ async def notification_poller(bot: Bot):
                     keyboard = None
                     if notif.get("type") == "config_ready":
                         keyboard = onboarding_keyboard()
+                    elif notif.get("type") == "health_ping_request":
+                        keyboard = health_ping_keyboard(notif.get("subscription_id"))
                     await bot.send_message(
                         chat_id=int(telegram_id),
                         text=text,

@@ -286,6 +286,14 @@ class User(Base):
     # clawback the unspent trial bonus iff the user never made a real topup.
     # Cleared (set to NULL) after clawback so the tick doesn't revisit.
     trial_expires_at = Column(DateTime, nullable=True)
+    # Per-user notification preferences. Each controls a group of
+    # notification types that the worker/health-monitor emits.
+    notify_renewals = Column(
+        Boolean, nullable=False, server_default="true", default=True
+    )
+    notify_migrations = Column(
+        Boolean, nullable=False, server_default="true", default=True
+    )
     # Phase C — bot health-ping consent. The worker tick that queues
     # "помогите нам улучшить сервис" prompts skips users where this is
     # True. Flipped to True from a `hping:optout` callback handler.

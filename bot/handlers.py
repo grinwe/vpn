@@ -19,6 +19,7 @@ from .keyboards import (
     BTN_HELP,
     BTN_INVITE,
     BTN_MAIN_MENU,
+    BTN_TOPUP,
     help_back_keyboard,
     help_keyboard,
     onboarding_keyboard,
@@ -739,8 +740,111 @@ def health_ping_keyboard(sub_id: int | None) -> types.InlineKeyboardMarkup:
     return types.InlineKeyboardMarkup(inline_keyboard=rows)
 
 
+# ── /settings — notification preferences ──
+
+def _notif_prefs_keyboard(prefs: dict) -> types.InlineKeyboardMarkup:
+    """Build inline keyboard reflecting current notification preferences."""
+    renewals_on = prefs.get("notify_renewals", True)
+    migrations_on = prefs.get("notify_migrations", True)
+    health_off = prefs.get("health_ping_opt_out", False)
+
+    def _toggle(label: str, on: bool, cb: str) -> types.InlineKeyboardButton:
+        icon = "✅" if on else "❌"
+        return types.InlineKeyboardButton(text=f"{icon} {label}", callback_data=cb)
+
+    return types.InlineKeyboardMarkup(inline_keyboard=[
+        [_toggle("Напоминания о продлении", renewals_on, "nprefs:renewals")],
+        [_toggle("Уведомления о миграции", migrations_on, "nprefs:migrations")],
+        [_toggle("Опрос о качестве", not health_off, "nprefs:health")],
+    ])
+
+
+@router.message(Command("settings"))
+async def cmd_settings(message: types.Message):
+    """Show notification preferences with toggle buttons."""
+    tid = str(message.from_user.id)
+    try:
+        status_code, data = await _fetch_json(
+            "GET",
+            f"{BACKEND_URL}/api/users/notification-prefs?telegram_id={tid}",
+            headers=_admin_headers(message.from_user.id),
+        )
+    except aiohttp.ClientError:
+        await message.answer("Бэкенд недоступен.")
+        return
+
+    if status_code == 404:
+        await message.answer("У вас ещё нет аккаунта — нажмите /start.")
+        return
+    if status_code != 200:
+        await message.answer("Не удалось загрузить настройки.")
+        return
+
+    await message.answer(
+        "⚙️ <b>Настройки уведомлений</b>\n\n"
+        "Нажмите, чтобы включить или выключить:",
+        reply_markup=_notif_prefs_keyboard(data),
+    )
+
+
+@router.callback_query(F.data.startswith("nprefs:"))
+async def toggle_notification_pref(callback_query: types.CallbackQuery):
+    """Toggle a single notification preference and refresh the keyboard."""
+    tid = str(callback_query.from_user.id)
+    key = callback_query.data.split(":")[1]
+
+    # First, fetch current prefs
+    try:
+        status_code, prefs = await _fetch_json(
+            "GET",
+            f"{BACKEND_URL}/api/users/notification-prefs?telegram_id={tid}",
+            headers=_admin_headers(callback_query.from_user.id),
+        )
+    except aiohttp.ClientError:
+        await callback_query.answer("Бэкенд недоступен", show_alert=True)
+        return
+    if status_code != 200:
+        await callback_query.answer("Ошибка", show_alert=True)
+        return
+
+    # Toggle the requested field
+    payload: dict = {"telegram_id": tid}
+    if key == "renewals":
+        payload["notify_renewals"] = not prefs.get("notify_renewals", True)
+    elif key == "migrations":
+        payload["notify_migrations"] = not prefs.get("notify_migrations", True)
+    elif key == "health":
+        payload["health_ping_opt_out"] = not prefs.get("health_ping_opt_out", False)
+    else:
+        await callback_query.answer()
+        return
+
+    try:
+        status_code, updated = await _fetch_json(
+            "POST",
+            f"{BACKEND_URL}/api/users/notification-prefs",
+            json=payload,
+            headers=_admin_headers(callback_query.from_user.id),
+        )
+    except aiohttp.ClientError:
+        await callback_query.answer("Бэкенд недоступен", show_alert=True)
+        return
+    if status_code != 200:
+        await callback_query.answer("Не удалось сохранить", show_alert=True)
+        return
+
+    await callback_query.answer("Сохранено ✓")
+    try:
+        await callback_query.message.edit_reply_markup(
+            reply_markup=_notif_prefs_keyboard(updated),
+        )
+    except Exception:
+        pass
+
+
 # ── /balance — текущий баланс и runway ──
 
+@router.message(F.text == BTN_TOPUP)
 @router.message(F.text == "Баланс")
 @router.message(Command("balance"))
 async def cmd_balance(message: types.Message):
@@ -1006,11 +1110,12 @@ _HELP_CABINET = (
 
 _HELP_VPN = (
     "🌐 VPN не подключается или тормозит — чек-лист:\n\n"
+    "👉 Обнови подписку в VPN-клиенте — нажми кнопку 🔄 рядом с профилем, "
+    "чтобы подтянуть актуальный конфиг\n"
     "👉 Проверь баланс в личном кабинете — при 0 ₽ доступ блокируется\n"
     "👉 Обнови клиент (Hiddify / v2rayNG / Streisand) до последней версии в сторе\n"
     "👉 В настройках устройства выключи другие VPN-профили — два VPN одновременно работать не будут\n"
-    "👉 Перезагрузи телефон — помогает чаще, чем кажется\n"
-    "👉 В клиенте удали старый профиль и импортируй конфиг заново из кабинета\n"
+    "👉 Перезагрузи телефон\n"
     "👉 Проверь, что у тебя активна подписка (в кабинете — раздел «Мои подписки»)\n\n"
     "Если прошёл все шаги и всё ещё не работает — жми «Связаться с поддержкой», "
     "приложи скриншот клиента и модель телефона."
@@ -1061,10 +1166,30 @@ async def go_help(callback_query: types.CallbackQuery):
 async def go_start(callback_query: types.CallbackQuery):
     """«🏠 Главное меню» из любого inline-меню — шорткат на /start."""
     await callback_query.answer()
-    await cmd_start(callback_query.message.model_copy(update={
-        "from_user": callback_query.from_user,
-        "text": "/start",
-    }))
+    first_name = callback_query.from_user.first_name or "друг"
+    welcome = format_welcome(first_name, is_new=False, trial_available=False)
+    await callback_query.message.answer(welcome, reply_markup=welcome_action_keyboard())
+    await callback_query.message.answer(
+        "⌨️ Кнопки внизу всегда под рукой.",
+        reply_markup=start_keyboard(),
+    )
+
+
+@router.callback_query(F.data == "go:plans")
+async def go_plans(callback_query: types.CallbackQuery):
+    """Inline shortcut to /plans."""
+    await callback_query.answer()
+    await list_plans(callback_query.message)
+
+
+@router.callback_query(F.data == "go:topup")
+async def go_topup(callback_query: types.CallbackQuery):
+    """Inline shortcut to /balance (shows balance + topup link)."""
+    await callback_query.answer()
+    # Reuse cmd_balance but with the correct from_user
+    msg = callback_query.message
+    msg.from_user = callback_query.from_user
+    await cmd_balance(msg)
 
 
 @router.callback_query(F.data == "go:referral")

@@ -83,7 +83,7 @@ ansible-playbook -i inventories/prod/hosts.yml site.yml --tags web
 
 ## Что дальше
 
-- Delete node из UI и ручной drain (см. [docs/ROADMAP_WEBAPP.md](../docs/ROADMAP_WEBAPP.md) этап 2.75).
+- Delete node из UI и ручной drain.
 - Замена ручных TS-типов на `openapi-typescript` codegen из `/openapi.json`.
 - Tree-shake страниц на роли: отдельный scoped token → отдельный набор пунктов
   в навигации.

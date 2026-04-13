@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 import QRCode from "qrcode";
 import {
   activateSubscription,
@@ -215,13 +216,14 @@ export default function Plans({ onActivated, subLinkBase, me, changeSubscription
         )}
       </div>
 
-      {showHelp && <HelpSheet onClose={() => setShowHelp(false)} />}
-      {topupHint && (
+      {showHelp && createPortal(<HelpSheet onClose={() => setShowHelp(false)} />, document.body)}
+      {topupHint && createPortal(
         <TopupHintSheet
           suggested={topupHint.suggested}
           onPay={(kop) => payTopup(kop)}
           onClose={() => setTopupHint(null)}
-        />
+        />,
+        document.body,
       )}
       {toast && <Toast message={toast} onClose={() => setToast(null)} />}
     </div>
@@ -456,12 +458,9 @@ function ActivatedScreen({
         {subUrl && (
           <div className="mb-4">
             <p className="text-xs text-tg-hint mb-2">
-              Ссылка подписки — вставь её в Hiddify или v2rayNG:
+              Скопируй ссылку и вставь в Hiddify или v2rayNG:
             </p>
-            <div className="bg-tg-secondaryBg rounded-lg px-3 py-2 text-xs break-all font-mono text-tg-text">
-              {subUrl}
-            </div>
-            <div className="flex gap-2 mt-2">
+            <div className="flex gap-2">
               <button
                 onClick={async () => {
                   try {
@@ -475,7 +474,7 @@ function ActivatedScreen({
                 }}
                 className="flex-1 py-2 rounded-xl bg-tg-button text-tg-buttonText text-sm font-semibold"
               >
-                {copied ? "Скопировано ✓" : "Скопировать"}
+                {copied ? "Скопировано ✓" : "📋 Скопировать ссылку"}
               </button>
               <button
                 onClick={() => setShowQR((v) => !v)}
