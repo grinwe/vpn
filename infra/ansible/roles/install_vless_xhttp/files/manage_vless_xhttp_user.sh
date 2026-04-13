@@ -24,7 +24,8 @@ cmd_add() {
     jq -e . "${tmp}" >/dev/null || { rm -f "${tmp}"; exit 1; }
     mv "${tmp}" "${CONFIG}"; chmod 0640 "${CONFIG}"
   ) 200>"${LOCK}"
-  systemctl restart xray-xhttp
+  # NO_RESTART=1 skips the restart — caller restarts once after a batch.
+  [[ "${NO_RESTART:-}" == "1" ]] || systemctl restart xray-xhttp
   echo "added xhttp user ${email}"
 }
 
@@ -40,7 +41,7 @@ cmd_del() {
     jq -e . "${tmp}" >/dev/null || { rm -f "${tmp}"; exit 1; }
     mv "${tmp}" "${CONFIG}"; chmod 0640 "${CONFIG}"
   ) 200>"${LOCK}"
-  systemctl restart xray-xhttp
+  [[ "${NO_RESTART:-}" == "1" ]] || systemctl restart xray-xhttp
   echo "removed xhttp user ${email}"
 }
 

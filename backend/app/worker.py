@@ -23,6 +23,10 @@ logger = logging.getLogger(__name__)
 # (Dockerfile.worker) therefore uses `python -c "from app.worker import main; main()"`
 # so sys.modules has `app.worker` from the first import and RQ's re-import
 # is a no-op. Do NOT revert to `python -m app.worker`.
+DLQ_ENTRIES = Counter(
+    "vpn_provisioning_dlq_total",
+    "Provisioning jobs that exhausted all retries (dead-letter)",
+)
 RENEWAL_RUNS = Counter(
     "vpn_renewal_check_runs_total", "Renewal cron tick count", ["outcome"]
 )
@@ -777,6 +781,170 @@ def run_balance_charge_tick() -> dict:
     return stats
 
 
+def run_traffic_stats_tick() -> dict:
+    """Phase B — passive xray traffic stats collector.
+
+    Walks every active/draining node, SSHs in, runs ``xray api
+    statsquery --reset`` on each loopback gRPC port, persists one row
+    per node into ``node_traffic_samples``. The row's ``interval_seconds``
+    is the configured tick interval — the actual delta between two
+    rows might drift on a slow tick, but the detector that consumes
+    this only cares about per-tick rate so the configured interval is
+    a "good enough" anchor.
+
+    Self-rescheduling via ``TRAFFIC_STATS_INTERVAL`` (default 300s).
+    Disabled when the env var is 0.
+
+    Errors per node never abort the whole tick — they're logged in
+    ``services.traffic_stats.collect_and_persist`` and the row is
+    skipped. The next tick retries.
+    """
+    from datetime import timedelta
+
+    from .db import SessionLocal
+    from .queue import get_queue
+    from .services import traffic_stats
+
+    interval = int(os.getenv("TRAFFIC_STATS_INTERVAL", "300"))
+    summary: dict = {"collected": 0, "nodes": []}
+    session = SessionLocal()
+    try:
+        rows = traffic_stats.collect_all_active_nodes(session, interval)
+        summary["collected"] = len(rows)
+        summary["nodes"] = rows
+    except Exception:  # noqa: BLE001
+        logger.exception("traffic_stats: tick failed")
+        if session.is_active:
+            session.rollback()
+    finally:
+        session.close()
+
+    if interval > 0:
+        queue = get_queue()
+        if queue is not None:
+            try:
+                queue.enqueue_in(
+                    timedelta(seconds=interval),
+                    "app.worker.run_traffic_stats_tick",
+                    result_ttl=3600,
+                )
+            except Exception:  # noqa: BLE001
+                logger.exception("traffic_stats: failed to re-enqueue tick")
+    return summary
+
+
+def run_user_health_ping_tick() -> dict:
+    """Phase C — bot health-ping with consent + 24h debounce.
+
+    Picks active subs whose user has not opted out and was not pinged
+    in the last 24h. Writes one ``health_ping_request`` AuditLog row
+    per chosen user (the bot's notification poller picks them up and
+    delivers an inline keyboard with three buttons:
+    works / doesn't work / never ask me again).
+
+    Per-tick cap (USER_HEALTH_PING_BATCH, default 50) protects against
+    a once-a-day flood when the table grows. We update
+    ``User.health_ping_last_at`` *before* committing the row so a
+    Telegram retry loop never double-sends to the same user — the
+    next tick filters them out by the timestamp.
+
+    Self-rescheduling via ``USER_HEALTH_PING_INTERVAL`` (default 1800s).
+    Disabled when the env var is 0.
+    """
+    from datetime import timedelta
+    from sqlalchemy import or_
+
+    from . import models
+    from .db import SessionLocal
+    from .queue import get_queue
+    from .time_utils import utcnow
+
+    interval = int(os.getenv("USER_HEALTH_PING_INTERVAL", "1800"))
+    batch = int(os.getenv("USER_HEALTH_PING_BATCH", "50"))
+    debounce_hours = int(os.getenv("USER_HEALTH_PING_DEBOUNCE_HOURS", "24"))
+
+    summary = {"queued": 0, "skipped": 0}
+    session = SessionLocal()
+    try:
+        if interval <= 0 or batch <= 0:
+            return summary
+
+        now = utcnow()
+        debounce_cutoff = now - timedelta(hours=debounce_hours)
+
+        # Pick users who:
+        #   - have at least one active sub
+        #   - have a telegram_id (otherwise the bot can't reach them)
+        #   - have NOT opted out
+        #   - were never pinged OR last ping is older than the debounce window
+        subs = (
+            session.query(models.Subscription)
+            .join(models.User, models.User.id == models.Subscription.user_id)
+            .filter(
+                models.Subscription.status == models.SubscriptionStatus.active,
+                models.User.telegram_id.isnot(None),
+                models.User.health_ping_opt_out.is_(False),
+                or_(
+                    models.User.health_ping_last_at.is_(None),
+                    models.User.health_ping_last_at <= debounce_cutoff,
+                ),
+            )
+            .order_by(models.User.health_ping_last_at.asc().nulls_first())
+            .limit(batch)
+            .all()
+        )
+
+        seen_users: set[int] = set()
+        for sub in subs:
+            user = sub.user
+            if user is None or user.id in seen_users:
+                summary["skipped"] += 1
+                continue
+            seen_users.add(user.id)
+
+            node = sub.node
+            session.add(
+                models.AuditLog(
+                    actor="system",
+                    actor_type=models.AuditActor.system,
+                    action="health_ping_request",
+                    target_type="subscription",
+                    target_id=sub.id,
+                    extra={
+                        "telegram_id": user.telegram_id,
+                        "subscription_id": sub.id,
+                        "node_id": node.id if node else None,
+                        "node_name": node.name if node else None,
+                    },
+                )
+            )
+            user.health_ping_last_at = now
+            session.add(user)
+            summary["queued"] += 1
+
+        if summary["queued"] > 0:
+            session.commit()
+    except Exception:
+        logger.exception("user_health_ping: tick failed")
+        if session.is_active:
+            session.rollback()
+    finally:
+        session.close()
+
+    if interval > 0:
+        queue = get_queue()
+        if queue is not None:
+            try:
+                queue.enqueue_in(
+                    timedelta(seconds=interval),
+                    "app.worker.run_user_health_ping_tick",
+                    result_ttl=3600,
+                )
+            except Exception:  # noqa: BLE001
+                logger.exception("user_health_ping: failed to re-enqueue tick")
+    return summary
+
+
 def run_provisioning_task(task_id: int, node_id: int | None = None) -> dict:
     """RQ job — executed by the worker process."""
     from .db import SessionLocal
@@ -810,8 +978,54 @@ def run_provisioning_task(task_id: int, node_id: int | None = None) -> dict:
         session.close()
 
 
+def dlq_exception_handler(job, exc_type, exc_value, tb):  # noqa: ARG001
+    """Called by RQ when a job permanently fails (all retries exhausted).
+
+    Writes an AuditLog entry so ops can see the failure in the admin UI
+    without digging through Redis.  Also bumps the Prometheus counter.
+    """
+    DLQ_ENTRIES.inc()
+    task_id = job.args[0] if job.args else None
+    logger.error(
+        "Provisioning job %s (task %s) dead-lettered after retries: %s",
+        job.id, task_id, exc_value,
+    )
+    if task_id is None:
+        return True  # let RQ continue its normal failure flow
+
+    try:
+        from .db import SessionLocal
+        from . import models
+
+        session = SessionLocal()
+        try:
+            session.add(
+                models.AuditLog(
+                    actor="rq_worker",
+                    actor_type=models.AuditActor.system,
+                    action="provisioning_dlq",
+                    target_type="provisioning_task",
+                    target_id=task_id,
+                    extra={
+                        "job_id": job.id,
+                        "error": str(exc_value)[:500],
+                        "exc_type": exc_type.__name__ if exc_type else None,
+                    },
+                )
+            )
+            session.commit()
+        finally:
+            session.close()
+    except Exception:  # noqa: BLE001
+        logger.exception("Failed to write DLQ audit log for task %s", task_id)
+
+    return True  # let RQ continue its normal failure flow
+
+
 def main() -> None:
-    logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
+    from .logging_config import configure_logging
+
+    configure_logging()
     try:
         from redis import Redis
         from rq import Queue, Worker
@@ -923,7 +1137,50 @@ def main() -> None:
         except Exception:  # noqa: BLE001
             logger.exception("Failed to schedule drain tick")
 
-    worker = Worker([queue], connection=connection)
+    # Phase B — passive xray stats collector. SSHs into each active
+    # node every TRAFFIC_STATS_INTERVAL seconds (default 300) and
+    # writes a row into node_traffic_samples. Disabled when set to 0.
+    traffic_stats_interval = int(os.getenv("TRAFFIC_STATS_INTERVAL", "300"))
+    if traffic_stats_interval > 0:
+        try:
+            from datetime import timedelta
+            queue.enqueue_in(
+                timedelta(seconds=min(traffic_stats_interval, 60)),
+                "app.worker.run_traffic_stats_tick",
+                result_ttl=3600,
+            )
+            logger.info(
+                "Traffic stats tick bootstrapped: first run in 60s (interval=%ss)",
+                traffic_stats_interval,
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("Failed to schedule traffic stats tick")
+
+    # Phase C — bot health-ping with consent. Queues a friendly
+    # "помогите нам улучшить сервис" prompt to active users at most
+    # once per USER_HEALTH_PING_DEBOUNCE_HOURS, capped at
+    # USER_HEALTH_PING_BATCH per tick. Disabled when set to 0.
+    health_ping_interval = int(os.getenv("USER_HEALTH_PING_INTERVAL", "1800"))
+    if health_ping_interval > 0:
+        try:
+            from datetime import timedelta
+            queue.enqueue_in(
+                timedelta(seconds=min(health_ping_interval, 60)),
+                "app.worker.run_user_health_ping_tick",
+                result_ttl=3600,
+            )
+            logger.info(
+                "User health-ping tick bootstrapped: first run in 60s (interval=%ss)",
+                health_ping_interval,
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("Failed to schedule user health-ping tick")
+
+    worker = Worker(
+        [queue],
+        connection=connection,
+        exception_handlers=[dlq_exception_handler],
+    )
     logger.info("Starting RQ worker on queue %s", queue_name)
     worker.work(with_scheduler=True)
 

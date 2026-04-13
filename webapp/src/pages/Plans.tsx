@@ -2,8 +2,10 @@ import { useEffect, useRef, useState } from "react";
 import QRCode from "qrcode";
 import {
   activateSubscription,
+  changePlan,
   createTopup,
   fetchPlans,
+  MeResponse,
   WebAppPlan,
 } from "../api";
 import { navigate } from "../router";
@@ -43,7 +45,7 @@ function friendlyActivateError(raw: string): string {
   return "Не удалось выполнить операцию. Попробуй ещё раз или напиши в поддержку.";
 }
 
-export default function Plans({ onActivated, subLinkBase }: { onActivated: () => void; subLinkBase: string }) {
+export default function Plans({ onActivated, subLinkBase, me, changeSubscriptionId }: { onActivated: () => void; subLinkBase: string; me: MeResponse; changeSubscriptionId?: number }) {
   const [plans, setPlans] = useState<WebAppPlan[] | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [period, setPeriod] = useState<Period>("month");
@@ -59,6 +61,14 @@ export default function Plans({ onActivated, subLinkBase }: { onActivated: () =>
     subToken: string | null;
   } | null>(null);
   const [toast, setToast] = useState<string | null>(null);
+
+  // When changing an existing subscription, find the current plan ID
+  // so we can highlight it and use changePlan API instead of activate.
+  const changeSub = changeSubscriptionId
+    ? me.subscriptions.find((s) => s.id === changeSubscriptionId)
+    : undefined;
+  const currentPlanId = changeSub?.plan_id ?? null;
+  const isChangeMode = !!changeSub;
 
   useEffect(() => {
     fetchPlans()
@@ -80,16 +90,33 @@ export default function Plans({ onActivated, subLinkBase }: { onActivated: () =>
   const visible = plans.filter((p) => p.period === period);
 
   async function activate(plan: WebAppPlan) {
+    if (currentPlanId === plan.id) return; // already on this plan
     setBusyPlanId(plan.id);
     try {
-      const res = await activateSubscription(plan.id);
-      const tg = getTg();
-      tg?.HapticFeedback?.notificationOccurred("success");
-      setActivated({ tier: plan.tier, days: res.plan_duration_days, subToken: res.sub_token });
+      if (isChangeMode && changeSub) {
+        const currentName = changeSub.plan_name;
+        const newPrice = `${plan.price_rub.toFixed(0)} ₽/${plan.period === "year" ? "год" : "мес"}`;
+        if (!confirm(`Сменить тариф «${currentName}» на «${plan.tier}»?\n\nНовая стоимость: ${newPrice}.\nБудет выполнен перерасчёт за остаток периода.`)) {
+          setBusyPlanId(null);
+          return;
+        }
+        const res = await changePlan(changeSub.id, plan.id);
+        const tg = getTg();
+        tg?.HapticFeedback?.notificationOccurred("success");
+        const refund = res.refunded_kopecks > 0 ? ` Возврат ${(res.refunded_kopecks / 100).toFixed(0)} ₽.` : "";
+        const charge = res.charged_kopecks > 0 ? ` Списано ${(res.charged_kopecks / 100).toFixed(0)} ₽.` : "";
+        showToast(`Тариф изменён на «${res.new_plan_name}».${refund}${charge}`);
+        setTimeout(() => {
+          onActivated();
+          navigate({ name: "home" });
+        }, 1500);
+      } else {
+        const res = await activateSubscription(plan.id);
+        const tg = getTg();
+        tg?.HapticFeedback?.notificationOccurred("success");
+        setActivated({ tier: plan.tier, days: res.plan_duration_days, subToken: res.sub_token });
+      }
     } catch (e) {
-      // Insufficient balance comes back as a 402 with a JSON payload —
-      // try to parse out the suggested topup amount and offer the
-      // topup modal instead of dumping the raw error on the user.
       const msg = (e as Error).message;
       const match = /402.*suggested_topup_kopecks["']?\s*:\s*(\d+)/.exec(msg);
       if (match) {
@@ -151,7 +178,7 @@ export default function Plans({ onActivated, subLinkBase }: { onActivated: () =>
         <button onClick={() => navigate({ name: "home" })} className="text-tg-link">
           ← Назад
         </button>
-        <h1 className="text-xl font-semibold">Тарифы</h1>
+        <h1 className="text-xl font-semibold">{isChangeMode ? "Сменить тариф" : "Тарифы"}</h1>
         <button onClick={() => setShowHelp(true)} className="text-tg-link text-sm">
           🤔 Помощь
         </button>
@@ -178,6 +205,8 @@ export default function Plans({ onActivated, subLinkBase }: { onActivated: () =>
             <PlanCard
               key={p.id}
               plan={p}
+              isCurrent={currentPlanId === p.id}
+              isChangeMode={isChangeMode}
               busy={busyPlanId === p.id}
               disabled={busyPlanId !== null && busyPlanId !== p.id}
               onActivate={() => activate(p)}
@@ -231,28 +260,44 @@ function PeriodButton({
 
 function PlanCard({
   plan,
+  isCurrent,
+  isChangeMode,
   busy,
   disabled,
   onActivate,
 }: {
   plan: WebAppPlan;
+  isCurrent: boolean;
+  isChangeMode: boolean;
   busy: boolean;
   disabled: boolean;
   onActivate: () => void;
 }) {
   const popular = plan.badge === "popular";
-  // Heuristic: divide period price by days for the per-day estimate.
-  // Backend has the authoritative daily_rate; we just want a number to
-  // show on the card so the user knows what activation will cost per
-  // 24h before they tap.
   const dailyRub = Math.round((plan.price_rub / plan.duration_days) * 10) / 10;
+
+  const ringClass = isCurrent
+    ? "ring-2 ring-green-500"
+    : popular
+      ? "ring-2 ring-[var(--accent-from)]"
+      : "";
+
+  const buttonLabel = busy
+    ? isChangeMode ? "Меняем…" : "Активируем…"
+    : isCurrent
+      ? "Текущий тариф"
+      : isChangeMode
+        ? "Перейти"
+        : "Активировать";
+
   return (
-    <div
-      className={`card relative ${
-        popular ? "ring-2 ring-[var(--accent-from)]" : ""
-      }`}
-    >
-      {popular && (
+    <div className={`card relative ${ringClass}`}>
+      {isCurrent && (
+        <div className="chip inline-block mb-2 bg-green-500/15 text-green-300 border-green-500/30">
+          ТЕКУЩИЙ
+        </div>
+      )}
+      {!isCurrent && popular && (
         <div className="chip inline-block mb-2 bg-yellow-500/15 text-yellow-300 border-yellow-500/30">
           ⭐ ПОПУЛЯРНЫЙ
         </div>
@@ -271,10 +316,10 @@ function PlanCard({
       </div>
       <button
         onClick={onActivate}
-        disabled={busy || disabled}
-        className="btn-primary w-full mt-3"
+        disabled={busy || disabled || isCurrent}
+        className={`w-full mt-3 ${isCurrent ? "btn-ghost opacity-60 cursor-default" : "btn-primary"}`}
       >
-        {busy ? "Активируем…" : "Активировать"}
+        {buttonLabel}
       </button>
     </div>
   );

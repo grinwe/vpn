@@ -65,3 +65,35 @@
     content: |
       Managed VPN node. Unauthorized access prohibited.
       SSH key auth only. Contact NOC for access.
+
+# xray log directory must exist BEFORE any protocol role renders a
+# config that references /var/log/xray/access-*.log. We put it here
+# (not inside install_vless_*) because protocol roles are gated on
+# extra_vars that may be absent during a manual site.yml run, yet the
+# config from a previous backend-driven run already has the access log
+# path — xray crashes on restart with "permission denied" if the
+# directory is missing or root-owned.
+- name: Ensure xray log directory
+  file:
+    path: /var/log/xray
+    state: directory
+    owner: nobody
+    group: nogroup
+    mode: '0750'
+
+- name: Install xray access log rotation
+  copy:
+    content: |
+      /var/log/xray/access-*.log {
+          daily
+          rotate 3
+          missingok
+          notifempty
+          compress
+          delaycompress
+          copytruncate
+      }
+    dest: /etc/logrotate.d/xray
+    owner: root
+    group: root
+    mode: '0644'

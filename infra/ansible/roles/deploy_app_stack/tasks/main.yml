@@ -84,6 +84,8 @@
       - "--exclude=.pytest_cache"
       - "--exclude=admin/node_modules"
       - "--exclude=admin/dist"
+      - "--exclude=webapp/node_modules"
+      - "--exclude=webapp/dist"
       - "--exclude=backend/.venv"
       - "--exclude=bot/.venv"
       - "--exclude=.env"

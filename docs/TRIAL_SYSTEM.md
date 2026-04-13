@@ -50,7 +50,7 @@ trial_expires_at   = Column(DateTime, nullable=True)  # activated_at + TRIAL_DUR
 
 HTTP-обёртки:
 - Admin: [api_extensions.py:278](../backend/app/api_extensions.py#L278) — `POST /api/trial/activate`, принимает `telegram_id` в теле.
-- WebApp: [api_webapp.py:786](../backend/app/api_webapp.py#L786) — `POST /api/webapp/trial/activate`, `user_id` берётся из проверенного initData (JWT).
+- WebApp: [api_webapp.py:828](../backend/app/api_webapp.py#L828) — `POST /api/webapp/trial/activate`, `user_id` берётся из проверенного initData (JWT).
 
 Оба возвращают `TrialActivateResponse { trial_amount_kopecks, referral_bonus_kopecks, balance_kopecks, trial_expires_at }`.
 
@@ -76,7 +76,7 @@ HTTP-обёртки:
 
 ### Stage 3 — referrer payout (on referee's first real topup)
 
-Живёт в [api.py:_mark_invoice_paid_core](../backend/app/api.py#L1195), в ветке `if invoice.kind == "topup":`, **до** записи самого топапа:
+Живёт в [api/invoices.py:_mark_invoice_paid_core](../backend/app/api/invoices.py#L61), в ветке `if invoice.kind == "topup":` (строки 132-204), **до** записи самого топапа:
 
 ```python
 if topup_user.referred_by_id is not None:
@@ -130,7 +130,7 @@ WHERE trial_expires_at IS NOT NULL
 
 ## WebApp integration
 
-- `GET /api/webapp/me` возвращает `balance.trial_available: bool` и `balance.trial_amount_kopecks: int` ([api_webapp.py:198](../backend/app/api_webapp.py#L198)).
+- `GET /api/webapp/me` возвращает `balance.trial_available: bool` и `balance.trial_amount_kopecks: int` ([api_webapp.py:229](../backend/app/api_webapp.py#L229)).
 - [webapp/src/pages/Home.tsx](../webapp/src/pages/Home.tsx) показывает карточку «🎁 Забери пробный месяц» iff `trial_available`. Тап → `POST /api/webapp/trial/activate` → refresh `/me` → баннер скрывается.
 - На 409 — тост «Триал уже активирован», `/me` всё равно рефрешится.
 
@@ -191,7 +191,7 @@ docker compose run --rm backend alembic upgrade head
 - [backend/app/services/trial.py](../backend/app/services/trial.py) — `activate_trial()`, `trial_amount_kopecks()`
 - [backend/app/api_extensions.py](../backend/app/api_extensions.py) — admin-scoped `/trial/activate`, refactored `/users/register`
 - [backend/app/api_webapp.py](../backend/app/api_webapp.py) — WebApp wrapper + `trial_available` на `/me`
-- [backend/app/api.py](../backend/app/api.py) — referrer payout hook в `_mark_invoice_paid_core`
+- [backend/app/api/invoices.py](../backend/app/api/invoices.py) — referrer payout hook в `_mark_invoice_paid_core`
 - [backend/app/worker.py](../backend/app/worker.py) — phase 3 trial expiry pass
 - [bot/handlers.py](../bot/handlers.py) — `format_welcome()`, trial notification mapping
 - [webapp/src/pages/Home.tsx](../webapp/src/pages/Home.tsx) — баннер + активация

@@ -92,7 +92,7 @@ class VPNNodeOut(VPNNodeCreate):
     provider_id: int | None = None
     status: str
     is_active: bool
-    health_score: int = 100
+    health_score: int | None = None
     blocked_regions: list[str] = []
     created_at: datetime
     updated_at: datetime
@@ -274,6 +274,7 @@ class InvoiceListItem(BaseModel):
     currency: str
     status: str
     action: str
+    kind: str = "subscription"
     created_at: datetime
 
 

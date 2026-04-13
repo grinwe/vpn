@@ -1,6 +1,6 @@
 # Модель данных
 
-Всё описание ниже соответствует `backend/app/models.py`. Миграции живут в `backend/app/alembic/versions/`, последняя — `0017_fix_enum_values.py`. Схема — PostgreSQL, JSONB для гибких полей, enum-типы реализованы через `sqlalchemy.Enum` → postgres enum.
+Всё описание ниже соответствует `backend/app/models.py`. Миграции живут в `backend/app/alembic/versions/`, последняя — `0022_device_sub_token.py`. Схема — PostgreSQL, JSONB для гибких полей, enum-типы реализованы через `sqlalchemy.Enum` → postgres enum.
 
 ```
  users ─┬──◄── invoices ─┬──◄── payments
@@ -100,7 +100,7 @@ class VPNNode(Base):
     status: Enum(VPNNodeStatus),       # registering/active/disabled/error/draining
     is_active, pool_id → server_pools,
     max_users, max_bandwidth_mbps,     # capacity knobs
-    health_score: Integer DEFAULT 100,
+    health_score: Integer NULL,          # NULL = no probes yet
     last_health_check_at,
     blocked_regions: JSONB NULL,       # ['ru-mts', 'kz', ...]
     cooldown_until: DateTime NULL,     # reprovision backoff
@@ -173,17 +173,20 @@ Freeze-бухгалтерия (два правила одновременно):
 «Одна конкретная установка клиента» под данной подпиской: iPhone, ноут, роутер. Имеет уникальный `access_username` — идентификатор, под которым пользователь известен демону протокола на ноде.
 
 ```python
-# backend/app/models.py:352
+# backend/app/models.py:375
 class Device(Base):
     id, user_id → users (CASCADE), subscription_id → subscriptions (CASCADE),
     config_id → vpn_configs,
     name, status: Enum(DeviceStatus),   # pending/active/failed/disabled/revoked
     access_username,                    # 'warm-<node_id>-<hex>' или аналогичный
     connection_uri,                     # Fernet-encrypted
+    sub_token (unique, indexed),        # per-device dynamic sub-link token
     last_seen_at
 ```
 
-`connection_uri` обычно — это URL динамической подписки вида `<SUB_LINK_BASE_URL>/<sub_token>` (см. `services/provisioning.py:813`). То есть все Devices одной Subscription разделяют один `sub_token`, а клиент подтягивает все протоколы по этому URL.
+`sub_token` — уникальный токен на уровне устройства (не подписки). `/sub/{token}` сначала ищет `Device.sub_token` и возвращает только credentials этого устройства. Если не найден — fallback на `Subscription.sub_token` (backward compat для старых клиентов). Это предотвращает sharing: поделившись ссылкой, пользователь раскрывает только один device, а не всю подписку.
+
+`connection_uri` — URL динамической подписки вида `<SUB_LINK_BASE_URL>/<device.sub_token>`. Шифруется Fernet.
 
 ### `credentials`
 
@@ -241,9 +244,10 @@ class Payment(Base):
     amount (Numeric(10,2)), currency,
     status: Enum(PaymentStatus),        # pending/paid/failed/refunded
     provider, external_id (NULL)
+    UNIQUE(provider, external_id)         # #52 — NULLs excluded by Postgres
 ```
 
-Идемпотентность webhook'ов держится на паре `(provider, external_id)` через блокировку в `_mark_invoice_paid_core` — см. `components/payments.md`.
+Идемпотентность webhook'ов держится на `UNIQUE(provider, external_id)` (#52) + status-flip идемпотентность в `_mark_invoice_paid_core`. Constraint предотвращает дупликаты из webhook-ретраев и double-click checkout'ов. `IntegrityError` обрабатывается в `api/payments.py` — checkout возвращает существующий pay_url, admin create → 409. См. `components/payments.md`.
 
 ### `balance_transactions`
 
@@ -368,6 +372,7 @@ class ReferralCode(Base):
 | `ix_balance_transactions_created_at` | balance_transactions | created_at | периодическая reconciliation |
 | `ix_health_probes_*` | health_probes | `(node_id)`, `(source_region)`, `(observed_at)` | агрегация health |
 | `ix_api_tokens_token_hash` | api_tokens | unique(token_hash) | быстрый lookup при auth |
+| `uq_payments_provider_external_id` | payments | unique(provider, external_id) | #52 — dedup webhook retries / double-click checkout |
 
 ## Миграции
 
@@ -389,6 +394,11 @@ class ReferralCode(Base):
 - `0015` — billing v2 (тонкая настройка balance flow; см. `docs/BILLING_V2.md`).
 - `0016` — `vless-xhttp` в `VPNConfigProtocol` enum.
 - `0017` — `0017_fix_enum_values.py` — правки enum-значений после багов в предыдущих.
+- `0018` — `extra_device_slots`.
+- `0019` — `node_traffic_samples` (Phase B).
+- `0020` — `user_health_ping` (Phase C).
+- `0021` — `UNIQUE(provider, external_id)` на payments (#52). Дедупликация перед наложением constraint.
+- `0022` — `Device.sub_token` (per-device credential isolation). Backfill existing devices с уникальными токенами + unique index.
 
 Миграции запускаются только backend'ом на старте (`main.py:18` → `migrations.run_migrations()`). Воркер явно skip'ает миграции через `SKIP_MIGRATIONS=1` в `docker-compose.yml:103`, чтобы не гонять гонку на `alembic_version` advisory lock.
 

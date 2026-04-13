@@ -48,7 +48,7 @@ Backend прогоняет `alembic upgrade head` на старте (`main.py:18
 
 ### 2. Self-rescheduling cron-тики
 
-Вся периодика — **не через rq-scheduler в явном виде и не через внешний cron**, а через паттерн «функция в конце своего тела снова ставит себя в очередь через `queue.enqueue_in(timedelta(...), 'app.worker.run_XXX_tick')`». Пять штук:
+Вся периодика — **не через rq-scheduler в явном виде и не через внешний cron**, а через паттерн «функция в конце своего тела снова ставит себя в очередь через `queue.enqueue_in(timedelta(...), 'app.worker.run_XXX_tick')`». Шесть штук:
 
 | Функция                    | Default interval             | Что делает                                       |
 |----------------------------|------------------------------|---------------------------------------------------|
@@ -57,6 +57,7 @@ Backend прогоняет `alembic upgrade head` на старте (`main.py:18
 | `run_renewal_check`        | `RENEWAL_CHECK_INTERVAL=300` | Expire-ит подписки, инициирует renewal reminders, hard-revoke после grace |
 | `run_warm_pool_check`      | `WARM_POOL_CHECK_INTERVAL=120` | Топит warm pool на каждой активной ноде до `WARM_POOL_TARGET` |
 | `run_balance_charge_tick`  | `BALANCE_CHARGE_INTERVAL=3600` | Renew balance-подписок, expire auto_renew=False, auto-unfreeze, clawback trial |
+| `run_traffic_stats_tick`   | `TRAFFIC_STATS_INTERVAL=300` | SSH на каждую active/draining ноду, читает xray stats + sharing violations → `node_traffic_samples` + `AuditLog` |
 
 ### Bootstrap при старте воркера
 
@@ -152,11 +153,28 @@ Drain тика продолжает работать даже при `AUTOSCALE_
 
 `_maybe_emit_low_balance_warning` (`worker.py:450-520`) — идемпотентен на календарный день: проверяет, нет ли уже `low_balance_warning` audit-лога на сегодня у этого пользователя, только тогда пишет новый. Это и есть единственный механизм дедупликации нотификаций — бот не отслеживает ack'и сверх `:delivered` маркера.
 
+## Retry и DLQ
+
+Единичные provisioning-задачи (`run_provisioning_task`) ставятся в очередь через `queue.enqueue_task()` с:
+
+- `Retry(max=3, interval=[10, 30, 120])` — три попытки с нарастающим backoff
+- `job_timeout=RQ_JOB_TIMEOUT` (default 900s) — hard-kill per job
+- `failure_ttl=RQ_FAILED_TTL` (default 604800 = 1 неделя) — сколько RQ хранит упавший job в FailedJobRegistry
+
+Если все 3 retry исчерпаны, RQ вызывает `dlq_exception_handler` (зарегистрирован на Worker через `exception_handlers`). Хендлер:
+
+1. Инкрементирует `vpn_provisioning_dlq_total` Prometheus counter
+2. Пишет `AuditLog(action="provisioning_dlq")` с `job_id`, `exc_type`, `error` (первые 500 символов)
+3. Логирует через `logger.error`
+
+Отдельной DLQ-очереди нет — RQ's FailedJobRegistry и есть DLQ. Audit-лог обеспечивает видимость в admin UI без ковыряния Redis.
+
 ## Метрики
 
 Работают prometheus-клиенты напрямую в процессе воркера. Глобальная `CollectorRegistry` — это то, почему воркер обязан импортироваться под каноническим именем (см. выше). Экспорт метрик воркера в backend'овый `/metrics` **не происходит автоматически** — воркер не слушает HTTP, его метрики доступны только если поверх натянут push-gateway или отдельный exporter.
 
 Основные:
+- `vpn_provisioning_dlq_total` — provisioning jobs, исчерпавшие retry (dead-letter)
 - `vpn_renewal_check_runs_total{outcome}` — количество renewal-тиков (`worker.py:26-28`)
 - `vpn_renewal_check_last_run_timestamp` — unix ts последнего успешного тика
 - `vpn_renewal_revoked_total` — subs auto-revoked после grace
@@ -190,5 +208,5 @@ Drain тика продолжает работать даже при `AUTOSCALE_
 
 - Структура обработки ошибок между тиками неконсистентна (см. выше). Не ясно, намеренно ли `run_autoscale_tick` падает молча при ошибке `evaluate_all_pools`, или это пропущено.
 - `WARM_POOL_MAX_CONCURRENT` задаётся в compose (`docker-compose.yml:127`, default 2), но в коде `run_warm_pool_check` сам его не читает — лимит применяется глубже, в `services/warm_pool.py` через `threading.Semaphore`. Поведение этого семафора при горизонтальном масштабировании воркеров — см. `components/warm-pool.md`.
-- Retry-политика единичных `run_provisioning_task` при падении ansible'а — не очевидна из самого `worker.py`. RQ имеет встроенный retry через `Job.retry`, но в коде `enqueue_task` в `backend/app/queue.py` его использование нужно проверять отдельно.
+- ✅ Retry-политика единичных `run_provisioning_task`: `Retry(max=3, interval=[10, 30, 120])` + `dlq_exception_handler` при окончательном провале → пишет в audit_log. См. § Retry и DLQ.
 - `worker.work(with_scheduler=True)` поднимает scheduler-поток внутри worker-процесса. При двух параллельно запущенных воркерах обa поднимут scheduler — как RQ это разруливает (один scheduler побеждает по advisory lock?) из кода не видно.

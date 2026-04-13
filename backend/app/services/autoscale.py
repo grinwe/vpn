@@ -35,6 +35,7 @@ from decimal import Decimal
 from typing import Iterable
 
 from prometheus_client import Counter, Gauge
+from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from .. import models
@@ -199,6 +200,25 @@ def _active_subs_on_nodes(db: Session, nodes: Iterable[models.VPNNode]) -> int:
     )
 
 
+# #61 — advisory lock namespace. Two-int form of pg_advisory_xact_lock
+# so different apps sharing the same Postgres don't collide.
+_ADVISORY_NS = 0xA5CA  # mnemonic: "autoscale"
+
+
+def _try_lock_pool(db: Session, pool_id: int) -> bool:
+    """Try to acquire a per-pool advisory lock for this transaction.
+
+    Returns True if the lock was acquired, False if another worker
+    already holds it. The lock is released automatically when the
+    session's transaction commits or rolls back.
+    """
+    row = db.execute(
+        text("SELECT pg_try_advisory_xact_lock(:ns, :pid)"),
+        {"ns": _ADVISORY_NS, "pid": pool_id},
+    )
+    return bool(row.scalar())
+
+
 def _record(pool_name: str, outcome: str, utilization: float, eligible: int) -> None:
     """Single point that touches Prometheus so every return path stays consistent."""
     POOL_UTILIZATION.labels(pool=pool_name).set(utilization)
@@ -207,6 +227,21 @@ def _record(pool_name: str, outcome: str, utilization: float, eligible: int) -> 
 
 
 def evaluate_pool(db: Session, pool: models.ServerPool) -> PoolDecision:
+    # #61 — distributed lock. If another worker is already evaluating
+    # this pool, skip it — the next tick will pick it up.
+    if not _try_lock_pool(db, pool.id):
+        _record(pool.name, "locked", 0.0, 0)
+        return PoolDecision(
+            pool_id=pool.id,
+            pool_name=pool.name,
+            utilization=0.0,
+            total_capacity=0,
+            active_subs=0,
+            node_count=len(pool.nodes),
+            scaled_up=False,
+            reason="skipped — another worker holds the pool lock",
+        )
+
     if not pool.autoscale_enabled:
         _record(pool.name, "disabled", 0.0, 0)
         return PoolDecision(
@@ -440,6 +475,20 @@ def evaluate_pool_downscale(db: Session, pool: models.ServerPool) -> DrainDecisi
     done by ``run_drain_tick``. Keeping the two split mirrors the
     spawn/bootstrap split on the upscale side.
     """
+    # #61 — same distributed lock as upscale. Prevents a race where one
+    # worker spawns while another drains the same pool.
+    if not _try_lock_pool(db, pool.id):
+        _record_drain(pool.name, "locked", 0.0, 0)
+        return DrainDecision(
+            pool_id=pool.id,
+            pool_name=pool.name,
+            utilization=0.0,
+            eligible_nodes=0,
+            already_draining=0,
+            marked_node_id=None,
+            reason="skipped — another worker holds the pool lock",
+        )
+
     if not DOWNSCALE_ENABLED:
         _record_drain(pool.name, "disabled", 0.0, 0)
         return DrainDecision(

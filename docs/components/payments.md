@@ -60,21 +60,35 @@ Legacy fallback: если `PAYMENT_PROVIDERS` не задан, читается 
 - **Округление вверх**: `stars = max(1, int(amount + 0.999))` (`telegram_stars.py:58-59`). Stars — целые юниты, ни 0.5 XTR, ни 0 XTR быть не может.
 - **Title обрезается до 32 символов** (`telegram_stars.py:62-63`) — Bot API жёстко лимитирует, иначе call возвращает 400.
 
-Webhook на стороне backend'а — это **не** callback от TG. Поток такой:
+#### Режим 1 (deprecated): shared-secret relay через бота
+
+Старый поток (audit #62 — shared-bearer как единственная аутентификация):
 
 ```
-user pays in TG → TG шлёт successful_payment → bot handler
+user pays → TG шлёт successful_payment → bot handler
      → bot POST backend:/api/payments/webhook/telegram_stars
         + X-Telegram-Stars-Secret: <shared>
 ```
 
-`verify_webhook`:
-- Проверяет `X-Telegram-Stars-Secret` через `hmac.compare_digest` — это **не подпись данных**, а классический shared-bearer (`telegram_stars.py:92-99`).
-- Принимает либо голый `successful_payment`, либо полный update envelope (`sp = payload.get("successful_payment") or payload`) — «being liberal saves a foot-gun later» (комментарий).
-- `currency` должен быть `"XTR"`, иначе 401 → «someone wired non-Stars successful_payment to this route».
-- Статус всегда `"paid"` — у `successful_payment` нет `canceled`/`expired` вариантов, они не доходят сюда.
+`verify_webhook` проверял `X-Telegram-Stars-Secret` через `hmac.compare_digest` — классический shared-bearer. Если секрет утёк, фейковый payment проходил.
 
-Bot → backend forward описан в `components/bot.md` (раздел Stars-платёжный поток).
+#### Режим 2 (рекомендуемый): native Telegram webhook
+
+После #62 backend регистрирует себя как Telegram webhook через `setWebhook(url=.../tg-webhook, secret_token=...)`. Telegram сам подтверждает аутентичность обновлений заголовком `X-Telegram-Bot-Api-Secret-Token`.
+
+```
+user pays → TG шлёт update на /tg-webhook (backend напрямую)
+     → backend проверяет secret_token header
+     → если successful_payment (XTR): _mark_invoice_paid_core
+     → если pre_checkout_query (XTR): answerPreCheckoutQuery(ok=True) через Bot API
+     → иначе: forward в bot через BOT_INTERNAL_WEBHOOK_URL
+```
+
+Env для активации: `TELEGRAM_WEBHOOK_SECRET_TOKEN`, `TELEGRAM_WEBHOOK_URL`, `BOT_INTERNAL_WEBHOOK_URL`, `BOT_WEBHOOK_PORT`. Бот переходит из polling в webhook-режим (aiohttp-сервер на внутреннем порте).
+
+Старый shared-secret путь (`telegram_stars.py:verify_webhook`) остаётся для backward compat, но `TELEGRAM_STARS_WEBHOOK_SECRET` теперь необязательна.
+
+Bot → backend forward описан в `components/bot.md`.
 
 ### Generic SBP (`generic_sbp.py`)
 
@@ -273,4 +287,4 @@ bot/handlers.py                                   │
 - **`verify_webhook` у Stars принимает любой currency только через ручную проверку.** `raise` срабатывает только если `sp.currency != "XTR"` — а если поле отсутствует, используется fallback `"XTR"` (`telegram_stars.py:114`). Это нужно, потому что forward от бота иногда не содержит currency, но делает провайдер чуть слепее, чем хотелось бы.
 - **Referral-payout на `kind=topup` не атомарен с самим топапом.** Оба идут внутри одной транзакции `_mark_invoice_paid_core`, но обёрнуты разными `try/except`: ошибка бонуса не откатывает топап, но ошибка топапа откатывает бонус через общий rollback. Комментарий в коде сам это признаёт: «Payout will be retried by a nightly reconciliation if we ever add one; for now it's fire-and-forget».
 
-> ⚠️ См. audit/... — shared-bearer как единственная аутентификация Stars webhook'а.
+> ✅ Исправлено (#62): native Telegram webhook (`/tg-webhook`) заменяет shared-bearer. Старый polling-relay deprecated.

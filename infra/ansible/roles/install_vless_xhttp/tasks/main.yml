@@ -48,12 +48,26 @@
   register: xray_xhttp_install
   changed_when: "'already installed' not in xray_xhttp_install.stdout"
 
+# Also in bootstrap_node (the authoritative one). Kept here as a
+# safety net in case bootstrap order changes.
+- name: Ensure xray log directory
+  file:
+    path: /var/log/xray
+    state: directory
+    owner: nobody
+    group: nogroup
+    mode: '0750'
+
+# Directory is shared with install_vless_reality whose xray process
+# runs as nobody:nogroup (upstream xray.service has User=nobody).
+# group=root + mode=0750 would strip traverse permission for nobody
+# and cause "permission denied" on the next reality xray restart.
 - name: Ensure xray config directory
   file:
     path: /usr/local/etc/xray
     state: directory
     owner: root
-    group: root
+    group: nogroup
     mode: '0750'
 
 - name: Obtain TLS certificate via certbot (if no cert path provided)
@@ -157,3 +171,25 @@
     enabled: yes
     state: started
     daemon_reload: yes
+
+- name: Flush xray-xhttp handlers before leaving the role
+  meta: flush_handlers
+
+- name: Check if xray-xhttp is actually running
+  command: systemctl is-active xray-xhttp
+  register: _xray_xhttp_active
+  changed_when: false
+  failed_when: false
+
+- name: Reset xray-xhttp failed state
+  command: systemctl reset-failed xray-xhttp
+  when: _xray_xhttp_active.stdout != 'active'
+  changed_when: false
+  failed_when: false
+
+- name: Force-start xray-xhttp after clearing failed state
+  systemd:
+    name: xray-xhttp
+    state: restarted
+    daemon_reload: yes
+  when: _xray_xhttp_active.stdout != 'active'

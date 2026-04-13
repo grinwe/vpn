@@ -30,7 +30,7 @@ scoped API tokens. Это инфраструктура уровня коммер
 | B | Протоколы: дописать Ansible роли (VLESS+XHTTP, Hysteria2) | 🔴 Критично | 3-4 дня |
 | C | CORS explicit origins | 🟡 Средне | 0.5 дня |
 | D | Per-route rate limits (auth, topup, activate) | 🟡 Средне | 0.5 дня |
-| E | YooKassa → удалить | 🟡 Средне | 1 день |
+| ~~E~~ | ~~YooKassa → удалить~~ | ✅ Готово | — |
 | F | Docker secrets для SSH key и APP_SECRET_KEY | 🟡 Средне | 0.5 дня |
 | G | Экран «Подписка готова» после активации | 🟡 UX | 0.5 дня |
 | H | Relay-архитектура (RU jump-нода → WG tunnel → зарубежная нода) | 🔴 Стратегически | 2-3 дня |
@@ -185,17 +185,9 @@ AllowedIPs = 10.77.0.X/32
 
 ## Фаза 4: Операционная готовность (неделя 3)
 
-### 🟡 E. Drop YooKassa (1 день)
+### ✅ E. Drop YooKassa — DONE
 
-YooKassa гарантированно откажет VPN-мерчанту. 65-75% VPN-сервисов уже потеряли
-российские платёжные системы.
-
-**Рекомендуемый платёжный стек:**
-1. **Telegram Stars** — primary (нативная интеграция, нет юрлица в РФ)
-2. **CryptoBot USDT/TON** — secondary (комиссия 1-3%, стимулировать дисконтом 10-15%)
-3. **Card-to-card (SBP)** — manual fallback для крупных сумм
-
-Стратегия: Stars для онбординга, CryptoBot для повторных оплат с дисконтом.
+YooKassa удалена из кода. Текущий платёжный стек: Telegram Stars (primary), CryptoBot (secondary), SBP generic (manual fallback).
 
 ### 🟡 G. Экран «Подписка готова» (0.5 дня)
 
@@ -215,7 +207,7 @@ YooKassa гарантированно откажет VPN-мерчанту. 65-75
 | Security Sprint | Redis, CORS, per-route limits, Docker secrets | 2 |
 | Протоколы | VLESS+XHTTP роль, Hysteria2 роль, Reality обновление | 3-4 |
 | Relay-архитектура | WG exit-node роль, RU relay настройка, provisioning | 2-3 |
-| Операционная готовность | Drop YooKassa, activation UX screen | 1.5 |
+| Операционная готовность | ~~Drop YooKassa~~, activation UX screen | 0.5 |
 | **Итого** | | **~9-11 дней** |
 
 ---
@@ -287,4 +279,4 @@ YooKassa гарантированно откажет VPN-мерчанту. 65-75
 5. **VLESS Reality обновление** — 0.5 дня, whitelisted SNI + gRPC
 6. **Relay-архитектура** — 2-3 дня, RU jump-нода + WG tunnel (референс: vpn-setup)
 7. **Экран «Подписка готова»** — 0.5 дня, UX fix
-8. **Drop YooKassa** — 1 день, убрать юридический риск
+8. ~~**Drop YooKassa**~~ — ✅ done

@@ -50,12 +50,26 @@
   register: xray_ws_install
   changed_when: "'already installed' not in xray_ws_install.stdout"
 
+# Also in bootstrap_node (the authoritative one). Kept here as a
+# safety net in case bootstrap order changes.
+- name: Ensure xray log directory
+  file:
+    path: /var/log/xray
+    state: directory
+    owner: nobody
+    group: nogroup
+    mode: '0750'
+
+# Directory is shared with install_vless_reality whose xray process
+# runs as nobody:nogroup (upstream xray.service has User=nobody).
+# group=root + mode=0750 would strip traverse permission for nobody
+# and cause "permission denied" on the next reality xray restart.
 - name: Ensure xray config directory
   file:
     path: /usr/local/etc/xray
     state: directory
     owner: root
-    group: root
+    group: nogroup
     mode: '0750'
 
 # Preserve clients added dynamically by manage_vless_ws_user.sh across
@@ -130,3 +144,25 @@
     enabled: yes
     state: started
     daemon_reload: yes
+
+- name: Flush xray-ws-cdn handlers before leaving the role
+  meta: flush_handlers
+
+- name: Check if xray-ws-cdn is actually running
+  command: systemctl is-active xray-ws-cdn
+  register: _xray_ws_cdn_active
+  changed_when: false
+  failed_when: false
+
+- name: Reset xray-ws-cdn failed state
+  command: systemctl reset-failed xray-ws-cdn
+  when: _xray_ws_cdn_active.stdout != 'active'
+  changed_when: false
+  failed_when: false
+
+- name: Force-start xray-ws-cdn after clearing failed state
+  systemd:
+    name: xray-ws-cdn
+    state: restarted
+    daemon_reload: yes
+  when: _xray_ws_cdn_active.stdout != 'active'

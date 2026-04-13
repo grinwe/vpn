@@ -7,7 +7,7 @@ import { useEffect, useState } from "react";
 
 export type Route =
   | { name: "home" }
-  | { name: "plans" }
+  | { name: "plans"; subscriptionId?: number }
   | { name: "history" }
   | { name: "help" }
   | { name: "checkout"; invoiceId: number };
@@ -16,6 +16,8 @@ function parseHash(): Route {
   const raw = window.location.hash.replace(/^#/, "");
   if (raw === "" || raw === "/") return { name: "home" };
   if (raw === "plans" || raw === "/plans") return { name: "plans" };
+  const planChange = raw.match(/^\/?plans\/change\/(\d+)$/);
+  if (planChange) return { name: "plans", subscriptionId: Number(planChange[1]) };
   if (raw === "history" || raw === "/history") return { name: "history" };
   if (raw === "help" || raw === "/help") return { name: "help" };
   const m = raw.match(/^\/?checkout\/(\d+)$/);
@@ -28,7 +30,9 @@ export function navigate(route: Route): void {
     route.name === "home"
       ? "/"
       : route.name === "plans"
-        ? "/plans"
+        ? route.subscriptionId
+          ? `/plans/change/${route.subscriptionId}`
+          : "/plans"
         : route.name === "history"
           ? "/history"
           : route.name === "help"

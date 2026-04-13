@@ -147,6 +147,7 @@ docker compose exec db psql -U vpn -d vpn -c \
   journalctl -u xray --no-pager -n 50
   ```
   Типичный fix для xray: `config.json` битый (невалидный JSON после ручного редактирования). Откатить на `config.json.1` (backup рендерит сама роль), `systemctl restart xray`.
+  > **Примечание:** с апреля 2026 протокольные роли содержат auto-recovery — если xray unit в `failed` state, роль сама делает `reset-failed` + restart. Ручное вмешательство нужно только если auto-recovery тоже падает (читай вывод ansible).
 - **`Config validation failed`** (install_vless_reality) — `xray -test` упал. Смотреть вывод в ansible stderr — там точный текст ошибки.
 
 **После fix'а:**
@@ -211,9 +212,12 @@ docker compose exec db psql -U vpn -d vpn -c \
 По провайдерам:
 
 - **CryptoBot:** сигнатура не сошлась → 401. Проверить `CRYPTOBOT_TOKEN` в `.env`, HMAC считается от **sha256(token)** как ключа. Логи backend'а должны показать `Invalid Crypto-Pay-Api-Signature`. Если да — токен перевыпустили, обновить в `.env` + `force-recreate backend`.
-- **Telegram Stars:** webhook **не** идёт от TG напрямую — его форвардит бот (см. `components/bot.md`). Если `bot` упал, Stars-платежи теряются.
-  - Смотреть `bot` логи на `successful_payment` event.
-  - Проверить `TELEGRAM_STARS_WEBHOOK_SECRET` одинаково в `backend` и `bot` env.
+- **Telegram Stars (webhook-режим, #62):** TG шлёт update'ы напрямую на `POST /tg-webhook` backend'а. Backend проверяет `X-Telegram-Bot-Api-Secret-Token` и обрабатывает `successful_payment`/`pre_checkout_query` самостоятельно. Если не приходят:
+  - Проверить `TELEGRAM_WEBHOOK_SECRET_TOKEN` и `TELEGRAM_WEBHOOK_URL` в `.env`.
+  - Проверить nginx location `= /tg-webhook` проксирует на backend.
+  - `docker compose logs backend | grep tg-webhook` — видны ли входящие update'ы?
+  - `docker compose logs backend | grep setWebhook` — webhook зарегистрировался на startup?
+- **Telegram Stars (polling legacy):** Если `BOT_WEBHOOK_PORT=0` — старый поток, webhook форвардится ботом. Смотреть `bot` логи на `successful_payment` event. Проверить `TELEGRAM_STARS_WEBHOOK_SECRET` одинаково в обоих env.
 - **SBP (generic):** webhook может не прийти, если провайдер кладёт его на URL, закрытый nginx'ом или CF WAF'ом. Смотреть `/var/log/nginx/access.log` на хосте — есть ли вообще POST на `/api/payments/webhook/<slug>`.
 
 **Manual mark paid:** админский путь — через бота `/invoices` → inline-кнопка, или через SPA. Это триггерит `_mark_invoice_paid_core`, который сделает branch-specific логику (topup vs renewal vs new_subscription). См. `components/payments.md`.
@@ -240,7 +244,8 @@ FROM vpn_nodes WHERE id = <X>;
 **Fix «оживить ноду после error»:**
 
 ```sql
-UPDATE vpn_nodes SET status='active', health_score=100, cooldown_until=NULL WHERE id=<X>;
+UPDATE vpn_nodes SET status='active', health_score=NULL, cooldown_until=NULL WHERE id=<X>;
+-- health_score=NULL — score пересчитается автоматически из health_probes при следующем check
 ```
 
 После этого прогнать health check вручную через `/api/nodes/<X>/health` или перезапустить ansible `site.yml -l <name>`.

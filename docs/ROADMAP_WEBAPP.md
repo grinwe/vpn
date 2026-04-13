@@ -76,7 +76,7 @@
 
 ### Этап 2 — Покупка через WebApp (Telegram Stars)
 
-**Цель:** довести цикл «открыл WebApp → выбрал тариф → оплатил → получил конфиг» до состояния «работает целиком, не выходя из Telegram». Без редиректов в браузер. YooKassa отложена (риск блокировки), но провайдерный слой пишем расширяемо, чтобы её добавить было одной задачей.
+**Цель:** довести цикл «открыл WebApp → выбрал тариф → оплатил → получил конфиг» до состояния «работает целиком, не выходя из Telegram». Без редиректов в браузер. Провайдерный слой расширяемый (Stars, CryptoBot, SBP generic).
 
 **Почему именно Stars сначала:**
 - Нативный UX: `tg.openInvoice(slug)` открывает Stars-checkout поверх WebApp, юзер платит, окно закрывается, callback приходит с `paid` — никакого `return_url`, никаких редиректов, работает на iOS/Android/Desktop одинаково.
@@ -89,7 +89,7 @@
    - `POST /api/webapp/plans` (или `GET`) — список планов в формате, заточенном под карточки WebApp: `id, name, tier (Solo|Family|Pro), period (month|year), price_rub, price_stars, max_devices, badge`. Поле `badge` — `popular` для Family.
    - `POST /api/webapp/checkout` — `{plan_id, provider: "stars"}`. Создаёт `Invoice(status=pending)`, дёргает Bot API `createInvoiceLink` (currency `XTR`, prices в звёздах), сохраняет `provider_invoice_id` в Invoice, возвращает `{invoice_id, slug}`. Slug — это `https://t.me/$<hash>`, его фронт скармливает в `tg.openInvoice`.
    - `GET /api/webapp/invoices/{id}` — статус инвойса для поллинга после оплаты.
-   - Расширение `models.Invoice` (если надо): поле `provider` (enum: `stars`, `yookassa`, `cryptobot`, `manual`), `provider_invoice_id` (string, nullable). Alembic-ревизия.
+   - Расширение `models.Invoice` (если надо): поле `provider` (enum: `stars`, `cryptobot`, `sbp`, `manual`), `provider_invoice_id` (string, nullable). Alembic-ревизия.
 
 2. **Bot — обработчики Stars-платежа:**
    - `pre_checkout_query` хендлер: всегда `answer_pre_checkout_query(ok=True)` (валидацию мы уже сделали при `createInvoiceLink`). Оборачиваем в try/except, чтобы гарантированно ответить за 10 сек — иначе TG отменит платёж.

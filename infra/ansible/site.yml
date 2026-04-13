@@ -24,6 +24,9 @@
     # external probers miss.
     - role: install_probe_agent
       when: probe_agent_backend_url | default('') | length > 0
+    # Sharing enforcer — local daemon that detects credential sharing
+    # via xray access logs and disrupts it via gRPC rmuser/adduser.
+    - install_sharing_enforcer
     - check_node_health
 
 # ── WireGuard exit nodes (foreign, non-RU) ──────────────────────────

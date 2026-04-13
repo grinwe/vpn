@@ -3,7 +3,7 @@ import logging
 from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
 from aiogram.fsm.storage.memory import MemoryStorage
-from .config import BOT_TOKEN, BACKEND_URL, ADMIN_API_TOKEN, NOTIFICATION_POLL_INTERVAL
+from .config import BOT_TOKEN, BACKEND_URL, ADMIN_API_TOKEN, NOTIFICATION_POLL_INTERVAL, BOT_WEBHOOK_PORT
 from .handlers import close_session, router, get_session, onboarding_keyboard
 from .keyboards import DEFAULT_COMMANDS
 from .support import support_router
@@ -98,7 +98,29 @@ async def main():
         poller_task = asyncio.create_task(notification_poller(bot))
 
     try:
-        await dp.start_polling(bot)
+        if BOT_WEBHOOK_PORT > 0:
+            # #62 — Webhook mode: the backend forwards Telegram updates to
+            # this internal aiohttp server. Payment updates are handled by
+            # the backend directly and never reach here.
+            from aiohttp import web
+            from aiogram.webhook.aiohttp_server import SimpleRequestHandler
+
+            wh_app = web.Application()
+            handler = SimpleRequestHandler(dispatcher=dp, bot=bot)
+            handler.register(wh_app, path="/webhook")
+
+            runner = web.AppRunner(wh_app)
+            await runner.setup()
+            site = web.TCPSite(runner, host="0.0.0.0", port=BOT_WEBHOOK_PORT)
+            await site.start()
+            logger.info("Bot webhook server listening on 0.0.0.0:%d", BOT_WEBHOOK_PORT)
+
+            try:
+                await asyncio.Event().wait()  # run until cancelled
+            finally:
+                await runner.cleanup()
+        else:
+            await dp.start_polling(bot)
     finally:
         if poller_task:
             poller_task.cancel()

@@ -1,0 +1,24 @@
+[Unit]
+Description=xray credential sharing enforcer
+After=network.target
+# Start after any xray service that might be present
+After=xray.service xray-ws-cdn.service xray-xhttp.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /usr/local/bin/xray_enforcer.py
+Restart=always
+RestartSec=5
+
+Environment=ENFORCER_CHECK_INTERVAL={{ enforcer_check_interval | default(10) }}
+Environment=ENFORCER_WINDOW_SECONDS={{ enforcer_window_seconds | default(120) }}
+Environment=ENFORCER_MAX_IPS={{ enforcer_max_ips | default(1) }}
+Environment=ENFORCER_RECONNECT_DELAY={{ enforcer_reconnect_delay | default(2) }}
+
+# Logging goes to journald
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=xray-enforcer
+
+[Install]
+WantedBy=multi-user.target

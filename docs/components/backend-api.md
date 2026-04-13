@@ -6,9 +6,9 @@ FastAPI-приложение из `backend/app/main.py`. Три роутера, 
 
 ```python
 # backend/app/main.py:107-109
-app.include_router(api_router)     # api.py         — admin surface
-app.include_router(ext_router)     # api_extensions — mixed / public /sub
-app.include_router(webapp_router)  # api_webapp     — Mini App
+app.include_router(api_router)     # api/             — admin surface (package с 16 модулями)
+app.include_router(ext_router)     # api_extensions   — mixed / public /sub
+app.include_router(webapp_router)  # api_webapp       — Mini App
 ```
 
 На старте (`main.py:18`) прогоняются alembic-миграции, затем `reset_stuck_tasks()` подбирает `ProvisioningTask.status=running|pending` с прошлой жизни процесса и перепихивает их в очередь. Это даёт корректный recovery после жёсткого рестарта, но двойной запуск idempotent ansible-playbook'а — плата за простоту (см. `components/worker.md`).
@@ -24,44 +24,38 @@ Middleware порядок:
 
 | Роутер | Префикс | Модуль | Auth | Кто зовёт |
 |---|---|---|---|---|
-| `api_router` | `/api` | `api.py` | `X-Admin-Token` (shared secret) или scoped `X-Api-Token` | admin SPA, bot, probe-агенты, traffic-коллекторы |
+| `api_router` | `/api` | `api/` (package) | `X-Admin-Token` (shared secret) или scoped `X-Api-Token` | admin SPA, bot, probe-агенты, traffic-коллекторы |
 | `webapp_router` | `/api/webapp` | `api_webapp.py` | Telegram `initData` → короткоживущий JWT | браузер пользователя внутри Telegram Mini App |
 | `ext_router` | `/api` | `api_extensions.py` | смешанная: `/sub/{token}` — public, остальное — `require_admin` или `optional_admin` | Hiddify/v2rayNG (public sub link), бот (нотификации), admin |
 
 Общий префикс `/api` у `api_router` и `ext_router` означает, что они фактически делят namespace — FastAPI собирает обе таблицы маршрутов в один роутинг, различая по конкретному пути.
 
-## `api.py` — admin surface
+## `api/` — admin surface
 
-~2830 строк, ~55 роутов. Разбит логически на блоки (без подроутеров, только комментарии):
+~3240 строк, 62 роута, 16 модулей. Реализован как Python-пакет: `backend/app/api/__init__.py` собирает master-router (`APIRouter(prefix="/api")`) из листовых модулей через `include_router`. Каждый подмодуль держит свой локальный `router = APIRouter()` (без префикса — пути внутри файлов читаются как `/plans`, а не `/api/plans`), что упрощает unit-тесты в изоляции.
 
-```
-/api/healthz              health check (public, deep=true проверяет queue)
-/api/stats                admin dashboard summary
-/api/nodes                CRUD нод, resync/bootstrap/diagnose/active toggle
-/api/nodes/{id}/configs   VPNConfig CRUD
-/api/nodes/{id}/probes    агрегация health-проб (scoped: probe:write)
-/api/nodes/{id}/health    последний health score (probe:read)
-/api/nodes/{id}/migrate   принудительная миграция subs на другую ноду
-/api/nodes/spawn          spawn через CloudProvider
-/api/nodes/{id}/destroy   destroy через CloudProvider
-/api/provisioning/tasks   просмотр/retry/delete/batch ProvisioningTask
-/api/subscriptions        POST — создание subscription + провижининг
-/api/subscriptions/{id}   status, disable, enable, devices, disable
-/api/devices/{id}         GET status, POST revoke
-/api/users                listing, by_telegram, balance, disable
-/api/users/{id}/topup     admin топап пользователя в копейках
-/api/plans                CRUD (видимость, duration, цена)
-/api/invoices             listing, create, mark_paid, cancel, mark_unpaid, batch
-/api/invoices/{id}/checkout создать pay_url у провайдера
-/api/payments             legacy вручную записать Payment
-/api/payments/webhook/{provider_name} webhook endpoints от провайдеров
-/api/cloud/providers      CRUD CloudProvider
-/api/pools/{id}/autoscale обновить autoscale knobs
-/api/autoscale/tick       ручной дёрг autoscale-тика
-/api/api-tokens           выдача/удаление scoped токенов
-/api/audit-logs           чтение journal'а
-/api/probes/targets       выдача списка targets probe-агенту
-```
+### Карта модулей
+
+| Модуль | Префикс(ы) | LOC | Что делает |
+|---|---|---|---|
+| `api/_common.py` | — | 177 | `get_db`, `_audit`, `_resolve_admin_actor`, `_get_or_create_user`, `_get_user_from_payload`, `_create_subscription_for_user`, `ADMIN_ACTOR_HEADER`, `logger`. Общие зависимости для всех листовых модулей. |
+| `api/health.py` | `/healthz`, `/stats` | 102 | health check (public, `deep=true` проверяет очередь) + admin dashboard summary |
+| `api/plans.py` | `/plans` | 82 | CRUD планов (видимость, duration, цена) |
+| `api/audit.py` | `/audit-logs` | 44 | чтение журнала аудита |
+| `api/tokens.py` | `/api-tokens` | 104 | выдача/отзыв scoped API-токенов |
+| `api/nodes.py` | `/nodes` + subpaths | 596 | CRUD нод, resync/bootstrap/diagnose/active toggle, `/configs` CRUD, spawn/destroy через CloudProvider, миграция подписок, health |
+| `api/tasks.py` | `/provisioning/tasks` | 276 | просмотр/retry/delete/batch `ProvisioningTask` + `_enrich_task_telegram` (батч-резолв `telegram_id` для ADMIN_UI) |
+| `api/subscriptions.py` | `/subscriptions`, `/devices` | 309 | POST — создание subscription + провижининг; status/disable/enable/devices; revoke устройства |
+| `api/users.py` | `/users` | 291 | listing, by_telegram, balance, disable, `/topup` (admin топап в копейках). Хостит `_subscriptions_for_user`, который re-exported из `api/__init__.py` и используется `api_webapp.py` |
+| `api/traffic.py` | `/subscriptions/{id}/traffic`, `/nodes/{id}/traffic` | 205 | traffic accounting: оба эндпойнта делят `_apply_traffic_delta` (revoke при превышении лимита) |
+| `api/probes.py` | `/nodes/{id}/probes`, `/probes/targets` | 115 | агрегация health-проб (scoped: `probe:write`) + список targets (scoped: `probe:read`) |
+| `api/invoices.py` | `/invoices` | 462 | listing/create/mark_paid/cancel/mark_unpaid/batch + `_mark_invoice_paid_core` (shared с webhook'ом) |
+| `api/payments.py` | `/payments`, `/invoices/{id}/checkout`, `/payments/webhook/{provider_name}` | 169 | создание провайдерского инвойса, webhook от провайдеров (HMAC, не require_admin), legacy ручная запись Payment |
+| `api/cloud.py` | `/cloud/providers` | 148 | CRUD `CloudProvider` (шифрование секретов через `security._encrypt`) |
+| `api/autoscale.py` | `/pools/{id}/autoscale`, `/autoscale/tick` | 98 | autoscale knobs + ручной дёрг тика |
+| `api/__init__.py` | master `/api` | 66 | собирает всё через `include_router`, re-export `require_admin` (из `..auth`) и `_subscriptions_for_user` (из `.users`) |
+
+Порядок `include_router` в `__init__.py` чисто для читаемости — FastAPI резолвит роуты по prefix/path, а не по порядку. Группировка примерно соответствует домену (health → plans → audit → tokens → nodes/tasks/subs/users → traffic/probes → invoices/payments → cloud/autoscale).
 
 Большинство роутов сидят под `Depends(require_admin)`. Исключения:
 
@@ -69,7 +63,7 @@ Middleware порядок:
 - **Webhooks** `/api/payments/webhook/{provider_name}` — НЕ требуют admin-token, они авторизуются самим провайдером через HMAC-подпись. См. `components/payments.md`.
 - **`/api/healthz`** — public (liveness/readiness).
 
-Ключевая вспомогательная функция — `_mark_invoice_paid_core` (`api.py:1774`). Именно её дёргают и admin, и webhook'и; она берёт `SELECT FOR UPDATE` на `Invoice`, проверяет статус, при `kind='topup'` идёт в `services.balance.topup()`, при `kind='subscription'` — в `ProvisioningOrchestrator`.
+Ключевая вспомогательная функция — `_mark_invoice_paid_core` (`api/invoices.py:61`). Именно её дёргают и admin, и webhook'и; она берёт `SELECT FOR UPDATE` на `Invoice`, проверяет статус, при `kind='topup'` идёт в `services.balance.topup()`, при `kind='subscription'` — в `ProvisioningOrchestrator`. Webhook из `api/payments.py` импортирует её напрямую (`from .invoices import _mark_invoice_paid_core`).
 
 ### Пагинация, фильтрация и поиск
 
@@ -77,7 +71,7 @@ Middleware порядок:
 
 ### Audit logging
 
-Внутри admin-роутов любое state-changing действие пишется через `_audit(db, actor, action, target_type, target_id, metadata=...)` (`api.py:49-69`). `actor` приходит из `_resolve_admin_actor(actor_header)` — **заголовок `X-Admin-Actor` не проверяется криптографически**, это self-declared идентификатор для различения действий бота от действий человека. См. `api.py:72-75`.
+Внутри admin-роутов любое state-changing действие пишется через `_audit(db, actor, action, target_type, target_id, metadata=...)` (`api/_common.py:42-69`). `actor` приходит из `_resolve_admin_actor(actor_header)` — **заголовок `X-Admin-Actor` не проверяется криптографически**, это self-declared идентификатор для различения действий бота от действий человека. См. `api/_common.py:72-81`.
 
 > ⚠️ Shared admin token + unchecked actor header = если компрометируется любой носитель токена, audit trail теряет доверие. См. audit/...
 
@@ -86,12 +80,12 @@ Middleware порядок:
 ~1430 строк, ~20 роутов. Это отдельный security domain:
 
 1. Пользователь открывает Mini App → клиентский JS получает от Telegram `window.Telegram.WebApp.initData` (signed query-string).
-2. Frontend шлёт `POST /api/webapp/auth {init_data}` (`api_webapp.py:149`).
-3. Backend верифицирует HMAC по стандартной схеме Telegram: `HMAC-SHA256(data_check_string, HMAC-SHA256("WebAppData", bot_token))` — `api_webapp.py:49-80`.
-4. `auth_date` проверяется на `> 86400` секунд от now (защита от replay) — `api_webapp.py:76-78`.
-5. Если User не существует — создаётся автоматически (`api_webapp.py:176-180`).
-6. Выдаётся **compact hand-rolled JWT**: `base64url(payload).base64url(hmac)`, где `payload = {"uid": id, "exp": now + TTL}`, TTL из `WEBAPP_JWT_TTL_SECONDS` (дефолт 1800 = 30 минут). Не PyJWT — только `hmac` из стандартной библиотеки (`api_webapp.py:94-117`).
-7. Дальнейшие запросы несут `Authorization: Bearer <token>`, проходят через `require_webapp_user` (`api_webapp.py:120-134`), которая возвращает ORM-объект `User`.
+2. Frontend шлёт `POST /api/webapp/auth {init_data}` (`api_webapp.py:173`).
+3. Backend верифицирует HMAC по стандартной схеме Telegram: `HMAC-SHA256(data_check_string, HMAC-SHA256("WebAppData", bot_token))` — `_verify_init_data()` в `api_webapp.py:52-104`.
+4. `auth_date` проверяется жёстко (после fix'а #53, 2026-04): обязан быть, положительный integer, не в будущем (кроме ~60с clock-skew), не старше `WEBAPP_INIT_DATA_TTL_SECONDS` (дефолт **300**, было hardcoded 24h). Раньше `if auth_date and …` молча пропускал проверку при missing/zero — это дыра закрыта.
+5. Если User не существует — создаётся автоматически (`api_webapp.py:195-204`).
+6. Выдаётся **compact hand-rolled JWT**: `base64url(payload).base64url(hmac)`, где `payload = {"uid": id, "exp": now + TTL}`, TTL из `WEBAPP_JWT_TTL_SECONDS` (дефолт 1800 = 30 минут). Не PyJWT — только `hmac` из стандартной библиотеки (`issue_token`/`verify_token` в `api_webapp.py:107-140`).
+7. Дальнейшие запросы несут `Authorization: Bearer <token>`, проходят через `require_webapp_user` (`api_webapp.py:142-156`), которая возвращает ORM-объект `User`.
 
 ### Ключевые endpoints
 
@@ -169,13 +163,13 @@ def dynamic_sub_link(token: str, db: Session = Depends(get_db)):
 ```
                   X-Admin-Token (shared secret, env)
                       │
-                      ├─► api.py (require_admin)            ← admin SPA, bot
-                      ├─► api.py scoped endpoints            ← alt: X-Api-Token
+                      ├─► api/ (require_admin)              ← admin SPA, bot
+                      ├─► api/ scoped endpoints              ← alt: X-Api-Token
                       └─► api_extensions.py (require_admin)  ← bot
                   
                   X-Api-Token (sha256 hashed, scoped)
                       │
-                      └─► api.py scoped                      ← probes, traffic collectors
+                      └─► api/probes.py, api/traffic.py      ← probes, traffic collectors
 
                   Telegram initData → JWT
                       │
@@ -183,24 +177,24 @@ def dynamic_sub_link(token: str, db: Session = Depends(get_db)):
 
                   HMAC signature in body/headers
                       │
-                      └─► api.py /payments/webhook/*          ← payment providers
+                      └─► api/payments.py /payments/webhook/* ← payment providers
 
                   none
                       │
-                      ├─► api.py /healthz
+                      ├─► api/health.py /healthz
                       └─► api_extensions.py /sub/{token}
 ```
 
 ## Обработка ошибок
 
 - FastAPI `HTTPException` — для бизнес-ошибок, превращается в `{"detail": "..."}`.
-- Внутренние сбои логируются через `logger.exception`, наружу уходит generic 500. Исключения — провижининг: `_create_subscription_for_user` ловит любую ошибку, делает rollback, отдаёт 500 "Provisioning failed" (`api.py:119-122`).
+- Внутренние сбои логируются через `logger.exception`, наружу уходит generic 500. Исключения — провижининг: `_create_subscription_for_user` ловит любую ошибку, делает rollback, отдаёт 500 "Provisioning failed" (`api/_common.py:129-160`).
 - Rate limit превышение — 429, обрабатывается SlowAPI middleware.
 
 ## Зависимости роутов от сервисов
 
 ```
-api.py          →  services.provisioning, services.payments,
+api/            →  services.provisioning, services.payments,
                    services.autoscale, services.health,
                    services.node_spawner, services.balance,
                    services.cloud, services.warm_pool
@@ -213,6 +207,5 @@ api_extensions.py → services.provisioning, services.trial
 
 ## ⚠️ Неясные места
 
-- `api_webapp.py` импортирует `_subscriptions_for_user` прямо из `api.py` (`api_webapp.py:30`). Это единственная точка крест-модульного импорта приватных helper'ов — неясно, является ли это осознанным «этот helper shared» или остатком рефакторинга. Если рефакторинг — есть риск неожиданного поведения при изменениях в api.py.
-- `_mark_invoice_paid_core` при уже `paid` инвойсе делает fallback на «latest subscription by (user_id, plan_id)» (`api.py:1810-1820`). Логика защиты от повторной доставки webhook'а, но может отдать пользователю данные **другой** подписки, если он успел купить второй инвойс на тот же план. Код-level ambiguity; см. audit/...
-- `/api/healthz?deep=true` проверяет, что queue доступна, но не гоняет SELECT 1 на неё — `get_queue() is not None` верифицирует наличие Redis connection, но не его работоспособность.
+- `_mark_invoice_paid_core` при уже `paid` инвойсе делает fallback на «latest subscription by (user_id, plan_id)» (`api/invoices.py:96-121`). Логика защиты от повторной доставки webhook'а, но может отдать пользователю данные **другой** подписки, если он успел купить второй инвойс на тот же план. Код-level ambiguity; см. audit/...
+- `/api/healthz?deep=true` проверяет, что queue доступна, но не гоняет SELECT 1 на неё — `get_queue() is not None` верифицирует наличие Redis connection, но не его работоспособность (`api/health.py:21-30`).

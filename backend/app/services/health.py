@@ -108,7 +108,9 @@ def _aggregate(
         for region in per_region_total
         if per_region_total[region] > 0
     }
-    overall = (ok_total / total) if total else 1.0
+    # #64 — zero probes → None, not 1.0. Prevents fresh/unprobed nodes
+    # from appearing as 100% healthy in UI and autoscale selector.
+    overall = (ok_total / total) if total else None
     return overall, per_region, total, dict(per_region_total)
 
 
@@ -135,14 +137,18 @@ def recompute_node_health(
         if rate < BLOCK_THRESHOLD and per_region_samples.get(region, 0) >= MIN_SAMPLES
     )
     node.blocked_regions = blocked or None
-    node.health_score = int(round(overall * 100))
+    node.health_score = int(round(overall * 100)) if overall is not None else None
     node.last_health_check_at = utcnow()
 
     migrated: list[int] = []
     # Same gate as per-region: need enough total samples before we'll
     # pronounce the node dead. Without this, a node that just came up
     # gets killed by the first probe if it fails.
-    global_death = overall < DEAD_THRESHOLD and total_samples >= MIN_SAMPLES
+    global_death = (
+        overall is not None
+        and overall < DEAD_THRESHOLD
+        and total_samples >= MIN_SAMPLES
+    )
     if auto_migrate and (global_death or blocked):
         logger.warning(
             "Node %s degraded: health=%.2f blocked_regions=%s — considering migration",

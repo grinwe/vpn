@@ -28,15 +28,30 @@ vault_app_secret_key: "replace-me-fernet-key"
 # Telegram bot token from @BotFather.
 vault_bot_token: "123456:ABC-..."
 
+# Public @username of the bot (without @). Used by backend to build
+# referral share links (https://t.me/<username>?start=ref_...).
+vault_bot_username: "MyVPNBot"
+
 # Comma-separated telegram user IDs that can use admin bot commands.
 vault_admin_ids: "111111111,222222222"
 
-# Shared secret for Telegram Stars webhook HMAC. Leave empty if
-# you're not using Stars as a payment provider.
+# Telegram webhook secret — used both for the legacy Stars forwarding
+# and for the native Telegram webhook (setWebhook secret_token, #62).
+# Generate with: python -c 'import secrets; print(secrets.token_urlsafe(32))'
 vault_telegram_stars_webhook_secret: ""
+
+# JWT secret for webapp session tokens. At least 32 chars.
+# Generate with: python -c 'import secrets; print(secrets.token_urlsafe(32))'
+# Rotating invalidates all active webapp sessions.
+vault_webapp_jwt_secret: ""
 
 # Cloudflare API token used by certbot-dns-cloudflare for the DNS-01
 # ACME challenge. Scope it to Zone → DNS → Edit on the target zone
 # only (do NOT use a Global API Key). Create at
 # https://dash.cloudflare.com/profile/api-tokens.
 vault_cloudflare_api_token: "replace-me-cf-dns-edit-token"
+
+# Scoped API token for the probe-agent (probe:read + probe:write).
+# Mint via POST /api/api-tokens, then paste the returned plaintext here.
+# Leave empty to skip — probe-agent container will restart-loop on 401.
+vault_probe_agent_token: ""

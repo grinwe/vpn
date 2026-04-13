@@ -14,14 +14,14 @@ Req: `{ init_data: string }` — сырой initData как его отдал Te
 
 Res: `{ token, expires_in, user_id }`.
 
-Что делает бэкенд ([api_webapp.py:148](../backend/app/api_webapp.py#L148)):
+Что делает бэкенд ([api_webapp.py:173](../backend/app/api_webapp.py#L173)):
 
-1. `_verify_init_data()` — парсит querystring, проверяет HMAC-SHA256 по секрету, производному от `BOT_TOKEN`. Если подпись не сходится — 401 `bad initData signature`.
+1. `_verify_init_data()` — парсит querystring, проверяет HMAC-SHA256 по секрету, производному от `BOT_TOKEN`. Если подпись не сходится — 401 `initData hash mismatch`. Плюс жёсткая валидация `auth_date`: обязан быть, положительный integer, не в будущем (60с clock-skew), не старше `WEBAPP_INIT_DATA_TTL_SECONDS` (дефолт 300с) — закрыли дыру «auth_date=0 / missing пропускали TTL», было 24h hardcoded (fix #53, 2026-04).
 2. `json.loads(parsed["user"])` — извлекает Telegram user object.
 3. `User.get_or_create(telegram_id=…)` — здесь может родиться новая строка в `users` без `/start` в боте. Это ожидаемо: юзер, открывший WebApp через deeplink до бот-приветствия, сразу валидный.
 4. `issue_token(user_id, WEBAPP_JWT_SECRET, WEBAPP_JWT_TTL_SECONDS)` — HS256, payload `{sub: user_id, exp, iat}`. Default TTL — `WEBAPP_JWT_TTL_SECONDS=1800` (30 мин).
 
-Фронт кладёт токен в `Authorization: Bearer <token>` на все последующие запросы. [require_webapp_user()](../backend/app/api_webapp.py#L119) — FastAPI dependency: валидирует JWT, загружает `User` по `sub`, 401 если истёк или подпись не сходится.
+Фронт кладёт токен в `Authorization: Bearer <token>` на все последующие запросы. [require_webapp_user()](../backend/app/api_webapp.py#L142) — FastAPI dependency: валидирует JWT, загружает `User` по `sub`, 401 если истёк или подпись не сходится.
 
 **Rotation invariant:** если ты ротируешь `WEBAPP_JWT_SECRET`, все открытые WebApp-сессии умирают и юзер должен перезайти через bot-кнопку. Это by design — tradeoff за простоту single-secret HMAC.
 
@@ -53,13 +53,16 @@ Res ([MeResponse](../backend/app/api_webapp.py#L232)):
 
 - **`min_days_remaining`** — *минимум* по всем active balance-subs, не среднее. Это то, что отображается в header card — юзер должен видеть когда кончится его **самая ранняя** подписка, не усреднённую оптимистичную оценку.
 - **`trial_available`** — `user.trial_activated_at IS NULL`. `trial_amount_kopecks` читается каждый запрос из БД (cheapest visible 30-day plan price × 100), поэтому изменение цены через `/admin/plans` автоматически подхватывается без деплоя. Если в БД нет ни одного visible 30-day плана — `trial_amount_kopecks=0` и баннер не рендерится (см. [TRIAL_SYSTEM.md](TRIAL_SYSTEM.md)).
-- **`subscription_extras[].daily_cost_kopecks`** — канонический `_daily_cost_kopecks(plan, billable_devices)` из balance_svc, чтобы preview в UI совпадал с тем, что реально спишется на следующем tick'е. `billable_devices = max(live_devices, 1)` — свежая sub без девайсов показывается как 1-device, иначе будет «∞ дней» до первого provisioning'а.
-- **`subscription_extras[].days_remaining`** — `sub_days_remaining(sub, billable_devices, user.balance_kopecks)` = `(sub.prepaid_kopecks + wallet) // daily_cost`. Включает и prepaid bucket подписки, и общий кошелёк юзера, потому что `charge_subscription` fallback'ится в кошелёк, когда bucket иссякает. Для мульти-саб юзеров кошелёк не делится — каждая карточка оптимистично видит его целиком; точный pro-rata split когда кому-то помешает. Default freeze window — `MAX_FREEZE_DAYS_PER_PERIOD = 7` (было 14 до 2026-04-10).
-- **`subscription_extras[].can_freeze`** — `sub.status == active AND days_left_in_year >= MAX_FREEZE_DAYS_PER_PERIOD`. Кнопка «заморозить» на карточке скрывается по этому флагу; 400 от `/freeze` всё равно ловится тостом.
+- **`subscription_extras[].plan_price_kopecks`** — цена плана на **один период** (месяц/год) как в `Plan.price`. Это то, что списывается при каждом renewal из кошелька (плюс опционально extra-device surcharge, см. ниже).
+- **`subscription_extras[].bundled_devices`** — `plan.max_devices` (сколько девайсов «бесплатно» идёт с тарифом).
+- **`subscription_extras[].extra_device_slots`** — платные слоты сверх бандла, **хранятся на `Subscription.extra_device_slots`** (миграция `0018_extra_device_slots`). Bumps +1 на каждом успешном add-device с платой, обнуляется только при смене тарифа или отмене. Явно **не** декрементится при remove-device — именно это чинит баг «удалил → следующий renewal дешевле», и пользовательский UI в `Home.tsx` об этом предупреждает в confirm'е.
+- **`subscription_extras[].extra_device_monthly_kopecks`** — абонплата за один платный слот, `EXTRA_DEVICE_MONTHLY_KOPECKS` из env, default **10000 kopecks = ₽100/мес**. Экспонируется в ответе специально чтобы UI не дублировал константу.
+- **`subscription_extras[].next_extra_fee_kopecks`** — prorated плата, которая спишется *прямо сейчас* если юзер нажмёт «+ Добавить устройство». 0 если `live_devices + 1 <= bundled_devices + extra_device_slots` (т.е. новый девайс ещё помещается в уже оплаченный envelope — например, юзер купил слот, потом удалил девайс, и теперь возвращает его бесплатно). Иначе — `prorated_extra_device_fee(sub)` по остатку до `sub.expires_at`. `Home.tsx` показывает это значение в confirm-диалоге add-device, чтобы юзер видел реальную сумму до тапа.
+- **`subscription_extras[].can_freeze`** — `sub.status == active AND auto_renew AND NOT has_frozen_this_year`. Кнопка «заморозить» на карточке скрывается по этому флагу; 400 от `/freeze` всё равно ловится тостом.
 - **`sub_link_base_url`** — из env `SUB_LINK_BASE_URL`. Пустая строка = используй relative `/api/sub/<token>` на том же origin'е. Нужно, потому что WebApp и sub-link могут жить на разных доменах (boring-domain proxy для обхода DPI).
 - **Copy-config UI** — кнопка на карточке подписки зовёт `navigator.clipboard.writeText(subUrl)`, с fallback на `document.execCommand('copy')` для старых WebView. После успеха — тост `Скопировано ✓` на 1.5с + Telegram haptic `notificationOccurred('success')`. Это заменило старую «Показать конфиг» кнопку (которая разворачивала текст прямо на странице) — юзеры почти всегда хотят скопировать, а не разглядывать base64.
 - **QR-код рядом с copy-кнопкой** — вторая кнопка «Показать QR» в той же flex-row; тап переключает локальный `showQR` и рендерит `<canvas>` через `QRCode.toCanvas(ref.current, subUrl, { width: 260, margin: 2, errorCorrectionLevel: "M" })` в `useEffect` на `showQR`. Пакет [`qrcode`](https://www.npmjs.com/package/qrcode) (~15 KB, canvas-based, без runtime-depов). Use-case: юзер открывает webapp на ноуте и сканирует QR с телефона, не перекидывая sub-link через мессенджер.
-- **`/me` фильтрует терминальные подписки** — `status in ("blocked", "expired")` вырезаются на webapp-сайде ([api_webapp.py](../backend/app/api_webapp.py) около L382), чтобы в кабинете не болталось легаси от миграций/expiration'ов. Админский `/api/me` отдаёт всё, не трогаем — там истории полный набор нужен.
+- **`/me` фильтрует терминальные подписки** — `status in ("blocked", "expired")` вырезаются на webapp-сайде ([api_webapp.py](../backend/app/api_webapp.py) около L382), чтобы в кабинете не болталось легаси от миграций/expiration'ов. Это тот же фильтр, которым единственная подписка юзера исчезает из UI после `activate` нового плана (старая получает `status=blocked` в single-sub-swap'е) — поведение совпадает с админским «revoke now». Админский `/api/me` отдаёт всё, не трогаем — там истории полный набор нужен.
 
 ## Plans & checkout
 
@@ -107,7 +110,7 @@ Req: `{ amount_kopecks, provider="telegram_stars" }`.
 
 Особенность: `Invoice.amount` **всегда в рублях**, даже если displayed currency — XTR. Это чтобы `_mark_invoice_paid_core` начислил чистое количество копеек независимо от провайдера. Displayed — отдельно в `currency`.
 
-Создаётся `Invoice(kind="topup", plan_id=NULL)` — эта pair «без плана + kind=topup» — та самая, которую хук в [api.py:1195](../backend/app/api.py#L1195) распознаёт и кладёт в баланс вместо провижининга, плюс тригерит referrer payout при первом топапе (см. [TRIAL_SYSTEM.md](TRIAL_SYSTEM.md#stage-3)).
+Создаётся `Invoice(kind="topup", plan_id=NULL)` — эта pair «без плана + kind=topup» — та самая, которую хук в [api/invoices.py:132](../backend/app/api/invoices.py#L132) распознаёт и кладёт в баланс вместо провижининга, плюс тригерит referrer payout при первом топапе (см. [TRIAL_SYSTEM.md](TRIAL_SYSTEM.md#stage-3)).
 
 ### `POST /api/webapp/trial/activate`
 
@@ -121,24 +124,30 @@ Req: `{ amount_kopecks, provider="telegram_stars" }`.
 
 ### `POST /api/webapp/subscriptions/activate`
 
-Req: `{ plan_id }`. **Списать всю цену плана с кошелька в prepaid bucket подписки → создать подписку → списать day 1 из bucket'а.**
+Req: `{ plan_id }`. **Single-subscription invariant:** у юзера может быть максимум одна live-подписка. Если уже есть — старая отменяется (devices revoked), остаток её цены возвращается на кошелёк, затем обычный activate-флоу на новый план.
 
-Механика (обновлена 2026-04-10 — переход с daily-from-wallet на prepaid bucket, см. [BALANCE_REFERENCE.md § activate_prepaid](BALANCE_REFERENCE.md#activation-activate_prepaid--refund_prepaid)):
+Механика (обновлена 2026-04-11 — добавлен single-sub invariant с revoke+refund старой подписки; базовая логика из 2026-04-10 `activate_prepaid`/`prorated_sub_refund_kopecks`, см. [BALANCE_REFERENCE.md § activate_prepaid](BALANCE_REFERENCE.md#activation-activate_prepaid--refund_prepaid)):
 
 1. Plan должен быть `is_visible` **и** иметь `daily_rate_kopecks > 0`. Legacy (invoice-only) плана — 400 «use /checkout for one-shot billing».
-2. Pre-flight: `required = plan_price_kopecks(plan)` (полная цена плана, не один день!). Если `balance_kopecks < required` → **402** с телом:
+2. Загрузка всех live-подписок юзера (status ∈ `active`, `frozen` — т.е. всё что пропускает `/me`-фильтр). Если среди них есть **та же** `plan_id` — 400 «Already on this plan». UX: фронт прячет кнопку «Активировать» на карточке текущего плана (через `isCurrent` флаг), так что в норме юзер сюда не попадёт, но backend enforces на всякий случай.
+3. Pre-flight: `refund_estimate = sum(prorated_sub_refund_kopecks(old) for old in live_subs)` — сколько вернётся с плюс-прошлых подписок, `required = plan_price_kopecks(plan)`. Если `balance_kopecks + refund_estimate < required` → **402** с телом:
    ```json
    { "code": "insufficient_balance", "balance_kopecks", "required_kopecks", "suggested_topup_kopecks" }
    ```
-   `suggested_topup_kopecks = max(MIN_TOPUP_KOPECKS, required - balance_kopecks)`. Фронт использует это, чтобы pre-fill топап-модал на недостающую сумму.
-3. `ProvisioningOrchestrator.provision_subscription(user, plan)` — warm pool fast path → fallback cold ansible.
-4. `balance_svc.activate_prepaid(db, user_id, sub, reference=f"activate:{sub.id}")` — пишет **одну** `kind=spend` транзакцию на `-full_price`, инкрементит `sub.prepaid_kopecks` на ту же сумму. На ValueError (race с конкурентным списанием) → `sub.prepaid_kopecks = 0`, 402 `Balance was drained mid-activation`.
-5. `sub.next_charge_at = utcnow()` — anchor текущим моментом.
-6. `balance_svc.charge_subscription(db, sub)` — списывает день 1 уже из свежего prepaid bucket'а (без записи в ledger).
+   `suggested_topup_kopecks = max(MIN_TOPUP_KOPECKS, required - balance_kopecks - refund_estimate)`. Фронт использует это, чтобы pre-fill топап-модал на недостающую сумму. Обрати внимание: при смене плана юзеру иногда **не нужно ничего топапить** даже если кошелёк пустой — прорейтед возврат со старого плана покрывает новый.
+4. `ProvisioningOrchestrator.provision_subscription(user, plan)` — warm pool fast path → fallback cold ansible.
+5. **Атомарный refund+charge блок** (всё через `db.flush()`, без промежуточных коммитов — чтобы на сбое можно было откатить одним `db.rollback()`):
+   - для каждой старой подписки — `balance_svc.refund_subscription_remainder(db, old, reference=f"sub_switch_refund:{old.id}", note="refund on plan switch")` — кладёт `kind=refund` ledger row на реальный прорейтед, возвращает сумму. `refunded_total += …`.
+   - `balance_svc.activate_prepaid(db, user_id, new_sub, reference=f"activate:{new_sub.id}")` — списывает полную цену нового плана с кошелька в `new_sub.prepaid_kopecks`. На `ValueError` — `db.rollback()` (откатывает и refund и charge), `new_sub.status = expired`, 402 `Balance was drained mid-activation`.
+6. `new_sub.next_charge_at = utcnow()` + `balance_svc.charge_subscription(db, new_sub)` — day-1 tick из bucket'а (как раньше).
+7. **Revoke старых подписок.** Для каждой `old_sub`: `orchestrator.revoke_subscription_devices(old_sub)` (помечает credentials `revoked`, запускает ansible background-job на снос юзера с ноды), затем `old_sub.status = blocked`, `old_sub.auto_renew = False`. Это делается **после** refund+charge коммита намеренно: `revoke_device` внутри orchestrator коммитит свои таблицы, и если бы мы уронились тут после рефанда — юзер бы получил два плана на балансе. Каждый revoke обёрнут в `try/except logger.warning` — если ansible-job не стартанул, это не должно вернуть юзеру error status (провижининг-воркер добьёт позже).
+8. `db.commit()` финального состояния, return.
 
-**Эффект:** юзер не может «купить месячный Basic за 5 ₽» — нужна полная цена плана upfront. Зато после покупки подписка гарантированно живёт свой месяц (при условии живого провижининга) — daily tick просто дренит bucket. Если юзер дополнительно топапит кошелёк во время подписки, он становится fallback-запасом: когда bucket иссякает, `charge_subscription` начинает брать из кошелька.
+**Эффект для юзера:** одна кнопка «Активировать другой тариф» честно выполняет «старое нуль → новое полное», без скрытых parallel-subs. Res несёт `refunded_from_previous_kopecks`, фронт показывает это на success-экране зелёным баннером «С предыдущей подписки на баланс вернулось N ₽», чтобы юзер своими глазами увидел возврат.
 
-Res: `{ subscription_id, sub_token, days_remaining, balance_kopecks, daily_cost_kopecks }`. `days_remaining` = `(prepaid + wallet) // daily`.
+Res: `{ subscription_id, sub_token, expires_at, balance_kopecks, plan_price_kopecks, plan_duration_days, refunded_from_previous_kopecks }`. `refunded_from_previous_kopecks = 0` на чистой первой активации или когда остаток старой sub был нулём (expired/только что куплена).
+
+**UI warning.** Перед `activateSubscription(...)` фронт показывает `confirm()` диалог, если `currentSub && currentSub.plan_id !== plan.id`: «У тебя уже активна подписка «X». Если продолжишь, старая будет отключена (устройства отозваны), а остаток её стоимости вернётся на баланс. Затем спишется полная стоимость нового тарифа «Y». Продолжить?». Backend всё равно enforces — диалог это UX, не security.
 
 ### `POST /api/webapp/subscriptions/{id}/freeze` / `unfreeze`
 
@@ -147,15 +156,60 @@ Res: `{ subscription_id, sub_token, days_remaining, balance_kopecks, daily_cost_
 `freeze` Res: `{ subscription_id, status, frozen_until, freeze_days_left_in_year }`.
 `unfreeze` Res: `{ subscription_id, status, next_charge_at }`.
 
-### `POST /api/webapp/subscriptions/{id}/devices`
+### `POST /api/webapp/subscriptions/{id}/migrate_node`
 
-Добавить устройство на активную подписку. Стоимость за каждое устройство **сверх** `plan.max_devices` — `EXTRA_DEVICE_KOPECKS_PER_MONTH / 30` в день, встраивается в `_daily_cost_kopecks(plan, new_device_count)`.
+Перенос активной подписки на другую VPN-ноду внутри того же пула плана. Ре-использует тот же хелпер, что stage-5 drain tick в [ProvisioningOrchestrator.migrate_subscription_to_new_node](../backend/app/services/provisioning.py) — так что механика идентична тому, что делает админ при decommission'е ноды:
 
-Pre-flight: `sub.prepaid_kopecks` должно покрывать хотя бы один следующий tick с новым device count. На нехватке — 402 с `code: "insufficient_prepaid_for_device"` (примечание: гейт перешёл с кошелька на prepaid bucket вместе с общим prepaid-реворком 2026-04-10).
+1. 404, если sub не твоя. 400, если `sub.status != active` или у sub нет node/plan. Заморозку мигрировать нельзя — сначала разморозка.
+2. `choose_node(db, plan, exclude_node_ids=[current_node_id])` — селектор, исключающий текущую ноду. Если нет eligible ноды в пулах тарифа — **503** `No alternative nodes available` (UX: фронт показывает «Пока нет других доступных нод для твоего тарифа. Попробуй позже.» — не 500, чтобы юзер понял, что это не баг, а просто пул пуст).
+3. Revoke всех live-девайсов на старой ноде (`background=True` — fire-and-forget ansible per device).
+4. `sub.node_id = target.id`, `db.flush()` + refresh.
+5. `reprovision_subscription(sub)` — полный warm-pool fast path → cold fallback на новой ноде.
+6. Возврат: `{ subscription_id, old_node_id, old_node_name, new_node_id, new_node_name, new_node_region, task_id }`.
 
-Провижининг — `orchestrator.reprovision_subscription(sub, device_name=f"device-{N}")`. По успеху — `{ subscription_id, device_id, device_count, new_daily_cost_kopecks }`.
+**sub_token не меняется** — это ключевой пойнт. Клиенты (Hiddify и т.п.) подписаны на `/sub/{token}` и при следующем profile-update интервале подхватят URIs, указывающие на новую ноду, без ручной пере-установки профиля. UI говорит юзеру «Обнови профиль в клиенте» — достаточно нажать "Update" в приложении, ничего копировать заново не нужно.
 
-UI кнопки «+ добавить устройство» есть в Home.tsx на карточке подписки. Админский вариант (обходящий prepaid-гейт) — `POST /api/subscriptions/{id}/devices` в [admin Users.tsx](../admin/src/pages/Users.tsx), см. [ADMIN_UI.md](ADMIN_UI.md).
+**Бесплатно.** Без proration, без refund — тот же план, тот же `expires_at`, другой pop. Нет списаний с кошелька.
+
+**UI.** Кнопка «🌍 Сменить ноду» в [SubscriptionCard](../webapp/src/pages/Home.tsx), показывается только для `active` sub (не frozen, не expired). Confirm-диалог предупреждает, что устройства будут переподключены автоматически и что надо обновить профиль в клиенте. На 503 показывает дружелюбный алерт, на остальные ошибки — generic friendlyError.
+
+### `POST /api/webapp/subscriptions/{id}/devices` (add-device)
+
+Добавить устройство на активную подписку. В V2 billing тариф покрывает **до `plan.max_devices`** устройств за ежемесячный `plan.price`. Каждое устройство сверх бандла требует купить **платный слот** за `EXTRA_DEVICE_MONTHLY_KOPECKS` (env, **по умолчанию 10000 kopecks = ₽100/мес**). Нет жёсткого cap'а — сколько угодно слотов за дополнительные деньги. Старый V1-гейт по `sub.prepaid_kopecks` удалён вместе с переходом на monthly-renewal (миграция `0015_billing_v2`).
+
+**Модель хранения слотов.** Каждый купленный extra-слот персистится на `Subscription.extra_device_slots` (колонка добавлена миграцией `0018_extra_device_slots`, `INT NOT NULL DEFAULT 0`). Это критично: при удалении девайса слот **не** освобождается и продолжает оплачиваться на каждом renewal'е. Иначе мы попадали в баг «удалил → следующий renewal дешевле → юзер экономит, пересоздавая девайсы», а также давали юзеру «пожить» на чужие деньги, покупая слоты непосредственно перед удалением.
+
+Обнуление слотов — только через `/change_plan` (смена тарифа сбрасывает состояние) или отмену подписки. Пока подписка жива в текущем тарифе — она платит за все когда-либо купленные слоты до конца.
+
+**Формула платы.**
+```
+capacity = plan.max_devices + sub.extra_device_slots
+needs_new_slot = (live_devices + 1) > capacity
+fee = needs_new_slot ? prorated_extra_device_fee(sub) : 0
+```
+`prorated_extra_device_fee` — пропорция `EXTRA_DEVICE_MONTHLY_KOPECKS` от остатка текущего периода до `sub.expires_at`, через `math.ceil` (минимум 1 копейка за начатый день). Если `live_devices < capacity` (юзер раньше удалил девайс, но заплаченный слот остался) — `fee = 0`, юзер возвращает девайс в уже оплаченный envelope бесплатно.
+
+Pre-flight: `user.balance_kopecks >= fee`. На нехватке — **402** с `detail = { code: "insufficient_balance", balance_kopecks, required_kopecks: fee, suggested_topup_kopecks: max(min_topup_kopecks(db), fee - balance), hint }`. Фронтенд в [Home.tsx](../webapp/src/pages/Home.tsx) парсит ошибку через `parseInsufficientBalance` из [errors.ts](../webapp/src/errors.ts) (общий хелпер — тот же паттерн у `/activate` и `/change_plan`), показывает конкретную сумму в алерте вместо тостa с кодом.
+
+**Провижининг → charge → bump.** После `reprovision_subscription` (если `fee > 0`) идёт `balance_svc.charge_extra_device(...)` с `kind=spend` ledger row `reference=f"extra_device:{sub.id}:{device.id}"`, затем `sub.extra_device_slots += 1`. На `ValueError` от charge (race — кто-то другой дренил wallet между pre-flight и commit'ом) — откатываем provision через `revoke_device(background=True)`, возвращаем 402.
+
+Res: `{ subscription_id, device_id, device_count, extra_device_slots, charged_kopecks, balance_kopecks }`. `charged_kopecks=0` и `extra_device_slots` не меняется, когда девайс помещается в уже оплаченный envelope.
+
+**Renewal.** В `balance.renew_subscription`: `total = plan.price + sub.extra_device_slots * EXTRA_DEVICE_MONTHLY_KOPECKS`. Считается **из стореджа**, не из `live_devices` — это делает учёт устойчивым к remove/re-add между рenewal'ами. `note` у ledger row: `renew {plan} (sub N) + K extra slot(s)`.
+
+**UI.** Confirm-диалог кнопки «+ добавить устройство» в [Home.tsx](../webapp/src/pages/Home.tsx) читает `extra.next_extra_fee_kopecks` + `extra.extra_device_monthly_kopecks` и строит текст вида «Сейчас спишется N ₽ за остаток периода. На каждом следующем продлении будет добавляться M ₽/мес за этот слот — пока не поменяешь тариф или не отменишь подписку.» Если fee=0 — короткий вариант «У тебя ещё есть оплаченный слот — ничего не спишется.»
+
+**Admin bypass.** Админский `POST /api/subscriptions/{id}/devices` (см. [ADMIN_UI.md](ADMIN_UI.md)) провижинит девайс **без** charge *и* **без** bump `extra_device_slots`. Это сознательно: админ раздаёт постоянные freebies. Следующий renewal будет платить только за `sub.extra_device_slots` (которое админ не тронул), т.е. админский slot не зафиксируется в будущих списаниях. Минус: при смене тарифа или handoff'е на self-serve админский freebie тихо исчезнет в пределах одного renewal'а — об этом знать, если подарил Pro-тариф с «+2 девайса на подарок».
+
+### `DELETE /api/webapp/devices/{id}` (remove-device)
+
+Отзыв одного устройства с подписки. Последний девайс удалить нельзя — это отмена подписки, обрабатывается через `/cancel`.
+
+**Важно: никакого refund'а, и `sub.extra_device_slots` не декрементится.** Юзер заплатил за слот, слот остаётся и продолжает тикать на каждом renewal'е до смены тарифа / отмены. Это by design — смотри объяснение в секции add-device выше. UI в [Home.tsx](../webapp/src/pages/Home.tsx) явно предупреждает об этом в confirm-диалоге удаления («Деньги за уже оплаченный период не возвращаются, а платный слот сохраняется на подписке…»), чтобы юзер не подумал «удалил = перестал платить».
+
+Что физически делает endpoint: `revoke_device(device, reason="user_removed", background=True)` — credential помечается `revoked`, в фоне запускается ansible playbook, который сносит юзера с ноды. `sub.extra_device_slots` и баланс не меняются.
+
+Res: `{ device_id, device_count, extra_device_slots, balance_kopecks }`. `extra_device_slots` всегда возвращается как есть на `sub`, чтобы фронт мог сразу обновить локальный state без второго похода в `/me`.
 
 ## History & referral
 
@@ -181,12 +235,14 @@ Res: `{ code, bonus_kopecks, invited_count, earned_kopecks, share_url }`.
 | Код | Когда |
 |-----|-------|
 | 401 | initData не валидируется / JWT протух / не передан Bearer |
-| 402 | Нет баланса — `/subscriptions/activate`, `/subscriptions/{id}/devices`. Тело несёт `code`, `balance_kopecks`, `required_kopecks`, `suggested_topup_kopecks`. |
+| 402 | Нет баланса — `/subscriptions/activate`, `/subscriptions/{id}/devices`, `/change_plan`. Тело несёт `code`, `balance_kopecks`, `required_kopecks`, `suggested_topup_kopecks`. |
 | 404 | Plan / subscription / invoice не найден **или** не принадлежит юзеру (не различаем, чтобы не утекало existence) |
 | 409 | Trial уже активирован / слишком много активных subs на плане |
-| 400 | Legacy плана через `/activate` / freeze нельзя / plan без daily_rate |
-| 503 | Нет trial-плана / провайдер не настроен |
+| 400 | Legacy плана через `/activate` / freeze нельзя / plan без daily_rate / `Already on this plan` на `/subscriptions/activate` |
+| 503 | Нет trial-плана / провайдер не настроен / `/migrate_node` не нашёл альтернативную ноду в пуле тарифа |
 | 502 | Провайдер вернул ошибку при `create_invoice` |
+
+**Важно: юзер не должен видеть сырые `401: …`, `402: {...}`, `500: …` тексты.** Всё клиентское сообщение об ошибке проходит через [`friendlyError`](../webapp/src/errors.ts) — общий хелпер, который распознаёт HTTP-код в префиксе сообщения fetch'а и возвращает русскую human-readable строку («Сервис временно недоступен…», «Сессия истекла…» и т.п.). Страницы `App.tsx`, `Home.tsx`, `Plans.tsx`, `History.tsx`, `CheckoutPending.tsx` вызывают его через `alert(friendlyError(msg, { fallback: "операция" }))` или `setError(friendlyError(...))`. 402 с `suggested_topup_kopecks` обрабатывается отдельным хелпером `parseInsufficientBalance(msg)`, который достаёт сумму и открывает топап-модал / показывает конкретное «Пополни на N ₽».
 
 ## What's on each webapp page
 

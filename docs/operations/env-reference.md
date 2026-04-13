@@ -23,9 +23,11 @@
 | `ADMIN_API_TOKEN` | — | backend, worker, bot | Shared secret для `X-Admin-Token` header. Используется SPA, ботом и scrape'ом Prometheus. Роль требует `length >= 20`. |
 | `ADMIN_ACTOR_HEADER` | `X-Admin-Actor` | backend | Имя header'а, откуда backend читает self-declared actor id для `AuditLog.actor`. Менять незачем. |
 | `WEBAPP_JWT_SECRET` | — | backend | HMAC-ключ hand-rolled JWT сессии Telegram Mini App. Ротация = все открытые WebApp-сессии форсят re-handshake через initData. Роль требует `length >= 32`. |
-| `WEBAPP_JWT_TTL_SECONDS` | `1800` | backend | Время жизни WebApp JWT. |
+| `WEBAPP_JWT_TTL_SECONDS` | `1800` | backend | Время жизни WebApp сессионного JWT. |
+| `WEBAPP_INIT_DATA_TTL_SECONDS` | `300` | backend | TTL для Telegram `initData` при обмене на сессионный JWT через `POST /api/webapp/auth`. Короткий handshake — бьёт replay-окно, если initData утечёт. Не путать с `WEBAPP_JWT_TTL_SECONDS` (время жизни сессионного токена). Добавлено после fix'а #53 (2026-04), до этого TTL был хардкод 86400с и ещё пропускался при `auth_date=0`. |
 | `LOG_LEVEL` | `INFO` | backend, worker | DEBUG/INFO/WARNING. DEBUG очень шумный на prod. |
-| `SLOWAPI_STORAGE_URI` | `memory://` | backend | Slowapi backend. `memory://` — per-process, ок для одного backend-инстанса. Для multi-replica → `redis://redis:6379/1`. |
+| `LOG_FORMAT` | `json` | backend, worker | `json` — structured JSON (для prod/log aggregators). `console` — human-readable (для local dev). Оба включают `request_id`. |
+| `SLOWAPI_STORAGE_URI` | auto (`REDIS_URL` → `memory://`) | backend | Slowapi backend. Если не задан, подхватывает `REDIS_URL` (rate limits shared через Redis). Явное `memory://` — только для offline dev. |
 | `CORS_ALLOWED_ORIGINS` | `""` | backend | Comma-separated list. Пусто → webapp на том же origin (same nginx), CORS не нужен. |
 
 ## Telegram Bot
@@ -55,7 +57,7 @@
 
 | переменная | default | кто читает | описание |
 |---|---|---|---|
-| `PROVISIONING_SSH_KEY` | (compose default — **literal public key string**) | compose, worker volume | Путь **на хосте** к приватнику для SSH на VPN-ноды. Дефолт в compose — literal строка-ключ, что ломает монтирование. См. `infrastructure/deployment.md` → PROVISIONING_SSH_KEY foot-gun. Должно быть `/opt/vpn/secrets/provisioning_key`. |
+| `PROVISIONING_SSH_KEY` | **обязателен** | compose, worker volume | Путь **на хосте** к ed25519 приватнику для SSH на VPN-ноды. compose откажется стартовать без неё (`?:` required). Обычно `/opt/vpn/secrets/provisioning_key`. |
 | `ANSIBLE_PRIVATE_KEY_FILE` | — | worker | Путь **внутри контейнера** к тому же ключу (обычно `/run/secrets/provisioning_key`, туда маппится volume). |
 | `ANSIBLE_ROOT` | — | worker | Директория с `playbooks/` и `roles/`. По умолчанию `/app/infra/ansible`. |
 | `MAX_CONCURRENT_ANSIBLE` | `3` | worker | Размер `_ansible_semaphore` в `ProvisioningOrchestrator`. Каждый процесс ansible ест ~200MB. Отдельный от warm-pool семафора. |
@@ -81,9 +83,7 @@
 
 | переменная | default | кто читает | описание |
 |---|---|---|---|
-| `MAX_FREEZE_DAYS_PER_PERIOD` | `14` | backend, worker | Hard cap на одно freeze-событие. |
-| `FREEZE_YEAR_BUDGET_DAYS` | `30` | backend, worker | Годовой лимит freeze-дней на подписку. Сбрасывается при смене `frozen_year`. |
-| `FREEZE_DAYS` | `7` | backend | Продление `expires_at` при активации freeze — deprecated, остался от stage 3. |
+| `FREEZE_DAYS` | `14` | backend, worker | Сколько дней длится одна заморозка (1 раз в календарный год). `expires_at += FREEZE_DAYS` при freeze. |
 | `MIN_TOPUP_KOPECKS` | `10000` | backend, worker | Минимальная сумма пополнения (₽100). Дешевле — `/checkout` 400'ит. |
 | `EXTRA_DEVICE_KOPECKS_PER_MONTH` | `10000` | backend, worker | Надбавка per device/month сверх `plan.max_devices`. |
 | `REFERRAL_BONUS_KOPECKS` | `5000` | backend, worker | Бонус реферреру при первом `kind=topup` реферрала + бонус реферралу при активации trial. |
@@ -122,7 +122,11 @@
 | `PAYMENT_PROVIDER` | `cryptobot` | backend, bot | Single-provider mode (legacy). Если `PAYMENT_PROVIDERS` задан — игнорируется. |
 | `PAYMENT_PROVIDERS` | `""` | backend, bot | Comma-separated список провайдеров. Backend при checkout'е выбирает `random.choice(list)`. |
 | `CRYPTOBOT_TOKEN` | `""` | backend | Bearer token к CryptoBot API. HMAC webhook-сигнатура считается от `sha256(token)` как ключа. |
-| `TELEGRAM_STARS_WEBHOOK_SECRET` | `""` | backend, bot | Shared secret, который бот добавляет в `X-Telegram-Stars-Secret` header при форварде `successful_payment` в backend. **Должен быть одинаковым** в двух сервисах. |
+| `TELEGRAM_STARS_WEBHOOK_SECRET` | `""` | backend, bot | **Deprecated** (#62). Shared secret для legacy polling-режима. Заменён на `TELEGRAM_WEBHOOK_SECRET_TOKEN`. |
+| `TELEGRAM_WEBHOOK_SECRET_TOKEN` | `""` | backend | Secret для native Telegram webhook (`setWebhook`). Backend проверяет `X-Telegram-Bot-Api-Secret-Token` header на каждом update. |
+| `TELEGRAM_WEBHOOK_URL` | `""` | backend | Публичный URL для `/tg-webhook` (напр. `https://grinwer.online/tg-webhook`). Если пусто — webhook не регистрируется. |
+| `BOT_INTERNAL_WEBHOOK_URL` | `""` | backend | Внутренний URL бота для forward не-payment update'ов (напр. `http://bot:8081/webhook`). |
+| `BOT_WEBHOOK_PORT` | `0` | bot | Порт для aiohttp webhook-сервера. `> 0` — webhook-режим, `0` — legacy polling. |
 | `SBP_<SLUG>_HMAC_SECRET` | — | backend | HMAC secret для provider'а `sbp:<slug>`. Обязательно. |
 | `SBP_<SLUG>_PAY_URL_TEMPLATE` | — | backend | `str.format` template URL с placeholder'ами `{invoice_id}`/`{amount}`. Альтернатива `_CREATE_URL`. |
 | `SBP_<SLUG>_CREATE_URL` | — | backend | URL для POST `{invoice_id, amount, currency}` → возвращает pay URL. Альтернатива `_PAY_URL_TEMPLATE`. |
@@ -166,9 +170,10 @@
 | `BOT_TOKEN` | backend, worker, bot |
 | `WARM_POOL_ENABLED` | backend, worker |
 | `SUB_LINK_BASE_URL` | backend, worker, bot |
-| `MAX_FREEZE_DAYS_PER_PERIOD`, `FREEZE_YEAR_BUDGET_DAYS` | backend, worker |
+| `FREEZE_DAYS` | backend, worker |
 | `MIN_TOPUP_KOPECKS`, `EXTRA_DEVICE_KOPECKS_PER_MONTH`, `REFERRAL_BONUS_KOPECKS` | backend, worker |
-| `PAYMENT_PROVIDER`, `PAYMENT_PROVIDERS`, `TELEGRAM_STARS_WEBHOOK_SECRET` | backend, bot |
+| `PAYMENT_PROVIDER`, `PAYMENT_PROVIDERS` | backend, bot |
+| `TELEGRAM_STARS_WEBHOOK_SECRET` | backend, bot (только в legacy polling-режиме; в webhook-режиме не нужна) |
 
 ## Обязательные vs опциональные
 
@@ -205,8 +210,8 @@ Handler `recreate app stack` в `deploy_app_stack` делает это авто�
 
 - **`RENEWAL_CHECK_INTERVAL` в `.env.example` = 300, в коде default = 3600.** `worker.py` имеет `os.getenv("RENEWAL_CHECK_INTERVAL", "3600")`, а `.env.example` ставит `300`. Разница в 12×. Непонятно, какое считается правильным.
 - **`AUTOSCALE_INTERVAL` default = `0` в коде, `300` в `.env.example`.** `0` означает «отключить полностью». Чистый env без `.env.example` выключит autoscale — это может быть сюрпризом при dev-разворачивании.
-- **`PROVISIONING_SSH_KEY` compose default — literal public key.** Уже упомянуто в `deployment.md`/`runbook.md`. Повторяем: `.env.example` ставит `/opt/vpn/secrets/provisioning_key`, но compose fallback на `ssh-ed25519 AAA...` — чистое compose-only окружение без `.env.example` получит broken mount.
-- **`FREEZE_DAYS=7` в коде, но без использования в stage 4 логике.** Похоже, deprecated stage 3 наследие. Неясно, можно ли удалять.
+- ✅ **`PROVISIONING_SSH_KEY` теперь обязателен.** Compose использует `${PROVISIONING_SSH_KEY:?...}` — без переменной `docker-compose up` выдаст ошибку, а не сломанный mount.
+- ✅ **`FREEZE_DAYS` — единственный freeze-tunable.** `MAX_FREEZE_DAYS_PER_PERIOD` и `FREEZE_YEAR_BUDGET_DAYS` убраны (были dead code). `FREEZE_DAYS=14` по умолчанию, 1 раз в год.
 - **Нет env для включения/выключения individual-провайдера.** Включение CryptoBot — только `PAYMENT_PROVIDER=cryptobot` или наличие в `PAYMENT_PROVIDERS` списке. Нет способа «оставить rotation, но временно выключить конкретно SBP» без редактирования списка.
 - **`SBP_<SLUG>_*` не валидируются на старте backend'а.** Если `PAYMENT_PROVIDERS=sbp:foo,cryptobot`, но нет `SBP_FOO_HMAC_SECRET` — ошибка всплывёт только в момент первого `/checkout` c этим провайдером. Pre-flight check для SBP не зафиксирован.
 - **`BOT_USERNAME` может быть пустым** — рефералки покажут бесшовный код вместо share-link. Warning'а backend не эмитит.

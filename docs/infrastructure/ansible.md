@@ -78,32 +78,34 @@ web:         { nl-web       → 45.14.244.140 }
 
 Все три — один и тот же IP. Разделение только логическое: когда появится вторая машина, это тривиальный inventory-edit.
 
-**VPN-ноды в inventory не записываются.** Секция `vpn_nodes:` закомментирована. Реальные ноды приходят из **базы данных** и материализуются в **temp-inventory на лету** при каждом `run_playbook`-вызове:
+**VPN-ноды в inventory не записываются.** Секция `vpn_nodes:` закомментирована. Реальные ноды приходят из **базы данных** и материализуются в **temp-inventory на лету** при каждом `run_playbook`-вызове (функция `build_inventory_for_node` в `backend/app/services/ansible_runner.py`, рендерит через `.format()` шаблон вида):
 
-```python
-# backend/app/services/ansible_runner.py:32-52
-def build_inventory_for_node(node: models.VPNNode, ansible_user="root") -> Path:
-    inventory_content = """
+```yaml
 all:
   hosts:
-    {name}:
-      ansible_host: {host}
-      ansible_port: {port}
-      ansible_user: {user}
+    <node.name>:
+      ansible_host: <node.host>
+      ansible_port: <node.ssh_port>
+      ansible_user: root
   children:
     vpn_nodes:
       hosts:
-        {name}:
+        <node.name>:
     db_host:
-      hosts: {{}}
-""".format(name=node.name, host=node.host, port=node.ssh_port, user=ansible_user)
-    handle = tempfile.NamedTemporaryFile("w", delete=False, suffix="-inventory.yml")
-    handle.write(inventory_content)
-    handle.flush()
-    return Path(handle.name)
+      hosts: {}
 ```
 
 Это один файл с **одной нодой внутри**. `--limit <node.name>` даёт ещё одно гарантирующее «не ходи никуда больше». При одновременной работе двух провижинеров — два разных temp-файла с разными процессами ansible, без взаимного влияния на общий inventory.
+
+**Валидация идентификаторов (fix #55).** `.format()` на сыром шаблоне — YAML-injection'шный вектор: `\n` или `:` в `node.name` позволяли бы перезаписать `ansible_host`/`ansible_user`/`--private-key` и увести плейбук на чужую машину с реальным SSH-ключом. Чтобы это закрыть, перед рендером вызывается `_validate_node_for_inventory()` → `validate_node_identity_fields()`:
+
+- `node.name` обязан матчить `^[a-z0-9][a-z0-9-]{0,62}$` (DNS-safe, без ведущего дефиса, ≤63 символа)
+- `node.host` — `^[A-Za-z0-9.\-:\[\]]{1,253}$` (IPv4/IPv6/DNS, без пробелов, кавычек и переводов строк)
+- `node.ssh_port` — `int` в диапазоне `[1, 65535]`
+
+Нарушение → `InvalidNodeIdentity` (подкласс `ValueError`) **до** любых файловых операций, то есть отбитый запрос не оставляет мусора в `/tmp`. Одноимённый хелпер публичен и вызывается также из `api/nodes.py::create_node` и `services/node_spawner.py::spawn_node` — трёхслойная защита (API → service → render) на случай, если кто-то обойдёт один из фронтов. Регрессии закреплены в `backend/tests/test_ansible_runner_inventory.py`.
+
+**Cleanup контракт.** `build_inventory_for_node` возвращает путь к файлу с `delete=False`, и **каллер обязан** вызвать `inventory.unlink()` в `finally`-блоке — иначе `/tmp` забивается по одному файлу на каждый прогон. Текущие вызовы (`provisioning.py::_run_ansible`, `warm_pool.py::_warm_bundle`/`_physical_revoke`) это делают; перед добавлением нового caller'а проверьте grep'ом.
 
 Для ручных операторских прогонов (`ansible-playbook site.yml`) inventory с реальными VPN-нодами просто не существует в git-репо — это сознательное решение. Заливку с оператор-машины предполагается делать с подменой через `-i`.
 
@@ -270,7 +272,7 @@ Xray биндит исходящий freedom-socket на интерфейс `wg0
 
 ## Как backend использует ansible
 
-Со стороны backend'а точкой входа является `run_playbook(playbook, inventory, limit, extra_vars)` в `ansible_runner.py:55-89`:
+Со стороны backend'а точкой входа является `run_playbook(playbook, inventory, limit, extra_vars)` в `backend/app/services/ansible_runner.py` (функция `run_playbook`):
 
 ```python
 cmd = [

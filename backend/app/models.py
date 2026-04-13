@@ -2,6 +2,7 @@ import enum
 
 from .time_utils import utcnow
 from sqlalchemy import (
+    BigInteger,
     Boolean,
     Column,
     DateTime,
@@ -12,6 +13,7 @@ from sqlalchemy import (
     String,
     Table,
     Text,
+    UniqueConstraint,
 )
 from sqlalchemy.dialects.postgresql import ARRAY, JSONB
 from sqlalchemy.orm import relationship
@@ -23,9 +25,8 @@ class SubscriptionStatus(str, enum.Enum):
     blocked = "blocked"
     expired = "expired"
     # Stage 4: user-initiated pause. No charges, devices physically
-    # revoked from the node so the slot is freed for others. Capped at
-    # MAX_FREEZE_DAYS_PER_PERIOD per call and FREEZE_YEAR_BUDGET_DAYS
-    # per calendar year via Subscription.frozen_days_used / frozen_year.
+    # revoked from the node so the slot is freed for others. One freeze
+    # of FREEZE_DAYS per calendar year (tracked via has_frozen_this_year).
     frozen = "frozen"
 
 
@@ -197,7 +198,7 @@ class VPNNode(Base):
 
     max_users = Column(Integer, nullable=True)
     max_bandwidth_mbps = Column(Integer, nullable=True)
-    health_score = Column(Integer, default=100)
+    health_score = Column(Integer, nullable=True)
     last_health_check_at = Column(DateTime, nullable=True)
     blocked_regions = Column(JSONB, nullable=True)
     cooldown_until = Column(DateTime, nullable=True)
@@ -218,6 +219,9 @@ class VPNNode(Base):
     subscriptions = relationship("Subscription", back_populates="node")
     provider = relationship("CloudProvider", back_populates="nodes")
     probes = relationship("HealthProbe", back_populates="node", cascade="all, delete-orphan")
+    traffic_samples = relationship(
+        "NodeTrafficSample", back_populates="node", cascade="all, delete-orphan"
+    )
 
 
 class VPNConfig(Base):
@@ -282,6 +286,16 @@ class User(Base):
     # clawback the unspent trial bonus iff the user never made a real topup.
     # Cleared (set to NULL) after clawback so the tick doesn't revisit.
     trial_expires_at = Column(DateTime, nullable=True)
+    # Phase C — bot health-ping consent. The worker tick that queues
+    # "помогите нам улучшить сервис" prompts skips users where this is
+    # True. Flipped to True from a `hping:optout` callback handler.
+    health_ping_opt_out = Column(
+        Boolean, nullable=False, server_default="false", default=False
+    )
+    # Per-user 24h debounce on the health-ping prompt. Updated each time
+    # the worker queues a new ping for the user (write happens before
+    # the bot delivers it, so a Telegram retry can't double-send).
+    health_ping_last_at = Column(DateTime, nullable=True)
 
     invoices = relationship("Invoice", back_populates="user")
     devices = relationship("Device", back_populates="user")
@@ -340,6 +354,15 @@ class Subscription(Base):
     has_frozen_this_year = Column(
         Boolean, nullable=False, server_default="false", default=False
     )
+    # Paid-for device slots *above* the plan's bundled ``max_devices``.
+    # Bumped by ``webapp_add_device`` when the user buys an extra slot,
+    # never decremented — removing the physical device leaves the slot
+    # on the sub so the next renewal still bills for it. Reset to 0 by
+    # ``balance.change_plan`` since the new plan has its own bundle.
+    # Admin add-device does NOT touch this counter (operator override).
+    extra_device_slots = Column(
+        Integer, nullable=False, server_default="0", default=0
+    )
 
     user = relationship("User")
     plan = relationship("Plan")
@@ -360,6 +383,9 @@ class Device(Base):
     status = Column(Enum(DeviceStatus), default=DeviceStatus.pending)
     access_username = Column(String, nullable=True)
     connection_uri = Column(Text, nullable=True)
+    # Per-device dynamic sub-link token — each device gets its own URL
+    # so sharing a link exposes only one device's credentials.
+    sub_token = Column(String, unique=True, index=True, nullable=True)
     created_at = Column(DateTime, default=utcnow)
     updated_at = Column(DateTime, default=utcnow, onupdate=utcnow)
     last_seen_at = Column(DateTime, nullable=True)
@@ -411,6 +437,16 @@ class Credential(Base):
 
 class Payment(Base):
     __tablename__ = "payments"
+    # #52 — composite unique so the same provider can't record the same
+    # external payment twice. NULLs are excluded by Postgres (multiple
+    # rows with external_id=NULL are allowed — manual payments, etc.).
+    __table_args__ = (
+        UniqueConstraint(
+            "provider",
+            "external_id",
+            name="uq_payments_provider_external_id",
+        ),
+    )
 
     id = Column(Integer, primary_key=True)
     subscription_id = Column(Integer, ForeignKey("subscriptions.id"), nullable=True)
@@ -499,6 +535,43 @@ class HealthProbe(Base):
     details = Column(JSONB, nullable=True)
 
     node = relationship("VPNNode", back_populates="probes")
+
+
+class NodeTrafficSample(Base):
+    """One periodic snapshot of a node's xray stats counters (Phase B).
+
+    Written by ``services.traffic_stats.collect_node_stats`` once per
+    worker tick (TRAFFIC_STATS_INTERVAL). uplink/downlink are *cumulative
+    bytes since the previous reset* — the collector calls
+    ``xray api statsquery --reset`` so each row is a delta over
+    ``interval_seconds``, not an absolute counter that overflows.
+
+    The detector that uses these rows lives in a follow-up; for the MVP
+    we just collect the time-series so the next iteration has data to
+    baseline against.
+    """
+    __tablename__ = "node_traffic_samples"
+
+    id = Column(Integer, primary_key=True)
+    node_id = Column(
+        Integer,
+        ForeignKey("vpn_nodes.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    observed_at = Column(DateTime, default=utcnow, nullable=False)
+    interval_seconds = Column(Integer, nullable=False, default=0, server_default="0")
+    # BigInteger because xray byte counters routinely cross 2^31 (2.1 GB)
+    # per interval on a busy node — Integer would silently overflow.
+    uplink_bytes = Column(BigInteger, nullable=False, default=0, server_default="0")
+    downlink_bytes = Column(BigInteger, nullable=False, default=0, server_default="0")
+    active_users = Column(Integer, nullable=False, default=0, server_default="0")
+    # Per-protocol breakdown:
+    #   {"vless-reality": {"uplink": 123, "downlink": 456, "users": 7}, ...}
+    # plus a "_errors" key listing protocols whose collection failed.
+    details = Column(JSONB, nullable=True)
+
+    node = relationship("VPNNode", back_populates="traffic_samples")
 
 
 class ApiToken(Base):

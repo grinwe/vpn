@@ -58,11 +58,59 @@ class SubLinkResponse(BaseModel):
 
 @ext_router.get("/sub/{token}")
 def dynamic_sub_link(token: str, db: Session = Depends(get_db)):
-    """Dynamic subscription link. Returns current configs as JSON.
+    """Dynamic subscription link — per-device or legacy per-subscription.
+
+    Lookup order:
+    1. Device.sub_token → returns only that device's credentials (secure).
+    2. Subscription.sub_token → backward compat for clients installed
+       before per-device tokens. Returns all active credentials.
 
     Clients (Hiddify, v2rayNG) poll this URL and auto-update when the
     server changes due to migration. The token is stable across migrations.
     """
+    import base64
+
+    # ── Per-device lookup (preferred) ──────────────────────────────────
+    device = db.query(models.Device).filter_by(sub_token=token).first()
+    if device:
+        sub = device.subscription
+        if sub.status != models.SubscriptionStatus.active:
+            raise HTTPException(status_code=403, detail="Subscription is not active")
+        if sub.expires_at and sub.expires_at < utcnow():
+            raise HTTPException(status_code=403, detail="Subscription expired")
+
+        configs = []
+        for cred in device.credentials:
+            if not cred.is_active:
+                continue
+            decrypted = _decrypt(cred.config_text)
+            if decrypted:
+                configs.append(SubLinkConfig(protocol=cred.proto, uri=decrypted))
+
+        db.add(
+            models.AuditLog(
+                actor=str(sub.user_id),
+                actor_type=models.AuditActor.user,
+                action="subscription_fetch",
+                target_type="device",
+                target_id=device.id,
+                extra={"protocols": [c.protocol for c in configs], "device_token": True},
+            )
+        )
+        db.commit()
+
+        uris = "\n".join(c.uri for c in configs)
+        encoded = base64.b64encode(uris.encode()).decode()
+        return PlainTextResponse(
+            content=encoded,
+            media_type="text/plain",
+            headers={
+                "subscription-userinfo": f"expire={int(sub.expires_at.timestamp())}",
+                "profile-update-interval": "6",
+            },
+        )
+
+    # ── Legacy per-subscription fallback ───────────────────────────────
     sub = db.query(models.Subscription).filter_by(sub_token=token).first()
     if not sub:
         raise HTTPException(status_code=404, detail="Subscription not found")
@@ -86,13 +134,9 @@ def dynamic_sub_link(token: str, db: Session = Depends(get_db)):
                 cred.id, cred.proto, sub.id,
             )
 
-    # Also return as plain text for Hiddify/v2rayNG subscription import
-    # format: one URI per line
-    import base64
     uris = "\n".join(c.uri for c in configs)
     encoded = base64.b64encode(uris.encode()).decode()
 
-    # Cheap analytics: track which subscriptions are actually being polled.
     db.add(
         models.AuditLog(
             actor=str(sub.user_id),
@@ -100,12 +144,11 @@ def dynamic_sub_link(token: str, db: Session = Depends(get_db)):
             action="subscription_fetch",
             target_type="subscription",
             target_id=sub.id,
-            extra={"protocols": [c.protocol for c in configs]},
+            extra={"protocols": [c.protocol for c in configs], "legacy_token": True},
         )
     )
     db.commit()
 
-    # Return based on Accept header
     return PlainTextResponse(
         content=encoded,
         media_type="text/plain",
@@ -354,6 +397,11 @@ class NotificationOut(BaseModel):
     telegram_id: str
     text: str
     type: str = "info"
+    # Optional context the bot needs to build inline keyboards. Currently
+    # used by Phase C health-ping prompts so the callback data can carry
+    # the subscription ID — leave NULL for notification types that don't
+    # need it (renewal_reminder, expiry_reminder, ...).
+    subscription_id: int | None = None
 
 
 @ext_router.get("/notifications/pending", response_model=list[NotificationOut])
@@ -370,7 +418,7 @@ def get_pending_notifications(
     """
     notif_actions = [
         "renewal_reminder", "expiry_reminder", "config_ready", "migration_notice",
-        "low_balance_warning", "trial_expiry_warning",
+        "low_balance_warning", "trial_expiry_warning", "health_ping_request",
     ]
     logs = (
         db.query(models.AuditLog)
@@ -426,17 +474,127 @@ def get_pending_notifications(
                 "Пополни баланс, чтобы подписка не отключилась — "
                 "реферальные 50 ₽ (если есть) остаются при тебе."
             )
+        elif log.action == "health_ping_request":
+            # Phase C — friendly framing matters. People hate "наш бот
+            # хочет тебя опросить" but tolerate "помоги нам бороться с
+            # блокировками". The opt-out button on the message itself
+            # is the safety valve.
+            text = (
+                "🛟 Помогите нам улучшить сервис!\n\n"
+                "Мы боремся с блокировками — подскажите, как сейчас "
+                "работает VPN на вашем устройстве? Это займёт одну "
+                "секунду и поможет нам быстрее ловить проблемы.\n\n"
+                "Спасибо, что вы с нами! 💛"
+            )
         else:
             continue
+
+        sub_id_extra: int | None = None
+        # health_ping_request always carries subscription_id in extra.
+        # Other notification types might too (e.g. config_ready) but we
+        # only forward it for the ones the bot needs it for, to keep
+        # the keyboard-routing logic on the bot side simple.
+        if log.action == "health_ping_request":
+            raw = extra.get("subscription_id")
+            if isinstance(raw, int):
+                sub_id_extra = raw
 
         results.append(NotificationOut(
             id=log.id,
             telegram_id=telegram_id,
             text=text,
             type=log.action,
+            subscription_id=sub_id_extra,
         ))
 
     return results
+
+
+# ── Phase C: bot health-ping responses + opt-out ──
+
+class HealthPingResponseRequest(BaseModel):
+    telegram_id: str
+    subscription_id: int | None = None
+    answer: str  # "ok" | "bad"
+
+
+@ext_router.post("/users/health-ping-response")
+def submit_health_ping_response(
+    body: HealthPingResponseRequest,
+    db: Session = Depends(get_db),
+    admin_token: str = Depends(require_admin),
+):
+    """Record a user's answer to the health-ping prompt.
+
+    Writes an AuditLog row that the (eventual) detector reads as a
+    time-series of per-node user reports. We don't update health_score
+    here — the detector lives in a follow-up — but the row carries
+    enough context (subscription_id, node lookup at write time) for
+    that future detector to backfill from.
+    """
+    if body.answer not in ("ok", "bad"):
+        raise HTTPException(status_code=400, detail="answer must be 'ok' or 'bad'")
+
+    user = db.query(models.User).filter_by(telegram_id=body.telegram_id).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    node_id: int | None = None
+    if body.subscription_id is not None:
+        sub = db.get(models.Subscription, body.subscription_id)
+        # Cross-check ownership so a leaked sub_id from one user can't
+        # be used to forge a report from another.
+        if sub and sub.user_id == user.id:
+            node_id = sub.node_id
+
+    db.add(
+        models.AuditLog(
+            actor=str(user.id),
+            actor_type=models.AuditActor.user,
+            action="health_ping_response",
+            target_type="subscription",
+            target_id=body.subscription_id,
+            extra={
+                "telegram_id": body.telegram_id,
+                "answer": body.answer,
+                "node_id": node_id,
+            },
+        )
+    )
+    db.commit()
+    return {"ok": True}
+
+
+class HealthPingOptOutRequest(BaseModel):
+    telegram_id: str
+
+
+@ext_router.post("/users/health-ping-opt-out")
+def opt_out_health_ping(
+    body: HealthPingOptOutRequest,
+    db: Session = Depends(get_db),
+    admin_token: str = Depends(require_admin),
+):
+    """Set ``User.health_ping_opt_out`` so the worker stops queueing
+    pings for this user. Idempotent — calling twice is fine.
+    """
+    user = db.query(models.User).filter_by(telegram_id=body.telegram_id).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    user.health_ping_opt_out = True
+    db.add(user)
+    db.add(
+        models.AuditLog(
+            actor=str(user.id),
+            actor_type=models.AuditActor.user,
+            action="health_ping_opt_out",
+            target_type="user",
+            target_id=user.id,
+            extra={"telegram_id": body.telegram_id},
+        )
+    )
+    db.commit()
+    return {"ok": True, "opted_out": True}
 
 
 @ext_router.post("/notifications/{notif_id}/ack")

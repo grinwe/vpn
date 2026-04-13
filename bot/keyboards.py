@@ -13,6 +13,7 @@ WEBAPP_BASE_URL = os.getenv("WEBAPP_BASE_URL", "").rstrip("/")
 # handlers can match on them via F.text == BTN_MAIN_MENU without drifting
 # strings between files.
 BTN_MAIN_MENU = "🏠 Главное меню"
+BTN_BUY = "💎 Подписка"
 BTN_INVITE = "🤝 Пригласить"
 BTN_HELP = "❓ Помощь"
 
@@ -27,8 +28,8 @@ def start_keyboard() -> types.ReplyKeyboardMarkup:
     """
     return types.ReplyKeyboardMarkup(
         keyboard=[
-            [types.KeyboardButton(text=BTN_MAIN_MENU), types.KeyboardButton(text=BTN_INVITE)],
-            [types.KeyboardButton(text=BTN_HELP)],
+            [types.KeyboardButton(text=BTN_MAIN_MENU), types.KeyboardButton(text=BTN_BUY)],
+            [types.KeyboardButton(text=BTN_INVITE), types.KeyboardButton(text=BTN_HELP)],
         ],
         resize_keyboard=True,
     )

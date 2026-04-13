@@ -63,7 +63,7 @@ docker-compose logs -f backend
 |----------|--------|-------|
 | Telegram Stars | Primary | Native UX, 35-50% commission |
 | CryptoBot (USDT/TON) | Secondary | Low commission (1-3%) |
-| YooKassa | Backup | High block risk for VPN merchants |
+| SBP (generic) | Manual | Card-to-card via SBP webhook |
 
 ## Key Features
 
@@ -81,6 +81,7 @@ docker-compose logs -f backend
 - **Free trial** — any user can one-shot activate a trial via WebApp: credits the price of Basic 1m (read from DB, not hardcoded) as `kind=bonus` onto the balance. Gated by `User.trial_activated_at IS NULL`, row-locked. Worker sends a warning `TRIAL_EXPIRY_WARN_DAYS` before `trial_expires_at`; on expiry, users without any real `kind=topup` get a `kind=adjust` clawback of `min(15000, balance)`. Paid users keep everything. See [docs/TRIAL_SYSTEM.md](docs/TRIAL_SYSTEM.md).
 - **Referral program** — three-stage, anti-farm: (1) **attribution** happens on any `/start ref_XXX` while `user.referred_by_id IS NULL`, no bonus at this point; (2) **referee bonus** `REFERRAL_BONUS_KOPECKS` is credited when the referee activates their trial; (3) **referrer payout** of the same amount is credited only when the referee makes their **first real `kind=topup`** via a payment webhook. Idempotent via `referral_payout:{user_id}` reference. Fake-account farming yields zero payout until real money flows.
 - **Self-service** — users can regenerate configs via bot
+- **Credential sharing protection** — per-device sub_tokens (each device gets its own sub link) + local enforcer daemon on nodes (xray access log → detect 2+ IPs per UUID → xray gRPC rmuser/adduser cycle, instant disconnect)
 - **4 VPN protocols** with automatic fallback
 
 ## API Endpoints (Key)

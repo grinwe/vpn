@@ -64,30 +64,23 @@ dp.include_router(router)
 
 ### 3. Stars-платёжный поток
 
-Telegram Stars — единственный способ принять оплату *внутри* TG, без внешнего pay_url. Два хэндлера:
+Telegram Stars — единственный способ принять оплату *внутри* TG, без внешнего pay_url.
 
-```python
-# bot/handlers.py:366-371
-@router.pre_checkout_query()
-async def _stars_pre_checkout(query):
-    if query.currency != "XTR":
-        await query.answer(ok=False, error_message="Unsupported currency")
-    await query.answer(ok=True)
+#### Polling-режим (legacy)
 
-# bot/handlers.py:374-413
-@router.message(F.successful_payment)
-async def _stars_successful_payment(message):
-    sp = message.successful_payment
-    # forward на backend с shared secret
-    status, _ = await _fetch_json(
-        "POST",
-        f"{BACKEND_URL}/api/payments/webhook/telegram_stars",
-        json=forward,
-        headers={"X-Telegram-Stars-Secret": TELEGRAM_STARS_WEBHOOK_SECRET},
-    )
-```
+Два хэндлера в `handlers.py` — `_stars_pre_checkout` (отвечает OK на pre_checkout_query) и `_stars_successful_payment` (форвардит на backend через `X-Telegram-Stars-Secret` shared-secret). Бот выступал relay'ом — shared-secret был единственной аутентификацией (audit #62).
 
-Ключевой момент: Telegram присылает `successful_payment` именно боту (а не на HTTPS webhook backend'а, как CryptoBot и SBP). Бот выступает relay'ом, добавляя shared-secret заголовок для аутентификации перед backend'ом. Детали верификации на стороне бэка — в `components/payments.md`.
+#### Webhook-режим (рекомендуемый, #62)
+
+При `BOT_WEBHOOK_PORT > 0` бот переходит из polling в aiohttp-сервер на внутреннем порте. Backend регистрируется как Telegram webhook (`setWebhook`) и:
+
+- `pre_checkout_query` (XTR) — backend отвечает OK через Bot API напрямую
+- `successful_payment` (XTR) — backend вызывает `_mark_invoice_paid_core` напрямую
+- Все остальные update'ы — forward в бот через `BOT_INTERNAL_WEBHOOK_URL`
+
+Stars-хэндлеры в `handlers.py` в webhook-режиме не вызываются (backend перехватывает payment-update'ы до пересылки боту). Хэндлеры остаются в коде для backward compat с polling-режимом.
+
+Endpoint: `POST /tg-webhook` (`app/telegram_webhook.py`). Детали — `components/payments.md`.
 
 ## X-Admin-Actor — кто дёргает backend от имени бота
 

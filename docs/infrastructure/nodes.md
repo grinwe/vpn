@@ -13,7 +13,7 @@ is_active (bool)                     — ручной kill switch
 pool_id → ServerPool                 — логическая группировка (план → пул → нода)
 
 max_users, max_bandwidth_mbps        — ёмкость (используется autoscale)
-health_score (int, default=100)      — агрегат от health-probe'ов (см. ниже)
+health_score (int, nullable)         — агрегат от health-probe'ов; NULL = нет данных (см. ниже)
 last_health_check_at                 — timestamp последнего check
 cooldown_until                       — DateTime, до которой NodeSelector не берёт ноду
 blocked_regions (JSONB)              — регионы, из которых ноду НЕ отдавать
@@ -69,7 +69,7 @@ enum VPNNodeStatus (models.py:50-61):
 
 Начальное состояние, когда строка только-только создана:
 
-- **ручная регистрация**: `POST /api/nodes` — админ заводит запись в БД. Статус `registering`, `is_active=True`, `health_score=100`.
+- **ручная регистрация**: `POST /api/nodes` — админ заводит запись в БД. Статус `registering`, `is_active=True`, `health_score=NULL` (нет проб → `choose_node` всё равно берёт, т.к. `IS NULL` проходит фильтр).
 - **автоспавн**: `node_spawner.spawn_node` (`backend/app/services/node_spawner.py:154-221`). Порядок:
   1. `driver.create_server(...)` — вызов у Hetzner/Vultr/DO/Aeza/manual. Блокирующий (30–90с).
   2. `VPNNode(status=registering, provider_id=..., provider_external_id=...)` в БД.
@@ -116,9 +116,11 @@ Grace использует `updated_at`, не момент marking'а — каж
 
 ## Health score и cooldown
 
-`health_score` — целое 0–100. Source of truth — роль `check_node_health` (см. ниже) и фоновая RQ-задача, которая раз в N секунд опрашивает ноды и пишет в `health_probes` (+ обновляет `vpn_nodes.health_score` + `last_health_check_at`).
+`health_score` — целое 0–100, **или NULL** (нет данных). Source of truth — `services/health.py:recompute_node_health`, которая агрегирует `health_probes` за последние 15 минут (`LOOKBACK`).
 
-Точной формулы агрегации в одном месте нет — это accumulator: каждый failed probe декрементит, каждый ok восстанавливает. Конкретные числа лучше читать в `HealthProbe` handler'е worker'а (не в скоупе этого документа — файл `services/health.py`, если любопытно).
+Формула: `health_score = round(ok_count / total_count * 100)`. Если проб за окно нет — score сбрасывается в `NULL` (в UI «нет данных»). `choose_node` трактует `NULL` как eligible (`IS NULL` проходит фильтр), чтобы свежая нода не отваливалась из пула до первого проба.
+
+Если site.yml (bootstrap) упал на **уже active** ноде, `health_score` ставится в 0 (без демоута статуса, чтобы сохранить существующих пользователей), и autoscale перестаёт на неё сажать новых.
 
 `cooldown_until` — отдельный механизм для случая «нода недавно что-то натворила, дадим ей отдохнуть, но не выключаем». Проставляется, например, после fail'а provisioning-таска или временной ошибки API. До истечения ноду не возьмут ни пользовательский `choose_node`, ни autoscale.
 
@@ -175,6 +177,7 @@ install_hysteria2            — всегда в списке, gated на hyster
 relay_jump_node              — только если relay_config проставлен
 install_probe_agent          — health agent, пушит наружу
 install_traffic_collector    — xray stats API scraper (per-user bytes)
+install_sharing_enforcer     — локальный демон: access log → detect >1 IP/UUID → xray gRPC rmuser/adduser cycle
 node_exporter                — prometheus node_exporter
 check_node_health            — ассертит, что все ожидаемые порты слушают
 ```
@@ -199,6 +202,8 @@ check_node_health            — ассертит, что все ожидаем�
 
 Идея: роль **сама** решает, нужна ли она на этой ноде, по наличию своей переменной. Если backend отдаёт только `shadowtls_password` — `install_vless_reality` и остальные упадут в guard и `end_role`. Если на ноде был старый VLESS и его убрали из `VPNConfig`, роль сама **останавливает systemd unit'ы** вместо того, чтобы игнорировать.
 
+**Auto-recovery из failed-state.** Каждая xray-роль (`install_vless_reality`, `install_vless_xhttp`, `install_vless_ws_cdn`) в конце play'а проверяет, что её systemd unit действительно `active`. Если нет — `reset-failed` + `restarted`. Это страхует сценарий: предыдущий запуск упал (permission denied / bad config), unit в `failed` state, `RestartPreventExitStatus=23` запрещает auto-restart, а на следующем прогоне config template не изменился → handler не стреляет → `state: started` не восстанавливает unit, попавший в StartLimitBurst. Safety-net ловит и рестартит.
+
 ### Per-user управление
 
 Helper-скрипты на нодах (устанавливаются соответствующими ролями в `/usr/local/sbin/`):
@@ -206,10 +211,12 @@ Helper-скрипты на нодах (устанавливаются соотв
 | скрипт | протокол | механизм |
 |---|---|---|
 | `manage_vpn_user.sh` | ShadowTLS+SS | v1 **no-op с audit-логом** — все девайсы делят один ss-rust password. Persist нет, логирование в `/var/log/shadowtls-users.log`. v2 roadmap: SS2022 EIH. |
-| `manage_vless_user.sh` | VLESS Reality | `jq` patch `/usr/local/etc/xray/config.json` → `settings.clients` (add/del by email) → `systemctl restart xray`. |
-| `manage_vless_ws_user.sh` | VLESS WS+CDN | аналогично, но для `config_ws_cdn.json` + restart unit `xray-ws-cdn`. |
-| `manage_vless_xhttp_user.sh` | VLESS XHTTP | аналогично, `config_xhttp.json` + `xray-xhttp`. |
+| `manage_vless_user.sh` | VLESS Reality | `jq` patch `/usr/local/etc/xray/config.json` → `settings.clients` (add/del by email) → `systemctl restart xray`. Поддерживает `NO_RESTART=1` для batch-операций. |
+| `manage_vless_ws_user.sh` | VLESS WS+CDN | аналогично, но для `config_ws_cdn.json` + restart unit `xray-ws-cdn`. `NO_RESTART=1`. |
+| `manage_vless_xhttp_user.sh` | VLESS XHTTP | аналогично, `config_xhttp.json` + `xray-xhttp`. `NO_RESTART=1`. |
 | `manage_hy2_user.sh` | Hysteria2 | edit `/etc/hysteria/config.yaml` → restart `hysteria-server`. |
+
+**`NO_RESTART=1`** — переменная окружения, пропускает `systemctl restart` внутри manage-скрипта. Используется в `resync_node.yml` для batch-добавления клиентов: все add'ы проходят без рестарта, единый restart в конце батча. Без этого при ≥6 клиентах systemd rate-limit (`StartLimitBurst`) блокирует перезапуск.
 
 ShadowTLS — единственный, где helper **не** меняет состояние. Причина в `files/manage_vpn_user.sh:9-27`: v1 использует один shared password per node, per-user separation требует SS2022 EIH и ещё не реализован. Helper остаётся в pipeline для audit-trail'а и чтобы `provision_device.yml` мог единообразно звать `add`/`del` для любого протокола.
 
@@ -227,7 +234,7 @@ ShadowTLS — единственный, где helper **не** меняет со
 
 ## Autoscale pool math
 
-`autoscale.evaluate_pool` (`services/autoscale.py:209`). Ключевые формулы:
+`autoscale.evaluate_pool` (`services/autoscale.py`). При входе в функцию берётся `pg_try_advisory_xact_lock` (#61) — если другой worker уже оценивает этот пул, вызов возвращает `skipped` без побочных эффектов. Это предотвращает двойной spawn при горизонтальном масштабировании worker'ов. Ключевые формулы:
 
 ```
 eligible_nodes   = [n for n in pool.nodes if n.is_active
@@ -287,3 +294,14 @@ for provider_id in [primary] + fallbacks:
 - **Promote `registering → active` требует и ansible-success, и health pass.** Если ansible прошёл, а health-probe стабильно падает (например, UFW неправильно настроен), нода остаётся в `registering` надолго. `choose_node` её всё ещё берёт (registering в whitelist). Это компромисс «лучше отдать свежую ноду, чем задержать подписку», но клинические случаи возможны.
 - **Grace-таймер draining'а использует `updated_at`.** Любая операция, которая трогает ноду (даже миграция одной подписки), перезапускает таймер. В пуле с постоянным drip'ом миграций destroy может не случиться никогда.
 - **ShadowTLS `manage_vpn_user.sh` — no-op.** Единственный общий пароль per node. Revoke одного устройства **не удаляет его фактический доступ** — пользователь продолжает ходить, пока не ротируется node password для всех сразу. Real per-device isolation ждёт SS2022 EIH.
+
+## Sharing enforcer — защита от расшаривания
+
+На каждой ноде работает `xray-enforcer` systemd-сервис (`install_sharing_enforcer`), который:
+
+1. Каждые 10с (`ENFORCER_CHECK_INTERVAL`) парсит access-логи xray (`/var/log/xray/access-*.log`) за последние 120с (`ENFORCER_WINDOW_SECONDS`).
+2. Собирает уникальные IP по `email` (= `Device.access_username`, напр. `user-1-2`).
+3. Если у UUID обнаружено >1 IP (`ENFORCER_MAX_IPS`) — цикл: `xray api rmuser` (мгновенный disconnect) → sleep 2с (`ENFORCER_RECONNECT_DELAY`) → `xray api adduser` (легитимный пользователь переподключится, шарящий — нет).
+4. Каждое нарушение пишется в `/var/log/xray/sharing_violations.jsonl`.
+
+Мониторинг: backend-воркер через `traffic_stats` SSH-тик вычитывает + truncate'ит `sharing_violations.jsonl`, пишет `AuditLog(action="sharing_violation")` → видимость в admin UI.

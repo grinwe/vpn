@@ -20,7 +20,8 @@ cmd_add() {
     "${CONFIG}" >"${tmp}"
   jq -e . "${tmp}" >/dev/null || { rm -f "${tmp}"; exit 1; }
   mv "${tmp}" "${CONFIG}"; chmod 0640 "${CONFIG}"
-  systemctl restart xray-ws-cdn
+  # NO_RESTART=1 skips the restart — caller restarts once after a batch.
+  [[ "${NO_RESTART:-}" == "1" ]] || systemctl restart xray-ws-cdn
   echo "added ws-cdn user ${email}"
 }
 
@@ -33,7 +34,7 @@ cmd_del() {
     "${CONFIG}" >"${tmp}"
   jq -e . "${tmp}" >/dev/null || { rm -f "${tmp}"; exit 1; }
   mv "${tmp}" "${CONFIG}"; chmod 0640 "${CONFIG}"
-  systemctl restart xray-ws-cdn
+  [[ "${NO_RESTART:-}" == "1" ]] || systemctl restart xray-ws-cdn
   echo "removed ws-cdn user ${email}"
 }
 

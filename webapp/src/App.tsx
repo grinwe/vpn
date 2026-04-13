@@ -65,7 +65,7 @@ export default function App() {
     fetchMe().then(setMe).catch(() => undefined);
   };
 
-  if (route.name === "plans") return <Plans onActivated={refreshMe} subLinkBase={me?.sub_link_base_url ?? ""} />;
+  if (route.name === "plans") return <Plans onActivated={refreshMe} subLinkBase={me?.sub_link_base_url ?? ""} me={me!} changeSubscriptionId={route.subscriptionId} />;
   if (route.name === "history") return <History />;
   if (route.name === "help") return <Help botUsername={me?.bot_username} />;
   if (route.name === "checkout") return <CheckoutPending invoiceId={route.invoiceId} />;

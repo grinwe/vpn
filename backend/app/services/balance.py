@@ -8,10 +8,11 @@ debit another month. If the wallet is short the sub is expired.
 Each mutation is row-locked (``SELECT ... FOR UPDATE``) so concurrent
 topups and charges can never race.
 
-Freeze: 1 per calendar year, 7 days. ``expires_at += 7d`` so the user
-doesn't lose paid time. Devices are revoked on freeze, re-provisioned on
-unfreeze. Early unfreeze is allowed but blocks further freezes until the
-next calendar year.
+Freeze: 1 per calendar year, ``FREEZE_DAYS`` days (default 14).
+``expires_at += FREEZE_DAYS`` so the user doesn't lose paid time.
+Devices are revoked on freeze, re-provisioned on unfreeze. Early
+unfreeze is allowed but blocks further freezes until the next calendar
+year.
 """
 from __future__ import annotations
 
@@ -31,16 +32,12 @@ logger = logging.getLogger(__name__)
 
 # ── Tunables ─────────────────────────────────────────────────────────
 
-FREEZE_DAYS = int(os.getenv("FREEZE_DAYS", "7"))
+FREEZE_DAYS = int(os.getenv("FREEZE_DAYS", "14"))
 REFERRAL_BONUS_KOPECKS = int(os.getenv("REFERRAL_BONUS_KOPECKS", "5000"))
 TRIAL_DURATION_DAYS = int(os.getenv("TRIAL_DURATION_DAYS", "30"))
 TRIAL_EXPIRY_WARN_DAYS = int(os.getenv("TRIAL_EXPIRY_WARN_DAYS", "3"))
 MIN_TOPUP_KOPECKS = int(os.getenv("MIN_TOPUP_KOPECKS", "10000"))
-
-# Legacy tunables kept for import compatibility (unused in V2).
-MAX_FREEZE_DAYS_PER_PERIOD = FREEZE_DAYS
-FREEZE_YEAR_BUDGET_DAYS = FREEZE_DAYS
-EXTRA_DEVICE_DAILY_KOPECKS = 0
+EXTRA_DEVICE_MONTHLY_KOPECKS = int(os.getenv("EXTRA_DEVICE_KOPECKS_PER_MONTH", "10000"))
 
 
 # ── Metrics ──────────────────────────────────────────────────────────
@@ -366,6 +363,10 @@ def change_plan(
     sub.plan_id = new_plan.id
     sub.expires_at = now + timedelta(days=new_plan.duration_days)
     sub.auto_renew = True
+    # New plan, new bundle — reset paid extra slots. Existing devices
+    # stay alive; any that exceed the new plan's bundled capacity will
+    # incur the extra-device fee on the next "add device" action.
+    sub.extra_device_slots = 0
     db.add(sub)
     db.flush()
 
@@ -481,6 +482,58 @@ def unfreeze_subscription(
         "balance.unfreeze sub=%s user=%s auto=%s",
         sub.id, sub.user_id, auto,
     )
+
+
+# ── Extra device billing ──────────────────────────────────────────────
+
+
+def prorated_extra_device_fee(sub: models.Subscription) -> int:
+    """Pro-rated cost (kopecks) for one extra device slot.
+
+    Full price is ``EXTRA_DEVICE_MONTHLY_KOPECKS`` for
+    ``plan.duration_days``. We charge only the remaining fraction.
+    """
+    if not sub.expires_at or not sub.plan:
+        return EXTRA_DEVICE_MONTHLY_KOPECKS
+    remaining = (sub.expires_at - utcnow()).total_seconds()
+    remaining_days = max(remaining / 86400, 0)
+    period = sub.plan.duration_days or 30
+    return max(int(math.ceil(EXTRA_DEVICE_MONTHLY_KOPECKS * remaining_days / period)), 0)
+
+
+def charge_extra_device(
+    db: Session,
+    user_id: int,
+    sub: models.Subscription,
+    fee: int,
+    *,
+    reference: str,
+) -> int:
+    """Debit ``fee`` kopecks for an extra device slot.
+
+    Increments ``sub.extra_device_slots``. Raises ``ValueError`` if
+    balance is insufficient (caller should pre-check).
+    """
+    user = _lock_user(db, user_id)
+    if (user.balance_kopecks or 0) < fee:
+        raise ValueError(f"insufficient balance: need {fee}, have {user.balance_kopecks}")
+
+    _record_tx(
+        db, user,
+        amount_kopecks=-fee,
+        kind=models.BalanceTxKind.spend,
+        reference=reference,
+        note=f"extra device slot (sub {sub.id})",
+    )
+    sub.extra_device_slots = (sub.extra_device_slots or 0) + 1
+    db.add(sub)
+    CHARGE_AMOUNT_TOTAL.inc(fee)
+    db.flush()
+    logger.info(
+        "extra_device charged sub=%s user=%s fee=%s slots=%s",
+        sub.id, user_id, fee, sub.extra_device_slots,
+    )
+    return fee
 
 
 # ── Legacy compat stubs ─────────────────────────────────────────────

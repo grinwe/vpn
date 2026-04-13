@@ -48,12 +48,26 @@
         path: /usr/local/sbin/manage_vless_user.sh
       register: vless_reality_manage_script
 
+    # NO_RESTART=1 tells manage scripts to skip systemctl restart
+    # after each user — we restart once after the whole batch.
+    # Without this, systemd's StartLimitBurst (default 5 in 10s)
+    # kills the service after the 5th rapid restart.
     - name: Resync VLESS+Reality clients
       command: >-
         /usr/local/sbin/manage_vless_user.sh add {{ item.username }} {{ item.uuid }}
+      environment:
+        NO_RESTART: "1"
       loop: "{{ _reality_clients }}"
       loop_control:
         label: "{{ item.username }}"
+      when:
+        - vless_reality_manage_script.stat.exists
+        - _reality_clients | length > 0
+
+    - name: Restart xray after reality resync
+      systemd:
+        name: xray
+        state: restarted
       when:
         - vless_reality_manage_script.stat.exists
         - _reality_clients | length > 0
@@ -67,9 +81,19 @@
     - name: Resync VLESS+XHTTP clients
       command: >-
         /usr/local/sbin/manage_vless_xhttp_user.sh add {{ item.username }} {{ item.uuid }}
+      environment:
+        NO_RESTART: "1"
       loop: "{{ _xhttp_clients }}"
       loop_control:
         label: "{{ item.username }}"
+      when:
+        - vless_xhttp_manage_script.stat.exists
+        - _xhttp_clients | length > 0
+
+    - name: Restart xray-xhttp after resync
+      systemd:
+        name: xray-xhttp
+        state: restarted
       when:
         - vless_xhttp_manage_script.stat.exists
         - _xhttp_clients | length > 0
@@ -83,9 +107,19 @@
     - name: Resync VLESS+WS+CDN clients
       command: >-
         /usr/local/sbin/manage_vless_ws_user.sh add {{ item.username }} {{ item.uuid }}
+      environment:
+        NO_RESTART: "1"
       loop: "{{ _ws_cdn_clients }}"
       loop_control:
         label: "{{ item.username }}"
+      when:
+        - vless_ws_manage_script.stat.exists
+        - _ws_cdn_clients | length > 0
+
+    - name: Restart xray-ws-cdn after resync
+      systemd:
+        name: xray-ws-cdn
+        state: restarted
       when:
         - vless_ws_manage_script.stat.exists
         - _ws_cdn_clients | length > 0

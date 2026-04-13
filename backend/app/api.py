@@ -143,6 +143,7 @@ def _invoice_with_credentials(
         currency=invoice.currency,
         status=invoice.status.value,
         action=invoice.action.value,
+        kind=invoice.kind or "subscription",
         created_at=invoice.created_at,
         credentials=[schemas.CredentialOut.from_orm(c) for c in creds],
         provisioning_task_id=task.id if task else None,
@@ -1778,6 +1779,7 @@ def list_invoices(
                 currency=inv.currency,
                 status=inv.status.value,
                 action=inv.action.value,
+                kind=inv.kind or "subscription",
                 created_at=inv.created_at,
             )
         )

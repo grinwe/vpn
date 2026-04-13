@@ -89,6 +89,18 @@ server {
         proxy_read_timeout 60s;
     }
 
+    # #62 — Telegram Bot API webhook. Telegram sends updates here
+    # instead of the bot polling. The backend validates the secret_token
+    # header, processes payments directly, and forwards the rest to the
+    # bot over the internal Docker network.
+    location = /tg-webhook {
+        proxy_pass http://{{ deploy_web_frontend_api_upstream }};
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+
     # Dynamic subscription link endpoint — lives outside /api/ by
     # design so the URL users paste into Hiddify/v2rayNG stays short
     # (https://{{ deploy_web_frontend_domain }}/sub/<token>).

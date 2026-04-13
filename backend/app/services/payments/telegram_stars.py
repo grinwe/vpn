@@ -38,7 +38,7 @@ BOT_API_BASE = "https://api.telegram.org"
 class TelegramStarsProvider:
     name = "telegram_stars"
 
-    def __init__(self, bot_token: str, webhook_secret: str) -> None:
+    def __init__(self, bot_token: str, webhook_secret: str = "") -> None:
         self._bot_token = bot_token
         self._webhook_secret = webhook_secret
         self._session = requests.Session()
@@ -90,6 +90,11 @@ class TelegramStarsProvider:
     # ---------- webhook (bot → backend forward) ----------
 
     def verify_webhook(self, body: bytes, headers: dict[str, str]) -> WebhookEvent:
+        if not self._webhook_secret:
+            raise ProviderError(
+                "TELEGRAM_STARS_WEBHOOK_SECRET not configured — "
+                "use native Telegram webhook (/tg-webhook) instead"
+            )
         provided = headers.get("x-telegram-stars-secret") or headers.get(
             "X-Telegram-Stars-Secret"
         )
@@ -154,13 +159,13 @@ def _load_from_env() -> tuple[str, str]:
     # docker-compose) and TELEGRAM_BOT_TOKEN (a legacy alias kept for back
     # compat). If neither is set, the provider can't talk to Bot API.
     token = os.getenv("BOT_TOKEN") or os.getenv("TELEGRAM_BOT_TOKEN")
-    secret = os.getenv("TELEGRAM_STARS_WEBHOOK_SECRET")
+    # #62: webhook_secret is now optional — native Telegram webhook mode
+    # (TELEGRAM_WEBHOOK_SECRET_TOKEN) replaces the shared-secret approach.
+    # When only create_invoice is needed (checkout flow), the secret is not
+    # required. verify_webhook raises a clear error if called without it.
+    secret = os.getenv("TELEGRAM_STARS_WEBHOOK_SECRET", "")
     if not token:
         raise ProviderError(
             "BOT_TOKEN env var is required for telegram_stars provider"
-        )
-    if not secret:
-        raise ProviderError(
-            "TELEGRAM_STARS_WEBHOOK_SECRET env var is required for telegram_stars provider"
         )
     return token, secret

@@ -112,6 +112,16 @@
     vless_reality_existing_clients: []
   when: vless_reality_existing_clients is not defined
 
+# Also in bootstrap_node (the authoritative one). Kept here as a
+# safety net in case bootstrap order changes.
+- name: Ensure xray log directory
+  file:
+    path: /var/log/xray
+    state: directory
+    owner: nobody
+    group: nogroup
+    mode: '0750'
+
 - name: Ensure xray config directory
   file:
     path: /usr/local/etc/xray
@@ -180,3 +190,28 @@
 # listener.
 - name: Flush xray handlers before leaving the role
   meta: flush_handlers
+
+# Safety net: if xray entered 'failed' state on a previous run (e.g.
+# permission denied on /var/log/xray before bootstrap_node fixed it)
+# and this run's config template didn't change (so the handler didn't
+# fire), the unit will sit in 'failed' forever — `state: started`
+# above won't recover a unit that hit StartLimitBurst, and the handler
+# is a no-op when the template is unchanged. Detect and force-restart.
+- name: Check if xray is actually running
+  command: systemctl is-active xray
+  register: _xray_reality_active
+  changed_when: false
+  failed_when: false
+
+- name: Reset xray failed state
+  command: systemctl reset-failed xray
+  when: _xray_reality_active.stdout != 'active'
+  changed_when: false
+  failed_when: false
+
+- name: Force-start xray after clearing failed state
+  systemd:
+    name: xray
+    state: restarted
+    daemon_reload: yes
+  when: _xray_reality_active.stdout != 'active'

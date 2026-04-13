@@ -15,6 +15,7 @@ from .config import (
     TELEGRAM_STARS_WEBHOOK_SECRET,
 )
 from .keyboards import (
+    BTN_BUY,
     BTN_HELP,
     BTN_INVITE,
     BTN_MAIN_MENU,
@@ -223,6 +224,7 @@ async def cmd_start(message: types.Message, state: FSMContext):
 
 # ── /plans ──
 
+@router.message(F.text == BTN_BUY)
 @router.message(F.text == "Купить VPN")
 @router.message(Command("plans"))
 async def list_plans(message: types.Message):
@@ -622,6 +624,121 @@ async def toggle_auto_renew(callback_query: types.CallbackQuery):
         await callback_query.answer("Не удалось включить автопродление", show_alert=True)
 
 
+# ── Phase C: bot health-ping responses ──
+#
+# Three callback shapes (see health_ping_keyboard() in keyboards.py):
+#   hping:ok:<sub_id>     → user says VPN works
+#   hping:bad:<sub_id>    → user says VPN doesn't work
+#   hping:optout          → "не показывать этот опрос" (no sub_id)
+#
+# All three POST to backend and edit the original prompt in-place to
+# acknowledge the response so the inline keyboard goes away.
+
+@router.callback_query(F.data.startswith("hping:"))
+async def health_ping_response(callback_query: types.CallbackQuery):
+    parts = callback_query.data.split(":")
+    action = parts[1] if len(parts) > 1 else ""
+    sub_id: int | None = None
+    if len(parts) > 2 and parts[2].isdigit():
+        sub_id = int(parts[2])
+
+    user_telegram_id = str(callback_query.from_user.id)
+
+    if action == "optout":
+        try:
+            status_code, _ = await _fetch_json(
+                "POST",
+                f"{BACKEND_URL}/api/users/health-ping-opt-out",
+                json={"telegram_id": user_telegram_id},
+                headers=_admin_headers(callback_query.from_user.id),
+            )
+        except aiohttp.ClientError:
+            await callback_query.answer("Бэкенд недоступен", show_alert=True)
+            return
+        if status_code != 200:
+            await callback_query.answer("Не удалось сохранить", show_alert=True)
+            return
+        await callback_query.answer("Больше не побеспокоим 👌")
+        try:
+            await callback_query.message.edit_text(
+                "👍 Окей, больше не будем спрашивать. "
+                "Если что-то сломается — пиши в /help."
+            )
+        except Exception:
+            pass
+        return
+
+    if action not in ("ok", "bad"):
+        await callback_query.answer()
+        return
+
+    payload: dict = {"telegram_id": user_telegram_id, "answer": action}
+    if sub_id is not None:
+        payload["subscription_id"] = sub_id
+    try:
+        status_code, _ = await _fetch_json(
+            "POST",
+            f"{BACKEND_URL}/api/users/health-ping-response",
+            json=payload,
+            headers=_admin_headers(callback_query.from_user.id),
+        )
+    except aiohttp.ClientError:
+        await callback_query.answer("Бэкенд недоступен", show_alert=True)
+        return
+    if status_code != 200:
+        await callback_query.answer("Не удалось сохранить", show_alert=True)
+        return
+
+    if action == "ok":
+        await callback_query.answer("Спасибо! 💛")
+        ack_text = (
+            "🙌 Спасибо за помощь! Ваш ответ помогает нам "
+            "следить за качеством сервиса."
+        )
+    else:
+        await callback_query.answer("Спасибо! Чиним.")
+        ack_text = (
+            "🛠 Спасибо! Мы получили сигнал и проверяем ваш сервер.\n"
+            "Если проблема не уйдёт за 10 минут — напишите в /help, "
+            "приложите модель устройства."
+        )
+    try:
+        await callback_query.message.edit_text(ack_text)
+    except Exception:
+        pass
+
+
+def health_ping_keyboard(sub_id: int | None) -> types.InlineKeyboardMarkup:
+    """Build the 3-button inline keyboard for the health-ping prompt.
+
+    sub_id may be None if the worker couldn't resolve a node for the
+    user (shouldn't happen in practice — the tick filters on active
+    subs — but the callback handler still works without it).
+    """
+    sid_part = str(sub_id) if sub_id is not None else "0"
+    rows = [
+        [
+            types.InlineKeyboardButton(
+                text="✅ Всё работает",
+                callback_data=f"hping:ok:{sid_part}",
+            ),
+        ],
+        [
+            types.InlineKeyboardButton(
+                text="❌ Не работает",
+                callback_data=f"hping:bad:{sid_part}",
+            ),
+        ],
+        [
+            types.InlineKeyboardButton(
+                text="🙅 Не показывать",
+                callback_data="hping:optout",
+            ),
+        ],
+    ]
+    return types.InlineKeyboardMarkup(inline_keyboard=rows)
+
+
 # ── /balance — текущий баланс и runway ──
 
 @router.message(F.text == "Баланс")
@@ -830,10 +947,27 @@ async def mark_invoice_paid(callback_query: types.CallbackQuery):
     await callback_query.answer("Счет отмечен как оплаченный")
     await callback_query.message.answer(f"Счет #{invoice['id']} отмечен как оплаченный")
 
-    # Push config to user
+    # Notify user about the payment result
     user_id = invoice.get("user_telegram_id")
+    if not user_id:
+        return
+
+    kind = invoice.get("kind", "subscription")
+    action = invoice.get("action", "")
     credentials = invoice.get("credentials", [])
-    if user_id and credentials:
+
+    if kind == "topup":
+        amount = invoice.get("amount", 0)
+        await callback_query.message.bot.send_message(
+            chat_id=user_id,
+            text=f"✅ Баланс пополнен на {amount:.0f} ₽",
+        )
+    elif action == "renewal":
+        await callback_query.message.bot.send_message(
+            chat_id=user_id,
+            text="✅ Подписка продлена!",
+        )
+    elif credentials:
         configs_text = ["✅ Оплата подтверждена! Твои конфиги:\n"]
         for cred in credentials:
             configs_text.append(f"<b>{cred['proto']}:</b>")
@@ -845,7 +979,7 @@ async def mark_invoice_paid(callback_query: types.CallbackQuery):
             parse_mode="HTML",
             reply_markup=onboarding_keyboard(),
         )
-    elif user_id:
+    else:
         await callback_query.message.bot.send_message(
             chat_id=user_id,
             text="✅ Счет оплачен! Конфиг будет готов через минуту. Используй /config.",

@@ -53,6 +53,7 @@ export interface DeviceSummary {
   id: number;
   name: string;
   status: string;
+  sub_token: string | null;
   created_at: string | null;
 }
 
@@ -67,6 +68,9 @@ export interface SubscriptionExtra {
   can_freeze: boolean;
   device_count: number;
   bundled_devices: number;
+  extra_device_slots: number;
+  extra_device_monthly_kopecks: number;
+  next_extra_fee_kopecks: number;
   devices: DeviceSummary[];
 }
 

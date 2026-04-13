@@ -17,7 +17,7 @@ services:
     restart: unless-stopped
 
   redis:
-    image: redis:7-alpine
+    image: redis:7.4-alpine
     command:
       - redis-server
       - --appendonly
@@ -51,6 +51,12 @@ services:
       PAYMENT_PROVIDERS: ${PAYMENT_PROVIDERS:-}
       CRYPTOBOT_TOKEN: ${CRYPTOBOT_TOKEN:-}
       TELEGRAM_STARS_WEBHOOK_SECRET: ${TELEGRAM_STARS_WEBHOOK_SECRET:-}
+      # #62 — native Telegram webhook mode. When set, the backend
+      # registers itself as the Bot API webhook receiver on startup
+      # and processes Stars payments directly — no shared secret.
+      TELEGRAM_WEBHOOK_SECRET_TOKEN: ${TELEGRAM_WEBHOOK_SECRET_TOKEN:-}
+      TELEGRAM_WEBHOOK_URL: ${TELEGRAM_WEBHOOK_URL:-}
+      BOT_INTERNAL_WEBHOOK_URL: ${BOT_INTERNAL_WEBHOOK_URL:-http://bot:8081/webhook}
       BOT_TOKEN: ${BOT_TOKEN}
       # Needed by /api/webapp/referral to build the full t.me share link.
       # Without it share_url comes back None and the webapp falls back to
@@ -58,14 +64,15 @@ services:
       BOT_USERNAME: ${BOT_USERNAME:-}
       WEBAPP_JWT_SECRET: ${WEBAPP_JWT_SECRET}
       WEBAPP_JWT_TTL_SECONDS: ${WEBAPP_JWT_TTL_SECONDS:-1800}
+      # #53 — short-lived replay window for Telegram initData handshake.
+      WEBAPP_INIT_DATA_TTL_SECONDS: ${WEBAPP_INIT_DATA_TTL_SECONDS:-300}
       # Stage 2.5 — read by ProvisioningOrchestrator to bypass the warm
       # pool entirely when set to "0". Worker has its own copy because
       # it also reads the var to gate the periodic warmer.
       WARM_POOL_ENABLED: ${WARM_POOL_ENABLED:-1}
       # Stage 4 — balance billing. Backend reads these for the
       # WebApp endpoints (freeze caps, min topup, referral bonus).
-      MAX_FREEZE_DAYS_PER_PERIOD: ${MAX_FREEZE_DAYS_PER_PERIOD:-14}
-      FREEZE_YEAR_BUDGET_DAYS: ${FREEZE_YEAR_BUDGET_DAYS:-30}
+      FREEZE_DAYS: ${FREEZE_DAYS:-14}
       REFERRAL_BONUS_KOPECKS: ${REFERRAL_BONUS_KOPECKS:-5000}
       MIN_TOPUP_KOPECKS: ${MIN_TOPUP_KOPECKS:-10000}
       EXTRA_DEVICE_KOPECKS_PER_MONTH: ${EXTRA_DEVICE_KOPECKS_PER_MONTH:-10000}
@@ -129,8 +136,7 @@ services:
       # auto-unfreezes paused ones whose frozen_until lapsed. Tunables
       # cover the freeze caps, referral bonus and minimum topup.
       BALANCE_CHARGE_INTERVAL: ${BALANCE_CHARGE_INTERVAL:-3600}
-      MAX_FREEZE_DAYS_PER_PERIOD: ${MAX_FREEZE_DAYS_PER_PERIOD:-14}
-      FREEZE_YEAR_BUDGET_DAYS: ${FREEZE_YEAR_BUDGET_DAYS:-30}
+      FREEZE_DAYS: ${FREEZE_DAYS:-14}
       REFERRAL_BONUS_KOPECKS: ${REFERRAL_BONUS_KOPECKS:-5000}
       MIN_TOPUP_KOPECKS: ${MIN_TOPUP_KOPECKS:-10000}
       EXTRA_DEVICE_KOPECKS_PER_MONTH: ${EXTRA_DEVICE_KOPECKS_PER_MONTH:-10000}
@@ -140,8 +146,20 @@ services:
       # when running off the queue.
       SUB_LINK_BASE_URL: ${SUB_LINK_BASE_URL:-}
       LOW_BALANCE_WARN_DAYS: ${LOW_BALANCE_WARN_DAYS:-3}
+      # Phase B — passive xray traffic stats collector. Worker SSHs
+      # into each active node every TRAFFIC_STATS_INTERVAL seconds and
+      # writes per-node uplink/downlink/active_users into
+      # node_traffic_samples. 0 disables the tick.
+      TRAFFIC_STATS_INTERVAL: ${TRAFFIC_STATS_INTERVAL:-300}
+      # Phase C — bot health-ping with consent. Worker queues a
+      # friendly "помогите нам улучшить сервис" prompt to active users
+      # at most once per USER_HEALTH_PING_DEBOUNCE_HOURS, capped at
+      # USER_HEALTH_PING_BATCH per tick. 0 disables the tick.
+      USER_HEALTH_PING_INTERVAL: ${USER_HEALTH_PING_INTERVAL:-1800}
+      USER_HEALTH_PING_BATCH: ${USER_HEALTH_PING_BATCH:-50}
+      USER_HEALTH_PING_DEBOUNCE_HOURS: ${USER_HEALTH_PING_DEBOUNCE_HOURS:-24}
     volumes:
-      - ${PROVISIONING_SSH_KEY:-ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIE8IrzyHuBdSXDnBCE9XthETlDDrD4nsOqeubIt6oMkS provisioning@grinwer}:/run/secrets/provisioning_key:ro
+      - ${PROVISIONING_SSH_KEY:?Set PROVISIONING_SSH_KEY to the host path of the SSH private key}:/run/secrets/provisioning_key:ro
     depends_on:
       db:
         condition: service_healthy
@@ -177,6 +195,44 @@ services:
       SUB_LINK_BASE_URL: ${SUB_LINK_BASE_URL:-}
       WEBAPP_BASE_URL: ${WEBAPP_BASE_URL:-}
       NOTIFICATION_POLL_INTERVAL: ${NOTIFICATION_POLL_INTERVAL:-10}
+      # #62 — webhook mode port. >0 switches from polling to an internal
+      # aiohttp server that receives forwarded updates from the backend.
+      BOT_WEBHOOK_PORT: ${BOT_WEBHOOK_PORT:-0}
+    depends_on:
+      - backend
+    restart: unless-stopped
+
+  # ────────────────────────────────────────────────────────────────
+  # Probe agent — observes every VPN node from this host's vantage
+  # point (EU datacenter). Co-located with the backend on nl-web for
+  # the MVP signal: catches "node is physically dead from outside RU"
+  # cases that passive client telemetry would only see with delay.
+  # Talks to the backend over the internal Docker network — the
+  # PROBE_AGENT_TOKEN never leaves this host.
+  #
+  # NOT a substitute for in-RU observation: a DC vantage point cannot
+  # see RKN edge blocking that hits residential ISPs. That signal
+  # comes from passive user telemetry (xray stats trend + bot ping).
+  #
+  # First-time setup: mint a scoped token via the admin API,
+  #   curl -sS -X POST \
+  #     -H "X-Admin-Token: $ADMIN_API_TOKEN" \
+  #     -H "Content-Type: application/json" \
+  #     -d '{"name":"probe-nl-web","scopes":["probe:read","probe:write"]}' \
+  #     http://127.0.0.1:8000/api/api-tokens
+  # copy the returned `token` field into .env as PROBE_AGENT_TOKEN.
+  # ────────────────────────────────────────────────────────────────
+  probe-agent:
+    build: ./probes
+    environment:
+      BACKEND_URL: "http://backend:8000"
+      BACKEND_TOKEN: ${PROBE_AGENT_TOKEN}
+      SOURCE_REGION: ${PROBE_AGENT_REGION:-eu-nl}
+      SOURCE_KIND: datacenter
+      PROBE_INTERVAL: ${PROBE_AGENT_INTERVAL:-60}
+      PROBE_TIMEOUT: ${PROBE_AGENT_TIMEOUT:-5}
+      PROBE_CONCURRENCY: ${PROBE_AGENT_CONCURRENCY:-16}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
     depends_on:
       - backend
     restart: unless-stopped

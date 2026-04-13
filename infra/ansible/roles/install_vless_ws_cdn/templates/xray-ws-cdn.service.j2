@@ -1,6 +1,8 @@
 [Unit]
 Description=Xray VLESS WS+CDN
 After=network.target
+StartLimitBurst=30
+StartLimitIntervalSec=60
 
 [Service]
 Type=simple

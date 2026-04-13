@@ -122,7 +122,7 @@
 
 Текущая модель — «баланс в копейках на пользователе». Платежи принимаются через один из трёх провайдеров:
 
-- **Telegram Stars** — платёж внутри TG, webhook от бота через shared-secret заголовок.
+- **Telegram Stars** — платёж внутри TG. В webhook-режиме (#62): TG шлёт update напрямую на backend (`/tg-webhook`), backend проверяет `X-Telegram-Bot-Api-Secret-Token`. В legacy polling: бот форвардит `successful_payment` через shared-secret.
 - **CryptoBot** — HMAC-SHA256 по телу от `CRYPTOBOT_TOKEN`.
 - **Generic SBP** — конфигурация на слот (slug) через env, HMAC по сырому телу.
 
@@ -134,7 +134,7 @@
 
 | Сервис                 | Зачем                                              | Как интегрируется                                 |
 |------------------------|----------------------------------------------------|---------------------------------------------------|
-| Telegram Bot API       | получение обновлений бота, отправка сообщений      | aiogram long-poll из контейнера bot               |
+| Telegram Bot API       | получение обновлений бота, отправка сообщений      | webhook на backend `/tg-webhook` (#62) или aiogram long-poll (legacy) |
 | Telegram WebApp        | Mini App UX                                        | initData HMAC в `api_webapp.py`                   |
 | CryptoBot              | криптовалютные платежи                             | HTTP + HMAC webhook                               |
 | Generic SBP (bank)     | СБП через банк-агрегатор                           | HTTP + HMAC webhook, конфиг на slug               |

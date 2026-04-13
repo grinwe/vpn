@@ -71,7 +71,7 @@
 - **`verify_webhook` у Stars принимает любой currency только через ручную проверку.** `raise` срабатывает только если `sp.currency != "XTR"` — а если поле отсутствует, используется fallback `"XTR"` (`telegram_stars.py:114`). Это нужно, потому что forward от бота иногда не содержит currency, но делает провайдер чуть слепее, чем хотелось бы.
 - **Referral-payout на `kind=topup` не атомарен с самим топапом.** Оба идут внутри одной транзакции `_mark_invoice_paid_core`, но обёрнуты разными `try/except`: ошибка бонуса не откатывает топап, но ошибка топапа откатывает бонус через общий rollback. Комментарий в коде сам это признаёт: «Payout will be retried by a nightly reconciliation if we ever add one; for now it's fire-and-forget».
 
-> ⚠️ См. audit/... — shared-bearer как единственная аутентификация Stars webhook'а.
+> ✅ Исправлено (#62): native Telegram webhook (`/tg-webhook`) заменяет shared-bearer. Backend регистрируется через `setWebhook` и проверяет `X-Telegram-Bot-Api-Secret-Token`. Старый путь (shared-secret relay через бота) deprecated, но работает для backward compat.
 
 ---
 
@@ -117,7 +117,7 @@
 
 - **`wg_exit_nodes` группа в `inventories/prod/hosts.yml` пустая.** Код роли `wg_exit_node` готов, `relay_jump_node` готова, но ни одна нода не описана — фактически relay-схема в проде не используется. Неясно, есть ли она хоть где-то в inventory вне git.
 - **`relay_config` у jump-ноды хранится как JSONB plaintext.** В отличие от паролей `VPNConfig.settings`, которые зашифрованы Fernet, WG-приватник jump-ноды лежит в БД в открытом виде. Компрометация дампа БД = компрометация туннеля.
-- **Health score агрегация не зафиксирована в одном месте.** Декремент/инкремент раскиданы по worker-тикам и handler'ам `HealthProbe`. Порог `MIN_HEALTHY_SCORE` — константа в `provisioning.py`, но откуда берётся «что именно декрементит» — читается только в коде, не в документе.
+- ✅ **Health score агрегация задокументирована.** `services/health.py:recompute_node_health` — единственная точка агрегации: `ok_count / total_count * 100` за 15-минутное окно. NULL = нет проб. Описание — `docs/infrastructure/nodes.md § Health score и cooldown`.
 - **Автовосстановления из `error` нет.** Нода, попавшая в error (единичный сбой API провайдера во время destroy, например), остаётся там до ручного вмешательства. Нет self-heal'а, который бы через X часов попробовал снова.
 - **Promote `registering → active` требует и ansible-success, и health pass.** Если ansible прошёл, а health-probe стабильно падает (например, UFW неправильно настроен), нода остаётся в `registering` надолго. `choose_node` её всё ещё берёт (registering в whitelist). Это компромисс «лучше отдать свежую ноду, чем задержать подписку», но клинические случаи возможны.
 - **Grace-таймер draining'а использует `updated_at`.** Любая операция, которая трогает ноду (даже миграция одной подписки), перезапускает таймер. В пуле с постоянным drip'ом миграций destroy может не случиться никогда.

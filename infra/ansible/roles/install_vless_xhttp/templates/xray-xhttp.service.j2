@@ -1,6 +1,10 @@
 [Unit]
 Description=Xray VLESS XHTTP
 After=network.target
+# Raise the default (5 in 10s) so that batch user-add scripts that
+# restart per-user don't hit the rate limiter and leave the unit dead.
+StartLimitBurst=30
+StartLimitIntervalSec=60
 
 [Service]
 Type=simple

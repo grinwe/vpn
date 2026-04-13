@@ -1,6 +1,6 @@
 # Provisioning
 
-Слой, который превращает «пользователь купил план» в «на ноде появился новый user, и клиент может подключиться». Живёт в `backend/app/services/provisioning.py` (~1355 строк) и `backend/app/services/ansible_runner.py` (~90 строк).
+Слой, который превращает «пользователь купил план» в «на ноде появился новый user, и клиент может подключиться». Живёт в `backend/app/services/provisioning.py` (~1445 строк) и `backend/app/services/ansible_runner.py` (~225 строк).
 
 ## Две части задачи
 
@@ -39,7 +39,7 @@
 2. **Explicit node_id** — если caller знает, какую ноду хочет (редко, только админский путь `POST /api/subscriptions` с параметром), все остальные фильтры пропускаются.
 3. **Cooldown** — `cooldown_until IS NULL OR cooldown_until < now()`. Нода, только что деградировавшая по здоровью, сидит в cooldown'е, пока воркер не снимет.
 4. **Status** — `active` или `registering`. `registering` попала сюда, чтобы bootstrap-task на свежевыспавнутой ноде мог ссылаться сам на себя (до промоушна в `active`).
-5. **Health score** — `health_score IS NULL OR health_score >= MIN_HEALTHY_SCORE` (default 50, env). Нода без пришедших health probes считается здоровой по умолчанию — чтобы новая нода не отваливалась из пула до первого пробы.
+5. **Health score** — `health_score IS NULL OR health_score >= MIN_HEALTHY_SCORE` (default 50, env). `NULL` означает «нет данных» (нет проб за последние 15 мин или свежая нода) — такая нода считается eligible, чтобы не отваливалась из пула до первого проба. `health_score=0` ставится при fail'е site.yml на active-ноде (no-demote rail).
 6. **Exclude list** — caller может попросить «не возвращай эти node_id». Используется миграцией подписки с draining-ноды: `migrate_subscription_to_new_node` подмешивает туда текущую и соседние draining-ноды того же пула.
 
 Дальше — **сортировка по нагрузке**:
@@ -103,13 +103,21 @@ hy2://...        # для Hysteria2
 
 ## `_collect_site_extra_vars` — мост к ansible ролям
 
-`provisioning.py:280-377`. Для `action = bootstrap/rebootstrap` (site.yml) собирается полный dict extra-vars:
+Функция `_collect_site_extra_vars(node)` в `provisioning.py`. Для `action = bootstrap/rebootstrap` (site.yml) собирается полный dict extra-vars:
 
 - Ключи декриптятся из `config.settings` и переименовываются в соответствии с ansible-ролью (`install_shadowtls_stack`, `install_vless_reality`, `install_vless_ws_cdn`, `install_vless_xhttp`, `install_hysteria2`).
-- **Health-порт дайджест**: собирается список TCP-портов, которые `check_node_health` должна увидеть `LISTEN`ящими. **Hysteria2 намеренно исключён**: `ansible wait_for` умеет только TCP, а hy2 — чистый UDP. Liveness UDP нужна отдельная проверка. Комментарий `provisioning.py:359-361`.
+- **Health-порт дайджест**: собирается список TCP-портов, которые `check_node_health` должна увидеть `LISTEN`ящими. **Hysteria2 намеренно исключён**: `ansible wait_for` умеет только TCP, а hy2 — чистый UDP. Liveness UDP нужна отдельная проверка.
 - Если у ноды есть `relay_config` (jump → WireGuard → exit), туда добавляются `relay_wg_*` переменные для роли `relay_jump_node`.
 
 Этот dict потом уходит в `run_playbook(...extra_vars=extra)` как `--extra-vars '{...}'`.
+
+**Валидация extra_vars (fix #56).** Перед возвратом dict вызывается `_validate_extra_vars()`, которая блокирует:
+
+- **Jinja2-маркеры** (`{{`, `}}`, `{%`, `%}`, `{#`, `#}`) в любом строковом значении — ansible декодирует `--extra-vars` JSON и **повторно подставляет Jinja2** при рендере роли. `{{ lookup('pipe', '...') }}` в `VPNConfig.settings.short_id` стал бы RCE на worker'е. `json.dumps` не спасает — это защита от shell-injection на уровне CLI, не от Jinja2.
+- **Newlines / CR / NUL** — мусор, который сломает YAML-файлы, если роль пишет значение в конфиг.
+- **Ansible-зарезервированные ключи** (`ansible_host`, `ansible_user`, `hostvars`, …) — наш коллектор пишет только конкретные ключи, но если из-за бага попадёт `ansible_host`, плейбук уйдёт не на ту ноду. Блоклист ловит это бесплатно.
+
+При срабатывании → `ValueError` → `_execute_task` ловит через `except Exception` → таска помечается `failed` с внятным `error` → видно в `/admin/tasks`. Регрессии: `backend/tests/test_collect_site_extra_vars.py`.
 
 ## Orchestrator — класс ProvisioningOrchestrator
 
@@ -160,7 +168,7 @@ branch on returncode
 
 Семафор `_ansible_semaphore = threading.Semaphore(MAX_CONCURRENT_ANSIBLE)` (default 3, env) ограничивает параллельность. Process-local — та же история, что и в warm_pool: при масштабировании воркеров лимит множится на количество процессов.
 
-Inventory **генерится в temp-файл** на каждый запуск (`ansible_runner.build_inventory_for_node`, `ansible_runner.py:32-52`):
+Inventory **генерится в temp-файл** на каждый запуск (`ansible_runner.build_inventory_for_node`):
 
 ```yaml
 all:
@@ -177,7 +185,9 @@ all:
       hosts: {}
 ```
 
-После запуска файл unlink'ается в `finally` — чтобы `/tmp` не забивался. Ошибка `unlink` логируется, но не прерывает обработку.
+Перед рендером (`_validate_node_for_inventory`) три поля проходят жёсткий whitelist — `[a-z0-9][a-z0-9-]{0,62}` для `name`, `[A-Za-z0-9.\-:\[\]]{1,253}` для `host`, диапазон `[1, 65535]` для `ssh_port`. Иначе — `InvalidNodeIdentity`. Это защита от YAML injection (fix #55): `.format()` на raw-шаблоне сам по себе не экранирует `\n` или `:`, так что без валидации строка в `node.name` могла бы перезаписать `ansible_host`/`--private-key` и увести прогон на чужую машину. Подробнее — см. `docs/infrastructure/ansible.md`.
+
+После запуска файл unlink'ается в `finally` — чтобы `/tmp` не забивался. Ошибка `unlink` логируется, но не прерывает обработку. Контракт cleanup'а ложится на caller'а `build_inventory_for_node` — текущие три call-site'а (`provisioning.py::_run_ansible`, `warm_pool.py::_warm_bundle`, `warm_pool.py::_physical_revoke`) его соблюдают.
 
 **Важно:** ansible-playbook вызывается через `subprocess.run(..., timeout=300)`. Пять минут — максимум на один playbook-run. Если timeout достигнут — `subprocess.TimeoutExpired` → `RuntimeError("Ansible playbook timed out")`. Это единственная жёсткая граница; сам ansible внутри может иметь свой более короткий `async`/`poll`, но из Python-слоя видим только общее 5-минутное окно.
 

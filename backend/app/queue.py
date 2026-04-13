@@ -102,6 +102,7 @@ def enqueue_task(task_id: int, node_id: int | None) -> str | None:
             task_id,
             node_id,
             retry=Retry(max=3, interval=[10, 30, 120]),
+            job_timeout=DEFAULT_JOB_TIMEOUT,
             failure_ttl=FAILED_TTL,
             result_ttl=RESULT_TTL,
             job_id=job_id,

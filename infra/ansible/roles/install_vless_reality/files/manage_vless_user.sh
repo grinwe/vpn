@@ -42,6 +42,12 @@ require_config() {
 }
 
 reload_xray() {
+  # NO_RESTART=1 skips the restart — caller is responsible for
+  # restarting the service after a batch of add/del operations
+  # (e.g. resync_node.yml adds all users first, restarts once).
+  if [[ "${NO_RESTART:-}" == "1" ]]; then
+    return 0
+  fi
   systemctl restart xray
 }
 

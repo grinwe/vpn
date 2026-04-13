@@ -1,4 +1,5 @@
 import os
+import uuid
 
 from fastapi import Depends, FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -9,12 +10,15 @@ from slowapi.errors import RateLimitExceeded
 from slowapi.middleware import SlowAPIMiddleware
 
 from .config import get_settings
+from .logging_config import configure_logging, request_id_var
 from .migrations import run_migrations
 from .rate_limit import limiter
 from .api import router as api_router, require_admin
 from .api_extensions import ext_router
 from .api_webapp import webapp_router
+from .telegram_webhook import router as tg_webhook_router, register_webhook
 
+configure_logging()
 run_migrations()
 
 
@@ -90,6 +94,15 @@ ERROR_COUNTER = Counter("vpn_requests_errors_total", "HTTP errors", ["path", "st
 
 
 @app.middleware("http")
+async def add_request_id(request: Request, call_next):
+    rid = request.headers.get("X-Request-ID") or uuid.uuid4().hex
+    request_id_var.set(rid)
+    response = await call_next(request)
+    response.headers["X-Request-ID"] = rid
+    return response
+
+
+@app.middleware("http")
 async def add_metrics(request: Request, call_next):
     response = await call_next(request)
     status_code = response.status_code
@@ -107,6 +120,12 @@ async def add_metrics(request: Request, call_next):
 app.include_router(api_router)
 app.include_router(ext_router)
 app.include_router(webapp_router)
+app.include_router(tg_webhook_router)
+
+
+@app.on_event("startup")
+def _startup_register_telegram_webhook():
+    register_webhook()
 
 
 @app.get("/")

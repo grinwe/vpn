@@ -23,6 +23,11 @@ from sqlalchemy.orm import Session
 from .. import models
 from ..security import encrypt
 from ..time_utils import utcnow
+from .ansible_runner import (
+    InvalidNodeIdentity,
+    validate_node_identity_fields,
+    validate_node_name,
+)
 from .cloud import DriverError, get_driver
 from .provisioning import ProvisioningOrchestrator
 from .shadowtls import (
@@ -170,6 +175,16 @@ def spawn_node(
     if not provider or not provider.is_active:
         raise NodeSpawnError(f"CloudProvider {provider_id} not found or inactive")
 
+    # #55 — name validation runs *before* we pay for the cloud VM. If
+    # the caller (autoscale, /nodes/spawn, admin script) constructed a
+    # name that wouldn't be safe in an ansible inventory, fail fast —
+    # renting a machine we can't provision is strictly worse than a
+    # clear rejection.
+    try:
+        validate_node_name(name)
+    except InvalidNodeIdentity as exc:
+        raise NodeSpawnError(str(exc)) from exc
+
     driver = get_driver(provider)
     image = image or provider.default_image or "ubuntu-22.04"
     ssh_key_ids = ssh_key_ids if ssh_key_ids is not None else (provider.ssh_key_ids or [])
@@ -187,6 +202,18 @@ def spawn_node(
     except DriverError as exc:
         logger.exception("Failed to spawn node via %s", provider.name)
         raise NodeSpawnError(str(exc)) from exc
+
+    # #55 — host+port re-validation once the cloud driver returns.
+    # ``server.ipv4`` should always be a real IPv4 string, but any
+    # future driver that returns a malformed value (or we add IPv6
+    # support and forget to update one path) will still be caught
+    # before the row is committed or the inventory is rendered.
+    try:
+        validate_node_identity_fields(name, server.ipv4, 22)
+    except InvalidNodeIdentity as exc:
+        raise NodeSpawnError(
+            f"cloud driver {provider.name} returned invalid host: {exc}"
+        ) from exc
 
     node = models.VPNNode(
         name=name,

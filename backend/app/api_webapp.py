@@ -17,6 +17,7 @@ import base64
 import hashlib
 import hmac
 import json
+import logging
 import os
 import time
 from datetime import datetime
@@ -33,6 +34,8 @@ from .db import SessionLocal
 from .rate_limit import limiter
 from .services.payments.base import ProviderError, get_provider
 
+logger = logging.getLogger(__name__)
+
 webapp_router = APIRouter(prefix="/api/webapp", tags=["webapp"])
 
 
@@ -46,13 +49,22 @@ def get_db():
 
 # ---------- Telegram initData verification ----------
 
-def _verify_init_data(init_data: str, bot_token: str) -> dict:
+def _verify_init_data(init_data: str, bot_token: str, ttl_seconds: int) -> dict:
     """Validate Telegram WebApp initData and return parsed fields.
 
     Spec: https://core.telegram.org/bots/webapps#validating-data-received-via-the-mini-app
     Algorithm: split query-string, pull out ``hash``, sort the rest as
     ``key=value`` lines joined by ``\n``, HMAC-SHA256 it with a secret key
     derived as ``HMAC-SHA256("WebAppData", bot_token)``.
+
+    ``ttl_seconds`` bounds how stale the ``auth_date`` can be. This is
+    a handshake, not a session — the caller exchanges the parsed result
+    for a session JWT within seconds. Pre-fix (#53, 2026-04) the TTL
+    was hardcoded at 24h *and* the check was guarded by ``if auth_date
+    and …``, which silently skipped validation when ``auth_date`` was
+    missing or zero. Both gaps are closed here: ``auth_date`` must be
+    present, a positive integer, not in the future beyond a small
+    clock-skew window, and not older than ``ttl_seconds``.
     """
     parsed = dict(parse_qsl(init_data, keep_blank_values=True))
     received_hash = parsed.pop("hash", None)
@@ -70,11 +82,21 @@ def _verify_init_data(init_data: str, bot_token: str) -> dict:
     if not hmac.compare_digest(expected, received_hash):
         raise HTTPException(status_code=401, detail="initData hash mismatch")
 
-    # auth_date is unix seconds — reject anything older than 24h to limit
-    # replay attacks even if a user accidentally pasted their initData
-    # somewhere public.
-    auth_date = int(parsed.get("auth_date", "0"))
-    if auth_date and (time.time() - auth_date) > 86400:
+    raw_auth_date = parsed.get("auth_date")
+    if raw_auth_date is None or raw_auth_date == "":
+        raise HTTPException(status_code=401, detail="initData missing auth_date")
+    try:
+        auth_date = int(raw_auth_date)
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=401, detail="initData has invalid auth_date")
+    if auth_date <= 0:
+        raise HTTPException(status_code=401, detail="initData has invalid auth_date")
+    now = int(time.time())
+    # Tolerate ~60s of clock skew between the Telegram edge and this
+    # backend — anything more is suspicious.
+    if auth_date - now > 60:
+        raise HTTPException(status_code=401, detail="initData auth_date in future")
+    if (now - auth_date) > ttl_seconds:
         raise HTTPException(status_code=401, detail="initData expired")
 
     return parsed
@@ -155,7 +177,9 @@ def webapp_auth(request: Request, body: AuthRequest, db: Session = Depends(get_d
     if not settings.webapp_jwt_secret:
         raise HTTPException(status_code=500, detail="WEBAPP_JWT_SECRET not set")
 
-    parsed = _verify_init_data(body.init_data, settings.bot_token)
+    parsed = _verify_init_data(
+        body.init_data, settings.bot_token, settings.webapp_init_data_ttl_seconds
+    )
     user_blob = parsed.get("user")
     if not user_blob:
         raise HTTPException(status_code=401, detail="initData missing user")
@@ -210,6 +234,7 @@ class DeviceSummary(BaseModel):
     id: int
     name: str
     status: str
+    sub_token: str | None
     created_at: datetime | None
 
 
@@ -225,6 +250,18 @@ class SubscriptionWebAppExtra(BaseModel):
     can_freeze: bool
     device_count: int
     bundled_devices: int
+    # Paid extra-device slots on top of ``bundled_devices``. See
+    # ``webapp_add_device``. 0 for every sub that never bought a slot.
+    extra_device_slots: int
+    # Monthly fee per extra slot; lets the UI show "+₽100/мес за
+    # устройство" without hardcoding the env constant on the client.
+    extra_device_monthly_kopecks: int
+    # Pro-rated fee the user would be charged *right now* for buying
+    # one more slot (for the remainder of the current period). Used by
+    # the Home.tsx add-device confirm dialog. May be 0 if the new
+    # device still fits in the already-paid envelope (e.g. user had
+    # bought a slot then removed a device).
+    next_extra_fee_kopecks: int
     devices: list[DeviceSummary]
 
 
@@ -300,6 +337,17 @@ def _build_subscription_extras(
             and not already_froze
         )
 
+        bundled = (plan.max_devices if plan else 1) or 1
+        slots = sub.extra_device_slots or 0
+        # If the user already has a paid envelope big enough for the
+        # next device (bundled + slots > live), adding another one is
+        # free — show 0. Otherwise quote the pro-rated remainder.
+        capacity = bundled + slots
+        next_extra_fee = (
+            balance_svc.prorated_extra_device_fee(sub)
+            if plan and live_devices + 1 > capacity
+            else 0
+        )
         extras.append(
             SubscriptionWebAppExtra(
                 subscription_id=sub.id,
@@ -311,12 +359,16 @@ def _build_subscription_extras(
                 frozen_until=sub.frozen_until,
                 can_freeze=can_freeze,
                 device_count=live_devices,
-                bundled_devices=(plan.max_devices if plan else 1) or 1,
+                bundled_devices=bundled,
+                extra_device_slots=slots,
+                extra_device_monthly_kopecks=balance_svc.EXTRA_DEVICE_MONTHLY_KOPECKS,
+                next_extra_fee_kopecks=next_extra_fee,
                 devices=[
                     DeviceSummary(
                         id=d.id,
                         name=d.name or f"device-{d.id}",
                         status=d.status.value,
+                        sub_token=d.sub_token,
                         created_at=getattr(d, "created_at", None),
                     )
                     for d in live_device_rows
@@ -325,7 +377,14 @@ def _build_subscription_extras(
         )
 
         if days_left is not None and sub.status == models.SubscriptionStatus.active:
-            min_days = days_left if min_days is None else min(min_days, days_left)
+            # Total runway = current period remaining + future renewals
+            # the balance can cover (only if auto_renew is on).
+            runway = days_left
+            if sub.auto_renew and price > 0:
+                balance = user.balance_kopecks or 0
+                future_renewals = balance // price
+                runway += future_renewals * duration
+            min_days = runway if min_days is None else min(min_days, runway)
 
     return extras, min_days
 
@@ -813,6 +872,13 @@ class ActivateResponse(BaseModel):
     balance_kopecks: int
     plan_price_kopecks: int
     plan_duration_days: int
+    # Kopecks credited back to the wallet from prorated remainder(s)
+    # of any subscription(s) that were terminated during this
+    # activation. 0 on a first-time activation (user had no prior
+    # active sub) or when the old sub had no unused period left.
+    # The webapp surfaces this in the "subscription activated" screen
+    # so the user visibly sees the refund they were warned about.
+    refunded_from_previous_kopecks: int = 0
 
 
 @webapp_router.post("/subscriptions/activate", response_model=ActivateResponse)
@@ -823,9 +889,33 @@ def webapp_activate(
     user: models.User = Depends(require_webapp_user),
     db: Session = Depends(get_db),
 ):
-    """Buy a plan: debit plan.price from wallet, set expires_at.
+    """Buy a plan — **single-subscription model**.
 
-    V2 monthly billing — one charge per period, no daily tick.
+    Invariant after success: the user has exactly one active/frozen
+    subscription (the new one). If they already had an active/frozen
+    sub on a **different** plan, we:
+
+    1. Provision the new sub on ``plan``.
+    2. Credit the prorated remainder of every existing active/frozen
+       sub back to the wallet as ``kind=refund`` ledger rows.
+    3. Charge the full new plan price (``activate_subscription``).
+    4. Revoke every old sub via
+       ``revoke_subscription_devices`` — same effect as admin's
+       ``/subscriptions/{id}/disable``: ``status=blocked`` +
+       devices revoked + ansible cleanup task enqueued. The old sub
+       then disappears from ``/me`` (which filters out ``blocked``).
+
+    If they re-click the plan they're already on, we 400 instead of
+    silently creating a duplicate — the UI hides the activate button
+    on the current plan, but we defend at the API layer too.
+
+    On insufficient balance after the refund credit, we 402 with
+    ``suggested_topup_kopecks`` so the frontend can pre-fill the
+    topup modal. The user is always warned about the old-sub
+    termination in the webapp confirm dialog *before* the request
+    goes out (see ``webapp/src/pages/Plans.tsx``), so this endpoint
+    trusts the caller has consented — no two-step "review then
+    commit" flow.
     """
     from .services import balance as balance_svc
     from .services.provisioning import ProvisioningOrchestrator
@@ -840,8 +930,40 @@ def webapp_activate(
             status_code=400, detail="Plan has no price configured"
         )
 
-    if (user.balance_kopecks or 0) < plan_price:
-        shortfall = plan_price - (user.balance_kopecks or 0)
+    # Single-sub invariant: every active/frozen sub must be terminated
+    # before the new one goes live. We look across *any* plan (not
+    # just "different plan") so the 400 below fires for same-plan
+    # re-clicks.
+    existing_subs = (
+        db.query(models.Subscription)
+        .filter(
+            models.Subscription.user_id == user.id,
+            models.Subscription.status.in_(
+                [
+                    models.SubscriptionStatus.active,
+                    models.SubscriptionStatus.frozen,
+                ]
+            ),
+        )
+        .all()
+    )
+    for existing in existing_subs:
+        if existing.plan_id == plan.id:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Already on plan '{plan.name}'",
+            )
+
+    # Pre-flight balance check uses the projected balance *after* the
+    # prorated refund is credited. That way a user with a ₽0 wallet but
+    # a ₽300 refund pending on their old sub can still switch to a
+    # ₽250 plan.
+    refund_estimate = sum(
+        balance_svc.prorated_sub_refund_kopecks(s) for s in existing_subs
+    )
+    projected_balance = (user.balance_kopecks or 0) + refund_estimate
+    if projected_balance < plan_price:
+        shortfall = plan_price - projected_balance
         suggested = max(balance_svc.min_topup_kopecks(db), shortfall)
         raise HTTPException(
             status_code=402,
@@ -849,23 +971,10 @@ def webapp_activate(
                 "code": "insufficient_balance",
                 "balance_kopecks": user.balance_kopecks or 0,
                 "required_kopecks": plan_price,
+                "refund_estimate_kopecks": refund_estimate,
                 "suggested_topup_kopecks": suggested,
             },
         )
-
-    # Cancel active subscriptions on other plans so the user doesn't
-    # end up with multiple parallel subscriptions after a plan change.
-    existing_subs = (
-        db.query(models.Subscription)
-        .filter(
-            models.Subscription.user_id == user.id,
-            models.Subscription.status == models.SubscriptionStatus.active,
-            models.Subscription.plan_id != plan.id,
-        )
-        .all()
-    )
-    for old_sub in existing_subs:
-        old_sub.auto_renew = False
 
     orchestrator = ProvisioningOrchestrator(db)
     try:
@@ -873,7 +982,20 @@ def webapp_activate(
     except RuntimeError as exc:
         raise HTTPException(status_code=409, detail=str(exc))
 
+    # Atomic "refund + charge" block. Both go through _record_tx which
+    # only flushes (no commit), so a ValueError from activate_subscription
+    # rolls back the refund credit too. Same failure pattern as the
+    # original webapp_activate: rollback, mark the just-provisioned sub
+    # expired, and surface 402 to the caller.
+    refunded_total = 0
     try:
+        for old in existing_subs:
+            old_name = old.plan.name if old.plan else "?"
+            refunded_total += balance_svc.refund_subscription_remainder(
+                db, old,
+                reference=f"switch:{sub.id}:{old.id}",
+                note=f"switch {old_name} -> {plan.name}",
+            )
         balance_svc.activate_subscription(
             db, user.id, sub, reference=f"activate:{sub.id}"
         )
@@ -884,17 +1006,45 @@ def webapp_activate(
         db.commit()
         raise HTTPException(status_code=402, detail=str(exc))
 
+    # Now revoke the old subs. revoke_subscription_devices commits
+    # internally (per-device revoke_device calls commit), so this also
+    # persists the refund + charge from the block above. If an
+    # individual revoke raises (ansible task create failed, etc.) we
+    # log and keep going — the new sub is already live, and the
+    # reconciler will flag any stuck old sub on its next tick.
+    for old in existing_subs:
+        old_name = old.plan.name if old.plan else "?"
+        try:
+            orchestrator.revoke_subscription_devices(
+                old, reason=f"user switched {old_name} -> {plan.name}"
+            )
+        except Exception as exc:
+            logger.warning(
+                "webapp.activate revoke_old_failed user=%s old_sub=%s: %s",
+                user.id, old.id, exc,
+            )
+
     db.commit()
     db.refresh(user)
     db.refresh(sub)
 
+    # Return the primary device's per-device sub_token so the QR/link
+    # exposes only that device's credentials (not the entire subscription).
+    # Falls back to the subscription-level token for safety.
+    primary_device = next(
+        (d for d in sub.devices if d.sub_token),
+        None,
+    )
+    token = primary_device.sub_token if primary_device else sub.sub_token
+
     return ActivateResponse(
         subscription_id=sub.id,
-        sub_token=sub.sub_token,
+        sub_token=token,
         expires_at=sub.expires_at,
         balance_kopecks=user.balance_kopecks or 0,
         plan_price_kopecks=plan_price,
         plan_duration_days=plan.duration_days,
+        refunded_from_previous_kopecks=refunded_total,
     )
 
 
@@ -1028,6 +1178,79 @@ def webapp_change_plan(
     )
 
 
+class MigrateNodeResponse(BaseModel):
+    subscription_id: int
+    old_node_id: int
+    old_node_name: str
+    new_node_id: int
+    new_node_name: str
+    new_node_region: str | None
+    task_id: int
+
+
+@webapp_router.post(
+    "/subscriptions/{subscription_id}/migrate_node",
+    response_model=MigrateNodeResponse,
+)
+def webapp_migrate_node(
+    subscription_id: int,
+    user: models.User = Depends(require_webapp_user),
+    db: Session = Depends(get_db),
+):
+    """Relocate an active subscription to a different VPN node.
+
+    Same mechanics as the drain-tick migration used by stage 5 downscale:
+    preserves ``sub_token`` so installed clients keep working (they just
+    refetch ``/sub/{token}`` and pick up new host URIs on the next profile
+    update). Old devices on the previous node are revoked in the
+    background, a fresh device is provisioned on the newly chosen node.
+
+    Fails with 503 if ``choose_node`` cannot find any eligible alternative
+    in the plan's pools (e.g. user is already on the only available node).
+    Free of charge — same plan, same expiry, just a different pop.
+    """
+    from .services.provisioning import ProvisioningOrchestrator
+
+    sub = db.get(models.Subscription, subscription_id)
+    if not sub or sub.user_id != user.id:
+        raise HTTPException(status_code=404, detail="Subscription not found")
+    if sub.status != models.SubscriptionStatus.active:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Subscription is {sub.status.value}, must be active to migrate",
+        )
+    if sub.node is None:
+        raise HTTPException(status_code=400, detail="Subscription has no node")
+    if sub.plan is None:
+        raise HTTPException(status_code=400, detail="Subscription has no plan")
+
+    old_node = sub.node
+    orchestrator = ProvisioningOrchestrator(db)
+    try:
+        target, _device, task = orchestrator.migrate_subscription_to_new_node(sub)
+    except RuntimeError as exc:
+        # No eligible alternative node — tell the client so the UI can
+        # show a friendly "no other nodes available" message instead of
+        # a generic 500.
+        logger.info(
+            "webapp migrate_node failed for sub %s: %s", sub.id, exc
+        )
+        raise HTTPException(status_code=503, detail=str(exc))
+
+    db.commit()
+    db.refresh(sub)
+
+    return MigrateNodeResponse(
+        subscription_id=sub.id,
+        old_node_id=old_node.id,
+        old_node_name=old_node.name,
+        new_node_id=target.id,
+        new_node_name=target.name,
+        new_node_region=target.region,
+        task_id=task.id,
+    )
+
+
 class FreezeResponse(BaseModel):
     subscription_id: int
     status: str
@@ -1140,7 +1363,9 @@ class AddDeviceResponse(BaseModel):
     subscription_id: int
     device_id: int
     device_count: int
-    new_daily_cost_kopecks: int
+    extra_device_slots: int
+    charged_kopecks: int
+    balance_kopecks: int
 
 
 @webapp_router.post(
@@ -1154,11 +1379,25 @@ def webapp_add_device(
 ):
     """Provision an additional device on an active subscription.
 
-    Stage 4 hitvpn-style: each device above ``plan.max_devices`` adds
-    ``EXTRA_DEVICE_KOPECKS_PER_MONTH`` (≈100₽/mo) to the daily charge.
-    Pre-flight: user must have at least one day of the *new* daily
-    cost in balance — otherwise the very next charge tick would
-    immediately flip the sub to expired.
+    V2 billing: the plan price covers up to ``plan.max_devices`` devices
+    per period. Each device above that requires a paid slot at
+    ``EXTRA_DEVICE_MONTHLY_KOPECKS`` per month; the slot is persisted
+    on ``Subscription.extra_device_slots`` and billed on every future
+    renewal until the user changes plan or cancels.
+
+    Flow:
+
+    1. ``capacity = plan.max_devices + sub.extra_device_slots`` is the
+       free envelope (plan bundle + already-bought slots).
+    2. If ``live_devices + 1 <= capacity`` → free, just provision
+       (e.g. user removed a device earlier and is refilling).
+    3. Otherwise pro-rate ``EXTRA_DEVICE_MONTHLY_KOPECKS`` for the
+       remainder of the current period, check wallet, charge, bump
+       ``extra_device_slots`` by 1, and provision.
+
+    On insufficient balance we return **402** with
+    ``suggested_topup_kopecks`` so the frontend can pop the topup
+    modal (same pattern as ``/activate`` and ``/change_plan``).
     """
     from .services import balance as balance_svc
     from .services.provisioning import ProvisioningOrchestrator
@@ -1171,28 +1410,38 @@ def webapp_add_device(
             status_code=400,
             detail=f"subscription is {sub.status.value}, must be active",
         )
-    if sub.plan is None or sub.plan.daily_rate_kopecks is None:
-        raise HTTPException(
-            status_code=400, detail="plan has no daily rate (legacy plan)"
-        )
+    if sub.plan is None:
+        raise HTTPException(status_code=400, detail="subscription has no plan")
 
     current_devices = balance_svc._live_device_count(db, sub.id)
+    max_bundled = sub.plan.max_devices or 1
+    current_slots = sub.extra_device_slots or 0
+    capacity = max_bundled + current_slots
     new_device_count = current_devices + 1
-    new_daily_cost = balance_svc._daily_cost_kopecks(sub.plan, new_device_count)
+    # Only charge if the new device pushes us outside the current paid
+    # envelope. Re-filling a revoked slot (current_devices < capacity)
+    # is free because the slot was already paid for.
+    needs_new_slot = new_device_count > capacity
 
-    # Add-device doesn't touch the wallet — the extra cost drains the
-    # sub's prepaid bucket faster. Gate on that bucket being able to
-    # cover at least one day at the *new* rate; otherwise the next
-    # charge tick immediately expires the sub.
-    if (sub.prepaid_kopecks or 0) < new_daily_cost:
+    fee = (
+        balance_svc.prorated_extra_device_fee(sub)
+        if needs_new_slot
+        else 0
+    )
+    if fee > 0 and (user.balance_kopecks or 0) < fee:
+        shortfall = fee - (user.balance_kopecks or 0)
+        suggested = max(balance_svc.min_topup_kopecks(db), shortfall)
         raise HTTPException(
             status_code=402,
             detail={
-                "code": "insufficient_prepaid_for_device",
-                "prepaid_kopecks": sub.prepaid_kopecks or 0,
-                "required_kopecks": new_daily_cost,
-                "hint": "Remainder of the current plan can't cover this device. "
-                        "Buy a new plan or wait for the current one to renew.",
+                "code": "insufficient_balance",
+                "balance_kopecks": user.balance_kopecks or 0,
+                "required_kopecks": fee,
+                "suggested_topup_kopecks": suggested,
+                "hint": (
+                    f"Дополнительное устройство — {fee / 100:.0f} ₽ "
+                    f"за остаток текущего периода. Пополни баланс."
+                ),
             },
         )
 
@@ -1204,14 +1453,41 @@ def webapp_add_device(
     except RuntimeError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
 
+    charged = 0
+    if fee > 0:
+        try:
+            charged = balance_svc.charge_extra_device(
+                db,
+                user.id,
+                sub,
+                fee,
+                reference=f"extra_device:{sub.id}:{device.id}",
+            )
+        except ValueError as exc:
+            # Shouldn't normally hit — we pre-checked the balance above,
+            # but another request may have just drained the wallet. Roll
+            # back the provisioning we optimistically started.
+            orchestrator.revoke_device(
+                device, reason="add_device: insufficient balance", background=True
+            )
+            db.commit()
+            raise HTTPException(status_code=402, detail=str(exc))
+        # Persist the bought slot — this is what makes subsequent
+        # renewals include the surcharge.
+        sub.extra_device_slots = current_slots + 1
+        db.add(sub)
+
     db.commit()
+    db.refresh(user)
     db.refresh(sub)
 
     return AddDeviceResponse(
         subscription_id=sub.id,
         device_id=device.id,
         device_count=new_device_count,
-        new_daily_cost_kopecks=new_daily_cost,
+        extra_device_slots=sub.extra_device_slots or 0,
+        charged_kopecks=charged,
+        balance_kopecks=user.balance_kopecks or 0,
     )
 
 
@@ -1254,7 +1530,8 @@ def webapp_rename_device(
 class RemoveDeviceResponse(BaseModel):
     device_id: int
     device_count: int
-    new_daily_cost_kopecks: int
+    extra_device_slots: int
+    balance_kopecks: int
 
 
 @webapp_router.delete(
@@ -1267,6 +1544,14 @@ def webapp_remove_device(
     db: Session = Depends(get_db),
 ):
     """Revoke a device and its credential on the VPN node.
+
+    Important (V2): removing a physical device does **not** refund
+    money and does **not** free up the paid slot. If the user bought
+    an extra slot on this subscription, they continue to pay for it on
+    every renewal until they change plan or cancel. That's by design —
+    the frontend warns the user in the confirm dialog, and the /me
+    response exposes ``extra_device_slots`` so the UI can show the
+    user how many paid slots are attached to the sub.
 
     The last device on a subscription cannot be removed — that's
     effectively a subscription cancel, handled separately.
@@ -1293,15 +1578,16 @@ def webapp_remove_device(
 
     orchestrator = ProvisioningOrchestrator(db)
     orchestrator.revoke_device(device, reason="user_removed", background=True)
-    db.commit()
 
-    new_count = live_count - 1
-    new_daily = balance_svc._daily_cost_kopecks(sub.plan, new_count) if sub.plan else 0
+    db.commit()
+    db.refresh(user)
+    db.refresh(sub)
 
     return RemoveDeviceResponse(
         device_id=device.id,
-        device_count=new_count,
-        new_daily_cost_kopecks=new_daily,
+        device_count=live_count - 1,
+        extra_device_slots=sub.extra_device_slots or 0,
+        balance_kopecks=user.balance_kopecks or 0,
     )
 
 

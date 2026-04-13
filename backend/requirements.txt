@@ -11,3 +11,4 @@ cryptography
 redis>=5
 rq>=1.16
 slowapi>=0.1.9
+structlog>=24.1

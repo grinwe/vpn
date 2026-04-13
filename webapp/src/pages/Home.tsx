@@ -29,7 +29,7 @@ export default function Home({
 }) {
   const [topupOpen, setTopupOpen] = useState(false);
   const [referral, setReferral] = useState<ReferralInfo | null>(null);
-  const [showVideos, setShowVideos] = useState(false);
+  const [showSetup, setShowSetup] = useState(false);
   const [trialActivating, setTrialActivating] = useState(false);
 
   // Trial is retroactive: any user whose trial_activated_at is still
@@ -74,9 +74,19 @@ export default function Home({
   return (
     <div className="min-h-screen p-4 max-w-xl mx-auto">
       <header className="mb-6">
-        <div className="text-tg-hint text-sm">Личный кабинет</div>
-        <div className="text-2xl font-semibold">
-          {me.user.telegram_id ? `@${me.user.telegram_id}` : "Гость"}
+        <div className="flex items-center justify-between">
+          <div>
+            <div className="text-tg-hint text-sm">Личный кабинет</div>
+            <div className="text-2xl font-semibold">
+              {me.user.telegram_id ? `@${me.user.telegram_id}` : "Гость"}
+            </div>
+          </div>
+          <button
+            onClick={() => setShowSetup(true)}
+            className="px-3 py-2 rounded-xl bg-tg-button text-tg-buttonText text-sm font-semibold"
+          >
+            Как настроить
+          </button>
         </div>
       </header>
 
@@ -153,9 +163,12 @@ export default function Home({
       <div className="flex gap-2">
         <button
           className="btn-primary flex-1 py-3"
-          onClick={() => navigate({ name: "plans" })}
+          onClick={() => {
+            const activeSub = me.subscriptions.find((s) => s.status === "active");
+            navigate({ name: "plans", subscriptionId: activeSub?.id });
+          }}
         >
-          {me.subscriptions.length === 0 ? "Выбрать подписку" : "Добавить подписку"}
+          {me.subscriptions.length === 0 ? "Выбрать подписку" : "Сменить подписку"}
         </button>
         <button
           className="btn-ghost py-3 px-4"
@@ -219,41 +232,7 @@ export default function Home({
         </section>
       )}
 
-      {/* ── Video instructions ── */}
-      <section className="card mt-6">
-        <button
-          onClick={() => setShowVideos((v) => !v)}
-          className="w-full flex items-center justify-between text-left"
-        >
-          <span className="text-sm font-semibold">📺 Как настроить</span>
-          <span className="text-tg-hint text-xs">{showVideos ? "▲" : "▼"}</span>
-        </button>
-        {showVideos && (
-          <ul className="mt-3 space-y-2 text-sm">
-            <li>
-              <a className="text-tg-link" href="https://hiddify.com/" target="_blank" rel="noreferrer">
-                iOS — Hiddify Next
-              </a>
-            </li>
-            <li>
-              <a className="text-tg-link" href="https://hiddify.com/" target="_blank" rel="noreferrer">
-                Android — Hiddify Next / v2rayNG
-              </a>
-            </li>
-            <li>
-              <a className="text-tg-link" href="https://hiddify.com/" target="_blank" rel="noreferrer">
-                Windows — Hiddify Desktop
-              </a>
-            </li>
-            <li>
-              <a className="text-tg-link" href="https://hiddify.com/" target="_blank" rel="noreferrer">
-                macOS — Hiddify Desktop
-              </a>
-            </li>
-          </ul>
-        )}
-      </section>
-
+      {showSetup && <SetupSheet onClose={() => setShowSetup(false)} />}
       {topupOpen && <TopupModal onClose={() => setTopupOpen(false)} />}
     </div>
   );
@@ -282,15 +261,15 @@ function SubscriptionCard({
   const [busy, setBusy] = useState(false);
   const [showQR, setShowQR] = useState(false);
   const qrCanvasRef = useRef<HTMLCanvasElement | null>(null);
-  // Stage 8 — when SUB_LINK_BASE_URL is configured we surface that
-  // boring-domain URL (e.g. https://c1.cloudfn.app/sub/<token>) so
-  // already-installed clients keep working even if the primary domain
-  // gets blocked. Empty base falls back to the same-origin relative
-  // path on `grinwer.online`.
-  const subUrl = sub.sub_token
+  // Per-device sub link — use the first active device's token so the QR
+  // exposes only that device's credentials.  Falls back to the legacy
+  // subscription-level token for old subscriptions without device tokens.
+  const primaryDevice = extra?.devices?.find((d) => d.sub_token);
+  const linkToken = primaryDevice?.sub_token ?? sub.sub_token;
+  const subUrl = linkToken
     ? subLinkBase
-      ? `${subLinkBase}/${sub.sub_token}`
-      : `${window.location.origin}/api/sub/${sub.sub_token}`
+      ? `${subLinkBase}/${linkToken}`
+      : `${window.location.origin}/api/sub/${linkToken}`
     : null;
 
   const isFrozen = sub.status === "frozen";
@@ -429,6 +408,7 @@ function SubscriptionCard({
               <DeviceRow
                 key={d.id}
                 device={d}
+                subLinkBase={subLinkBase}
                 canRemove={extra.device_count > 1}
                 onAction={onAction}
               />
@@ -436,7 +416,12 @@ function SubscriptionCard({
           </ul>
           <button
             onClick={async () => {
-              if (!confirm("Добавить ещё одно устройство?")) return;
+              const fee = extra.next_extra_fee_kopecks;
+              const monthly = extra.extra_device_monthly_kopecks;
+              const msg = fee > 0
+                ? `Добавить ещё одно устройство?\n\nСпишется ${(fee / 100).toFixed(0)} ₽ за остаток периода, далее +${(monthly / 100).toFixed(0)} ₽/мес.`
+                : "Добавить ещё одно устройство?";
+              if (!confirm(msg)) return;
               setBusy(true);
               try {
                 await addDevice(sub.id);
@@ -485,35 +470,25 @@ function SubscriptionCard({
         </div>
       )}
 
-      {/* Freeze / unfreeze + change plan */}
-      {extra && (
-        <div className="mt-3 flex gap-2">
+      {/* Freeze / unfreeze */}
+      {extra && (isFrozen || (!isFrozen && extra.can_freeze)) && (
+        <div className="mt-3">
           {isFrozen ? (
             <button
               onClick={handleUnfreeze}
               disabled={busy}
-              className="flex-1 py-2 rounded-xl bg-tg-button text-tg-buttonText text-sm font-semibold disabled:opacity-50"
+              className="w-full py-2 rounded-xl bg-tg-button text-tg-buttonText text-sm font-semibold disabled:opacity-50"
             >
               {busy ? "…" : "Разморозить"}
             </button>
           ) : (
-            <>
-              {extra.can_freeze && (
-                <button
-                  onClick={handleFreeze}
-                  disabled={busy}
-                  className="flex-1 py-2 rounded-xl bg-tg-secondaryBg ring-1 ring-tg-hint text-tg-text text-sm disabled:opacity-50"
-                >
-                  {busy ? "…" : "Заморозить на 7 дн."}
-                </button>
-              )}
-              <button
-                onClick={() => navigate({ name: "plans" })}
-                className="flex-1 py-2 rounded-xl bg-tg-secondaryBg ring-1 ring-tg-hint text-tg-text text-sm"
-              >
-                Сменить тариф
-              </button>
-            </>
+            <button
+              onClick={handleFreeze}
+              disabled={busy}
+              className="w-full py-2 rounded-xl bg-tg-secondaryBg ring-1 ring-tg-hint text-tg-text text-sm disabled:opacity-50"
+            >
+              {busy ? "…" : "Заморозить на 7 дн."}
+            </button>
           )}
         </div>
       )}
@@ -595,11 +570,70 @@ function StatusBadge({ status, autoRenew }: { status: string; autoRenew?: boolea
   return <span className={`chip ${color}`}>{label}</span>;
 }
 
+const SETUP_PLATFORMS = [
+  {
+    label: "Android (v2rayNG)",
+    text: "1. Установите v2rayNG из Google Play или GitHub\n2. Скопируйте ссылку конфига из раздела «Устройства»\n3. Откройте v2rayNG → нажмите + → Импорт из буфера\n4. Нажмите кнопку ▶️ для подключения\n\nАльтернатива: Hiddify (Google Play) — автоимпорт по ссылке.",
+  },
+  {
+    label: "iOS (Hiddify / Streisand)",
+    text: "1. Установите Hiddify или Streisand из App Store\n2. Скопируйте ссылку конфига из раздела «Устройства»\n3. Откройте приложение → + → Добавить из буфера\n4. Нажмите Подключить",
+  },
+  {
+    label: "Windows (Hiddify / Nekoray)",
+    text: "1. Скачайте Hiddify с hiddify.com или Nekoray с GitHub\n2. Скопируйте ссылку конфига из раздела «Устройства»\n3. В программе: Добавить профиль из буфера\n4. Активируйте системный прокси и подключитесь",
+  },
+  {
+    label: "macOS (Hiddify)",
+    text: "1. Скачайте Hiddify с hiddify.com\n2. Скопируйте ссылку конфига из раздела «Устройства»\n3. Добавьте профиль из буфера обмена\n4. Подключитесь",
+  },
+];
+
+function SetupSheet({ onClose }: { onClose: () => void }) {
+  const [open, setOpen] = useState<number | null>(null);
+
+  useEffect(() => { getTg()?.expand(); }, []);
+
+  return (
+    <div className="fixed inset-0 bg-black/60 flex items-end justify-center z-50 animate-fadeIn" onClick={onClose}>
+      <div
+        className="bg-tg-bg rounded-t-3xl border-t border-white/10 p-6 max-w-xl w-full max-h-[80vh] overflow-y-auto animate-slideUp"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <h2 className="text-lg font-semibold mb-3">Как настроить VPN</h2>
+        <div className="space-y-2">
+          {SETUP_PLATFORMS.map((p, i) => (
+            <div key={i}>
+              <button
+                onClick={() => setOpen(open === i ? null : i)}
+                className="w-full text-left px-3 py-2.5 rounded-xl bg-tg-secondaryBg text-sm font-semibold flex items-center justify-between"
+              >
+                {p.label}
+                <span className="text-tg-hint text-xs">{open === i ? "▲" : "▼"}</span>
+              </button>
+              {open === i && (
+                <div className="px-3 py-2 text-sm text-tg-hint whitespace-pre-line">
+                  {p.text}
+                </div>
+              )}
+            </div>
+          ))}
+        </div>
+        <button onClick={onClose} className="btn-primary w-full mt-4">
+          Закрыть
+        </button>
+      </div>
+    </div>
+  );
+}
+
 const TOPUP_PRESETS = [10000, 30000, 60000, 150000]; // kopecks: 100/300/600/1500 ₽
 
 function TopupModal({ onClose }: { onClose: () => void }) {
   const [busy, setBusy] = useState(false);
   const [customRub, setCustomRub] = useState<string>("");
+
+  useEffect(() => { getTg()?.expand(); }, []);
 
   async function pay(amountKopecks: number) {
     const tg = getTg();
@@ -629,9 +663,9 @@ function TopupModal({ onClose }: { onClose: () => void }) {
   }
 
   return (
-    <div className="fixed inset-0 bg-black/60 flex items-end justify-center" onClick={onClose}>
+    <div className="fixed inset-0 bg-black/60 flex items-end justify-center z-50 animate-fadeIn" onClick={onClose}>
       <div
-        className="bg-tg-bg rounded-t-3xl border-t border-white/10 p-6 max-w-xl w-full"
+        className="bg-tg-bg rounded-t-3xl border-t border-white/10 p-6 max-w-xl w-full max-h-[80vh] overflow-y-auto animate-slideUp"
         onClick={(e) => e.stopPropagation()}
       >
         <h2 className="text-lg font-semibold mb-3">Пополнение баланса</h2>
@@ -664,6 +698,9 @@ function TopupModal({ onClose }: { onClose: () => void }) {
             Оплатить
           </button>
         </div>
+        {customRub && Number(customRub) > 0 && Number(customRub) < 100 && (
+          <div className="text-red-400 text-xs mt-1">Минимальная сумма пополнения — 100 ₽</div>
+        )}
         <button
           onClick={onClose}
           disabled={busy}
@@ -678,17 +715,26 @@ function TopupModal({ onClose }: { onClose: () => void }) {
 
 function DeviceRow({
   device,
+  subLinkBase,
   canRemove,
   onAction,
 }: {
   device: DeviceSummary;
+  subLinkBase: string;
   canRemove: boolean;
   onAction: () => void;
 }) {
   const [editing, setEditing] = useState(false);
   const [name, setName] = useState(device.name);
   const [busy, setBusy] = useState(false);
+  const [copied, setCopied] = useState(false);
   const inputRef = useRef<HTMLInputElement>(null);
+
+  const deviceUrl = device.sub_token
+    ? subLinkBase
+      ? `${subLinkBase}/${device.sub_token}`
+      : `${window.location.origin}/api/sub/${device.sub_token}`
+    : null;
 
   useEffect(() => {
     if (editing) inputRef.current?.focus();
@@ -716,7 +762,7 @@ function DeviceRow({
   }
 
   async function handleRemove() {
-    if (!confirm(`Удалить устройство «${device.name}»? Доступ будет отозван.`)) return;
+    if (!confirm(`Удалить устройство «${device.name}»?\n\nДоступ будет отозван. Если устройство было платным, ежемесячная стоимость снизится.`)) return;
     setBusy(true);
     try {
       await removeDevice(device.id);
@@ -729,44 +775,77 @@ function DeviceRow({
     }
   }
 
+  async function copyDeviceLink() {
+    if (!deviceUrl) return;
+    try {
+      await navigator.clipboard.writeText(deviceUrl);
+    } catch {
+      const ta = document.createElement("textarea");
+      ta.value = deviceUrl;
+      document.body.appendChild(ta);
+      ta.select();
+      try { document.execCommand("copy"); } catch { /* empty */ }
+      document.body.removeChild(ta);
+    }
+    getTg()?.HapticFeedback?.impactOccurred("light");
+    setCopied(true);
+    setTimeout(() => setCopied(false), 1500);
+  }
+
   return (
-    <li className="flex items-center gap-2 bg-tg-bg rounded px-2 py-1.5 text-xs">
-      {editing ? (
-        <input
-          ref={inputRef}
-          value={name}
-          onChange={(e) => setName(e.target.value)}
-          onBlur={saveName}
-          onKeyDown={(e) => {
-            if (e.key === "Enter") saveName();
-            if (e.key === "Escape") {
-              setName(device.name);
-              setEditing(false);
-            }
-          }}
-          maxLength={64}
-          disabled={busy}
-          className="flex-1 bg-transparent border-b border-tg-link outline-none text-tg-text"
-        />
-      ) : (
-        <span
-          className="flex-1 truncate cursor-pointer"
-          onClick={() => setEditing(true)}
-          title="Нажми, чтобы переименовать"
-        >
-          {device.name}
-        </span>
-      )}
-      <span className="text-tg-hint shrink-0">{device.status}</span>
-      {canRemove && (
-        <button
-          onClick={handleRemove}
-          disabled={busy}
-          className="text-red-400 hover:text-red-300 shrink-0 disabled:opacity-50"
-          title="Удалить устройство"
-        >
-          ✕
-        </button>
+    <li className="bg-tg-bg rounded px-2 py-1.5 text-xs">
+      <div className="flex items-center gap-2">
+        {editing ? (
+          <input
+            ref={inputRef}
+            value={name}
+            onChange={(e) => setName(e.target.value)}
+            onBlur={saveName}
+            onKeyDown={(e) => {
+              if (e.key === "Enter") saveName();
+              if (e.key === "Escape") {
+                setName(device.name);
+                setEditing(false);
+              }
+            }}
+            maxLength={64}
+            disabled={busy}
+            className="flex-1 bg-transparent border-b border-tg-link outline-none text-tg-text"
+          />
+        ) : (
+          <span
+            className="flex-1 truncate cursor-pointer"
+            onClick={() => setEditing(true)}
+            title="Нажми, чтобы переименовать"
+          >
+            {device.name}
+          </span>
+        )}
+        <span className="text-tg-hint shrink-0">{device.status}</span>
+        {deviceUrl && (
+          <button
+            onClick={copyDeviceLink}
+            className="text-tg-link shrink-0"
+            title="Скопировать ссылку устройства"
+          >
+            {copied ? "✓" : "🔗"}
+          </button>
+        )}
+        {canRemove && (
+          <button
+            onClick={handleRemove}
+            disabled={busy}
+            className="text-red-400 hover:text-red-300 shrink-0 disabled:opacity-50"
+            title="Удалить устройство"
+          >
+            ✕
+          </button>
+        )}
+      </div>
+      {deviceUrl && (
+        <div className="mt-1 text-[10px] font-mono text-tg-hint truncate">
+          {deviceUrl}
+        </div>
       )}
     </li>
   );
