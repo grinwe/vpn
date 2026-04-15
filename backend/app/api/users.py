@@ -191,6 +191,34 @@ def list_users(
     ]
 
 
+@router.get("/users/banned-telegram-ids", response_model=list[str])
+def list_banned_telegram_ids(
+    db: Session = Depends(get_db),
+    admin_token: str = Depends(require_admin),
+):
+    """Return the list of Telegram IDs for currently-banned users.
+
+    The bot pulls this periodically (short TTL cache) so its outer
+    middleware can drop incoming updates from banned accounts WITHOUT
+    making a backend call per update — the motivating scenario is a
+    DDoS where hundreds of bot accounts spam ``/start``. One admin API
+    call every N seconds beats N calls per second.
+
+    Only rows where ``banned_at IS NOT NULL AND telegram_id IS NOT NULL``.
+    Legacy users without a ``telegram_id`` can't send TG updates anyway,
+    so there's nothing to gate.
+    """
+    rows = (
+        db.query(models.User.telegram_id)
+        .filter(
+            models.User.banned_at.isnot(None),
+            models.User.telegram_id.isnot(None),
+        )
+        .all()
+    )
+    return [tg for (tg,) in rows]
+
+
 @router.post("/users/{user_id}/ban")
 def ban_user(
     user_id: int,

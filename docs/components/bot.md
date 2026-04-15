@@ -11,6 +11,7 @@ bot/
 ├── bot.py        — точка входа: Dispatcher, роутеры, notification poller, graceful shutdown
 ├── handlers.py   — ~970 строк, все основные команды (user + admin /invoices)
 ├── support.py    — FSM support-тикетов, подключается отдельным роутером
+├── middleware.py — outer middleware BanGuard: тихий drop апдейтов от забаненных
 ├── keyboards.py  — все ReplyKeyboard / InlineKeyboard
 ├── config.py     — чтение env (BOT_TOKEN, BACKEND_URL, ADMIN_API_TOKEN, ADMIN_IDS, ...)
 └── requirements.txt
@@ -25,6 +26,20 @@ dp.include_router(router)
 ```
 
 `MemoryStorage` — осознанный выбор: single-instance бот, нет нужды в Redis storage. Переход на multi-instance потребует RedisStorage (комментарий `bot.py:75-77`).
+
+## BanGuard — тихий drop забаненных
+
+`bot/middleware.py` — outer middleware на `dp.update`, регистрируется ПЕРЕД роутерами (`bot.py::main`). Каждые 30с (`_TTL_SECONDS`) подтягивает `GET /api/users/banned-telegram-ids` в процесс-локальный `set[str]`. На каждый входящий `Update` достаёт `from_user.id` (перебирая `message / edited_message / callback_query / inline_query / pre_checkout_query / chat_member / my_chat_member / chosen_inline_result / shipping_query`), сравнивает со строкой из кэша — если совпало, `return None` без вызова `handler(event, data)`.
+
+Почему это outer middleware, а не фильтр в роутере:
+
+- **DDoS-мотивация.** Инцидент: ~250 throwaway-аккаунтов долбили `/start` и клали процесс. Если бан-чек лежит внутри роутера, каждый mach of `CommandStart` всё равно прогружает FSMContext, тянет UserDB, etc. Outer middleware отрубает update'ы ещё до `FSMContext.get_data()`.
+- **Один admin-вызов на TTL, не на update.** Бот при DDoS'е не усиливает нагрузку на backend — вызовов к `/banned-telegram-ids` ровно `60/_TTL_SECONDS` в минуту (2 по текущим дефолтам), независимо от объёма входящих апдейтов.
+- **Fail-open при blip'е backend'а.** Если рефреш упал (5xx / таймаут / connection error), `_banned` остаётся в последнем успешно прочитанном состоянии. Лучше однократно пропустить забаненного внутрь, чем зачёрнодырить всю юзерскую базу из-за сетевого сбоя.
+
+«No ACK» — инвариант. На dropped-update мы НЕ отвечаем никак (ни текстом, ни reaction'ом, ни ошибкой). Любой ответ тренирует DDoS-скрипты, что аккаунт достижим. Update просто поглощается молча.
+
+Устанавливает бан только `POST /api/users/{id}/ban` (админ-панель). Снимается `/unban`. Поле — `User.banned_at` (`DateTime NULL`). Ортогонально `Subscription.status=blocked`: бан трогает только Telegram-аккаунт, подписки и их устройства не затрагиваются.
 
 ## Почему aiogram long-poll, а не webhook
 

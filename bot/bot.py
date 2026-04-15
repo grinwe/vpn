@@ -6,6 +6,7 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from .config import BOT_TOKEN, BACKEND_URL, ADMIN_API_TOKEN, NOTIFICATION_POLL_INTERVAL, BOT_WEBHOOK_PORT
 from .handlers import close_session, router, get_session, onboarding_keyboard, health_ping_keyboard
 from .keyboards import DEFAULT_COMMANDS
+from .middleware import BanGuard
 from .support import support_router
 
 logger = logging.getLogger(__name__)
@@ -78,6 +79,11 @@ async def main():
     # memory is fine for a single-instance bot; if we go multi-instance
     # this becomes RedisStorage.
     dp = Dispatcher(storage=MemoryStorage())
+    # BanGuard runs as outer middleware on `update` so it fires BEFORE
+    # any router/handler dispatch — a banned user's update is consumed
+    # silently without touching FSM state, backend, or router chain.
+    # See bot/middleware.py for the no-ACK rationale.
+    dp.update.outer_middleware(BanGuard())
     # Support router must be included FIRST so its StateFilter handlers
     # get priority over the generic text/command matchers in the main
     # handlers router — otherwise admin's typed reply would hit /start
