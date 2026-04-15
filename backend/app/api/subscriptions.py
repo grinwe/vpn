@@ -299,6 +299,80 @@ def enable_subscription(
     }
 
 
+@router.post(
+    "/subscriptions/{subscription_id}/migrate",
+    response_model=schemas.SubscriptionMigrateOut,
+)
+def migrate_subscription(
+    subscription_id: int,
+    payload: schemas.SubscriptionMigrateIn,
+    db: Session = Depends(get_db),
+    admin_token: str = Depends(require_admin),
+    admin_actor: str | None = Header(default=None, alias=ADMIN_ACTOR_HEADER),
+):
+    """Admin override: move one subscription to a specific target node.
+
+    Per-sub counterpart to ``POST /nodes/{id}/migrate`` (which drains a
+    whole node). Bypasses pool/health/capacity/cooldown filters — only
+    ``is_active=True`` is enforced on the target. Intended for surgical
+    admin fixes ("move user X off node Y right now") after e.g. a
+    partial outage or a user-specific complaint.
+
+    ``sub_token`` is preserved so the client's sub-link URL keeps
+    working. Old devices are revoked in background, the new device is
+    provisioned via the normal reprovision path.
+    """
+    sub = db.get(models.Subscription, subscription_id)
+    if not sub:
+        raise HTTPException(status_code=404, detail="Subscription not found")
+    if sub.status != models.SubscriptionStatus.active:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Subscription is {sub.status.value}, must be active",
+        )
+    old_node = sub.node
+    if old_node is None:
+        raise HTTPException(status_code=400, detail="Subscription has no node")
+    if payload.target_node_id == sub.node_id:
+        raise HTTPException(
+            status_code=400, detail="target_node_id matches current node"
+        )
+
+    orchestrator = ProvisioningOrchestrator(db)
+    try:
+        new_node, _device, task = orchestrator.migrate_subscription_to_new_node(
+            sub, target_node_id=payload.target_node_id
+        )
+    except RuntimeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    actor, actor_type = _resolve_admin_actor(admin_actor)
+    _audit(
+        db,
+        actor,
+        "subscription_migrated",
+        "subscription",
+        sub.id,
+        actor_type=actor_type,
+        metadata={
+            "old_node_id": old_node.id,
+            "old_node_name": old_node.name,
+            "new_node_id": new_node.id,
+            "new_node_name": new_node.name,
+            "reason": "admin override",
+        },
+    )
+    db.commit()
+    return schemas.SubscriptionMigrateOut(
+        subscription_id=sub.id,
+        old_node_id=old_node.id,
+        old_node_name=old_node.name,
+        new_node_id=new_node.id,
+        new_node_name=new_node.name,
+        provisioning_task_id=task.id if task else None,
+    )
+
+
 @router.post("/subscriptions/{subscription_id}/unblock-sharing")
 def unblock_sharing(
     subscription_id: int,

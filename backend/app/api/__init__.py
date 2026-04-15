@@ -23,6 +23,7 @@ from . import (
     autoscale,
     cloud,
     health,
+    health_pings,
     invoices,
     nodes,
     payments,
@@ -51,6 +52,7 @@ router.include_router(subscriptions.router)
 router.include_router(users.router)
 router.include_router(traffic.router)
 router.include_router(probes.router)
+router.include_router(health_pings.router)
 
 router.include_router(invoices.router)
 router.include_router(payments.router)

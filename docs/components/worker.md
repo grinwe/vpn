@@ -57,7 +57,8 @@ Backend прогоняет `alembic upgrade head` на старте (`main.py:18
 | `run_renewal_check`        | `RENEWAL_CHECK_INTERVAL=300` | Expire-ит подписки, инициирует renewal reminders, hard-revoke после grace |
 | `run_warm_pool_check`      | `WARM_POOL_CHECK_INTERVAL=120` | Топит warm pool на каждой активной ноде до `WARM_POOL_TARGET` |
 | `run_balance_charge_tick`  | `BALANCE_CHARGE_INTERVAL=3600` | Renew balance-подписок, expire auto_renew=False, auto-unfreeze, clawback trial |
-| `run_traffic_stats_tick`   | `TRAFFIC_STATS_INTERVAL=300` | SSH на каждую active/draining ноду, читает xray stats + sharing violations → `node_traffic_samples` + `AuditLog` |
+| `run_traffic_stats_tick`   | `TRAFFIC_STATS_INTERVAL=300` | SSH на каждую active/draining ноду, читает xray stats + sharing violations → `node_traffic_samples` + `AuditLog`. Per-protocol breakdown в `details` содержит список `access_username` (а не просто count) — админка читает последний sample через `GET /api/nodes/{id}/users`. После persist вызывается Phase D `detect_traffic_drops()` — пассивный детектор ТСПУ-блокировок (gated через `TRAFFIC_DROP_ENABLED=1`) |
+| `run_pending_rescue_tick`  | `PENDING_RESCUE_INTERVAL=60` | Сканирует `ProvisioningTask.status=pending` старше `PENDING_RESCUE_AGE` секунд и re-enqueue'ит через `enqueue_task`. Дедуп по `job_id=provision-<task_id>` — если задача уже в RQ, это no-op. Закрывает дыру, когда `run_task_async` закоммитил row, но `enqueue_task` упал (транзиентный Redis hiccup, serialization issue) — до этого фикса такие задачи висели в pending до следующего рестарта бэкенда (`reset_stuck_tasks` в main.py срабатывает только на boot). Метрика: `vpn_provisioning_pending_rescue_total` инкрементится на каждый rescue |
 
 ### Bootstrap при старте воркера
 
@@ -137,6 +138,21 @@ Drain тика продолжает работать даже при `AUTOSCALE_
 1. **Expire.** Все `active` subs с `expires_at < now` → flip в `expired`. `/api/sub/{token}` после этого отдаёт 403, клиент клиента перестаёт обновляться (`api_extensions.py:70-74`).
 2. **Hard revoke.** Для `expired` subs с `expires_at < now - RENEWAL_GRACE_HOURS` — запускается orchestrator.revoke → ansible чистит пользователя с ноды. Grace по дефолту 24h.
 3. **Renewal reminders.** Для `active` subs с `expires_at < now + 3 days` пишется `AuditLog(action='renewal_reminder', extra={telegram_id, expires_at})`. Бот это считает (`components/bot.md`).
+
+### `run_traffic_stats_tick` — сбор samples (Phase D детектор отключён)
+
+Каждые 5 минут SSH'ится на все active/draining ноды, вычитывает xray statsquery + sharing_violations.jsonl → пишет `node_traffic_samples` и `AuditLog(action="sharing_violation")`.
+
+**Phase D детектор отключён (2026-04-15).** Раньше после `collect_all_active_nodes()` вызывался `traffic_stats.detect_traffic_drops(session, rows)`, который на любом idle-окне (например, все клиенты поставили телефон на зарядку, active_users=0 при прошлой пачке ≥`TRAFFIC_DROP_MIN_USERS`) помечал ноду `suspect_since` и через `CONFIRM_TICKS*TRAFFIC_STATS_INTERVAL` вызывал `migrate_subscriptions_off(exclude_same_region=True)` + флипал ноду в `error`. В проде это проявлялось как отвал подключения у активных юзеров каждые 5-10 минут (совпадает с `TRAFFIC_STATS_INTERVAL=300s`).
+
+Сейчас:
+- Вызов `detect_traffic_drops` в `run_traffic_stats_tick` закомментирован.
+- Сама функция `detect_traffic_drops` стоит no-op (`return []`), тело сохранено для быстрого возврата.
+- Переселение нод теперь только ручное — через админ-UI (`POST /api/nodes/{id}/migrate`) или при апгрейде/даунскейле пула.
+
+Чтобы вернуть автомиграцию — нужно пересмотреть пороги (`TRAFFIC_DROP_MIN_USERS`, `CONFIRM_TICKS`, `MIN_IDLE_BYTES`) и добавить anti-flap гейты, затем расхешировать блок в `worker.run_traffic_stats_tick` + снять early-return в `traffic_stats.detect_traffic_drops`.
+
+Подробнее алгоритм (на случай возврата) — `infrastructure/nodes.md` → Phase D.
 
 ### `run_warm_pool_check`
 

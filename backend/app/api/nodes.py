@@ -10,6 +10,8 @@ both modules.
 """
 from __future__ import annotations
 
+from datetime import datetime, timedelta
+
 from fastapi import APIRouter, Depends, Header, HTTPException, Query
 from sqlalchemy.orm import Session
 
@@ -228,17 +230,39 @@ def set_node_active(
     admin_actor: str | None = Header(default=None, alias=ADMIN_ACTOR_HEADER),
 ):
     """Toggle ``is_active``. A node with ``is_active=False`` stays up but
-    is excluded from the scheduler in :func:`services.provisioning._pick_node`,
+    is excluded from the scheduler in :func:`services.provisioning.choose_node`,
     so new subscriptions won't land on it. Existing subs keep working.
     Useful for staging a freshly-added node for manual testing before it
     starts taking real traffic.
+
+    Side-effect on promote to ``is_active=True``: clears ``cooldown_until``,
+    ``suspect_since`` and ``blocked_regions``. Rationale: these are set by
+    the health monitor / traffic-drop detector after an incident and block
+    ``choose_node`` from picking the node. An operator explicitly flipping
+    the kill switch back on is saying "take subs again" — leaving stale
+    gates would silently defeat that intent and all new subs would keep
+    landing on the one node that isn't in cooldown (prod-hit 2026-04-15,
+    3 of 4 nodes were ``is_active=True`` with cooldown still in the future,
+    all new subs stacked on the 4th). Mirrors PATCH ``/nodes/{id}/status``.
     """
     node = db.get(models.VPNNode, node_id)
     if not node:
         raise HTTPException(404, "Node not found")
     if "is_active" not in body:
         raise HTTPException(400, "is_active required")
-    node.is_active = bool(body["is_active"])
+    next_active = bool(body["is_active"])
+    cleared: list[str] = []
+    if next_active:
+        if node.cooldown_until is not None:
+            node.cooldown_until = None
+            cleared.append("cooldown_until")
+        if node.suspect_since is not None:
+            node.suspect_since = None
+            cleared.append("suspect_since")
+        if node.blocked_regions:
+            node.blocked_regions = None
+            cleared.append("blocked_regions")
+    node.is_active = next_active
     db.add(node)
     db.commit()
     db.refresh(node)
@@ -247,7 +271,66 @@ def set_node_active(
         db, actor, "node_set_active",
         "vpn_node", node.id,
         actor_type=actor_type,
-        metadata={"is_active": node.is_active},
+        metadata={"is_active": node.is_active, "cleared": cleared},
+    )
+    db.commit()
+    return schemas.VPNNodeOut.from_orm(node)
+
+
+_ALLOWED_STATUS_OVERRIDES = {"active", "error", "disabled"}
+
+
+@router.patch("/nodes/{node_id}/status", response_model=schemas.VPNNodeOut)
+def set_node_status(
+    node_id: int,
+    body: dict,
+    db: Session = Depends(get_db),
+    admin_token: str = Depends(require_admin),
+    admin_actor: str | None = Header(default=None, alias=ADMIN_ACTOR_HEADER),
+):
+    """Manually override node status.
+
+    Allowed values: ``active``, ``error``, ``disabled``.  ``registering``
+    and ``draining`` are managed automatically and cannot be set by hand.
+
+    Side-effects on promote to ``active``: clears ``cooldown_until``,
+    ``suspect_since`` and ``blocked_regions`` so the node immediately
+    re-enters the selection pool.  Demote to ``error``/``disabled``
+    sets ``is_active=False`` to prevent new subscriptions landing here.
+    """
+    node = db.get(models.VPNNode, node_id)
+    if not node:
+        raise HTTPException(404, "Node not found")
+    raw = body.get("status")
+    if not raw or raw not in _ALLOWED_STATUS_OVERRIDES:
+        raise HTTPException(
+            400,
+            f"status must be one of {sorted(_ALLOWED_STATUS_OVERRIDES)}",
+        )
+    try:
+        new_status = models.VPNNodeStatus(raw)
+    except ValueError as exc:
+        raise HTTPException(400, f"Invalid status: {raw}") from exc
+
+    old_status = node.status
+    node.status = new_status
+
+    if new_status == models.VPNNodeStatus.active:
+        node.cooldown_until = None
+        node.suspect_since = None
+        node.blocked_regions = None
+    elif new_status in (models.VPNNodeStatus.error, models.VPNNodeStatus.disabled):
+        node.is_active = False
+
+    db.add(node)
+    db.commit()
+    db.refresh(node)
+    actor, actor_type = _resolve_admin_actor(admin_actor)
+    _audit(
+        db, actor, "node_status_changed",
+        "vpn_node", node.id,
+        actor_type=actor_type,
+        metadata={"old_status": old_status.value, "new_status": new_status.value},
     )
     db.commit()
     return schemas.VPNNodeOut.from_orm(node)
@@ -349,6 +432,105 @@ def create_config(
     return config
 
 
+@router.put(
+    "/nodes/{node_id}/configs/{config_id}",
+    response_model=schemas.VPNConfigOut,
+)
+def update_config(
+    node_id: int,
+    config_id: int,
+    payload: schemas.VPNConfigUpdate,
+    db: Session = Depends(get_db),
+    admin_token: str = Depends(require_admin),
+    admin_actor: str | None = Header(default=None, alias=ADMIN_ACTOR_HEADER),
+):
+    """Edit an existing VPNConfig in place and re-run bootstrap.
+
+    Protocol change is forbidden — replacing the protocol is what
+    delete+create is for, and it has side effects (warm pool, live
+    devices) that can't be papered over here. Every other field is
+    editable; omitted fields stay as-is.
+    """
+    config = db.get(models.VPNConfig, config_id)
+    if not config or config.node_id != node_id:
+        raise HTTPException(status_code=404, detail="Config not found")
+
+    # Guard against accidental protocol swap. The UI sends ``protocol``
+    # read-only for clarity; reject the request if someone flipped it.
+    if payload.protocol is not None and payload.protocol != config.protocol.value:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Protocol change is not supported. Delete the config and "
+                "create a new one for the target protocol."
+            ),
+        )
+
+    changed: list[str] = []
+    if payload.name is not None and payload.name != config.name:
+        config.name = payload.name
+        changed.append("name")
+    if payload.port is not None and payload.port != config.port:
+        config.port = payload.port
+        changed.append("port")
+    if payload.sni is not None and payload.sni != config.sni:
+        config.sni = payload.sni
+        changed.append("sni")
+    if payload.public_key is not None and payload.public_key != config.public_key:
+        config.public_key = payload.public_key
+        changed.append("public_key")
+    if payload.fallback is not None and payload.fallback != config.fallback:
+        config.fallback = payload.fallback
+        changed.append("fallback")
+    if payload.is_enabled is not None and payload.is_enabled != config.is_enabled:
+        config.is_enabled = payload.is_enabled
+        changed.append("is_enabled")
+    if payload.settings is not None:
+        # Shallow-merge so the UI can update one sub-key without having
+        # to resend the encrypted secrets it never saw. Passing ``{}``
+        # explicitly is a no-op (nothing to merge).
+        merged = dict(config.settings or {})
+        merged.update(payload.settings)
+        if merged != (config.settings or {}):
+            config.settings = merged
+            changed.append("settings")
+
+    if not changed:
+        # Nothing actually changed — skip bootstrap + warm invalidation.
+        # Idempotent from the UI perspective.
+        return config
+
+    db.commit()
+    db.refresh(config)
+
+    actor, actor_type = _resolve_admin_actor(admin_actor)
+    _audit(
+        db,
+        actor,
+        "config_updated",
+        "vpn_config",
+        config.id,
+        actor_type=actor_type,
+        metadata={"changed_fields": changed},
+    )
+    # Existing warm bundles were built with the previous config values —
+    # port/sni/pubkey baked into the URI. Drop them so the warmer
+    # rebuilds with the updated config.
+    from ..services import warm_pool
+    warm_pool.invalidate_node_warm_pool(db, node_id, reason="config updated")
+    # Re-run site.yml so Ansible re-renders xray config with new values.
+    node = db.get(models.VPNNode, node_id)
+    if node:
+        orchestrator = ProvisioningOrchestrator(db)
+        task = orchestrator.create_task(
+            "node", node.id, "bootstrap",
+            {"pool_id": node.pool_id, "config_change": True},
+        )
+        db.commit()
+        orchestrator.run_task_async(task, node=node)
+    return config
+
+
 @router.delete("/nodes/{node_id}/configs/{config_id}", status_code=204)
 def delete_config(
     node_id: int,
@@ -438,6 +620,193 @@ def list_configs(
 ):
     configs = db.query(models.VPNConfig).filter(models.VPNConfig.node_id == node_id).all()
     return [schemas.VPNConfigOut.from_orm(cfg) for cfg in configs]
+
+
+# Freshness window for "who's on the node right now" — matches the
+# default TRAFFIC_STATS_INTERVAL (5 min) plus two skipped ticks. Older
+# than this means the collector hasn't written a sample recently, so
+# the list is showing a historical snapshot — admin UI flips to a
+# "нет свежих данных" banner.
+_NODE_USERS_FRESHNESS = timedelta(minutes=15)
+
+
+@router.get("/nodes/{node_id}/users", response_model=schemas.NodeActiveUsersOut)
+def list_node_users(
+    node_id: int,
+    db: Session = Depends(get_db),
+    admin_token: str = Depends(require_admin),
+):
+    """Return the access_usernames seen on the node in the last traffic-stats tick.
+
+    Reads the freshest ``NodeTrafficSample`` for the node, unpacks
+    per-protocol user lists from ``details``, and left-joins each
+    username to Device → Subscription → User/Plan so the admin UI can
+    show who is currently on the node without a second round-trip.
+
+    Tolerates legacy samples where ``details["<proto>"]["users"]`` is
+    a bare int (pre-2026-04 format) — those rows just don't contribute
+    usernames, count is unreliable anyway.
+    """
+    node = db.get(models.VPNNode, node_id)
+    if not node:
+        raise HTTPException(status_code=404, detail="Node not found")
+
+    sample = (
+        db.query(models.NodeTrafficSample)
+        .filter(models.NodeTrafficSample.node_id == node_id)
+        .order_by(models.NodeTrafficSample.observed_at.desc())
+        .first()
+    )
+
+    observed_at: datetime | None = None
+    stale = True
+    username_protos: dict[str, set[str]] = {}
+
+    if sample is not None:
+        observed_at = sample.observed_at
+        # observed_at is stored as naive UTC (default=utcnow) — compare
+        # against a naive now() so we don't accidentally trip over tz.
+        age = datetime.utcnow() - (
+            observed_at.replace(tzinfo=None) if observed_at.tzinfo else observed_at
+        )
+        stale = age > _NODE_USERS_FRESHNESS
+        details = sample.details or {}
+        for proto, payload in details.items():
+            if proto == "_errors" or not isinstance(payload, dict):
+                continue
+            users_raw = payload.get("users")
+            if not isinstance(users_raw, list):
+                # Legacy int-count format; nothing we can do.
+                continue
+            for uname in users_raw:
+                if not isinstance(uname, str) or not uname:
+                    continue
+                username_protos.setdefault(uname, set()).add(proto)
+
+    if not username_protos:
+        return schemas.NodeActiveUsersOut(
+            node_id=node_id,
+            observed_at=observed_at,
+            stale=stale,
+            users=[],
+        )
+
+    # One JOIN grabs every field the UI needs in a single query. Left
+    # joins so orphan access_usernames (on the node but not in the DB)
+    # still show up with ``device_id=None``.
+    rows = (
+        db.query(
+            models.Device.id.label("device_id"),
+            models.Device.access_username,
+            models.Device.name.label("device_name"),
+            models.Subscription.id.label("subscription_id"),
+            models.Subscription.expires_at,
+            models.User.id.label("user_id"),
+            models.User.telegram_id,
+            models.Plan.id.label("plan_id"),
+            models.Plan.name.label("plan_name"),
+        )
+        .outerjoin(
+            models.Subscription,
+            models.Subscription.id == models.Device.subscription_id,
+        )
+        .outerjoin(models.User, models.User.id == models.Device.user_id)
+        .outerjoin(models.Plan, models.Plan.id == models.Subscription.plan_id)
+        .filter(models.Device.access_username.in_(list(username_protos.keys())))
+        .all()
+    )
+
+    by_username: dict[str, dict] = {}
+    for r in rows:
+        if r.access_username in by_username:
+            # Multiple Devices sharing access_username shouldn't happen
+            # under current provisioning, but if it does, the first row
+            # wins — the UI only has a single slot per username.
+            continue
+        by_username[r.access_username] = {
+            "device_id": r.device_id,
+            "device_name": r.device_name,
+            "subscription_id": r.subscription_id,
+            "user_id": r.user_id,
+            "user_telegram_id": r.telegram_id,
+            "plan_id": r.plan_id,
+            "plan_name": r.plan_name,
+            "subscription_expires_at": r.expires_at,
+        }
+
+    out_users: list[schemas.NodeActiveUserOut] = []
+    for uname, protos in sorted(username_protos.items()):
+        meta = by_username.get(uname, {})
+        out_users.append(
+            schemas.NodeActiveUserOut(
+                access_username=uname,
+                device_id=meta.get("device_id"),
+                device_name=meta.get("device_name"),
+                subscription_id=meta.get("subscription_id"),
+                user_id=meta.get("user_id"),
+                user_telegram_id=meta.get("user_telegram_id"),
+                plan_id=meta.get("plan_id"),
+                plan_name=meta.get("plan_name"),
+                protocols=sorted(protos),
+                subscription_expires_at=meta.get("subscription_expires_at"),
+            )
+        )
+
+    return schemas.NodeActiveUsersOut(
+        node_id=node_id,
+        observed_at=observed_at,
+        stale=stale,
+        users=out_users,
+    )
+
+
+@router.get(
+    "/nodes/{node_id}/traffic-history",
+    response_model=schemas.NodeTrafficHistoryOut,
+)
+def get_node_traffic_history(
+    node_id: int,
+    db: Session = Depends(get_db),
+    admin_token: str = Depends(require_admin),
+    hours: int = Query(default=24, ge=1, le=168),
+):
+    """Return NodeTrafficSample series for the last ``hours`` hours.
+
+    Hard-bounded to [1, 168] so a misclick in the UI can't drag the
+    whole month of samples (~8600 rows per node). Default 24h lines up
+    with the admin sparkline; operators who want a longer window pass
+    ``?hours=72`` etc.
+    """
+    node = db.get(models.VPNNode, node_id)
+    if not node:
+        raise HTTPException(status_code=404, detail="Node not found")
+
+    to_ts = datetime.utcnow()
+    from_ts = to_ts - timedelta(hours=hours)
+    samples = (
+        db.query(models.NodeTrafficSample)
+        .filter(
+            models.NodeTrafficSample.node_id == node_id,
+            models.NodeTrafficSample.observed_at >= from_ts,
+        )
+        .order_by(models.NodeTrafficSample.observed_at.asc())
+        .all()
+    )
+
+    return schemas.NodeTrafficHistoryOut(
+        node_id=node_id,
+        from_ts=from_ts,
+        to_ts=to_ts,
+        samples=[
+            schemas.NodeTrafficSamplePoint(
+                observed_at=s.observed_at,
+                active_users=s.active_users,
+                uplink_bytes=s.uplink_bytes,
+                downlink_bytes=s.downlink_bytes,
+            )
+            for s in samples
+        ],
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -595,6 +964,8 @@ def migrate_node_route(
         actor_type=actor_type,
         metadata={
             "migrated_count": len(migrated),
+            "considered_count": result["considered_count"],
+            "no_target_count": result["no_target_count"],
             "device_task_ids": result["device_task_ids"],
             "resync_task_ids": result["resync_task_ids"],
         },
@@ -615,4 +986,8 @@ def migrate_node_route(
         "revoke_task_ids": result["revoke_task_ids"],
         "device_task_ids": result["device_task_ids"],
         "resync_task_ids": result["resync_task_ids"],
+        # Lets the UI tell "0 active subs on this node" apart from
+        # "had subs but every other node was in cooldown / unhealthy".
+        "considered_count": result["considered_count"],
+        "no_target_count": result["no_target_count"],
     }

@@ -179,6 +179,7 @@ export default function Home({
         </button>
       </div>
 
+
       {/* ── Referral block ── */}
       {referral && referral.code && (
         <section className="card mt-6">

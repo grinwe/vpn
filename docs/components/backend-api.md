@@ -2,6 +2,8 @@
 
 FastAPI-приложение из `backend/app/main.py`. Три роутера, собранные в один ASGI-процесс, делят PostgreSQL-сессию, Redis-очередь и общий набор сервисов под `backend/app/services/`.
 
+Видимость health-ping телеметрии: модуль `api/health_pings.py` (см. таблицу ниже) агрегирует `AuditLog` по `action IN (health_ping_request|response|opt_out)` в три admin-endpoint'а (`/health-pings/summary`, `/health-pings/recent-bad`, `/nodes/{id}/health-pings`). Webapp отдельным endpoint'ом `POST /api/webapp/health-ping-report` даёт юзеру кнопку «🆘 VPN не работает» без ожидания планового пинга. `HealthPingResponseRequest` в `api_extensions.py` носит опциональное `source: "prompted" | "self_reported"` (default — `"prompted"`, чтобы не ломать bot-клиентов) — админка отдельно подсвечивает self-reported как более сильный сигнал.
+
 ## Сборка приложения
 
 ```python
@@ -43,12 +45,13 @@ Middleware порядок:
 | `api/plans.py` | `/plans` | 82 | CRUD планов (видимость, duration, цена) |
 | `api/audit.py` | `/audit-logs` | 44 | чтение журнала аудита |
 | `api/tokens.py` | `/api-tokens` | 104 | выдача/отзыв scoped API-токенов |
-| `api/nodes.py` | `/nodes` + subpaths | 596 | CRUD нод, resync/bootstrap/diagnose/active toggle, `/configs` CRUD, spawn/destroy через CloudProvider, миграция подписок, health |
+| `api/nodes.py` | `/nodes` + subpaths | 780 | CRUD нод, resync/bootstrap/diagnose/active toggle, **`PATCH /nodes/{id}/status`** (ручной override статуса active/error/disabled), `/configs` CRUD (+ **`PUT /nodes/{id}/configs/{cfg_id}`** — in-place редактирование без delete+create), **`GET /nodes/{id}/users`** (кто на ноде в последнем traffic-tick'е, с джойном на Device/Subscription/User/Plan), **`GET /nodes/{id}/traffic-history?hours=24`** (временной ряд `NodeTrafficSample` для sparkline-графика в админке), spawn/destroy через CloudProvider, миграция подписок, health |
 | `api/tasks.py` | `/provisioning/tasks` | 276 | просмотр/retry/delete/batch `ProvisioningTask` + `_enrich_task_telegram` (батч-резолв `telegram_id` для ADMIN_UI) |
-| `api/subscriptions.py` | `/subscriptions`, `/devices` | 309 | POST — создание subscription + провижининг; status/disable/enable/devices; revoke устройства |
+| `api/subscriptions.py` | `/subscriptions`, `/devices` | 309 | POST — создание subscription + провижининг; status/disable/enable/devices; revoke устройства; **`POST /subscriptions/{id}/migrate`** (per-sub admin override: переселить на выбранную ноду без проверок пула/health/cooldown, только `is_active=True`) |
 | `api/users.py` | `/users` | 291 | listing, by_telegram, balance, disable, `/topup` (admin топап в копейках). Хостит `_subscriptions_for_user`, который re-exported из `api/__init__.py` и используется `api_webapp.py` |
 | `api/traffic.py` | `/subscriptions/{id}/traffic`, `/nodes/{id}/traffic` | 205 | traffic accounting: оба эндпойнта делят `_apply_traffic_delta` (revoke при превышении лимита) |
 | `api/probes.py` | `/nodes/{id}/probes`, `/probes/targets` | 115 | агрегация health-проб (scoped: `probe:write`) + список targets (scoped: `probe:read`) |
+| `api/health_pings.py` | `/health-pings/summary`, `/health-pings/recent-bad`, `/nodes/{id}/health-pings` | ~420 | агрегация user-side health-ping телеметрии из `AuditLog` (`action IN (health_ping_request|response|opt_out)`) для админ-дашборда `/health-pings` и виджета в карточке ноды. JSONB-join по `extra->>'node_id'` без прохода через `Subscription` (значение денормализовано на момент записи). Различает `extra.source = prompted/self_reported`. |
 | `api/invoices.py` | `/invoices` | 462 | listing/create/mark_paid/cancel/mark_unpaid/batch + `_mark_invoice_paid_core` (shared с webhook'ом) |
 | `api/payments.py` | `/payments`, `/invoices/{id}/checkout`, `/payments/webhook/{provider_name}` | 169 | создание провайдерского инвойса, webhook от провайдеров (HMAC, не require_admin), legacy ручная запись Payment |
 | `api/cloud.py` | `/cloud/providers` | 148 | CRUD `CloudProvider` (шифрование секретов через `security._encrypt`) |
@@ -146,11 +149,17 @@ POST /api/notifications/{id}/ack                ← require_admin (ack от бо
 # backend/app/api_extensions.py:59
 @ext_router.get("/sub/{token}")
 def dynamic_sub_link(token: str, db: Session = Depends(get_db)):
+    device = db.query(models.Device).filter_by(sub_token=token).first()
+    if device:
+        # per-device path + alias fallback
+        ...
     sub = db.query(models.Subscription).filter_by(sub_token=token).first()
-    ...
+    # legacy per-subscription path
 ```
 
-Выдаёт base64-кодированный список URI всех активных credential'ов подписки + заголовки `subscription-userinfo` (expire) и `profile-update-interval: 6`, которые Hiddify/v2rayNG читают для автообновления. Пишет `AuditLog(action='subscription_fetch')` на каждый опрос.
+Два уровня lookup'а: сначала `Device.sub_token` (добавлен alembic `0022_device_sub_token`, выдаётся webapp'ом при покупке), затем legacy `Subscription.sub_token` для старых клиентов, установленных до миграции. Выдаёт base64-кодированный список URI активных credential'ов + заголовки `subscription-userinfo` (expire) и `profile-update-interval: 6`, которые Hiddify/v2rayNG читают для автообновления. Пишет `AuditLog(action='subscription_fetch')` на каждый опрос (`target_type='device'` или `'subscription'` в зависимости от пути).
+
+**Alias-fallback для seamless migration.** Миграция (admin override, drain, auto-migrate-on-block) revoke'ает старый Device и создаёт новый с **другим** `sub_token`. Сохранённый в Hiddify URL указывал бы на revoked device и отдавал бы пустой список — юзер вынужден был бы копировать новый URL из webapp. Фикс: если найденный по токену device имеет `status in (revoked, disabled)` или у него нет активных credential'ов — ищем любой живой device на **той же** Subscription и отдаём его креды. В AuditLog extra пишется `aliased_to_device_id`, чтобы alias-путь был виден. Для multi-device подписок есть известное ограничение: `reprovision_subscription` на миграции создаёт один device, и все старые URL'ы alias'нутся на него (коллапс в единственного выжившего).
 
 > ⚠️ Audit-лог на каждый анонимный опрос + дефолтный nginx access_log (`infrastructure/deployment.md`) = деанон-timeline. См. audit/...
 

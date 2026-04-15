@@ -82,6 +82,7 @@ services:
       # CDN-fronted domain (Cloudflare Worker proxy etc.) so an RKN
       # block on grinwer.online does not kill installed clients.
       SUB_LINK_BASE_URL: ${SUB_LINK_BASE_URL:-}
+      ANSIBLE_PLAYBOOK_TIMEOUT: ${ANSIBLE_PLAYBOOK_TIMEOUT:-300}
     ports:
       - "127.0.0.1:8000:8000"
     depends_on:
@@ -96,7 +97,7 @@ services:
       context: .
       dockerfile: backend/Dockerfile.worker
     deploy:
-      replicas: 3
+      replicas: 1
     environment:
       DATABASE_URL: ${DATABASE_URL}
       ADMIN_API_TOKEN: ${ADMIN_API_TOKEN}
@@ -120,8 +121,12 @@ services:
       AUTOSCALE_LOW_WATERMARK: ${AUTOSCALE_LOW_WATERMARK:-0.3}
       AUTOSCALE_MIN_NODES: ${AUTOSCALE_MIN_NODES:-1}
       AUTOSCALE_DRAIN_GRACE_HOURS: ${AUTOSCALE_DRAIN_GRACE_HOURS:-24}
-      DRAIN_TICK_INTERVAL: ${DRAIN_TICK_INTERVAL:-600}
+      DRAIN_TICK_INTERVAL: ${DRAIN_TICK_INTERVAL:-6000000}
       DRAIN_MIGRATE_BATCH: ${DRAIN_MIGRATE_BATCH:-10}
+      # Self-heal for stuck pending provisioning tasks.
+      PENDING_RESCUE_INTERVAL: ${PENDING_RESCUE_INTERVAL:-60}
+      PENDING_RESCUE_AGE: ${PENDING_RESCUE_AGE:-60}
+      ANSIBLE_PLAYBOOK_TIMEOUT: ${ANSIBLE_PLAYBOOK_TIMEOUT:-300}
       RENEWAL_CHECK_INTERVAL: ${RENEWAL_CHECK_INTERVAL:-300}
       RENEWAL_GRACE_HOURS: ${RENEWAL_GRACE_HOURS:-24}
       # Stage 2.5 — warm credential pool. Worker tops up each active

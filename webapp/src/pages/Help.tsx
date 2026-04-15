@@ -1,9 +1,16 @@
 import { useState } from "react";
 import { navigate } from "../router";
+import { reportVpnBroken } from "../api";
 
 interface Props {
   botUsername?: string;
 }
+
+// Состояния кнопки «у меня прямо сейчас не работает VPN». Используется
+// как priority-сигнал для админов поверх плановых health-ping'ов бота.
+// Клиентский 5-мин cooldown после успешной отправки — сервер повторы
+// тоже принимает, но нет смысла плодить AuditLog одним тапом.
+type SelfReportState = "idle" | "pending" | "sent" | "error";
 
 const FAQ: { title: string; body: string }[] = [
   {
@@ -39,10 +46,25 @@ const FAQ: { title: string; body: string }[] = [
 
 export default function Help({ botUsername }: Props) {
   const [open, setOpen] = useState<number | null>(null);
+  const [selfReportState, setSelfReportState] = useState<SelfReportState>("idle");
 
   const supportUrl = botUsername
     ? `https://t.me/${botUsername}?start=support`
     : null;
+
+  const handleReportBroken = async () => {
+    if (selfReportState === "pending" || selfReportState === "sent") return;
+    setSelfReportState("pending");
+    try {
+      await reportVpnBroken();
+      setSelfReportState("sent");
+      setTimeout(() => setSelfReportState("idle"), 5 * 60 * 1000);
+    } catch (err) {
+      console.error("reportVpnBroken failed", err);
+      setSelfReportState("error");
+      setTimeout(() => setSelfReportState("idle"), 5000);
+    }
+  };
 
   return (
     <div className="p-4 max-w-xl mx-auto space-y-4">
@@ -94,6 +116,32 @@ export default function Help({ botUsername }: Props) {
             Напиши /help в боте, чтобы связаться с поддержкой.
           </p>
         )}
+      </div>
+
+      {/* ── Self-report «VPN не работает» ──
+          Нейтральный секондари-экшн внизу помощи. Отдельно от «Написать
+          в поддержку» потому что это другой канал: не диалог с живым
+          оператором, а priority-сигнал для админов (поверх плановых
+          health-ping'ов бота) — «юзер не дождался следующего пинга,
+          ткнул сам». Намеренно без красного — на Home.tsx эта кнопка
+          читалась как «сервис сломан», что путало. */}
+      <div className="pt-2">
+        <button
+          onClick={handleReportBroken}
+          disabled={
+            selfReportState === "pending" || selfReportState === "sent"
+          }
+          className="w-full py-2 rounded-lg text-sm text-tg-hint border border-white/10 hover:bg-white/5 disabled:opacity-60 transition-colors"
+        >
+          {selfReportState === "pending" && "Отправляем..."}
+          {selfReportState === "sent" && "✓ Жалоба отправлена — админы смотрят"}
+          {selfReportState === "error" && "Не удалось отправить, попробуй позже"}
+          {selfReportState === "idle" && "Сообщить, что VPN сейчас не работает"}
+        </button>
+        <p className="text-tg-hint text-xs mt-2">
+          Кнопка отправит маячок админам с номером твоей подписки и ноды.
+          Это не замена поддержке — для диалога используй кнопку выше.
+        </p>
       </div>
     </div>
   );

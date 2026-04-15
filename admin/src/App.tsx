@@ -10,6 +10,7 @@ import ApiTokens from "./pages/ApiTokens";
 import Tasks from "./pages/Tasks";
 import AuditLogs from "./pages/AuditLogs";
 import CloudProviders from "./pages/CloudProviders";
+import HealthPings from "./pages/HealthPings";
 
 function Layout({ children }: { children: React.ReactNode }) {
   const { logout } = useAuth();
@@ -26,6 +27,7 @@ function Layout({ children }: { children: React.ReactNode }) {
           <NavLink to="/plans" className={linkCls}>Plans</NavLink>
           <NavLink to="/nodes" className={linkCls}>Nodes</NavLink>
           <NavLink to="/tasks" className={linkCls}>Tasks</NavLink>
+          <NavLink to="/health-pings" className={linkCls}>Health</NavLink>
           <NavLink to="/tokens" className={linkCls}>API tokens</NavLink>
           <NavLink to="/cloud" className={linkCls}>Cloud</NavLink>
           <NavLink to="/audit" className={linkCls}>Audit</NavLink>
@@ -65,6 +67,10 @@ export default function App() {
       <Route path="/tokens" element={<Protected><ApiTokens /></Protected>} />
       <Route path="/cloud" element={<Protected><CloudProviders /></Protected>} />
       <Route path="/audit" element={<Protected><AuditLogs /></Protected>} />
+      <Route
+        path="/health-pings"
+        element={<Protected><HealthPings /></Protected>}
+      />
       <Route path="*" element={<Navigate to="/" replace />} />
     </Routes>
   );

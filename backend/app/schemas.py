@@ -78,6 +78,61 @@ class VPNConfigOut(VPNConfigCreate):
         from_attributes = True
 
 
+class VPNConfigUpdate(BaseModel):
+    # In-place edit of an existing VPNConfig. Protocol is intentionally
+    # absent — changing protocol turns the row into a different config
+    # entirely. All other fields are optional; omitted ones are left
+    # untouched. ``settings`` is merged into the existing JSONB so the UI
+    # can update one sub-key without having to re-send the encrypted
+    # secrets it never received in VPNConfigOut.
+    name: str | None = None
+    port: int | None = None
+    sni: str | None = None
+    public_key: str | None = None
+    fallback: str | None = None
+    settings: dict[str, Any] | None = None
+    is_enabled: bool | None = None
+    # Optional — if sent, backend verifies it matches the existing
+    # protocol (defensive; the UI passes it for readability).
+    protocol: str | None = None
+
+
+class NodeActiveUserOut(BaseModel):
+    access_username: str
+    device_id: int | None = None
+    device_name: str | None = None
+    subscription_id: int | None = None
+    user_id: int | None = None
+    user_telegram_id: str | None = None
+    plan_id: int | None = None
+    plan_name: str | None = None
+    protocols: list[str] = Field(default_factory=list)
+    subscription_expires_at: datetime | None = None
+
+
+class NodeActiveUsersOut(BaseModel):
+    node_id: int
+    observed_at: datetime | None = None
+    # ``True`` if the latest NodeTrafficSample is older than 15 minutes
+    # (or doesn't exist) — UI should surface "нет свежих данных".
+    stale: bool
+    users: list[NodeActiveUserOut] = Field(default_factory=list)
+
+
+class NodeTrafficSamplePoint(BaseModel):
+    observed_at: datetime
+    active_users: int
+    uplink_bytes: int
+    downlink_bytes: int
+
+
+class NodeTrafficHistoryOut(BaseModel):
+    node_id: int
+    from_ts: datetime
+    to_ts: datetime
+    samples: list[NodeTrafficSamplePoint] = Field(default_factory=list)
+
+
 class VPNNodeCreate(BaseModel):
     name: str
     region: str
@@ -94,6 +149,12 @@ class VPNNodeOut(VPNNodeCreate):
     is_active: bool
     health_score: int | None = None
     blocked_regions: list[str] = []
+    # Until this timestamp ``choose_node`` skips the node even with
+    # ``is_active=True``. Surfaced so the admin UI can warn operators —
+    # otherwise a node that's toggled "active" but still cooling down
+    # looks eligible and silently gets no traffic.
+    cooldown_until: datetime | None = None
+    suspect_since: datetime | None = None
     created_at: datetime
     updated_at: datetime
 
@@ -164,6 +225,12 @@ class SubscriptionOut(BaseModel):
     plan_name: str
     plan_id: int = 0
     node: str
+    # Exposed so the admin UI can exclude the current node from the
+    # per-sub migrate dropdown and highlight it in node lists. Nullable
+    # defensively — a sub without a node wouldn't round-trip anyway,
+    # but the existing schema never promised non-null and some legacy
+    # data paths may still hit this code before node_id is set.
+    node_id: int | None = None
     region: str
     expires_at: datetime
     status: str
@@ -171,6 +238,27 @@ class SubscriptionOut(BaseModel):
     sub_token: str | None = None
     credentials: List[CredentialOut]
     devices: List[DeviceOut] = []
+    # True iff at least one of this subscription's live device emails
+    # has a more recent `sharing_block` audit than `sharing_unblock`.
+    # Used by the admin UI to gate the "снять sharing-бан" button so
+    # it only shows when there's actually something to unblock.
+    sharing_blocked: bool = False
+
+
+class SubscriptionMigrateIn(BaseModel):
+    # Target node id. Admin override: skips pool/health/cooldown checks,
+    # only validates is_active=True. Required — auto-selection is what
+    # the mass migrate-off-node endpoint is for.
+    target_node_id: int
+
+
+class SubscriptionMigrateOut(BaseModel):
+    subscription_id: int
+    old_node_id: int
+    old_node_name: str
+    new_node_id: int
+    new_node_name: str
+    provisioning_task_id: int | None
 
 
 class DisableRequest(BaseModel):
@@ -527,3 +615,67 @@ class AuditLogOut(BaseModel):
 
     class Config:
         from_attributes = True
+
+
+# ── Health-ping admin dashboard ──
+
+
+class HealthPingTotals(BaseModel):
+    requests: int
+    responses: int
+    ok: int
+    bad: int
+    bad_prompted: int
+    bad_self_reported: int
+    opt_outs: int
+    response_rate: float  # 0..1, clamped
+
+
+class HealthPingPerNode(BaseModel):
+    node_id: int | None  # null для rows, где node_id в extra отсутствует/невалиден
+    node_name: str | None
+    requests: int
+    ok: int
+    bad: int
+    bad_ratio: float  # 0..1
+
+
+class HealthPingTimeseriesPoint(BaseModel):
+    bucket_ts: datetime
+    ok: int
+    bad: int
+
+
+class HealthPingSummaryOut(BaseModel):
+    from_ts: datetime
+    to_ts: datetime
+    hours: int
+    bucket: str  # "hour" | "day"
+    totals: HealthPingTotals
+    per_node: list[HealthPingPerNode]
+    timeseries: list[HealthPingTimeseriesPoint]
+
+
+class HealthPingRecentBadItem(BaseModel):
+    created_at: datetime
+    telegram_id: str | None
+    user_id: int | None
+    node_id: int | None
+    node_name: str | None
+    subscription_id: int | None
+    plan_name: str | None
+    source: str  # "prompted" | "self_reported"
+
+
+class HealthPingRecentBadOut(BaseModel):
+    items: list[HealthPingRecentBadItem]
+
+
+class NodeHealthPingStatsOut(BaseModel):
+    node_id: int
+    hours: int
+    requests: int
+    ok: int
+    bad: int
+    bad_ratio: float  # 0..1
+    last_bad_at: datetime | None

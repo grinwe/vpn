@@ -170,9 +170,17 @@ def run_playbook(
     *,
     limit: str | None = None,
     extra_vars: dict[str, Any] | None = None,
-    timeout: int = 300,
+    timeout: int | None = None,
 ) -> subprocess.CompletedProcess:
-    """Execute an Ansible playbook and return the completed process."""
+    """Execute an Ansible playbook and return the completed process.
+
+    ``timeout`` defaults to ``ANSIBLE_PLAYBOOK_TIMEOUT`` env var (300s).
+    Override at call sites where the playbook is genuinely longer —
+    e.g. bootstrapping a new node that pulls packages — so ops can
+    tune without a code change.
+    """
+    if timeout is None:
+        timeout = int(os.getenv("ANSIBLE_PLAYBOOK_TIMEOUT", "300"))
     _ensure_ansible_root()
     playbook_path = ANSIBLE_ROOT / playbook
     if not playbook_path.exists():

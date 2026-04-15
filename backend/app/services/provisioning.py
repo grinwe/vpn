@@ -40,6 +40,7 @@ def choose_node(
     node_id: int | None = None,
     *,
     exclude_node_ids: list[int] | None = None,
+    exclude_regions: list[str] | None = None,
 ) -> models.VPNNode:
     """Pick a VPN node, respecting plan pools, capacity, health and cooldown.
 
@@ -62,6 +63,9 @@ def choose_node(
 
     if exclude_node_ids:
         query = query.filter(~models.VPNNode.id.in_(exclude_node_ids))
+
+    if exclude_regions:
+        query = query.filter(~models.VPNNode.region.in_(exclude_regions))
 
     query = query.filter(
         (models.VPNNode.cooldown_until.is_(None))
@@ -742,14 +746,20 @@ class ProvisioningOrchestrator:
                     cred.is_active = True
                     cred.revoked_at = None
             elif task.action == "revoke":
-                # The device has been removed from the VPN node via ansible.
-                # Delete the row and its credentials from the DB entirely —
-                # keeping revoked devices around was polluting both the admin
-                # UI and the user's subscription card after multiple
-                # migrations. The ProvisioningTask row survives for audit.
-                for cred in list(device.credentials):
-                    self.db.delete(cred)
-                self.db.delete(device)
+                # Keep the Device row so its sub_token still resolves in
+                # /api/sub/{token}. The dynamic-sub-link endpoint treats
+                # revoked devices as aliases: it finds a live sibling on
+                # the same subscription and serves that instead, so saved
+                # Hiddify/v2rayN URLs keep working after migrations.
+                # Read-paths that render device lists already filter out
+                # revoked/disabled rows (_live_device_count in balance.py,
+                # live_device_rows in api_webapp.py).
+                device.status = models.DeviceStatus.revoked
+                device.updated_at = utcnow()
+                for cred in device.credentials:
+                    cred.is_active = False
+                    cred.revoked_at = cred.revoked_at or utcnow()
+                self.db.add(device)
                 self.db.commit()
                 return
         else:
@@ -1332,7 +1342,16 @@ class ProvisioningOrchestrator:
         # Suffix with the current epoch second so a freeze→unfreeze cycle
         # doesn't reuse the previous access_username (which the node may
         # still have in its TTL window after the absent run).
-        username = f"user-{user.id}-{subscription.id}-{int(utcnow().timestamp())}"
+        # Include a short random hex suffix so rapid consecutive calls
+        # (e.g. multi-device migration loop) don't collide on username.
+        # access_username MUST be unique on the node — without the hex
+        # the two calls happening within the same wallclock second would
+        # produce identical usernames and ansible would silently skip the
+        # second device's provision, corrupting the resync state.
+        username = (
+            f"user-{user.id}-{subscription.id}-"
+            f"{int(utcnow().timestamp())}-{secrets.token_hex(2)}"
+        )
         password = secrets.token_urlsafe(12)
         user_uuid = uuid.uuid4()
 
@@ -1417,6 +1436,7 @@ class ProvisioningOrchestrator:
         subscription: models.Subscription,
         *,
         exclude_node_ids: list[int] | None = None,
+        target_node_id: int | None = None,
     ) -> tuple[models.VPNNode, models.Device, models.ProvisioningTask]:
         """Move a subscription from its current node to a freshly chosen one.
 
@@ -1442,6 +1462,13 @@ class ProvisioningOrchestrator:
         Raises ``RuntimeError`` if no eligible target node exists in the
         plan's pools — the caller (drain tick) catches this and just
         leaves the sub on the old node, retrying on the next tick.
+
+        ``target_node_id`` — admin override. When set, ``choose_node``
+        is called with ``node_id=target_node_id`` which **skips** the
+        pool/health/capacity/cooldown filters and only validates that
+        the node is ``is_active=True``. Use for admin UI "move user to
+        this specific node" — pool rules and warm state don't apply
+        because the admin is explicitly taking responsibility.
         """
         old_node = subscription.node
         if old_node is None:
@@ -1454,7 +1481,14 @@ class ProvisioningOrchestrator:
         if old_node.id not in excluded:
             excluded.append(old_node.id)
 
-        target = choose_node(self.db, plan, exclude_node_ids=excluded)
+        if target_node_id is not None:
+            if target_node_id == old_node.id:
+                raise RuntimeError(
+                    "target_node_id matches the subscription's current node"
+                )
+            target = choose_node(self.db, plan, node_id=target_node_id)
+        else:
+            target = choose_node(self.db, plan, exclude_node_ids=excluded)
         if target.id == old_node.id:
             # Defensive: choose_node should never return an excluded node,
             # but bail loudly if it does — silently re-provisioning on
@@ -1464,6 +1498,8 @@ class ProvisioningOrchestrator:
         # Revoke old devices first so the slot frees up on the old node
         # before the drain tick re-evaluates capacity. Background is fine:
         # the new device on the target node is the user-visible thing.
+        # Revoked Device rows are kept (sub_token stays resolvable); the
+        # /sub/{token} endpoint aliases them to a live sibling device.
         for device in list(subscription.devices):
             if device.status in (
                 models.DeviceStatus.disabled,

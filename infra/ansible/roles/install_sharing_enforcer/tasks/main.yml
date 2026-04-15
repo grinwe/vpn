@@ -48,9 +48,24 @@
     mode: '0644'
   notify: restart xray-enforcer
 
-- name: Enable and start xray-enforcer
+# Soft-off switch. Set `sharing_enforcer_enabled: true` in group_vars
+# (or per-host) when ready to re-enable. Default is off because the
+# v2 enforcer was kicking legitimate users on small-fleet prod — see
+# backend/app/services/traffic_stats.py for matching backend gate.
+# Leaving the role wired (unit file + binary stay deployed) makes it
+# a one-variable flip to re-enable without a full role re-run.
+- name: Ensure xray-enforcer runs (enabled)
   systemd:
     name: xray-enforcer
     enabled: yes
     state: started
     daemon_reload: yes
+  when: sharing_enforcer_enabled | default(false) | bool
+
+- name: Ensure xray-enforcer is stopped (disabled)
+  systemd:
+    name: xray-enforcer
+    enabled: no
+    state: stopped
+    daemon_reload: yes
+  when: not (sharing_enforcer_enabled | default(false) | bool)

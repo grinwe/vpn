@@ -3,8 +3,10 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   api,
   DeviceOut,
-  UserOut,
+  SubscriptionMigrateOut,
   SubscriptionOut,
+  UserOut,
+  VPNNodeOut,
   adminTopupByTelegram,
 } from "../api";
 
@@ -34,6 +36,16 @@ export default function Users() {
   const { data: subs } = useQuery<SubscriptionOut[]>({
     queryKey: ["user-subs", selected?.id],
     queryFn: () => api.get(`/users/${selected!.id}`),
+    enabled: selected !== null,
+  });
+
+  // Only loaded when a user is selected — the list is used to populate
+  // per-sub migrate dropdowns. Filtered client-side to is_active=true
+  // (the endpoint validates is_active anyway, but hiding disabled nodes
+  // up-front avoids the "why does my pick 400?" surprise).
+  const { data: allNodes } = useQuery<VPNNodeOut[]>({
+    queryKey: ["nodes-for-migrate"],
+    queryFn: () => api.get(`/nodes`),
     enabled: selected !== null,
   });
 
@@ -110,6 +122,21 @@ export default function Users() {
       qc.invalidateQueries({ queryKey: ["user-subs"] });
     },
     onError: (e: Error) => alert(`Не удалось разблокировать: ${e.message}`),
+  });
+
+  const migrateSub = useMutation({
+    mutationFn: ({ subId, targetNodeId }: { subId: number; targetNodeId: number }) =>
+      api.post<SubscriptionMigrateOut>(`/subscriptions/${subId}/migrate`, {
+        target_node_id: targetNodeId,
+      }),
+    onSuccess: (res) => {
+      alert(
+        `Подписка #${res.subscription_id} переведена: ${res.old_node_name} → ${res.new_node_name}. Провижнинг-таска #${res.provisioning_task_id ?? "—"} запущена, следи в Tasks.`,
+      );
+      qc.invalidateQueries({ queryKey: ["user-subs"] });
+      qc.invalidateQueries({ queryKey: ["provisioning-tasks"] });
+    },
+    onError: (e: Error) => alert(`Не удалось перевести: ${e.message}`),
   });
 
   return (
@@ -302,21 +329,30 @@ export default function Users() {
                             enable
                           </button>
                         )}
-                        <button
-                          disabled={unblockSharing.isPending}
-                          onClick={() => {
-                            if (
-                              confirm(
-                                `Снять sharing-бан для подписки #${s.id}?\n\nEnforcer заблокировал юзера за раздачу конфига. Команда unblock будет отправлена на ноду.`
+                        {s.sharing_blocked && (
+                          <button
+                            disabled={unblockSharing.isPending}
+                            onClick={() => {
+                              if (
+                                confirm(
+                                  `Снять sharing-бан для подписки #${s.id}?\n\nEnforcer заблокировал юзера за раздачу конфига. Команда unblock будет отправлена на ноду.`
+                                )
                               )
-                            )
-                              unblockSharing.mutate(s.id);
-                          }}
-                          className="text-xs px-2 py-1 rounded bg-amber-700 hover:bg-amber-600 disabled:opacity-50"
-                        >
-                          снять sharing-бан
-                        </button>
+                                unblockSharing.mutate(s.id);
+                            }}
+                            className="text-xs px-2 py-1 rounded bg-amber-700 hover:bg-amber-600 disabled:opacity-50"
+                          >
+                            снять sharing-бан
+                          </button>
+                        )}
                       </div>
+                      {s.status === "active" && (
+                        <MigrateSubControl
+                          sub={s}
+                          nodes={allNodes}
+                          mutation={migrateSub}
+                        />
+                      )}
                     </li>
                   ))}
                 </ul>
@@ -391,6 +427,73 @@ function DeviceList({
             ))}
         </>
       )}
+    </div>
+  );
+}
+
+// Per-sub "move to specific node" control — admin override.
+// Шлёт POST /subscriptions/{id}/migrate с target_node_id. На бэке
+// выбор ноды не проходит пул/health/cooldown-фильтры (см. docstring
+// migrate_subscription_to_new_node) — админ осознанно берёт
+// ответственность. Мы всё равно прячем ноды с is_active=false из
+// дропдауна, чтобы не собирать 400 на пустом месте.
+function MigrateSubControl({
+  sub,
+  nodes,
+  mutation,
+}: {
+  sub: SubscriptionOut;
+  nodes: VPNNodeOut[] | undefined;
+  mutation: {
+    mutate: (args: { subId: number; targetNodeId: number }) => void;
+    isPending: boolean;
+  };
+}) {
+  const [targetId, setTargetId] = useState<string>("");
+  const candidates = (nodes ?? []).filter(
+    (n) => n.is_active && n.id !== sub.node_id,
+  );
+  if (candidates.length === 0) {
+    return (
+      <div className="mt-2 text-xs text-slate-500">
+        Нет других активных нод для переселения.
+      </div>
+    );
+  }
+  const target = candidates.find((n) => String(n.id) === targetId);
+  return (
+    <div className="mt-2 flex gap-1 items-center">
+      <select
+        value={targetId}
+        onChange={(e) => setTargetId(e.target.value)}
+        className="text-xs px-1 py-0.5 rounded bg-slate-800 border border-slate-700 flex-1"
+      >
+        <option value="">— выбери ноду —</option>
+        {candidates.map((n) => (
+          <option key={n.id} value={String(n.id)}>
+            #{n.id} {n.name} ({n.region})
+            {n.cooldown_until && new Date(n.cooldown_until).getTime() > Date.now()
+              ? " ⚠ cooldown"
+              : ""}
+          </option>
+        ))}
+      </select>
+      <button
+        disabled={mutation.isPending || !target}
+        onClick={() => {
+          if (!target) return;
+          if (
+            confirm(
+              `Перевести подписку #${sub.id} с ноды «${sub.node}» на «${target.name}» (#${target.id}, ${target.region})?\n\n` +
+                `Пул/health/cooldown НЕ проверяются — это ручной admin-override. Старые девайсы будут revoke'нуты в фоне, новый девайс поднимется через ansible (1–2 мин). sub_token сохраняется.`,
+            )
+          )
+            mutation.mutate({ subId: sub.id, targetNodeId: target.id });
+        }}
+        className="text-xs px-2 py-1 rounded bg-blue-700 hover:bg-blue-600 disabled:opacity-50"
+      >
+        переселить
+      </button>
     </div>
   );
 }

@@ -20,11 +20,11 @@ purchase flow.
 from __future__ import annotations
 
 import logging
+import os
 from collections import defaultdict
 from datetime import datetime, timedelta
 
 from ..time_utils import utcnow
-from typing import Iterable
 
 from sqlalchemy import func
 from sqlalchemy.orm import Session
@@ -141,28 +141,32 @@ def recompute_node_health(
     node.last_health_check_at = utcnow()
 
     migrated: list[int] = []
-    # Same gate as per-region: need enough total samples before we'll
-    # pronounce the node dead. Without this, a node that just came up
-    # gets killed by the first probe if it fails.
-    global_death = (
-        overall is not None
-        and overall < DEAD_THRESHOLD
-        and total_samples >= MIN_SAMPLES
-    )
-    if auto_migrate and (global_death or blocked):
-        logger.warning(
-            "Node %s degraded: health=%.2f blocked_regions=%s — considering migration",
-            node.name,
-            overall,
-            blocked,
-        )
-        if global_death:
-            node.status = models.VPNNodeStatus.error
-            node.is_active = False
-            node.cooldown_until = utcnow() + DEFAULT_COOLDOWN
-            migrated = migrate_subscriptions_off(db, node, reason="node unreachable")[
-                "subscription_ids"
-            ]
+    # DISABLED 2026-04-15: автомиграция по healthcheck отключена — на
+    # транзиентных сбоях probes (сетевой дребезг, единичные таймауты)
+    # мы флипали ноду в error и переселяли активных пользователей, что
+    # проявлялось как отвал подключения каждые 5-10 минут. До пересмотра
+    # порогов / anti-flap логики оставляем функцию считать score и
+    # blocked_regions, но решения о миграции теперь принимает админ
+    # через ручной маршрут. Чтобы вернуть поведение — расхешировать блок.
+    # global_death = (
+    #     overall is not None
+    #     and overall < DEAD_THRESHOLD
+    #     and total_samples >= MIN_SAMPLES
+    # )
+    # if auto_migrate and (global_death or blocked):
+    #     logger.warning(
+    #         "Node %s degraded: health=%.2f blocked_regions=%s — considering migration",
+    #         node.name,
+    #         overall,
+    #         blocked,
+    #     )
+    #     if global_death:
+    #         node.status = models.VPNNodeStatus.error
+    #         node.is_active = False
+    #         node.cooldown_until = utcnow() + DEFAULT_COOLDOWN
+    #         migrated = migrate_subscriptions_off(db, node, reason="node unreachable")[
+    #             "subscription_ids"
+    #         ]
 
     db.add(node)
     db.commit()
@@ -177,7 +181,11 @@ def recompute_node_health(
 
 
 def migrate_subscriptions_off(
-    db: Session, node: models.VPNNode, *, reason: str
+    db: Session,
+    node: models.VPNNode,
+    *,
+    reason: str,
+    exclude_same_region: bool = False,
 ) -> dict:
     """Move all active subscriptions off ``node`` to a healthy alternative.
 
@@ -187,6 +195,14 @@ def migrate_subscriptions_off(
     path) can read ``["subscription_ids"]``; the admin migrate route
     surfaces ``task_ids`` so the UI can render a grouped progress
     banner for the batch.
+
+    ``considered_count`` is the number of active subs we tried to move;
+    ``no_target_count`` is how many of those ``choose_node`` couldn't
+    find a destination for (every other node in cooldown / unhealthy /
+    out of the plan's pool). The admin UI reads these to distinguish
+    "no active subs on this node" from "had subs but nowhere to send
+    them" — previously both produced an empty ``subscription_ids`` and
+    the UI showed the same misleading "нечего мигрировать" toast.
     """
     from .provisioning import (
         ProvisioningOrchestrator,
@@ -194,7 +210,7 @@ def migrate_subscriptions_off(
         choose_node,
     )
 
-    subs: Iterable[models.Subscription] = (
+    subs: list[models.Subscription] = (
         db.query(models.Subscription)
         .filter(
             models.Subscription.node_id == node.id,
@@ -202,6 +218,8 @@ def migrate_subscriptions_off(
         )
         .all()
     )
+    considered_count = len(subs)
+    no_target_count = 0
     migrated_ids: list[int] = []
     orchestrator = ProvisioningOrchestrator(db)
     # Unique target nodes this batch migrated to — we run a single
@@ -217,9 +235,15 @@ def migrate_subscriptions_off(
 
     for sub in subs:
         try:
-            target = choose_node(db, sub.plan, exclude_node_ids=[node.id])
+            target = choose_node(
+                db,
+                sub.plan,
+                exclude_node_ids=[node.id],
+                exclude_regions=[node.region] if exclude_same_region else None,
+            )
         except RuntimeError as exc:
             logger.error("No healthy node available for sub %s: %s", sub.id, exc)
+            no_target_count += 1
             continue
 
         # Revoke the old devices on the (possibly already-dead) node. Best
@@ -254,6 +278,18 @@ def migrate_subscriptions_off(
             # telegram_id in extra the poller silently drops the row, so
             # skip the write for non-Telegram users (e.g. email-only).
             if sub.user and sub.user.telegram_id and sub.user.notify_migrations:
+                # Resolve the same subscription URI the webapp cabinet shows
+                # (primary device's sub_token, falling back to sub-level
+                # token) so the notification points straight at the new
+                # config instead of forcing the user to open /config.
+                sub_base = os.getenv("SUB_LINK_BASE_URL", "").rstrip("/")
+                device_token = _device.sub_token if _device and _device.sub_token else sub.sub_token
+                sub_uri: str | None = None
+                if device_token:
+                    sub_uri = (
+                        f"{sub_base}/{device_token}" if sub_base
+                        else f"/api/sub/{device_token}"
+                    )
                 db.add(
                     models.AuditLog(
                         actor="health_monitor",
@@ -266,6 +302,7 @@ def migrate_subscriptions_off(
                             "old_node": node.name,
                             "new_node": target.name,
                             "reason": reason,
+                            "sub_uri": sub_uri,
                         },
                     )
                 )
@@ -301,4 +338,6 @@ def migrate_subscriptions_off(
         "revoke_task_ids": revoke_task_ids,
         "device_task_ids": device_task_ids,
         "resync_task_ids": resync_task_ids,
+        "considered_count": considered_count,
+        "no_target_count": no_target_count,
     }

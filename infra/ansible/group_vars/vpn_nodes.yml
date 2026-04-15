@@ -15,3 +15,12 @@ ssh_public_keys:
   - "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIE8IrzyHuBdSXDnBCE9XthETlDDrD4nsOqeubIt6oMkS provisioning@grinwer"
 domain_mask: "www.cloudflare.com"
 vless_enabled: true
+
+# Sharing enforcer daemon на ноде (install_sharing_enforcer role).
+# Отключён 2026-04-15: v2 enforcer рвал коннект легитимным юзерам
+# (телефон+ноут под CGNAT = "concurrent IP") циклом rmuser→sleep→adduser
+# раз в KICK_COOLDOWN (120s), в UX это воспринималось как разрывы
+# каждые 5-10 минут. До перетюнинга порогов оставляем false.
+# Роль по-прежнему ставит бинарь + unit-файл, но systemd unit будет
+# stopped + disabled.
+sharing_enforcer_enabled: false

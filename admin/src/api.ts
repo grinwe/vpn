@@ -103,10 +103,30 @@ export interface SubscriptionOut {
   id: number;
   plan_name: string;
   node: string;
+  // Current node id. Used by the admin per-sub migrate dropdown to
+  // exclude the sub's current node from the target list.
+  node_id: number | null;
   region: string;
   expires_at: string;
   status: string;
   devices?: DeviceOut[];
+  // True iff at least one live device has an open sharing-enforcer block
+  // on the node. Computed server-side from AuditLog. Gates the
+  // "снять sharing-бан" button in the Users page.
+  sharing_blocked?: boolean;
+}
+
+export interface SubscriptionMigrateIn {
+  target_node_id: number;
+}
+
+export interface SubscriptionMigrateOut {
+  subscription_id: number;
+  old_node_id: number;
+  old_node_name: string;
+  new_node_id: number;
+  new_node_name: string;
+  provisioning_task_id: number | null;
 }
 
 export interface StatsOut {
@@ -148,6 +168,8 @@ export interface VPNNodeOut {
   is_active: boolean;
   health_score: number;
   blocked_regions: string[];
+  cooldown_until: string | null;
+  suspect_since: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -205,6 +227,54 @@ export interface VPNConfigCreateIn {
   is_enabled?: boolean;
 }
 
+// Partial update — any field omitted is left untouched on the server.
+// ``protocol`` is for client-side validation only (the backend rejects
+// swapping the protocol of an existing config with 400).
+export interface VPNConfigUpdateIn {
+  name?: string | null;
+  port?: number | null;
+  sni?: string | null;
+  public_key?: string | null;
+  fallback?: string | null;
+  settings?: Record<string, unknown> | null;
+  is_enabled?: boolean | null;
+  protocol?: VPNConfigProtocol | null;
+}
+
+export interface NodeActiveUserOut {
+  access_username: string;
+  device_id: number | null;
+  device_name: string | null;
+  subscription_id: number | null;
+  user_id: number | null;
+  user_telegram_id: string | null;
+  plan_id: number | null;
+  plan_name: string | null;
+  protocols: string[];
+  subscription_expires_at: string | null;
+}
+
+export interface NodeActiveUsersOut {
+  node_id: number;
+  observed_at: string | null;
+  stale: boolean;
+  users: NodeActiveUserOut[];
+}
+
+export interface NodeTrafficSamplePoint {
+  observed_at: string;
+  active_users: number;
+  uplink_bytes: number;
+  downlink_bytes: number;
+}
+
+export interface NodeTrafficHistoryOut {
+  node_id: number;
+  from_ts: string;
+  to_ts: string;
+  samples: NodeTrafficSamplePoint[];
+}
+
 export interface PlanOut {
   id: number;
   name: string;
@@ -250,4 +320,69 @@ export interface ProvisioningTaskOut {
   started_at: string | null;
   finished_at: string | null;
   telegram_id: string | null;
+}
+
+// ── Health-ping dashboard ──
+// Источник данных — AuditLog rows с action IN (health_ping_request,
+// health_ping_response, health_ping_opt_out). См. docs/data-model.md.
+
+export interface HealthPingTotals {
+  requests: number;
+  responses: number;
+  ok: number;
+  bad: number;
+  bad_prompted: number;
+  bad_self_reported: number;
+  opt_outs: number;
+  response_rate: number;
+}
+
+export interface HealthPingPerNode {
+  node_id: number | null;
+  node_name: string | null;
+  requests: number;
+  ok: number;
+  bad: number;
+  bad_ratio: number;
+}
+
+export interface HealthPingTimeseriesPoint {
+  bucket_ts: string;
+  ok: number;
+  bad: number;
+}
+
+export interface HealthPingSummaryOut {
+  from_ts: string;
+  to_ts: string;
+  hours: number;
+  bucket: "hour" | "day" | string;
+  totals: HealthPingTotals;
+  per_node: HealthPingPerNode[];
+  timeseries: HealthPingTimeseriesPoint[];
+}
+
+export interface HealthPingRecentBadItem {
+  created_at: string;
+  telegram_id: string | null;
+  user_id: number | null;
+  node_id: number | null;
+  node_name: string | null;
+  subscription_id: number | null;
+  plan_name: string | null;
+  source: "prompted" | "self_reported" | string;
+}
+
+export interface HealthPingRecentBadOut {
+  items: HealthPingRecentBadItem[];
+}
+
+export interface NodeHealthPingStatsOut {
+  node_id: number;
+  hours: number;
+  requests: number;
+  ok: number;
+  bad: number;
+  bad_ratio: number;
+  last_bad_at: string | null;
 }

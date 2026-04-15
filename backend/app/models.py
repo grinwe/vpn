@@ -202,6 +202,10 @@ class VPNNode(Base):
     last_health_check_at = Column(DateTime, nullable=True)
     blocked_regions = Column(JSONB, nullable=True)
     cooldown_until = Column(DateTime, nullable=True)
+    # Phase D traffic-drop detector: set when active_users drops from
+    # ≥MIN to 0 between two traffic_stats ticks. Cleared on next tick
+    # after confirmation (→ error) or false-alarm (→ None).
+    suspect_since = Column(DateTime, nullable=True)
     # Relay config: when set, this node is a jump node that tunnels
     # traffic through a WireGuard tunnel to a foreign exit node.
     # Keys: wg_private_key, wg_address_v4, wg_address_v6,
@@ -575,8 +579,14 @@ class NodeTrafficSample(Base):
     downlink_bytes = Column(BigInteger, nullable=False, default=0, server_default="0")
     active_users = Column(Integer, nullable=False, default=0, server_default="0")
     # Per-protocol breakdown:
-    #   {"vless-reality": {"uplink": 123, "downlink": 456, "users": 7}, ...}
+    #   {"vless-reality": {
+    #       "uplink": 123, "downlink": 456,
+    #       "users": ["user-1-2", "user-4-7"],    # sorted access_username list
+    #       "user_count": 2                        # == len(users)
+    #   }, ...}
     # plus a "_errors" key listing protocols whose collection failed.
+    # Legacy rows (pre-2026-04) have ``users`` as a bare int count —
+    # readers must tolerate both formats (see api/nodes.py::list_node_users).
     details = Column(JSONB, nullable=True)
 
     node = relationship("VPNNode", back_populates="traffic_samples")

@@ -33,7 +33,7 @@
 
 ## Выбор ноды — `choose_node`
 
-`provisioning.py:37-137`. Не просто `ORDER BY load LIMIT 1`: компонуется шесть фильтров одним запросом.
+`provisioning.py:37-137`. Не просто `ORDER BY load LIMIT 1`: компонуется семь фильтров одним запросом.
 
 1. **Pool membership** — если у плана заданы `server_pools`, нода должна принадлежать одному из них. Пустой список пулов = «любая нода подходит».
 2. **Explicit node_id** — если caller знает, какую ноду хочет (редко, только админский путь `POST /api/subscriptions` с параметром), все остальные фильтры пропускаются.
@@ -41,6 +41,7 @@
 4. **Status** — `active` или `registering`. `registering` попала сюда, чтобы bootstrap-task на свежевыспавнутой ноде мог ссылаться сам на себя (до промоушна в `active`).
 5. **Health score** — `health_score IS NULL OR health_score >= MIN_HEALTHY_SCORE` (default 50, env). `NULL` означает «нет данных» (нет проб за последние 15 мин или свежая нода) — такая нода считается eligible, чтобы не отваливалась из пула до первого проба. `health_score=0` ставится при fail'е site.yml на active-ноде (no-demote rail).
 6. **Exclude list** — caller может попросить «не возвращай эти node_id». Используется миграцией подписки с draining-ноды: `migrate_subscription_to_new_node` подмешивает туда текущую и соседние draining-ноды того же пула.
+7. **Exclude regions** (`exclude_regions: list[str] | None`) — caller может исключить ноды по `region`. Изначально задумывалось под Phase D traffic-drop детектор через `migrate_subscriptions_off(exclude_same_region=True)` для перенаправления при подозрении на ТСПУ-блок регионалкой. Phase D отключён 2026-04-15 (см. ниже), так что сейчас параметр используется только при явном вызове через ручной `POST /api/nodes/{id}/migrate`.
 
 Дальше — **сортировка по нагрузке**:
 
@@ -254,9 +255,48 @@ else:
 
 `sub_token` **не меняется** — это единственный persistent identifier, который клиент хранит (в Hiddify-профиле стоит `https://grinwer.online/sub/<token>`). Ротация токена silently сломала бы все установленные конфиги на клиентах.
 
+**Device-level sub_token и seamless-URL transfer.** После alembic `0022_device_sub_token` каждый `Device` получает собственный `sub_token`, и webapp теперь кладёт в клиента именно device-token URL. При миграции старый device revoke'ается, `_handle_task_outcome` по успеху ansible **полностью удаляет** строку Device из БД (`provisioning.py:754-757`). Без дополнительной логики это сломало бы bumpless «обновления подписки» в Hiddify/v2rayN: сохранённый URL `/sub/<OLD_TOKEN>` после удаления строки возвращал бы 404.
+
+**Primary механизм** — перенос всех `sub_token` старых девайсов на новые прямо внутри `migrate_subscription_to_new_node`:
+
+1. До revoke: собираем snapshot `[(sub_token, name), …]` по **всем** активным девайсам подписки (sorted by id — детерминированный порядок).
+2. Чистим `old_device.sub_token = None` на каждом и flush — освобождаем unique-значения.
+3. Revoke (ansible async) → worker потом удаляет строки (уже без sub_token, унику не ломает).
+4. `reprovision_subscription` вызывается в цикле **N раз** (по числу сохранённых snapshot'ов, min 1) — каждый раз создаёт свежий Device + кидает свой apply-task.
+5. **Перезаписываем** `new_devices[i].sub_token = old_tokens[i]` и коммитим одним batch'ем.
+
+В результате все сохранённые пользователем URL (primary + каждый extra slot) продолжают указывать на живые девайсы подписки, переживая любое количество миграций подряд. Юзер жмёт «обновить подписку» — клиент подхватывает новые сервера без повторного копирования. Multi-device подписки с 3 слотами теперь мигрируют полностью seamless.
+
+Важный саб-фикс: `reprovision_subscription` теперь формирует `access_username` как `f"user-{uid}-{sid}-{ts}-{token_hex(2)}"` — 4 hex-символа случайности. До этого в цикле N подряд вызовов в одну и ту же секунду получали одинаковый username, и ansible silently дедуплицировал второй device, оставляя подписку с одним реально-рабочим.
+
+**Defense-in-depth** — `api_extensions.dynamic_sub_link` дополнительно проверяет: если lookup по токену нашёл device, но он `revoked/disabled` или без активных credentials — ищет живой device той же Subscription и alias'ит запрос (пишет `aliased_to_device_id` в AuditLog). Это покрывает edge-case'ы (token transfer не сработал, ручное вмешательство в БД, legacy-записи).
+
+**Revoke-timeout tolerance.** Когда старая нода реально мертва/тормозит, ansible revoke через `provision_device.yml state=absent` может упасть по subprocess-таймауту (`ANSIBLE_PLAYBOOK_TIMEOUT`, default 300s). Это **не ломает миграцию** — revoke идёт в background, а новые девайсы на target-ноде уже живы и URL юзера уже алиасится на них. В админ-UI failed revoke-task остаётся как задача с `can_rerun=True` — при желании очистить мусор на старой ноде админ жмёт retry. Таймаут можно поднять через env при регулярно-медленных нодах.
+
 Защита: если `choose_node` вернул ту же ноду (defensive bug), — `RuntimeError`. Молча re-provisioning'нить на той же draining-ноде запустил бы drain в бесконечный цикл.
 
 Старые devices revoke'аются в **background** (ансибл state=absent на старой ноде), новое устройство проводится по нормальному пути. Между этими двумя моментами существует короткое окно, когда пользователь может подключиться и к старой (не успели revoke), и к новой (уже active) ноде. Это осознанный trade-off ради того, чтобы не блокировать миграцию на ansible-run'е старой ноды.
+
+**Admin override — `target_node_id`**. Параметр позволяет передать конкретную ноду-цель вместо авто-выбора через `choose_node`. Когда он задан, `choose_node` вызывается с `node_id=target_node_id`, и это **обходит** все фильтры пула/health/capacity/cooldown — проверяется только `is_active=True`. Используется новым admin-эндпойнтом `POST /api/subscriptions/{id}/migrate`: админ явно берёт ответственность за выбор, например чтобы дотащить одного проблемного юзера на «чистую» ноду после частичной деградации. Если `target_node_id == sub.node_id` — `RuntimeError` (и endpoint возвращает 400). Webapp-кнопку «поменять ноду» не трогаем — пользовательская самопереезжалка не возвращается, остаётся только админский путь.
+
+## `migrate_subscriptions_off` — массовая миграция по ноде
+
+`services/health.py::migrate_subscriptions_off(db, node, reason, exclude_same_region=False)`. Прогоняет все активные подписки ноды через `choose_node(exclude_node_ids=[node.id], exclude_regions=…)` → `migrate_subscription_to_new_node`. Используется в:
+
+- **Admin `POST /nodes/{id}/migrate`** — ручная массовая миграция (default: `exclude_same_region=False`). **Это единственный активный каллер с 2026-04-15.**
+- ~~**`recompute_node_health`**~~ — автомиграция по health-деградации **отключена 2026-04-15** (ложно-положительные probe-сбои уносили юзеров раз в несколько минут). Код закомментирован, `recompute_node_health` по-прежнему считает `health_score`/`blocked_regions`, но не вызывает миграцию.
+- ~~**Phase D `detect_traffic_drops`**~~ — автомиграция по traffic-drop **отключена 2026-04-15** (детектор триггерился на обычные idle-окна). `detect_traffic_drops` возвращает no-op, вызов в `worker.run_traffic_stats_tick` закомментирован.
+
+Флаг `exclude_same_region` опционален (default `False`), так что существующие call-site'ы не меняют поведения.
+
+Возвращает dict со следующими полями:
+
+- `subscription_ids` — id успешно мигрированных подписок (legacy-контракт, читается `recompute_node_health` и ботом).
+- `revoke_task_ids` / `device_task_ids` / `resync_task_ids` — id фоновых provisioning-тасок (revoke старых device'ов, apply на новой ноде, post-resync per target). Admin UI через них рисует грууппированный прогресс-баннер по батчу.
+- `considered_count` — сколько активных подписок нашли на ноде (до фильтрации).
+- `no_target_count` — для скольких из них `choose_node` не смог подобрать destination (все остальные ноды в cooldown / unhealthy / вне пулов плана).
+
+Последние два поля нужны, чтобы admin endpoint `POST /api/nodes/{id}/migrate` мог различать три исхода: **«подписок не было»** (`considered_count == 0`), **«были, но некуда переселить»** (`no_target_count == considered_count`), **«часть/все переселены»**. Раньше все три случая давали пустой `subscription_ids` и UI показывал одинаковый «нечего мигрировать» toast — после инцидента 2026-04-15, когда 3/4 нод залипли в cooldown, это оказалось принципиально: админ не видел, что подписки **есть**, просто destination нет.
 
 ## `revoke_device` — обычный revoke
 

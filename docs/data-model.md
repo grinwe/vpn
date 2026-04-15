@@ -1,6 +1,6 @@
 # Модель данных
 
-Всё описание ниже соответствует `backend/app/models.py`. Миграции живут в `backend/app/alembic/versions/`, последняя — `0022_device_sub_token.py`. Схема — PostgreSQL, JSONB для гибких полей, enum-типы реализованы через `sqlalchemy.Enum` → postgres enum.
+Всё описание ниже соответствует `backend/app/models.py`. Миграции живут в `backend/app/alembic/versions/`, последняя — `0024_node_suspect_since.py`. Схема — PostgreSQL, JSONB для гибких полей, enum-типы реализованы через `sqlalchemy.Enum` → postgres enum.
 
 ```
  users ─┬──◄── invoices ─┬──◄── payments
@@ -104,6 +104,7 @@ class VPNNode(Base):
     last_health_check_at,
     blocked_regions: JSONB NULL,       # ['ru-mts', 'kz', ...]
     cooldown_until: DateTime NULL,     # reprovision backoff
+    suspect_since: DateTime NULL,      # Phase D detector: active_users упал N→0
     relay_config: JSONB NULL,          # WG tunnel к иностранному exit'у
     provider_id → cloud_providers NULL,
     provider_external_id, provider_region, provider_plan,
@@ -118,6 +119,8 @@ class VPNNode(Base):
 5. `error` — провижининг сломался, ручное вмешательство.
 
 `cooldown_until` — anti-flap: если autoscale только что провижинил новую ноду и она сразу упала в health, не крутим повторный spawn в течение окна.
+
+`suspect_since` — Phase D traffic-drop детектор (`services/traffic_stats.py::detect_traffic_drops`). Ставится моментом, когда `active_users` на ноде упал с ≥`TRAFFIC_DROP_MIN_USERS` до 0 между двумя traffic_stats тиками (пассивный ТСПУ-сигнал). На следующем тике — либо `status=error`/`cooldown_until=+3d`/`suspect_since=NULL` (подтверждение: трафик пошёл на мигрированных подписках на ноде другого региона), либо `suspect_since=NULL` (false-alarm). Не часть `VPNNodeStatus` enum'а — это промежуточное подозрение внутри детектора, не часть жизненного цикла.
 
 ### `vpn_configs`
 
@@ -314,6 +317,44 @@ class HealthProbe(Base):
 
 Агрегат используется health-скорером для bump/drop `VPNNode.health_score` и `blocked_regions`. Сырые строки хранятся ограниченное время (см. cleanup-тик в воркере, если есть — иначе ⚠️).
 
+### `node_traffic_samples`
+
+Периодические снимки xray stats-счётчиков ноды (Phase B → D). Пишутся `services.traffic_stats.collect_node_stats` раз в `TRAFFIC_STATS_INTERVAL` (default 300с).
+
+```python
+# backend/app/models.py:552
+class NodeTrafficSample(Base):
+    id, node_id → vpn_nodes (CASCADE, indexed),
+    observed_at (default=utcnow),
+    interval_seconds,                          # длина окна, фактический tick
+    uplink_bytes, downlink_bytes: BigInteger,  # delta-счётчики (xray statsquery --reset)
+    active_users: Integer,                     # count уникальных access_username
+    details: JSONB                             # per-protocol breakdown (см. ниже)
+```
+
+Формат `details`:
+
+```json
+{
+  "vless-reality": {
+    "uplink": 12345,
+    "downlink": 67890,
+    "users": ["user-1-2", "user-4-7"],   // sorted access_username list (2026-04+)
+    "user_count": 2                       // == len(users)
+  },
+  "shadowtls+shadowsocks": { "uplink": 0, "downlink": 0, "users": [], "user_count": 0 },
+  "_errors": ["vless-xhttp"]              // протоколы, на которых collect упал
+}
+```
+
+Legacy-rows (pre-2026-04) хранят `users` как bare `int` (count без списка) — читатели обязаны проверять `isinstance(v, list)` (`api/nodes.py::list_node_users`). Backfill не нужен: через один tick после деплоя все ноды пишут новый формат.
+
+Фазы:
+- **Phase B**: сбор time-series, `active_users` column, без автодействий.
+- **Phase D**: `traffic_stats.detect_traffic_drops` читает `active_users` из двух последних sample'ов для ноды, срабатывает на drop ≥`TRAFFIC_DROP_MIN_USERS` → 0. Не читает `details`.
+
+Админские потребители: `GET /api/nodes/{id}/users` (последний sample + джойн по `access_username`), `GET /api/nodes/{id}/traffic-history?hours=24` (sparkline).
+
 ### `api_tokens`
 
 Scoped машинные токены.
@@ -344,6 +385,16 @@ class AuditLog(Base):
 **Важно**: column на диске называется `metadata` (чтобы не конфликтовать с SQLAlchemy reserved `Base.metadata`), в Python-модели — `extra`. См. `models.py:526`.
 
 Особенность: тот же audit log используется как «очередь уведомлений боту» — воркер пишет строки с `action in ('renewal_reminder', 'config_ready', 'migration_notice', …)`, бот опрашивает их через `/api/notifications/pending` (`backend/app/api_extensions.py:359`) и помечает delivered добавлением `:delivered` в `action`.
+
+**Health-ping actions** (источник данных для админ-дашборда `/health-pings`):
+
+| `action` | Актор | Что в `extra` |
+|---|---|---|
+| `health_ping_request` | `system` | `telegram_id, subscription_id, node_id, node_name` — worker пишет на каждый плановый пинг |
+| `health_ping_response` | `user` | `telegram_id, answer ("ok"\|"bad"), node_id, source ("prompted"\|"self_reported")` — ответ юзера |
+| `health_ping_opt_out` | `user` | `telegram_id` — юзер нажал «не показывать» |
+
+Поле `extra.source` различает, пришёл ли `bad`-ответ по плановому пингу (`prompted`) или юзер сам инициировал жалобу через self-report кнопку в боте/вебапе (`self_reported`). Legacy rows без этого поля трактуются как `prompted`.
 
 ### `referral_codes`
 
@@ -399,6 +450,8 @@ class ReferralCode(Base):
 - `0020` — `user_health_ping` (Phase C).
 - `0021` — `UNIQUE(provider, external_id)` на payments (#52). Дедупликация перед наложением constraint.
 - `0022` — `Device.sub_token` (per-device credential isolation). Backfill existing devices с уникальными токенами + unique index.
+- `0023` — `user_notification_prefs`.
+- `0024` — `VPNNode.suspect_since: DateTime NULL` для Phase D traffic-drop детектора.
 
 Миграции запускаются только backend'ом на старте (`main.py:18` → `migrations.run_migrations()`). Воркер явно skip'ает миграции через `SKIP_MIGRATIONS=1` в `docker-compose.yml:103`, чтобы не гонять гонку на `alembic_version` advisory lock.
 

@@ -79,10 +79,17 @@ class ProtocolStats:
     error: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
+        # ``users`` used to be a bare count (``int``). We now persist the
+        # sorted list of access_usernames so the admin UI can show "who
+        # is on this node right now" without a second round-trip to SSH.
+        # ``user_count`` kept for consumers that only want the cardinal.
+        # Readers must be tolerant to the legacy int format on historical
+        # samples — see api/nodes.py::list_node_users.
         out: dict[str, Any] = {
             "uplink": self.uplink,
             "downlink": self.downlink,
-            "users": len(self.users),
+            "users": sorted(self.users),
+            "user_count": len(self.users),
         }
         if self.error:
             out["error"] = self.error
@@ -292,30 +299,35 @@ def collect_node_stats(node) -> NodeStatsResult:
         result.active_users = len(all_users)
 
         # ── Read sharing enforcer violations (Phase 2) ─────────────
-        # The local enforcer daemon appends JSONL to this file. We
-        # read + truncate so each violation is ingested exactly once.
-        try:
-            viol_cmd = (
-                "cat /var/log/xray/sharing_violations.jsonl 2>/dev/null "
-                "&& truncate -s 0 /var/log/xray/sharing_violations.jsonl 2>/dev/null"
-            )
-            v_rc, v_out, _ = _ssh_run(client, viol_cmd)
-            if v_rc == 0 and v_out.strip():
-                for line in v_out.strip().splitlines():
-                    try:
-                        row = json.loads(line)
-                        result.sharing_violations.append(SharingViolation(
-                            ts=row.get("ts", ""),
-                            email=row.get("email", ""),
-                            ips=row.get("ips", []),
-                            ip_count=row.get("ip_count", 0),
-                            action=row.get("action", ""),
-                            severity=row.get("severity", "warning"),
-                        ))
-                    except (json.JSONDecodeError, KeyError):
-                        continue
-        except Exception:  # noqa: BLE001
-            logger.debug("sharing violations read failed on node %s", node.id)
+        # Gated off by default: the v2 enforcer was kicking legitimate
+        # users on small-fleet prod (phone + laptop = "concurrent IP"
+        # under CGNAT). We keep the read wired for when detection is
+        # tuned and re-enabled — flip `SHARING_ENFORCEMENT_ENABLED=1`
+        # on the worker. See matching ansible gate in
+        # install_sharing_enforcer/tasks/main.yml.
+        if os.getenv("SHARING_ENFORCEMENT_ENABLED", "0") == "1":
+            try:
+                viol_cmd = (
+                    "cat /var/log/xray/sharing_violations.jsonl 2>/dev/null "
+                    "&& truncate -s 0 /var/log/xray/sharing_violations.jsonl 2>/dev/null"
+                )
+                v_rc, v_out, _ = _ssh_run(client, viol_cmd)
+                if v_rc == 0 and v_out.strip():
+                    for line in v_out.strip().splitlines():
+                        try:
+                            row = json.loads(line)
+                            result.sharing_violations.append(SharingViolation(
+                                ts=row.get("ts", ""),
+                                email=row.get("email", ""),
+                                ips=row.get("ips", []),
+                                ip_count=row.get("ip_count", 0),
+                                action=row.get("action", ""),
+                                severity=row.get("severity", "warning"),
+                            ))
+                        except (json.JSONDecodeError, KeyError):
+                            continue
+            except Exception:  # noqa: BLE001
+                logger.debug("sharing violations read failed on node %s", node.id)
 
         return result
     finally:
@@ -419,6 +431,225 @@ def collect_and_persist(session, node, interval_seconds: int) -> dict[str, Any] 
         "active_users": result.active_users,
         "sharing_violations": len(result.sharing_violations),
     }
+
+
+# Effectively disables auto-migration at small fleet sizes. While the
+# service has on the order of ~10 concurrent users total, any natural
+# fluctuation can drop active_users to 0 for a tick, and auto-migration
+# on that basis causes far more damage than it prevents (sub.node_id
+# flips, warm pool churn, device re-provisioning). We keep the detector
+# wired so the audit trail (`traffic_drop_detected`/`_cleared`) still
+# records suspicious silence, but the migration gate is set high enough
+# that it only fires once we have real scale (50+ concurrent users on
+# the smallest node). Lower the env var `TRAFFIC_DROP_MIN_USERS` when
+# ready to re-enable at smaller thresholds.
+MIN_ACTIVE_USERS_DEFAULT = 100
+# Number of consecutive zero-user ticks we need to see after a drop
+# before migrating. With TRAFFIC_STATS_INTERVAL=300 the default of 3
+# means ~15 min of sustained silence — long enough that a transient
+# all-idle window (video paused, phone screens off) doesn't trigger
+# migration. A real TSPU edge-block will keep giving us zeros past
+# this bound, so confirmation still fires within one interval budget.
+CONFIRM_TICKS_DEFAULT = 3
+# Minimum traffic floor (bytes per tick) that flips the "no users"
+# reading from "likely idle" to "likely blocked". xray keepalives and
+# idle TLS chatter typically produce <100KB/5min per connection, so
+# anything above ~1MB total across all users says somebody is really
+# moving data — not a block scenario.
+MIN_IDLE_BYTES_DEFAULT = 1_000_000
+
+
+def detect_traffic_drops(session, current_summaries: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Phase D — detect nodes where traffic went quiet after being busy.
+
+    Called after ``collect_all_active_nodes`` on every traffic_stats tick.
+
+    The detector is **two-stage** on purpose — we don't trust a single
+    zero-users tick. ``xray api statsquery --reset`` only counts users
+    who actually moved bytes in the interval, so a tick where every
+    client happens to be idle (video paused, screen off, keepalive-only)
+    legitimately reports ``active_users=0`` with no block involved.
+
+    Stage A (this tick, Phase 2 below) — mark suspect:
+      * ``curr.active_users == 0`` AND
+      * ``curr.uplink+downlink < MIN_IDLE_BYTES`` AND
+      * previous tick showed ``active_users >= MIN_USERS``
+      → set ``suspect_since = now``. **No migration yet.**
+
+    Stage B (subsequent ticks, Phase 1 below) — confirm or clear:
+      * Once ``suspect_since`` is older than ``CONFIRM_TICKS * interval``,
+        inspect the source node's own recent samples.
+      * If any of the last ``CONFIRM_TICKS`` samples had active_users>0 or
+        traffic above the idle floor → false alarm, clear ``suspect_since``.
+      * Otherwise → migrate subs off to another region, mark ``error``.
+
+    Migration is deliberately guarded behind confirmation: flipping
+    ``subscription.node_id`` has real UX cost (users reconnect, warm
+    pool consumed, admin sees divergence between DB and xray config)
+    and has to be a deliberate decision, not a single-tick reaction.
+
+    DISABLED 2026-04-15: детектор триггерился на обычные idle-окна и
+    начинал переселять активных пользователей, из-за чего у юзеров
+    отваливалось подключение каждые 5-10 минут (совпадает с
+    TRAFFIC_STATS_INTERVAL=300s). Пороги/эвристику нужно пересмотреть
+    до возврата автомиграции. Функция оставлена no-op — достаточно
+    снять early-return ниже чтобы восстановить поведение.
+    """
+    return []
+
+    # ── original body kept for future re-enable ─────────────────────
+    from .. import models  # noqa: E402
+    from ..time_utils import utcnow  # noqa: E402
+    from .health import migrate_subscriptions_off, DEFAULT_COOLDOWN  # noqa: E402
+
+    min_users = int(os.getenv("TRAFFIC_DROP_MIN_USERS", str(MIN_ACTIVE_USERS_DEFAULT)))
+    confirm_ticks = int(os.getenv("TRAFFIC_DROP_CONFIRM_TICKS", str(CONFIRM_TICKS_DEFAULT)))
+    min_idle_bytes = int(os.getenv("TRAFFIC_DROP_MIN_IDLE_BYTES", str(MIN_IDLE_BYTES_DEFAULT)))
+    interval = int(os.getenv("TRAFFIC_STATS_INTERVAL", "300"))
+    results: list[dict[str, Any]] = []
+
+    # ── Phase 1: confirm or clear existing suspects ──────────────────
+    suspect_nodes = (
+        session.query(models.VPNNode)
+        .filter(models.VPNNode.suspect_since.isnot(None))
+        .all()
+    )
+    for node in suspect_nodes:
+        elapsed = (utcnow() - node.suspect_since).total_seconds()
+        if elapsed < interval * confirm_ticks:
+            continue  # not enough ticks yet
+
+        # Pull the last N samples on THIS node (not the migration
+        # target) — the question we're answering is "did the source
+        # node stay quiet?", not "are users now somewhere else?".
+        recent = (
+            session.query(models.NodeTrafficSample)
+            .filter(models.NodeTrafficSample.node_id == node.id)
+            .order_by(models.NodeTrafficSample.observed_at.desc())
+            .limit(confirm_ticks)
+            .all()
+        )
+        still_silent = bool(recent) and all(
+            s.active_users == 0
+            and (s.uplink_bytes + s.downlink_bytes) < min_idle_bytes
+            for s in recent
+        )
+
+        if not still_silent:
+            # Users came back or traffic reappeared — false alarm.
+            node.suspect_since = None
+            session.add(node)
+            session.add(models.AuditLog(
+                actor="traffic_drop_detector",
+                actor_type=models.AuditActor.system,
+                action="traffic_drop_cleared",
+                target_type="vpn_node",
+                target_id=node.id,
+                extra={"node_name": node.name},
+            ))
+            results.append({"node_id": node.id, "node": node.name, "outcome": "cleared"})
+            logger.info("traffic_drop: false alarm on node %s (%s), cleared", node.id, node.name)
+            continue
+
+        # Sustained silence across the confirmation window — now we
+        # actually migrate. Up until this point no subscription.node_id
+        # has been touched.
+        try:
+            migration = migrate_subscriptions_off(
+                session, node, reason="traffic_drop", exclude_same_region=True,
+            )
+            migrated_ids = migration["subscription_ids"]
+        except Exception:  # noqa: BLE001
+            logger.exception(
+                "traffic_drop: migration failed for node %s — leaving suspect flag set",
+                node.id,
+            )
+            results.append({"node_id": node.id, "node": node.name, "outcome": "confirm_migration_failed"})
+            continue
+
+        node.status = models.VPNNodeStatus.error
+        node.is_active = False
+        node.cooldown_until = utcnow() + DEFAULT_COOLDOWN
+        node.suspect_since = None
+        session.add(node)
+        session.add(models.AuditLog(
+            actor="traffic_drop_detector",
+            actor_type=models.AuditActor.system,
+            action="traffic_drop_confirmed",
+            target_type="vpn_node",
+            target_id=node.id,
+            extra={
+                "node_name": node.name,
+                "migrated_subscription_ids": migrated_ids,
+                "confirm_ticks": confirm_ticks,
+            },
+        ))
+        results.append({
+            "node_id": node.id,
+            "node": node.name,
+            "outcome": "confirmed",
+            "migrated": migrated_ids,
+        })
+        logger.warning(
+            "traffic_drop: CONFIRMED block on node %s (%s), migrated %d subs",
+            node.id, node.name, len(migrated_ids),
+        )
+
+    # ── Phase 2: detect new drops — mark suspect only, don't migrate ──
+    now = utcnow()
+    for summary in current_summaries:
+        if summary["active_users"] != 0:
+            continue
+        # Bytes floor — if data is still flowing, this is an idle-user
+        # artefact of statsquery, not a block.
+        if (summary.get("uplink_bytes", 0) + summary.get("downlink_bytes", 0)) >= min_idle_bytes:
+            continue
+
+        node_id = summary["node_id"]
+        node = session.get(models.VPNNode, node_id)
+        if not node:
+            continue
+
+        # Already suspect — phase 1 above will handle it.
+        if node.suspect_since is not None:
+            continue
+
+        # Get previous sample (the one before the current tick)
+        prev_sample = (
+            session.query(models.NodeTrafficSample)
+            .filter(models.NodeTrafficSample.node_id == node_id)
+            .order_by(models.NodeTrafficSample.observed_at.desc())
+            # offset 1 = skip the sample we just wrote in this tick
+            .offset(1)
+            .first()
+        )
+        if not prev_sample or prev_sample.active_users < min_users:
+            continue
+
+        logger.warning(
+            "traffic_drop: suspect on node %s (%s): %d → 0 users, awaiting %d confirm ticks",
+            node.id, node.name, prev_sample.active_users, confirm_ticks,
+        )
+        node.suspect_since = now
+        session.add(node)
+        session.add(models.AuditLog(
+            actor="traffic_drop_detector",
+            actor_type=models.AuditActor.system,
+            action="traffic_drop_detected",
+            target_type="vpn_node",
+            target_id=node.id,
+            extra={
+                "node_name": node.name,
+                "prev_active_users": prev_sample.active_users,
+                "curr_active_users": 0,
+                "confirm_ticks_required": confirm_ticks,
+            },
+        ))
+        results.append({"node_id": node.id, "node": node.name, "outcome": "suspect"})
+
+    if results:
+        session.commit()
+    return results
 
 
 def collect_all_active_nodes(session, interval_seconds: int) -> list[dict[str, Any]]:

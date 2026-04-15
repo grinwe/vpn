@@ -4,11 +4,15 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   api,
   ApiError,
+  NodeActiveUsersOut,
   NodeHealthOut,
+  NodeHealthPingStatsOut,
+  NodeTrafficHistoryOut,
   ProvisioningTaskOut,
   VPNConfigCreateIn,
   VPNConfigOut,
   VPNConfigProtocol,
+  VPNConfigUpdateIn,
   VPNNodeCreateIn,
   VPNNodeOut,
 } from "../api";
@@ -75,6 +79,27 @@ function HealthBadge({ score, blocked }: { score: number | null; blocked: string
           {blocked.length} blocked
         </span>
       )}
+    </span>
+  );
+}
+
+// 2026-04 incident: 3/4 нод застряли с cooldown_until в будущем, UI показывал
+// только is_active=✓, админ не видел, что choose_node их игнорит. Теперь в
+// колонке "Активна" рядом с ✓/✕ висит бейдж с оставшимся временем, если
+// cooldown ещё действует. После истечения — скрыт.
+function CooldownBadge({ until }: { until: string | null }) {
+  if (!until) return null;
+  const ms = new Date(until).getTime() - Date.now();
+  if (ms <= 0) return null;
+  const hours = Math.floor(ms / 3_600_000);
+  const label =
+    hours >= 24 ? `${Math.floor(hours / 24)}d ${hours % 24}h` : `${hours}h`;
+  return (
+    <span
+      className="text-xs px-1 py-0.5 rounded bg-red-900 text-red-300"
+      title={`cooldown до ${new Date(until).toLocaleString()}`}
+    >
+      cooldown {label}
     </span>
   );
 }
@@ -218,6 +243,8 @@ export default function Nodes() {
           revoke_task_ids: number[];
           device_task_ids: number[];
           resync_task_ids: number[];
+          considered_count: number;
+          no_target_count: number;
         }>(`/nodes/${node.id}/migrate`, {})
         .then((res) => ({ ...res, nodeName: node.name })),
     onSuccess: (res) => {
@@ -225,11 +252,26 @@ export default function Nodes() {
       qc.invalidateQueries({ queryKey: ["provisioning-tasks"] });
       qc.invalidateQueries({ queryKey: ["user-subs"] });
       if (res.task_ids.length === 0) {
-        alert(
-          res.migrated_subscriptions.length === 0
-            ? "Активных подписок на этой ноде не было — мигрировать нечего."
-            : `Мигрировано подписок: ${res.migrated_subscriptions.length}, но фоновых тасок не создано. Смотри логи.`,
-        );
+        // Three cases, previously conflated under "нечего мигрировать":
+        //   considered=0                 → на ноде нет активных subs.
+        //   considered>0, no_target=all  → subs есть, но choose_node
+        //                                  не нашёл куда (все остальные
+        //                                  ноды в cooldown / unhealthy /
+        //                                  вне pool'а плана).
+        //   considered>0, migrated=0     → иначе: провалились на фазе
+        //                                  reprovision (логи).
+        if (res.considered_count === 0) {
+          alert("Активных подписок на этой ноде не было — мигрировать нечего.");
+        } else if (res.no_target_count >= res.considered_count) {
+          alert(
+            `Нашли ${res.considered_count} активных подписок на ноде, но выбрать целевую ноду не удалось ни для одной: все остальные ноды в cooldown, unhealthy, или вне пулов планов.\n\n` +
+              `Проверь список нод — cooldown чистится через кнопку "вернуть в пул" или смену статуса на active.`,
+          );
+        } else {
+          alert(
+            `Обработано подписок: ${res.considered_count}, мигрировано: ${res.migrated_subscriptions.length}, без цели: ${res.no_target_count}. Фоновых тасок не создано — смотри логи.`,
+          );
+        }
         return;
       }
       addOp({
@@ -305,6 +347,13 @@ export default function Nodes() {
       });
     },
     onError: (e: Error) => alert(`Не удалось запустить диагностику: ${e.message}`),
+  });
+
+  const setStatus = useMutation({
+    mutationFn: ({ id, status }: { id: number; status: string }) =>
+      api.patch<VPNNodeOut>(`/nodes/${id}/status`, { status }),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ["nodes"] }),
+    onError: (e: Error) => alert(`Не удалось сменить статус: ${e.message}`),
   });
 
   const { data, isLoading, error, refetch, isFetching } = useQuery<VPNNodeOut[]>({
@@ -406,11 +455,46 @@ export default function Nodes() {
                   <td>{n.region}</td>
                   <td className="font-mono text-slate-400">{n.host}</td>
                   <td>{n.pool_id ?? "—"}</td>
-                  <td className={statusColor(n.status)}>{n.status}</td>
+                  <td onClick={(e) => e.stopPropagation()}>
+                    <select
+                      value={n.status}
+                      disabled={setStatus.isPending}
+                      onChange={(e) => {
+                        const next = e.target.value;
+                        if (next === n.status) return;
+                        if (
+                          confirm(
+                            `Сменить статус ноды #${n.id} (${n.name}): ${n.status} → ${next}?` +
+                              (next === "active"
+                                ? "\n\nCooldown, suspect и blocked_regions будут сброшены."
+                                : "\n\nis_active будет выключен."),
+                          )
+                        )
+                          setStatus.mutate({ id: n.id, status: next });
+                        else e.target.value = n.status;
+                      }}
+                      className={`text-xs px-1 py-0.5 rounded bg-slate-800 border border-slate-700 ${statusColor(n.status)}`}
+                    >
+                      <option value="active">active</option>
+                      <option value="registering" disabled>
+                        registering
+                      </option>
+                      <option value="error">error</option>
+                      <option value="disabled">disabled</option>
+                      <option value="draining" disabled>
+                        draining
+                      </option>
+                    </select>
+                  </td>
                   <td>
                     <HealthBadge score={n.health_score} blocked={n.blocked_regions} />
                   </td>
-                  <td>{n.is_active ? "✓" : "✕"}</td>
+                  <td>
+                    <span className="inline-flex items-center gap-1">
+                      <span>{n.is_active ? "✓" : "✕"}</span>
+                      <CooldownBadge until={n.cooldown_until} />
+                    </span>
+                  </td>
                   <td>{new Date(n.updated_at).toLocaleString()}</td>
                   <td onClick={(e) => e.stopPropagation()}>
                     <div className="flex gap-1">
@@ -419,7 +503,7 @@ export default function Nodes() {
                         onClick={() => {
                           const next = !n.is_active;
                           const msg = next
-                            ? `Включить ноду #${n.id} (${n.name}) в пул? Новые подписки снова смогут на ней создаваться.`
+                            ? `Включить ноду #${n.id} (${n.name}) в пул? Новые подписки снова смогут на ней создаваться.\n\nCooldown, suspect_since и blocked_regions будут сброшены.`
                             : `Исключить ноду #${n.id} (${n.name}) из пула? Существующие подписки продолжат работать, но новые на неё не попадут.`;
                           if (confirm(msg))
                             setActive.mutate({ id: n.id, is_active: next });
@@ -515,6 +599,9 @@ export default function Nodes() {
                   <tr className="border-b border-slate-800 bg-slate-900/60">
                     <td colSpan={11} className="p-4 space-y-4">
                       <NodeHealth nodeId={n.id} />
+                      <NodeActiveUsers nodeId={n.id} />
+                      <NodeTrafficChart nodeId={n.id} />
+                      <NodeHealthPings nodeId={n.id} />
                       <NodeConfigs nodeId={n.id} nodeHost={n.host} />
                     </td>
                   </tr>
@@ -672,6 +759,7 @@ function CreateNodeForm({ onDone }: { onDone: () => void }) {
 function NodeConfigs({ nodeId, nodeHost }: { nodeId: number; nodeHost: string }) {
   const qc = useQueryClient();
   const [addOpen, setAddOpen] = useState(false);
+  const [editingId, setEditingId] = useState<number | null>(null);
   const [deleteErr, setDeleteErr] = useState<string | null>(null);
 
   const { data, isLoading } = useQuery<VPNConfigOut[]>({
@@ -744,28 +832,499 @@ function NodeConfigs({ nodeId, nodeHost }: { nodeId: number; nodeHost: string })
             </tr>
           </thead>
           <tbody>
-            {data.map((c) => (
-              <tr key={c.id} className="border-t border-slate-800">
-                <td className="py-1 font-mono">{c.name}</td>
-                <td className="font-mono text-slate-300">{c.protocol}</td>
-                <td className="font-mono">{c.port}</td>
-                <td className="font-mono text-slate-400">{c.sni ?? "—"}</td>
-                <td>{c.is_enabled ? "✓" : "✕"}</td>
-                <td className="text-right">
-                  <button
-                    onClick={() => confirmDelete(c)}
-                    disabled={deleteMutation.isPending}
-                    className="px-2 py-0.5 rounded bg-red-900 hover:bg-red-800 disabled:opacity-50 text-red-100"
-                    title="Удалить конфиг"
-                  >
-                    🗑
-                  </button>
-                </td>
-              </tr>
-            ))}
+            {data.map((c) => {
+              const isEditing = editingId === c.id;
+              return (
+                <>
+                  <tr key={c.id} className="border-t border-slate-800">
+                    <td className="py-1 font-mono">{c.name}</td>
+                    <td className="font-mono text-slate-300">{c.protocol}</td>
+                    <td className="font-mono">{c.port}</td>
+                    <td className="font-mono text-slate-400">{c.sni ?? "—"}</td>
+                    <td>{c.is_enabled ? "✓" : "✕"}</td>
+                    <td className="text-right space-x-1">
+                      <button
+                        onClick={() =>
+                          setEditingId(isEditing ? null : c.id)
+                        }
+                        className="px-2 py-0.5 rounded bg-slate-700 hover:bg-slate-600 text-slate-100"
+                        title="Редактировать"
+                      >
+                        ✏
+                      </button>
+                      <button
+                        onClick={() => confirmDelete(c)}
+                        disabled={deleteMutation.isPending}
+                        className="px-2 py-0.5 rounded bg-red-900 hover:bg-red-800 disabled:opacity-50 text-red-100"
+                        title="Удалить конфиг"
+                      >
+                        🗑
+                      </button>
+                    </td>
+                  </tr>
+                  {isEditing && (
+                    <tr key={`${c.id}-edit`} className="border-t border-slate-800 bg-slate-950/60">
+                      <td colSpan={6} className="p-2">
+                        <EditConfigForm
+                          nodeId={nodeId}
+                          config={c}
+                          onDone={() => setEditingId(null)}
+                        />
+                      </td>
+                    </tr>
+                  )}
+                </>
+              );
+            })}
           </tbody>
         </table>
       )}
+    </div>
+  );
+}
+
+function EditConfigForm({
+  nodeId,
+  config,
+  onDone,
+}: {
+  nodeId: number;
+  config: VPNConfigOut;
+  onDone: () => void;
+}) {
+  const qc = useQueryClient();
+  const [form, setForm] = useState<VPNConfigUpdateIn>({
+    name: config.name,
+    port: config.port,
+    sni: config.sni,
+    fallback: config.fallback,
+    public_key: config.public_key,
+    is_enabled: config.is_enabled,
+    protocol: config.protocol, // read-only, just echoed back for backend validation
+  });
+  const [err, setErr] = useState<string | null>(null);
+
+  const mutation = useMutation({
+    mutationFn: (payload: VPNConfigUpdateIn) =>
+      api.put<VPNConfigOut>(`/nodes/${nodeId}/configs/${config.id}`, payload),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["node-configs", nodeId] });
+      qc.invalidateQueries({ queryKey: ["provisioning-tasks"] });
+      onDone();
+    },
+    onError: (e: Error) => {
+      setErr(e instanceof ApiError ? `${e.status}: ${e.message}` : e.message);
+    },
+  });
+
+  function submit(e: React.FormEvent) {
+    e.preventDefault();
+    setErr(null);
+    // settings intentionally omitted — backend merges if sent, otherwise
+    // leaves existing (encrypted) secrets in place. UI никогда не трогает
+    // сырые secrets, так что мы их и не шлём обратно.
+    mutation.mutate({
+      name: form.name ?? undefined,
+      port: form.port ?? undefined,
+      sni: form.sni ?? null,
+      fallback: form.fallback ?? null,
+      public_key: form.public_key ?? null,
+      is_enabled: form.is_enabled ?? undefined,
+      protocol: form.protocol ?? undefined,
+    });
+  }
+
+  return (
+    <form onSubmit={submit} className="grid grid-cols-2 gap-2 text-xs">
+      <label className="flex flex-col">
+        <span className="text-slate-400 mb-1">Протокол (нельзя менять)</span>
+        <input
+          disabled
+          className="bg-slate-800 border border-slate-700 rounded px-2 py-1 font-mono text-slate-400"
+          value={config.protocol}
+        />
+      </label>
+      <label className="flex flex-col">
+        <span className="text-slate-400 mb-1">Имя</span>
+        <input
+          className="bg-slate-800 border border-slate-700 rounded px-2 py-1 font-mono"
+          value={form.name ?? ""}
+          onChange={(e) => setForm({ ...form, name: e.target.value })}
+        />
+      </label>
+      <label className="flex flex-col">
+        <span className="text-slate-400 mb-1">Порт</span>
+        <input
+          type="number"
+          className="bg-slate-800 border border-slate-700 rounded px-2 py-1 font-mono"
+          value={form.port ?? ""}
+          onChange={(e) => setForm({ ...form, port: Number(e.target.value) })}
+        />
+      </label>
+      <label className="flex flex-col">
+        <span className="text-slate-400 mb-1">SNI / fake domain</span>
+        <input
+          className="bg-slate-800 border border-slate-700 rounded px-2 py-1 font-mono"
+          value={form.sni ?? ""}
+          onChange={(e) => setForm({ ...form, sni: e.target.value || null })}
+        />
+      </label>
+      <label className="flex flex-col">
+        <span className="text-slate-400 mb-1">Fallback (REALITY dest)</span>
+        <input
+          className="bg-slate-800 border border-slate-700 rounded px-2 py-1 font-mono"
+          placeholder="www.asus.com:443"
+          value={form.fallback ?? ""}
+          onChange={(e) =>
+            setForm({ ...form, fallback: e.target.value || null })
+          }
+        />
+      </label>
+      <label className="flex flex-col">
+        <span className="text-slate-400 mb-1">Public key (REALITY)</span>
+        <input
+          className="bg-slate-800 border border-slate-700 rounded px-2 py-1 font-mono"
+          value={form.public_key ?? ""}
+          onChange={(e) =>
+            setForm({ ...form, public_key: e.target.value || null })
+          }
+        />
+      </label>
+      <label className="flex items-center gap-2 col-span-2">
+        <input
+          type="checkbox"
+          checked={!!form.is_enabled}
+          onChange={(e) => setForm({ ...form, is_enabled: e.target.checked })}
+        />
+        <span className="text-slate-300">Enabled</span>
+      </label>
+      <div className="col-span-2 text-slate-500 text-[11px]">
+        Сохранение запустит bootstrap-таску на ноде — ansible перегенерит xray
+        config. Существующие клиенты на этом протоколе, возможно, переподключатся.
+      </div>
+      {err && <div className="col-span-2 text-red-400">{err}</div>}
+      <div className="col-span-2 flex gap-2 justify-end">
+        <button
+          type="button"
+          onClick={onDone}
+          className="px-2 py-1 rounded bg-slate-700 hover:bg-slate-600"
+        >
+          Отмена
+        </button>
+        <button
+          type="submit"
+          disabled={mutation.isPending}
+          className="px-2 py-1 rounded bg-emerald-600 hover:bg-emerald-500 font-semibold disabled:opacity-50"
+        >
+          {mutation.isPending ? "Сохраняем…" : "Сохранить + bootstrap"}
+        </button>
+      </div>
+    </form>
+  );
+}
+
+// ── Active users panel ─────────────────────────────────────────────
+
+function NodeActiveUsers({ nodeId }: { nodeId: number }) {
+  const { data, isLoading, error } = useQuery<NodeActiveUsersOut>({
+    queryKey: ["node-active-users", nodeId],
+    queryFn: () => api.get(`/nodes/${nodeId}/users`),
+    refetchInterval: 60_000,
+  });
+
+  if (isLoading)
+    return <div className="text-xs text-slate-500">Загрузка списка юзеров…</div>;
+  if (error)
+    return (
+      <div className="text-xs text-red-400">{(error as Error).message}</div>
+    );
+  if (!data) return null;
+
+  const observed = data.observed_at
+    ? new Date(data.observed_at).toLocaleTimeString()
+    : null;
+
+  return (
+    <div className="rounded border border-slate-700 p-3 text-xs">
+      <div className="flex items-center justify-between mb-2">
+        <div className="text-xs uppercase tracking-wide text-slate-400">
+          Активные юзеры
+        </div>
+        <div className="text-[11px] text-slate-500">
+          {data.stale ? (
+            <span className="text-yellow-400">
+              Нет свежих данных{observed ? ` (последний снимок ${observed})` : ""}
+            </span>
+          ) : (
+            <span>
+              {data.users.length} юзер(ов){observed ? `, снимок ${observed}` : ""}
+            </span>
+          )}
+        </div>
+      </div>
+      {data.users.length === 0 ? (
+        <div className="text-slate-500">
+          На ноде нет активных юзеров в последнем тике traffic-stats.
+        </div>
+      ) : (
+        <table className="w-full">
+          <thead className="text-left text-slate-500">
+            <tr>
+              <th className="py-1">Telegram / username</th>
+              <th>Device</th>
+              <th>План</th>
+              <th>Истекает</th>
+              <th>Протоколы</th>
+            </tr>
+          </thead>
+          <tbody>
+            {data.users.map((u) => {
+              const orphan = u.device_id === null;
+              return (
+                <tr
+                  key={u.access_username}
+                  className={`border-t border-slate-800 ${
+                    orphan ? "bg-yellow-950/30" : ""
+                  }`}
+                >
+                  <td className="py-1">
+                    {u.user_telegram_id ? (
+                      <Link
+                        to={`/users?telegram_id=${encodeURIComponent(u.user_telegram_id)}`}
+                        className="text-blue-400 hover:underline font-mono"
+                      >
+                        {u.user_telegram_id}
+                      </Link>
+                    ) : (
+                      <span
+                        className="font-mono text-yellow-400"
+                        title="username на ноде, в БД нет связанного device — вероятно, orphan после миграции"
+                      >
+                        {u.access_username}
+                      </span>
+                    )}
+                  </td>
+                  <td>
+                    {u.device_id ? (
+                      <Link
+                        to={`/subscriptions?device_id=${u.device_id}`}
+                        className="text-blue-400 hover:underline"
+                      >
+                        {u.device_name ?? `#${u.device_id}`}
+                      </Link>
+                    ) : (
+                      <span className="text-slate-500">—</span>
+                    )}
+                  </td>
+                  <td className="text-slate-300">
+                    {u.plan_name ?? (u.plan_id ? `#${u.plan_id}` : "—")}
+                  </td>
+                  <td className="font-mono text-slate-400">
+                    {u.subscription_expires_at
+                      ? new Date(u.subscription_expires_at).toLocaleDateString()
+                      : "—"}
+                  </td>
+                  <td className="font-mono text-slate-400">
+                    {u.protocols.join(", ")}
+                  </td>
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
+      )}
+    </div>
+  );
+}
+
+// ── Traffic chart (SVG sparkline) ───────────────────────────────────
+
+function formatBytes(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  if (bytes < 1024 * 1024 * 1024) return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
+  return `${(bytes / 1024 / 1024 / 1024).toFixed(2)} GB`;
+}
+
+function NodeTrafficChart({ nodeId }: { nodeId: number }) {
+  const { data, isLoading, error } = useQuery<NodeTrafficHistoryOut>({
+    queryKey: ["node-traffic-history", nodeId],
+    queryFn: () => api.get(`/nodes/${nodeId}/traffic-history?hours=24`),
+    refetchInterval: 60_000,
+  });
+
+  if (isLoading)
+    return <div className="text-xs text-slate-500">Загрузка графика…</div>;
+  if (error)
+    return (
+      <div className="text-xs text-red-400">{(error as Error).message}</div>
+    );
+  if (!data) return null;
+
+  const samples = data.samples;
+  if (samples.length === 0) {
+    return (
+      <div className="rounded border border-slate-700 p-3 text-xs text-slate-500">
+        Нет данных traffic-stats за последние 24 часа.
+      </div>
+    );
+  }
+
+  // Layout constants
+  const W = 720;
+  const H = 120;
+  const padL = 32;
+  const padR = 48;
+  const padT = 12;
+  const padB = 20;
+  const plotW = W - padL - padR;
+  const plotH = H - padT - padB;
+
+  const fromMs = new Date(data.from_ts).getTime();
+  const toMs = new Date(data.to_ts).getTime();
+  const spanMs = Math.max(1, toMs - fromMs);
+
+  const maxUsers = Math.max(1, ...samples.map((s) => s.active_users));
+  const maxTraffic = Math.max(
+    1,
+    ...samples.map((s) => s.uplink_bytes + s.downlink_bytes),
+  );
+
+  const xFor = (iso: string) => {
+    const t = new Date(iso).getTime();
+    return padL + ((t - fromMs) / spanMs) * plotW;
+  };
+  const yForUsers = (u: number) =>
+    padT + plotH - (u / maxUsers) * plotH;
+  const yForTraffic = (b: number) =>
+    padT + plotH - (b / maxTraffic) * plotH;
+
+  const usersPath = samples
+    .map((s, i) => `${i === 0 ? "M" : "L"}${xFor(s.observed_at).toFixed(1)},${yForUsers(s.active_users).toFixed(1)}`)
+    .join(" ");
+  const trafficPath = samples
+    .map(
+      (s, i) =>
+        `${i === 0 ? "M" : "L"}${xFor(s.observed_at).toFixed(1)},${yForTraffic(
+          s.uplink_bytes + s.downlink_bytes,
+        ).toFixed(1)}`,
+    )
+    .join(" ");
+
+  // Vertical gridlines every 6 hours
+  const gridTimes: number[] = [];
+  const step = 6 * 60 * 60 * 1000;
+  for (let t = Math.ceil(fromMs / step) * step; t <= toMs; t += step) {
+    gridTimes.push(t);
+  }
+
+  return (
+    <div className="rounded border border-slate-700 p-3 text-xs">
+      <div className="flex items-center justify-between mb-2">
+        <div className="text-xs uppercase tracking-wide text-slate-400">
+          Трафик и юзеры за 24ч
+        </div>
+        <div className="flex gap-4 text-[11px] text-slate-500">
+          <span>
+            <span className="inline-block w-3 h-0.5 bg-emerald-400 align-middle mr-1" />
+            active_users (max {maxUsers})
+          </span>
+          <span>
+            <span className="inline-block w-3 h-0.5 bg-blue-400 align-middle mr-1" />
+            traffic up+down (max {formatBytes(maxTraffic)})
+          </span>
+        </div>
+      </div>
+      <svg
+        viewBox={`0 0 ${W} ${H}`}
+        preserveAspectRatio="none"
+        className="w-full"
+        style={{ height: H }}
+      >
+        {/* X-axis grid */}
+        {gridTimes.map((t) => {
+          const x = padL + ((t - fromMs) / spanMs) * plotW;
+          const label = new Date(t).toLocaleTimeString([], {
+            hour: "2-digit",
+            minute: "2-digit",
+          });
+          return (
+            <g key={t}>
+              <line
+                x1={x}
+                x2={x}
+                y1={padT}
+                y2={padT + plotH}
+                stroke="#334155"
+                strokeDasharray="2,3"
+              />
+              <text
+                x={x}
+                y={H - 4}
+                fill="#64748b"
+                fontSize="10"
+                textAnchor="middle"
+              >
+                {label}
+              </text>
+            </g>
+          );
+        })}
+        {/* Plot frame */}
+        <rect
+          x={padL}
+          y={padT}
+          width={plotW}
+          height={plotH}
+          fill="none"
+          stroke="#1e293b"
+        />
+        {/* Y-axis labels */}
+        <text x={4} y={padT + 4} fill="#34d399" fontSize="10">
+          {maxUsers}
+        </text>
+        <text x={4} y={padT + plotH} fill="#34d399" fontSize="10">
+          0
+        </text>
+        <text
+          x={W - 4}
+          y={padT + 4}
+          fill="#60a5fa"
+          fontSize="10"
+          textAnchor="end"
+        >
+          {formatBytes(maxTraffic)}
+        </text>
+        <text
+          x={W - 4}
+          y={padT + plotH}
+          fill="#60a5fa"
+          fontSize="10"
+          textAnchor="end"
+        >
+          0
+        </text>
+        {/* Lines */}
+        <path d={trafficPath} fill="none" stroke="#60a5fa" strokeWidth="1.5" />
+        <path d={usersPath} fill="none" stroke="#34d399" strokeWidth="1.5" />
+        {/* Hover tooltips via <title> on point circles */}
+        {samples.map((s, i) => (
+          <circle
+            key={i}
+            cx={xFor(s.observed_at)}
+            cy={yForUsers(s.active_users)}
+            r={2}
+            fill="#34d399"
+          >
+            <title>
+              {new Date(s.observed_at).toLocaleString()}
+              {"\n"}users: {s.active_users}
+              {"\n"}up: {formatBytes(s.uplink_bytes)}
+              {"\n"}down: {formatBytes(s.downlink_bytes)}
+            </title>
+          </circle>
+        ))}
+      </svg>
     </div>
   );
 }
@@ -1028,5 +1587,71 @@ function OperationProgressBanner({
         )}
       </div>
     </div>
+  );
+}
+
+// Health-ping stats widget for the node expand-row. Shows 24ч summary;
+// клик ведёт на /health-pings?node_id=... с автофильтром recent-bad.
+function NodeHealthPings({ nodeId }: { nodeId: number }) {
+  const { data, isLoading, error } = useQuery<NodeHealthPingStatsOut>({
+    queryKey: ["node-health-pings", nodeId],
+    queryFn: () => api.get(`/nodes/${nodeId}/health-pings?hours=24`),
+    refetchInterval: 120_000,
+  });
+
+  if (isLoading)
+    return (
+      <div className="text-xs text-slate-500">Загрузка health-pings…</div>
+    );
+  if (error)
+    return (
+      <div className="text-xs text-red-400">{(error as Error).message}</div>
+    );
+  if (!data) return null;
+
+  const resp = data.ok + data.bad;
+  const ratio = data.bad_ratio;
+  const toneCls =
+    resp === 0
+      ? "border-slate-700 text-slate-500"
+      : ratio === 0
+        ? "border-emerald-700 text-emerald-300"
+        : ratio <= 0.2
+          ? "border-yellow-700 text-yellow-300"
+          : "border-red-700 text-red-300";
+
+  const lastBadLabel = data.last_bad_at
+    ? new Date(data.last_bad_at).toLocaleTimeString([], {
+        hour: "2-digit",
+        minute: "2-digit",
+      })
+    : null;
+
+  return (
+    <Link
+      to={`/health-pings?node_id=${nodeId}`}
+      className={`block rounded border p-3 text-xs hover:bg-slate-800/60 ${toneCls}`}
+    >
+      <div className="flex items-center justify-between">
+        <div>
+          <span className="uppercase tracking-wide mr-2">
+            Health-pings 24ч
+          </span>
+          {resp === 0 ? (
+            <span>нет ответов</span>
+          ) : (
+            <span>
+              {data.ok} ok / {data.bad} bad ({(ratio * 100).toFixed(0)}% bad)
+            </span>
+          )}
+          {lastBadLabel && (
+            <span className="ml-3 text-slate-400">
+              · последняя жалоба {lastBadLabel}
+            </span>
+          )}
+        </div>
+        <span className="text-slate-400">детали →</span>
+      </div>
+    </Link>
   );
 }

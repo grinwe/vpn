@@ -31,6 +31,7 @@
 - **enable** на подписке (если `status != active`) — `POST /api/subscriptions/{id}/enable`. Если sub был `frozen` — прозрачно зовёт `balance_svc.unfreeze_subscription`. Если `blocked`/`expired` — флипит статус в `active`, ресет `notes`, `next_charge_at = now`, перепровижнивает один девайс через orchestrator.
 - **+ add device** на подписке (только когда `status=active`) — `POST /api/subscriptions/{id}/devices`, админский обход prepaid-гейта. Считает текущие live-девайсы, создаёт новый с именем `device-{N+1}`, запускает ansible. Используется, когда юзер нагрешил руками или нужен тест-девайс на его аккаунте.
 - **unbind** на конкретном девайсе (если `status != revoked|disabled`) — `POST /api/devices/{id}/revoke`. Отвязывает от ноды через ansible, sub остаётся живой — удобно когда один юзер просит освободить слот на ноде.
+- **переселить** per-sub (только когда `status=active`) — dropdown со всеми active-нодами + кнопка. `POST /api/subscriptions/{id}/migrate` с `{target_node_id}`. Это **ручной admin-override**: пул/health/cooldown-фильтры обходятся, проверяется только `is_active=True` на целевой ноде. Старые девайсы revoke'аются в фоне, новый проводится через `reprovision_subscription`. `sub_token` сохраняется, поэтому sub-link у клиента продолжает работать. Отличается от node-wide `POST /nodes/{id}/migrate` тем, что переселяет ровно одну подписку на заданную ноду — альтернатива ушедшей в 2026-04 webapp-кнопке «поменять ноду» (она осознанно не возвращается).
 
 Чего нет: adjust кредита с произвольным знаком, прямого просмотра ledger транзакций из UI. Пока только через psql.
 
@@ -104,6 +105,7 @@ CRUD по тарифам. Поля: `name`, `duration_days`, `max_devices`, `pri
 | `enable` на подписке | `POST /api/subscriptions/{id}/enable` | `frozen` → `unfreeze_subscription`; `blocked/expired` → `active` + reprovision одного девайса |
 | `+ add device` на подписке | `POST /api/subscriptions/{id}/devices` | Создаёт новый `Device`, ставит ansible-таску. Обходит prepaid-гейт (админский override). |
 | `unbind` на девайсе | `POST /api/devices/{id}/revoke` | Статус девайса → `revoked`, ansible снимает с ноды. Sub остаётся живой. |
+| `переселить` на подписке | `POST /api/subscriptions/{id}/migrate` с `{target_node_id}` | Одна подписка переезжает на выбранную ноду; пул/health/cooldown НЕ проверяются (только `is_active=True`). Старые девайсы revoke'аются в фоне, новый поднимается через `reprovision_subscription`. `sub_token` сохраняется. |
 | `пополнить баланс` | `POST /api/users/by_telegram/{tg}/topup` | `kind=adjust, note=admin_topup`, в ledger'е новая строка |
 | `+ Добавить ноду` | `POST /api/nodes` | enqueue `site.yml` в worker; статус `registering` → `active`/`error` |
 | `+ Добавить конфиг` на ноде | `POST /api/nodes/{id}/configs` | warm-pool ноды инвалидируется, warmer пересобирает bundles за несколько тиков |

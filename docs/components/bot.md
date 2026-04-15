@@ -2,6 +2,8 @@
 
 Живёт в `bot/`. Стек — aiogram 3, один процесс, один poll-loop, в контейнере.
 
+Self-report: в `bot/keyboards.py::start_keyboard()` есть шестая reply-кнопка «🆘 VPN не работает» (константа `BTN_VPN_BROKEN`). Message-handler `self_report_vpn_broken` в `bot/handlers.py` шлёт `POST /api/users/health-ping-response` с `answer=bad`, `source=self_reported`. Нужно потому, что плановый `run_user_health_ping_tick` **приходит юзеру не чаще раза в сутки** (дефолты: `USER_HEALTH_PING_INTERVAL=1800` — интервал самого тика, `USER_HEALTH_PING_DEBOUNCE_HOURS=24` — per-user debounce, плюс окно МСК 11–14) — ждать сутки, чтобы пожаловаться на сломанный VPN, абсурд. Плановый тик воркера **не затронут**; self-report — это дополнительный канал, не замена. Admin-видимость всей телеметрии (plan + self-report) — страница `/health-pings` в админке + компактный виджет в expand-row карточки ноды (`admin/src/pages/Nodes.tsx::NodeHealthPings`). Бэкенд различает два типа в `AuditLog.extra.source` (`"prompted"` vs `"self_reported"`).
+
 ## Структура модулей
 
 ```

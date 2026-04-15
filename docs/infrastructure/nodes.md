@@ -17,6 +17,9 @@ health_score (int, nullable)         — агрегат от health-probe'ов; 
 last_health_check_at                 — timestamp последнего check
 cooldown_until                       — DateTime, до которой NodeSelector не берёт ноду
 blocked_regions (JSONB)              — регионы, из которых ноду НЕ отдавать
+suspect_since (DateTime NULL)        — Phase D traffic-drop detector: момент, когда active_users
+                                       упал с ≥TRAFFIC_DROP_MIN_USERS до 0. Очищается на
+                                       следующем тике (подтверждение → error или false-alarm → NULL)
 relay_config (JSONB)                 — если set, нода — jump-node, нужна role relay_jump_node
 
 provider_id → CloudProvider          — автор спавна (или NULL для ручной)
@@ -112,7 +115,9 @@ Grace использует `updated_at`, не момент marking'а — каж
 
 Нода в ошибочном состоянии — bootstrap упал, health стабильно плохой, `destroy_node` получил exception от провайдера. `_eligible_nodes` специально исключает `error` из подсчёта `counted_nodes` при autoscale-решении «есть ли ещё места», **иначе** одна сломанная нода вечно держала бы пул на `max_nodes` и новые уже не спавнились бы (`autoscale.py:244-246`).
 
-**Из `error` нода никуда автоматически не выходит.** Требуется либо `/admin/nodes/{id}` flip, либо ручной `destroy_node`.
+**Из `error` нода никуда автоматически не выходит.** Требуется либо `/admin/nodes/{id}` flip, либо ручной `destroy_node`, либо **`PATCH /api/nodes/{id}/status`** со значением `active` — admin-эндпоинт для ручного override'а (принимает `active`/`error`/`disabled`; `registering`/`draining` только через автоматику). При переводе в `active` чистятся `cooldown_until`, `suspect_since`, `blocked_regions`; пишется `AuditLog(action="node_status_changed")`. Admin SPA выставляет этот эндпоинт через dropdown статуса в детальной панели ноды.
+
+Тот же side-effect у **`POST /api/nodes/{id}/active`** с `is_active=true` (кнопка «вернуть в пул» в admin SPA): когда ноду включают обратно, `cooldown_until`/`suspect_since`/`blocked_regions` чистятся в той же транзакции. Без этого после traffic-drop-инцидента или auto-migrate'а нода с `is_active=True` + `cooldown_until` в будущем выглядела для админа рабочей, но `choose_node` её игнорил — вся новая нагрузка уходила на одну единственную нелокдаун-ноду (инцидент 2026-04-15). `AuditLog(action="node_active_changed").extra.cleared` содержит список очищенных полей.
 
 ## Health score и cooldown
 
@@ -123,6 +128,26 @@ Grace использует `updated_at`, не момент marking'а — каж
 Если site.yml (bootstrap) упал на **уже active** ноде, `health_score` ставится в 0 (без демоута статуса, чтобы сохранить существующих пользователей), и autoscale перестаёт на неё сажать новых.
 
 `cooldown_until` — отдельный механизм для случая «нода недавно что-то натворила, дадим ей отдохнуть, но не выключаем». Проставляется, например, после fail'а provisioning-таска или временной ошибки API. До истечения ноду не возьмут ни пользовательский `choose_node`, ни autoscale.
+
+### Phase D — traffic-drop detector (TSPU-signals)
+
+Active-пробы из ДЦ не ловят ТСПУ-блокировки, резидентные пробы ненадёжны (одна проба с одного ISP ничего не скажет про другого оператора). Единственный надёжный пассивный сигнал — **резкое падение `active_users`** на ноде: если было ≥5, стало 0 между двумя traffic_stats тиками (5-мин интервал) — нода вероятно заблокирована для пользователей.
+
+Детектор живёт в `services/traffic_stats.py::detect_traffic_drops`, вызывается из `run_traffic_stats_tick` после `collect_all_active_nodes`. Алгоритм:
+
+1. **Детект**: на каждом тике для нод с `curr.active_users == 0` и `prev.active_users >= TRAFFIC_DROP_MIN_USERS` (default 5) → ставим `suspect_since = now()`, запускаем **проверочную миграцию** через `migrate_subscriptions_off(exclude_same_region=True)` (в ноду другого региона, т.к. ТСПУ блочит регионально). Пишем `AuditLog(action="traffic_drop_detected")`.
+2. **Подтверждение** (следующий тик): если на ноде-получателе уже есть трафик — это подтверждение блока: `status=error`, `is_active=False`, `cooldown_until=now+3d`, `suspect_since=NULL`. `AuditLog(action="traffic_drop_confirmed")`.
+3. **Ложная тревога**: если на новой ноде тоже 0 — пользователи просто не сидят; `suspect_since=NULL`, юзеры **остаются** на новой ноде (откат сломал бы sub_token'ы). `AuditLog(action="traffic_drop_cleared")`.
+
+Мастер-switch `TRAFFIC_DROP_ENABLED=1` (default). Параметры — см. `operations/env-reference.md`.
+
+### Админская видимость
+
+`NodeTrafficSample.details` с 2026-04 содержит per-protocol **список `access_username`**, а не только count. Это позволяет админке показывать "кто сейчас на ноде" по последнему tick'у без отдельного SSH-запроса. Эндпойнт — `GET /api/nodes/{id}/users`: отдаёт `observed_at`, флаг `stale` (sample старше 15 мин), и по каждому юзеру джойнит `Device → Subscription → User/Plan`. Orphan-username'ы (на ноде есть, в БД нет — наследие миграции) помечаются отдельно.
+
+Для визуального отслеживания момента blocking'а (и вообще нагрузки) есть `GET /api/nodes/{id}/traffic-history?hours=24` — тонкий запрос, возвращающий временной ряд `NodeTrafficSample` для sparkline-графика в карточке ноды. `hours` ограничен [1, 168].
+
+Редактирование `VPNConfig` на ноде — `PUT /api/nodes/{id}/configs/{cfg_id}`: правит всё кроме `protocol` (смена протокола — delete+create), shallow-merge'ит `settings` чтобы UI не нужно было пересылать зашифрованные секреты. После успеха инвалидирует warm-pool + ставит bootstrap-таску с `config_change=True`.
 
 ## Архитектуры трафика
 
@@ -290,18 +315,38 @@ for provider_id in [primary] + fallbacks:
 - **`wg_exit_nodes` группа в `inventories/prod/hosts.yml` пустая.** Код роли `wg_exit_node` готов, `relay_jump_node` готова, но ни одна нода не описана — фактически relay-схема в проде не используется. Неясно, есть ли она хоть где-то в inventory вне git.
 - **`relay_config` у jump-ноды хранится как JSONB plaintext.** В отличие от паролей `VPNConfig.settings`, которые зашифрованы Fernet, WG-приватник jump-ноды лежит в БД в открытом виде. Компрометация дампа БД = компрометация туннеля.
 - **Health score агрегация не зафиксирована в одном месте.** Декремент/инкремент раскиданы по worker-тикам и handler'ам `HealthProbe`. Порог `MIN_HEALTHY_SCORE` — константа в `provisioning.py`, но откуда берётся «что именно декрементит» — читается только в коде, не в документе.
-- **Автовосстановления из `error` нет.** Нода, попавшая в error (единичный сбой API провайдера во время destroy, например), остаётся там до ручного вмешательства. Нет self-heal'а, который бы через X часов попробовал снова.
+- **Автовосстановления из `error` нет.** Нода, попавшая в error (единичный сбой API провайдера во время destroy, например), остаётся там до ручного вмешательства (`PATCH /api/nodes/{id}/status → active` или `destroy_node`). Нет self-heal'а, который бы через X часов попробовал снова.
 - **Promote `registering → active` требует и ansible-success, и health pass.** Если ansible прошёл, а health-probe стабильно падает (например, UFW неправильно настроен), нода остаётся в `registering` надолго. `choose_node` её всё ещё берёт (registering в whitelist). Это компромисс «лучше отдать свежую ноду, чем задержать подписку», но клинические случаи возможны.
 - **Grace-таймер draining'а использует `updated_at`.** Любая операция, которая трогает ноду (даже миграция одной подписки), перезапускает таймер. В пуле с постоянным drip'ом миграций destroy может не случиться никогда.
 - **ShadowTLS `manage_vpn_user.sh` — no-op.** Единственный общий пароль per node. Revoke одного устройства **не удаляет его фактический доступ** — пользователь продолжает ходить, пока не ротируется node password для всех сразу. Legacy-протокол, sharing enforcer его не покрывает.
 
-## Sharing enforcer — защита от расшаривания
+## Sharing enforcer — защита от расшаривания (ОТКЛЮЧЁН 2026-04-15)
 
-На каждой ноде работает `xray-enforcer` systemd-сервис (`install_sharing_enforcer`), который:
+**Status:** Отключён через `sharing_enforcer_enabled: false` в `group_vars/vpn_nodes.yml`. Роль `install_sharing_enforcer` по-прежнему ставит `xray_enforcer.py` + systemd unit, но unit `xray-enforcer.service` в состоянии `stopped + disabled`.
 
-1. Каждые 10с (`ENFORCER_CHECK_INTERVAL`) парсит access-логи xray (`/var/log/xray/access-*.log`) за последние 120с (`ENFORCER_WINDOW_SECONDS`).
+**Причина отключения:** V2 enforcer `rmuser→sleep→adduser` рвал коннект легитимным пользователям:
+- Телефон + ноутбук под одним аккаунтом CGNAT → два разных "видимых" IP в одном SLOT_SECONDS окне → detections растут → через 3 concurrent → warning → kick.
+- `ENFORCER_KICK_COOLDOWN=120s` — между kicks того же email минимум 2 минуты. На практике UX это воспринималось как **разрыв коннекта каждые 5-10 минут** для юзеров со вторым устройством на нестабильном IP.
+- `rmuser` через gRPC — точечный, другие юзеры на ноде не страдают, но для жертвы это полный disconnect до `adduser` + reconnect клиента.
+
+**Как применить отключение на уже-раскатанных нодах:**
+```
+ansible-playbook -i inventories/prod/hosts.yml site.yml --tags sharing_enforcer --ask-vault-pass
+```
+Роль вычитает `sharing_enforcer_enabled: false` из group_vars и переведёт юнит в stopped+disabled state.
+
+**Как работал enforcer (для возможной реактивации):**
+
+1. Каждые 10с (`ENFORCER_CHECK_INTERVAL`) парсит access-логи xray (`/var/log/xray/access-*.log`) за последние 120с (`ENFORCER_SLOT_SECONDS`).
 2. Собирает уникальные IP по `email` (= `Device.access_username`, напр. `user-1-2`).
-3. Если у UUID обнаружено >1 IP (`ENFORCER_MAX_IPS`) — цикл: `xray api rmuser` (мгновенный disconnect) → sleep 2с (`ENFORCER_RECONNECT_DELAY`) → `xray api adduser` (легитимный пользователь переподключится, шарящий — нет).
-4. Каждое нарушение пишется в `/var/log/xray/sharing_violations.jsonl`.
+3. Tier 1 (warning): 3 concurrent-IP detections в течение `WARNING_WINDOW=3600s` → notification юзеру, без kick.
+4. Tier 2 (kick): `rmuser` → sleep → `adduser` через gRPC, но не чаще `KICK_COOLDOWN=120s` для того же email.
+5. Tier 3 (block): 3 kicks в `BLOCK_WINDOW=43200s` → `rmuser` без `adduser`, пока админ не `sharing_unblock`.
+6. Каждое событие пишется в `/var/log/xray/sharing_violations.jsonl`.
 
-Мониторинг: backend-воркер через `traffic_stats` SSH-тик вычитывает + truncate'ит `sharing_violations.jsonl`, пишет `AuditLog(action="sharing_violation")` → видимость в admin UI.
+**Мониторинг (всё ещё работает как пассивный код):** backend-воркер через `traffic_stats` SSH-тик вычитывает + truncate'ит `sharing_violations.jsonl`, пишет `AuditLog(action="sharing_violation")` → видимость в admin UI. Но поскольку enforcer не запущен, файл всегда пустой. Бэкенд-гейт `SHARING_ENFORCEMENT_ENABLED=0` дополнительно убирает сам чтение этого файла.
+
+**Перед реактивацией нужно:**
+- Повысить `ENFORCER_WARNING_THRESHOLD` до значения, которое не ловит CGNAT-эффект (реально встречающееся 2-3 IP для одного аккаунта в час).
+- Или научить enforcer учитывать "родственные" IP (одинаковые /24 или одинаковый ASN).
+- Или требовать kick только после `WARNING_THRESHOLD * 2-3` detections — дать явное предупреждение раньше, чем разрывать.

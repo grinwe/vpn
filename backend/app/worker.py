@@ -42,6 +42,84 @@ RENEWAL_REVOKED = Counter(
 RENEWAL_GRACE_HOURS = int(os.getenv("RENEWAL_GRACE_HOURS", "24"))
 
 
+PENDING_RESCUE = Counter(
+    "vpn_provisioning_pending_rescue_total",
+    "Pending provisioning tasks re-enqueued by the self-heal tick",
+)
+
+
+def run_pending_rescue_tick() -> dict:
+    """Periodic self-heal — re-enqueue provisioning tasks that are stuck.
+
+    When `run_task_async` enqueues into RQ, an exception inside the Redis
+    client (transient connection drop, serialization hiccup) can leave the
+    ProvisioningTask row committed as ``pending`` without an RQ job
+    attached. ``reset_stuck_tasks`` recovers those on backend startup, but
+    in steady state they sit forever until the next restart. This tick
+    rescans the table every ``PENDING_RESCUE_INTERVAL`` seconds and pushes
+    any ``pending`` task older than ``PENDING_RESCUE_AGE`` seconds back
+    into the queue; ``enqueue_task`` has deterministic ``job_id`` dedup,
+    so already-queued tasks are no-ops.
+    """
+    from datetime import timedelta
+
+    from .db import SessionLocal
+    from . import models
+    from .queue import enqueue_task, get_queue
+    from .time_utils import utcnow
+
+    age = int(os.getenv("PENDING_RESCUE_AGE", "60"))
+    rescued = 0
+    scanned = 0
+
+    session = SessionLocal()
+    try:
+        cutoff = utcnow() - timedelta(seconds=age)
+        pending = (
+            session.query(models.ProvisioningTask)
+            .filter(
+                models.ProvisioningTask.status
+                == models.ProvisioningTaskStatus.pending,
+                models.ProvisioningTask.created_at < cutoff,
+            )
+            .all()
+        )
+        scanned = len(pending)
+        for task in pending:
+            try:
+                job_id = enqueue_task(task.id, None)
+                if job_id:
+                    rescued += 1
+                    PENDING_RESCUE.inc()
+            except Exception:  # noqa: BLE001
+                logger.exception(
+                    "pending_rescue: failed to re-enqueue task %s", task.id
+                )
+    finally:
+        session.close()
+
+    if rescued:
+        logger.warning(
+            "pending_rescue: re-enqueued %s/%s stalled pending task(s)",
+            rescued, scanned,
+        )
+
+    interval = int(os.getenv("PENDING_RESCUE_INTERVAL", "60"))
+    if interval > 0:
+        queue = get_queue()
+        if queue is not None:
+            try:
+                queue.enqueue_in(
+                    timedelta(seconds=interval),
+                    "app.worker.run_pending_rescue_tick",
+                    result_ttl=3600,
+                )
+            except Exception:  # noqa: BLE001
+                logger.exception("pending_rescue: failed to re-enqueue tick")
+
+    return {"scanned": scanned, "rescued": rescued}
+
+
 def run_autoscale_tick() -> list[dict]:
     """Periodic job — walk pools and scale up where needed."""
     from dataclasses import asdict
@@ -193,7 +271,7 @@ def run_drain_tick() -> dict:
     finally:
         session.close()
 
-    interval = int(os.getenv("DRAIN_TICK_INTERVAL", "600"))
+    interval = int(os.getenv("DRAIN_TICK_INTERVAL", "600000"))
     if interval > 0:
         queue = get_queue()
         if queue is not None:
@@ -890,12 +968,29 @@ def run_traffic_stats_tick() -> dict:
     from .services import traffic_stats
 
     interval = int(os.getenv("TRAFFIC_STATS_INTERVAL", "300"))
-    summary: dict = {"collected": 0, "nodes": []}
+    summary: dict = {"collected": 0, "nodes": [], "traffic_drops": []}
     session = SessionLocal()
     try:
         rows = traffic_stats.collect_all_active_nodes(session, interval)
         summary["collected"] = len(rows)
         summary["nodes"] = rows
+
+        # Phase D — traffic-drop detector: detect nodes where users
+        # suddenly disappeared (TSPU block) and migrate to another region.
+        # DISABLED 2026-04-15: детектор срабатывал на обычные idle-окна
+        # и ломал активные коннекты юзерам каждые 5-10 минут. Сама
+        # функция `detect_traffic_drops` возвращает пустой список, но
+        # на всякий случай не вызываем её вовсе, чтобы не жечь запросы.
+        # if int(os.getenv("TRAFFIC_DROP_ENABLED", "1")):
+        #     try:
+        #         drops = traffic_stats.detect_traffic_drops(session, rows)
+        #         summary["traffic_drops"] = drops
+        #         if drops:
+        #             logger.warning("traffic_stats: traffic drops detected: %s", drops)
+        #     except Exception:  # noqa: BLE001
+        #         logger.exception("traffic_stats: traffic drop detector failed")
+        #         if session.is_active:
+        #             session.rollback()
     except Exception:  # noqa: BLE001
         logger.exception("traffic_stats: tick failed")
         if session.is_active:
@@ -1150,6 +1245,27 @@ def main() -> None:
 
     queue = Queue(queue_name, connection=connection)
 
+    # Schedule pending-task rescue (default: every minute). Re-enqueues
+    # provisioning tasks stuck in ``pending`` — typically because an RQ
+    # enqueue hit a transient Redis error at creation time and the task
+    # row was committed without a job attached. Short interval by design:
+    # the impact of a stalled user-facing provisioning is high.
+    pending_rescue_interval = int(os.getenv("PENDING_RESCUE_INTERVAL", "60"))
+    if pending_rescue_interval > 0:
+        try:
+            from datetime import timedelta
+            queue.enqueue_in(
+                timedelta(seconds=min(pending_rescue_interval, 30)),
+                "app.worker.run_pending_rescue_tick",
+                result_ttl=3600,
+            )
+            logger.info(
+                "Pending-rescue tick bootstrapped: first run in 30s "
+                "(interval=%ss)", pending_rescue_interval,
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("Failed to schedule pending-rescue tick")
+
     # Schedule autoscale tick
     autoscale_interval = int(os.getenv("AUTOSCALE_INTERVAL", "0"))
     if autoscale_interval > 0:
@@ -1221,7 +1337,7 @@ def main() -> None:
     # downscale path. Even when ``AUTOSCALE_DOWNSCALE_ENABLED=0`` the
     # tick still runs so already-draining nodes (set manually by an
     # operator via the admin) get migrated + destroyed.
-    drain_interval = int(os.getenv("DRAIN_TICK_INTERVAL", "600"))
+    drain_interval = int(os.getenv("DRAIN_TICK_INTERVAL", "600000"))
     if drain_interval > 0:
         try:
             from datetime import timedelta

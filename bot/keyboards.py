@@ -17,6 +17,12 @@ BTN_BUY = "💎 Подписка"
 BTN_TOPUP = "💳 Пополнить"
 BTN_INVITE = "🤝 Пригласить"
 BTN_HELP = "❓ Помощь"
+# Self-report VPN breakage — отдельная всегда-доступная кнопка в нижней
+# reply-клавиатуре. Плановый health-ping воркера приходит юзеру не чаще
+# раза в сутки и только в обеденное окно МСК (см. USER_HEALTH_PING_*
+# в worker.py). Эта кнопка позволяет юзеру пожаловаться прямо сейчас,
+# не дожидаясь следующего окна.
+BTN_VPN_BROKEN = "🆘 VPN не работает"
 
 
 def start_keyboard() -> types.ReplyKeyboardMarkup:
@@ -25,7 +31,7 @@ def start_keyboard() -> types.ReplyKeyboardMarkup:
         keyboard=[
             [types.KeyboardButton(text=BTN_MAIN_MENU), types.KeyboardButton(text=BTN_BUY)],
             [types.KeyboardButton(text=BTN_TOPUP), types.KeyboardButton(text=BTN_INVITE)],
-            [types.KeyboardButton(text=BTN_HELP)],
+            [types.KeyboardButton(text=BTN_HELP), types.KeyboardButton(text=BTN_VPN_BROKEN)],
         ],
         resize_keyboard=True,
     )

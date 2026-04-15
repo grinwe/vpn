@@ -2,6 +2,8 @@
 
 Single source of truth по `/api/webapp/*` — что фронт ([webapp/src/pages/](../webapp/src/pages/)) реально дёргает, какие pydantic-модели возвращаются, какие 4xx ждать. Если расходится с кодом — прав [api_webapp.py](../backend/app/api_webapp.py).
 
+Self-report: `POST /api/webapp/health-ping-report` (без тела) под webapp-JWT — юзер жмёт красную кнопку «🆘 VPN не работает» на Home; бэкенд находит первую `active` подписку юзера и пишет `AuditLog` с `action=health_ping_response`, `extra.answer="bad"`, `extra.source="self_reported"`, `extra.node_id=<denorm>`. Если активной подписки нет, row всё равно пишется, но с `node_id=null`. Rate-limit серверный пока не делаем; клиент (webapp/src/pages/Home.tsx) сам блокирует кнопку на 5 минут после успешной отправки. Функция `reportVpnBroken()` в `webapp/src/api.ts`. Ответ: `{ ok, subscription_id, node_id }`. Эти события едут в тот же дашборд, что и плановые пинги бота, — админка (`/health-pings`) отдельной карточкой выделяет self-reported как более сильный сигнал.
+
 Отдельная от admin API дорожка: здесь нет `X-Admin-Token`, вместо него — JWT, выданный по Telegram initData. Авторизован только юзер на себя самого, admin-скоупы не применимы.
 
 ## Auth handshake
@@ -156,22 +158,11 @@ Res: `{ subscription_id, sub_token, expires_at, balance_kopecks, plan_price_kope
 `freeze` Res: `{ subscription_id, status, frozen_until, freeze_days_left_in_year }`.
 `unfreeze` Res: `{ subscription_id, status, next_charge_at }`.
 
-### `POST /api/webapp/subscriptions/{id}/migrate_node`
+### `POST /api/webapp/subscriptions/{id}/migrate_node` (UI отключён)
 
-Перенос активной подписки на другую VPN-ноду внутри того же пула плана. Ре-использует тот же хелпер, что stage-5 drain tick в [ProvisioningOrchestrator.migrate_subscription_to_new_node](../backend/app/services/provisioning.py) — так что механика идентична тому, что делает админ при decommission'е ноды:
+Кнопка «🌍 Сменить ноду» из [SubscriptionCard](../webapp/src/pages/Home.tsx) **убрана** — пользовательский self-migrate больше не экспонируется в webapp. Endpoint остаётся в бэкенде как вестижиал (та же механика, что drain-tick), но UI его не вызывает. Админский эквивалент — `POST /api/subscriptions/{id}/migrate` (см. [backend-api.md](components/backend-api.md)) с возможностью указать конкретную target-ноду в обход фильтров пула.
 
-1. 404, если sub не твоя. 400, если `sub.status != active` или у sub нет node/plan. Заморозку мигрировать нельзя — сначала разморозка.
-2. `choose_node(db, plan, exclude_node_ids=[current_node_id])` — селектор, исключающий текущую ноду. Если нет eligible ноды в пулах тарифа — **503** `No alternative nodes available` (UX: фронт показывает «Пока нет других доступных нод для твоего тарифа. Попробуй позже.» — не 500, чтобы юзер понял, что это не баг, а просто пул пуст).
-3. Revoke всех live-девайсов на старой ноде (`background=True` — fire-and-forget ansible per device).
-4. `sub.node_id = target.id`, `db.flush()` + refresh.
-5. `reprovision_subscription(sub)` — полный warm-pool fast path → cold fallback на новой ноде.
-6. Возврат: `{ subscription_id, old_node_id, old_node_name, new_node_id, new_node_name, new_node_region, task_id }`.
-
-**sub_token не меняется** — это ключевой пойнт. Клиенты (Hiddify и т.п.) подписаны на `/sub/{token}` и при следующем profile-update интервале подхватят URIs, указывающие на новую ноду, без ручной пере-установки профиля. UI говорит юзеру «Обнови профиль в клиенте» — достаточно нажать "Update" в приложении, ничего копировать заново не нужно.
-
-**Бесплатно.** Без proration, без refund — тот же план, тот же `expires_at`, другой pop. Нет списаний с кошелька.
-
-**UI.** Кнопка «🌍 Сменить ноду» в [SubscriptionCard](../webapp/src/pages/Home.tsx), показывается только для `active` sub (не frozen, не expired). Confirm-диалог предупреждает, что устройства будут переподключены автоматически и что надо обновить профиль в клиенте. На 503 показывает дружелюбный алерт, на остальные ошибки — generic friendlyError.
+**Seamless URL refresh.** Исторически этот endpoint гарантировал, что `sub_token` не меняется при переезде, и клиент (Hiddify/v2rayN) по кнопке «обновить подписку» автоматически подхватывал новые сервера. После alembic `0022_device_sub_token` токен стал **per-device**, и миграция создаёт новый Device с новым токеном — сохранённый в клиенте URL указывал бы на revoked device. Фикс в `api_extensions.dynamic_sub_link`: если device revoked/disabled и нет активных credential'ов — эндпойнт alias'ит запрос на live-device той же Subscription. Для юзера URL продолжает работать «навсегда» (пока подписка жива), без повторного копирования из ЛК. Admin-миграция через новый эндпойнт использует тот же механизм, так что переезд бесшовен для клиента.
 
 ### `POST /api/webapp/subscriptions/{id}/devices` (add-device)
 

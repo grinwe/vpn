@@ -35,6 +35,61 @@ class AdminTopupResponse(BaseModel):
     tx_id: int
 
 
+def _sub_sharing_blocked(db: Session, sub: models.Subscription) -> bool:
+    """Decide whether this subscription currently has a sharing-enforcer
+    block in effect on the node.
+
+    Source of truth is the AuditLog stream: `traffic_stats.collect_and_persist`
+    writes a `sharing_block` row per (email, tick) when the on-node enforcer
+    reports a block, and `/subscriptions/{id}/unblock-sharing` writes a
+    `sharing_unblock` row. For each live device email we check whether the
+    latest block is more recent than the latest unblock mentioning that email;
+    if yes for any one email — the sub is blocked.
+
+    Runs per-sub per-request and does 2N queries (N = live device emails,
+    usually ≤3). Admin pages aren't hot path — simpler beats batched here.
+    """
+    emails = [
+        d.access_username for d in sub.devices
+        if d.access_username and d.status not in (
+            models.DeviceStatus.revoked, models.DeviceStatus.disabled
+        )
+    ]
+    if not emails:
+        return False
+    for email in emails:
+        # Latest sharing_block event for this specific email. The block
+        # audit stores the email in extra->>'email' (single email per row,
+        # written by traffic_stats when the enforcer fires).
+        last_block = (
+            db.query(models.AuditLog.created_at)
+            .filter(
+                models.AuditLog.action == "sharing_block",
+                models.AuditLog.extra["email"].astext == email,
+            )
+            .order_by(models.AuditLog.created_at.desc())
+            .first()
+        )
+        if not last_block:
+            continue
+        # Latest sharing_unblock event that included this email. Unblocks
+        # are batched per-subscription and store the emails list under
+        # extra->'emails' (JSONB array). The `?` JSONB op asks
+        # "does this array contain this string as a top-level element".
+        last_unblock = (
+            db.query(models.AuditLog.created_at)
+            .filter(
+                models.AuditLog.action == "sharing_unblock",
+                models.AuditLog.extra["emails"].op("?")(email),
+            )
+            .order_by(models.AuditLog.created_at.desc())
+            .first()
+        )
+        if last_unblock is None or last_unblock[0] < last_block[0]:
+            return True
+    return False
+
+
 def _subscriptions_for_user(user_id: int, db: Session) -> list[schemas.SubscriptionOut]:
     subs = (
         db.query(models.Subscription)
@@ -50,6 +105,7 @@ def _subscriptions_for_user(user_id: int, db: Session) -> list[schemas.Subscript
             plan_name=sub.plan.name,
             plan_id=sub.plan_id,
             node=sub.node.name,
+            node_id=sub.node_id,
             region=sub.node.region,
             expires_at=sub.expires_at,
             status=sub.status.value,
@@ -57,6 +113,7 @@ def _subscriptions_for_user(user_id: int, db: Session) -> list[schemas.Subscript
             sub_token=sub.sub_token,
             credentials=[schemas.CredentialOut.from_orm(c) for c in sub.credentials],
             devices=[schemas.DeviceOut.from_orm(d) for d in sub.devices],
+            sharing_blocked=_sub_sharing_blocked(db, sub),
         )
         result.append(item)
     return result

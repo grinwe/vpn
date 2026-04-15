@@ -20,6 +20,7 @@ from .keyboards import (
     BTN_INVITE,
     BTN_MAIN_MENU,
     BTN_TOPUP,
+    BTN_VPN_BROKEN,
     help_back_keyboard,
     help_keyboard,
     onboarding_keyboard,
@@ -99,6 +100,17 @@ def _admin_headers(actor_id: int) -> dict[str, str]:
         headers["X-Admin-Token"] = ADMIN_API_TOKEN
     headers["X-Admin-Actor"] = str(actor_id)
     return headers
+
+
+# ── Self-report VPN breakage debounce ──
+#
+# In-memory {telegram_id: monotonic seconds} — last time this user pressed
+# «🆘 VPN не работает». Не сохраняется между рестартами бота, и это ОК:
+# задача cooldown — защитить от случайного двойного тапа и спама, не от
+# долгосрочного злоупотребления. Бэкенд всё равно принимает повтор —
+# 2-3 лишние строчки в AuditLog не страшны.
+_SELF_REPORT_COOLDOWN_S = 300  # 5 минут
+_self_report_last: dict[int, float] = {}
 
 
 # ── Onboarding instructions ──────────────────────────────────────────
@@ -707,6 +719,56 @@ async def health_ping_response(callback_query: types.CallbackQuery):
         await callback_query.message.edit_text(ack_text)
     except Exception:
         pass
+
+
+# Self-report: юзер жмёт «🆘 VPN не работает» в reply-клавиатуре.
+# Плановый health-ping приходит юзеру не чаще раза в сутки и только в
+# обеденное окно МСК (USER_HEALTH_PING_DEBOUNCE_HOURS=24, окно 11–14) —
+# self-report закрывает эту дыру и позволяет пожаловаться прямо сейчас.
+# source="self_reported" помечает запись, чтобы админка выделяла такие
+# жалобы красным как более сильный сигнал, чем ответ на плановый пинг.
+@router.message(F.text == BTN_VPN_BROKEN)
+async def self_report_vpn_broken(message: types.Message) -> None:
+    tg_id = message.from_user.id
+    now_mono = asyncio.get_event_loop().time()
+    last = _self_report_last.get(tg_id)
+    if last is not None and (now_mono - last) < _SELF_REPORT_COOLDOWN_S:
+        await message.answer(
+            "👍 Мы уже получили вашу жалобу, не волнуйтесь — админы смотрят.\n"
+            "Если проблема не уйдёт за 10 минут, напишите в /help."
+        )
+        return
+
+    payload = {
+        "telegram_id": str(tg_id),
+        "answer": "bad",
+        "source": "self_reported",
+    }
+    try:
+        status_code, _ = await _fetch_json(
+            "POST",
+            f"{BACKEND_URL}/api/users/health-ping-response",
+            json=payload,
+            headers=_admin_headers(tg_id),
+        )
+    except aiohttp.ClientError:
+        await message.answer(
+            "Не получилось отправить жалобу — попробуйте ещё раз через минуту."
+        )
+        return
+    if status_code != 200:
+        await message.answer(
+            "Не получилось отправить жалобу — попробуйте ещё раз через минуту."
+        )
+        return
+
+    _self_report_last[tg_id] = now_mono
+    await message.answer(
+        "🛠 Спасибо! Мы получили сигнал и проверяем ваш сервер прямо сейчас.\n"
+        "Если проблема не уйдёт за 10 минут — напишите в /help, "
+        "приложите модель устройства.",
+        reply_markup=help_keyboard(),
+    )
 
 
 def health_ping_keyboard(sub_id: int | None) -> types.InlineKeyboardMarkup:

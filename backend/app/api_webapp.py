@@ -1732,3 +1732,58 @@ def webapp_referral(
         earned_kopecks=earned_total,
         share_url=share_url,
     )
+
+
+class HealthPingReportResponse(BaseModel):
+    ok: bool
+    subscription_id: int | None
+    node_id: int | None
+
+
+@webapp_router.post("/health-ping-report", response_model=HealthPingReportResponse)
+def webapp_health_ping_report(
+    user: models.User = Depends(require_webapp_user),
+    db: Session = Depends(get_db),
+):
+    """User pressed 'VPN doesn't work' in the webapp.
+
+    Records a self-reported bad answer in AuditLog so the admin
+    `/health-pings` dashboard picks it up alongside prompted ones
+    (from the scheduled bot ping). We attach it to the user's first
+    active subscription if they have one, so per-node aggregation
+    works; if not, we still persist the complaint without node_id.
+
+    No rate-limit beyond the standard SlowAPI middleware — users
+    clicking their own 'SOS' button are the ones we *want* to hear
+    from. Legitimate spam is handled client-side (5-min disable
+    after click).
+    """
+    sub = (
+        db.query(models.Subscription)
+        .filter(
+            models.Subscription.user_id == user.id,
+            models.Subscription.status == models.SubscriptionStatus.active,
+        )
+        .order_by(models.Subscription.id.asc())
+        .first()
+    )
+    node_id = sub.node_id if sub else None
+    sub_id = sub.id if sub else None
+
+    db.add(
+        models.AuditLog(
+            actor=str(user.id),
+            actor_type=models.AuditActor.user,
+            action="health_ping_response",
+            target_type="subscription",
+            target_id=sub_id,
+            extra={
+                "telegram_id": user.telegram_id,
+                "answer": "bad",
+                "node_id": node_id,
+                "source": "self_reported",
+            },
+        )
+    )
+    db.commit()
+    return HealthPingReportResponse(ok=True, subscription_id=sub_id, node_id=node_id)

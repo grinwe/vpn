@@ -78,6 +78,13 @@
 | `AUTOSCALE_INTERVAL` | `0` / `300` | worker | `run_autoscale_check`. `0` — отключить. `.env.example` ставит `300`. |
 | `DRAIN_TICK_INTERVAL` | `600` | worker | `run_drain_tick` (stage 5 downscale). Продолжает тикать даже если `AUTOSCALE_DOWNSCALE_ENABLED=0`, чтобы ручные draining-ноды могли дочиститься. |
 | `DRAIN_MIGRATE_BATCH` | `10` | worker | Сколько подписок за один tick мигрируется с одной draining-ноды. |
+| `PENDING_RESCUE_INTERVAL` | `60` | worker | `run_pending_rescue_tick` — re-enqueue `ProvisioningTask.status=pending` старше `PENDING_RESCUE_AGE`. Закрывает дыру, когда `enqueue_task` упал на Redis-hiccup'е и строка осталась без job'а. `0` отключает. |
+| `PENDING_RESCUE_AGE` | `60` | worker | Минимальный возраст (sec) pending-задачи, чтобы её подхватил rescue-tick. Меньше этого — считается «только что создана, ещё не RQ'нулась». |
+| `ANSIBLE_PLAYBOOK_TIMEOUT` | `300` | backend, worker | subprocess-таймаут (sec) на один `ansible-playbook` run. При регулярно-медленных нодах (package installs, slow SSH) можно поднять, иначе revoke/apply ловят `TimeoutExpired` и таска становится failed. |
+| `TRAFFIC_STATS_INTERVAL` | `300` | worker | `run_traffic_stats_tick` — SSH-сбор xray stats + sharing violations. Phase D `detect_traffic_drops` **отключён 2026-04-15** — теперь только сбор samples. |
+| ~~`TRAFFIC_DROP_ENABLED`~~ | ~~`1`~~ | worker | **Inert с 2026-04-15.** Phase D детектор отключён на уровне кода (`worker.run_traffic_stats_tick` не вызывает `detect_traffic_drops`, функция стоит no-op). Переменная оставлена для обратной совместимости env, но не читается. |
+| ~~`TRAFFIC_DROP_MIN_USERS`~~ | ~~`5`~~ | worker | **Inert с 2026-04-15.** При возврате автомиграции пороги нужно пересмотреть — прежние значения ложно-триггерили миграции в idle-окнах. |
+| ~~`TRAFFIC_DROP_CONFIRM_TICKS`~~ | ~~`1`~~ | worker | **Inert с 2026-04-15.** См. `TRAFFIC_DROP_MIN_USERS`. |
 
 ## Balance billing / trial
 

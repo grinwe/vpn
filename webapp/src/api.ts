@@ -345,3 +345,22 @@ export interface ReferralInfo {
 export async function fetchReferral() {
   return request<ReferralInfo>("/api/webapp/referral");
 }
+
+// ── Self-report «VPN не работает» ────────────────────────────────────
+//
+// Запись в тот же AuditLog, что и плановые health-ping'и бота, но с
+// extra.source = "self_reported" — админка выделяет такие жалобы
+// отдельной красной карточкой как более сильный сигнал.
+
+export interface HealthPingReportResponse {
+  ok: boolean;
+  subscription_id: number | null;
+  node_id: number | null;
+}
+
+export async function reportVpnBroken() {
+  return request<HealthPingReportResponse>(
+    "/api/webapp/health-ping-report",
+    { method: "POST" },
+  );
+}
