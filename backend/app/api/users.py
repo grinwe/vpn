@@ -185,9 +185,75 @@ def list_users(
             created_at=u.created_at,
             subscription_count=counts.get(u.id, 0),
             balance_kopecks=u.balance_kopecks or 0,
+            banned_at=u.banned_at,
         )
         for u in users
     ]
+
+
+@router.post("/users/{user_id}/ban")
+def ban_user(
+    user_id: int,
+    body: schemas.BanRequest,
+    db: Session = Depends(get_db),
+    admin_token: str = Depends(require_admin),
+    admin_actor: str | None = Header(default=None, alias=ADMIN_ACTOR_HEADER),
+):
+    """Mark a user as banned.
+
+    Bot middleware drops every incoming update from banned users
+    silently (no reply — DDoS bots don't get feedback). Orthogonal to
+    subscriptions: this endpoint does NOT revoke/block subs, and
+    ``/users/{id}/disable`` does NOT set banned_at. Idempotent — banning
+    an already-banned user returns ``already_banned`` and skips the
+    audit write.
+    """
+    user = db.get(models.User, user_id)
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    if user.banned_at is not None:
+        return {"status": "already_banned", "banned_at": user.banned_at}
+    user.banned_at = utcnow()
+    db.commit()
+    db.refresh(user)
+    actor, actor_type = _resolve_admin_actor(admin_actor)
+    _audit(
+        db,
+        actor,
+        "user_banned",
+        "user",
+        user_id,
+        metadata={"reason": body.reason},
+        actor_type=actor_type,
+    )
+    return {"status": "banned", "banned_at": user.banned_at}
+
+
+@router.post("/users/{user_id}/unban")
+def unban_user(
+    user_id: int,
+    db: Session = Depends(get_db),
+    admin_token: str = Depends(require_admin),
+    admin_actor: str | None = Header(default=None, alias=ADMIN_ACTOR_HEADER),
+):
+    """Clear a user's ban. Idempotent for already-unbanned users."""
+    user = db.get(models.User, user_id)
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    if user.banned_at is None:
+        return {"status": "not_banned"}
+    user.banned_at = None
+    db.commit()
+    actor, actor_type = _resolve_admin_actor(admin_actor)
+    _audit(
+        db,
+        actor,
+        "user_unbanned",
+        "user",
+        user_id,
+        actor_type=actor_type,
+    )
+    return {"status": "unbanned"}
 
 
 @router.get(

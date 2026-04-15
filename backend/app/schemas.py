@@ -598,9 +598,17 @@ class UserOut(BaseModel):
     created_at: datetime
     subscription_count: int = 0
     balance_kopecks: int = 0
+    banned_at: datetime | None = None
 
     class Config:
         from_attributes = True
+
+
+class BanRequest(BaseModel):
+    # Same shape as DisableRequest but kept separate because ban is a
+    # user-level action (blocks bot updates) while disable cascades to
+    # subscription revocation — don't confuse the two in audit logs.
+    reason: str | None = None
 
 
 class AuditLogOut(BaseModel):

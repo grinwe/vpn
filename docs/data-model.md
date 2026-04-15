@@ -48,12 +48,14 @@ class User(Base):
     trial_activated_at: DateTime NULL,   # NULL = триал ещё доступен
     trial_expires_at: DateTime NULL,     # момент клоубэка бонуса
     referred_by_id: FK → users.id NULL,
+    banned_at: DateTime NULL,            # user-level бан, ставится из админки
     created_at
 ```
 
 Инварианты:
 - `balance_kopecks` должен сходиться с `SUM(balance_transactions.amount_kopecks) WHERE user_id = x`. Это не enforced — BalanceTransaction — append-only ledger, column обновляется в коде. Комментарий в модели явно это фиксирует как «trust the column for reads, reconcile nightly» (`models.py:551-562`).
 - `trial_activated_at IS NULL` ⇔ пользователь ещё может дёрнуть `/api/trial/activate`.
+- `banned_at IS NOT NULL` ⇒ бот молча дропает все апдейты от этого Telegram-аккаунта (без ACK, чтобы не кормить DDoS-ботов обратной связью). Ортогонально `Subscription.status=blocked`: бан юзера не трогает его подписки, а `/users/{id}/disable` не ставит `banned_at`. Ставится `POST /api/users/{id}/ban`, снимается `/unban`.
 
 ### `plans`
 

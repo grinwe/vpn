@@ -308,6 +308,12 @@ class User(Base):
     # the worker queues a new ping for the user (write happens before
     # the bot delivers it, so a Telegram retry can't double-send).
     health_ping_last_at = Column(DateTime, nullable=True)
+    # User-level ban. When set, the bot drops all incoming updates from
+    # this user silently (no ACK — we don't want to give DDoS bots
+    # feedback). Orthogonal to Subscription.status=blocked: banning a
+    # user does NOT touch their subs, and blocking a sub doesn't set
+    # this. Cleared to NULL on unban.
+    banned_at = Column(DateTime, nullable=True)
 
     invoices = relationship("Invoice", back_populates="user")
     devices = relationship("Device", back_populates="user")
