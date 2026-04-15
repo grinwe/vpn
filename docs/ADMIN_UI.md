@@ -24,7 +24,9 @@
 
 Таблица юзеров + боковая панель с деталями и подписками выбранного.
 
-- Поиск по `telegram_id` / `email` с debounce 300ms (`GET /api/users?limit=100&search=…`).
+- Поиск по `telegram_id` / `email` с debounce 300ms (`GET /api/users?limit=50&offset=…&search=…`).
+- **Пагинация через `useInfiniteQuery`** с кнопкой «Загрузить ещё» в подвале таблицы. Страница — 50 записей (backend cap — 200). Счётчик «Загружено: N» всегда на виду. Ордер с бэка — `id DESC`, новые регистрации всегда сверху, пагинация стабильна.
+- Колонка «Создан» показывает **дату И время** (`toLocaleString('ru-RU', { dateStyle: 'short', timeStyle: 'short' })`) — раньше было только число, и на DDoS-инцидентах невозможно было отличить «эти 250 регистраций сыпанулись за минуту» от «за сутки».
 - Клик на строку — загружает `GET /api/users/{id}` и показывает список подписок с девайсами.
 - **Пополнить баланс** — форма в детали-панели (только если у юзера есть `telegram_id`). `POST /api/users/by_telegram/{tg_id}/topup` пишет `kind=adjust` с note `admin_topup`. В ledger'е появляется отдельная строка, user balance обновляется оптимистично в UI.
 - **revoke now** на подписке (если `status != blocked|expired`) — `POST /api/subscriptions/{id}/disable`. Юзер отключается от ноды через Ansible за 1-2 минуты, sub переходит в `blocked`.

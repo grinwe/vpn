@@ -1,5 +1,10 @@
 import { useEffect, useState } from "react";
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import {
+  useInfiniteQuery,
+  useMutation,
+  useQuery,
+  useQueryClient,
+} from "@tanstack/react-query";
 import {
   api,
   DeviceOut,
@@ -9,6 +14,10 @@ import {
   VPNNodeOut,
   adminTopupByTelegram,
 } from "../api";
+
+// Backend caps `limit` at 200; 50 keeps each page snappy and makes "Load
+// more" feel incremental rather than dumping a wall of rows at once.
+const PAGE_SIZE = 50;
 
 export default function Users() {
   const qc = useQueryClient();
@@ -25,13 +34,33 @@ export default function Users() {
   const [topupRub, setTopupRub] = useState("");
   const [topupNote, setTopupNote] = useState("");
 
-  const { data: users, isLoading } = useQuery<UserOut[]>({
+  const {
+    data: usersData,
+    fetchNextPage,
+    hasNextPage,
+    isFetchingNextPage,
+    isLoading,
+  } = useInfiniteQuery({
     queryKey: ["users", { search: debouncedSearch }],
-    queryFn: () =>
-      api.get(
-        `/users?limit=100${debouncedSearch ? `&search=${encodeURIComponent(debouncedSearch)}` : ""}`
+    initialPageParam: 0,
+    queryFn: ({ pageParam }) =>
+      api.get<UserOut[]>(
+        `/users?limit=${PAGE_SIZE}&offset=${pageParam}${
+          debouncedSearch
+            ? `&search=${encodeURIComponent(debouncedSearch)}`
+            : ""
+        }`,
       ),
+    // Short page = we drained the server. Otherwise bump offset by the
+    // total count so far — the list is ordered by id DESC on the backend,
+    // which is stable enough for paginated admin browsing (new signups
+    // appear at the top, not mid-page).
+    getNextPageParam: (lastPage, allPages) => {
+      if (lastPage.length < PAGE_SIZE) return undefined;
+      return allPages.reduce((n, p) => n + p.length, 0);
+    },
   });
+  const users = usersData?.pages.flat() ?? [];
 
   const { data: subs } = useQuery<SubscriptionOut[]>({
     queryKey: ["user-subs", selected?.id],
@@ -153,36 +182,55 @@ export default function Users() {
         {isLoading ? (
           <div>Загрузка…</div>
         ) : (
-          <table className="w-full text-sm">
-            <thead className="text-left text-slate-400 border-b border-slate-700">
-              <tr>
-                <th className="py-2">ID</th>
-                <th>Telegram</th>
-                <th>Email</th>
-                <th>Subs</th>
-                <th>Баланс</th>
-                <th>Создан</th>
-              </tr>
-            </thead>
-            <tbody>
-              {users?.map((u) => (
-                <tr
-                  key={u.id}
-                  onClick={() => setSelected(u)}
-                  className={`cursor-pointer border-b border-slate-800 hover:bg-slate-800 ${
-                    selected?.id === u.id ? "bg-slate-800" : ""
-                  }`}
-                >
-                  <td className="py-2">{u.id}</td>
-                  <td>{u.telegram_id ?? "—"}</td>
-                  <td>{u.email ?? "—"}</td>
-                  <td>{u.subscription_count}</td>
-                  <td>{(u.balance_kopecks / 100).toFixed(2)} ₽</td>
-                  <td>{new Date(u.created_at).toLocaleDateString()}</td>
+          <>
+            <table className="w-full text-sm">
+              <thead className="text-left text-slate-400 border-b border-slate-700">
+                <tr>
+                  <th className="py-2">ID</th>
+                  <th>Telegram</th>
+                  <th>Email</th>
+                  <th>Subs</th>
+                  <th>Баланс</th>
+                  <th>Создан</th>
                 </tr>
-              ))}
-            </tbody>
-          </table>
+              </thead>
+              <tbody>
+                {users.map((u) => (
+                  <tr
+                    key={u.id}
+                    onClick={() => setSelected(u)}
+                    className={`cursor-pointer border-b border-slate-800 hover:bg-slate-800 ${
+                      selected?.id === u.id ? "bg-slate-800" : ""
+                    }`}
+                  >
+                    <td className="py-2">{u.id}</td>
+                    <td>{u.telegram_id ?? "—"}</td>
+                    <td>{u.email ?? "—"}</td>
+                    <td>{u.subscription_count}</td>
+                    <td>{(u.balance_kopecks / 100).toFixed(2)} ₽</td>
+                    <td>
+                      {new Date(u.created_at).toLocaleString("ru-RU", {
+                        dateStyle: "short",
+                        timeStyle: "short",
+                      })}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+            <div className="mt-4 flex items-center gap-3 text-sm text-slate-400">
+              <span>Загружено: {users.length}</span>
+              {hasNextPage && (
+                <button
+                  onClick={() => fetchNextPage()}
+                  disabled={isFetchingNextPage}
+                  className="px-3 py-1 rounded bg-slate-700 hover:bg-slate-600 disabled:opacity-50"
+                >
+                  {isFetchingNextPage ? "Загружаем…" : "Загрузить ещё"}
+                </button>
+              )}
+            </div>
+          </>
         )}
       </div>
 

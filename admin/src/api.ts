@@ -70,6 +70,7 @@ export interface UserOut {
   created_at: string;
   subscription_count: number;
   balance_kopecks: number;
+  banned_at: string | null;
 }
 
 export interface AdminTopupResponse {
