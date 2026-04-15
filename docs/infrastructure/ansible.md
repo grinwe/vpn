@@ -27,7 +27,7 @@ infra/ansible/
 │   └── deploy_monitoring.yml     ← Grafana/Prometheus на monitoring-host
 └── roles/
     ├── base_node                 ← общие системные настройки (не vpn-спец.)
-    ├── bootstrap_node            ← pre-install: user, ufw, sshd, apt
+    ├── bootstrap_node            ← pre-install: user, ufw (+ rate-limit 22/tcp), sshd-hardening, fail2ban, unattended-upgrades, apt
     ├── install_shadowtls_stack   ← ShadowTLS v3 + shadowsocks-rust
     ├── install_vless_reality     ← xray + VLESS Reality (xtls-rprx-vision)
     ├── install_vless_ws_cdn      ← xray + VLESS/WS за Cloudflare

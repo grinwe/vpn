@@ -193,7 +193,7 @@ client ──TLS (Reality, RU :443)──▶ jump node (RU) ──WireGuard tunn
 Полная цепочка из `site.yml` для группы `vpn_nodes`:
 
 ```
-bootstrap_node               — user/group, SSH hardening, UFW, базовые пакеты
+bootstrap_node               — user/group, SSH hardening, UFW + rate-limit 22/tcp, fail2ban sshd, unattended-upgrades, базовые пакеты
 install_shadowtls_stack      — всегда в списке, gated на shadowtls_password
 install_vless_reality        — всегда в списке, gated на vless_reality_private_key
 install_vless_xhttp          — всегда в списке, gated на vless_xhttp_domain

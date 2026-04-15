@@ -34,6 +34,8 @@
       - curl
       - htop
       - jq
+      - fail2ban
+      - unattended-upgrades
     state: present
     update_cache: yes
 
@@ -42,6 +44,17 @@
     state: enabled
     policy: deny
   notify: reload ufw
+
+# ufw limit на 22/tcp: 6+ соединений с одного src IP за 30с → block.
+# Это firewall-уровневый троттлинг брутфорса; работает ДО sshd вообще,
+# так что при ддос-атаке не забивается sshd-лог и fail2ban успевает
+# спокойно разбирать то, что прошло через rate-limit. ssh ходит на
+# стандартный порт 22 (см. MOTD, inventories — кастомного порта нет).
+- name: Rate-limit SSH at firewall level
+  ufw:
+    rule: limit
+    port: "22"
+    proto: tcp
 
 - name: Allow firewall ports
   ufw:
@@ -65,6 +78,91 @@
     line: 'PermitRootLogin prohibit-password'
     state: present
   notify: restart ssh
+
+# Доп. sshd-ужесточение. Ни одна из строк не должна ломать
+# Ansible-прогон: мы всегда заходим root'ом по ключу, MaxAuthTries=5
+# оставляет запас на ssh-agent с несколькими ключами (3 — рискованно,
+# если у оператора в агенте залито 4-5 ключей, sshd рвёт соединение
+# раньше, чем доходит до нужного). X11/TcpForwarding на VPN-ноде не
+# нужны: SSH туда ходит только для Ansible, пользовательский трафик —
+# через xray/shadowtls, у них свои порты.
+- name: Harden sshd (MaxAuthTries)
+  lineinfile:
+    path: /etc/ssh/sshd_config
+    regexp: '^#?MaxAuthTries'
+    line: 'MaxAuthTries 5'
+    state: present
+  notify: restart ssh
+
+- name: Harden sshd (LoginGraceTime)
+  lineinfile:
+    path: /etc/ssh/sshd_config
+    regexp: '^#?LoginGraceTime'
+    line: 'LoginGraceTime 30'
+    state: present
+  notify: restart ssh
+
+- name: Harden sshd (PermitEmptyPasswords)
+  lineinfile:
+    path: /etc/ssh/sshd_config
+    regexp: '^#?PermitEmptyPasswords'
+    line: 'PermitEmptyPasswords no'
+    state: present
+  notify: restart ssh
+
+- name: Harden sshd (X11Forwarding)
+  lineinfile:
+    path: /etc/ssh/sshd_config
+    regexp: '^#?X11Forwarding'
+    line: 'X11Forwarding no'
+    state: present
+  notify: restart ssh
+
+# fail2ban sshd jail. Это L7-бан после rate-limit: если кто-то прошёл
+# ufw limit (≤5 соединений/30с), но внутри них валит битые логины —
+# ловим тут по паттернам sshd-лога. maxretry=5 / findtime=10m / ban=1h
+# — умеренно агрессивно для управляемой ноды (нет shell-юзеров, все
+# логины должны быть только автоматизированные Ansible-запуски).
+- name: Configure fail2ban sshd jail
+  copy:
+    dest: /etc/fail2ban/jail.d/sshd.local
+    owner: root
+    group: root
+    mode: '0644'
+    content: |
+      [sshd]
+      enabled = true
+      port = ssh
+      filter = sshd
+      maxretry = 5
+      findtime = 600
+      bantime = 3600
+      backend = systemd
+  notify: restart fail2ban
+
+- name: Ensure fail2ban is enabled and running
+  service:
+    name: fail2ban
+    state: started
+    enabled: yes
+
+# unattended-upgrades — security-only по умолчанию. Конфиг ставит
+# систему на автоматическое применение security-патчей, оставляя
+# feature-апдейты ручными. `Unattended-Upgrade::Automatic-Reboot`
+# отключён: VPN-нода с клиентским трафиком не должна ребутаться сама
+# посреди ночи без наблюдения — накопившиеся ядерные CVE приоритетнее
+# uptime только на отдельных нодах, и это осознанный ручной выбор.
+- name: Enable unattended-upgrades (security-only, no auto-reboot)
+  copy:
+    dest: /etc/apt/apt.conf.d/20auto-upgrades
+    owner: root
+    group: root
+    mode: '0644'
+    content: |
+      APT::Periodic::Update-Package-Lists "1";
+      APT::Periodic::Unattended-Upgrade "1";
+      APT::Periodic::AutocleanInterval "7";
+      Unattended-Upgrade::Automatic-Reboot "false";
 
 - name: Set MOTD banner
   copy:
