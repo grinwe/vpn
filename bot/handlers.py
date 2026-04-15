@@ -1,5 +1,7 @@
 import asyncio
 import logging
+import os
+from urllib.parse import urlparse
 
 import aiohttp
 from aiogram import F, Router, types
@@ -14,6 +16,30 @@ from .config import (
     SUB_LINK_BASE_URL,
     TELEGRAM_STARS_WEBHOOK_SECRET,
 )
+
+
+def _build_sub_url(sub_token: str | None) -> str | None:
+    """Абсолютный URL подписки для показа юзеру.
+
+    Порядок приоритетов:
+    1. SUB_LINK_BASE_URL — если задан (например, CF-воркер), используем как есть.
+    2. WEBAPP_BASE_URL — берём origin (https://grinwer.online) и приклеиваем
+       /api/sub/{token}. В проде всегда задан, потому что без него
+       Telegram Mini App не запускается — фактически это гарантированный
+       fallback.
+    3. None — значит URL построить неоткуда, вызывающий код должен это
+       обработать (сейчас такого в проде не случается).
+    """
+    if not sub_token:
+        return None
+    if SUB_LINK_BASE_URL:
+        return f"{SUB_LINK_BASE_URL.rstrip('/')}/{sub_token}"
+    webapp_base = os.getenv("WEBAPP_BASE_URL", "")
+    if webapp_base:
+        parsed = urlparse(webapp_base)
+        if parsed.scheme and parsed.netloc:
+            return f"{parsed.scheme}://{parsed.netloc}/api/sub/{sub_token}"
+    return None
 from .keyboards import (
     BTN_BUY,
     BTN_HELP,
@@ -466,46 +492,39 @@ async def cmd_config(message: types.Message):
         await message.answer("У тебя нет активных подписок с готовыми конфигами. Используй /plans.")
         return
 
-    # Build config message with all credentials
-    lines = ["🔐 <b>Твои конфиги для подключения:</b>\n"]
-    for cred in active_sub["credentials"]:
-        proto = cred.get("proto", "unknown")
-        config_text = cred.get("config_text", "")
-        if config_text:
-            lines.append(f"<b>{proto}:</b>")
-            lines.append(f"<code>{config_text}</code>\n")
-
-    # Подписочная ссылка уезжает вторым отдельным сообщением —
-    # на мобильном тап-копирование одной короткой строки ловит URL
-    # без промаха, а в многострочном HTML-посте рядом с креденшелами
-    # юзеры стабильно промахивались мимо <code>.
+    # /config отдаёт ОДНУ подписочную ссылку, а не список vless://.
+    # Клиенты (Hiddify / V2rayNG / Streisand) сами разворачивают её в
+    # набор серверов и потом рефрешат при миграциях. Список из 10
+    # сырых vless-линков нужен был только как дебажный fallback на
+    # случай, когда SUB_LINK_BASE_URL не задан — теперь fallback берём
+    # из WEBAPP_BASE_URL, поэтому URL всегда есть.
     sub_token = active_sub.get("sub_token")
-    sub_url = (
-        f"{SUB_LINK_BASE_URL.rstrip('/')}/{sub_token}"
-        if sub_token and SUB_LINK_BASE_URL
-        else None
-    )
-    if sub_url:
-        lines.append(
-            "🔗 <b>Ссылка подписки</b> (автообновляется при смене сервера) — "
-            "следующим сообщением, тапни чтобы скопировать ⬇️"
+    sub_url = _build_sub_url(sub_token)
+    if not sub_url:
+        # Такое случается только в dev-окружении без WEBAPP_BASE_URL.
+        logger.warning(
+            "cmd_config: no sub_url for user %s (SUB_LINK_BASE_URL + WEBAPP_BASE_URL оба пусты)",
+            message.from_user.id,
         )
-
-    lines.append(
-        "Не знаешь как настроить? Нажми кнопку с твоей платформой ниже 👇"
-    )
+        await message.answer(
+            "Не удалось собрать ссылку подписки. Напиши в поддержку."
+        )
+        return
 
     await message.answer(
-        "\n".join(lines),
+        "🔗 <b>Твоя ссылка подписки</b>\n"
+        "Импортируй её в VPN-клиент (Hiddify / V2rayNG / Streisand) один раз — "
+        "при смене сервера клиент сам подтянет новые настройки по этой ссылке.\n\n"
+        "⬇️ Ссылка следующим сообщением, тапни чтобы скопировать.\n\n"
+        "Не знаешь как настроить? Нажми кнопку с твоей платформой ниже 👇",
         reply_markup=onboarding_keyboard(),
         parse_mode="HTML",
     )
-    if sub_url:
-        await message.answer(
-            f"<code>{sub_url}</code>",
-            parse_mode="HTML",
-            disable_web_page_preview=True,
-        )
+    await message.answer(
+        f"<code>{sub_url}</code>",
+        parse_mode="HTML",
+        disable_web_page_preview=True,
+    )
 
 
 # ── Onboarding instructions callbacks ──
