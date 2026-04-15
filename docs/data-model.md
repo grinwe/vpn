@@ -189,6 +189,8 @@ class Device(Base):
 
 `sub_token` — уникальный токен на уровне устройства (не подписки). `/sub/{token}` сначала ищет `Device.sub_token` и возвращает только credentials этого устройства. Если не найден — fallback на `Subscription.sub_token` (backward compat для старых клиентов). Это предотвращает sharing: поделившись ссылкой, пользователь раскрывает только один device, а не всю подписку.
 
+**Device.sub_token сохраняется после revoke** — строка Device с `status=revoked` остаётся в БД, и её токен продолжает резолвиться в endpoint через alias на живого соседа по Subscription. Это load-bearing для seamless-миграций; подробности — `components/backend-api.md` «Sub-link invariant». Запрещается чистить revoked-devices без апдейта alias-логики.
+
 `connection_uri` — URL динамической подписки вида `<SUB_LINK_BASE_URL>/<device.sub_token>`. Шифруется Fernet.
 
 ### `credentials`

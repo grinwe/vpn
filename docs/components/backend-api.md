@@ -159,7 +159,19 @@ def dynamic_sub_link(token: str, db: Session = Depends(get_db)):
 
 Два уровня lookup'а: сначала `Device.sub_token` (добавлен alembic `0022_device_sub_token`, выдаётся webapp'ом при покупке), затем legacy `Subscription.sub_token` для старых клиентов, установленных до миграции. Выдаёт base64-кодированный список URI активных credential'ов + заголовки `subscription-userinfo` (expire) и `profile-update-interval: 6`, которые Hiddify/v2rayNG читают для автообновления. Пишет `AuditLog(action='subscription_fetch')` на каждый опрос (`target_type='device'` или `'subscription'` в зависимости от пути).
 
-**Alias-fallback для seamless migration.** Миграция (admin override, drain, auto-migrate-on-block) revoke'ает старый Device и создаёт новый с **другим** `sub_token`. Сохранённый в Hiddify URL указывал бы на revoked device и отдавал бы пустой список — юзер вынужден был бы копировать новый URL из webapp. Фикс: если найденный по токену device имеет `status in (revoked, disabled)` или у него нет активных credential'ов — ищем любой живой device на **той же** Subscription и отдаём его креды. В AuditLog extra пишется `aliased_to_device_id`, чтобы alias-путь был виден. Для multi-device подписок есть известное ограничение: `reprovision_subscription` на миграции создаёт один device, и все старые URL'ы alias'нутся на него (коллапс в единственного выжившего).
+**Alias-fallback для seamless migration.** Миграция (admin override, drain, auto-migrate-on-block) revoke'ает старый Device и создаёт новый с **другим** `sub_token`. Сохранённый в Hiddify URL указывал бы на revoked device и отдавал бы пустой список — юзер вынужден был бы копировать новый URL из webapp. Фикс: если найденный по токену device имеет `status != active` или у него нет активных credential'ов — ищем любой живой device на **той же** Subscription (берём самый свежий по `updated_at`, чтобы цепочка миграций A→B→C alias'илась на C) и отдаём его креды. В AuditLog extra пишется `aliased_to_device_id`, чтобы alias-путь был виден. Для multi-device подписок есть известное ограничение: `reprovision_subscription` на миграции создаёт один device, и все старые URL'ы alias'нутся на него (коллапс в единственного выжившего).
+
+**Safety net.** Если ни прямой device, ни alias не дают ни одного работающего конфига — endpoint возвращает **503**, а не пустой 200. Hiddify/v2rayN на пустой 200 затирают локально закешированный профиль (пользователь остаётся без VPN), на 503 — оставляют last-known-good и повторяют запрос. Срабатывает в окне между revoke и provision, либо если вся подписка сломана (все устройства revoked/failed без работающего sibling).
+
+### ⚠️ Sub-link invariant (НЕ ТРОГАТЬ)
+
+Три инварианта живут в связке, ломать любой из них — значит каждая миграция заново пойдёт с рассылкой новых URI в боте (уже обжигались):
+
+1. `backend/app/services/provisioning.py` `_handle_task_outcome(action="revoke")` **не удаляет** строку `Device`. Ставит `status=revoked`, деактивирует creds. `db.delete(device)` здесь — баг, который возвращает 404 всем сохранённым клиентам на подписке.
+2. `reprovision_subscription` / `provision_subscription` / `create_device_for_subscription` создают **новый** `Device` с новым `sub_token`, **никогда** не мутируют `sub_token` уже существующего. Три генератора — три единственные точки записи `sub_token`.
+3. `dynamic_sub_link` в `api_extensions.py` алиасит нерабочий device (статус ≠ active или все creds неактивны) на живого соседа по той же `Subscription`. Без этого — тот же 404.
+
+Любая попытка «почистить старые revoked devices», «переиспользовать sub_token при миграции», «упростить alias-блок» — сначала читать этот раздел. Тесты, которые подтверждают инвариант, живут в `backend/tests/test_balance.py` (`original_token` фикстура).
 
 > ⚠️ Audit-лог на каждый анонимный опрос + дефолтный nginx access_log (`infrastructure/deployment.md`) = деанон-timeline. См. audit/...
 

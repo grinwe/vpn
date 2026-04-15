@@ -79,33 +79,51 @@ def dynamic_sub_link(token: str, db: Session = Depends(get_db)):
         if sub.expires_at and sub.expires_at < utcnow():
             raise HTTPException(status_code=403, detail="Subscription expired")
 
-        # Seamless-migration alias. Migration (admin override, drain,
-        # auto-migrate-on-block) revokes the old Device and provisions
-        # a fresh one on the target node with a NEW sub_token. The user's
-        # Hiddify/v2rayN profile is still pointing at the OLD token —
-        # without this fallback the saved subscription URL refreshes
-        # into an empty config and the user has to manually copy the
-        # new URL from /config or the webapp. With it, the old URL
-        # transparently resolves to whichever device is currently live
-        # on the same subscription. Same user, same sub, just new node.
-        # Multi-device subs collapse to a single device after migration
-        # (`reprovision_subscription` provisions one) — known limitation,
-        # secondary clients will all alias onto the same survivor.
+        # ╔══════════════════════════════════════════════════════════════╗
+        # ║  DO NOT TOUCH without reading docs/components/backend-api.md ║
+        # ║  section "Sub-link invariant".                               ║
+        # ║                                                              ║
+        # ║  Seamless-migration alias. Every resync/migration path       ║
+        # ║  (admin override, drain, auto-migrate-on-block, webapp       ║
+        # ║  device-move, balance unfreeze) revokes the old Device row   ║
+        # ║  and provisions a fresh one on the target node with a NEW    ║
+        # ║  sub_token. The user's Hiddify/v2rayN profile is still       ║
+        # ║  pointing at the OLD token — without this fallback the       ║
+        # ║  saved subscription URL refreshes into an empty config and   ║
+        # ║  the user has to manually reimport the new URL, which is     ║
+        # ║  exactly the 404-loop we already shipped new URIs to fix.    ║
+        # ║                                                              ║
+        # ║  Load-bearing invariant (the three MUST hold together):      ║
+        # ║    1. provisioning.py `_handle_task_outcome` keeps the       ║
+        # ║       revoked Device row in the DB (option A).               ║
+        # ║    2. Reprovisioning creates a NEW Device on the same Sub    ║
+        # ║       (never mutates the old one's sub_token).               ║
+        # ║    3. This block finds the live sibling on the same Sub.    ║
+        # ║  Break any one and saved client URLs start 404-ing.          ║
+        # ║                                                              ║
+        # ║  Multi-device subs collapse to a single device after         ║
+        # ║  migration (`reprovision_subscription` provisions one) —     ║
+        # ║  known limitation, secondary clients alias onto the          ║
+        # ║  survivor. Accepted: same user, same sub.                    ║
+        # ╚══════════════════════════════════════════════════════════════╝
         source_device = device
-        if device.status in (
-            models.DeviceStatus.revoked,
-            models.DeviceStatus.disabled,
-        ) or not any(c.is_active for c in device.credentials):
+        if device.status != models.DeviceStatus.active or not any(
+            c.is_active for c in device.credentials
+        ):
+            # Prefer the most recently-updated active sibling so
+            # chained migrations (A → B → C) always alias onto C,
+            # not some stale B that was left around.
             live = next(
                 (
                     d
-                    for d in sub.devices
-                    if d.id != device.id
-                    and d.status
-                    not in (
-                        models.DeviceStatus.revoked,
-                        models.DeviceStatus.disabled,
+                    for d in sorted(
+                        sub.devices,
+                        key=lambda x: x.updated_at or x.created_at,
+                        reverse=True,
                     )
+                    if d.id != device.id
+                    and d.status == models.DeviceStatus.active
+                    and any(c.is_active for c in d.credentials)
                 ),
                 None,
             )
@@ -119,6 +137,22 @@ def dynamic_sub_link(token: str, db: Session = Depends(get_db)):
             decrypted = _decrypt(cred.config_text)
             if decrypted:
                 configs.append(SubLinkConfig(protocol=cred.proto, uri=decrypted))
+
+        # Safety net: if neither the direct device nor its alias
+        # yielded a single working config, return 503 instead of an
+        # empty 200. Empty-200 = "subscription with zero servers" and
+        # most clients will *overwrite* the local cached profile with
+        # nothing, stranding the user. 503 tells the client to retry
+        # and keeps the last-known-good profile in place.
+        if not configs:
+            logger.warning(
+                "sub-link: no active configs for token=%s sub=%s device=%s (source=%s)",
+                token, sub.id, device.id, source_device.id,
+            )
+            raise HTTPException(
+                status_code=503,
+                detail="No active endpoints — provisioning in progress, retry shortly",
+            )
 
         db.add(
             models.AuditLog(
@@ -175,6 +209,18 @@ def dynamic_sub_link(token: str, db: Session = Depends(get_db)):
                 "sub-link: decrypt returned empty for credential %s (proto=%s, sub=%s)",
                 cred.id, cred.proto, sub.id,
             )
+
+    # Same safety as the per-device branch — see the invariant box
+    # above. Empty-200 would wipe the user's cached profile.
+    if not configs:
+        logger.warning(
+            "sub-link: legacy sub-token has no active configs sub=%s token=%s",
+            sub.id, token,
+        )
+        raise HTTPException(
+            status_code=503,
+            detail="No active endpoints — provisioning in progress, retry shortly",
+        )
 
     uris = "\n".join(c.uri for c in configs)
     encoded = base64.b64encode(uris.encode()).decode()

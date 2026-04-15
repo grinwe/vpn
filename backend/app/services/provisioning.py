@@ -746,14 +746,21 @@ class ProvisioningOrchestrator:
                     cred.is_active = True
                     cred.revoked_at = None
             elif task.action == "revoke":
-                # Keep the Device row so its sub_token still resolves in
-                # /api/sub/{token}. The dynamic-sub-link endpoint treats
-                # revoked devices as aliases: it finds a live sibling on
-                # the same subscription and serves that instead, so saved
-                # Hiddify/v2rayN URLs keep working after migrations.
-                # Read-paths that render device lists already filter out
-                # revoked/disabled rows (_live_device_count in balance.py,
-                # live_device_rows in api_webapp.py).
+                # ╔══════════════════════════════════════════════════════╗
+                # ║  DO NOT revert to `db.delete(device)`. See            ║
+                # ║  docs/components/backend-api.md "Sub-link invariant". ║
+                # ║                                                       ║
+                # ║  Deleting the Device row wipes its sub_token, which   ║
+                # ║  breaks every saved Hiddify/v2rayN URL pointing at    ║
+                # ║  it — every migration becomes "bot, send me the new   ║
+                # ║  URI". Keeping the row + marking status=revoked lets  ║
+                # ║  /api/sub/{token} alias to a live sibling on the      ║
+                # ║  same Sub (see dynamic_sub_link in api_extensions).   ║
+                # ║                                                       ║
+                # ║  Read paths already filter revoked rows out of the    ║
+                # ║  UI (_live_device_count in balance.py, live_device_   ║
+                # ║  rows in api_webapp.py) so the admin card stays tidy. ║
+                # ╚══════════════════════════════════════════════════════╝
                 device.status = models.DeviceStatus.revoked
                 device.updated_at = utcnow()
                 for cred in device.credentials:

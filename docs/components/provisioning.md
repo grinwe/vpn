@@ -148,7 +148,8 @@ branch on returncode
     ├─ 0 ──► _mark_task(success) → _handle_task_outcome(success=True)
     │         │
     │         └─ если action=apply → device.status=active, creds.is_active=True
-    │            если action=revoke → DELETE device + credentials
+    │            если action=revoke → device.status=revoked, creds.is_active=False
+    │                                (строка Device СОХРАНЯЕТСЯ — см. Sub-link invariant)
     │            если target=node   → promote registering→active
     │            если success       → _notify_bot_config_ready
     │
@@ -206,7 +207,7 @@ all:
 **Device-level tasks:**
 
 - `apply` success → `device.status = active`, все `device.credentials.is_active = True`, `revoked_at = None`.
-- `revoke` success → **полное удаление** device и его credentials из БД (`db.delete`). `ProvisioningTask`-строка остаётся для audit'а. Причина (комментарий `provisioning.py:631-635`): revoked-записи засоряли UI и карточку подписки после миграций.
+- `revoke` success → `device.status = revoked`, `cred.is_active = False`, `cred.revoked_at = now()`. **Строка Device сохраняется** — её `sub_token` продолжает резолвиться в `/api/sub/{token}` через alias на живого соседа (см. **Sub-link invariant** в `components/backend-api.md`). До 2026-04-15 здесь стоял `db.delete(device)`, что ломало все сохранённые Hiddify/v2rayN URL при каждой миграции.
 - Сбой любой → `device.status = failed`.
 
 ### Bot notification hook
@@ -255,21 +256,30 @@ else:
 
 `sub_token` **не меняется** — это единственный persistent identifier, который клиент хранит (в Hiddify-профиле стоит `https://grinwer.online/sub/<token>`). Ротация токена silently сломала бы все установленные конфиги на клиентах.
 
-**Device-level sub_token и seamless-URL transfer.** После alembic `0022_device_sub_token` каждый `Device` получает собственный `sub_token`, и webapp теперь кладёт в клиента именно device-token URL. При миграции старый device revoke'ается, `_handle_task_outcome` по успеху ansible **полностью удаляет** строку Device из БД (`provisioning.py:754-757`). Без дополнительной логики это сломало бы bumpless «обновления подписки» в Hiddify/v2rayN: сохранённый URL `/sub/<OLD_TOKEN>` после удаления строки возвращал бы 404.
+**Device-level sub_token и seamless-URL через alias (option A).** После alembic `0022_device_sub_token` каждый `Device` получает собственный `sub_token`, и webapp кладёт в клиента именно device-token URL. При миграции старый device revoke'ается, но с 2026-04-15 его строка **сохраняется** в БД (`_handle_task_outcome` ставит `status=revoked` вместо `db.delete`). Новый device на target-ноде создаётся `reprovision_subscription` с собственным свежим `sub_token` — старый токен никто не перезаписывает и не переносит.
 
-**Primary механизм** — перенос всех `sub_token` старых девайсов на новые прямо внутри `migrate_subscription_to_new_node`:
+**Как старый URL продолжает работать.** `api_extensions.dynamic_sub_link`:
 
-1. До revoke: собираем snapshot `[(sub_token, name), …]` по **всем** активным девайсам подписки (sorted by id — детерминированный порядок).
-2. Чистим `old_device.sub_token = None` на каждом и flush — освобождаем unique-значения.
-3. Revoke (ansible async) → worker потом удаляет строки (уже без sub_token, унику не ломает).
-4. `reprovision_subscription` вызывается в цикле **N раз** (по числу сохранённых snapshot'ов, min 1) — каждый раз создаёт свежий Device + кидает свой apply-task.
-5. **Перезаписываем** `new_devices[i].sub_token = old_tokens[i]` и коммитим одним batch'ем.
+1. Находит Device по токену из URL — это **старый** device (уже revoked).
+2. Видит `status != active`, запускает alias-блок.
+3. Ищет на той же `Subscription` самого свежего (по `updated_at`) active-соседа с активными credentials — это **новый** device на target-ноде.
+4. Отдаёт его креды клиенту; в AuditLog extra пишется `aliased_to_device_id`.
 
-В результате все сохранённые пользователем URL (primary + каждый extra slot) продолжают указывать на живые девайсы подписки, переживая любое количество миграций подряд. Юзер жмёт «обновить подписку» — клиент подхватывает новые сервера без повторного копирования. Multi-device подписки с 3 слотами теперь мигрируют полностью seamless.
+Результат: сохранённый в Hiddify/v2rayN URL с первого дня подписки продолжает работать через любое число миграций. Клиент дёргает `/sub/<ORIGINAL_TOKEN>` — всегда получает актуальный набор серверов. Пользователю не нужно переимпортировать URL.
 
-Важный саб-фикс: `reprovision_subscription` теперь формирует `access_username` как `f"user-{uid}-{sid}-{ts}-{token_hex(2)}"` — 4 hex-символа случайности. До этого в цикле N подряд вызовов в одну и ту же секунду получали одинаковый username, и ansible silently дедуплицировал второй device, оставляя подписку с одним реально-рабочим.
+**Load-bearing инвариант.** Три части связки нельзя ломать по отдельности:
 
-**Defense-in-depth** — `api_extensions.dynamic_sub_link` дополнительно проверяет: если lookup по токену нашёл device, но он `revoked/disabled` или без активных credentials — ищет живой device той же Subscription и alias'ит запрос (пишет `aliased_to_device_id` в AuditLog). Это покрывает edge-case'ы (token transfer не сработал, ручное вмешательство в БД, legacy-записи).
+- Revoke **не удаляет** Device (см. провокационный комментарий в `_handle_task_outcome`).
+- `reprovision_subscription` / `provision_subscription` / `create_device_for_subscription` создают **новый** Device, никогда не трогают `sub_token` уже существующих.
+- Alias в `dynamic_sub_link` резолвит нерабочий device на живого соседа.
+
+Если любую из трёх сломать — миграция снова потребует рассылки новых URI через бот (уже прошли этот путь). Детальный инвариант-бокс — `components/backend-api.md` «Sub-link invariant».
+
+**Multi-device подписки.** `reprovision_subscription` на миграции создаёт один Device на всю подписку, не N. Все сохранённые URL (primary + extra slots) коллапсируются на этого одного выжившего через alias. Принято как известное ограничение: same user, same sub, один живой endpoint — миграция seamless, просто в клиенте на всех устройствах одна и та же конфигурация.
+
+Важный саб-фикс: `reprovision_subscription` формирует `access_username` как `f"user-{uid}-{sid}-{ts}-{token_hex(2)}"` — 4 hex-символа случайности. До этого при скоростных подряд-вызовах в одну секунду могли получиться одинаковые username'ы, и ansible silently дедуплицировал второй device.
+
+**Safety net в endpoint'е.** Если alias не нашёл живого соседа И у прямого device все creds неактивны — endpoint возвращает **503**, а не пустой 200. Клиент на 503 retry'ит и **не** трогает свой кэш; на пустой 200 — затёр бы профиль. Срабатывает в коротком окне между revoke и provision, либо когда вся подписка сломана.
 
 **Revoke-timeout tolerance.** Когда старая нода реально мертва/тормозит, ansible revoke через `provision_device.yml state=absent` может упасть по subprocess-таймауту (`ANSIBLE_PLAYBOOK_TIMEOUT`, default 300s). Это **не ломает миграцию** — revoke идёт в background, а новые девайсы на target-ноде уже живы и URL юзера уже алиасится на них. В админ-UI failed revoke-task остаётся как задача с `can_rerun=True` — при желании очистить мусор на старой ноде админ жмёт retry. Таймаут можно поднять через env при регулярно-медленных нодах.
 
