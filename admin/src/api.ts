@@ -80,6 +80,25 @@ export interface AdminTopupResponse {
   tx_id: number;
 }
 
+export interface BatchBanResult {
+  action: "ban" | "unban";
+  done: number[];
+  skipped: number[];
+  not_found: number[];
+}
+
+export function batchBanUsers(
+  userIds: number[],
+  action: "ban" | "unban",
+  reason?: string,
+): Promise<BatchBanResult> {
+  return api.post<BatchBanResult>("/users/batch_ban", {
+    user_ids: userIds,
+    action,
+    reason: reason ?? null,
+  });
+}
+
 export function adminTopupByTelegram(
   telegramId: string,
   amountKopecks: number,

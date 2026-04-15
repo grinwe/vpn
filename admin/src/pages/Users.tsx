@@ -7,6 +7,7 @@ import {
 } from "@tanstack/react-query";
 import {
   api,
+  batchBanUsers,
   DeviceOut,
   SubscriptionMigrateOut,
   SubscriptionOut,
@@ -33,6 +34,12 @@ export default function Users() {
   const [selected, setSelected] = useState<UserOut | null>(null);
   const [topupRub, setTopupRub] = useState("");
   const [topupNote, setTopupNote] = useState("");
+  // Bulk selection lives next to single-row selection. Single-row
+  // selection (`selected`) drives the detail sidebar; `selectedIds` is
+  // the set used by bulk ban/unban. They are intentionally independent —
+  // you can check a row for a bulk op without opening its details, and
+  // vice versa.
+  const [selectedIds, setSelectedIds] = useState<Set<number>>(new Set());
 
   const {
     data: usersData,
@@ -168,10 +175,79 @@ export default function Users() {
     onError: (e: Error) => alert(`Не удалось перевести: ${e.message}`),
   });
 
+  const batchBan = useMutation({
+    mutationFn: ({
+      ids,
+      action,
+    }: {
+      ids: number[];
+      action: "ban" | "unban";
+    }) => batchBanUsers(ids, action),
+    onSuccess: (res) => {
+      alert(
+        `${res.action === "ban" ? "Забанено" : "Разбанено"}: ${res.done.length}` +
+          (res.skipped.length
+            ? `, пропущено: ${res.skipped.length} (уже в нужном состоянии)`
+            : "") +
+          (res.not_found.length
+            ? `, не найдено: ${res.not_found.length}`
+            : ""),
+      );
+      setSelectedIds(new Set());
+      qc.invalidateQueries({ queryKey: ["users"] });
+    },
+    onError: (e: Error) => alert(`Batch ban/unban ошибка: ${e.message}`),
+  });
+
+  const toggleRowSelected = (id: number) => {
+    setSelectedIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  };
+
+  const selArr = Array.from(selectedIds);
+  const hasSelection = selArr.length > 0;
+
   return (
     <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
       <div className="lg:col-span-2">
-        <h1 className="text-2xl font-semibold mb-4">Users</h1>
+        <div className="flex items-center gap-3 mb-4 flex-wrap">
+          <h1 className="text-2xl font-semibold">Users</h1>
+          {hasSelection && (
+            <div className="flex items-center gap-2 ml-auto">
+              <span className="text-xs text-slate-400">
+                {selArr.length} выбрано
+              </span>
+              <button
+                disabled={batchBan.isPending}
+                onClick={() => {
+                  if (
+                    confirm(
+                      `Забанить ${selArr.length} юзер(ов)?\n\nБот будет молча дропать все апдейты от этих Telegram-аккаунтов. Подписки НЕ затрагиваются.`,
+                    )
+                  )
+                    batchBan.mutate({ ids: selArr, action: "ban" });
+                }}
+                className="text-xs px-2 py-1 rounded bg-red-700 hover:bg-red-600 disabled:opacity-50"
+              >
+                ban all
+              </button>
+              <button
+                disabled={batchBan.isPending}
+                onClick={() => {
+                  if (confirm(`Разбанить ${selArr.length} юзер(ов)?`))
+                    batchBan.mutate({ ids: selArr, action: "unban" });
+                }}
+                className="text-xs px-2 py-1 rounded bg-emerald-700 hover:bg-emerald-600 disabled:opacity-50"
+              >
+                unban all
+              </button>
+            </div>
+          )}
+        </div>
         <input
           type="text"
           placeholder="Поиск по telegram_id или email…"
@@ -186,6 +262,22 @@ export default function Users() {
             <table className="w-full text-sm">
               <thead className="text-left text-slate-400 border-b border-slate-700">
                 <tr>
+                  <th className="py-2 w-8">
+                    <input
+                      type="checkbox"
+                      checked={
+                        users.length > 0 && selectedIds.size === users.length
+                      }
+                      onChange={() => {
+                        if (selectedIds.size === users.length) {
+                          setSelectedIds(new Set());
+                        } else {
+                          setSelectedIds(new Set(users.map((u) => u.id)));
+                        }
+                      }}
+                      className="accent-blue-600"
+                    />
+                  </th>
                   <th className="py-2">ID</th>
                   <th>Telegram</th>
                   <th>Email</th>
@@ -201,10 +293,30 @@ export default function Users() {
                     onClick={() => setSelected(u)}
                     className={`cursor-pointer border-b border-slate-800 hover:bg-slate-800 ${
                       selected?.id === u.id ? "bg-slate-800" : ""
+                    } ${selectedIds.has(u.id) ? "bg-blue-950/30" : ""} ${
+                      u.banned_at ? "text-red-300" : ""
                     }`}
                   >
+                    <td
+                      className="py-2"
+                      onClick={(e) => e.stopPropagation()}
+                    >
+                      <input
+                        type="checkbox"
+                        checked={selectedIds.has(u.id)}
+                        onChange={() => toggleRowSelected(u.id)}
+                        className="accent-blue-600"
+                      />
+                    </td>
                     <td className="py-2">{u.id}</td>
-                    <td>{u.telegram_id ?? "—"}</td>
+                    <td>
+                      {u.telegram_id ?? "—"}
+                      {u.banned_at && (
+                        <span className="ml-2 inline-block text-[10px] px-1.5 py-0.5 rounded bg-red-900/60 text-red-200 border border-red-700/50 align-middle">
+                          banned
+                        </span>
+                      )}
+                    </td>
                     <td>{u.email ?? "—"}</td>
                     <td>{u.subscription_count}</td>
                     <td>{(u.balance_kopecks / 100).toFixed(2)} ₽</td>

@@ -284,6 +284,80 @@ def unban_user(
     return {"status": "unbanned"}
 
 
+class BatchBanRequest(BaseModel):
+    # `ban` sets banned_at=now on the given user_ids, `unban` clears it.
+    # Audit rows are per-user so individual bans remain attributable even
+    # when this arrived as a batch. The Invoices bulk endpoint returns the
+    # same `{done, skipped, not_found}` shape — we mirror it so the admin
+    # UI can reuse the same result-summary toast.
+    user_ids: list[int] = Field(min_length=1, max_length=500)
+    action: str  # "ban" or "unban"
+    reason: str | None = Field(default=None, max_length=500)
+
+
+@router.post("/users/batch_ban")
+def batch_ban(
+    body: BatchBanRequest,
+    db: Session = Depends(get_db),
+    admin_token: str = Depends(require_admin),
+    admin_actor: str | None = Header(default=None, alias=ADMIN_ACTOR_HEADER),
+):
+    if body.action not in ("ban", "unban"):
+        raise HTTPException(
+            status_code=400, detail="action must be 'ban' or 'unban'"
+        )
+    users = (
+        db.query(models.User).filter(models.User.id.in_(body.user_ids)).all()
+    )
+    found_ids = {u.id for u in users}
+    not_found = [uid for uid in body.user_ids if uid not in found_ids]
+    actor, actor_type = _resolve_admin_actor(admin_actor)
+
+    done: list[int] = []
+    skipped: list[int] = []
+    now = utcnow()
+    for user in users:
+        if body.action == "ban":
+            if user.banned_at is not None:
+                skipped.append(user.id)
+                continue
+            user.banned_at = now
+            db.add(
+                models.AuditLog(
+                    actor=actor,
+                    actor_type=actor_type,
+                    action="user_banned",
+                    target_type="user",
+                    target_id=user.id,
+                    extra={"reason": body.reason, "batch": True},
+                )
+            )
+            done.append(user.id)
+        else:
+            if user.banned_at is None:
+                skipped.append(user.id)
+                continue
+            user.banned_at = None
+            db.add(
+                models.AuditLog(
+                    actor=actor,
+                    actor_type=actor_type,
+                    action="user_unbanned",
+                    target_type="user",
+                    target_id=user.id,
+                    extra={"batch": True},
+                )
+            )
+            done.append(user.id)
+    db.commit()
+    return {
+        "action": body.action,
+        "done": done,
+        "skipped": skipped,
+        "not_found": not_found,
+    }
+
+
 @router.get(
     "/users/by_telegram/{telegram_id}",
     response_model=list[schemas.SubscriptionOut],
