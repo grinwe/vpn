@@ -475,12 +475,21 @@ async def cmd_config(message: types.Message):
             lines.append(f"<b>{proto}:</b>")
             lines.append(f"<code>{config_text}</code>\n")
 
-    # Add dynamic subscription link if available
+    # Подписочная ссылка уезжает вторым отдельным сообщением —
+    # на мобильном тап-копирование одной короткой строки ловит URL
+    # без промаха, а в многострочном HTML-посте рядом с креденшелами
+    # юзеры стабильно промахивались мимо <code>.
     sub_token = active_sub.get("sub_token")
-    if sub_token and SUB_LINK_BASE_URL:
-        sub_url = f"{SUB_LINK_BASE_URL.rstrip('/')}/{sub_token}"
-        lines.append("🔗 <b>Ссылка подписки</b> (автообновляется при смене сервера):")
-        lines.append(f"<code>{sub_url}</code>\n")
+    sub_url = (
+        f"{SUB_LINK_BASE_URL.rstrip('/')}/{sub_token}"
+        if sub_token and SUB_LINK_BASE_URL
+        else None
+    )
+    if sub_url:
+        lines.append(
+            "🔗 <b>Ссылка подписки</b> (автообновляется при смене сервера) — "
+            "следующим сообщением, тапни чтобы скопировать ⬇️"
+        )
 
     lines.append(
         "Не знаешь как настроить? Нажми кнопку с твоей платформой ниже 👇"
@@ -491,6 +500,12 @@ async def cmd_config(message: types.Message):
         reply_markup=onboarding_keyboard(),
         parse_mode="HTML",
     )
+    if sub_url:
+        await message.answer(
+            f"<code>{sub_url}</code>",
+            parse_mode="HTML",
+            disable_web_page_preview=True,
+        )
 
 
 # ── Onboarding instructions callbacks ──

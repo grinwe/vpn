@@ -20,7 +20,6 @@ purchase flow.
 from __future__ import annotations
 
 import logging
-import os
 from collections import defaultdict
 from datetime import datetime, timedelta
 
@@ -278,18 +277,6 @@ def migrate_subscriptions_off(
             # telegram_id in extra the poller silently drops the row, so
             # skip the write for non-Telegram users (e.g. email-only).
             if sub.user and sub.user.telegram_id and sub.user.notify_migrations:
-                # Resolve the same subscription URI the webapp cabinet shows
-                # (primary device's sub_token, falling back to sub-level
-                # token) so the notification points straight at the new
-                # config instead of forcing the user to open /config.
-                sub_base = os.getenv("SUB_LINK_BASE_URL", "").rstrip("/")
-                device_token = _device.sub_token if _device and _device.sub_token else sub.sub_token
-                sub_uri: str | None = None
-                if device_token:
-                    sub_uri = (
-                        f"{sub_base}/{device_token}" if sub_base
-                        else f"/api/sub/{device_token}"
-                    )
                 db.add(
                     models.AuditLog(
                         actor="health_monitor",
@@ -302,7 +289,6 @@ def migrate_subscriptions_off(
                             "old_node": node.name,
                             "new_node": target.name,
                             "reason": reason,
-                            "sub_uri": sub_uri,
                         },
                     )
                 )

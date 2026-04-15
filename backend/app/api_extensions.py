@@ -562,16 +562,24 @@ def get_pending_notifications(
                 "Продли сейчас через /renew, иначе VPN отключится."
             )
         elif log.action == "config_ready":
-            text = (
-                "✅ Конфиг VPN готов!\n"
-                "Используй /config чтобы получить ссылку для подключения."
-            )
-        elif log.action == "migration_notice":
             sub_uri = extra.get("sub_uri")
             text = (
-                "🔄 Твой VPN-сервер был перемещён.\n"
-                + (f"Новый конфиг: {sub_uri}\n" if sub_uri else "")
-                + "Чтобы всё продолжило работать - нажми 🔄 и переподключись в своем VPN-клиенте (V2rayNG / Hiddify / Streisand и т.п.)"
+                "✅ Конфиг VPN готов!\n"
+                + (f"Ссылка: {sub_uri}\n" if sub_uri else "")
+            )
+        elif log.action == "migration_notice":
+            # Намеренно без URL. Подписочная ссылка, лежащая в профиле
+            # Hiddify/V2rayNG, продолжает резолвиться после миграции
+            # через sibling-alias в /sub/{token} (см. api_extensions.py
+            # «Seamless-migration alias»). Юзеру достаточно дёрнуть
+            # refresh в клиенте. Раньше в сообщении был /api/sub/…,
+            # но это путало — люди копировали его и импортировали
+            # заново вместо того, чтобы нажать 🔄.
+            text = (
+                "🔄 Твой VPN-сервер переехал.\n"
+                "Подписка обновится в клиенте автоматически — "
+                "просто нажми 🔄 рядом с профилем в Hiddify / V2rayNG / Streisand.\n"
+                "Ничего переустанавливать и копировать не нужно."
             )
         elif log.action == "low_balance_warning":
             days = extra.get("days_remaining", "?")
