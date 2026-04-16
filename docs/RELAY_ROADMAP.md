@@ -283,6 +283,29 @@
 
 **Acceptance F:** после 10 рестартов воркера `rq info` показывает не больше 8 tick-jobs в `scheduled`; `GET /provisioning/queue-status` отдаёт консистентную картину; нажатие «backfill креды» на уже сломанной ноде приводит к появлению недостающего протокола в `/sub/{token}` в течение одного resync-цикла.
 
+## G. Hardening admin UX и multi-exit балансировка (2026-04-17+)
+
+Стабильность после Stage F — момент подобрать UX-долги и развернуть схему «несколько exit'ов на одну relay» для балансировки нагрузки. Crash-safety не затрагивается (checkpoint `checkpoint-F-stable-2026-04-17`).
+
+**G.1 — Умное удаление ноды.**
+- `backend/alembic 0028_subscription_node_id_nullable` — `Subscription.node_id` становится `nullable=True` с `ON DELETE SET NULL`. До этого терминальная история (expired/terminated subs) блокировала `DELETE /api/nodes/{id}` FK-констрейнтом, админка отвечала опакным «Не удалось удалить». После: история остаётся в БД с `node_id=NULL`, webapp продолжает резолвить `sub_token` через device-alias.
+- `backend/app/api/nodes.py::delete_node` — перед `db.delete(node)` каскадно дропает `Credential`-ы с `pool_state=warm` на этой ноде (inventory, не user-data), ловит `IntegrityError` и конвертирует в 409 с внятным `detail`. 409 при `active/frozen` подписках теперь возвращает `{active_subs: N}` структурированно.
+- `admin/src/pages/Nodes.tsx` — обработка 409 `{active_subs}`: оффер «N живых подписок, мигрировать и удалить?» → `POST /migrate` → повторный DELETE после успешной миграции. Синхронно — потому что `migrate_subscription_to_new_node` флипает `subscription.node_id` в одной транзакции до запуска ansible; после ответа endpoint'а активных subs на ноде уже нет (ansible-таски висят в фоне, но они не трогают FK).
+
+**G.2 — Detach exit'а честно гоняет ansible.**
+- `backend/app/api/exits.py::delete_link` — помимо DB cleanup, создаёт `ProvisioningTask(target_type=wg_exit_node, action=wg_peer_remove, payload={relay_node_id, wg_client_public_key})`. Новый playbook `infra/ansible/playbooks/wg_exit_peer_remove.yml` + role task `wg_exit_node/tasks/remove_peer.yml` — удаляет `[Peer]` блок из `wg0.conf` exit'а по pubkey и перезагружает `wg-quick@wg0`. Идемпотентно (если peer уже отсутствует — no-op).
+- UI: текущий «Ansible НЕ запустится (D.1 ещё не готов)» confirm заменяется на «Удалить peer с exit'а и почистить relay_config? Запустится ansible на exit-ноде».
+
+**G.3+ — Multi-exit per relay (балансировка нагрузки).**
+Цель: один relay (дешёвый жирный RU-хост) проксирует юзеров на несколько зарубежных exit'ов с авто-распределением нагрузки. Декомпозиция (перед стартом сверить с пользователем):
+- **G.3 schema** — снять `unique` на `RelayExitLink.relay_node_id` (M:N вместо 1:1). Добавить `Credential.exit_id` FK → `WGExitNode.id nullable=True ON DELETE SET NULL`. Добавить `RelayExitLink.wg_interface_name` (`wg0`, `wg1`, ...) с уникальностью по `(relay_node_id, wg_interface_name)`. Миграция `0029_multi_exit_per_relay`.
+- **G.4 backend провижининг** — при создании Credential (cold-path + warm-pool): если у relay несколько активных `RelayExitLink`-ов, выбрать наименее загруженный exit (count credentials per `exit_id` в рамках relay), записать `credential.exit_id`. Warm-pool: bundle credentials одной identity стягиваются на один exit_id.
+- **G.5 ansible relay_jump_node** — цикл по `RelayExitLink`-ам вместо одного wg0: каждый линк → свой `wg-quick@wgN` с `[Peer]`-ом, endpoint'ом и `Address = relay_private_ip/32`. `iptables nat` остаётся одним MASQUERADE (общий для всех wgN).
+- **G.6 xray config на relay** — рендерится с N outbound'ами (по одному на линк, с `sockopt.interface: wgN`) + routing-правилами `type=field, user=[uuid1,uuid2], outboundTag=exit-N`. Источник правды — `credential.exit_id` на VLESS family creds ноды. Default outbound = relay's own egress (для юзеров без exit_id, напр. ещё не провижённых warm-pool bundles).
+- **G.7 admin UI** — на `Exits.tsx` текущий «один relay — один exit» UX становится «attach multiple», на `Nodes.tsx` в expand-блоке relay-ноды показываем список линков с counter'ами credentials per exit. Кнопка «перебалансировать» (опционально) — пересобрать `credential.exit_id` распределение через orchestrator.
+
+**Acceptance G:** (1) удаление ноды работает на любой ноде без ручной чистки БД; если есть живые subs — UI предлагает мигрировать и удаляет после; (2) detach на exit-ноде с живым relay снимает peer из wg0.conf за один ansible run; (3) для relay с 3-мя линками 9 юзеров распределяются 3+3+3 автоматически, каждый стабильно выходит через свой exit.
+
 ## Риски и открытые вопросы
 
 - **Шифрование relay_config.** Сейчас `wg_private_key` в JSONB plain. В B — шифровать через `credentials.encrypt` (та же схема, что `ss_password_enc`).
