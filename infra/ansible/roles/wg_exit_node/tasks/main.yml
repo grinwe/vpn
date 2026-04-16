@@ -35,6 +35,22 @@
     state: present
     update_cache: yes
 
+# Many providers ship Ubuntu with UFW active and INPUT policy DROP,
+# allowing only SSH/HTTP(S). Without this rule, WG handshake packets
+# from relays arrive at the interface but are silently dropped before
+# the kernel WG module ever sees them — wg show reports 0 received,
+# no dmesg errors, tunnel is permanently "initiating".
+- name: Detect UFW binary
+  stat:
+    path: /usr/sbin/ufw
+  register: wg_exit_ufw_bin
+
+- name: Allow WireGuard UDP port through UFW
+  when: wg_exit_ufw_bin.stat.exists
+  command: ufw allow {{ wg_exit_port | default(51820) }}/udp
+  register: wg_exit_ufw_allow
+  changed_when: "'Skipping adding existing rule' not in (wg_exit_ufw_allow.stdout | default(''))"
+
 - name: Enable IPv4 forwarding
   sysctl:
     name: net.ipv4.ip_forward
@@ -61,7 +77,9 @@
   iptables:
     table: nat
     chain: POSTROUTING
-    source: "{{ wg_exit_address_v4 | default('10.77.0.1/24') | ansible.utils.ipaddr('network/prefix') }}"
+    # Network CIDR precomputed by the backend (_collect_exit_extra_vars)
+    # to avoid the ansible.utils collection dependency.
+    source: "{{ wg_exit_network_v4 | default('10.77.0.0/24') }}"
     out_interface: "{{ ansible_default_ipv4.interface }}"
     jump: MASQUERADE
   notify: persist iptables

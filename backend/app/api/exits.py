@@ -237,6 +237,25 @@ def delete_exit(
     return {"exit_id": exit_id, "deleted": True}
 
 
+@router.post("/exits/_keygen")
+def preview_keygen(
+    db: Session = Depends(get_db),
+    admin_token: str = Depends(require_admin),
+):
+    """Generate a fresh WG keypair without persisting — form helper.
+
+    The ``ExitForm`` in the admin UI calls this so the operator can
+    fill the create/edit form with a valid keypair in one click
+    (browsers sometimes autofill ``type=password`` fields with unrelated
+    credentials, producing a urlsafe-base64 string that wg-quick
+    rejects with "Key is not the correct length or format"). No DB
+    row is created — the generated pair is only stored if the admin
+    submits the form.
+    """
+    pub, priv = generate_wireguard_keypair()
+    return {"wg_public_key": pub, "wg_private_key": priv}
+
+
 @router.post("/exits/{exit_id}/keygen", response_model=schemas.WGExitKeygenOut)
 def keygen_exit(
     exit_id: int,
@@ -259,6 +278,46 @@ def keygen_exit(
     actor, actor_type = _resolve_admin_actor(admin_actor)
     _audit(db, actor, "wg_exit_keygen", "wg_exit_node", exit_node.id, actor_type=actor_type)
     return schemas.WGExitKeygenOut(id=exit_node.id, wg_public_key=pub)
+
+
+@router.post("/exits/{exit_id}/bootstrap")
+def rebootstrap_exit(
+    exit_id: int,
+    db: Session = Depends(get_db),
+    admin_token: str = Depends(require_admin),
+    admin_actor: str | None = Header(default=None, alias=ADMIN_ACTOR_HEADER),
+):
+    """Re-run ``bootstrap_exit.yml`` against an existing exit.
+
+    Mirror of :func:`~backend.app.api.nodes.rebootstrap_node` for WG
+    exit nodes. Use when the ``wg_exit_node`` role changed, manual
+    edits on the server need to be reconciled, or keys were rotated.
+    The role is idempotent — the peer list is re-rendered from the
+    current ``relay_exit_links`` rows, so attached relays keep their
+    tunnels. Creates a fresh ``bootstrap`` task (same action
+    :func:`create_exit` schedules on first registration) and hands it
+    to the orchestrator.
+    """
+    exit_node = db.get(models.WGExitNode, exit_id)
+    if not exit_node:
+        raise HTTPException(status_code=404, detail="Exit node not found")
+    orchestrator = ProvisioningOrchestrator(db)
+    task = orchestrator.create_task(
+        "exit", exit_node.id, "bootstrap", {"rerun": True}
+    )
+    db.commit()
+    orchestrator.run_task_async(task)
+    actor, actor_type = _resolve_admin_actor(admin_actor)
+    _audit(
+        db,
+        actor,
+        "wg_exit_bootstrap_rerun",
+        "wg_exit_node",
+        exit_node.id,
+        actor_type=actor_type,
+        metadata={"task_id": task.id},
+    )
+    return {"exit_id": exit_node.id, "task_id": task.id}
 
 
 @router.get("/exits/{exit_id}/links", response_model=list[schemas.RelayExitLinkOut])

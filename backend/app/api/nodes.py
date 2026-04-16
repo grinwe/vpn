@@ -421,8 +421,15 @@ def create_config(
     # drop them so the warmer rebuilds with the new config included.
     from ..services import warm_pool
     warm_pool.invalidate_node_warm_pool(db, node.id, reason="config added")
-    # Run site.yml so Ansible installs the new protocol on the node.
     orchestrator = ProvisioningOrchestrator(db)
+    # Backfill credentials for existing devices on this node — without
+    # this, users provisioned before the new protocol existed get an
+    # updated node xray config but a stale per-user credential set, and
+    # the new protocol never appears in /sub/{token}. The node-level
+    # bootstrap's auto-resync (_handle_task_outcome → resync_node_clients)
+    # then pushes the newly-created vless-family rows onto the node.
+    orchestrator.backfill_credentials_for_new_config(node, config)
+    # Run site.yml so Ansible installs the new protocol on the node.
     task = orchestrator.create_task(
         "node", node.id, "bootstrap",
         {"pool_id": node.pool_id, "config_change": True},

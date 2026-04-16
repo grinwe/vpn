@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import base64
+import ipaddress
 import logging
 import os
 import re
@@ -507,11 +508,28 @@ def _collect_exit_extra_vars(
         }
         for link in links
     ]
+    # Precompute the subnet for NAT masquerade. The role used to call
+    # `ansible.utils.ipaddr('network/prefix')` but that collection isn't
+    # shipped with the backend's Ansible, and adding it means another
+    # image rebuild — cheaper to derive it here where we have Python's
+    # stdlib. `ip_interface` accepts both "10.77.0.1/24" (host/prefix)
+    # and bare IPs (treated as /32 — admin error, caller will see the
+    # assertion fail when the wg interface won't come up).
+    try:
+        wg_exit_network_v4 = str(
+            ipaddress.ip_interface(exit_node.wg_address_v4).network
+        )
+    except ValueError as exc:
+        raise RuntimeError(
+            f"Exit node {exit_node.name} has invalid "
+            f"wg_address_v4={exit_node.wg_address_v4!r}: {exc}"
+        ) from exc
     extra: dict[str, Any] = {
         "wg_exit_private_key": decrypt(exit_node.wg_private_key_enc),
         "wg_exit_peers": peers,
         "wg_exit_port": exit_node.wg_port,
         "wg_exit_address_v4": exit_node.wg_address_v4,
+        "wg_exit_network_v4": wg_exit_network_v4,
     }
     # String values are scanned for Jinja2 markers / newlines; the peer
     # list is a list of dicts and skips the string branch. Defence-in-depth
@@ -1376,6 +1394,128 @@ class ProvisioningOrchestrator:
         self.run_task_async(task, node=node)
         self.db.refresh(subscription)
         return subscription, task
+
+    def backfill_credentials_for_new_config(
+        self, node: models.VPNNode, new_config: models.VPNConfig
+    ) -> int:
+        """Create ``Credential`` rows for every existing Device on ``node``
+        when a new protocol has just been added to the node.
+
+        Subscriptions created before the new config existed only have
+        credentials for the protocols that were enabled at provision
+        time — adding a new VPNConfig updates the server's xray config
+        but leaves user subscriptions unchanged, so the new protocol
+        never appears in ``/sub/{token}``. This backfill closes that
+        gap: rows are written with ``is_active=True`` so that the
+        node-level bootstrap's auto-resync (``_handle_task_outcome``
+        → ``resync_node_clients``) picks up the new vless-family rows
+        and pushes them onto the node via ``manage_vless_*_user.sh``.
+
+        For VLESS family we reuse the device's existing VLESS UUID so
+        the node sees one user across all vless-* protocols; if the
+        device has no prior VLESS credential, a fresh UUID is minted.
+        Returns the number of rows created.
+        """
+        proto = new_config.protocol
+        supported = {
+            models.VPNConfigProtocol.vless_reality,
+            models.VPNConfigProtocol.vless_xhttp,
+            models.VPNConfigProtocol.vless_ws_cdn,
+            models.VPNConfigProtocol.shadowtls_ss,
+            models.VPNConfigProtocol.hysteria2,
+        }
+        if proto not in supported:
+            logger.warning(
+                "backfill: unsupported protocol %s on node %s, skipping",
+                proto.value, node.id,
+            )
+            return 0
+
+        devices = (
+            self.db.query(models.Device)
+            .join(
+                models.Subscription,
+                models.Subscription.id == models.Device.subscription_id,
+            )
+            .filter(
+                models.Subscription.node_id == node.id,
+                models.Subscription.status == models.SubscriptionStatus.active,
+                models.Device.status.in_(
+                    (models.DeviceStatus.active, models.DeviceStatus.pending)
+                ),
+            )
+            .all()
+        )
+
+        created = 0
+        for device in devices:
+            existing = next(
+                (c for c in device.credentials if c.config_id == new_config.id),
+                None,
+            )
+            if existing is not None:
+                continue
+
+            username = device.access_username
+            if not username:
+                logger.warning(
+                    "backfill: device %s has no access_username, skipping",
+                    device.id,
+                )
+                continue
+
+            if proto.value in _VLESS_FAMILY_PROTOS:
+                user_uuid: str | None = None
+                for cred in device.credentials:
+                    if cred.proto in _VLESS_FAMILY_PROTOS:
+                        user_uuid = _extract_vless_uuid(cred.config_text)
+                        if user_uuid:
+                            break
+                if not user_uuid:
+                    user_uuid = str(uuid.uuid4())
+
+                if proto == models.VPNConfigProtocol.vless_reality:
+                    cred_text = _build_vless_reality_credential(
+                        node, new_config, user_uuid
+                    )
+                elif proto == models.VPNConfigProtocol.vless_xhttp:
+                    cred_text = _build_vless_xhttp_credential(
+                        node, new_config, user_uuid
+                    )
+                else:
+                    cred_text = _build_vless_ws_cdn_credential(
+                        node, new_config, user_uuid
+                    )
+            elif proto == models.VPNConfigProtocol.shadowtls_ss:
+                cred_text = _build_shadowtls_credential(
+                    node, new_config, username, secrets.token_urlsafe(12)
+                )
+            else:
+                cred_text = _build_hysteria2_credential(
+                    node, new_config, secrets.token_urlsafe(12)
+                )
+
+            self.db.add(
+                models.Credential(
+                    subscription_id=device.subscription_id,
+                    device_id=device.id,
+                    config_id=new_config.id,
+                    node_id=node.id,
+                    proto=proto.value,
+                    config_text=encrypt(cred_text),
+                    access_username=username,
+                    is_active=True,
+                )
+            )
+            created += 1
+
+        if created:
+            self.db.flush()
+            logger.info(
+                "backfill: created %s credentials for node %s config %s (%s)",
+                created, node.id, new_config.id, proto.value,
+            )
+        return created
 
     def resync_node_clients(
         self, node: models.VPNNode

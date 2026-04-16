@@ -58,18 +58,23 @@
         enabled: yes
         state: started
 
+    # Retry with backoff — after the exit peer list was (re)applied
+    # earlier in the same relay_tunnel run, wg needs a few seconds to
+    # handshake. If still down after ~30s, fail the play loudly so a
+    # broken tunnel cannot masquerade as a successful bootstrap (which
+    # is what the previous failed_when:false variant allowed — the
+    # admin saw green, but client traffic silently timed out).
     - name: Test tunnel connectivity
       command: curl -s --interface wg0 --connect-timeout 5 https://ifconfig.me
       register: tunnel_test
       changed_when: false
-      failed_when: false
+      retries: 6
+      delay: 5
+      until: tunnel_test.rc == 0
 
     - name: Report tunnel status
       debug:
-        msg: >-
-          WireGuard tunnel {{ 'UP — exit IP: ' + tunnel_test.stdout
-            if tunnel_test.rc == 0
-            else 'DOWN — check endpoint and keys' }}
+        msg: "WireGuard tunnel UP — exit IP: {{ tunnel_test.stdout }}"
 
     - name: Find existing xray configs
       find:
@@ -90,12 +95,13 @@
           exit 78
         fi
         TMP=$(mktemp)
+        # Plain path-assign; the earlier form (path) |= .x = value is a
+        # jq syntax error because |= cannot be chained into another =.
         jq '
-          (.outbounds[] | select(.tag == "direct" and .protocol == "freedom")) |=
-            .streamSettings.sockopt = {
-              "interface": "wg0",
-              "tcpKeepAliveInterval": 30
-            }
+          (.outbounds[] | select(.tag == "direct" and .protocol == "freedom")).streamSettings.sockopt = {
+            "interface": "wg0",
+            "tcpKeepAliveInterval": 30
+          }
         ' "${CONFIG}" > "${TMP}"
         jq -e . "${TMP}" > /dev/null || { rm -f "${TMP}"; exit 1; }
         mv "${TMP}" "${CONFIG}"

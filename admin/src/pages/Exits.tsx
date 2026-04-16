@@ -85,6 +85,16 @@ export default function Exits() {
     onError: (e: Error) => alert(`Ошибка: ${e.message}`),
   });
 
+  const bootstrapMut = useMutation({
+    mutationFn: (id: number) =>
+      api.post<{ exit_id: number; task_id: number }>(
+        `/exits/${id}/bootstrap`,
+        {},
+      ),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ["wg-exits"] }),
+    onError: (e: Error) => alert(`Ошибка: ${e.message}`),
+  });
+
   const toggleExpanded = (id: number) => {
     setExpanded((prev) => {
       const next = new Set(prev);
@@ -196,6 +206,27 @@ export default function Exits() {
                           className="text-xs px-2 py-1 rounded bg-purple-700 hover:bg-purple-600 disabled:opacity-50"
                         >
                           keygen
+                        </button>
+                        <button
+                          disabled={bootstrapMut.isPending || !e.has_private_key}
+                          title={
+                            !e.has_private_key
+                              ? "Сначала сгенерируйте ключ (keygen)"
+                              : undefined
+                          }
+                          onClick={() => {
+                            if (
+                              confirm(
+                                `Перекатить bootstrap_exit.yml на exit #${e.id} (${e.name})?\n\n` +
+                                  "Роль идемпотентна — peer list перерендерится из текущих привязок, " +
+                                  "активные тоннели не пострадают.",
+                              )
+                            )
+                              bootstrapMut.mutate(e.id);
+                          }}
+                          className="text-xs px-2 py-1 rounded bg-purple-700 hover:bg-purple-600 disabled:opacity-50"
+                        >
+                          bootstrap
                         </button>
                         <button
                           disabled={deleteMut.isPending || e.peers_count > 0}
@@ -479,6 +510,20 @@ function ExitForm({
     onError: (e: Error) => setErr(e instanceof ApiError ? `${e.status}: ${e.message}` : e.message),
   });
 
+  const keygenPreviewMut = useMutation({
+    mutationFn: () =>
+      api.post<{ wg_public_key: string; wg_private_key: string }>(
+        "/exits/_keygen",
+        {},
+      ),
+    onSuccess: (res) => {
+      setWgPublic(res.wg_public_key);
+      setWgPrivate(res.wg_private_key);
+      setErr(null);
+    },
+    onError: (e: Error) => setErr(`Ошибка генерации ключа: ${e.message}`),
+  });
+
   function submit(e: React.FormEvent) {
     e.preventDefault();
     setErr(null);
@@ -561,10 +606,21 @@ function ExitForm({
         />
       </label>
       <label className="flex flex-col col-span-2">
-        <span className="text-slate-400 mb-1">WG public key (optional — use keygen кнопку)</span>
+        <div className="flex items-center justify-between mb-1">
+          <span className="text-slate-400">WG public key (опционально)</span>
+          <button
+            type="button"
+            disabled={keygenPreviewMut.isPending}
+            onClick={() => keygenPreviewMut.mutate()}
+            className="text-xs px-2 py-0.5 rounded bg-purple-700 hover:bg-purple-600 disabled:opacity-50"
+          >
+            {keygenPreviewMut.isPending ? "…" : "Сгенерировать пару"}
+          </button>
+        </div>
         <input
           value={wgPublic}
           onChange={(e) => setWgPublic(e.target.value)}
+          autoComplete="new-password"
           className="bg-slate-800 border border-slate-700 rounded px-2 py-1 font-mono"
         />
       </label>
@@ -577,6 +633,7 @@ function ExitForm({
           value={wgPrivate}
           onChange={(e) => setWgPrivate(e.target.value)}
           placeholder={isEdit && editExit?.has_private_key ? "••••••••" : ""}
+          autoComplete="new-password"
           className="bg-slate-800 border border-slate-700 rounded px-2 py-1 font-mono"
         />
       </label>
