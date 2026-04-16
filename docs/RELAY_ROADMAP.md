@@ -212,18 +212,22 @@
 - `schemas.NodeBulkMigrateOut` + `NodeBulkMigrateFailure` — строгая pydantic‑схема ответа.
 - `admin/src/pages/Nodes.tsx`: кнопка «переселить на…» в строке ноды + модалка `MigrateToModal` с dropdown активных нод (исключая from). Мутация `migrateTo`, успех запускает банер `addOp({kind: "migration"})` с task_ids/device_task_ids/resync_task_ids; при наличии failed — alert с первыми 3 ошибками.
 
-**D.3 — Production миграция (операционно)**
+**D.3 — Production миграция (операционно) — runbook готов, ждёт оператора**
 
 Фазово, на каждой из 8 foreign нод. Запускается ТОЛЬКО по команде пользователя, по одной ноде за раз.
 
+Полный пошаговый runbook — [`docs/operations/relay-migration.md`](operations/relay-migration.md). Краткое резюме:
+
 1. **P1:** создать `wg_exit_nodes` row для существующей ноды, bootstrap exit‑роли через `site.yml --tags wg-exit --limit foreign-01`. VLESS на ноде продолжает работать параллельно.
-2. **P2:** создать RU‑relay в админке с `exit_id=<foreign-01>`, дождаться `active`.
-3. **P3:** `POST /nodes/{foreign-01.id}/migrate-to/{ru-relay.id}`. `sub_token` сохраняется, клиенты на следующем profile‑update получают `vless://...@ru-relay`.
-4. **P4:** когда `active subs == 0` на foreign‑01 — disable VLESS‑роли на ней (флаг в админке "это теперь pure exit", или удаление `vpn_nodes` row).
+2. **P2:** создать RU‑relay в админке, прикрепить к `exit-foreign-01`, дождаться `active`.
+3. **P3:** в админке нажать «переселить на…» → выбрать `ru-relay-01`. `POST /nodes/{foreign-01.id}/migrate-to/{ru-relay-01.id}`. `sub_token` сохраняется, клиенты на следующем profile‑update получают `vless://...@ru-relay-01`.
+4. **P4:** когда `active subs == 0` на foreign‑01 — удалить или задизейблить VLESS‑сервисы на ней.
 
 Между шагами — выдержка (сутки) для проверки что юзеры перерефетчили sub‑link.
 
-**Acceptance:** после прохода всех 8 нод: в админке "8 exit, N relay", все active subs на relay, зарубежные ноды без VLESS‑сервисов.
+Откат (каждая фаза) и мониторинг‑запросы описаны в runbook'е.
+
+**Acceptance:** после прохода всех 8 нод: в админке «8 exit, N relay», все active subs на relay, зарубежные ноды без VLESS‑сервисов.
 
 ## Риски и открытые вопросы
 
