@@ -451,7 +451,6 @@ def _collect_site_extra_vars(node: models.VPNNode) -> dict[str, Any]:
         extra.update({
             "relay_wg_private_key": rc.get("wg_private_key", ""),
             "relay_wg_address_v4": rc.get("wg_address_v4", ""),
-            "relay_wg_address_v6": rc.get("wg_address_v6", ""),
             "relay_wg_endpoint": rc.get("wg_endpoint", ""),
             "relay_wg_exit_public_key": rc.get("wg_exit_public_key", ""),
         })

@@ -17,7 +17,6 @@
 # Required variables:
 #   relay_wg_private_key:    WG client private key for this jump node
 #   relay_wg_address_v4:     WG client address (e.g. 10.77.0.2/24)
-#   relay_wg_address_v6:     WG client address (e.g. fd77::2/64)
 #   relay_wg_endpoint:       Exit node WG endpoint (e.g. 1.2.3.4:51820)
 #   relay_wg_exit_public_key: Exit node's WG public key
 

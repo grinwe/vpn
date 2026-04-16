@@ -1,6 +1,6 @@
 [Interface]
 PrivateKey = {{ relay_wg_private_key }}
-Address = {{ relay_wg_address_v4 }}{{ ', ' + relay_wg_address_v6 if relay_wg_address_v6 | default('') | length > 0 else '' }}
+Address = {{ relay_wg_address_v4 }}
 # Table = off prevents WireGuard from auto-managing routes.
 # We add manual metric-200 routes via PostUp so that:
 #   - Xray traffic (bound to wg0 via sockopt) goes through the tunnel
@@ -9,16 +9,10 @@ Address = {{ relay_wg_address_v4 }}{{ ', ' + relay_wg_address_v6 if relay_wg_add
 Table = off
 
 PostUp  = ip route add 0.0.0.0/0 dev %i metric 200 || true
-{% if relay_wg_address_v6 | default('') | length > 0 %}
-PostUp  = ip -6 route add ::/0 dev %i metric 100 || true
-{% endif %}
 PostDown = ip route del 0.0.0.0/0 dev %i metric 200 || true
-{% if relay_wg_address_v6 | default('') | length > 0 %}
-PostDown = ip -6 route del ::/0 dev %i metric 100 || true
-{% endif %}
 
 [Peer]
 PublicKey = {{ relay_wg_exit_public_key }}
 Endpoint = {{ relay_wg_endpoint }}
-AllowedIPs = 0.0.0.0/0{{ ', ::/0' if relay_wg_address_v6 | default('') | length > 0 else '' }}
+AllowedIPs = 0.0.0.0/0
 PersistentKeepalive = 25

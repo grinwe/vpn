@@ -9,17 +9,15 @@
 # The exit node:
 #   - Listens on wg_exit_port (default 51820)
 #   - Accepts peers defined in wg_exit_peers list
-#   - Enables IPv4/IPv6 forwarding + NAT masquerade
+#   - Enables IPv4 forwarding + NAT masquerade
 #   - Uses wg syncconf for non-disruptive peer updates
 #
 # Required variables:
 #   wg_exit_port:        WireGuard listen port (default: 51820)
 #   wg_exit_address_v4:  Interface address (default: 10.77.0.1/24)
-#   wg_exit_address_v6:  Interface address (default: fd77::1/64)
 #   wg_exit_private_key: Server private key (generate with `wg genkey`)
 #   wg_exit_peers:       List of peer dicts:
-#     - { name: "ru-01", public_key: "...", allowed_ips_v4: "10.77.0.2/32",
-#         allowed_ips_v6: "fd77::2/128" }
+#     - { name: "ru-01", public_key: "...", allowed_ips_v4: "10.77.0.2/32" }
 
 - name: Require WireGuard exit node variables
   assert:
@@ -38,13 +36,6 @@
 - name: Enable IPv4 forwarding
   sysctl:
     name: net.ipv4.ip_forward
-    value: "1"
-    sysctl_set: yes
-    reload: yes
-
-- name: Enable IPv6 forwarding
-  sysctl:
-    name: net.ipv6.conf.all.forwarding
     value: "1"
     sysctl_set: yes
     reload: yes

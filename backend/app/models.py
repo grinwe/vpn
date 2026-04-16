@@ -208,8 +208,7 @@ class VPNNode(Base):
     suspect_since = Column(DateTime, nullable=True)
     # Relay config: when set, this node is a jump node that tunnels
     # traffic through a WireGuard tunnel to a foreign exit node.
-    # Keys: wg_private_key, wg_address_v4, wg_address_v6,
-    #        wg_endpoint, wg_exit_public_key
+    # Keys: wg_private_key, wg_address_v4, wg_endpoint, wg_exit_public_key
     relay_config = Column(JSONB, nullable=True)
 
     provider_id = Column(Integer, ForeignKey("cloud_providers.id"), nullable=True)
