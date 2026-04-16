@@ -451,6 +451,16 @@ class Credential(Base):
     # from config_id but the index can't traverse a join, and warm-pool
     # SELECT must be sub-millisecond.
     node_id = Column(Integer, ForeignKey("vpn_nodes.id"), nullable=True, index=True)
+    # G.3+: pin this credential (and therefore its xray user UUID) to
+    # one exit. Populated by provisioning in G.4 when the relay has
+    # multiple RelayExitLinks; NULL means "use relay's default outbound"
+    # (legacy 1:1 relays + warm-pool bundles before assignment).
+    exit_id = Column(
+        Integer,
+        ForeignKey("wg_exit_nodes.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
     proto = Column(String, nullable=False)
     config_text = Column(Text, nullable=False)
     # Username shared across all credentials in the same warm bundle.
@@ -602,31 +612,45 @@ class WGExitNode(Base):
 
 
 class RelayExitLink(Base):
-    """N:1 link — a relay (jump) VPN node tunnels to one exit.
+    """N:N link — a relay may tunnel to multiple exits (post-G.3).
 
     Separate from ``VPNNode.relay_config`` (which the worker reads as a
     flat dict) to keep the WG client keypair in a properly normalized
-    table with the right FK + unique constraint. ``relay_config`` is
-    updated in the same transaction from this row's data.
+    table. Uniqueness is composite ``(relay_node_id, wg_interface_name)``
+    so each tunnel gets its own kernel interface (``wg0``, ``wg1``, …).
+    Legacy rows rolled forward on migration 0029 carry ``wg0``; the
+    attach endpoint still enforces 1:1 at the app layer until G.4 lands
+    the allocator.
 
     ``wg_client_private_key_enc`` is Fernet-encrypted (via
     ``security.encrypt``); the worker decrypts when building extra vars.
     """
     __tablename__ = "relay_exit_links"
+    __table_args__ = (
+        UniqueConstraint(
+            "relay_node_id",
+            "wg_interface_name",
+            name="uq_relay_exit_links_relay_iface",
+        ),
+    )
 
     id = Column(Integer, primary_key=True)
-    # Unique — a relay is attached to at most one exit at a time.
-    # Switching exit = delete + insert.
     relay_node_id = Column(
         Integer,
         ForeignKey("vpn_nodes.id", ondelete="CASCADE"),
         nullable=False,
-        unique=True,
     )
     exit_id = Column(
         Integer,
         ForeignKey("wg_exit_nodes.id", ondelete="RESTRICT"),
         nullable=False,
+    )
+    # Kernel interface name on the relay — each link gets its own
+    # wg-quick@wgN unit so the relay_jump_node role can loop cleanly.
+    # Defaults to "wg0" for legacy 1:1 rows; G.4 allocator hands out
+    # wg1/wg2/... when a second exit is attached to the same relay.
+    wg_interface_name = Column(
+        String(16), nullable=False, server_default="wg0"
     )
     wg_client_private_key_enc = Column(Text, nullable=False)
     wg_client_public_key = Column(String, nullable=False)
