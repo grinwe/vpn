@@ -442,9 +442,14 @@ def detach_relay(
 
     Drops the link row and clears the relay's ``relay_config``, then
     schedules a ``relay_tunnel`` teardown task (re-renders the exit's
-    peer list without this client, and brings wg0 down + un-patches
-    Xray on the relay — the ``relay_jump_node`` role reads the empty
-    ``relay_wg_*`` vars and takes the teardown branch).
+    peer list without this client via ``bootstrap_exit.yml`` +
+    ``wg syncconf``, and brings wg0 down + un-patches Xray on the relay
+    via ``relay_tunnel_apply.yml`` — the ``relay_jump_node`` role reads
+    the empty ``relay_wg_*`` vars and takes the teardown branch).
+
+    Returns ``task_id`` so the admin UI can surface progress in
+    /tasks. It is ``None`` only if the relay row was already gone
+    (rare — FK cascade order drops the link first).
     """
     link = (
         db.query(models.RelayExitLink)
@@ -475,6 +480,7 @@ def detach_relay(
     # on the relay; the role sees empty relay_wg_* vars and tears wg0
     # down + unpatches Xray. If the relay row is gone (rare — FK cascades
     # drop the link first), skip — there's no target to reconfigure.
+    task_id: int | None = None
     if relay is not None:
         orchestrator = ProvisioningOrchestrator(db)
         task = orchestrator.create_task(
@@ -484,6 +490,14 @@ def detach_relay(
             {"exit_id": exit_id, "link_id": link_id, "detach": True},
         )
         db.commit()
+        task_id = task.id
         orchestrator.run_task_async(task)
 
-    return {"exit_id": exit_id, "relay_node_id": relay_node_id, "deleted": True}
+    return {
+        "exit_id": exit_id,
+        "relay_node_id": relay_node_id,
+        "deleted": True,
+        # task_id lets the admin UI link to /tasks?id=N so the admin
+        # sees the ansible run instead of wondering if anything happened.
+        "task_id": task_id,
+    }

@@ -276,10 +276,24 @@ function ExitLinksPanel({ exitNode }: { exitNode: WGExitNodeOut }) {
 
   const detachMut = useMutation({
     mutationFn: (relayId: number) =>
-      api.del(`/exits/${exitNode.id}/links/${relayId}`),
-    onSuccess: () => {
+      api.del<{
+        exit_id: number;
+        relay_node_id: number;
+        deleted: boolean;
+        task_id: number | null;
+      }>(`/exits/${exitNode.id}/links/${relayId}`),
+    onSuccess: (res) => {
       qc.invalidateQueries({ queryKey: ["wg-exit-links", exitNode.id] });
       qc.invalidateQueries({ queryKey: ["wg-exits"] });
+      qc.invalidateQueries({ queryKey: ["provisioning-tasks"] });
+      if (res.task_id) {
+        alert(
+          `Relay отсоединён. Ansible крутится в фоне, задача #${res.task_id} — ` +
+            `см. вкладку Tasks.`,
+        );
+      } else {
+        alert("Relay отсоединён из БД. Ansible не запущен — relay-нода уже удалена.");
+      }
     },
     onError: (e: Error) => alert(`Ошибка: ${e.message}`),
   });
@@ -360,8 +374,11 @@ function ExitLinksPanel({ exitNode }: { exitNode: WGExitNodeOut }) {
                     onClick={() => {
                       if (
                         confirm(
-                          `Отсоединить ${l.relay_node_name} от ${exitNode.name}? ` +
-                            "Ansible НЕ запустится (D.1 ещё не готов) — relay_config очистится только в БД.",
+                          `Отсоединить ${l.relay_node_name} от ${exitNode.name}?\n\n` +
+                            "Запустится ansible: bootstrap_exit.yml на exit'е " +
+                            "(peer уйдёт из wg0.conf, wg syncconf подхватит) " +
+                            "и relay_tunnel_apply.yml на relay (wg0 down + " +
+                            "Xray outbound вернётся на прямую).",
                         )
                       )
                         detachMut.mutate(l.relay_node_id);

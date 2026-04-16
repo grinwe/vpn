@@ -293,8 +293,10 @@
 - `admin/src/pages/Nodes.tsx` — обработка 409 `{active_subs}`: оффер «N живых подписок, мигрировать и удалить?» → `POST /migrate` → повторный DELETE после успешной миграции. Синхронно — потому что `migrate_subscription_to_new_node` флипает `subscription.node_id` в одной транзакции до запуска ansible; после ответа endpoint'а активных subs на ноде уже нет (ansible-таски висят в фоне, но они не трогают FK).
 
 **G.2 — Detach exit'а честно гоняет ansible.**
-- `backend/app/api/exits.py::delete_link` — помимо DB cleanup, создаёт `ProvisioningTask(target_type=wg_exit_node, action=wg_peer_remove, payload={relay_node_id, wg_client_public_key})`. Новый playbook `infra/ansible/playbooks/wg_exit_peer_remove.yml` + role task `wg_exit_node/tasks/remove_peer.yml` — удаляет `[Peer]` блок из `wg0.conf` exit'а по pubkey и перезагружает `wg-quick@wg0`. Идемпотентно (если peer уже отсутствует — no-op).
-- UI: текущий «Ansible НЕ запустится (D.1 ещё не готов)» confirm заменяется на «Удалить peer с exit'а и почистить relay_config? Запустится ansible на exit-ноде».
+- Аудит обнаружил, что backend **уже** гоняет `bootstrap_exit.yml` на exit'е и `relay_tunnel_apply.yml` на relay в рамках одной таски `relay_tunnel.apply` с `detach=True` (см. `provisioning.py` worker step → `exit_node` resolve from `payload.exit_id` → `_collect_exit_extra_vars` строит `wg_exit_peers` уже без detached линка, так как он удалён из БД до запуска таски → `syncconf wg0` из handler'а подхватывает новый конфиг). То есть отдельный `wg_exit_peer_remove.yml` не нужен — `bootstrap_exit.yml` идемпотентен и уже выдаёт тот же эффект.
+- Фикс свёлся к тому, чтобы: (1) UI-копи в `Exits.tsx` перестал врать про «Ansible НЕ запустится (D.1 ещё не готов)» и показывал реальный флоу, (2) endpoint возвращал `task_id` чтобы админка могла линковать юзера в `/tasks` и видеть прогресс.
+- `backend/app/api/exits.py::detach_relay` теперь возвращает `{exit_id, relay_node_id, deleted, task_id}` (опционально `task_id` отсутствует если relay row уже ушёл — редкий случай).
+- UI: confirm копи заменён на «Отсоединить X от Y? Ansible re-render'нит peer list на exit'е + wg0 на relay (detach branch).». После успеха — short-tip «Ansible работает в фоне, задача #N».
 
 **G.3+ — Multi-exit per relay (балансировка нагрузки).**
 Цель: один relay (дешёвый жирный RU-хост) проксирует юзеров на несколько зарубежных exit'ов с авто-распределением нагрузки. Декомпозиция (перед стартом сверить с пользователем):
