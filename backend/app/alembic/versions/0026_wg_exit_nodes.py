@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from alembic import op
 import sqlalchemy as sa
+from sqlalchemy.dialects import postgresql
 
 
 revision = "0026_wg_exit_nodes"
@@ -19,17 +20,30 @@ branch_labels = None
 depends_on = None
 
 
-WG_EXIT_NODE_STATUS = sa.Enum(
-    "registering",
-    "active",
-    "error",
-    "disabled",
-    name="wgexitnodestatus",
-)
-
-
 def upgrade() -> None:
-    WG_EXIT_NODE_STATUS.create(op.get_bind(), checkfirst=True)
+    # Idempotent enum creation — mirrors the 0008_warmpool pattern so a
+    # partial prior run that created the type but never marked the migration
+    # applied won't crash the replay with DuplicateObject.
+    op.execute(
+        "DO $$ BEGIN "
+        "IF NOT EXISTS (SELECT 1 FROM pg_type WHERE typname='wgexitnodestatus') "
+        "THEN CREATE TYPE wgexitnodestatus AS ENUM "
+        "('registering','active','error','disabled'); "
+        "END IF; END $$;"
+    )
+
+    wg_exit_node_status = postgresql.ENUM(
+        "registering",
+        "active",
+        "error",
+        "disabled",
+        name="wgexitnodestatus",
+        create_type=False,
+    )
+
+    bind = op.get_bind()
+    if sa.inspect(bind).has_table("wg_exit_nodes"):
+        return
 
     op.create_table(
         "wg_exit_nodes",
@@ -57,7 +71,7 @@ def upgrade() -> None:
         sa.Column("provider_region", sa.String(), nullable=True),
         sa.Column(
             "status",
-            WG_EXIT_NODE_STATUS,
+            wg_exit_node_status,
             nullable=False,
             server_default="registering",
         ),
@@ -85,4 +99,4 @@ def upgrade() -> None:
 
 def downgrade() -> None:
     op.drop_table("wg_exit_nodes")
-    WG_EXIT_NODE_STATUS.drop(op.get_bind(), checkfirst=True)
+    op.execute("DROP TYPE IF EXISTS wgexitnodestatus")

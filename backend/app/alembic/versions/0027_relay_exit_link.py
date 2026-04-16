@@ -20,37 +20,46 @@ depends_on = None
 
 
 def upgrade() -> None:
-    op.create_table(
-        "relay_exit_links",
-        sa.Column("id", sa.Integer(), primary_key=True),
-        sa.Column(
-            "relay_node_id",
-            sa.Integer(),
-            sa.ForeignKey("vpn_nodes.id", ondelete="CASCADE"),
-            nullable=False,
-            unique=True,
-        ),
-        sa.Column(
-            "exit_id",
-            sa.Integer(),
-            sa.ForeignKey("wg_exit_nodes.id", ondelete="RESTRICT"),
-            nullable=False,
-        ),
-        sa.Column("wg_client_private_key_enc", sa.Text(), nullable=False),
-        sa.Column("wg_client_public_key", sa.String(), nullable=False),
-        sa.Column("wg_client_address_v4", sa.String(), nullable=False),
-        sa.Column(
-            "created_at",
-            sa.DateTime(),
-            nullable=False,
-            server_default=sa.func.now(),
-        ),
-    )
-    op.create_index(
-        "ix_relay_exit_links_exit_id",
-        "relay_exit_links",
-        ["exit_id"],
-    )
+    bind = op.get_bind()
+    inspector = sa.inspect(bind)
+
+    if not inspector.has_table("relay_exit_links"):
+        op.create_table(
+            "relay_exit_links",
+            sa.Column("id", sa.Integer(), primary_key=True),
+            sa.Column(
+                "relay_node_id",
+                sa.Integer(),
+                sa.ForeignKey("vpn_nodes.id", ondelete="CASCADE"),
+                nullable=False,
+                unique=True,
+            ),
+            sa.Column(
+                "exit_id",
+                sa.Integer(),
+                sa.ForeignKey("wg_exit_nodes.id", ondelete="RESTRICT"),
+                nullable=False,
+            ),
+            sa.Column("wg_client_private_key_enc", sa.Text(), nullable=False),
+            sa.Column("wg_client_public_key", sa.String(), nullable=False),
+            sa.Column("wg_client_address_v4", sa.String(), nullable=False),
+            sa.Column(
+                "created_at",
+                sa.DateTime(),
+                nullable=False,
+                server_default=sa.func.now(),
+            ),
+        )
+
+    existing_indexes = {
+        ix["name"] for ix in inspector.get_indexes("relay_exit_links")
+    }
+    if "ix_relay_exit_links_exit_id" not in existing_indexes:
+        op.create_index(
+            "ix_relay_exit_links_exit_id",
+            "relay_exit_links",
+            ["exit_id"],
+        )
 
 
 def downgrade() -> None:
