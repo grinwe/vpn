@@ -16,10 +16,12 @@ Telegram Bot (aiogram) → FastAPI Backend → PostgreSQL + Redis/RQ
 
 | Protocol | Transport | TSPU Status (April 2026) |
 |----------|-----------|--------------------------|
-| ShadowTLS v3 + Shadowsocks | TCP | Working |
 | VLESS + Reality | TCP (high port) | Under active attack; works on ports 47000+ |
+| VLESS + XHTTP | TCP (TLS-fronted) | Working, обход 16KB curtain |
 | VLESS + WebSocket + CDN | WebSocket via Cloudflare | Working (CDN IPs whitelisted) |
 | Hysteria2 | QUIC/UDP | Working on broadband, unstable on mobile |
+
+> ShadowTLS v3 + Shadowsocks — **deprecated (0.2, April 2026)**, UI не создаёт новые конфиги.  Enum и роль оставлены до 0.4 для легаси-нод.
 
 ### Components
 
@@ -168,7 +170,7 @@ vpn/
 ├── probes/            # Health probe agent
 ├── infra/ansible/     # Ansible playbooks + 12 roles
 │   └── roles/
-│       ├── install_shadowtls_stack/
+│       ├── install_shadowtls_stack/   ← deprecated (0.2), закомменчена в site.yml
 │       ├── install_vless_reality/
 │       ├── install_vless_ws_cdn/     # NEW
 │       ├── install_hysteria2/        # NEW

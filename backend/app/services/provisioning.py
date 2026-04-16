@@ -930,9 +930,10 @@ class ProvisioningOrchestrator:
         if node is None:
             raise RuntimeError("warm bundle has no node — corrupted state")
 
-        # Pick the device-anchor config: ShadowTLS first, else any.
+        # Pick the device-anchor config: VLESS Reality first, else any.
+        # (ShadowTLS is deprecated — 0.2 rollout.)
         primary = next(
-            (c for c in bundle if c.proto == models.VPNConfigProtocol.shadowtls_ss.value),
+            (c for c in bundle if c.proto == models.VPNConfigProtocol.vless_reality.value),
             bundle[0],
         )
         if primary.config_id is None:
@@ -1093,9 +1094,10 @@ class ProvisioningOrchestrator:
             device_uri = f"/api/sub/{device_sub_token}"
 
         # Pick a representative config for Device.config_id (FK is NOT NULL).
-        # ShadowTLS preferred, otherwise the first enabled config.
+        # VLESS Reality preferred (ShadowTLS deprecated — 0.2), otherwise
+        # the first enabled config.
         primary_config = next(
-            (c for c in enabled_configs if c.protocol == models.VPNConfigProtocol.shadowtls_ss),
+            (c for c in enabled_configs if c.protocol == models.VPNConfigProtocol.vless_reality),
             enabled_configs[0],
         )
 
@@ -1379,7 +1381,7 @@ class ProvisioningOrchestrator:
             device_uri = f"/api/sub/{device_sub_token}"
 
         primary_config = next(
-            (c for c in enabled_configs if c.protocol == models.VPNConfigProtocol.shadowtls_ss),
+            (c for c in enabled_configs if c.protocol == models.VPNConfigProtocol.vless_reality),
             enabled_configs[0],
         )
 

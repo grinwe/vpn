@@ -2,6 +2,8 @@
 
 Документ про **ноды-exit'ы**: кто их регистрирует, какой у них жизненный цикл, какие на них роли выполняются и что значит каждая колонка в `VPNNode`. Детали про оркестратор ansible — в `infrastructure/ansible.md`, про орchestration из backend'а — в `components/provisioning.md`. Здесь — перспектива самих нод.
 
+> **Deprecation notice (0.2, April 2026):** `shadowtls_ss` — legacy-протокол. Роль `install_shadowtls_stack` закомментирована в [site.yml](../../infra/ansible/site.yml), UI запрещает создание новых `shadowtls+shadowsocks` конфигов.  Описания ShadowTLS ниже оставлены для легаси-нод, которые пока их ещё отдают; полное удаление — в 0.4 после rollout.
+
 ## Модель: `VPNNode` и её колонки
 
 `backend/app/models.py:183-220`. Ключевые поля и зачем они существуют:

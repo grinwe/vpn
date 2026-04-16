@@ -214,6 +214,9 @@ export interface VPNNodeCreateIn {
 
 // Протоколы должны быть в синке с VPNConfigProtocol enum в
 // backend/app/models.py — backend ругнётся 400 на неизвестный.
+// shadowtls+shadowsocks оставлен в типе, так как его всё ещё может
+// вернуть бэк для легаси-нод.  Новые конфиги через UI не создаём
+// (см. Nodes.tsx, PROTOCOL_DEFAULTS) — полное удаление в 0.4.
 export type VPNConfigProtocol =
   | "shadowtls+shadowsocks"
   | "vless-reality"

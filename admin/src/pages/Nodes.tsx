@@ -538,7 +538,7 @@ export default function Nodes() {
                           if (
                             confirm(
                               `Перекатить site.yml на ноду #${n.id} (${n.name}) с нуля?\n\n` +
-                                `Запустится вся цепочка ролей (bootstrap_node, install_shadowtls_stack, install_vless_reality, check_node_health). install_vless_reality preserve'ит существующих VLESS-клиентов через slurp старого config.json, плюс после успеха бэк авто-триггернёт resync всех активных UUID'ов. Безопасно для ноды с живым трафиком.`,
+                                `Запустится вся цепочка ролей (bootstrap_node, install_vless_reality, install_vless_ws_cdn, install_vless_xhttp, install_hysteria2, check_node_health). install_vless_reality preserve'ит существующих VLESS-клиентов через slurp старого config.json, плюс после успеха бэк авто-триггернёт resync всех активных UUID'ов. Безопасно для ноды с живым трафиком.`,
                             )
                           )
                             bootstrap.mutate({ id: n.id, name: n.name });
@@ -1330,14 +1330,15 @@ function NodeTrafficChart({ nodeId }: { nodeId: number }) {
 }
 
 // Дефолты под каждый протокол — совпадают с тем, что ставит ansible
-// по дефолту (см. install_shadowtls_stack/files/shadowtls_power_script.sh
-// и install_vless_reality/defaults). Если операторы начнут менять
-// порты в ролях — синхронизировать здесь.
+// по дефолту (см. install_vless_reality/defaults). Если операторы
+// начнут менять порты в ролях — синхронизировать здесь.
+// shadowtls+shadowsocks убран из UI (0.2, протокол dead).  Легаси-тип
+// остаётся в VPNConfigProtocol на случай старых конфигов с ноды.
+type CreatableProtocol = Exclude<VPNConfigProtocol, "shadowtls+shadowsocks">;
 const PROTOCOL_DEFAULTS: Record<
-  VPNConfigProtocol,
+  CreatableProtocol,
   { port: number; sni: string; name: string }
 > = {
-  "shadowtls+shadowsocks": { port: 8443, sni: "www.cloudflare.com", name: "shadowtls" },
   "vless-reality": { port: 9443, sni: "www.asus.com", name: "vless-reality" },
   "vless-ws-cdn": { port: 443, sni: "", name: "vless-ws-cdn" },
   "hysteria2": { port: 8443, sni: "", name: "hysteria2" },
@@ -1354,7 +1355,7 @@ function AddConfigForm({
   onDone: () => void;
 }) {
   const qc = useQueryClient();
-  const [protocol, setProtocol] = useState<VPNConfigProtocol>("shadowtls+shadowsocks");
+  const [protocol, setProtocol] = useState<CreatableProtocol>("vless-reality");
   const defaults = PROTOCOL_DEFAULTS[protocol];
   const [form, setForm] = useState<VPNConfigCreateIn>({
     name: defaults.name,
@@ -1366,7 +1367,7 @@ function AddConfigForm({
 
   // Меняем протокол — сбрасываем дефолты, чтобы юзер не оставил
   // порт 8443 у vless-reality случайно.
-  function onProtocolChange(p: VPNConfigProtocol) {
+  function onProtocolChange(p: CreatableProtocol) {
     setProtocol(p);
     const d = PROTOCOL_DEFAULTS[p];
     setForm({ name: d.name, protocol: p, port: d.port, sni: d.sni || null });
@@ -1401,9 +1402,8 @@ function AddConfigForm({
         <select
           className="bg-slate-800 border border-slate-700 rounded px-2 py-1 font-mono"
           value={protocol}
-          onChange={(e) => onProtocolChange(e.target.value as VPNConfigProtocol)}
+          onChange={(e) => onProtocolChange(e.target.value as CreatableProtocol)}
         >
-          <option value="shadowtls+shadowsocks">shadowtls+shadowsocks</option>
           <option value="vless-reality">vless-reality</option>
           <option value="vless-ws-cdn">vless-ws-cdn</option>
           <option value="hysteria2">hysteria2</option>
@@ -1437,8 +1437,7 @@ function AddConfigForm({
         />
       </label>
       <div className="col-span-2 text-slate-500 text-[11px]">
-        Host ноды: <span className="font-mono">{nodeHost}</span>. ShadowTLS+Shadowsocks
-        не требует public_key / fallback, остальное оставляем дефолтным. Для
+        Host ноды: <span className="font-mono">{nodeHost}</span>. Для
         vless-reality бэкенд сам генерит ключи, если оставить{" "}
         <span className="font-mono">public_key</span> пустым — см. роль{" "}
         <span className="font-mono">install_vless_reality</span>.

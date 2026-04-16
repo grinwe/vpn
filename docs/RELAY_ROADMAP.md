@@ -37,7 +37,7 @@
 
 Каждая стадия — один или несколько коммитов, чтобы `git revert` откатывал атомарно. PR'ов не делаем.
 
-### 0.1 — Strip IPv6
+### 0.1 — Strip IPv6 ✅ (2026-04-16)
 
 Ноды только с IPv4, v6 в WG‑темплейтах — мёртвый код.
 
@@ -53,20 +53,27 @@
 
 **Acceptance:** `grep -ri "v6\|ipv6" infra/ansible/roles/{relay_jump_node,wg_exit_node}` возвращает только незначимые комментарии. `ansible-lint infra/ansible` зелёный.
 
-### 0.2 — Comment out ShadowTLS
+### 0.2 — Comment out ShadowTLS ✅ (2026-04-16)
 
-Протокол мёртв, живых подписок нет. Трогаем аккуратно: три захардкоженных `next(c for c in bundle if c.proto == shadowtls_ss)` в `provisioning.py` — блокер (warm-pool cold-path'у нужен любой enabled VLESS‑конфиг, ShadowTLS‑ветку убираем).
+Протокол мёртв, живых подписок нет. Трогаем аккуратно: три захардкоженных `next(c for c in bundle if c.proto == shadowtls_ss)` в `provisioning.py` были anchor-preference'ом для Device.config_id — переписаны на VLESS‑first с fallback `bundle[0]` / `enabled_configs[0]`.
 
-**Файлы (комментируем, не удаляем):**
-- `infra/ansible/site.yml` — строка `- install_shadowtls_stack` в комментарий.
-- `backend/app/services/provisioning.py` — три `next(...)`‑блока переписать на VLESS‑first, ShadowTLS‑ветки — dead branches с явным `raise RuntimeError("ShadowTLS deprecated")`.
-- `backend/app/services/shadowtls.py`, `services/warm_pool.py`, `api/nodes.py`, `models.py` (enum `VPNConfigProtocol.shadowtls_ss`), `schemas.py` — пометить deprecated.
-- `admin/src/pages/Nodes.tsx` — убрать из `PROTOCOL_DEFAULTS`.
-- `docs/NODES.md`, `README.md` — убрать из рекомендаций.
+**Сделано:**
+- `infra/ansible/site.yml` — `- install_shadowtls_stack` закомментирован, рядом — объяснение почему и что оставить до 0.4.
+- `backend/app/services/provisioning.py` — три `next(...)`‑блока (L934, L1098, L1383) переведены на `vless_reality` first, fallback на `[0]` сохранён → `StopIteration` невозможен.  Credential-builder / protocols_payload ветки `shadowtls_ss` оставлены как defensive dead-code (UI их уже не триггерит).
+- `admin/src/pages/Nodes.tsx` — `PROTOCOL_DEFAULTS` переведён на `CreatableProtocol` (Exclude `shadowtls+shadowsocks`), default useState → `vless-reality`, `<option>` для shadowtls удалён, текст описания очищен, bootstrap‑confirm без shadowtls.
+- `admin/src/api.ts` — комментарий у `VPNConfigProtocol`: shadowtls остаётся в type-unions для легаси-строк с бэка до 0.4.
+- `docs/NODES.md`, `docs/infrastructure/nodes.md`, `docs/infrastructure/ansible.md`, `docs/architecture.md`, `README.md` — deprecation notice + `shadowtls` выкинут из рекомендаций / схем.
 
-**Impact на прод:** существующие ноды с установленным shadowtls‑стеком продолжат работать (систему `shadowtls.service` не трогаем). Новые ноды shadowtls получать не будут. Юзеры с legacy shadowtls‑подписками (их нет по подтверждению) не пострадают.
+**Оставлено до 0.4 (дефенсивно, API не ломаем):**
+- `backend/app/services/shadowtls.py`, credential-builder ветки в `warm_pool.py`/`provisioning.py`.
+- `api.py` / `api/nodes.py` ветки `ensure_shadowtls_config` — недостижимы через UI, но отвечают на прямой POST.
+- `models.py` enum `VPNConfigProtocol.shadowtls_ss` (DB-enum значение пока нужно).
+- Роль `infra/ansible/roles/install_shadowtls_stack/` — физически на диске, не импортируется из site.yml.
+- Тесты `tests/test_warm_pool.py`, `tests/test_subscription_link.py`, `tests/test_collect_site_extra_vars.py` — проверяют легаси-путь.
 
-**Acceptance:** в UI нельзя создать ShadowTLS‑конфиг, bootstrap новой ноды проходит без shadowtls‑роли, unit‑тест warm-pool без shadowtls зелёный.
+**Impact на прод:** существующие ноды с установленным shadowtls‑стеком продолжат работать (shadow-tls.service на них не трогается, extra_vars всё ещё передаются). Новые ноды shadowtls-роль не получают.  Юзеры с legacy shadowtls‑подписками (их нет по подтверждению) не пострадают.
+
+**Acceptance:** в UI нельзя создать ShadowTLS‑конфиг (✔, `<option>` удалён), bootstrap новой ноды проходит без shadowtls‑роли (✔, закомментирована в site.yml).  Existing unit‑тесты warm-pool не ломаются — ShadowTLS-ветки pipeline'а сохранены.
 
 ### 0.3 — Comment out Hysteria2
 

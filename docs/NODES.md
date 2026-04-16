@@ -22,10 +22,12 @@
 
 | Protocol | Ansible role | Default port | Default SNI | Service |
 |----------|--------------|--------------|-------------|---------|
-| `shadowtls+shadowsocks` | [install_shadowtls_stack](../infra/ansible/roles/install_shadowtls_stack) | 8443 | `www.cloudflare.com` | shadowtls-wrapper + ss-rust |
 | `vless-reality` | [install_vless_reality](../infra/ansible/roles/install_vless_reality) | 9443 | `www.asus.com` | xray |
+| `vless-xhttp` | [install_vless_xhttp](../infra/ansible/roles/install_vless_xhttp) | 443 | (TLS fronting domain) | xray |
 | `vless-ws-cdn` | [install_vless_ws_cdn](../infra/ansible/roles/install_vless_ws_cdn) | 443 | (CDN domain) | xray + Cloudflare proxy |
 | `hysteria2` | [install_hysteria2](../infra/ansible/roles/install_hysteria2) | 8443/UDP | (none) | hysteria-server |
+
+> `shadowtls+shadowsocks` — **deprecated** (0.2, April 2026). Роль `install_shadowtls_stack` закомментирована в [site.yml](../infra/ansible/site.yml), UI не даёт создавать новые конфиги.  Enum-значение `shadowtls_ss` оставлено в `VPNConfigProtocol` и бэкенд-branch'и — until 0.4 — на случай легаси-нод.
 
 Источник дефолтов: [admin/src/pages/Nodes.tsx `PROTOCOL_DEFAULTS`](../admin/src/pages/Nodes.tsx). Если меняешь значения в ansible-ролях — синхронизируй оба места, иначе форма в Admin UI будет предлагать не то, что реально поднимется на ноде.
 
@@ -37,7 +39,6 @@
 2. **VLESS XHTTP** — основной TCP-протокол, обход 16KB curtain ТСПУ.
 3. **Fallback: Hysteria2** — UDP/QUIC. На мобильных нестабилен (пакет-лосс режет соединение), на broadband отлично.
 4. **Fallback: VLESS+WS+CDN** — через Cloudflare. Работает, пока CF IP'шники в whitelist'е, но это moving target и каждая нода требует отдельного domain-setup'а.
-5. **Legacy: ShadowTLS+Shadowsocks** — нет per-user isolation (общий пароль на ноду), sharing enforcer не покрывает.
 
 **Минимум на каждой ноде:** vless-reality. Остальные — по потребности/региону.
 
@@ -61,7 +62,7 @@ return configs[0]
 1. Если caller явно попросил протокол — отдаём первый enabled того же типа (без preference — по порядку в `node.configs`, который = ORM-дефолт = `id ASC`).
 2. Иначе — первый enabled вообще.
 
-**Важно:** в трёх местах провижининга ([L557, L706, L833](../backend/app/services/provisioning.py)) есть hard-coded `next(c for c in bundle if c.proto == shadowtls_ss)`. Это значит: если на ноде **нет** включённого `shadowtls+shadowsocks` — полный провижининг упадёт `StopIteration` на warm-pool assignment. Ревью это или пересмотри, если планируешь нарушать «ShadowTLS primary»-инвариант.
+**Заметка (0.2):** в трёх местах провижининга (`_finalize_warm_assignment`, `provision_subscription`, `add_device_to_subscription`) ранее был hard-coded `next(... shadowtls_ss, bundle[0])` для anchor-конфига девайса.  После 0.2 anchor-preference переключён на `vless_reality` (ShadowTLS deprecated).  Fallback `bundle[0]` страхует от `StopIteration` в любом случае.
 
 ## Pools (`server_pools`)
 

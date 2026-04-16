@@ -6,7 +6,10 @@
     # Protocol roles: always included so they can clean up removed
     # protocols.  Each role handles its own gating internally and
     # stops+disables its services when the config vars are absent.
-    - install_shadowtls_stack
+    # ShadowTLS deprecated (0.2): protocol is dead, no new configs are
+    # provisioned.  Left commented out for a release cycle before full
+    # deletion — uncomment if a legacy node needs cleanup.
+    # - install_shadowtls_stack
     - install_vless_reality
     - install_vless_ws_cdn
     - install_vless_xhttp

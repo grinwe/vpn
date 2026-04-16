@@ -2,6 +2,8 @@
 
 Всё, что делается на реальном железе — поднятие VPN-ноды, установка протоколов, деплой приложения, мониторинг — оркеструется Ansible'ом из `infra/ansible/`. Backend не имеет альтернативного пути настраивать ноды; каждое действие на ноде идёт через `subprocess.run(["ansible-playbook", ...])` из `backend/app/services/ansible_runner.py`.
 
+> **Deprecation notice (0.2, April 2026):** роль `install_shadowtls_stack` закомментирована в [site.yml](../../infra/ansible/site.yml).  Упоминания ShadowTLS ниже оставлены для легаси-нод; role directory сам по себе пока существует.  Полное удаление — 0.4.
+
 ## Структура директории
 
 ```
