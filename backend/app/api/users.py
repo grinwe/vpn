@@ -104,9 +104,10 @@ def _subscriptions_for_user(user_id: int, db: Session) -> list[schemas.Subscript
             id=sub.id,
             plan_name=sub.plan.name,
             plan_id=sub.plan_id,
-            node=sub.node.name,
+            # node may be NULL for terminated subs whose node was deleted.
+            node=sub.node.name if sub.node else "(удалена)",
             node_id=sub.node_id,
-            region=sub.node.region,
+            region=sub.node.region if sub.node else "",
             expires_at=sub.expires_at,
             status=sub.status.value,
             auto_renew=sub.auto_renew or False,

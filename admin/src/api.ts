@@ -17,7 +17,16 @@ export function setToken(token: string | null) {
 }
 
 export class ApiError extends Error {
-  constructor(public status: number, message: string) {
+  // `detail` preserves the raw FastAPI `detail` payload — string when the
+  // backend sends a plain message, object when it sends structured info
+  // (e.g. `{error, active_subs, message}` from DELETE /nodes/{id}).
+  // Callers can narrow on `typeof detail === "object"` to branch on the
+  // `error` code without parsing the message string.
+  constructor(
+    public status: number,
+    message: string,
+    public detail: unknown = message,
+  ) {
     super(message);
   }
 }
@@ -39,14 +48,21 @@ async function request<T>(
   });
 
   if (!res.ok) {
-    let detail = res.statusText;
+    let message = res.statusText;
+    let rawDetail: unknown = res.statusText;
     try {
       const payload = await res.json();
-      if (payload?.detail) detail = payload.detail;
+      if (payload?.detail !== undefined) {
+        rawDetail = payload.detail;
+        message =
+          typeof payload.detail === "string"
+            ? payload.detail
+            : payload.detail?.message ?? JSON.stringify(payload.detail);
+      }
     } catch {
       /* not json */
     }
-    throw new ApiError(res.status, detail);
+    throw new ApiError(res.status, message, rawDetail);
   }
   if (res.status === 204) return undefined as T;
   return (await res.json()) as T;

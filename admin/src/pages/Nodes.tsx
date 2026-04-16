@@ -408,16 +408,81 @@ export default function Nodes() {
     onError: (e: Error) => alert(`Не удалось запустить bootstrap: ${e.message}`),
   });
 
+  // Smart delete: walk the 409 → migrate → delete path so admins can
+  // remove a node without poking migrate first. Cloud-provisioned nodes
+  // still go through /destroy (teardown playbook + VPS deprovision);
+  // only raw DB rows take the migrate-then-delete branch.
   const deleteNode = useMutation({
-    mutationFn: (node: { id: number; provider_id: number | null }) =>
-      node.provider_id
-        ? api.post<{ node_id: number }>(`/nodes/${node.id}/destroy`, {})
-        : api.del<{ node_id: number; deleted: boolean }>(`/nodes/${node.id}`),
-    onSuccess: () => {
-      qc.invalidateQueries({ queryKey: ["nodes"] });
-      alert("Нода удалена.");
+    mutationFn: async (node: { id: number; name: string; provider_id: number | null }) => {
+      if (node.provider_id) {
+        return api.post<{ node_id: number }>(`/nodes/${node.id}/destroy`, {});
+      }
+
+      const tryDelete = () =>
+        api.del<{
+          node_id: number;
+          deleted: boolean;
+          warm_credentials_deleted?: number;
+          bound_credentials_detached?: number;
+        }>(`/nodes/${node.id}`);
+
+      try {
+        return await tryDelete();
+      } catch (err) {
+        if (!(err instanceof ApiError) || err.status !== 409) throw err;
+        const detail = err.detail as { error?: string; active_subs?: number } | string;
+        if (typeof detail !== "object" || detail.error !== "active_subs") throw err;
+
+        const n = detail.active_subs ?? 0;
+        const confirmed = window.confirm(
+          `На ноде "${node.name}" ещё ${n} активных/замороженных подписок.\n\n` +
+            `Перенести их на другие ноды (как при обычном переселении), а затем удалить?\n\n` +
+            `OK — перенести и удалить.\nОтмена — ничего не делать.`,
+        );
+        if (!confirmed) throw new Error("отменено пользователем");
+
+        // /migrate kicks off per-sub migrations synchronously at DB level
+        // (subscription.node_id flips immediately), so on return the node
+        // has zero active subs and DELETE can proceed. The device task
+        // fan-out continues in background — doesn't block node removal.
+        const mig = await api.post<{
+          node_id: number;
+          migrated_subscriptions: number[];
+          task_ids: number[];
+          considered_count: number;
+          no_target_count: number;
+        }>(`/nodes/${node.id}/migrate`, {});
+        if (mig.no_target_count > 0 && mig.migrated_subscriptions.length === 0) {
+          throw new Error(
+            `Не удалось выбрать целевую ноду ни для одной из ${mig.considered_count} ` +
+              `подписок — все остальные ноды в cooldown/unhealthy/вне пула. ` +
+              `Разберись с остальными нодами и повтори.`,
+          );
+        }
+        qc.invalidateQueries({ queryKey: ["user-subs"] });
+        qc.invalidateQueries({ queryKey: ["provisioning-tasks"] });
+        return tryDelete();
+      }
     },
-    onError: (e: Error) => alert(`Не удалось удалить: ${e.message}`),
+    onSuccess: (res) => {
+      qc.invalidateQueries({ queryKey: ["nodes"] });
+      const bits: string[] = ["Нода удалена."];
+      if ("warm_credentials_deleted" in res && res.warm_credentials_deleted) {
+        bits.push(`warm-креды удалены: ${res.warm_credentials_deleted}`);
+      }
+      if ("bound_credentials_detached" in res && res.bound_credentials_detached) {
+        bits.push(`исторических кредов отвязано: ${res.bound_credentials_detached}`);
+      }
+      alert(bits.join(" "));
+    },
+    onError: (e: Error) => {
+      if (e.message === "отменено пользователем") return;
+      const extra =
+        e instanceof ApiError && typeof e.detail === "object" && e.detail
+          ? `\n\nДетали: ${JSON.stringify(e.detail, null, 2)}`
+          : "";
+      alert(`Не удалось удалить: ${e.message}${extra}`);
+    },
   });
 
   const diagnose = useMutation({
@@ -718,12 +783,15 @@ export default function Nodes() {
                               `Удалить ноду #${n.id} (${n.name})?\n\n` +
                                 (n.provider_id
                                   ? "Cloud-нода — VM будет уничтожена через API провайдера."
-                                  : "Manual-нода — запись будет удалена из БД.") +
-                                "\n\nЕсли на ноде есть активные подписки — сначала переселите их.",
+                                  : "Manual-нода — запись будет удалена из БД." +
+                                    "\n\nЕсли на ноде есть подписки — будет " +
+                                    "предложено переселить их и удалить ноду.") +
+                                "",
                             )
                           )
                             deleteNode.mutate({
                               id: n.id,
+                              name: n.name,
                               provider_id: n.provider_id,
                             });
                         }}

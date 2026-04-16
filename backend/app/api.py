@@ -1051,8 +1051,9 @@ def _subscriptions_for_user(user_id: int, db: Session) -> list[schemas.Subscript
             id=sub.id,
             plan_name=sub.plan.name,
             plan_id=sub.plan_id,
-            node=sub.node.name,
-            region=sub.node.region,
+            # node may be NULL for terminated subs whose node was deleted.
+            node=sub.node.name if sub.node else "(удалена)",
+            region=sub.node.region if sub.node else "",
             expires_at=sub.expires_at,
             status=sub.status.value,
             auto_renew=sub.auto_renew or False,
@@ -1607,7 +1608,8 @@ def get_subscription_status(subscription_id: int, db: Session = Depends(get_db))
     is_active = sub.status == models.SubscriptionStatus.active and sub.expires_at > utcnow()
     return schemas.SubscriptionStatusOut(
         plan_name=sub.plan.name,
-        server_name=sub.node.name,
+        # node may be NULL if the sub was terminated and its node later deleted.
+        server_name=sub.node.name if sub.node else "(удалена)",
         expires_at=sub.expires_at,
         is_active=is_active,
         proto_configs=[schemas.CredentialOut.from_orm(c) for c in sub.credentials],

@@ -481,7 +481,8 @@ def get_subscription_status(subscription_id: int, db: Session = Depends(get_db))
     is_active = sub.status == models.SubscriptionStatus.active and sub.expires_at > utcnow()
     return schemas.SubscriptionStatusOut(
         plan_name=sub.plan.name,
-        server_name=sub.node.name,
+        # node may be NULL if the sub was terminated and its node later deleted.
+        server_name=sub.node.name if sub.node else "(удалена)",
         expires_at=sub.expires_at,
         is_active=is_active,
         proto_configs=[schemas.CredentialOut.from_orm(c) for c in sub.credentials],

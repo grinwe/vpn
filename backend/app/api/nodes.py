@@ -13,6 +13,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from .. import models, schemas
@@ -945,8 +946,18 @@ def delete_node(
 ):
     """Remove a node from the database.
 
-    Refuses if the node still has active/frozen subscriptions — migrate
-    them first. For cloud-provisioned nodes use POST /destroy instead.
+    Refuses with 409 if the node still has active/frozen subscriptions —
+    the admin UI uses that signal to offer a migrate-then-delete flow.
+    The response body includes ``active_subs`` so the UI can render a
+    specific confirm rather than a generic error.
+
+    Warm-pool credentials bound to this node are deleted before the node
+    row goes — they can't be reassigned once the node is gone. Credentials
+    attached to terminated subs are detached (node_id → NULL) so the
+    historical sub/cred link survives.
+
+    For cloud-provisioned nodes use ``POST /destroy`` instead — that runs
+    the teardown playbook and deprovisions the VPS.
     """
     node = db.get(models.VPNNode, node_id)
     if not node:
@@ -966,14 +977,74 @@ def delete_node(
     if active_subs > 0:
         raise HTTPException(
             status_code=409,
-            detail=f"Node has {active_subs} active subscription(s). Migrate them first.",
+            detail={
+                "error": "active_subs",
+                "active_subs": active_subs,
+                "message": (
+                    f"На ноде ещё {active_subs} активных/замороженных подписок — "
+                    "сперва перенеси их на другую ноду."
+                ),
+            },
         )
 
+    # Warm-pool credentials (no subscription) can't survive a missing
+    # node — they'd never be assignable. Delete them.
+    warm_deleted = (
+        db.query(models.Credential)
+        .filter(
+            models.Credential.node_id == node.id,
+            models.Credential.subscription_id.is_(None),
+        )
+        .delete(synchronize_session=False)
+    )
+
+    # Bound credentials on terminated/expired subs: detach (NULL node_id)
+    # so the audit trail survives but the FK stops pinning the node.
+    bound_detached = (
+        db.query(models.Credential)
+        .filter(
+            models.Credential.node_id == node.id,
+            models.Credential.subscription_id.isnot(None),
+        )
+        .update({models.Credential.node_id: None}, synchronize_session=False)
+    )
+
     actor, actor_type = _resolve_admin_actor(admin_actor)
-    _audit(db, actor, "node_deleted", "vpn_node", node.id, actor_type=actor_type)
+    _audit(
+        db,
+        actor,
+        "node_deleted",
+        "vpn_node",
+        node.id,
+        actor_type=actor_type,
+        metadata={
+            "warm_credentials_deleted": warm_deleted,
+            "bound_credentials_detached": bound_detached,
+        },
+    )
     db.delete(node)
-    db.commit()
-    return {"node_id": node_id, "deleted": True}
+    try:
+        db.commit()
+    except IntegrityError as exc:
+        db.rollback()
+        # Something still points here — surface the DB-level detail so
+        # the admin can fix it instead of staring at "Не удалось удалить".
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error": "fk_blocked",
+                "message": (
+                    "БД отказала в удалении: на ноду ещё что-то ссылается. "
+                    f"Detail: {exc.orig}"
+                ),
+            },
+        ) from exc
+    return {
+        "node_id": node_id,
+        "deleted": True,
+        "warm_credentials_deleted": warm_deleted,
+        "bound_credentials_detached": bound_detached,
+    }
 
 
 # ---------------------------------------------------------------------------

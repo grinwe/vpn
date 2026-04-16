@@ -349,7 +349,14 @@ class Subscription(Base):
     id = Column(Integer, primary_key=True)
     user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
     plan_id = Column(Integer, ForeignKey("plans.id"), nullable=False)
-    node_id = Column(Integer, ForeignKey("vpn_nodes.id"), nullable=False)
+    # Nullable + SET NULL so deleting a VPNNode detaches historical
+    # (terminated/expired) subs instead of hitting an IntegrityError.
+    # Active/frozen subs are guarded at the /nodes/{id} DELETE endpoint.
+    node_id = Column(
+        Integer,
+        ForeignKey("vpn_nodes.id", ondelete="SET NULL"),
+        nullable=True,
+    )
     created_at = Column(DateTime, default=utcnow)
     updated_at = Column(DateTime, default=utcnow, onupdate=utcnow)
     expires_at = Column(DateTime, nullable=False)
