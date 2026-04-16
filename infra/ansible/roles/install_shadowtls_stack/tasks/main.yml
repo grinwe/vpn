@@ -37,162 +37,165 @@
   when: shadowtls_password is not defined or shadowtls_password | length == 0
   failed_when: false
 
-- name: Skip role when ShadowTLS is not configured
-  meta: end_role
-  when: shadowtls_password is not defined or shadowtls_password | length == 0
+# Gate the whole configuration path on shadowtls_password being provided.
+# Replaces the old `meta: end_role` skip task — `end_role` not supported
+# on the ansible version running the bootstrap from this workspace, plus
+# block+when is more portable across strategy plugins.
+- name: Configure ShadowTLS stack
+  when: shadowtls_password is defined and shadowtls_password | length > 0
+  block:
+    - name: Require ShadowTLS config variables
+      assert:
+        that:
+          - shadowtls_port is defined
+          - shadowtls_password | length >= 16
+          - shadowtls_ss_password is defined and shadowtls_ss_password | length >= 16
+          - shadowtls_handshake_domain is defined and shadowtls_handshake_domain | length > 0
+        fail_msg: >-
+          install_shadowtls_stack requires backend-supplied parameters
+          (shadowtls_port, shadowtls_password, shadowtls_ss_password,
+          shadowtls_handshake_domain). The backend generates these in
+          services/shadowtls.py and passes them as extra_vars when running
+          site.yml for a node.
 
-- name: Require ShadowTLS config variables
-  assert:
-    that:
-      - shadowtls_port is defined
-      - shadowtls_password | length >= 16
-      - shadowtls_ss_password is defined and shadowtls_ss_password | length >= 16
-      - shadowtls_handshake_domain is defined and shadowtls_handshake_domain | length > 0
-    fail_msg: >-
-      install_shadowtls_stack requires backend-supplied parameters
-      (shadowtls_port, shadowtls_password, shadowtls_ss_password,
-      shadowtls_handshake_domain). The backend generates these in
-      services/shadowtls.py and passes them as extra_vars when running
-      site.yml for a node.
+    - name: Ensure dependencies
+      apt:
+        name:
+          - curl
+          - xz-utils
+          - ca-certificates
+        state: present
+        update_cache: yes
 
-- name: Ensure dependencies
-  apt:
-    name:
-      - curl
-      - xz-utils
-      - ca-certificates
-    state: present
-    update_cache: yes
+    - name: Ensure config directory
+      file:
+        path: "{{ shadowtls_config_dir }}"
+        state: directory
+        owner: root
+        group: root
+        mode: '0750'
 
-- name: Ensure config directory
-  file:
-    path: "{{ shadowtls_config_dir }}"
-    state: directory
-    owner: root
-    group: root
-    mode: '0750'
+    # ── shadow-tls binary ────────────────────────────────────────────
+    - name: Check installed shadow-tls version
+      command: "{{ shadowtls_binary_dest }} --version"
+      register: shadowtls_installed_version
+      failed_when: false
+      changed_when: false
 
-# ── shadow-tls binary ────────────────────────────────────────────────
-- name: Check installed shadow-tls version
-  command: "{{ shadowtls_binary_dest }} --version"
-  register: shadowtls_installed_version
-  failed_when: false
-  changed_when: false
+    - name: Download shadow-tls binary
+      get_url:
+        url: "{{ shadowtls_binary_url }}"
+        dest: "{{ shadowtls_binary_dest }}"
+        mode: '0755'
+        owner: root
+        group: root
+        force: yes
+      when: >-
+        shadowtls_installed_version.rc != 0
+        or shadowtls_binary_version | regex_replace('^v','')
+           not in (shadowtls_installed_version.stdout | default(''))
+      notify: restart shadow-tls
 
-- name: Download shadow-tls binary
-  get_url:
-    url: "{{ shadowtls_binary_url }}"
-    dest: "{{ shadowtls_binary_dest }}"
-    mode: '0755'
-    owner: root
-    group: root
-    force: yes
-  when: >-
-    shadowtls_installed_version.rc != 0
-    or shadowtls_binary_version | regex_replace('^v','')
-       not in (shadowtls_installed_version.stdout | default(''))
-  notify: restart shadow-tls
+    # ── shadowsocks-rust binary ──────────────────────────────────────
+    - name: Check installed ssserver version
+      command: "{{ ssrust_binary_dest }} --version"
+      register: ssrust_installed_version
+      failed_when: false
+      changed_when: false
 
-# ── shadowsocks-rust binary ──────────────────────────────────────────
-- name: Check installed ssserver version
-  command: "{{ ssrust_binary_dest }} --version"
-  register: ssrust_installed_version
-  failed_when: false
-  changed_when: false
+    - name: Download shadowsocks-rust tarball
+      get_url:
+        url: "{{ ssrust_tarball_url }}"
+        dest: "/tmp/shadowsocks-rust-{{ ssrust_version }}.tar.xz"
+        mode: '0644'
+      when: >-
+        ssrust_installed_version.rc != 0
+        or ssrust_version | regex_replace('^v','')
+           not in (ssrust_installed_version.stdout | default(''))
+      register: ssrust_tarball
 
-- name: Download shadowsocks-rust tarball
-  get_url:
-    url: "{{ ssrust_tarball_url }}"
-    dest: "/tmp/shadowsocks-rust-{{ ssrust_version }}.tar.xz"
-    mode: '0644'
-  when: >-
-    ssrust_installed_version.rc != 0
-    or ssrust_version | regex_replace('^v','')
-       not in (ssrust_installed_version.stdout | default(''))
-  register: ssrust_tarball
+    - name: Extract ssserver binary
+      shell: |
+        set -euo pipefail
+        tmp=$(mktemp -d)
+        tar -xJf "/tmp/shadowsocks-rust-{{ ssrust_version }}.tar.xz" -C "$tmp"
+        install -m 0755 -o root -g root "$tmp/ssserver" "{{ ssrust_binary_dest }}"
+        rm -rf "$tmp" "/tmp/shadowsocks-rust-{{ ssrust_version }}.tar.xz"
+      args:
+        # ansible shell: defaults to /bin/sh (dash on Debian/Ubuntu), which
+        # does not understand `set -o pipefail`. Force bash explicitly so
+        # the heredoc runs under a shell that supports the option.
+        executable: /bin/bash
+      # Mirror the Download condition instead of gating on `ssrust_tarball is
+      # changed`: if the tarball is already cached in /tmp (get_url returns
+      # ok=not changed) but the installed ssserver binary is broken or
+      # missing, we still need to re-extract. Gating on the tarball task
+      # silently skipped extraction on reruns and left /usr/local/bin/ssserver
+      # as whatever garbage was there → systemd 203/EXEC.
+      when: >-
+        ssrust_installed_version.rc != 0
+        or ssrust_version | regex_replace('^v','')
+           not in (ssrust_installed_version.stdout | default(''))
+      notify: restart ssserver
 
-- name: Extract ssserver binary
-  shell: |
-    set -euo pipefail
-    tmp=$(mktemp -d)
-    tar -xJf "/tmp/shadowsocks-rust-{{ ssrust_version }}.tar.xz" -C "$tmp"
-    install -m 0755 -o root -g root "$tmp/ssserver" "{{ ssrust_binary_dest }}"
-    rm -rf "$tmp" "/tmp/shadowsocks-rust-{{ ssrust_version }}.tar.xz"
-  args:
-    # ansible shell: defaults to /bin/sh (dash on Debian/Ubuntu), which
-    # does not understand `set -o pipefail`. Force bash explicitly so
-    # the heredoc runs under a shell that supports the option.
-    executable: /bin/bash
-  # Mirror the Download condition instead of gating on `ssrust_tarball is
-  # changed`: if the tarball is already cached in /tmp (get_url returns
-  # ok=not changed) but the installed ssserver binary is broken or
-  # missing, we still need to re-extract. Gating on the tarball task
-  # silently skipped extraction on reruns and left /usr/local/bin/ssserver
-  # as whatever garbage was there → systemd 203/EXEC.
-  when: >-
-    ssrust_installed_version.rc != 0
-    or ssrust_version | regex_replace('^v','')
-       not in (ssrust_installed_version.stdout | default(''))
-  notify: restart ssserver
+    # ── Config + systemd units ───────────────────────────────────────
+    - name: Render ssserver config
+      template:
+        src: ssserver.json.j2
+        dest: "{{ shadowtls_ss_config }}"
+        owner: root
+        group: root
+        mode: '0640'
+        backup: yes
+      notify: restart ssserver
 
-# ── Config + systemd units ───────────────────────────────────────────
-- name: Render ssserver config
-  template:
-    src: ssserver.json.j2
-    dest: "{{ shadowtls_ss_config }}"
-    owner: root
-    group: root
-    mode: '0640'
-    backup: yes
-  notify: restart ssserver
+    - name: Install ssserver systemd unit
+      template:
+        src: ssserver.service.j2
+        dest: /etc/systemd/system/ssserver.service
+        owner: root
+        group: root
+        mode: '0644'
+      notify:
+        - reload systemd
+        - restart ssserver
 
-- name: Install ssserver systemd unit
-  template:
-    src: ssserver.service.j2
-    dest: /etc/systemd/system/ssserver.service
-    owner: root
-    group: root
-    mode: '0644'
-  notify:
-    - reload systemd
-    - restart ssserver
+    - name: Install shadow-tls systemd unit
+      template:
+        src: shadow-tls.service.j2
+        dest: /etc/systemd/system/shadow-tls.service
+        owner: root
+        group: root
+        mode: '0644'
+      notify:
+        - reload systemd
+        - restart shadow-tls
 
-- name: Install shadow-tls systemd unit
-  template:
-    src: shadow-tls.service.j2
-    dest: /etc/systemd/system/shadow-tls.service
-    owner: root
-    group: root
-    mode: '0644'
-  notify:
-    - reload systemd
-    - restart shadow-tls
+    - name: Install VPN user management helper
+      copy:
+        src: manage_vpn_user.sh
+        dest: /usr/local/sbin/manage_vpn_user.sh
+        owner: root
+        group: root
+        mode: '0750'
 
-- name: Install VPN user management helper
-  copy:
-    src: manage_vpn_user.sh
-    dest: /usr/local/sbin/manage_vpn_user.sh
-    owner: root
-    group: root
-    mode: '0750'
+    - name: Ensure ssserver enabled and running
+      systemd:
+        name: ssserver
+        enabled: yes
+        state: started
+        daemon_reload: yes
 
-- name: Ensure ssserver enabled and running
-  systemd:
-    name: ssserver
-    enabled: yes
-    state: started
-    daemon_reload: yes
+    - name: Ensure shadow-tls enabled and running
+      systemd:
+        name: shadow-tls
+        enabled: yes
+        state: started
+        daemon_reload: yes
 
-- name: Ensure shadow-tls enabled and running
-  systemd:
-    name: shadow-tls
-    enabled: yes
-    state: started
-    daemon_reload: yes
-
-# Flush handlers so that any queued ssserver/shadow-tls restart (e.g.
-# after a config rotation on an already-live node) happens before
-# check_node_health in the same play opens a socket. See the
-# corresponding comment in install_vless_reality for the full story.
-- name: Flush shadow-tls handlers before leaving the role
-  meta: flush_handlers
+    # Flush handlers so that any queued ssserver/shadow-tls restart (e.g.
+    # after a config rotation on an already-live node) happens before
+    # check_node_health in the same play opens a socket. See the
+    # corresponding comment in install_vless_reality for the full story.
+    - name: Flush shadow-tls handlers before leaving the role
+      meta: flush_handlers
