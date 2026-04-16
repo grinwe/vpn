@@ -56,24 +56,31 @@
 # We fetch the CIDR lists at deploy time (they change rarely; CF
 # publishes them as plain text). If you want auto-refresh, add a
 # systemd timer that re-runs these two get_url tasks periodically.
+# Shell out to system `curl` instead of ansible's `uri` here. `uri`
+# runs in the controller's Python interpreter and imports `ssl`; if the
+# controller has a broken Python build (e.g. self-compiled 3.10 linked
+# against a missing libssl.so.1.1), ansible swallows the ImportError
+# and then explodes with `NameError: name 'ssl' is not defined` when it
+# actually tries to open the TLS connection. `curl` uses the system
+# TLS stack, so it is resilient to whatever state the controller's
+# Python venv is in — this is an infra role and we'd rather not tie
+# deployment to a specific operator workstation.
 - name: Fetch Cloudflare IPv4 CIDRs (on controller)
-  uri:
-    url: https://www.cloudflare.com/ips-v4
-    return_content: true
+  command: curl -fsSL https://www.cloudflare.com/ips-v4
   register: cf_ipv4
   delegate_to: localhost
   run_once: true
   become: false
+  changed_when: false
   when: deploy_web_frontend_trust_cloudflare | bool
 
 - name: Fetch Cloudflare IPv6 CIDRs (on controller)
-  uri:
-    url: https://www.cloudflare.com/ips-v6
-    return_content: true
+  command: curl -fsSL https://www.cloudflare.com/ips-v6
   register: cf_ipv6
   delegate_to: localhost
   run_once: true
   become: false
+  changed_when: false
   when: deploy_web_frontend_trust_cloudflare | bool
 
 - name: Render Cloudflare real-IP snippet
