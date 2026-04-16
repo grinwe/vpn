@@ -17,6 +17,7 @@ from sqlalchemy.orm import Session
 from .. import models, schemas
 from ..auth import require_admin
 from ..security import encrypt as _encrypt
+from ..services.provisioning import ProvisioningOrchestrator
 from ..services.relay import (
     RelayAllocationError,
     allocate_client_address,
@@ -102,6 +103,15 @@ def create_exit(
     if db.query(models.WGExitNode).filter(models.WGExitNode.name == payload.name).first():
         raise HTTPException(status_code=409, detail="Exit node with this name already exists")
 
+    # Stage E — an exit without a private key can't be bootstrapped, and
+    # the admin UI shouldn't need two clicks (create → keygen) to get a
+    # usable node. Auto-generate on the server side when the admin hasn't
+    # provided the half themselves (e.g. bringing over an existing server).
+    public_key = payload.wg_public_key
+    private_key = payload.wg_private_key
+    if not private_key:
+        public_key, private_key = generate_wireguard_keypair()
+
     exit_node = models.WGExitNode(
         name=payload.name,
         region=payload.region,
@@ -109,8 +119,8 @@ def create_exit(
         ssh_port=payload.ssh_port,
         wg_port=payload.wg_port,
         wg_address_v4=payload.wg_address_v4,
-        wg_public_key=payload.wg_public_key,
-        wg_private_key_enc=_encrypt(payload.wg_private_key) if payload.wg_private_key else None,
+        wg_public_key=public_key,
+        wg_private_key_enc=_encrypt(private_key),
         provider_id=payload.provider_id,
         provider_external_id=payload.provider_external_id,
         provider_region=payload.provider_region,
@@ -122,6 +132,16 @@ def create_exit(
     db.refresh(exit_node)
     actor, actor_type = _resolve_admin_actor(admin_actor)
     _audit(db, actor, "wg_exit_created", "wg_exit_node", exit_node.id, actor_type=actor_type)
+
+    # Stage E — schedule the Ansible bootstrap on the worker. The role
+    # is idempotent, and this first run carries an empty peer list (the
+    # exit is unattached). Attaching a relay later re-runs bootstrap_exit
+    # as part of the relay_tunnel task so the peer list stays in sync.
+    orchestrator = ProvisioningOrchestrator(db)
+    task = orchestrator.create_task("exit", exit_node.id, "bootstrap", {})
+    db.commit()
+    orchestrator.run_task_async(task)
+
     return _to_out(exit_node, peers_count=0)
 
 
@@ -271,8 +291,9 @@ def attach_relay(
 
     Generates a fresh WG client keypair, allocates a free /32 in the
     exit's subnet, writes the link row, and populates the relay node's
-    ``relay_config`` in a single transaction. Does NOT invoke Ansible —
-    the worker-side bootstrap flow lands in stage D.
+    ``relay_config`` in a single transaction, then schedules a
+    ``relay_tunnel`` task on the worker that re-renders the exit's peer
+    list and brings wg0 up on the relay (stage E).
     """
     exit_node = db.get(models.WGExitNode, exit_id)
     if not exit_node:
@@ -331,6 +352,22 @@ def attach_relay(
         db, actor, "relay_exit_attached", "relay_exit_link", link.id,
         actor_type=actor_type,
     )
+
+    # Stage E — worker task runs bootstrap_exit.yml (new peer added to
+    # the server's wg0.conf) then relay_tunnel_apply.yml (wg0 up + Xray
+    # sockopt patched) on the relay. exit_id is carried on the payload
+    # so a future detach task can still find the right exit after
+    # relay_config is cleared.
+    orchestrator = ProvisioningOrchestrator(db)
+    task = orchestrator.create_task(
+        "relay_tunnel",
+        relay.id,
+        "apply",
+        {"exit_id": exit_node.id, "link_id": link.id},
+    )
+    db.commit()
+    orchestrator.run_task_async(task)
+
     return _link_to_out(link)
 
 
@@ -344,10 +381,11 @@ def detach_relay(
 ):
     """Detach a relay from this exit.
 
-    Drops the link row and clears the relay's ``relay_config``. Does NOT
-    invoke Ansible to tear down wg0 on the relay — that idempotent
-    teardown is D.1. Until then the detach is DB-only, so use with care
-    on live relays.
+    Drops the link row and clears the relay's ``relay_config``, then
+    schedules a ``relay_tunnel`` teardown task (re-renders the exit's
+    peer list without this client, and brings wg0 down + un-patches
+    Xray on the relay — the ``relay_jump_node`` role reads the empty
+    ``relay_wg_*`` vars and takes the teardown branch).
     """
     link = (
         db.query(models.RelayExitLink)
@@ -360,6 +398,7 @@ def detach_relay(
     if not link:
         raise HTTPException(status_code=404, detail="Link not found")
 
+    link_id = link.id
     relay = db.get(models.VPNNode, relay_node_id)
     if relay:
         relay.relay_config = None
@@ -368,7 +407,24 @@ def detach_relay(
     db.commit()
     actor, actor_type = _resolve_admin_actor(admin_actor)
     _audit(
-        db, actor, "relay_exit_detached", "relay_exit_link", link.id,
+        db, actor, "relay_exit_detached", "relay_exit_link", link_id,
         actor_type=actor_type,
     )
+
+    # Stage E — teardown task. Runs bootstrap_exit.yml on the exit
+    # (peer list no longer includes this relay) and relay_tunnel_apply.yml
+    # on the relay; the role sees empty relay_wg_* vars and tears wg0
+    # down + unpatches Xray. If the relay row is gone (rare — FK cascades
+    # drop the link first), skip — there's no target to reconfigure.
+    if relay is not None:
+        orchestrator = ProvisioningOrchestrator(db)
+        task = orchestrator.create_task(
+            "relay_tunnel",
+            relay.id,
+            "apply",
+            {"exit_id": exit_id, "link_id": link_id, "detach": True},
+        )
+        db.commit()
+        orchestrator.run_task_async(task)
+
     return {"exit_id": exit_id, "relay_node_id": relay_node_id, "deleted": True}

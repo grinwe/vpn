@@ -21,7 +21,11 @@ from sqlalchemy.orm import Session
 from .. import models
 from ..db import SessionLocal
 from ..security import decrypt, encrypt
-from .ansible_runner import build_inventory_for_node, run_playbook
+from .ansible_runner import (
+    build_inventory_for_exit_node,
+    build_inventory_for_node,
+    run_playbook,
+)
 
 logger = logging.getLogger(__name__)
 TASK_STATUS_COUNTER = Counter("vpn_provisioning_tasks_total", "Provisioning tasks processed", ["status"])
@@ -474,6 +478,78 @@ def _collect_site_extra_vars(node: models.VPNNode) -> dict[str, Any]:
     return extra
 
 
+def _collect_exit_extra_vars(
+    db: Session, exit_node: models.WGExitNode
+) -> dict[str, Any]:
+    """Build extra_vars for ``bootstrap_exit.yml`` on a WG exit node.
+
+    Decrypts the server private key and walks every ``RelayExitLink``
+    attached to this exit to produce the ``wg_exit_peers`` list the
+    ``wg_exit_node`` role renders into ``/etc/wireguard/wg0.conf``. An
+    empty list is legitimate (first bootstrap before any relay is
+    attached) — the role assertion explicitly accepts it.
+    """
+    if not exit_node.wg_private_key_enc:
+        raise RuntimeError(
+            f"Exit node {exit_node.name} has no private key — "
+            "generate one via POST /exits/{id}/keygen first"
+        )
+    links = (
+        db.query(models.RelayExitLink)
+        .filter(models.RelayExitLink.exit_id == exit_node.id)
+        .all()
+    )
+    peers = [
+        {
+            "name": link.relay_node.name if link.relay_node else f"relay-{link.relay_node_id}",
+            "public_key": link.wg_client_public_key,
+            "allowed_ips_v4": link.wg_client_address_v4,
+        }
+        for link in links
+    ]
+    extra: dict[str, Any] = {
+        "wg_exit_private_key": decrypt(exit_node.wg_private_key_enc),
+        "wg_exit_peers": peers,
+        "wg_exit_port": exit_node.wg_port,
+        "wg_exit_address_v4": exit_node.wg_address_v4,
+    }
+    # String values are scanned for Jinja2 markers / newlines; the peer
+    # list is a list of dicts and skips the string branch. Defence-in-depth
+    # — the only admin-controlled strings here are peer names, which the
+    # relay node creation path already validates through the same regex
+    # as the inventory builder.
+    _validate_extra_vars(extra, node_hint=f"exit/{exit_node.id}/{exit_node.name}")
+    return extra
+
+
+def _collect_relay_tunnel_extra_vars(
+    relay: models.VPNNode,
+) -> dict[str, Any]:
+    """Extra_vars for ``relay_tunnel_apply.yml`` on a relay jump node.
+
+    The ``relay_jump_node`` role is two-mode: with all four ``relay_wg_*``
+    vars set it brings wg0 up and patches Xray outbound sockopt; with
+    any of them missing it tears the tunnel down. Detach flows hit the
+    second branch by calling us on a relay whose ``relay_config`` was
+    already cleared.
+    """
+    rc = relay.relay_config or {}
+    priv_enc = rc.get("wg_private_key_enc")
+    priv_plain = rc.get("wg_private_key")
+    if priv_enc:
+        priv = decrypt(priv_enc) or ""
+    else:
+        priv = priv_plain or ""
+    extra: dict[str, Any] = {
+        "relay_wg_private_key": priv,
+        "relay_wg_address_v4": rc.get("wg_address_v4", ""),
+        "relay_wg_endpoint": rc.get("wg_endpoint", ""),
+        "relay_wg_exit_public_key": rc.get("wg_exit_public_key", ""),
+    }
+    _validate_extra_vars(extra, node_hint=f"relay/{relay.id}/{relay.name}")
+    return extra
+
+
 def _generate_sub_token() -> str:
     """Generate a stable 22-char URL-safe subscription token."""
     return secrets.token_urlsafe(16)
@@ -743,6 +819,33 @@ class ProvisioningOrchestrator:
             self.db.commit()
             return
 
+        # ── Exit-level outcome: same registering → active flip ──
+        if task.target_type == "exit":
+            exit_node = self.db.get(models.WGExitNode, task.target_id)
+            if not exit_node:
+                return
+            if success:
+                if exit_node.status == models.WGExitNodeStatus.registering:
+                    exit_node.status = models.WGExitNodeStatus.active
+            else:
+                # Only demote a still-registering exit. Active exits
+                # stay active on a transient bootstrap failure — a broken
+                # peer-list re-render shouldn't kick every attached relay
+                # offline.
+                if exit_node.status == models.WGExitNodeStatus.registering:
+                    exit_node.status = models.WGExitNodeStatus.error
+            self.db.add(exit_node)
+            self.db.commit()
+            return
+
+        # ── Relay-tunnel outcome: nothing to flip on the DB side ──
+        # The relay VPNNode's status is managed by node-level site.yml
+        # runs, not by tunnel up/down. An attach failure already shows
+        # up in the tasks UI — promoting/demoting the node here would
+        # fight with the normal bootstrap flow.
+        if task.target_type == "relay_tunnel":
+            return
+
         device = self.db.get(models.Device, task.target_id)
         if not device:
             return
@@ -867,6 +970,106 @@ class ProvisioningOrchestrator:
                     result = run_playbook(
                         "site.yml", inventory, limit=node.name, extra_vars=site_vars,
                     )
+            elif task.target_type == "exit":
+                # Stage E — bootstrap/re-bootstrap a WG exit node. Same
+                # task type is used for first-time install (peers=[]) and
+                # for every subsequent peer-list change; the role is
+                # idempotent (wg syncconf on the running interface).
+                exit_node = self.db.get(models.WGExitNode, task.target_id)
+                if not exit_node:
+                    raise RuntimeError("WG exit node not found for provisioning")
+                inventory = build_inventory_for_exit_node(exit_node)
+                exit_vars = _collect_exit_extra_vars(self.db, exit_node)
+                result = run_playbook(
+                    "playbooks/bootstrap_exit.yml",
+                    inventory,
+                    limit=exit_node.name,
+                    extra_vars=exit_vars,
+                    timeout=600,
+                )
+            elif task.target_type == "relay_tunnel":
+                # Stage E — reconcile the WireGuard client side of a
+                # relay jump node. Runs two playbooks sequentially so an
+                # attach/detach produces a consistent state across both
+                # ends in a single task:
+                #   1) bootstrap_exit.yml on the current (or formerly
+                #      attached) exit — re-renders its peer list so the
+                #      relay is added/removed from the server config.
+                #   2) relay_tunnel_apply.yml on the relay itself —
+                #      brings wg0 up + patches Xray when relay_config is
+                #      set; tears both down when it isn't (detach path).
+                #
+                # ``exit_id`` is carried on task.payload because detach
+                # clears ``relay_config`` before the task fires, so we'd
+                # have no other way to find the exit whose wg0.conf still
+                # holds the now-stale peer line.
+                relay = self.db.get(models.VPNNode, task.target_id)
+                if not relay:
+                    raise RuntimeError("Relay VPN node not found for provisioning")
+                exit_id = (payload or {}).get("exit_id")
+                exit_node = None
+                if exit_id is not None:
+                    exit_node = self.db.get(models.WGExitNode, int(exit_id))
+
+                combined_stdout: list[str] = []
+                combined_stderr: list[str] = []
+                rc = 0
+                # Step 1 — refresh the exit's peer list. Skipped if the
+                # exit row is already gone (admin deleted it after
+                # detaching every relay).
+                if exit_node is not None:
+                    exit_inv = build_inventory_for_exit_node(exit_node)
+                    try:
+                        exit_vars = _collect_exit_extra_vars(self.db, exit_node)
+                        exit_result = run_playbook(
+                            "playbooks/bootstrap_exit.yml",
+                            exit_inv,
+                            limit=exit_node.name,
+                            extra_vars=exit_vars,
+                            timeout=600,
+                        )
+                        combined_stdout.append(
+                            f"=== bootstrap_exit on {exit_node.name} ===\n"
+                            + (exit_result.stdout or "")
+                        )
+                        combined_stderr.append(exit_result.stderr or "")
+                        if exit_result.returncode:
+                            rc = exit_result.returncode
+                    finally:
+                        try:
+                            exit_inv.unlink()
+                        except OSError:
+                            logger.warning(
+                                "Failed to remove exit inventory %s", exit_inv
+                            )
+
+                # Step 2 — apply (or tear down) the tunnel on the relay.
+                # Runs even if step 1 failed so the relay side isn't left
+                # stranded; final returncode is the worst of the two.
+                inventory = build_inventory_for_node(relay)
+                relay_vars = _collect_relay_tunnel_extra_vars(relay)
+                relay_result = run_playbook(
+                    "playbooks/relay_tunnel_apply.yml",
+                    inventory,
+                    limit=relay.name,
+                    extra_vars=relay_vars,
+                    timeout=600,
+                )
+                combined_stdout.append(
+                    f"=== relay_tunnel_apply on {relay.name} ===\n"
+                    + (relay_result.stdout or "")
+                )
+                combined_stderr.append(relay_result.stderr or "")
+                if relay_result.returncode:
+                    rc = relay_result.returncode
+
+                class _CombinedResult:
+                    """Matches the subset of CompletedProcess fields run_task() reads."""
+
+                result = _CombinedResult()
+                result.stdout = "\n".join(combined_stdout)
+                result.stderr = "\n".join(s for s in combined_stderr if s)
+                result.returncode = rc
             elif task.target_type == "device":
                 # Fallback node resolution: callers that don't pre-load
                 # the node (rerun from /admin/tasks, RQ worker with no

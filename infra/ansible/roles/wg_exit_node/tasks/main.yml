@@ -23,9 +23,11 @@
   assert:
     that:
       - wg_exit_private_key is defined and wg_exit_private_key | length > 0
-      - wg_exit_peers is defined and wg_exit_peers | length > 0
+      - wg_exit_peers is defined
     fail_msg: >-
-      wg_exit_node requires wg_exit_private_key and wg_exit_peers.
+      wg_exit_node requires wg_exit_private_key and a (possibly empty)
+      wg_exit_peers list. First bootstrap runs with peers=[]; peers are
+      added by later relay_tunnel_apply runs.
 
 - name: Install WireGuard
   apt:

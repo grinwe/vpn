@@ -164,6 +164,45 @@ all:
     return Path(handle.name)
 
 
+def build_inventory_for_exit_node(
+    exit_node: models.WGExitNode, ansible_user: str = "root"
+) -> Path:
+    """Generate a single-host inventory for a WG exit node.
+
+    Mirrors :func:`build_inventory_for_node` but puts the host under the
+    ``wg_exit_nodes`` group so ``bootstrap_exit.yml`` (which targets
+    ``hosts: wg_exit_nodes``) matches. Identity fields are validated
+    through the same whitelist to keep the inventory YAML
+    injection-proof; an exit node whose name/host/ssh_port don't match
+    the regex is rejected with :class:`InvalidNodeIdentity`.
+
+    Caller must unlink the returned temp file in a ``finally`` block.
+    """
+    _ensure_ansible_root()
+    validate_node_identity_fields(exit_node.name, exit_node.host, exit_node.ssh_port)
+    inventory_content = """
+all:
+  hosts:
+    {name}:
+      ansible_host: {host}
+      ansible_port: {port}
+      ansible_user: {user}
+  children:
+    wg_exit_nodes:
+      hosts:
+        {name}:
+""".format(
+        name=exit_node.name,
+        host=exit_node.host,
+        port=exit_node.ssh_port,
+        user=ansible_user,
+    )
+    handle = tempfile.NamedTemporaryFile("w", delete=False, suffix="-inventory.yml")
+    handle.write(inventory_content)
+    handle.flush()
+    return Path(handle.name)
+
+
 def run_playbook(
     playbook: str,
     inventory: Path,
