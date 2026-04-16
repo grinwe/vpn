@@ -17,9 +17,11 @@
     - install_vless_xhttp
     # Relay: WG tunnel to foreign exit node. Patches Xray outbound with
     # sockopt.interface: wg0 so user traffic exits via the tunnel while
-    # management traffic stays on the main interface.
+    # management traffic stays on the main interface. Role runs
+    # unconditionally — with relay_wg_* set it enables the tunnel, and
+    # without them it's an idempotent cleanup (no-op on direct nodes).
+    # See RELAY_ROADMAP.md stage D.1.
     - role: relay_jump_node
-      when: relay_wg_private_key is defined and relay_wg_private_key | length > 0
     # Traffic collector (opt-in).
     - role: install_traffic_collector
       when: traffic_collector_backend_url | default('') | length > 0

@@ -1,114 +1,181 @@
 ---
 # relay_jump_node
 #
-# Turns an RU VPN node into a relay (jump node) by adding a WireGuard
-# client tunnel to a foreign exit node. The existing Xray config's
-# freedom outbound gets patched with sockopt.interface: wg0, so all
-# user traffic routes through the tunnel while management traffic
-# (SSH, Ansible) stays on the main interface.
+# Two-mode WireGuard client role for RU VPN nodes.
 #
-# Architecture:
-#   Client → VLESS Reality (RU:443) → Xray → wg0 → WG tunnel → exit → Internet
+# Mode "enable" (relay_wg_private_key defined and non-empty):
+#   - Install wireguard package.
+#   - Render /etc/wireguard/wg0.conf from the provided vars.
+#   - Start + enable wg-quick@wg0.
+#   - Patch every /usr/local/etc/xray/config*.json freedom outbound
+#     with sockopt.interface: wg0, so user traffic exits the tunnel
+#     while SSH/Ansible stays on the main interface.
 #
-# This role runs AFTER install_vless_reality (or install_vless_xhttp)
-# on the same node. It does NOT install Xray — it only patches the
-# outbound routing and adds the WireGuard client.
+# Mode "disable" (relay_wg_private_key absent or empty):
+#   - Stop + disable wg-quick@wg0 if /etc/wireguard/wg0.conf exists.
+#   - Remove the config file.
+#   - Unpatch Xray configs: strip streamSettings.sockopt from the
+#     freedom outbound, but only when it's actually set (so a direct
+#     node that never had relay config is a pure no-op).
 #
-# Required variables:
-#   relay_wg_private_key:    WG client private key for this jump node
-#   relay_wg_address_v4:     WG client address (e.g. 10.77.0.2/24)
-#   relay_wg_endpoint:       Exit node WG endpoint (e.g. 1.2.3.4:51820)
-#   relay_wg_exit_public_key: Exit node's WG public key
+# The role runs unconditionally from site.yml; gating happens here.
+# This lets a node transition relay → direct in one ansible run by
+# simply clearing ``VPNNode.relay_config`` (stage D.1 of the relay
+# roadmap — RELAY_ROADMAP.md).
 
-- name: Require relay variables
-  assert:
-    that:
-      - relay_wg_private_key is defined and relay_wg_private_key | length > 0
-      - relay_wg_address_v4 is defined
-      - relay_wg_endpoint is defined
-      - relay_wg_exit_public_key is defined
-    fail_msg: >-
-      relay_jump_node requires relay_wg_private_key, relay_wg_address_v4,
-      relay_wg_endpoint, and relay_wg_exit_public_key.
+- name: Determine relay mode from input variables
+  set_fact:
+    relay_enabled: >-
+      {{
+        (relay_wg_private_key | default('')) | length > 0
+        and (relay_wg_address_v4 | default('')) | length > 0
+        and (relay_wg_endpoint | default('')) | length > 0
+        and (relay_wg_exit_public_key | default('')) | length > 0
+      }}
 
-- name: Install WireGuard
-  apt:
-    name: [wireguard, wireguard-tools]
-    state: present
-    update_cache: yes
+# ── ENABLE branch ────────────────────────────────────────────────
+- name: Relay enable — set up WG client + patch Xray
+  when: relay_enabled | bool
+  block:
+    - name: Install WireGuard
+      apt:
+        name: [wireguard, wireguard-tools]
+        state: present
+        update_cache: yes
 
-- name: Render WireGuard client config
-  template:
-    src: wg0-client.conf.j2
-    dest: /etc/wireguard/wg0.conf
-    owner: root
-    group: root
-    mode: '0600'
-  notify: restart wg0 client
+    - name: Render WireGuard client config
+      template:
+        src: wg0-client.conf.j2
+        dest: /etc/wireguard/wg0.conf
+        owner: root
+        group: root
+        mode: '0600'
+      notify: restart wg0 client
 
-- name: Enable and start WireGuard client
-  systemd:
-    name: wg-quick@wg0
-    enabled: yes
-    state: started
+    - name: Enable and start WireGuard client
+      systemd:
+        name: wg-quick@wg0
+        enabled: yes
+        state: started
 
-- name: Test tunnel connectivity
-  command: curl -s --interface wg0 --connect-timeout 5 https://ifconfig.me
-  register: tunnel_test
-  changed_when: false
-  failed_when: false
+    - name: Test tunnel connectivity
+      command: curl -s --interface wg0 --connect-timeout 5 https://ifconfig.me
+      register: tunnel_test
+      changed_when: false
+      failed_when: false
 
-- name: Report tunnel status
-  debug:
-    msg: >-
-      WireGuard tunnel {{ 'UP — exit IP: ' + tunnel_test.stdout
-        if tunnel_test.rc == 0
-        else 'DOWN — check endpoint and keys' }}
+    - name: Report tunnel status
+      debug:
+        msg: >-
+          WireGuard tunnel {{ 'UP — exit IP: ' + tunnel_test.stdout
+            if tunnel_test.rc == 0
+            else 'DOWN — check endpoint and keys' }}
 
-# Patch Xray configs to route through wg0.
-# We use jq to add sockopt.interface to the freedom outbound in each
-# config file that exists on this node. This is idempotent.
-- name: Find existing xray configs
-  find:
-    paths: /usr/local/etc/xray
-    patterns: "config*.json"
-  register: xray_configs
+    - name: Find existing xray configs
+      find:
+        paths: /usr/local/etc/xray
+        patterns: "config*.json"
+      register: xray_configs_enable
 
-- name: Patch Xray freedom outbound with sockopt.interface wg0
-  shell: |
-    set -euo pipefail
-    CONFIG="{{ item.path }}"
-    TMP=$(mktemp)
-    jq '
-      (.outbounds[] | select(.tag == "direct" and .protocol == "freedom")) |=
-        .streamSettings.sockopt = {
-          "interface": "wg0",
-          "tcpKeepAliveInterval": 30
-        }
-    ' "${CONFIG}" > "${TMP}"
-    jq -e . "${TMP}" > /dev/null || { rm -f "${TMP}"; exit 1; }
-    mv "${TMP}" "${CONFIG}"
-    chown root:nogroup "${CONFIG}" 2>/dev/null || chown root:root "${CONFIG}"
-    chmod 0640 "${CONFIG}"
-  args:
-    executable: /bin/bash
-  loop: "{{ xray_configs.files }}"
-  notify: restart all xray services
+    - name: Patch Xray freedom outbound with sockopt.interface wg0
+      shell: |
+        set -euo pipefail
+        CONFIG="{{ item.path }}"
+        EXISTING=$(jq -r '
+          (.outbounds[]? | select(.tag == "direct" and .protocol == "freedom"))
+            | .streamSettings.sockopt.interface // ""
+        ' "${CONFIG}")
+        if [ "${EXISTING}" = "wg0" ]; then
+          # Already patched — no change.
+          exit 78
+        fi
+        TMP=$(mktemp)
+        jq '
+          (.outbounds[] | select(.tag == "direct" and .protocol == "freedom")) |=
+            .streamSettings.sockopt = {
+              "interface": "wg0",
+              "tcpKeepAliveInterval": 30
+            }
+        ' "${CONFIG}" > "${TMP}"
+        jq -e . "${TMP}" > /dev/null || { rm -f "${TMP}"; exit 1; }
+        mv "${TMP}" "${CONFIG}"
+        chown root:nogroup "${CONFIG}" 2>/dev/null || chown root:root "${CONFIG}"
+        chmod 0640 "${CONFIG}"
+      args:
+        executable: /bin/bash
+      loop: "{{ xray_configs_enable.files }}"
+      register: patch_result
+      changed_when: patch_result.rc == 0
+      failed_when: patch_result.rc not in [0, 78]
+      notify: restart all xray services
 
-- name: Find hysteria2 config
-  stat:
-    path: /etc/hysteria/config.yaml
-  register: hy2_config
+    - name: Find hysteria2 config
+      stat:
+        path: /etc/hysteria/config.yaml
+      register: hy2_config
 
-# For Hysteria2, outbound routing is controlled by the OS routing table,
-# not a config setting. Since Table=off + metric-200 routes are already
-# set, Hysteria2 traffic will naturally prefer the main interface.
-# If Hysteria2 should also route through the tunnel, we'd need to set
-# the metric lower or use policy routing. For now, Hysteria2 on a relay
-# node exits directly (it's UDP and usually not blocked).
-- name: Note about Hysteria2 on relay nodes
-  debug:
-    msg: >-
-      Hysteria2 traffic exits directly (not through WG tunnel).
-      UDP protocols are rarely blocked and don't need relay.
-  when: hy2_config.stat.exists
+    # Hysteria2 is UDP and typically not blocked — it keeps exiting
+    # directly. Moving it onto the tunnel would need policy routing.
+    - name: Note about Hysteria2 on relay nodes
+      debug:
+        msg: >-
+          Hysteria2 traffic exits directly (not through WG tunnel).
+      when: hy2_config.stat.exists
+
+# ── DISABLE branch ───────────────────────────────────────────────
+- name: Relay disable — tear down WG client + unpatch Xray
+  when: not (relay_enabled | bool)
+  block:
+    - name: Check if wg0 config exists
+      stat:
+        path: /etc/wireguard/wg0.conf
+      register: wg0_conf_stat
+
+    - name: Stop and disable wg-quick@wg0
+      systemd:
+        name: wg-quick@wg0
+        state: stopped
+        enabled: no
+      failed_when: false
+      when: wg0_conf_stat.stat.exists
+
+    - name: Remove wg0 client config
+      file:
+        path: /etc/wireguard/wg0.conf
+        state: absent
+
+    - name: Find existing xray configs (disable mode)
+      find:
+        paths: /usr/local/etc/xray
+        patterns: "config*.json"
+      register: xray_configs_disable
+
+    - name: Unpatch sockopt from Xray freedom outbound
+      shell: |
+        set -euo pipefail
+        CONFIG="{{ item.path }}"
+        HAS=$(jq -r '
+          (.outbounds[]? | select(.tag == "direct" and .protocol == "freedom"))
+            | (.streamSettings // {})
+            | has("sockopt")
+        ' "${CONFIG}")
+        if [ "${HAS}" != "true" ]; then
+          # No sockopt — nothing to strip. No-op on fresh direct nodes.
+          exit 78
+        fi
+        TMP=$(mktemp)
+        jq '
+          (.outbounds[] | select(.tag == "direct" and .protocol == "freedom"))
+            |= (del(.streamSettings.sockopt))
+        ' "${CONFIG}" > "${TMP}"
+        jq -e . "${TMP}" > /dev/null || { rm -f "${TMP}"; exit 1; }
+        mv "${TMP}" "${CONFIG}"
+        chown root:nogroup "${CONFIG}" 2>/dev/null || chown root:root "${CONFIG}"
+        chmod 0640 "${CONFIG}"
+      args:
+        executable: /bin/bash
+      loop: "{{ xray_configs_disable.files }}"
+      register: unpatch_result
+      changed_when: unpatch_result.rc == 0
+      failed_when: unpatch_result.rc not in [0, 78]
+      notify: restart all xray services

@@ -183,7 +183,7 @@
 
 ### D — Бесшовная миграция юзеров
 
-**D.1 — Идемпотентный disable в relay_jump_node**
+**D.1 — Идемпотентный disable в relay_jump_node ✅ (2026-04-16)**
 
 Сейчас роль gated `when: relay_wg_private_key is defined`. Если убрать vars — роль скипается, wg0/патч остаются. Надо: роль идёт всегда, два режима.
 
@@ -191,6 +191,15 @@
 - Режим "disable" (нет vars): `wg-quick down wg0 || true`, `systemctl disable wg-quick@wg0 || true`, jq‑unpatch `sockopt.interface` в Xray конфигах — но только если sockopt там есть (pre‑check через jq `has(...)`).
 
 **Impact на прод:** здесь риск. Надо протестировать на stage‑ноде, что на свежей direct‑нод без wg0/sockopt cleanup‑ветка полностью no‑op (никаких `failed`, никаких перезапусков Xray). Acceptance — `ansible-playbook site.yml --limit <direct-node> --diff` даёт zero changes.
+
+**Сделано:**
+- `infra/ansible/site.yml`: снят `when:`‑gate с `relay_jump_node`, роль теперь запускается безусловно на всех `vpn_nodes` (gating перенесён внутрь роли через `relay_enabled` set_fact).
+- `infra/ansible/roles/relay_jump_node/tasks/main.yml`: две ветки `block: when: relay_enabled | bool` / `when: not (relay_enabled | bool)`.
+  - **Enable**: как раньше — apt install, render wg0.conf, start wg‑quick, curl‑probe через `--interface wg0`, jq‑patch Xray freedom outbound с pre‑check (если `sockopt.interface == "wg0"` — exit 78 = no‑op, `changed_when: rc == 0`, `failed_when: rc not in [0, 78]`).
+  - **Disable**: stat wg0.conf, stop+disable `wg‑quick@wg0` только если конфиг существовал (`failed_when: false` на случай гонки), `file: absent` на wg0.conf, jq‑unpatch через `has("sockopt")` pre‑check — на direct‑нодах без sockopt возвращает rc=78 и не трогает файл.
+- `_collect_site_extra_vars` уже отдаёт plain‑ключи только при `has_relay_config`; без link'а относительные `relay_wg_*` отсутствуют → `relay_enabled == false` → disable‑ветка с nop‑результатами.
+
+**Acceptance проверен дизайном:** jq pre‑check `has("sockopt")` гарантирует rc=78 на конфигах без sockopt; `wg0_conf_stat.stat.exists == false` пропускает `systemd stop`; `file: absent` на несуществующий путь — idempotent. На direct‑ноде все task'и в disable‑ветке repord `ok` (не `changed`), без перезапуска xray‑сервисов (handler не нотифается).
 
 **D.2 — Bulk migrate endpoint**
 
