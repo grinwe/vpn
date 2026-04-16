@@ -229,6 +229,37 @@
 
 **Acceptance:** после прохода всех 8 нод: в админке «8 exit, N relay», все active subs на relay, зарубежные ноды без VLESS‑сервисов.
 
+### E — Post‑release fixes (2026-04-17)
+
+После первого реального сценария «создал exit → привязал relay → связка бутстрапится» вылезла серия багов, не покрытых Stage C. Всё пофикшено одним раундом, стадия E объединяет их.
+
+**E.1 — Exit rebootstrap + keygen UI**
+- `backend/app/api/exits.py`: `POST /exits/{id}/bootstrap` (мирроринг `rebootstrap_node`) + `POST /exits/_keygen` (non‑persisting preview пары ключей для формы).
+- `admin/src/pages/Exits.tsx`: кнопка bootstrap в таблице + «Сгенерировать пару» в `ExitForm`. Оба WG‑инпута получили `autoComplete="new-password"` — без этого браузер подставлял urlsafe‑base64 админский токен в поле приватного ключа, и WG на старте валился с `Key is not the correct length or format`.
+
+**E.2 — `_collect_exit_extra_vars` без ansible.utils.ipaddr**
+- `backend/app/services/provisioning.py`: `wg_exit_network_v4` считается Python‑модулем `ipaddress` до вызова playbook'а. В backend‑контейнере не было коллекции `ansible.utils`, и Jinja `| ansible.utils.ipaddr('network/prefix')` падал на первом же запуске exit bootstrap.
+- `roles/wg_exit_node/tasks/main.yml`: подставляет `wg_exit_network_v4 | default('10.77.0.0/24')` вместо inline‑вычисления.
+
+**E.3 — jq syntax + split_args apostrophe**
+- `roles/relay_jump_node/tasks/main.yml`: jq `(path) |= .nested = value` — невалидный синтаксис (`|=` не цепляется в `=`). Переписано на path‑based assignment `(path).nested = value`. Тест на синтетическом JSON подтверждает эквивалентность.
+- Комментарий внутри `shell: |` содержал `won't` — апостроф ansible `split_args` учитывает независимо от shell‑контекста, play падал с «unbalanced jinja2 block or quotes». Контракции в комментариях убраны проактивно в обеих ролях.
+
+**E.4 — UFW allow для WG‑порта на exit**
+- `roles/wg_exit_node/tasks/main.yml`: новая задача — если `/usr/sbin/ufw` существует, `ufw allow {{ wg_exit_port }}/udp`. Без этого на хостингах с дефолтным `INPUT policy DROP` (contabo и подобные) handshake‑пакеты релея не доходили до WG‑kernel: в `tcpdump` видны `In length 148`, но `wg show` — `0 B received`, а `dmesg` чист. Roote cause реального прод‑инцидента 2026‑04‑17.
+- Idempotent (`ufw allow` возвращает `Skipping adding existing rule` на повторе).
+
+**E.5 — Fatal tunnel test в relay_jump_node**
+- Было: `failed_when: false` на `curl --interface wg0 ifconfig.me`. Бутстрап зеленел даже при мёртвом туннеле (см. E.4), админ думал что всё ок, клиенты таймаутились.
+- Стало: `retries: 6, delay: 5, until: tunnel_test.rc == 0`. ~30 сек окно на handshake, дальше play падает. Silent success по этому пути невозможен.
+
+**E.6 — Backfill credentials when a new protocol is added to a node**
+- `backend/app/services/provisioning.py::ProvisioningOrchestrator.backfill_credentials_for_new_config` — новый метод.
+- `backend/app/api/nodes.py::create_config`: вызывает backfill сразу после сохранения `VPNConfig`, до постановки bootstrap task.
+- Проблема: при добавлении второго протокола на ноду `site.yml` обновлял xray‑конфиг, но для уже существующих `Device` не создавались `Credential`‑строки под новый протокол. `/sub/{token}` рендерит `sub.credentials`, поэтому второй протокол **никогда не появлялся** в подписке для ранее провиженных юзеров (новые юзеры получали оба — у них `provision_cold_path` итерирует `enabled_configs`). Для VLESS family переиспользуется существующий UUID девайса (нода видит одного user‑а через все vless‑*).  После успешного bootstrap `_handle_task_outcome → resync_node_clients` подтягивает свежие rows на ноду через `manage_vless_*_user.sh`.
+
+**Acceptance E:** exit bootstrap без UFW‑дропа, `ufw allow 51820/udp` в роли; relay bootstrap падает при мёртвом туннеле; добавление второго протокола на VPN‑ноду приводит к его появлению в `/sub/{token}` для всех активных подписок.
+
 ## Риски и открытые вопросы
 
 - **Шифрование relay_config.** Сейчас `wg_private_key` в JSONB plain. В B — шифровать через `credentials.encrypt` (та же схема, что `ss_password_enc`).
