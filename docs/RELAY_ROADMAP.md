@@ -260,6 +260,29 @@
 
 **Acceptance E:** exit bootstrap без UFW‑дропа, `ufw allow 51820/udp` в роли; relay bootstrap падает при мёртвом туннеле; добавление второго протокола на VPN‑ноду приводит к его появлению в `/sub/{token}` для всех активных подписок.
 
+### F — Worker queue hardening + admin tooling (2026-04-17)
+
+После фиксов E нашлись две operational issue'а, не блокирующие фичу, но перегружающие прод. Плюс бэкфил из E.6 реально нужен на уже-сломанных нодах — без ручной кнопки приходится либо дёргать API курлом, либо ждать автоматики (которой нет, потому что нет триггера — конфиг добавили в прошлом).
+
+**F.1 — `schedule_tick` + детерминированный дедуп тиков**
+- `backend/app/queue.py::schedule_tick(func_name, interval_seconds, tick_id)` — обёртка над `queue.enqueue_in(..., job_id=tick_id)` с `StartedJobRegistry.cleanup()` + fetch-check-delete-fresh (mirrors `enqueue_task`).
+- `backend/app/worker.py`: 16 мест (`queue.enqueue_in(...)` в 8 self-reschedule ветках + 8 bootstrap-ветках в `main()`) заменены на `schedule_tick(..., tick_id="tick-<slug>")`.
+- Root cause: каждый рестарт воркера в `main()` делал bootstrap-enqueue **поверх** ещё не стрельнувшего scheduled-job'а от прошлой инкарнации. После N рестартов на тик висело N параллельных цепочек. Репро 2026-04-17: `rq info` показал 57 scheduled jobs вместо 8. Следствия: дубль `run_balance_charge_tick` дважды в час → дубль debit, дубль renewal-reminder'ов; умножение SSH-нагрузки от `run_traffic_stats_tick`.
+- После фикса: 10 рестартов подряд оставляют ровно 8 scheduled jobs (по одному на тик). См. `docs/components/worker.md § Дедупликация тиков`.
+
+**F.2 — Queue monitoring + reset-stuck endpoints**
+- `backend/app/api/tasks.py`:
+  - `GET /api/provisioning/queue-status` — `{queued, started, failed, deferred, scheduled, workers, db_pending, db_running, ticks_scheduled: [...]}`. Быстрый снимок из RQ registries + `ProvisioningTask` counts.
+  - `POST /api/provisioning/queue/reset-stuck` — `StartedJobRegistry.cleanup()` + дедуп тиков (пере-`schedule_tick` для финальных/отсутствующих) + `reset_stuck_tasks()` (ставит `running` обратно в `pending`). Пишет `AuditLog`.
+- Для адмиинки: баннер на Tasks.tsx (Step 3, отложен до явного апрува) + кнопка reset.
+
+**F.3 — Node backfill-missing-creds endpoint + UI кнопка**
+- `backend/app/api/nodes.py::backfill_missing_creds` — `POST /api/nodes/{id}/backfill-missing-creds`. Итерирует все `enabled` `VPNConfig` ноды, вызывает `ProvisioningOrchestrator.backfill_credentials_for_new_config` (E.6) на каждом. Возвращает `{node_id, created: {config_id: count}, total_created}`. Аудит-лог `node_backfill_creds`.
+- `admin/src/pages/Nodes.tsx`: кнопка «backfill креды» в action-ряду ноды (рядом с resync/diagnose).
+- Зачем отдельно от E.6: E.6 закрывает дверь для будущих `create_config`, но уже сломанные ноды до E.6 деплоя — с живыми подписками без `Credential` под второй протокол — никто не бэкфилит автоматически. Эта кнопка — разовый ремонт, после успеха не нужна, но в UI остаётся как always-safe op.
+
+**Acceptance F:** после 10 рестартов воркера `rq info` показывает не больше 8 tick-jobs в `scheduled`; `GET /provisioning/queue-status` отдаёт консистентную картину; нажатие «backfill креды» на уже сломанной ноде приводит к появлению недостающего протокола в `/sub/{token}` в течение одного resync-цикла.
+
 ## Риски и открытые вопросы
 
 - **Шифрование relay_config.** Сейчас `wg_private_key` в JSONB plain. В B — шифровать через `credentials.encrypt` (та же схема, что `ss_password_enc`).

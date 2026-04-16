@@ -118,6 +118,7 @@ CRUD по тарифам. Поля: `name`, `duration_days`, `max_devices`, `pri
 | `исключить` / `вернуть в пул` на ноде | `POST /api/nodes/{id}/active` | Флипит `is_active`. Планировщик `_pick_node` сразу перестаёт видеть исключённую. |
 | `переселить` на ноде | `POST /api/nodes/{id}/migrate` | Все активные подписки получают новую ноду через `_pick_node`, ansible-таски в фоне. Миграция in-place: `sub_token` и строка сохраняются, дубликатов в webapp нет. |
 | `resync` на ноде | `POST /api/nodes/{id}/resync` | Force-retry всех активных VLESS UUID'ов на ноде через `playbooks/resync_node.yml` (цикл `manage_vless_user.sh add`). Идемпотентно. Safety-net при drift'е клиентов vs БД. См. [NODES.md § VLESS client resync](NODES.md#vless-client-resync). |
+| `backfill креды` на ноде | `POST /api/nodes/{id}/backfill-missing-creds` | Создаёт `Credential` для уже провижённых девайсов под enabled-протоколы ноды. Фиксит случай, когда добавили протокол на ноду, но в `/sub/{token}` у старых юзеров он не появился. Идемпотентно. |
 | `del` на таске | `DELETE /api/provisioning/tasks/{id}` | Жёсткое удаление записи (нельзя для `running`). |
 
 ## Navigation permission

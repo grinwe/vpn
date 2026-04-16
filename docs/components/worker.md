@@ -62,16 +62,18 @@ Backend прогоняет `alembic upgrade head` на старте (`main.py:18
 
 ### Bootstrap при старте воркера
 
-В `main()` (`worker.py:813-928`) каждая тика первый раз ставится в очередь через `enqueue_in(min(interval, X), ...)` — где `X` маленькое (30-60с), чтобы после рестарта бота/воркера первый прогон был почти сразу, а дальше уже с полным интервалом. Пример:
+В `main()` (`worker.py:1220-1401`) каждая тика первый раз ставится в очередь через `schedule_tick(func_name, min(interval, X), tick_id)` — где `X` маленькое (30-60с), чтобы после рестарта воркера первый прогон был почти сразу, а дальше уже с полным интервалом. Пример:
 
 ```python
-# worker.py:894-898
-queue.enqueue_in(
-    timedelta(seconds=min(balance_interval, 60)),
+# worker.py (bootstrap-ветка для balance-charge)
+schedule_tick(
     "app.worker.run_balance_charge_tick",
-    result_ttl=3600,
+    min(balance_interval, 60),
+    tick_id="tick-balance-charge",
 )
 ```
+
+`schedule_tick` — обёртка над `queue.enqueue_in(..., job_id=tick_id)` с zombie-reclaim и дедупом поверх. Без детерминированного `job_id` каждый рестарт воркера плодил бы новую цепочку тика: после 3-4 рестартов `rq info` показывал 50+ `scheduled` jobs вместо 8 (репро 2026-04-17). Детали — § Дедупликация тиков ниже.
 
 Затем `worker.work(with_scheduler=True)` — блокирующий вызов, запускает worker main loop + scheduler loop для отложенных задач.
 
@@ -80,23 +82,21 @@ queue.enqueue_in(
 Каждая тика в конце своего тела делает примерно так:
 
 ```python
-# worker.py:432-443 (warm-pool pattern)
+# warm-pool pattern
 interval = int(os.getenv("WARM_POOL_CHECK_INTERVAL", "120"))
 if interval > 0:
-    queue = get_queue()
-    if queue is not None:
-        try:
-            queue.enqueue_in(
-                timedelta(seconds=interval),
-                "app.worker.run_warm_pool_check",
-                result_ttl=3600,
-            )
-        except Exception:
-            logger.exception("warm_pool: failed to re-enqueue tick")
+    try:
+        schedule_tick(
+            "app.worker.run_warm_pool_check",
+            interval,
+            tick_id="tick-warm-pool",
+        )
+    except Exception:
+        logger.exception("warm_pool: failed to re-enqueue tick")
 return summary
 ```
 
-Ключевое: `enqueue_in` вызывается **в конце функции**, обычно внутри `if get_queue() is not None: try/except`. Это самопланирование работает так, что одна тика либо успешно запланировала следующую (цикл продолжается), либо нет (цикл оборвался).
+Ключевое: `schedule_tick` вызывается **в конце функции**, обычно внутри `try/except`. Это самопланирование работает так, что одна тика либо успешно запланировала следующую (цикл продолжается), либо нет (цикл оборвался).
 
 Структура обработки ошибок в теле тика при этом **разная** от функции к функции:
 
@@ -109,6 +109,53 @@ return summary
 > ⚠️ `enqueue_in` не в `finally` → частично-защищённый цикл. См. audit/...
 
 Единственный способ восстановить оборвавшуюся тику сейчас — рестарт воркер-контейнера (который bootstrap'ит все тики заново в `main()`).
+
+### Дедупликация тиков (`schedule_tick`)
+
+`queue.enqueue_in` без `job_id` — это RQ-вызов, который генерит случайный UUID на каждый job. Для unit-of-work `provision-{task_id}` такого риска нет, но для self-rescheduling тиков — был: каждый рестарт воркера в `main()` делал bootstrap-enqueue **поверх** ещё не стрельнувшего scheduled-job'а от прошлой инкарнации. После N рестартов на одну логическую тику висело N параллельных цепочек → очередь флудится, БД получает умноженную нагрузку, `_maybe_emit_low_balance_warning` перестаёт быть идемпотентным по календарному дню (две цепочки balance_charge в один и тот же час).
+
+Репро 2026-04-17: после пары рестартов worker-контейнера `rq info -u $REDIS_URL` показал 57 scheduled jobs вместо 8, все с уникальными uuid; CPU на бэке 80% от дублей `run_renewal_check`.
+
+Решение — `queue.schedule_tick(func_name, interval_seconds, tick_id)` в `backend/app/queue.py`. Под капотом:
+
+1. `StartedJobRegistry(queue=queue).cleanup()` — reclaim zombie (см. § Retry и DLQ).
+2. `Job.fetch(tick_id)`: если статус в `{queued, started, deferred, scheduled}` → возвращаем существующий id, повторный enqueue — no-op.
+3. Иначе (failed / finished / canceled / stopped / `NoSuchJob`) → `existing.delete()` (если есть) + `queue.enqueue_in(delta, func, job_id=tick_id, result_ttl=3600)`.
+
+`tick_id` — стабильный slug, по одному на тик:
+
+| Функция                      | `tick_id`              |
+|------------------------------|------------------------|
+| `run_pending_rescue_tick`    | `tick-pending-rescue`  |
+| `run_autoscale_tick`         | `tick-autoscale`       |
+| `run_drain_tick`             | `tick-drain`           |
+| `run_renewal_check`          | `tick-renewal`         |
+| `run_warm_pool_check`        | `tick-warm-pool`       |
+| `run_balance_charge_tick`    | `tick-balance-charge`  |
+| `run_traffic_stats_tick`     | `tick-traffic-stats`   |
+| `run_user_health_ping_tick`  | `tick-health-ping`     |
+
+Все 16 мест (8 self-reschedule + 8 bootstrap в `main()`) используют `schedule_tick`. После фикса параллельных цепочек быть не может: даже 10 рестартов подряд оставят ровно 8 jobs в `scheduled` (по одному на тик).
+
+Смотреть текущее состояние тиков — `GET /api/provisioning/queue-status` (см. § Admin monitoring очереди).
+
+## Admin monitoring очереди
+
+Для просмотра состояния очереди и ручного ремонта — два эндпоинта в `api/tasks.py`, доступны на `/admin/tasks`:
+
+- **`GET /api/provisioning/queue-status`** — снимок из RQ registries + быстрые counts по `ProvisioningTask`. Возвращает: `{queued, started, failed, deferred, scheduled, workers, db_pending, db_running, ticks_scheduled: [{tick_id, enqueue_at, status}]}`. Админская Tasks.tsx поллит это раз в 10с и рисует баннер если `failed > 0` или `queued > threshold`.
+
+- **`POST /api/provisioning/queue/reset-stuck`** — ручной reset zombie-состояния:
+  1. `StartedJobRegistry.cleanup()` — reclaim jobs, чей worker умер вместе с контейнером.
+  2. Дедуп тиков: для каждого `tick-*` job_id — если статус терминальный (failed / finished / canceled / stopped) или `NoSuchJobError` → пере-enqueue через `schedule_tick` с коротким delay (60с).
+  3. `reset_stuck_tasks()` — тот же флоу, что на старте backend'а: переставляет `ProvisioningTask.status=running` в `pending` и пере-enqueue'ит их.
+
+  Возвращает `{ticks_rescheduled: [...], tasks_requeued: N, zombies_cleaned: N}`. Пишет `AuditLog(action="queue_reset_stuck")`.
+
+Когда использовать reset:
+- Очередь заметно раздута и `rq info` показывает одни и те же тики в десятках копий (пре-фикс мира без `schedule_tick`; остаточные хвосты после миграции).
+- Таски висят в `pending` при живом воркере и `run_pending_rescue_tick` почему-то не успевает их вытащить.
+- Ручной SIGKILL worker-контейнера без graceful shutdown — какие-то jobs могут остаться в `started` без heartbeat.
 
 ## Конкретные тики — суть, а не сигнатуры
 
