@@ -991,3 +991,140 @@ def migrate_node_route(
         "considered_count": result["considered_count"],
         "no_target_count": result["no_target_count"],
     }
+
+
+@router.post(
+    "/nodes/{from_id}/migrate-to/{to_id}",
+    response_model=schemas.NodeBulkMigrateOut,
+)
+def migrate_node_to_target_route(
+    from_id: int,
+    to_id: int,
+    db: Session = Depends(get_db),
+    admin_token: str = Depends(require_admin),
+    admin_actor: str | None = Header(default=None, alias=ADMIN_ACTOR_HEADER),
+):
+    """Move every active subscription from ``from_id`` to a specific ``to_id``.
+
+    Bulk counterpart to ``POST /subscriptions/{id}/migrate`` — walks active
+    subs on the source node and funnels them into one explicit target via
+    ``migrate_subscription_to_new_node(target_node_id=to_id)``. Unlike
+    ``POST /nodes/{id}/migrate`` which auto-picks targets per-sub via
+    ``choose_node``, this endpoint pins all subs to a single chosen node
+    (needed for the relay cut-over in ``RELAY_ROADMAP.md`` D.3: the admin
+    points an old foreign direct-node's users at a freshly built RU relay).
+
+    ``sub_token`` is preserved per sub. Revokes on the old node and applies
+    on the new node run in background. One ``resync_node_clients`` is
+    issued on the target at the end to repair any drift.
+
+    Failures are per-sub: a sub that can't migrate (e.g. target not active)
+    is reported in ``failed`` and the loop continues with the next sub.
+    """
+    if from_id == to_id:
+        raise HTTPException(
+            status_code=400, detail="from_id and to_id must differ"
+        )
+    from_node = db.get(models.VPNNode, from_id)
+    if not from_node:
+        raise HTTPException(status_code=404, detail="Source node not found")
+    to_node = db.get(models.VPNNode, to_id)
+    if not to_node:
+        raise HTTPException(status_code=404, detail="Target node not found")
+    if not to_node.is_active:
+        raise HTTPException(
+            status_code=400, detail="Target node is not active"
+        )
+
+    subs: list[models.Subscription] = (
+        db.query(models.Subscription)
+        .filter(
+            models.Subscription.node_id == from_node.id,
+            models.Subscription.status == models.SubscriptionStatus.active,
+        )
+        .all()
+    )
+    considered = len(subs)
+    migrated_ids: list[int] = []
+    failed: list[schemas.NodeBulkMigrateFailure] = []
+    device_task_ids: list[int] = []
+    orchestrator = ProvisioningOrchestrator(db)
+
+    for sub in subs:
+        try:
+            _target, _device, task = orchestrator.migrate_subscription_to_new_node(
+                sub, target_node_id=to_node.id
+            )
+        except RuntimeError as exc:
+            failed.append(
+                schemas.NodeBulkMigrateFailure(
+                    subscription_id=sub.id, error=str(exc)
+                )
+            )
+            continue
+        except Exception as exc:  # noqa: BLE001
+            failed.append(
+                schemas.NodeBulkMigrateFailure(
+                    subscription_id=sub.id, error=f"internal: {exc}"
+                )
+            )
+            continue
+        migrated_ids.append(sub.id)
+        if task is not None:
+            device_task_ids.append(task.id)
+
+    # One resync on the target after the batch — same pattern as
+    # migrate_subscriptions_off. The per-sub apply adds each user, but
+    # if the target config is mid-drift (race with warm-pool, partial
+    # render) the resync re-pushes the full authoritative client list.
+    # Cheap (one extra ansible run), and catches the "invalid request
+    # user id" class of post-migrate bugs.
+    from ..services.provisioning import _node_has_vless_family
+
+    resync_task_ids: list[int] = []
+    if migrated_ids and _node_has_vless_family(to_node):
+        try:
+            resync_task = orchestrator.resync_node_clients(to_node)
+            if resync_task is not None:
+                resync_task_ids.append(resync_task.id)
+        except Exception:  # noqa: BLE001
+            # Logged by resync_node_clients; don't fail the whole batch
+            # — migrated subs are already on the new node.
+            pass
+
+    actor, actor_type = _resolve_admin_actor(admin_actor)
+    _audit(
+        db,
+        actor,
+        "node_bulk_migrated",
+        "vpn_node",
+        from_node.id,
+        actor_type=actor_type,
+        metadata={
+            "from_node_id": from_node.id,
+            "from_node_name": from_node.name,
+            "to_node_id": to_node.id,
+            "to_node_name": to_node.name,
+            "considered_count": considered,
+            "migrated_count": len(migrated_ids),
+            "failed_count": len(failed),
+            "migrated_subscription_ids": migrated_ids,
+            "failed_subscription_ids": [f.subscription_id for f in failed],
+            "device_task_ids": device_task_ids,
+            "resync_task_ids": resync_task_ids,
+        },
+    )
+    db.commit()
+
+    task_ids = device_task_ids + resync_task_ids
+    return schemas.NodeBulkMigrateOut(
+        from_node_id=from_node.id,
+        to_node_id=to_node.id,
+        considered_count=considered,
+        migrated=migrated_ids,
+        failed=failed,
+        task_ids=task_ids,
+        revoke_task_ids=[],
+        device_task_ids=device_task_ids,
+        resync_task_ids=resync_task_ids,
+    )

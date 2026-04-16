@@ -266,6 +266,23 @@ class SubscriptionMigrateOut(BaseModel):
     provisioning_task_id: int | None
 
 
+class NodeBulkMigrateFailure(BaseModel):
+    subscription_id: int
+    error: str
+
+
+class NodeBulkMigrateOut(BaseModel):
+    from_node_id: int
+    to_node_id: int
+    considered_count: int
+    migrated: list[int] = Field(default_factory=list)
+    failed: list[NodeBulkMigrateFailure] = Field(default_factory=list)
+    task_ids: list[int] = Field(default_factory=list)
+    revoke_task_ids: list[int] = Field(default_factory=list)
+    device_task_ids: list[int] = Field(default_factory=list)
+    resync_task_ids: list[int] = Field(default_factory=list)
+
+
 class DisableRequest(BaseModel):
     reason: str | None = None
 

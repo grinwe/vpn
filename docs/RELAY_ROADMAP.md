@@ -201,11 +201,16 @@
 
 **Acceptance проверен дизайном:** jq pre‑check `has("sockopt")` гарантирует rc=78 на конфигах без sockopt; `wg0_conf_stat.stat.exists == false` пропускает `systemd stop`; `file: absent` на несуществующий путь — idempotent. На direct‑ноде все task'и в disable‑ветке repord `ok` (не `changed`), без перезапуска xray‑сервисов (handler не нотифается).
 
-**D.2 — Bulk migrate endpoint**
+**D.2 — Bulk migrate endpoint ✅ (2026-04-16)**
 
 `POST /api/nodes/{from_id}/migrate-to/{to_id}` — переселяет все active subs с from на to через `migrate_subscription_to_new_node(target_node_id=to)`. Batch‑response `{migrated: [sub_id], failed: [{sub_id, error}]}`. Аудит‑лог.
 
 **Impact на прод:** нулевой до момента, когда админ явно ткнёт кнопку миграции.
+
+**Сделано:**
+- `backend/app/api/nodes.py::migrate_node_to_target_route`: endpoint валидирует from≠to, оба узла существуют, target is_active; итерирует active subs и вызывает `orchestrator.migrate_subscription_to_new_node(sub, target_node_id=to_id)` с per‑sub try/except (RuntimeError → `failed[].error`, прочие Exception → `failed[].error = "internal: ..."`). После батча — один `resync_node_clients(to_node)` на целевую (если vless‑family). Аудит `node_bulk_migrated` с from/to name+id, considered/migrated/failed counts, device_task_ids.
+- `schemas.NodeBulkMigrateOut` + `NodeBulkMigrateFailure` — строгая pydantic‑схема ответа.
+- `admin/src/pages/Nodes.tsx`: кнопка «переселить на…» в строке ноды + модалка `MigrateToModal` с dropdown активных нод (исключая from). Мутация `migrateTo`, успех запускает банер `addOp({kind: "migration"})` с task_ids/device_task_ids/resync_task_ids; при наличии failed — alert с первыми 3 ошибками.
 
 **D.3 — Production миграция (операционно)**
 

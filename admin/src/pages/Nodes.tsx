@@ -174,6 +174,9 @@ export default function Nodes() {
   const [createOpen, setCreateOpen] = useState(false);
   const [expandedNodeId, setExpandedNodeId] = useState<number | null>(null);
   const [trackedOps, setTrackedOps] = useState<TrackedOp[]>(loadTrackedOps);
+  const [migrateToModal, setMigrateToModal] = useState<
+    { from_id: number; from_name: string } | null
+  >(null);
   const qc = useQueryClient();
 
   // Sync tracked ops from localStorage whenever the component mounts
@@ -286,6 +289,70 @@ export default function Nodes() {
       });
     },
     onError: (e: Error) => alert(`Не удалось мигрировать: ${e.message}`),
+  });
+
+  const migrateTo = useMutation({
+    mutationFn: (args: {
+      from_id: number;
+      from_name: string;
+      to_id: number;
+      to_name: string;
+    }) =>
+      api
+        .post<{
+          from_node_id: number;
+          to_node_id: number;
+          considered_count: number;
+          migrated: number[];
+          failed: { subscription_id: number; error: string }[];
+          task_ids: number[];
+          revoke_task_ids: number[];
+          device_task_ids: number[];
+          resync_task_ids: number[];
+        }>(`/nodes/${args.from_id}/migrate-to/${args.to_id}`, {})
+        .then((res) => ({ ...res, from_name: args.from_name, to_name: args.to_name })),
+    onSuccess: (res) => {
+      qc.invalidateQueries({ queryKey: ["nodes"] });
+      qc.invalidateQueries({ queryKey: ["provisioning-tasks"] });
+      qc.invalidateQueries({ queryKey: ["user-subs"] });
+      setMigrateToModal(null);
+      if (res.considered_count === 0) {
+        alert(
+          `На ноде #${res.from_node_id} (${res.from_name}) активных подписок не было — мигрировать нечего.`,
+        );
+        return;
+      }
+      const failedNote = res.failed.length
+        ? `\n\nПровалились: ${res.failed.length}. Первые 3:\n` +
+          res.failed
+            .slice(0, 3)
+            .map((f) => `  sub #${f.subscription_id}: ${f.error}`)
+            .join("\n")
+        : "";
+      if (res.task_ids.length === 0) {
+        alert(
+          `Обработано ${res.considered_count}, мигрировано ${res.migrated.length}. Фоновых тасок не создано — смотри логи.${failedNote}`,
+        );
+        return;
+      }
+      addOp({
+        kind: "migration",
+        nodeId: res.to_node_id,
+        nodeName: `${res.from_name} → ${res.to_name}`,
+        taskIds: res.task_ids,
+        revokeTaskIds: res.revoke_task_ids,
+        deviceTaskIds: res.device_task_ids,
+        resyncTaskIds: res.resync_task_ids,
+        startedAt: Date.now(),
+      });
+      if (res.failed.length) {
+        alert(
+          `Переселено ${res.migrated.length}/${res.considered_count} подписок.${failedNote}`,
+        );
+      }
+    },
+    onError: (e: Error) =>
+      alert(`Не удалось мигрировать целевой: ${e.message}`),
   });
 
   const bootstrap = useMutation({
@@ -415,6 +482,24 @@ export default function Nodes() {
         />
       )}
 
+      {migrateToModal && data && (
+        <MigrateToModal
+          fromId={migrateToModal.from_id}
+          fromName={migrateToModal.from_name}
+          nodes={data}
+          pending={migrateTo.isPending}
+          onCancel={() => setMigrateToModal(null)}
+          onSubmit={(to_id, to_name) =>
+            migrateTo.mutate({
+              from_id: migrateToModal.from_id,
+              from_name: migrateToModal.from_name,
+              to_id,
+              to_name,
+            })
+          }
+        />
+      )}
+
       {trackedOps.map((op) => (
         <OperationProgressBanner
           key={`${op.kind}-${op.nodeId}-${op.startedAt}`}
@@ -533,6 +618,16 @@ export default function Nodes() {
                         переселить
                       </button>
                       <button
+                        disabled={migrateTo.isPending}
+                        onClick={() =>
+                          setMigrateToModal({ from_id: n.id, from_name: n.name })
+                        }
+                        className="text-xs px-2 py-1 rounded bg-indigo-700 hover:bg-indigo-600 disabled:opacity-50"
+                        title="Переселить все активные подписки на выбранную ноду (обходит pool/health фильтры)"
+                      >
+                        переселить на…
+                      </button>
+                      <button
                         disabled={bootstrap.isPending}
                         onClick={() => {
                           if (
@@ -629,6 +724,103 @@ export default function Nodes() {
         </Link>{" "}
         (фильтр status=failed или target=node), там error_message и кнопка rerun.
       </p>
+    </div>
+  );
+}
+
+// ── Bulk migrate-to modal ───────────────────────────────────────────
+// Targeted bulk migration: funnels every active sub on ``fromId`` to a
+// single chosen target (relay cut-over per RELAY_ROADMAP.md D.3).
+// Bypasses pool/health/cooldown filters — admin takes responsibility.
+
+function MigrateToModal({
+  fromId,
+  fromName,
+  nodes,
+  pending,
+  onCancel,
+  onSubmit,
+}: {
+  fromId: number;
+  fromName: string;
+  nodes: VPNNodeOut[];
+  pending: boolean;
+  onCancel: () => void;
+  onSubmit: (to_id: number, to_name: string) => void;
+}) {
+  const candidates = nodes.filter((n) => n.id !== fromId && n.is_active);
+  const [toId, setToId] = useState<number | null>(
+    candidates.length > 0 ? candidates[0].id : null,
+  );
+  const target = candidates.find((n) => n.id === toId) ?? null;
+
+  return (
+    <div
+      className="fixed inset-0 bg-black/60 flex items-center justify-center z-50"
+      onClick={onCancel}
+    >
+      <div
+        className="bg-slate-800 border border-slate-700 rounded-lg p-6 max-w-lg w-full mx-4"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <h2 className="text-lg font-semibold mb-3">
+          Переселить подписки с «{fromName}» на выбранную ноду
+        </h2>
+        <p className="text-sm text-slate-400 mb-4">
+          Все активные подписки с ноды #{fromId} ({fromName}) будут переселены
+          на выбранную целевую ноду. <span className="font-semibold">Проверки
+          пула, health и cooldown обходятся</span> — выбор админа считается
+          осознанным. <code className="font-mono">sub_token</code> сохраняется,
+          клиенты подхватят новый профиль на следующем рефетче sub-link.
+        </p>
+
+        {candidates.length === 0 ? (
+          <div className="text-sm text-amber-400 mb-4">
+            Нет других активных нод — некуда переселять.
+          </div>
+        ) : (
+          <>
+            <label className="block text-sm mb-1">Целевая нода</label>
+            <select
+              className="w-full bg-slate-900 border border-slate-600 rounded px-2 py-1.5 mb-4"
+              value={toId ?? ""}
+              onChange={(e) => setToId(Number(e.target.value))}
+            >
+              {candidates.map((n) => (
+                <option key={n.id} value={n.id}>
+                  #{n.id} · {n.name} ({n.region}) · {n.host}
+                </option>
+              ))}
+            </select>
+          </>
+        )}
+
+        <div className="flex justify-end gap-2">
+          <button
+            className="px-3 py-1.5 rounded bg-slate-700 hover:bg-slate-600 text-sm"
+            onClick={onCancel}
+            disabled={pending}
+          >
+            Отмена
+          </button>
+          <button
+            className="px-3 py-1.5 rounded bg-indigo-700 hover:bg-indigo-600 text-sm disabled:opacity-50"
+            disabled={pending || !target}
+            onClick={() => {
+              if (!target) return;
+              if (
+                confirm(
+                  `Переселить все активные подписки с #${fromId} (${fromName}) на #${target.id} (${target.name})?\n\n` +
+                    `Pool/health/cooldown-фильтры обходятся. Это то, что нужно при cut-over на RU-relay.`,
+                )
+              )
+                onSubmit(target.id, target.name);
+            }}
+          >
+            {pending ? "Переселяем…" : "Переселить"}
+          </button>
+        </div>
+      </div>
     </div>
   );
 }
