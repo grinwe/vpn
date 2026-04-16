@@ -80,8 +80,24 @@ def enqueue_task(task_id: int, node_id: int | None) -> str | None:
         from rq import Retry
         from rq.job import Job
         from rq.exceptions import NoSuchJobError
+        from rq.registry import StartedJobRegistry
 
         job_id = f"provision-{task_id}"
+        # Reclaim zombie `started` jobs before the dedupe check below.
+        # When a worker is SIGKILLed (OOM, container drop) mid-job, RQ
+        # leaves the job in `started` state with the deterministic id
+        # locked — `Job.fetch` then returns the zombie and the "skip if
+        # already in-flight" branch returns its id without re-enqueueing,
+        # so the matching ProvisioningTask sits in `pending` forever even
+        # though the live worker is idle. StartedJobRegistry.cleanup()
+        # inspects worker heartbeats and moves orphaned jobs into the
+        # failed registry, after which the existing "delete failed →
+        # fresh enqueue under the same id" path takes over uniformly.
+        try:
+            StartedJobRegistry(queue=queue).cleanup()
+        except Exception:  # noqa: BLE001
+            logger.debug("StartedJobRegistry.cleanup() failed (non-fatal)", exc_info=True)
+
         # Dedupe: if this task is already queued or in-flight, don't push
         # a second copy. We keep the deterministic job_id so restarts are
         # idempotent — re-enqueueing the same task after a crash is a

@@ -177,6 +177,20 @@ Drain тика продолжает работать даже при `AUTOSCALE_
 - `job_timeout=RQ_JOB_TIMEOUT` (default 900s) — hard-kill per job
 - `failure_ttl=RQ_FAILED_TTL` (default 604800 = 1 неделя) — сколько RQ хранит упавший job в FailedJobRegistry
 
+### Дедупликация и zombie-reclaim (`job_id = "provision-{task_id}"`)
+
+`enqueue_task` использует детерминированный `job_id`, чтобы повторный enqueue одной и той же ProvisioningTask был идемпотентным (важно для `reset_stuck_tasks` и `run_pending_rescue_tick` — оба спокойно кидают в очередь всё, что `pending`, без риска размножить работу).
+
+Порядок проверок перед `queue.enqueue(...)`:
+
+1. **`StartedJobRegistry.cleanup()`** — RQ по heartbeat-ам воркеров находит jobs, чей хэндлер умер вместе с контейнером (SIGKILL / OOM / `docker compose down` в середине ansible-прогона), и переводит их из `started` в `failed`. Без этого шага следующий `Job.fetch` возвращает zombie, и мы уходим в короткий путь «уже в работе» — таска висит в `pending` бесконечно, пока оператор руками не дропнет Redis-ключ.
+2. **`Job.fetch(job_id)`** — если job существует и статус в `{queued, started, deferred, scheduled}`, возвращаем его id без повторного enqueue.
+3. Иначе (статус `failed`/`finished`/`canceled`/`stopped` после cleanup'а) — `existing.delete()` и нормальный `queue.enqueue(...)` с тем же `job_id`.
+
+То есть «таска застряла в pending» теперь воспроизводится только если:
+- воркер вообще не поднят (`depends_on` / redis недоступен), или
+- `Retry(max=3)` исчерпан и job ушёл в DLQ до того, как автосамохил успел его пере-enqueue'нуть (по задумке — дальше `dlq_exception_handler` + audit-лог).
+
 Если все 3 retry исчерпаны, RQ вызывает `dlq_exception_handler` (зарегистрирован на Worker через `exception_handlers`). Хендлер:
 
 1. Инкрементирует `vpn_provisioning_dlq_total` Prometheus counter
