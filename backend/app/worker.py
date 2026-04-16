@@ -65,7 +65,7 @@ def run_pending_rescue_tick() -> dict:
 
     from .db import SessionLocal
     from . import models
-    from .queue import enqueue_task, get_queue
+    from .queue import enqueue_task, schedule_tick
     from .time_utils import utcnow
 
     age = int(os.getenv("PENDING_RESCUE_AGE", "60"))
@@ -106,16 +106,14 @@ def run_pending_rescue_tick() -> dict:
 
     interval = int(os.getenv("PENDING_RESCUE_INTERVAL", "60"))
     if interval > 0:
-        queue = get_queue()
-        if queue is not None:
-            try:
-                queue.enqueue_in(
-                    timedelta(seconds=interval),
-                    "app.worker.run_pending_rescue_tick",
-                    result_ttl=3600,
-                )
-            except Exception:  # noqa: BLE001
-                logger.exception("pending_rescue: failed to re-enqueue tick")
+        try:
+            schedule_tick(
+                "app.worker.run_pending_rescue_tick",
+                interval,
+                tick_id="tick-pending-rescue",
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("pending_rescue: failed to re-enqueue tick")
 
     return {"scanned": scanned, "rescued": rescued}
 
@@ -123,10 +121,9 @@ def run_pending_rescue_tick() -> dict:
 def run_autoscale_tick() -> list[dict]:
     """Periodic job — walk pools and scale up where needed."""
     from dataclasses import asdict
-    from datetime import timedelta
 
     from .db import SessionLocal
-    from .queue import get_queue
+    from .queue import schedule_tick
     from .services.autoscale import evaluate_all_pools
 
     session = SessionLocal()
@@ -138,16 +135,14 @@ def run_autoscale_tick() -> list[dict]:
 
     interval = int(os.getenv("AUTOSCALE_INTERVAL", "0"))
     if interval > 0:
-        queue = get_queue()
-        if queue is not None:
-            try:
-                queue.enqueue_in(
-                    timedelta(seconds=interval),
-                    "app.worker.run_autoscale_tick",
-                    result_ttl=3600,
-                )
-            except Exception:  # noqa: BLE001
-                logger.exception("Failed to re-enqueue autoscale tick")
+        try:
+            schedule_tick(
+                "app.worker.run_autoscale_tick",
+                interval,
+                tick_id="tick-autoscale",
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("Failed to re-enqueue autoscale tick")
     return result
 
 
@@ -169,10 +164,8 @@ def run_drain_tick() -> dict:
 
     Self-rescheduling via ``DRAIN_TICK_INTERVAL`` (default 600s).
     """
-    from datetime import timedelta
-
     from .db import SessionLocal
-    from .queue import get_queue
+    from .queue import schedule_tick
     from . import models
     from .services import autoscale
     from .services.node_spawner import NodeSpawnError, destroy_node
@@ -273,16 +266,14 @@ def run_drain_tick() -> dict:
 
     interval = int(os.getenv("DRAIN_TICK_INTERVAL", "600000"))
     if interval > 0:
-        queue = get_queue()
-        if queue is not None:
-            try:
-                queue.enqueue_in(
-                    timedelta(seconds=interval),
-                    "app.worker.run_drain_tick",
-                    result_ttl=3600,
-                )
-            except Exception:  # noqa: BLE001
-                logger.exception("Failed to re-enqueue drain tick")
+        try:
+            schedule_tick(
+                "app.worker.run_drain_tick",
+                interval,
+                tick_id="tick-drain",
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("Failed to re-enqueue drain tick")
     return stats
 
 
@@ -302,7 +293,6 @@ def run_renewal_check() -> dict:
     from datetime import timedelta
 
     from .db import SessionLocal
-    from .queue import get_queue
     from . import models
     from .services.provisioning import ProvisioningOrchestrator
     from .time_utils import utcnow
@@ -551,18 +541,15 @@ def run_renewal_check() -> dict:
     # Re-enqueue self
     interval = int(os.getenv("RENEWAL_CHECK_INTERVAL", "3600"))
     if interval > 0:
-        from .queue import get_queue
-        from datetime import timedelta
-        queue = get_queue()
-        if queue is not None:
-            try:
-                queue.enqueue_in(
-                    timedelta(seconds=interval),
-                    "app.worker.run_renewal_check",
-                    result_ttl=3600,
-                )
-            except Exception:  # noqa: BLE001
-                logger.exception("Failed to re-enqueue renewal check")
+        from .queue import schedule_tick
+        try:
+            schedule_tick(
+                "app.worker.run_renewal_check",
+                interval,
+                tick_id="tick-renewal",
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("Failed to re-enqueue renewal check")
     return stats
 
 
@@ -578,10 +565,8 @@ def run_warm_pool_check() -> dict:
     Returns a ``{node_id: warmed_count}`` summary so the RQ result
     backend captures a useful audit trail per tick.
     """
-    from datetime import timedelta
-
     from .db import SessionLocal
-    from .queue import get_queue
+    from .queue import schedule_tick
     from .services import warm_pool
 
     session = SessionLocal()
@@ -595,16 +580,14 @@ def run_warm_pool_check() -> dict:
 
     interval = int(os.getenv("WARM_POOL_CHECK_INTERVAL", "120"))
     if interval > 0:
-        queue = get_queue()
-        if queue is not None:
-            try:
-                queue.enqueue_in(
-                    timedelta(seconds=interval),
-                    "app.worker.run_warm_pool_check",
-                    result_ttl=3600,
-                )
-            except Exception:  # noqa: BLE001
-                logger.exception("warm_pool: failed to re-enqueue tick")
+        try:
+            schedule_tick(
+                "app.worker.run_warm_pool_check",
+                interval,
+                tick_id="tick-warm-pool",
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("warm_pool: failed to re-enqueue tick")
     return summary
 
 
@@ -826,11 +809,9 @@ def run_balance_charge_tick() -> dict:
 
     Self-reschedules at the end.
     """
-    from datetime import timedelta
-
     from . import models
     from .db import SessionLocal
-    from .queue import get_queue
+    from .queue import schedule_tick
     from .services import balance
     from .time_utils import utcnow
 
@@ -930,16 +911,14 @@ def run_balance_charge_tick() -> dict:
 
     interval = int(os.getenv("BALANCE_CHARGE_INTERVAL", "3600"))
     if interval > 0:
-        queue = get_queue()
-        if queue is not None:
-            try:
-                queue.enqueue_in(
-                    timedelta(seconds=interval),
-                    "app.worker.run_balance_charge_tick",
-                    result_ttl=3600,
-                )
-            except Exception:  # noqa: BLE001
-                logger.exception("Failed to re-enqueue balance charge tick")
+        try:
+            schedule_tick(
+                "app.worker.run_balance_charge_tick",
+                interval,
+                tick_id="tick-balance-charge",
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("Failed to re-enqueue balance charge tick")
     return stats
 
 
@@ -961,10 +940,8 @@ def run_traffic_stats_tick() -> dict:
     ``services.traffic_stats.collect_and_persist`` and the row is
     skipped. The next tick retries.
     """
-    from datetime import timedelta
-
     from .db import SessionLocal
-    from .queue import get_queue
+    from .queue import schedule_tick
     from .services import traffic_stats
 
     interval = int(os.getenv("TRAFFIC_STATS_INTERVAL", "300"))
@@ -999,16 +976,14 @@ def run_traffic_stats_tick() -> dict:
         session.close()
 
     if interval > 0:
-        queue = get_queue()
-        if queue is not None:
-            try:
-                queue.enqueue_in(
-                    timedelta(seconds=interval),
-                    "app.worker.run_traffic_stats_tick",
-                    result_ttl=3600,
-                )
-            except Exception:  # noqa: BLE001
-                logger.exception("traffic_stats: failed to re-enqueue tick")
+        try:
+            schedule_tick(
+                "app.worker.run_traffic_stats_tick",
+                interval,
+                tick_id="tick-traffic-stats",
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("traffic_stats: failed to re-enqueue tick")
     return summary
 
 
@@ -1035,7 +1010,7 @@ def run_user_health_ping_tick() -> dict:
 
     from . import models
     from .db import SessionLocal
-    from .queue import get_queue
+    from .queue import schedule_tick
     from .time_utils import utcnow
 
     interval = int(os.getenv("USER_HEALTH_PING_INTERVAL", "1800"))
@@ -1127,16 +1102,14 @@ def run_user_health_ping_tick() -> dict:
         session.close()
 
     if interval > 0:
-        queue = get_queue()
-        if queue is not None:
-            try:
-                queue.enqueue_in(
-                    timedelta(seconds=interval),
-                    "app.worker.run_user_health_ping_tick",
-                    result_ttl=3600,
-                )
-            except Exception:  # noqa: BLE001
-                logger.exception("user_health_ping: failed to re-enqueue tick")
+        try:
+            schedule_tick(
+                "app.worker.run_user_health_ping_tick",
+                interval,
+                tick_id="tick-health-ping",
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("user_health_ping: failed to re-enqueue tick")
     return summary
 
 
@@ -1250,14 +1223,20 @@ def main() -> None:
     # enqueue hit a transient Redis error at creation time and the task
     # row was committed without a job attached. Short interval by design:
     # the impact of a stalled user-facing provisioning is high.
+    #
+    # All bootstraps below use ``schedule_tick`` (deterministic job_id per
+    # tick). Pre-fix, raw ``queue.enqueue_in`` generated a new UUID on
+    # each worker restart, so restart-triggered bootstrap enqueued a job
+    # *alongside* the still-scheduled one from the prior incarnation —
+    # N restarts → N parallel chains per tick. See ``queue.schedule_tick``
+    # and ``docs/components/worker.md`` § Дедупликация тиков.
     pending_rescue_interval = int(os.getenv("PENDING_RESCUE_INTERVAL", "60"))
     if pending_rescue_interval > 0:
         try:
-            from datetime import timedelta
-            queue.enqueue_in(
-                timedelta(seconds=min(pending_rescue_interval, 30)),
+            schedule_tick(
                 "app.worker.run_pending_rescue_tick",
-                result_ttl=3600,
+                min(pending_rescue_interval, 30),
+                tick_id="tick-pending-rescue",
             )
             logger.info(
                 "Pending-rescue tick bootstrapped: first run in 30s "
@@ -1270,11 +1249,10 @@ def main() -> None:
     autoscale_interval = int(os.getenv("AUTOSCALE_INTERVAL", "0"))
     if autoscale_interval > 0:
         try:
-            from datetime import timedelta
-            queue.enqueue_in(
-                timedelta(seconds=autoscale_interval),
+            schedule_tick(
                 "app.worker.run_autoscale_tick",
-                result_ttl=3600,
+                autoscale_interval,
+                tick_id="tick-autoscale",
             )
             logger.info("Autoscale bootstrapped: first tick in %ss", autoscale_interval)
         except Exception:  # noqa: BLE001
@@ -1284,11 +1262,10 @@ def main() -> None:
     renewal_interval = int(os.getenv("RENEWAL_CHECK_INTERVAL", "3600"))
     if renewal_interval > 0:
         try:
-            from datetime import timedelta
-            queue.enqueue_in(
-                timedelta(seconds=min(renewal_interval, 60)),
+            schedule_tick(
                 "app.worker.run_renewal_check",
-                result_ttl=3600,
+                min(renewal_interval, 60),
+                tick_id="tick-renewal",
             )
             logger.info("Renewal check bootstrapped: first run in 60s (interval=%ss)", renewal_interval)
         except Exception:  # noqa: BLE001
@@ -1301,11 +1278,10 @@ def main() -> None:
     warm_enabled = os.getenv("WARM_POOL_ENABLED", "1").lower() not in {"0", "false", "no"}
     if warm_interval > 0 and warm_enabled:
         try:
-            from datetime import timedelta
-            queue.enqueue_in(
-                timedelta(seconds=min(warm_interval, 30)),
+            schedule_tick(
                 "app.worker.run_warm_pool_check",
-                result_ttl=3600,
+                min(warm_interval, 30),
+                tick_id="tick-warm-pool",
             )
             logger.info(
                 "Warm pool check bootstrapped: first run in 30s (interval=%ss, target=%s)",
@@ -1320,11 +1296,10 @@ def main() -> None:
     balance_interval = int(os.getenv("BALANCE_CHARGE_INTERVAL", "3600"))
     if balance_interval > 0:
         try:
-            from datetime import timedelta
-            queue.enqueue_in(
-                timedelta(seconds=min(balance_interval, 60)),
+            schedule_tick(
                 "app.worker.run_balance_charge_tick",
-                result_ttl=3600,
+                min(balance_interval, 60),
+                tick_id="tick-balance-charge",
             )
             logger.info(
                 "Balance charge tick bootstrapped: first run in 60s (interval=%ss)",
@@ -1340,11 +1315,10 @@ def main() -> None:
     drain_interval = int(os.getenv("DRAIN_TICK_INTERVAL", "600000"))
     if drain_interval > 0:
         try:
-            from datetime import timedelta
-            queue.enqueue_in(
-                timedelta(seconds=min(drain_interval, 60)),
+            schedule_tick(
                 "app.worker.run_drain_tick",
-                result_ttl=3600,
+                min(drain_interval, 60),
+                tick_id="tick-drain",
             )
             logger.info(
                 "Drain tick bootstrapped: first run in 60s (interval=%ss)",
@@ -1359,11 +1333,10 @@ def main() -> None:
     traffic_stats_interval = int(os.getenv("TRAFFIC_STATS_INTERVAL", "300"))
     if traffic_stats_interval > 0:
         try:
-            from datetime import timedelta
-            queue.enqueue_in(
-                timedelta(seconds=min(traffic_stats_interval, 60)),
+            schedule_tick(
                 "app.worker.run_traffic_stats_tick",
-                result_ttl=3600,
+                min(traffic_stats_interval, 60),
+                tick_id="tick-traffic-stats",
             )
             logger.info(
                 "Traffic stats tick bootstrapped: first run in 60s (interval=%ss)",
@@ -1379,11 +1352,10 @@ def main() -> None:
     health_ping_interval = int(os.getenv("USER_HEALTH_PING_INTERVAL", "1800"))
     if health_ping_interval > 0:
         try:
-            from datetime import timedelta
-            queue.enqueue_in(
-                timedelta(seconds=min(health_ping_interval, 60)),
+            schedule_tick(
                 "app.worker.run_user_health_ping_tick",
-                result_ttl=3600,
+                min(health_ping_interval, 60),
+                tick_id="tick-health-ping",
             )
             logger.info(
                 "User health-ping tick bootstrapped: first run in 60s (interval=%ss)",

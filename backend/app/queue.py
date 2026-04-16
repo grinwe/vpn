@@ -127,3 +127,74 @@ def enqueue_task(task_id: int, node_id: int | None) -> str | None:
     except Exception:  # noqa: BLE001
         logger.exception("Failed to enqueue task %s; falling back to inline", task_id)
         return None
+
+
+# Stable job_ids for the 8 self-rescheduling worker ticks. Each tick's
+# bootstrap call (in worker.main) and its self-reschedule call (at the
+# end of the tick body) MUST pass the same tick_id — that's what makes
+# repeated enqueues collapse into one scheduled job instead of spawning
+# a parallel chain on every worker restart.
+TICK_IDS = {
+    "app.worker.run_pending_rescue_tick": "tick-pending-rescue",
+    "app.worker.run_autoscale_tick": "tick-autoscale",
+    "app.worker.run_drain_tick": "tick-drain",
+    "app.worker.run_renewal_check": "tick-renewal",
+    "app.worker.run_warm_pool_check": "tick-warm-pool",
+    "app.worker.run_balance_charge_tick": "tick-balance-charge",
+    "app.worker.run_traffic_stats_tick": "tick-traffic-stats",
+    "app.worker.run_user_health_ping_tick": "tick-health-ping",
+}
+
+
+def schedule_tick(
+    func_name: str,
+    interval_seconds: int,
+    tick_id: str,
+) -> str | None:
+    """Enqueue a self-rescheduling tick with deterministic dedup.
+
+    Mirrors ``enqueue_task`` but for periodic tick jobs: uses a stable
+    ``tick_id`` as the RQ ``job_id`` so that the N+1-th call (bootstrap
+    on worker restart while the previous scheduled job is still alive)
+    collapses into a no-op instead of spawning a parallel chain.
+
+    Pre-fix (random UUIDs from raw ``queue.enqueue_in``) a few worker
+    restarts left 50+ duplicate ticks in ``scheduled``, each one debiting
+    balance twice per cycle and multiplying SSH load from
+    ``run_traffic_stats_tick``. See ``docs/components/worker.md``.
+
+    Returns the RQ job id on success or ``None`` if the queue is
+    unavailable.
+    """
+    queue = get_queue()
+    if queue is None:
+        return None
+    try:
+        from datetime import timedelta
+        from rq.job import Job
+        from rq.exceptions import NoSuchJobError
+        from rq.registry import StartedJobRegistry
+
+        try:
+            StartedJobRegistry(queue=queue).cleanup()
+        except Exception:  # noqa: BLE001
+            logger.debug("StartedJobRegistry.cleanup() failed (non-fatal)", exc_info=True)
+
+        try:
+            existing = Job.fetch(tick_id, connection=queue.connection)
+            if existing.get_status(refresh=True) in {"queued", "started", "deferred", "scheduled"}:
+                return existing.id
+            existing.delete()
+        except NoSuchJobError:
+            pass
+
+        job = queue.enqueue_in(
+            timedelta(seconds=interval_seconds),
+            func_name,
+            job_id=tick_id,
+            result_ttl=RESULT_TTL,
+        )
+        return job.id
+    except Exception:  # noqa: BLE001
+        logger.exception("Failed to schedule tick %s (%s)", tick_id, func_name)
+        return None
