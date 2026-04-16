@@ -10,6 +10,7 @@ import ApiTokens from "./pages/ApiTokens";
 import Tasks from "./pages/Tasks";
 import AuditLogs from "./pages/AuditLogs";
 import CloudProviders from "./pages/CloudProviders";
+import Exits from "./pages/Exits";
 import HealthPings from "./pages/HealthPings";
 
 function Layout({ children }: { children: React.ReactNode }) {
@@ -26,6 +27,7 @@ function Layout({ children }: { children: React.ReactNode }) {
           <NavLink to="/invoices" className={linkCls}>Invoices</NavLink>
           <NavLink to="/plans" className={linkCls}>Plans</NavLink>
           <NavLink to="/nodes" className={linkCls}>Nodes</NavLink>
+          <NavLink to="/exits" className={linkCls}>Exits</NavLink>
           <NavLink to="/tasks" className={linkCls}>Tasks</NavLink>
           <NavLink to="/health-pings" className={linkCls}>Health</NavLink>
           <NavLink to="/tokens" className={linkCls}>API tokens</NavLink>
@@ -63,6 +65,7 @@ export default function App() {
       <Route path="/invoices" element={<Protected><Invoices /></Protected>} />
       <Route path="/plans" element={<Protected><Plans /></Protected>} />
       <Route path="/nodes" element={<Protected><Nodes /></Protected>} />
+      <Route path="/exits" element={<Protected><Exits /></Protected>} />
       <Route path="/tasks" element={<Protected><Tasks /></Protected>} />
       <Route path="/tokens" element={<Protected><ApiTokens /></Protected>} />
       <Route path="/cloud" element={<Protected><CloudProviders /></Protected>} />

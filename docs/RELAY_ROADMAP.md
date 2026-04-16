@@ -110,7 +110,7 @@
 
 **Acceptance:** админ банит 250 ботов за 2-3 клика (таб → select‑all → ban all — даже если строк >500, runBatchBan дробит автоматически).
 
-### B — Exit как сущность: таблица + CRUD
+### B — Exit как сущность: таблица + CRUD ✅ (2026-04-16, partial)
 
 **Модель:** новая таблица `wg_exit_nodes`:
 - `id, name (unique), region, host, ssh_port, wg_port (default 51820), wg_address_v4 ('10.77.0.1/24'), wg_public_key, wg_private_key_enc (через credentials.encrypt), provider_id, provider_external_id, provider_region, status, is_active, created_at`.
@@ -128,6 +128,18 @@
 **Impact на прод:** нулевой — существующие ноды не трогаются, это новая сущность.
 
 **Acceptance:** админ создаёт exit через UI, ждёт 1–2 мин, видит `status=active`, `wg_public_key` заполнен. На exit'е `wg show` показывает wg0 без peers.
+
+**Сделано:**
+- Alembic `0026_wg_exit_nodes.py` (таблица + enum `wgexitnodestatus`).
+- `WGExitNodeStatus` + `WGExitNode` модель; `services/vless.py::generate_wireguard_keypair()` (стандартный base64 под wg).
+- `backend/app/api/exits.py`: `GET/POST/GET/{id}/PATCH/{id}/DELETE/{id}` + `POST /exits/{id}/keygen` (X25519 генерация, private хранится через Fernet-encrypt). Зарегистрирован в `api/__init__.py`.
+- Schemas: `WGExitNodeCreate/Patch/Out/KeygenOut`. `Out.has_private_key: bool` — private не отдаём по API.
+- `admin/src/pages/Exits.tsx` + нав/роут `/exits`: список, форма создания/редактирования (с выбором cloud provider), кнопки `keygen`/`edit`/`delete`. Статус переключается через PATCH.
+
+**Отложено в C:**
+- `POST /exits/{id}/bootstrap` и worker-путь `ProvisioningTask(target_type=exit)` — естественно собрать вместе с ansible_runner в C, т.к. роль `wg_exit_node` падает при пустом `wg_exit_peers` (assert), и первый прогон всё равно будет инициирован через создание relay-link.
+- Блокировка удаления при наличии relay-link'ов — появится, когда возникнет таблица `relay_exit_link` в C.
+- `POST /exits/{id}/active` — пока хватает PATCH `status` (нет внешней проверки; явный endpoint добавим, когда подключится health-probe для exit'ов).
 
 ### C — Связь relay ↔ exit, bootstrap‑поток
 

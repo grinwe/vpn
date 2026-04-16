@@ -62,6 +62,16 @@ class VPNNodeStatus(str, enum.Enum):
     draining = "draining"
 
 
+class WGExitNodeStatus(str, enum.Enum):
+    # Relay-era exit node lifecycle. Separate from VPNNodeStatus because
+    # an exit has no VLESS configs / warm pool / choose_node participation
+    # — it's just a WG server that relays hand-traffic to.
+    registering = "registering"
+    active = "active"
+    error = "error"
+    disabled = "disabled"
+
+
 class VPNConfigProtocol(str, enum.Enum):
     shadowtls_ss = "shadowtls+shadowsocks"
     vless_reality = "vless-reality"
@@ -537,6 +547,42 @@ class CloudProvider(Base):
     created_at = Column(DateTime, default=utcnow)
 
     nodes = relationship("VPNNode", back_populates="provider")
+
+
+class WGExitNode(Base):
+    """Foreign exit node in the relay architecture.
+
+    A WireGuard server that RU relay nodes (``VPNNode`` rows with
+    ``relay_config`` set) tunnel to. One exit holds many relays (N:M via
+    ``relay_exit_links``). Not listed in ``vpn_nodes`` on purpose —
+    exits have no VLESS configs, no warm credential pool, and are never
+    passed to ``choose_node`` for subscription placement.
+    """
+    __tablename__ = "wg_exit_nodes"
+
+    id = Column(Integer, primary_key=True)
+    name = Column(String, unique=True, nullable=False)
+    region = Column(String, nullable=False)
+    host = Column(String, nullable=False)
+    ssh_port = Column(Integer, default=22, nullable=False)
+
+    wg_port = Column(Integer, default=51820, nullable=False)
+    wg_address_v4 = Column(String, default="10.77.0.1/24", nullable=False)
+    wg_public_key = Column(String, nullable=True)
+    # Encrypted via ``security.encrypt`` — same Fernet scheme as cloud tokens.
+    wg_private_key_enc = Column(Text, nullable=True)
+
+    provider_id = Column(Integer, ForeignKey("cloud_providers.id"), nullable=True)
+    provider_external_id = Column(String, nullable=True)
+    provider_region = Column(String, nullable=True)
+
+    status = Column(Enum(WGExitNodeStatus), default=WGExitNodeStatus.registering, nullable=False)
+    is_active = Column(Boolean, default=True, nullable=False)
+    notes = Column(Text, nullable=True)
+    created_at = Column(DateTime, default=utcnow, nullable=False)
+    updated_at = Column(DateTime, default=utcnow, onupdate=utcnow, nullable=False)
+
+    provider = relationship("CloudProvider")
 
 
 class HealthProbe(Base):

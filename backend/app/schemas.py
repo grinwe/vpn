@@ -687,3 +687,65 @@ class NodeHealthPingStatsOut(BaseModel):
     bad: int
     bad_ratio: float  # 0..1
     last_bad_at: datetime | None
+
+
+class WGExitNodeCreate(BaseModel):
+    name: str
+    region: str
+    host: str
+    ssh_port: int = 22
+    wg_port: int = 51820
+    wg_address_v4: str = "10.77.0.1/24"
+    # Optional — if omitted, POST /exits/{id}/keygen can generate one later.
+    wg_public_key: str | None = None
+    wg_private_key: str | None = None
+    provider_id: int | None = None
+    provider_external_id: str | None = None
+    provider_region: str | None = None
+    is_active: bool = True
+    notes: str | None = None
+
+
+class WGExitNodePatch(BaseModel):
+    name: str | None = None
+    region: str | None = None
+    host: str | None = None
+    ssh_port: int | None = None
+    wg_port: int | None = None
+    wg_address_v4: str | None = None
+    wg_public_key: str | None = None
+    wg_private_key: str | None = None
+    provider_id: int | None = None
+    provider_external_id: str | None = None
+    provider_region: str | None = None
+    status: str | None = None
+    is_active: bool | None = None
+    notes: str | None = None
+
+
+class WGExitNodeOut(BaseModel):
+    id: int
+    name: str
+    region: str
+    host: str
+    ssh_port: int
+    wg_port: int
+    wg_address_v4: str
+    wg_public_key: str | None
+    has_private_key: bool
+    provider_id: int | None
+    provider_external_id: str | None
+    provider_region: str | None
+    status: str
+    is_active: bool
+    notes: str | None
+    created_at: datetime
+    updated_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class WGExitKeygenOut(BaseModel):
+    id: int
+    wg_public_key: str

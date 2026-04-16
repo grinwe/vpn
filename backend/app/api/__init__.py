@@ -22,6 +22,7 @@ from . import (
     audit,
     autoscale,
     cloud,
+    exits,
     health,
     health_pings,
     invoices,
@@ -59,6 +60,7 @@ router.include_router(payments.router)
 
 router.include_router(cloud.router)
 router.include_router(autoscale.router)
+router.include_router(exits.router)
 
 
 __all__ = [
