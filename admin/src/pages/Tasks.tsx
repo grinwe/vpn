@@ -4,8 +4,198 @@ import { api, ProvisioningTaskOut } from "../api";
 
 const STATUSES = ["", "pending", "running", "success", "failed"] as const;
 const TARGETS = ["", "node", "device", "subscription"] as const;
+const EXPECTED_TICKS = 8;
 
 type BatchResult = { ok: number[]; skipped: number[]; not_found: number[] };
+
+type QueueTick = {
+  tick_id: string;
+  func: string;
+  status: string | null;
+  enqueued_at: string | null;
+};
+
+type QueueWorker = {
+  name: string;
+  state: string;
+  current_job_id: string | null;
+};
+
+type QueueStatus = {
+  redis_available: boolean;
+  queue_name: string;
+  queued: number;
+  started: number;
+  scheduled: number;
+  deferred: number;
+  failed: number;
+  finished: number;
+  workers: QueueWorker[];
+  ticks: QueueTick[];
+  stuck_tasks: number;
+};
+
+type ResetStuckResult = {
+  queue_available: boolean;
+  requeued: number;
+  failed: number;
+  pending_requeued: number;
+};
+
+function tickHealthy(t: QueueTick): boolean {
+  return t.status === "scheduled" || t.status === "queued" || t.status === "started";
+}
+
+function QueueBanner() {
+  const qc = useQueryClient();
+  const { data, error, refetch } = useQuery<QueueStatus>({
+    queryKey: ["provisioning-queue-status"],
+    queryFn: () => api.get("/provisioning/queue-status"),
+    refetchInterval: (q) => (q.state.error ? false : 15_000),
+    retry: false,
+  });
+
+  const resetStuck = useMutation({
+    mutationFn: () =>
+      api.post<ResetStuckResult>("/provisioning/queue/reset-stuck", {}),
+    onSuccess: (res) => {
+      qc.invalidateQueries({ queryKey: ["provisioning-queue-status"] });
+      qc.invalidateQueries({ queryKey: ["provisioning-tasks"] });
+      alert(
+        `Reset-stuck: requeued=${res.requeued}, failed=${res.failed}, ` +
+          `pending_requeued=${res.pending_requeued}, queue_available=${res.queue_available}.`,
+      );
+    },
+    onError: (e: Error) => alert(`Reset-stuck ошибка: ${e.message}`),
+  });
+
+  if (error) {
+    return (
+      <div className="mb-4 p-3 rounded border border-red-700 bg-red-900/30 text-sm">
+        <div className="text-red-300 font-semibold">Queue-status недоступен</div>
+        <div className="text-red-400/80 mt-1 font-mono text-xs break-all">
+          {String(error)}
+        </div>
+        <button
+          onClick={() => refetch()}
+          className="mt-2 text-xs px-2 py-1 rounded bg-red-800 hover:bg-red-700"
+        >
+          Повторить
+        </button>
+      </div>
+    );
+  }
+
+  if (!data) {
+    return (
+      <div className="mb-4 p-3 rounded border border-slate-700 bg-slate-900/50 text-sm text-slate-400">
+        Загружаем состояние очереди…
+      </div>
+    );
+  }
+
+  const healthyTicks = data.ticks.filter(tickHealthy).length;
+  const totalTicks = data.ticks.length;
+  const tickDrift = totalTicks > 0 && healthyTicks < totalTicks;
+  const scheduledDrift = data.scheduled > EXPECTED_TICKS * 3;
+  const critical = !data.redis_available || data.stuck_tasks > 0;
+  const warning = !critical && (tickDrift || scheduledDrift || data.failed > 0);
+
+  const borderClass = critical
+    ? "border-red-700 bg-red-900/20"
+    : warning
+    ? "border-amber-700 bg-amber-900/20"
+    : "border-slate-700 bg-slate-900/40";
+
+  const badge = (label: string, value: string | number, tone?: "red" | "amber") => {
+    const toneClass =
+      tone === "red"
+        ? "bg-red-900/40 text-red-300 border-red-800"
+        : tone === "amber"
+        ? "bg-amber-900/40 text-amber-200 border-amber-800"
+        : "bg-slate-800/80 text-slate-300 border-slate-700";
+    return (
+      <span
+        key={label}
+        className={`text-xs px-2 py-0.5 rounded border ${toneClass}`}
+      >
+        <span className="text-slate-400 mr-1">{label}:</span>
+        {value}
+      </span>
+    );
+  };
+
+  const resetDisabled = resetStuck.isPending || !data.redis_available;
+
+  return (
+    <div className={`mb-4 p-3 rounded border text-sm ${borderClass}`}>
+      <div className="flex items-center flex-wrap gap-2">
+        <span className="text-xs uppercase text-slate-400 mr-1">Queue</span>
+        {badge(
+          "redis",
+          data.redis_available ? "OK" : "DOWN",
+          data.redis_available ? undefined : "red",
+        )}
+        {badge("queued", data.queued)}
+        {badge("running", data.started)}
+        {badge("scheduled", data.scheduled, scheduledDrift ? "amber" : undefined)}
+        {badge("failed", data.failed, data.failed > 0 ? "amber" : undefined)}
+        {badge(
+          "stuck (db)",
+          data.stuck_tasks,
+          data.stuck_tasks > 0 ? "red" : undefined,
+        )}
+        {badge("workers", data.workers.length)}
+        {badge(
+          "ticks",
+          `${healthyTicks}/${totalTicks}`,
+          tickDrift ? "amber" : undefined,
+        )}
+
+        <button
+          disabled={resetDisabled}
+          onClick={() => {
+            if (
+              confirm(
+                `Запустить reset-stuck?\n\n` +
+                  `Работает как startup-recovery: таски в running будут переведены в pending и переотправлены в RQ (если redis доступен) или помечены failed. Заодно заново заэнкьюит все pending строки. Безопасно для живого воркера — DDL не трогается, но это spike ansible-нагрузки.`,
+              )
+            )
+              resetStuck.mutate();
+          }}
+          className="text-xs px-2 py-1 rounded bg-amber-700 hover:bg-amber-600 disabled:opacity-50 ml-auto"
+          title={
+            data.redis_available
+              ? "Перепушить застрявшие таски"
+              : "Redis недоступен — нечего переэнкьюить"
+          }
+        >
+          {resetStuck.isPending ? "…" : "reset-stuck"}
+        </button>
+      </div>
+
+      {(tickDrift || scheduledDrift) && (
+        <div className="mt-2 text-xs text-slate-400">
+          {tickDrift && (
+            <div>
+              Не все ticks живы:{" "}
+              {data.ticks
+                .filter((t) => !tickHealthy(t))
+                .map((t) => `${t.tick_id} (${t.status ?? "null"})`)
+                .join(", ")}
+            </div>
+          )}
+          {scheduledDrift && (
+            <div>
+              scheduled={data.scheduled} — похоже на зомби-цепочки. Проверь{" "}
+              <code>rq info</code> и перезапусти воркер.
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
 
 function statusColor(s: string): string {
   switch (s) {
@@ -175,6 +365,7 @@ export default function Tasks() {
 
   return (
     <div>
+      <QueueBanner />
       <div className="flex items-center gap-3 mb-4 flex-wrap">
         <h1 className="text-2xl font-semibold">Provisioning tasks</h1>
 
