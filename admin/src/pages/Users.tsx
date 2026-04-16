@@ -20,6 +20,10 @@ import {
 // more" feel incremental rather than dumping a wall of rows at once.
 const PAGE_SIZE = 50;
 
+// Filter tab values.  Keep in sync with backend _apply_banned_filter
+// (backend/app/api/users.py) — "all" means "no filter", not "empty".
+type BannedFilter = "all" | "active" | "banned";
+
 export default function Users() {
   const qc = useQueryClient();
   const [search, setSearch] = useState("");
@@ -31,6 +35,10 @@ export default function Users() {
     const id = setTimeout(() => setDebouncedSearch(search), 300);
     return () => clearTimeout(id);
   }, [search]);
+  // Tab filter.  Default "active" — banned accounts are usually ban-waves
+  // of hundreds of rows that the operator only wants to see intentionally
+  // (either to review the wave or to batch-unban a false positive).
+  const [banned, setBanned] = useState<BannedFilter>("active");
   const [selected, setSelected] = useState<UserOut | null>(null);
   const [topupRub, setTopupRub] = useState("");
   const [topupNote, setTopupNote] = useState("");
@@ -40,6 +48,16 @@ export default function Users() {
   // you can check a row for a bulk op without opening its details, and
   // vice versa.
   const [selectedIds, setSelectedIds] = useState<Set<number>>(new Set());
+  // Anchor for shift+click range selection.  Stores the *index* in the
+  // currently-rendered list so the range is stable even while the list
+  // is being paginated (new pages append at the bottom, existing rows
+  // don't shift).  Reset whenever the filter or search changes — the
+  // list would reorder and the anchor would be meaningless.
+  const [lastClickedIndex, setLastClickedIndex] = useState<number | null>(null);
+  useEffect(() => {
+    setLastClickedIndex(null);
+    setSelectedIds(new Set());
+  }, [banned, debouncedSearch]);
 
   const {
     data: usersData,
@@ -48,16 +66,16 @@ export default function Users() {
     isFetchingNextPage,
     isLoading,
   } = useInfiniteQuery({
-    queryKey: ["users", { search: debouncedSearch }],
+    queryKey: ["users", { search: debouncedSearch, banned }],
     initialPageParam: 0,
-    queryFn: ({ pageParam }) =>
-      api.get<UserOut[]>(
-        `/users?limit=${PAGE_SIZE}&offset=${pageParam}${
-          debouncedSearch
-            ? `&search=${encodeURIComponent(debouncedSearch)}`
-            : ""
-        }`,
-      ),
+    queryFn: ({ pageParam }) => {
+      const params = new URLSearchParams();
+      params.set("limit", String(PAGE_SIZE));
+      params.set("offset", String(pageParam));
+      if (debouncedSearch) params.set("search", debouncedSearch);
+      if (banned !== "all") params.set("banned", banned);
+      return api.get<UserOut[]>(`/users?${params.toString()}`);
+    },
     // Short page = we drained the server. Otherwise bump offset by the
     // total count so far — the list is ordered by id DESC on the backend,
     // which is stable enough for paginated admin browsing (new signups
@@ -199,17 +217,119 @@ export default function Users() {
     onError: (e: Error) => alert(`Batch ban/unban ошибка: ${e.message}`),
   });
 
-  const toggleRowSelected = (id: number) => {
+  // Single-user ban / unban toggle — reused by the details sidebar.
+  // Piggybacks on batch_ban so there's one audit path on the backend.
+  const singleBan = useMutation({
+    mutationFn: ({ id, action }: { id: number; action: "ban" | "unban" }) =>
+      batchBanUsers([id], action),
+    onSuccess: (res) => {
+      const id = res.done[0];
+      if (id !== undefined && selected && selected.id === id) {
+        setSelected({
+          ...selected,
+          banned_at: res.action === "ban" ? new Date().toISOString() : null,
+        });
+      }
+      qc.invalidateQueries({ queryKey: ["users"] });
+    },
+    onError: (e: Error) => alert(`Не удалось изменить статус бана: ${e.message}`),
+  });
+
+  // Shift+click range selection.  When the user clicks a checkbox with
+  // shift held we toggle every row between the last-clicked index and
+  // the current index to the *new* state of the current row (matches
+  // GitHub / Gmail semantics — one click selects, shift-click extends
+  // the same action to the range).  Without shift we just toggle one
+  // row and remember its index as the new anchor.
+  const toggleRowSelected = (id: number, index: number, shift: boolean) => {
     setSelectedIds((prev) => {
       const next = new Set(prev);
-      if (next.has(id)) next.delete(id);
-      else next.add(id);
+      const willSelect = !next.has(id);
+      if (shift && lastClickedIndex !== null) {
+        const [lo, hi] = [
+          Math.min(lastClickedIndex, index),
+          Math.max(lastClickedIndex, index),
+        ];
+        for (let i = lo; i <= hi; i++) {
+          const row = users[i];
+          if (!row) continue;
+          if (willSelect) next.add(row.id);
+          else next.delete(row.id);
+        }
+      } else if (willSelect) {
+        next.add(id);
+      } else {
+        next.delete(id);
+      }
       return next;
     });
+    setLastClickedIndex(index);
   };
+
+  // "Select all filtered" — pulls every id matching current search/tab
+  // (capped server-side at 5000) and adds them to the selection set.
+  // The admin UI scenario: spam-wave of 250 bots, filter tab → Banned
+  // (or search for "bot_"), one click to select all, batch_ban in 500-
+  // chunks.  We don't clear existing selection — the operator may have
+  // hand-picked some rows first and want to extend.
+  const selectAllFiltered = useMutation({
+    mutationFn: async () => {
+      const params = new URLSearchParams();
+      if (debouncedSearch) params.set("search", debouncedSearch);
+      if (banned !== "all") params.set("banned", banned);
+      const qs = params.toString();
+      return api.get<number[]>(`/users/ids${qs ? `?${qs}` : ""}`);
+    },
+    onSuccess: (ids) => {
+      setSelectedIds((prev) => {
+        const next = new Set(prev);
+        for (const id of ids) next.add(id);
+        return next;
+      });
+    },
+    onError: (e: Error) => alert(`Не удалось получить список id: ${e.message}`),
+  });
 
   const selArr = Array.from(selectedIds);
   const hasSelection = selArr.length > 0;
+
+  // batch_ban hard-caps at 500 ids per request.  For large waves we
+  // chunk the selection and fire sequential requests so the user can
+  // one-click ban 2000+ rows without hitting the validator.
+  const BATCH_CHUNK = 500;
+  const runBatchBan = async (ids: number[], action: "ban" | "unban") => {
+    if (ids.length <= BATCH_CHUNK) {
+      batchBan.mutate({ ids, action });
+      return;
+    }
+    const chunks: number[][] = [];
+    for (let i = 0; i < ids.length; i += BATCH_CHUNK) {
+      chunks.push(ids.slice(i, i + BATCH_CHUNK));
+    }
+    let done = 0;
+    let skipped = 0;
+    let notFound = 0;
+    for (const c of chunks) {
+      try {
+        const res = await batchBanUsers(c, action);
+        done += res.done.length;
+        skipped += res.skipped.length;
+        notFound += res.not_found.length;
+      } catch (e) {
+        alert(
+          `Batch ${action} упал на чанке: ${e instanceof Error ? e.message : String(e)}.\n\nУспешно обработано до падения: ${done}.`,
+        );
+        break;
+      }
+    }
+    alert(
+      `${action === "ban" ? "Забанено" : "Разбанено"}: ${done}` +
+        (skipped ? `, пропущено: ${skipped} (уже в нужном состоянии)` : "") +
+        (notFound ? `, не найдено: ${notFound}` : ""),
+    );
+    setSelectedIds(new Set());
+    qc.invalidateQueries({ queryKey: ["users"] });
+  };
 
   return (
     <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
@@ -223,13 +343,20 @@ export default function Users() {
               </span>
               <button
                 disabled={batchBan.isPending}
+                onClick={() => setSelectedIds(new Set())}
+                className="text-xs px-2 py-1 rounded bg-slate-700 hover:bg-slate-600 disabled:opacity-50"
+              >
+                снять выделение
+              </button>
+              <button
+                disabled={batchBan.isPending}
                 onClick={() => {
                   if (
                     confirm(
                       `Забанить ${selArr.length} юзер(ов)?\n\nБот будет молча дропать все апдейты от этих Telegram-аккаунтов. Подписки НЕ затрагиваются.`,
                     )
                   )
-                    batchBan.mutate({ ids: selArr, action: "ban" });
+                    runBatchBan(selArr, "ban");
                 }}
                 className="text-xs px-2 py-1 rounded bg-red-700 hover:bg-red-600 disabled:opacity-50"
               >
@@ -239,7 +366,7 @@ export default function Users() {
                 disabled={batchBan.isPending}
                 onClick={() => {
                   if (confirm(`Разбанить ${selArr.length} юзер(ов)?`))
-                    batchBan.mutate({ ids: selArr, action: "unban" });
+                    runBatchBan(selArr, "unban");
                 }}
                 className="text-xs px-2 py-1 rounded bg-emerald-700 hover:bg-emerald-600 disabled:opacity-50"
               >
@@ -248,13 +375,57 @@ export default function Users() {
             </div>
           )}
         </div>
-        <input
-          type="text"
-          placeholder="Поиск по telegram_id или email…"
-          value={search}
-          onChange={(e) => setSearch(e.target.value)}
-          className="w-full mb-4 px-3 py-2 rounded bg-slate-800 border border-slate-700"
-        />
+        {/* Tabs — filter by ban state.  "all" shows both, "active"
+            hides banned (default), "banned" isolates the wave so the
+            operator can select-all + unban if it was a false positive. */}
+        <div className="flex items-center gap-2 mb-3 text-xs">
+          {(
+            [
+              ["active", "Активные"],
+              ["banned", "Забаненные"],
+              ["all", "Все"],
+            ] as [BannedFilter, string][]
+          ).map(([val, label]) => (
+            <button
+              key={val}
+              onClick={() => setBanned(val)}
+              className={`px-3 py-1 rounded ${
+                banned === val
+                  ? "bg-blue-700 text-white"
+                  : "bg-slate-800 hover:bg-slate-700 text-slate-300"
+              }`}
+            >
+              {label}
+            </button>
+          ))}
+        </div>
+        <div className="flex items-center gap-2 mb-4">
+          <input
+            type="text"
+            placeholder="Поиск по telegram_id или email…"
+            value={search}
+            onChange={(e) => setSearch(e.target.value)}
+            className="flex-1 px-3 py-2 rounded bg-slate-800 border border-slate-700"
+          />
+          <button
+            onClick={() => {
+              if (
+                !confirm(
+                  `Выделить всех юзеров по текущему фильтру (${banned === "all" ? "все" : banned === "active" ? "активные" : "забаненные"}${debouncedSearch ? `, поиск «${debouncedSearch}»` : ""})?\n\nБэкенд отдаёт до 5000 id за один запрос.`,
+                )
+              )
+                return;
+              selectAllFiltered.mutate();
+            }}
+            disabled={selectAllFiltered.isPending}
+            className="px-3 py-2 text-xs rounded bg-slate-700 hover:bg-slate-600 whitespace-nowrap disabled:opacity-50"
+            title="Загружает id всех юзеров под фильтром и добавляет их в выделение"
+          >
+            {selectAllFiltered.isPending
+              ? "Загружаем…"
+              : "выделить всё по фильтру"}
+          </button>
+        </div>
         {isLoading ? (
           <div>Загрузка…</div>
         ) : (
@@ -266,16 +437,25 @@ export default function Users() {
                     <input
                       type="checkbox"
                       checked={
-                        users.length > 0 && selectedIds.size === users.length
+                        users.length > 0 &&
+                        users.every((u) => selectedIds.has(u.id))
                       }
                       onChange={() => {
-                        if (selectedIds.size === users.length) {
-                          setSelectedIds(new Set());
-                        } else {
-                          setSelectedIds(new Set(users.map((u) => u.id)));
-                        }
+                        const allVisibleSelected = users.every((u) =>
+                          selectedIds.has(u.id),
+                        );
+                        setSelectedIds((prev) => {
+                          const next = new Set(prev);
+                          if (allVisibleSelected) {
+                            for (const u of users) next.delete(u.id);
+                          } else {
+                            for (const u of users) next.add(u.id);
+                          }
+                          return next;
+                        });
                       }}
                       className="accent-blue-600"
+                      title="Выделить / снять выделение со всех видимых"
                     />
                   </th>
                   <th className="py-2">ID</th>
@@ -287,7 +467,7 @@ export default function Users() {
                 </tr>
               </thead>
               <tbody>
-                {users.map((u) => (
+                {users.map((u, idx) => (
                   <tr
                     key={u.id}
                     onClick={() => setSelected(u)}
@@ -304,7 +484,12 @@ export default function Users() {
                       <input
                         type="checkbox"
                         checked={selectedIds.has(u.id)}
-                        onChange={() => toggleRowSelected(u.id)}
+                        onClick={(e) =>
+                          toggleRowSelected(u.id, idx, e.shiftKey)
+                        }
+                        onChange={() => {
+                          /* handled in onClick so we get shiftKey */
+                        }}
                         className="accent-blue-600"
                       />
                     </td>
@@ -353,13 +538,49 @@ export default function Users() {
         ) : (
           <div className="space-y-2 text-sm">
             <div>ID: {selected.id}</div>
-            <div>Telegram: {selected.telegram_id ?? "—"}</div>
+            <div>
+              Telegram: {selected.telegram_id ?? "—"}
+              {selected.banned_at && (
+                <span className="ml-2 inline-block text-[10px] px-1.5 py-0.5 rounded bg-red-900/60 text-red-200 border border-red-700/50 align-middle">
+                  banned
+                </span>
+              )}
+            </div>
             <div>Email: {selected.email ?? "—"}</div>
             <div>
               Баланс:{" "}
               <span className="font-mono">
                 {(selected.balance_kopecks / 100).toFixed(2)} ₽
               </span>
+            </div>
+            <div className="flex gap-2">
+              {selected.banned_at ? (
+                <button
+                  disabled={singleBan.isPending}
+                  onClick={() => {
+                    if (confirm(`Разбанить юзера #${selected.id}?`))
+                      singleBan.mutate({ id: selected.id, action: "unban" });
+                  }}
+                  className="text-xs px-2 py-1 rounded bg-emerald-700 hover:bg-emerald-600 disabled:opacity-50"
+                >
+                  unban
+                </button>
+              ) : (
+                <button
+                  disabled={singleBan.isPending}
+                  onClick={() => {
+                    if (
+                      confirm(
+                        `Забанить юзера #${selected.id}?\n\nБот будет молча дропать все апдейты. Подписки НЕ затрагиваются.`,
+                      )
+                    )
+                      singleBan.mutate({ id: selected.id, action: "ban" });
+                  }}
+                  className="text-xs px-2 py-1 rounded bg-red-700 hover:bg-red-600 disabled:opacity-50"
+                >
+                  ban
+                </button>
+              )}
             </div>
 
             <div className="pt-2 border-t border-slate-700">

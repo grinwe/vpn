@@ -151,11 +151,32 @@ def disable_user(
     return {"disabled": len(subs), "revocation_tasks": total_tasks}
 
 
+def _apply_banned_filter(q, banned: str | None):
+    """Narrow a users query by ban state.  ``banned`` values:
+    - ``active`` — only rows with ``banned_at IS NULL``
+    - ``banned`` — only rows with ``banned_at IS NOT NULL``
+    - ``all`` / ``None`` — no filter (default)
+    Raises HTTPException(400) for anything else so the admin SPA catches
+    typos early instead of silently getting the full list.
+    """
+    if banned in (None, "all"):
+        return q
+    if banned == "active":
+        return q.filter(models.User.banned_at.is_(None))
+    if banned == "banned":
+        return q.filter(models.User.banned_at.isnot(None))
+    raise HTTPException(
+        status_code=400,
+        detail="banned must be one of: all, active, banned",
+    )
+
+
 @router.get("/users", response_model=list[schemas.UserOut])
 def list_users(
     limit: int = Query(default=50, le=200, ge=1),
     offset: int = Query(default=0, ge=0),
     search: str | None = Query(default=None),
+    banned: str | None = Query(default=None),
     db: Session = Depends(get_db),
     admin_token: str = Depends(require_admin),
 ):
@@ -165,6 +186,7 @@ def list_users(
         q = q.filter(
             (models.User.telegram_id.ilike(like)) | (models.User.email.ilike(like))
         )
+    q = _apply_banned_filter(q, banned)
     users = q.order_by(models.User.id.desc()).offset(offset).limit(limit).all()
     if not users:
         return []
@@ -189,6 +211,41 @@ def list_users(
         )
         for u in users
     ]
+
+
+# Hard cap on the id-list response. 5000 is enough to cover the usual
+# spam-wave (single-shot ban of 250+ bots, with headroom) while keeping
+# the batch_ban's max_length=500 as a separate server-side hedge —
+# admin UI slices this list into chunks of that size.
+_USERS_IDS_MAX = 5000
+
+
+@router.get("/users/ids", response_model=list[int])
+def list_user_ids(
+    search: str | None = Query(default=None),
+    banned: str | None = Query(default=None),
+    db: Session = Depends(get_db),
+    admin_token: str = Depends(require_admin),
+):
+    """Return *all* user ids matching the current filter, capped at
+    :data:`_USERS_IDS_MAX`.  Feeds the admin "select all filtered"
+    action when the operator wants to apply batch_ban to a whole tab
+    (typical: "ban all 250 bots at once" — impossible with paginated
+    /users because the client doesn't have the ids on later pages).
+
+    Intentionally does NOT join subscriptions or compute any derived
+    fields — this endpoint is only an id producer, the UI already has
+    the rich rows for the currently-visible page.
+    """
+    q = db.query(models.User.id)
+    if search:
+        like = f"%{search}%"
+        q = q.filter(
+            (models.User.telegram_id.ilike(like)) | (models.User.email.ilike(like))
+        )
+    q = _apply_banned_filter(q, banned)
+    rows = q.order_by(models.User.id.desc()).limit(_USERS_IDS_MAX).all()
+    return [uid for (uid,) in rows]
 
 
 @router.get("/users/banned-telegram-ids", response_model=list[str])

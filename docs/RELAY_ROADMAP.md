@@ -91,21 +91,24 @@
 
 После неделю в проде (по команде) — `git rm` ролей `install_shadowtls_stack`, `install_hysteria2`, удаление enum‑значений, Alembic‑миграция (drop rows с deprecated protocol, переписать existing), чистка докстрингов. Отдельный коммит.
 
-### A — Admin Users: multiselect + tabs
+### A — Admin Users: multiselect + tabs ✅ (2026-04-16)
 
 Независимо от релея, deploy‑ready сам по себе, нулевой impact на прод.
 
 **Backend (`backend/app/api/users.py`):**
-- `GET /users?banned=true|false|all` (default `all`).
-- `GET /users/ids?banned=&search=` — `list[int]` без пагинации, cap 5000.
+- `GET /users?banned=all|active|banned` (default `None` = no filter) — helper `_apply_banned_filter`.
+- `GET /users/ids?banned=&search=` → `list[int]` без пагинации, cap 5000.
 
 **Frontend (`admin/src/pages/Users.tsx`):**
-- Табы "Все / Активные / Забаненные" над таблицей.
-- Shift+click: выделение диапазона от `lastClickedIndex`.
-- Кнопка "Выделить всех отфильтрованных" — дёргает `/users/ids`, кладёт в `selectedIds`.
-- В панели "Детали" — ban/unban одиночной кнопкой.
+- Табы "Активные / Забаненные / Все" — default `active`.
+- Shift+click: выделение диапазона от `lastClickedIndex` (сбрасывается при смене фильтра/поиска).
+- Кнопка "выделить всё по фильтру" — `selectAllFiltered` mutation через `/users/ids`, аддитивно в `selectedIds`.
+- Мастер-checkbox в таблице: "select all visible" теперь считается через `.every()` (работает корректно и когда `selectedIds` шире текущей страницы).
+- Кнопка "снять выделение" рядом с "ban all" / "unban all".
+- `runBatchBan()` сам чанкает по 500 id (обходит cap `batch_ban.max_length=500`) → можно забанить 2000+ строк одной кнопкой.
+- В панели «Детали» — ban/unban-кнопка (через `singleBan` mutation, бьёт в `batch_ban` с одиночным id).
 
-**Acceptance:** админ банит 250 ботов за 2 клика (таб → select‑all → ban all).
+**Acceptance:** админ банит 250 ботов за 2-3 клика (таб → select‑all → ban all — даже если строк >500, runBatchBan дробит автоматически).
 
 ### B — Exit как сущность: таблица + CRUD
 
