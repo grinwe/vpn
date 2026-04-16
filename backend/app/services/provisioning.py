@@ -1065,6 +1065,16 @@ class ProvisioningOrchestrator:
         else:
             warm_pool.record_pool_miss(self.db, node.id)
 
+        # Cold path = Ansible run = the thing that nuked an xray node
+        # during the 2026-04-15 bot flood. Gate the miss-path on a
+        # sliding window so a burst of new activations can't chain
+        # ansible runs faster than nodes tolerate. Warm-pool hits above
+        # already returned; migrations go through reprovision_subscription
+        # which is not throttled. See services/provisioning_throttle.py.
+        from . import provisioning_throttle
+
+        provisioning_throttle.check_and_consume()
+
         # ── Cold path (original implementation) ─────────────────────────
         device_label = device_name or "primary"
         # One identity shared across all protocols on this device — the node

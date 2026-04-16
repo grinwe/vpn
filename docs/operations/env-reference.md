@@ -167,6 +167,15 @@
 | `WARM_POOL_MAX_CONCURRENT` | `2` | worker | Размер `_warmer_semaphore`. Отдельный от `_ansible_semaphore` ProvisioningOrchestrator'а. Process-local. |
 | `WARM_POOL_CHECK_INTERVAL` | `120` | worker | Тик warmer'а (см. секцию «Worker ticks»). |
 
+## Cold-path provisioning throttle
+
+Sliding-window лимит на `ProvisioningOrchestrator.provision_subscription` в cold branch (промах warm-pool). Migrations и `reprovision_subscription` бесплатны. Добавлено после инцидента 2026-04-15: ~250 ботов зашли в бота за 2 минуты и уронили xray-ноду цепочкой ansible-апплаев. Превышение лимита → HTTP 503 + `Retry-After` → бот/webapp показывают «подожди N секунд». Окно на каждую реплику бэкенда — per-process, не кластерное.
+
+| переменная | default | кто читает | описание |
+|---|---|---|---|
+| `COLD_PROVISION_MAX_PER_WINDOW` | `5` | backend | Максимум cold-path активаций в окне. Повышай вместе с `WARM_POOL_TARGET`, чтобы органический трафик шёл через быстрый путь и не упирался. |
+| `COLD_PROVISION_WINDOW_SECONDS` | `60` | backend | Размер окна в секундах. |
+
 ## Кросс-сервисное зеркалирование — список
 
 Переменные, которые **обязательно** должны быть одинаковыми во всех читающих сервисах. Если где-то поменяли — перезапускайте **все** соответствующие контейнеры.

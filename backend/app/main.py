@@ -3,7 +3,7 @@ import uuid
 
 from fastapi import Depends, FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import PlainTextResponse
+from fastapi.responses import JSONResponse, PlainTextResponse
 from prometheus_client import Counter, generate_latest
 from slowapi import _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
@@ -13,6 +13,7 @@ from .config import get_settings
 from .logging_config import configure_logging, request_id_var
 from .migrations import run_migrations
 from .rate_limit import limiter
+from .services.provisioning_throttle import ColdPathThrottled
 from .api import router as api_router, require_admin
 from .api_extensions import ext_router
 from .api_webapp import webapp_router
@@ -76,6 +77,21 @@ app = FastAPI(title="VPN backend")
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 app.add_middleware(SlowAPIMiddleware)
+
+
+@app.exception_handler(ColdPathThrottled)
+async def _cold_path_throttled_handler(request: Request, exc: ColdPathThrottled):
+    # 503 + Retry-After so well-behaved clients back off instead of
+    # retrying immediately. Surfaces as a banner in the webapp and a
+    # "подожди N секунд" toast in the bot.
+    return JSONResponse(
+        status_code=503,
+        content={
+            "detail": "Слишком много активаций подряд, попробуй через несколько секунд.",
+            "retry_after_seconds": exc.retry_after_seconds,
+        },
+        headers={"Retry-After": str(exc.retry_after_seconds)},
+    )
 
 # CORS — restrict to explicit origins. WEBAPP_ORIGIN env controls which
 # frontend domains may call the API. Falls back to same-origin only (empty

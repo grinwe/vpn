@@ -31,6 +31,7 @@ from .services.payments import ProviderError, get_provider
 from .services.health import record_probe, recompute_node_health
 from .services.node_spawner import NodeSpawnError, destroy_node, spawn_node
 from .services.provisioning import ProvisioningOrchestrator
+from .services.provisioning_throttle import ColdPathThrottled
 
 router = APIRouter(prefix="/api")
 logger = logging.getLogger(__name__)
@@ -116,6 +117,11 @@ def _create_subscription_for_user(
         db.refresh(sub)
         _audit(db, user.telegram_id or "unknown", "subscription_created", "subscription", sub.id)
         return sub, task
+    except ColdPathThrottled:
+        # Let the app-level exception handler translate this to a 503
+        # with Retry-After — 500 would hide the backoff signal.
+        db.rollback()
+        raise
     except Exception as exc:  # noqa: BLE001
         logger.exception("Provisioning failed for user %s", user.telegram_id)
         db.rollback()

@@ -211,6 +211,16 @@ def dynamic_sub_link(token: str, db: Session = Depends(get_db)):
 - FastAPI `HTTPException` — для бизнес-ошибок, превращается в `{"detail": "..."}`.
 - Внутренние сбои логируются через `logger.exception`, наружу уходит generic 500. Исключения — провижининг: `_create_subscription_for_user` ловит любую ошибку, делает rollback, отдаёт 500 "Provisioning failed" (`api/_common.py:129-160`).
 - Rate limit превышение — 429, обрабатывается SlowAPI middleware.
+- Cold-path throttle — 503 с `Retry-After` header. Вызывается, когда окно `COLD_PROVISION_MAX_PER_WINDOW / COLD_PROVISION_WINDOW_SECONDS` исчерпано на cold branch `provision_subscription` (warm-pool промах). Migrations и `reprovision_subscription` лимит **не** трогают — только user-initiated активации. Перехватывается централизованно в `main.py` (`@app.exception_handler(ColdPathThrottled)`). Реализация — `services/provisioning_throttle.py`. Защита, придуманная после инцидента 2026-04-15 с bot-флудом.
+
+## Защита от бот-флуда
+
+Два независимых слоя:
+
+1. **Per-IP rate-limit на hot endpoint'ы входа** — `POST /api/users/register` и `POST /api/trial/activate` декорированы `@limiter.limit("10/minute")`. Общий дефолт SlowAPI (`300/minute; 60/second`) остаётся для остального. Бот ходит в бэк через один хост, так что per-IP фактически = per-bot-backend; не идеально, но достаточно на практике.
+2. **Global cold-path throttle на провижининг** — см. выше. Защита именно от цепочки ansible-ранов, а не от запросов. Миграции и reprovision бесплатны.
+
+Incident 2026-04-15: за 2 минуты в бот зашло ~250 ботов, все промахнулись мимо warm-pool, цепочка cold-path активаций положила одну xray-ноду. Оба слоя вместе гасят эту комбинацию: register/trial зарежутся на rate-limit, а те, что просочились — наткнутся на `ColdPathThrottled`.
 
 ## Зависимости роутов от сервисов
 

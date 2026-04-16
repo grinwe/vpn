@@ -21,6 +21,7 @@ from .. import models, schemas
 from ..config import get_settings
 from ..db import SessionLocal
 from ..services.provisioning import ProvisioningOrchestrator
+from ..services.provisioning_throttle import ColdPathThrottled
 
 logger = logging.getLogger("app.api")
 
@@ -154,6 +155,10 @@ def _create_subscription_for_user(
             sub.id,
         )
         return sub, task
+    except ColdPathThrottled:
+        # Propagate so the app-level handler renders 503 + Retry-After.
+        db.rollback()
+        raise
     except Exception as exc:  # noqa: BLE001
         logger.exception("Provisioning failed for user %s", user.telegram_id)
         db.rollback()

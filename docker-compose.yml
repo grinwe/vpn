@@ -139,6 +139,11 @@ services:
       WARM_POOL_BATCH_PER_TICK: ${WARM_POOL_BATCH_PER_TICK:-3}
       WARM_POOL_CHECK_INTERVAL: ${WARM_POOL_CHECK_INTERVAL:-120}
       WARM_POOL_MAX_CONCURRENT: ${WARM_POOL_MAX_CONCURRENT:-2}
+      # Cold-path throttle — sliding-window cap on warm-pool-miss
+      # activations (migrations/reprovision bypass). Prevents a bot
+      # burst from chaining ansible runs faster than xray tolerates.
+      COLD_PROVISION_MAX_PER_WINDOW: ${COLD_PROVISION_MAX_PER_WINDOW:-5}
+      COLD_PROVISION_WINDOW_SECONDS: ${COLD_PROVISION_WINDOW_SECONDS:-60}
       # Stage 4 — balance billing. Hourly tick charges due subs and
       # auto-unfreezes paused ones whose frozen_until lapsed. Tunables
       # cover the freeze caps, referral bonus and minimum topup.

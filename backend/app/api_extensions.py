@@ -15,7 +15,7 @@ import logging
 import secrets
 
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 
 from .auth import optional_admin, require_admin  # noqa: F401 — re-exported for legacy imports
 from fastapi.responses import PlainTextResponse
@@ -25,6 +25,7 @@ from sqlalchemy.orm import Session
 from . import models
 from .config import get_settings
 from .db import SessionLocal
+from .rate_limit import limiter
 from .security import decrypt as _decrypt
 from .time_utils import utcnow
 
@@ -328,7 +329,9 @@ class UserRegisterRequest(BaseModel):
 
 
 @ext_router.post("/users/register")
+@limiter.limit("10/minute")
 def register_user(
+    request: Request,
     body: UserRegisterRequest,
     db: Session = Depends(get_db),
     admin_token: str | None = Depends(optional_admin),
@@ -392,7 +395,9 @@ class TrialActivateResponse(BaseModel):
 
 
 @ext_router.post("/trial/activate", response_model=TrialActivateResponse)
+@limiter.limit("10/minute")
 def activate_trial(
+    request: Request,
     body: TrialActivateRequest,
     db: Session = Depends(get_db),
     admin_token: str | None = Depends(optional_admin),
