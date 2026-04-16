@@ -39,29 +39,35 @@
     state: present
     update_cache: yes
 
-- name: Configure UFW default policy
-  ufw:
-    state: enabled
-    policy: deny
-  notify: reload ufw
-
-# ufw limit на 22/tcp: 6+ соединений с одного src IP за 30с → block.
-# Это firewall-уровневый троттлинг брутфорса; работает ДО sshd вообще,
-# так что при ддос-атаке не забивается sshd-лог и fail2ban успевает
-# спокойно разбирать то, что прошло через rate-limit. ssh ходит на
-# стандартный порт 22 (см. MOTD, inventories — кастомного порта нет).
-- name: Rate-limit SSH at firewall level
-  ufw:
-    rule: limit
-    port: "22"
-    proto: tcp
-
-- name: Allow firewall ports
-  ufw:
-    rule: allow
-    port: "{{ item }}"
-    proto: tcp
-  loop: "{{ firewall_allowed_ports | default([]) }}"
+# ВРЕМЕННО ЗАКОММЕНТИРОВАНО — ufw rate-limit на 22/tcp блокировал сам
+# ansible-раннер (6+ коннектов/30с с одного egress-IP → drop), из-за
+# чего бутстрап падал на UNREACHABLE после этого шага. Вернуть после
+# того, как в group_vars/vpn_nodes.yml появится whitelist management-IP
+# и в роль будет добавлен `ufw allow from {{ item }} to any port 22`
+# ДО limit-правила.
+# - name: Configure UFW default policy
+#   ufw:
+#     state: enabled
+#     policy: deny
+#   notify: reload ufw
+#
+# # ufw limit на 22/tcp: 6+ соединений с одного src IP за 30с → block.
+# # Это firewall-уровневый троттлинг брутфорса; работает ДО sshd вообще,
+# # так что при ддос-атаке не забивается sshd-лог и fail2ban успевает
+# # спокойно разбирать то, что прошло через rate-limit. ssh ходит на
+# # стандартный порт 22 (см. MOTD, inventories — кастомного порта нет).
+# - name: Rate-limit SSH at firewall level
+#   ufw:
+#     rule: limit
+#     port: "22"
+#     proto: tcp
+#
+# - name: Allow firewall ports
+#   ufw:
+#     rule: allow
+#     port: "{{ item }}"
+#     proto: tcp
+#   loop: "{{ firewall_allowed_ports | default([]) }}"
 
 - name: Disable password authentication in sshd
   lineinfile:
