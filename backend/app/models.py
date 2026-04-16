@@ -236,6 +236,15 @@ class VPNNode(Base):
         "NodeTrafficSample", back_populates="node", cascade="all, delete-orphan"
     )
 
+    @property
+    def has_relay_config(self) -> bool:
+        """True iff this node is configured as a relay (tunnels to an exit).
+
+        Surfaced via ``VPNNodeOut`` so the admin UI can tell whether a
+        node already has an exit link and thus isn't attachable.
+        """
+        return self.relay_config is not None
+
 
 class VPNConfig(Base):
     __tablename__ = "vpn_configs"
@@ -583,6 +592,43 @@ class WGExitNode(Base):
     updated_at = Column(DateTime, default=utcnow, onupdate=utcnow, nullable=False)
 
     provider = relationship("CloudProvider")
+
+
+class RelayExitLink(Base):
+    """N:1 link — a relay (jump) VPN node tunnels to one exit.
+
+    Separate from ``VPNNode.relay_config`` (which the worker reads as a
+    flat dict) to keep the WG client keypair in a properly normalized
+    table with the right FK + unique constraint. ``relay_config`` is
+    updated in the same transaction from this row's data.
+
+    ``wg_client_private_key_enc`` is Fernet-encrypted (via
+    ``security.encrypt``); the worker decrypts when building extra vars.
+    """
+    __tablename__ = "relay_exit_links"
+
+    id = Column(Integer, primary_key=True)
+    # Unique — a relay is attached to at most one exit at a time.
+    # Switching exit = delete + insert.
+    relay_node_id = Column(
+        Integer,
+        ForeignKey("vpn_nodes.id", ondelete="CASCADE"),
+        nullable=False,
+        unique=True,
+    )
+    exit_id = Column(
+        Integer,
+        ForeignKey("wg_exit_nodes.id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    wg_client_private_key_enc = Column(Text, nullable=False)
+    wg_client_public_key = Column(String, nullable=False)
+    # Client address inside the tunnel subnet, e.g. "10.77.0.5/32".
+    wg_client_address_v4 = Column(String, nullable=False)
+    created_at = Column(DateTime, default=utcnow, nullable=False)
+
+    relay_node = relationship("VPNNode")
+    exit_node = relationship("WGExitNode")
 
 
 class HealthProbe(Base):

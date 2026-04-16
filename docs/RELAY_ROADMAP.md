@@ -141,7 +141,7 @@
 - Блокировка удаления при наличии relay-link'ов — появится, когда возникнет таблица `relay_exit_link` в C.
 - `POST /exits/{id}/active` — пока хватает PATCH `status` (нет внешней проверки; явный endpoint добавим, когда подключится health-probe для exit'ов).
 
-### C — Связь relay ↔ exit, bootstrap‑поток
+### C — Связь relay ↔ exit, bootstrap‑поток ✅ (2026-04-16, partial)
 
 **Модель:** новая таблица `relay_exit_link`:
 - `relay_node_id FK vpn_nodes, exit_id FK wg_exit_nodes, wg_client_private_key_enc, wg_client_address_v4 (/32 из 10.77.0.0/24), created_at`
@@ -165,6 +165,21 @@
 **Impact на прод:** нулевой — только для вновь создаваемых relay‑нод. Существующие 8 нод не получают `exit_id`, они остаются прямыми (как сейчас).
 
 **Acceptance:** админ создаёт RU‑relay с exit_id, обе ноды пересобираются без ручного SSH. С RU‑relay `curl --interface wg0 ifconfig.me` показывает IP exit'а.
+
+**Сделано:**
+- Alembic `0027_relay_exit_link.py` — таблица `relay_exit_links` с unique на `relay_node_id` и FK на `vpn_nodes (CASCADE)`, `wg_exit_nodes (RESTRICT)`.
+- `RelayExitLink` модель; `VPNNode.has_relay_config` свойство для UI-фильтра.
+- `services/relay.py`: `allocate_client_address` (итератор по /24 за вычетом server‑IP и занятых), `validate_requested_address`, `build_relay_config` (кладёт приватник шифрованным в JSONB).
+- `provisioning._collect_site_extra_vars` читает `wg_private_key_enc` и расшифровывает перед отправкой в ansible (fallback на legacy `wg_private_key` plain).
+- `api/exits.py`: `GET /exits/{id}/links`, `POST /exits/{id}/links` (автогенерация WG client keypair + /32 + запись link + обновление `relay_config` в одной транзакции), `DELETE /exits/{id}/links/{relay_node_id}`. Удаление exit'а блокируется при наличии link'ов.
+- `VPNNodeOut.has_relay_config: bool` — чтобы UI фильтровал доступные для прикрепления ноды без раскрытия tunnel-метаданных.
+- `admin/src/pages/Exits.tsx`: expandable row с таблицей прикреплённых relay'ев + inline-формой "+ Прикрепить relay" (dropdown свободных нод + опциональный адрес).
+- Peers count в списке exit'ов.
+
+**Отложено в D:**
+- Ansible не запускается при attach/detach — только БД-операции. На живом relay после detach остаётся поднятый wg0 (и Xray по-прежнему пытается выходить через него). Это безопасно пока relay пустой — использовать в проде только когда D.1 (idempotent cleanup) готов.
+- Форма "+ Добавить ноду" в Nodes.tsx не расширена селектором exit'а — attach делается через Exits page. Эквивалентно по возможностям; single-step создание добавим позже, если понадобится.
+- Кнопка "Сменить exit" — пока delete+create через два клика (detach → attach), чего достаточно для текущей нагрузки.
 
 ### D — Бесшовная миграция юзеров
 

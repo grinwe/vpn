@@ -1,5 +1,5 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { useState } from "react";
+import { Fragment, useState } from "react";
 import { api, ApiError } from "../api";
 
 interface WGExitNodeOut {
@@ -18,6 +18,7 @@ interface WGExitNodeOut {
   status: string;
   is_active: boolean;
   notes: string | null;
+  peers_count: number;
   created_at: string;
   updated_at: string;
 }
@@ -33,12 +34,34 @@ interface CloudProviderOut {
   kind: string;
 }
 
+interface VPNNodeMini {
+  id: number;
+  name: string;
+  region: string;
+  host: string;
+  status: string;
+  is_active: boolean;
+  has_relay_config: boolean;
+}
+
+interface RelayExitLinkOut {
+  id: number;
+  relay_node_id: number;
+  relay_node_name: string;
+  exit_id: number;
+  exit_name: string;
+  wg_client_public_key: string;
+  wg_client_address_v4: string;
+  created_at: string;
+}
+
 const STATUSES = ["registering", "active", "error", "disabled"] as const;
 
 export default function Exits() {
   const qc = useQueryClient();
   const [showForm, setShowForm] = useState(false);
   const [editId, setEditId] = useState<number | null>(null);
+  const [expanded, setExpanded] = useState<Set<number>>(new Set());
 
   const { data, isLoading, error } = useQuery<WGExitNodeOut[]>({
     queryKey: ["wg-exits"],
@@ -61,6 +84,15 @@ export default function Exits() {
     onSuccess: () => qc.invalidateQueries({ queryKey: ["wg-exits"] }),
     onError: (e: Error) => alert(`Ошибка: ${e.message}`),
   });
+
+  const toggleExpanded = (id: number) => {
+    setExpanded((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  };
 
   const providerLabel = (pid: number | null) => {
     if (pid == null) return "—";
@@ -100,6 +132,7 @@ export default function Exits() {
         <table className="w-full text-sm">
           <thead className="text-slate-400 border-b border-slate-700">
             <tr>
+              <th className="w-6"></th>
               <th className="text-left py-2 px-2">ID</th>
               <th className="text-left py-2 px-2">Name</th>
               <th className="text-left py-2 px-2">Region</th>
@@ -108,64 +141,204 @@ export default function Exits() {
               <th className="text-left py-2 px-2">WG addr</th>
               <th className="text-left py-2 px-2">Public key</th>
               <th className="text-left py-2 px-2">Provider</th>
+              <th className="text-left py-2 px-2">Peers</th>
               <th className="text-left py-2 px-2">Status</th>
               <th className="text-left py-2 px-2">Active</th>
               <th className="text-left py-2 px-2">Actions</th>
             </tr>
           </thead>
           <tbody>
-            {data.map((e) => (
-              <tr key={e.id} className="border-b border-slate-800 hover:bg-slate-800/50">
-                <td className="py-2 px-2">{e.id}</td>
-                <td className="py-2 px-2 font-mono">{e.name}</td>
-                <td className="py-2 px-2">{e.region}</td>
-                <td className="py-2 px-2 font-mono text-slate-300">{e.host}</td>
-                <td className="py-2 px-2">{e.wg_port}</td>
-                <td className="py-2 px-2 font-mono text-slate-400">{e.wg_address_v4}</td>
-                <td className="py-2 px-2 font-mono text-xs">
-                  {e.wg_public_key ? (
-                    <span title={e.wg_public_key}>{e.wg_public_key.slice(0, 12)}…</span>
-                  ) : (
-                    <span className="text-yellow-500">—</span>
+            {data.map((e) => {
+              const isOpen = expanded.has(e.id);
+              return (
+                <Fragment key={e.id}>
+                  <tr
+                    className="border-b border-slate-800 hover:bg-slate-800/50 cursor-pointer"
+                    onClick={() => toggleExpanded(e.id)}
+                  >
+                    <td className="px-2 text-slate-500">{isOpen ? "▼" : "▶"}</td>
+                    <td className="py-2 px-2">{e.id}</td>
+                    <td className="py-2 px-2 font-mono">{e.name}</td>
+                    <td className="py-2 px-2">{e.region}</td>
+                    <td className="py-2 px-2 font-mono text-slate-300">{e.host}</td>
+                    <td className="py-2 px-2">{e.wg_port}</td>
+                    <td className="py-2 px-2 font-mono text-slate-400">{e.wg_address_v4}</td>
+                    <td className="py-2 px-2 font-mono text-xs">
+                      {e.wg_public_key ? (
+                        <span title={e.wg_public_key}>{e.wg_public_key.slice(0, 12)}…</span>
+                      ) : (
+                        <span className="text-yellow-500">—</span>
+                      )}
+                      {!e.has_private_key && e.wg_public_key && (
+                        <span className="ml-2 text-yellow-500" title="private key missing">⚠</span>
+                      )}
+                    </td>
+                    <td className="py-2 px-2 text-slate-400">{providerLabel(e.provider_id)}</td>
+                    <td className="py-2 px-2">{e.peers_count}</td>
+                    <td className="py-2 px-2">{e.status}</td>
+                    <td className="py-2 px-2">{e.is_active ? "✓" : "✕"}</td>
+                    <td className="py-2 px-2" onClick={(ev) => ev.stopPropagation()}>
+                      <div className="flex gap-1">
+                        <button
+                          onClick={() => { setEditId(e.id); setShowForm(true); }}
+                          className="text-xs px-2 py-1 rounded bg-blue-700 hover:bg-blue-600"
+                        >
+                          edit
+                        </button>
+                        <button
+                          disabled={keygenMut.isPending}
+                          onClick={() => {
+                            const msg = e.has_private_key
+                              ? `Сгенерировать новый ключ для ${e.name}? Текущий будет перезаписан.`
+                              : `Сгенерировать ключ для ${e.name}?`;
+                            if (confirm(msg)) keygenMut.mutate(e.id);
+                          }}
+                          className="text-xs px-2 py-1 rounded bg-purple-700 hover:bg-purple-600 disabled:opacity-50"
+                        >
+                          keygen
+                        </button>
+                        <button
+                          disabled={deleteMut.isPending || e.peers_count > 0}
+                          title={e.peers_count > 0 ? "Сначала отсоедините relay'и" : undefined}
+                          onClick={() => {
+                            if (confirm(`Удалить exit ${e.name}?`))
+                              deleteMut.mutate(e.id);
+                          }}
+                          className="text-xs px-2 py-1 rounded bg-red-800 hover:bg-red-700 disabled:opacity-50"
+                        >
+                          delete
+                        </button>
+                      </div>
+                    </td>
+                  </tr>
+                  {isOpen && (
+                    <tr className="bg-slate-900/50">
+                      <td colSpan={13} className="p-4">
+                        <ExitLinksPanel exitNode={e} />
+                      </td>
+                    </tr>
                   )}
-                  {!e.has_private_key && e.wg_public_key && (
-                    <span className="ml-2 text-yellow-500" title="private key missing">⚠</span>
-                  )}
+                </Fragment>
+              );
+            })}
+          </tbody>
+        </table>
+      )}
+    </div>
+  );
+}
+
+function ExitLinksPanel({ exitNode }: { exitNode: WGExitNodeOut }) {
+  const qc = useQueryClient();
+  const [showAttach, setShowAttach] = useState(false);
+
+  const links = useQuery<RelayExitLinkOut[]>({
+    queryKey: ["wg-exit-links", exitNode.id],
+    queryFn: () => api.get(`/exits/${exitNode.id}/links`),
+  });
+
+  const nodes = useQuery<VPNNodeMini[]>({
+    queryKey: ["nodes-mini"],
+    queryFn: () => api.get("/nodes"),
+    enabled: showAttach,
+  });
+
+  const detachMut = useMutation({
+    mutationFn: (relayId: number) =>
+      api.del(`/exits/${exitNode.id}/links/${relayId}`),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["wg-exit-links", exitNode.id] });
+      qc.invalidateQueries({ queryKey: ["wg-exits"] });
+    },
+    onError: (e: Error) => alert(`Ошибка: ${e.message}`),
+  });
+
+  const attachableNodes = (nodes.data ?? []).filter(
+    (n) => !n.has_relay_config && n.is_active,
+  );
+
+  return (
+    <div className="space-y-3">
+      <div className="flex items-center justify-between">
+        <h3 className="text-sm font-semibold text-slate-300">Attached relays</h3>
+        <button
+          disabled={!exitNode.is_active || !exitNode.wg_public_key}
+          title={
+            !exitNode.wg_public_key
+              ? "Сначала сгенерируйте ключ (keygen)"
+              : !exitNode.is_active
+                ? "Exit не активен"
+                : undefined
+          }
+          onClick={() => setShowAttach((v) => !v)}
+          className="text-xs px-3 py-1 rounded bg-green-700 hover:bg-green-600 disabled:opacity-50"
+        >
+          {showAttach ? "Отмена" : "+ Прикрепить relay"}
+        </button>
+      </div>
+
+      {showAttach && (
+        <AttachRelayForm
+          exitId={exitNode.id}
+          nodes={attachableNodes}
+          loadingNodes={nodes.isLoading}
+          onDone={() => {
+            setShowAttach(false);
+            qc.invalidateQueries({ queryKey: ["wg-exit-links", exitNode.id] });
+            qc.invalidateQueries({ queryKey: ["wg-exits"] });
+          }}
+        />
+      )}
+
+      {links.isLoading && <div className="text-slate-400 text-xs">Загрузка…</div>}
+      {links.error && (
+        <div className="text-red-400 text-xs">{(links.error as Error).message}</div>
+      )}
+      {links.data && links.data.length === 0 && (
+        <div className="text-slate-500 text-xs italic">Нет прикреплённых relay-нод.</div>
+      )}
+      {links.data && links.data.length > 0 && (
+        <table className="w-full text-xs">
+          <thead className="text-slate-400">
+            <tr>
+              <th className="text-left py-1 px-2">Relay</th>
+              <th className="text-left py-1 px-2">WG client addr</th>
+              <th className="text-left py-1 px-2">Client public key</th>
+              <th className="text-left py-1 px-2">Создан</th>
+              <th className="py-1 px-2"></th>
+            </tr>
+          </thead>
+          <tbody>
+            {links.data.map((l) => (
+              <tr key={l.id} className="border-t border-slate-800">
+                <td className="py-1 px-2 font-mono">
+                  #{l.relay_node_id} {l.relay_node_name}
                 </td>
-                <td className="py-2 px-2 text-slate-400">{providerLabel(e.provider_id)}</td>
-                <td className="py-2 px-2">{e.status}</td>
-                <td className="py-2 px-2">{e.is_active ? "✓" : "✕"}</td>
-                <td className="py-2 px-2">
-                  <div className="flex gap-1">
-                    <button
-                      onClick={() => { setEditId(e.id); setShowForm(true); }}
-                      className="text-xs px-2 py-1 rounded bg-blue-700 hover:bg-blue-600"
-                    >
-                      edit
-                    </button>
-                    <button
-                      disabled={keygenMut.isPending}
-                      onClick={() => {
-                        const msg = e.has_private_key
-                          ? `Сгенерировать новый ключ для ${e.name}? Текущий будет перезаписан.`
-                          : `Сгенерировать ключ для ${e.name}?`;
-                        if (confirm(msg)) keygenMut.mutate(e.id);
-                      }}
-                      className="text-xs px-2 py-1 rounded bg-purple-700 hover:bg-purple-600 disabled:opacity-50"
-                    >
-                      keygen
-                    </button>
-                    <button
-                      disabled={deleteMut.isPending}
-                      onClick={() => {
-                        if (confirm(`Удалить exit ${e.name}?`))
-                          deleteMut.mutate(e.id);
-                      }}
-                      className="text-xs px-2 py-1 rounded bg-red-800 hover:bg-red-700 disabled:opacity-50"
-                    >
-                      delete
-                    </button>
-                  </div>
+                <td className="py-1 px-2 font-mono text-slate-400">
+                  {l.wg_client_address_v4}
+                </td>
+                <td className="py-1 px-2 font-mono" title={l.wg_client_public_key}>
+                  {l.wg_client_public_key.slice(0, 12)}…
+                </td>
+                <td className="py-1 px-2 text-slate-400">
+                  {new Date(l.created_at).toLocaleString()}
+                </td>
+                <td className="py-1 px-2">
+                  <button
+                    disabled={detachMut.isPending}
+                    onClick={() => {
+                      if (
+                        confirm(
+                          `Отсоединить ${l.relay_node_name} от ${exitNode.name}? ` +
+                            "Ansible НЕ запустится (D.1 ещё не готов) — relay_config очистится только в БД.",
+                        )
+                      )
+                        detachMut.mutate(l.relay_node_id);
+                    }}
+                    className="text-xs px-2 py-0.5 rounded bg-red-800 hover:bg-red-700 disabled:opacity-50"
+                  >
+                    detach
+                  </button>
                 </td>
               </tr>
             ))}
@@ -173,6 +346,94 @@ export default function Exits() {
         </table>
       )}
     </div>
+  );
+}
+
+function AttachRelayForm({
+  exitId,
+  nodes,
+  loadingNodes,
+  onDone,
+}: {
+  exitId: number;
+  nodes: VPNNodeMini[];
+  loadingNodes: boolean;
+  onDone: () => void;
+}) {
+  const [relayId, setRelayId] = useState<string>("");
+  const [address, setAddress] = useState("");
+  const [err, setErr] = useState<string | null>(null);
+
+  const mutation = useMutation({
+    mutationFn: (body: Record<string, unknown>) =>
+      api.post<RelayExitLinkOut>(`/exits/${exitId}/links`, body),
+    onSuccess: onDone,
+    onError: (e: Error) =>
+      setErr(e instanceof ApiError ? `${e.status}: ${e.message}` : e.message),
+  });
+
+  function submit(e: React.FormEvent) {
+    e.preventDefault();
+    setErr(null);
+    if (!relayId) {
+      setErr("Выберите relay ноду");
+      return;
+    }
+    const body: Record<string, unknown> = {
+      relay_node_id: Number(relayId),
+    };
+    if (address) body.wg_client_address_v4 = address;
+    mutation.mutate(body);
+  }
+
+  return (
+    <form
+      onSubmit={submit}
+      className="p-3 rounded border border-slate-700 bg-slate-900 grid grid-cols-2 gap-3"
+    >
+      <label className="flex flex-col">
+        <span className="text-slate-400 text-xs mb-1">Relay node</span>
+        <select
+          value={relayId}
+          onChange={(e) => setRelayId(e.target.value)}
+          className="bg-slate-800 border border-slate-700 rounded px-2 py-1 text-sm"
+        >
+          <option value="">
+            {loadingNodes ? "Загрузка…" : "— выберите relay —"}
+          </option>
+          {nodes.map((n) => (
+            <option key={n.id} value={n.id}>
+              #{n.id} {n.name} ({n.region}, {n.status})
+            </option>
+          ))}
+        </select>
+      </label>
+      <label className="flex flex-col">
+        <span className="text-slate-400 text-xs mb-1">
+          WG client addr (опционально — авто если пусто)
+        </span>
+        <input
+          value={address}
+          onChange={(e) => setAddress(e.target.value)}
+          placeholder="10.77.0.5/32"
+          className="bg-slate-800 border border-slate-700 rounded px-2 py-1 text-sm font-mono"
+        />
+      </label>
+
+      {err && <div className="col-span-2 text-red-400 text-xs">{err}</div>}
+      <div className="col-span-2 flex gap-2 justify-end text-xs">
+        <button type="button" onClick={onDone} className="px-3 py-1 rounded bg-slate-700">
+          Отмена
+        </button>
+        <button
+          type="submit"
+          disabled={mutation.isPending}
+          className="px-3 py-1 rounded bg-green-700 hover:bg-green-600 disabled:opacity-50"
+        >
+          Прикрепить
+        </button>
+      </div>
+    </form>
   );
 }
 

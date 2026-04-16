@@ -155,6 +155,11 @@ class VPNNodeOut(VPNNodeCreate):
     # looks eligible and silently gets no traffic.
     cooldown_until: datetime | None = None
     suspect_since: datetime | None = None
+    # True iff node.relay_config is populated (i.e. it's a relay attached
+    # to some wg_exit_node). Private key lives encrypted in the link row;
+    # we only expose the boolean so the admin UI can filter attachable
+    # nodes without learning the tunnel metadata.
+    has_relay_config: bool = False
     created_at: datetime
     updated_at: datetime
 
@@ -739,6 +744,7 @@ class WGExitNodeOut(BaseModel):
     status: str
     is_active: bool
     notes: str | None
+    peers_count: int = 0
     created_at: datetime
     updated_at: datetime
 
@@ -749,3 +755,24 @@ class WGExitNodeOut(BaseModel):
 class WGExitKeygenOut(BaseModel):
     id: int
     wg_public_key: str
+
+
+class RelayExitLinkCreate(BaseModel):
+    relay_node_id: int
+    # Optional — if omitted, the server picks the next free /32 in the
+    # exit's subnet. Must be host-form CIDR like "10.77.0.5/32".
+    wg_client_address_v4: str | None = None
+
+
+class RelayExitLinkOut(BaseModel):
+    id: int
+    relay_node_id: int
+    relay_node_name: str
+    exit_id: int
+    exit_name: str
+    wg_client_public_key: str
+    wg_client_address_v4: str
+    created_at: datetime
+
+    class Config:
+        from_attributes = True

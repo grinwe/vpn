@@ -448,8 +448,17 @@ def _collect_site_extra_vars(node: models.VPNNode) -> dict[str, Any]:
     # ── Relay (jump node → WG tunnel → exit) ──
     rc = node.relay_config
     if rc:
+        # Stage C: the key is stored encrypted under ``wg_private_key_enc``.
+        # Legacy rows used plaintext ``wg_private_key`` — keep reading both
+        # so existing data (if any) still works during the transition.
+        priv_enc = rc.get("wg_private_key_enc")
+        priv_plain = rc.get("wg_private_key")
+        if priv_enc:
+            priv = decrypt(priv_enc) or ""
+        else:
+            priv = priv_plain or ""
         extra.update({
-            "relay_wg_private_key": rc.get("wg_private_key", ""),
+            "relay_wg_private_key": priv,
             "relay_wg_address_v4": rc.get("wg_address_v4", ""),
             "relay_wg_endpoint": rc.get("wg_endpoint", ""),
             "relay_wg_exit_public_key": rc.get("wg_exit_public_key", ""),

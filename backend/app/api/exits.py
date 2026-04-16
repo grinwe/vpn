@@ -11,18 +11,40 @@ whether keygen is needed.
 from __future__ import annotations
 
 from fastapi import APIRouter, Depends, Header, HTTPException
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from .. import models, schemas
 from ..auth import require_admin
 from ..security import encrypt as _encrypt
+from ..services.relay import (
+    RelayAllocationError,
+    allocate_client_address,
+    build_relay_config,
+    validate_requested_address,
+)
 from ..services.vless import generate_wireguard_keypair
 from ._common import ADMIN_ACTOR_HEADER, _audit, _resolve_admin_actor, get_db
 
 router = APIRouter()
 
 
-def _to_out(exit_node: models.WGExitNode) -> schemas.WGExitNodeOut:
+def _link_to_out(link: models.RelayExitLink) -> schemas.RelayExitLinkOut:
+    return schemas.RelayExitLinkOut(
+        id=link.id,
+        relay_node_id=link.relay_node_id,
+        relay_node_name=link.relay_node.name if link.relay_node else "",
+        exit_id=link.exit_id,
+        exit_name=link.exit_node.name if link.exit_node else "",
+        wg_client_public_key=link.wg_client_public_key,
+        wg_client_address_v4=link.wg_client_address_v4,
+        created_at=link.created_at,
+    )
+
+
+def _to_out(
+    exit_node: models.WGExitNode, *, peers_count: int = 0
+) -> schemas.WGExitNodeOut:
     return schemas.WGExitNodeOut(
         id=exit_node.id,
         name=exit_node.name,
@@ -39,8 +61,17 @@ def _to_out(exit_node: models.WGExitNode) -> schemas.WGExitNodeOut:
         status=exit_node.status.value,
         is_active=exit_node.is_active,
         notes=exit_node.notes,
+        peers_count=peers_count,
         created_at=exit_node.created_at,
         updated_at=exit_node.updated_at,
+    )
+
+
+def _peers_count(db: Session, exit_id: int) -> int:
+    return (
+        db.query(models.RelayExitLink)
+        .filter(models.RelayExitLink.exit_id == exit_id)
+        .count()
     )
 
 
@@ -50,7 +81,15 @@ def list_exits(
     admin_token: str = Depends(require_admin),
 ):
     rows = db.query(models.WGExitNode).order_by(models.WGExitNode.id).all()
-    return [_to_out(r) for r in rows]
+    counts: dict[int, int] = dict(
+        db.query(
+            models.RelayExitLink.exit_id,
+            func.count(models.RelayExitLink.id),
+        )
+        .group_by(models.RelayExitLink.exit_id)
+        .all()
+    )
+    return [_to_out(r, peers_count=counts.get(r.id, 0)) for r in rows]
 
 
 @router.post("/exits", response_model=schemas.WGExitNodeOut)
@@ -83,7 +122,7 @@ def create_exit(
     db.refresh(exit_node)
     actor, actor_type = _resolve_admin_actor(admin_actor)
     _audit(db, actor, "wg_exit_created", "wg_exit_node", exit_node.id, actor_type=actor_type)
-    return _to_out(exit_node)
+    return _to_out(exit_node, peers_count=0)
 
 
 @router.get("/exits/{exit_id}", response_model=schemas.WGExitNodeOut)
@@ -95,7 +134,7 @@ def get_exit(
     exit_node = db.get(models.WGExitNode, exit_id)
     if not exit_node:
         raise HTTPException(status_code=404, detail="Exit node not found")
-    return _to_out(exit_node)
+    return _to_out(exit_node, peers_count=_peers_count(db, exit_id))
 
 
 @router.patch("/exits/{exit_id}", response_model=schemas.WGExitNodeOut)
@@ -152,7 +191,7 @@ def update_exit(
     db.refresh(exit_node)
     actor, actor_type = _resolve_admin_actor(admin_actor)
     _audit(db, actor, "wg_exit_updated", "wg_exit_node", exit_node.id, actor_type=actor_type)
-    return _to_out(exit_node)
+    return _to_out(exit_node, peers_count=_peers_count(db, exit_node.id))
 
 
 @router.delete("/exits/{exit_id}", status_code=200)
@@ -165,6 +204,12 @@ def delete_exit(
     exit_node = db.get(models.WGExitNode, exit_id)
     if not exit_node:
         raise HTTPException(status_code=404, detail="Exit node not found")
+    peers = _peers_count(db, exit_id)
+    if peers > 0:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Exit has {peers} attached relay(s); detach them first",
+        )
     actor, actor_type = _resolve_admin_actor(admin_actor)
     _audit(db, actor, "wg_exit_deleted", "wg_exit_node", exit_node.id, actor_type=actor_type)
     db.delete(exit_node)
@@ -194,3 +239,136 @@ def keygen_exit(
     actor, actor_type = _resolve_admin_actor(admin_actor)
     _audit(db, actor, "wg_exit_keygen", "wg_exit_node", exit_node.id, actor_type=actor_type)
     return schemas.WGExitKeygenOut(id=exit_node.id, wg_public_key=pub)
+
+
+@router.get("/exits/{exit_id}/links", response_model=list[schemas.RelayExitLinkOut])
+def list_exit_links(
+    exit_id: int,
+    db: Session = Depends(get_db),
+    admin_token: str = Depends(require_admin),
+):
+    exit_node = db.get(models.WGExitNode, exit_id)
+    if not exit_node:
+        raise HTTPException(status_code=404, detail="Exit node not found")
+    rows = (
+        db.query(models.RelayExitLink)
+        .filter(models.RelayExitLink.exit_id == exit_id)
+        .order_by(models.RelayExitLink.id)
+        .all()
+    )
+    return [_link_to_out(r) for r in rows]
+
+
+@router.post("/exits/{exit_id}/links", response_model=schemas.RelayExitLinkOut)
+def attach_relay(
+    exit_id: int,
+    payload: schemas.RelayExitLinkCreate,
+    db: Session = Depends(get_db),
+    admin_token: str = Depends(require_admin),
+    admin_actor: str | None = Header(default=None, alias=ADMIN_ACTOR_HEADER),
+):
+    """Attach a relay VPN node to this exit.
+
+    Generates a fresh WG client keypair, allocates a free /32 in the
+    exit's subnet, writes the link row, and populates the relay node's
+    ``relay_config`` in a single transaction. Does NOT invoke Ansible —
+    the worker-side bootstrap flow lands in stage D.
+    """
+    exit_node = db.get(models.WGExitNode, exit_id)
+    if not exit_node:
+        raise HTTPException(status_code=404, detail="Exit node not found")
+    if not exit_node.is_active:
+        raise HTTPException(status_code=400, detail="Exit is not active")
+
+    relay = db.get(models.VPNNode, payload.relay_node_id)
+    if not relay:
+        raise HTTPException(status_code=404, detail="Relay node not found")
+
+    existing = (
+        db.query(models.RelayExitLink)
+        .filter(models.RelayExitLink.relay_node_id == relay.id)
+        .first()
+    )
+    if existing:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"Relay {relay.name} is already attached to exit "
+                f"{existing.exit_id}; detach first"
+            ),
+        )
+
+    try:
+        if payload.wg_client_address_v4:
+            client_address = validate_requested_address(
+                db, exit_node, payload.wg_client_address_v4
+            )
+        else:
+            client_address = allocate_client_address(db, exit_node)
+        pub, priv = generate_wireguard_keypair()
+        relay_config = build_relay_config(
+            exit_node=exit_node,
+            client_private_key=priv,
+            client_address_v4=client_address,
+        )
+    except RelayAllocationError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    link = models.RelayExitLink(
+        relay_node_id=relay.id,
+        exit_id=exit_node.id,
+        wg_client_private_key_enc=_encrypt(priv),
+        wg_client_public_key=pub,
+        wg_client_address_v4=client_address,
+    )
+    db.add(link)
+    relay.relay_config = relay_config
+    db.commit()
+    db.refresh(link)
+
+    actor, actor_type = _resolve_admin_actor(admin_actor)
+    _audit(
+        db, actor, "relay_exit_attached", "relay_exit_link", link.id,
+        actor_type=actor_type,
+    )
+    return _link_to_out(link)
+
+
+@router.delete("/exits/{exit_id}/links/{relay_node_id}", status_code=200)
+def detach_relay(
+    exit_id: int,
+    relay_node_id: int,
+    db: Session = Depends(get_db),
+    admin_token: str = Depends(require_admin),
+    admin_actor: str | None = Header(default=None, alias=ADMIN_ACTOR_HEADER),
+):
+    """Detach a relay from this exit.
+
+    Drops the link row and clears the relay's ``relay_config``. Does NOT
+    invoke Ansible to tear down wg0 on the relay — that idempotent
+    teardown is D.1. Until then the detach is DB-only, so use with care
+    on live relays.
+    """
+    link = (
+        db.query(models.RelayExitLink)
+        .filter(
+            models.RelayExitLink.exit_id == exit_id,
+            models.RelayExitLink.relay_node_id == relay_node_id,
+        )
+        .first()
+    )
+    if not link:
+        raise HTTPException(status_code=404, detail="Link not found")
+
+    relay = db.get(models.VPNNode, relay_node_id)
+    if relay:
+        relay.relay_config = None
+
+    db.delete(link)
+    db.commit()
+    actor, actor_type = _resolve_admin_actor(admin_actor)
+    _audit(
+        db, actor, "relay_exit_detached", "relay_exit_link", link.id,
+        actor_type=actor_type,
+    )
+    return {"exit_id": exit_id, "relay_node_id": relay_node_id, "deleted": True}
