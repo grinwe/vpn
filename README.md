@@ -19,9 +19,8 @@ Telegram Bot (aiogram) → FastAPI Backend → PostgreSQL + Redis/RQ
 | VLESS + Reality | TCP (high port) | Under active attack; works on ports 47000+ |
 | VLESS + XHTTP | TCP (TLS-fronted) | Working, обход 16KB curtain |
 | VLESS + WebSocket + CDN | WebSocket via Cloudflare | Working (CDN IPs whitelisted) |
-| Hysteria2 | QUIC/UDP | Working on broadband, unstable on mobile |
 
-> ShadowTLS v3 + Shadowsocks — **deprecated (0.2, April 2026)**, UI не создаёт новые конфиги.  Enum и роль оставлены до 0.4 для легаси-нод.
+> ShadowTLS v3 + Shadowsocks — **deprecated (0.2, April 2026)**. Hysteria2 — **deprecated (0.3, April 2026)**.  UI не создаёт новые конфиги.  Enum'ы и роли оставлены до 0.4 для легаси-нод.
 
 ### Components
 
@@ -173,7 +172,7 @@ vpn/
 │       ├── install_shadowtls_stack/   ← deprecated (0.2), закомменчена в site.yml
 │       ├── install_vless_reality/
 │       ├── install_vless_ws_cdn/     # NEW
-│       ├── install_hysteria2/        # NEW
+│       ├── install_hysteria2/        ← deprecated (0.3), закомменчена в site.yml
 │       ├── install_traffic_collector/
 │       ├── monitoring_stack/
 │       └── ...

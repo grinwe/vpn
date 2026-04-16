@@ -75,9 +75,10 @@ ansible-playbook -i inventories/prod/hosts.yml site.yml --tags web
   (для отслеживания `registering → active` во время bootstrap). Кнопка
   «+ Добавить ноду» открывает форму создания — бэкенд автоматически
   enqueue'ит таску на `site.yml` через worker. Клик на строку разворачивает
-  панель конфигов протоколов (ShadowTLS+SS, VLESS Reality, VLESS+WS+CDN,
-  Hysteria2) с формой «+ Добавить конфиг» — протокольные дефолты
-  (порт/SNI) проставляются автоматически.
+  панель конфигов протоколов (VLESS Reality, VLESS XHTTP, VLESS+WS+CDN)
+  с формой «+ Добавить конфиг» — протокольные дефолты (порт/SNI)
+  проставляются автоматически.  ShadowTLS+SS и Hysteria2 deprecated
+  (0.2/0.3), через UI не создаются.
 - `/admin/tokens` — **API tokens**: scoped токены с отдельными правами для
   интеграций (probes, внешние сервисы) и самих админов.
 

@@ -25,9 +25,8 @@
 | `vless-reality` | [install_vless_reality](../infra/ansible/roles/install_vless_reality) | 9443 | `www.asus.com` | xray |
 | `vless-xhttp` | [install_vless_xhttp](../infra/ansible/roles/install_vless_xhttp) | 443 | (TLS fronting domain) | xray |
 | `vless-ws-cdn` | [install_vless_ws_cdn](../infra/ansible/roles/install_vless_ws_cdn) | 443 | (CDN domain) | xray + Cloudflare proxy |
-| `hysteria2` | [install_hysteria2](../infra/ansible/roles/install_hysteria2) | 8443/UDP | (none) | hysteria-server |
 
-> `shadowtls+shadowsocks` — **deprecated** (0.2, April 2026). Роль `install_shadowtls_stack` закомментирована в [site.yml](../infra/ansible/site.yml), UI не даёт создавать новые конфиги.  Enum-значение `shadowtls_ss` оставлено в `VPNConfigProtocol` и бэкенд-branch'и — until 0.4 — на случай легаси-нод.
+> `shadowtls+shadowsocks` — **deprecated** (0.2, April 2026).  `hysteria2` — **deprecated** (0.3, April 2026). Роли `install_shadowtls_stack` и `install_hysteria2` закомментированы в [site.yml](../infra/ansible/site.yml), UI не даёт создавать новые конфиги.  Enum-значения `shadowtls_ss` / `hysteria2` оставлены в `VPNConfigProtocol` и бэкенд-branch'и — until 0.4 — на случай легаси-нод.
 
 Источник дефолтов: [admin/src/pages/Nodes.tsx `PROTOCOL_DEFAULTS`](../admin/src/pages/Nodes.tsx). Если меняешь значения в ansible-ролях — синхронизируй оба места, иначе форма в Admin UI будет предлагать не то, что реально поднимется на ноде.
 
@@ -37,8 +36,7 @@
 
 1. **Primary: VLESS Reality** — основной протокол, per-user isolation + sharing enforcer. Порт 9443 (или high-port 47000+).
 2. **VLESS XHTTP** — основной TCP-протокол, обход 16KB curtain ТСПУ.
-3. **Fallback: Hysteria2** — UDP/QUIC. На мобильных нестабилен (пакет-лосс режет соединение), на broadband отлично.
-4. **Fallback: VLESS+WS+CDN** — через Cloudflare. Работает, пока CF IP'шники в whitelist'е, но это moving target и каждая нода требует отдельного domain-setup'а.
+3. **Fallback: VLESS+WS+CDN** — через Cloudflare. Работает, пока CF IP'шники в whitelist'е, но это moving target и каждая нода требует отдельного domain-setup'а.
 
 **Минимум на каждой ноде:** vless-reality. Остальные — по потребности/региону.
 

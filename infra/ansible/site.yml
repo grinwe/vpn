@@ -6,14 +6,15 @@
     # Protocol roles: always included so they can clean up removed
     # protocols.  Each role handles its own gating internally and
     # stops+disables its services when the config vars are absent.
-    # ShadowTLS deprecated (0.2): protocol is dead, no new configs are
-    # provisioned.  Left commented out for a release cycle before full
-    # deletion — uncomment if a legacy node needs cleanup.
+    # ShadowTLS deprecated (0.2) / Hysteria2 deprecated (0.3): protocols
+    # are dead, no new configs are provisioned.  Left commented out for
+    # a release cycle before full deletion — uncomment if a legacy node
+    # needs cleanup.
     # - install_shadowtls_stack
+    # - install_hysteria2
     - install_vless_reality
     - install_vless_ws_cdn
     - install_vless_xhttp
-    - install_hysteria2
     # Relay: WG tunnel to foreign exit node. Patches Xray outbound with
     # sockopt.interface: wg0 so user traffic exits via the tunnel while
     # management traffic stays on the main interface.

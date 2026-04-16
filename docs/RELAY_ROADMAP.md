@@ -75,9 +75,15 @@
 
 **Acceptance:** в UI нельзя создать ShadowTLS‑конфиг (✔, `<option>` удалён), bootstrap новой ноды проходит без shadowtls‑роли (✔, закомментирована в site.yml).  Existing unit‑тесты warm-pool не ломаются — ShadowTLS-ветки pipeline'а сохранены.
 
-### 0.3 — Comment out Hysteria2
+### 0.3 — Comment out Hysteria2 ✅ (2026-04-16)
 
-**Файлы:** аналогично 0.2 — `site.yml` play для `install_hysteria2`, enum, UI, docs. В `_collect_site_extra_vars` — ветку `hysteria2_port` снести.
+**Сделано:**
+- `infra/ansible/site.yml` — `- install_hysteria2` закомментирована рядом с shadowtls.
+- `admin/src/pages/Nodes.tsx` — `CreatableProtocol = Exclude<..., "shadowtls+shadowsocks" | "hysteria2">`, `<option value="hysteria2">` удалён, bootstrap-confirm обновлён.
+- `admin/src/api.ts` — комментарий дополнен.
+- `admin/README.md`, `docs/NODES.md`, `docs/architecture.md`, `docs/infrastructure/nodes.md`, `docs/infrastructure/ansible.md`, `README.md` — deprecation notice + hysteria2 выкинут из рекомендаций / диаграмм.
+
+**Оставлено до 0.4:** `_build_hysteria2_credential` + credential-builder ветки в provisioning.py/warm_pool.py, `_collect_site_extra_vars` ветка `hysteria2_port`, enum `VPNConfigProtocol.hysteria2`, тесты, роль `install_hysteria2/` на диске.
 
 **Impact на прод:** нулевой — у нас hysteria2 не используется.
 

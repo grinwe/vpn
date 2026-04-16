@@ -538,7 +538,7 @@ export default function Nodes() {
                           if (
                             confirm(
                               `Перекатить site.yml на ноду #${n.id} (${n.name}) с нуля?\n\n` +
-                                `Запустится вся цепочка ролей (bootstrap_node, install_vless_reality, install_vless_ws_cdn, install_vless_xhttp, install_hysteria2, check_node_health). install_vless_reality preserve'ит существующих VLESS-клиентов через slurp старого config.json, плюс после успеха бэк авто-триггернёт resync всех активных UUID'ов. Безопасно для ноды с живым трафиком.`,
+                                `Запустится вся цепочка ролей (bootstrap_node, install_vless_reality, install_vless_ws_cdn, install_vless_xhttp, check_node_health). install_vless_reality preserve'ит существующих VLESS-клиентов через slurp старого config.json, плюс после успеха бэк авто-триггернёт resync всех активных UUID'ов. Безопасно для ноды с живым трафиком.`,
                             )
                           )
                             bootstrap.mutate({ id: n.id, name: n.name });
@@ -1332,16 +1332,18 @@ function NodeTrafficChart({ nodeId }: { nodeId: number }) {
 // Дефолты под каждый протокол — совпадают с тем, что ставит ansible
 // по дефолту (см. install_vless_reality/defaults). Если операторы
 // начнут менять порты в ролях — синхронизировать здесь.
-// shadowtls+shadowsocks убран из UI (0.2, протокол dead).  Легаси-тип
-// остаётся в VPNConfigProtocol на случай старых конфигов с ноды.
-type CreatableProtocol = Exclude<VPNConfigProtocol, "shadowtls+shadowsocks">;
+// shadowtls+shadowsocks убран из UI (0.2), hysteria2 убран (0.3).
+// Легаси-типы остаются в VPNConfigProtocol для строк со старых нод.
+type CreatableProtocol = Exclude<
+  VPNConfigProtocol,
+  "shadowtls+shadowsocks" | "hysteria2"
+>;
 const PROTOCOL_DEFAULTS: Record<
   CreatableProtocol,
   { port: number; sni: string; name: string }
 > = {
   "vless-reality": { port: 9443, sni: "www.asus.com", name: "vless-reality" },
   "vless-ws-cdn": { port: 443, sni: "", name: "vless-ws-cdn" },
-  "hysteria2": { port: 8443, sni: "", name: "hysteria2" },
   "vless-xhttp": { port: 443, sni: "", name: "vless-xhttp" },
 };
 
@@ -1406,7 +1408,6 @@ function AddConfigForm({
         >
           <option value="vless-reality">vless-reality</option>
           <option value="vless-ws-cdn">vless-ws-cdn</option>
-          <option value="hysteria2">hysteria2</option>
           <option value="vless-xhttp">vless-xhttp</option>
         </select>
       </label>
