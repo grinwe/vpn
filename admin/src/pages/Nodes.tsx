@@ -236,6 +236,34 @@ export default function Nodes() {
     onError: (e: Error) => alert(`Не удалось запустить resync: ${e.message}`),
   });
 
+  const backfillCreds = useMutation({
+    mutationFn: (node: { id: number; name: string }) =>
+      api
+        .post<{
+          node_id: number;
+          created: Record<string, number>;
+          total_created: number;
+        }>(`/nodes/${node.id}/backfill-missing-creds`, {})
+        .then((res) => ({ ...res, nodeName: node.name })),
+    onSuccess: (res) => {
+      qc.invalidateQueries({ queryKey: ["provisioning-tasks"] });
+      qc.invalidateQueries({ queryKey: ["user-subs"] });
+      if (res.total_created === 0) {
+        alert(
+          `На ноде #${res.node_id} (${res.nodeName}) пропущенных кредов нет — все активные девайсы уже имеют Credential под каждый enabled-протокол.`,
+        );
+        return;
+      }
+      const perConfig = Object.entries(res.created)
+        .map(([cfg_id, n]) => `config #${cfg_id}: +${n}`)
+        .join("\n");
+      alert(
+        `Backfill на ноде #${res.node_id} (${res.nodeName}): создано ${res.total_created} Credential'ов.\n\n${perConfig}\n\nАвто-resync по bootstrap-хвосту подтянет их в xray в течение минуты.`,
+      );
+    },
+    onError: (e: Error) => alert(`Backfill не удался: ${e.message}`),
+  });
+
   const migrate = useMutation({
     mutationFn: (node: { id: number; name: string }) =>
       api
@@ -656,6 +684,22 @@ export default function Nodes() {
                         className="text-xs px-2 py-1 rounded bg-slate-700 hover:bg-slate-600 disabled:opacity-50"
                       >
                         resync
+                      </button>
+                      <button
+                        disabled={backfillCreds.isPending}
+                        onClick={() => {
+                          if (
+                            confirm(
+                              `Backfill пропущенных кредов на ноде #${n.id} (${n.name})?\n\n` +
+                                `Для каждого enabled-протокола ноды проверим все активные девайсы и допишем недостающие Credential-строки. Починит случай, когда /sub/{token} не отдаёт второй/третий протокол ранее провижённому юзеру (обычно после добавления нового VPNConfig на уже живую ноду). Идемпотентно — повторный запуск на здоровой ноде ничего не создаст.`,
+                            )
+                          )
+                            backfillCreds.mutate({ id: n.id, name: n.name });
+                        }}
+                        className="text-xs px-2 py-1 rounded bg-amber-700 hover:bg-amber-600 disabled:opacity-50"
+                        title="Backfill Credential-строк под enabled протоколы ноды"
+                      >
+                        backfill креды
                       </button>
                       <button
                         disabled={diagnose.isPending}

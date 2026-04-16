@@ -153,6 +153,54 @@ def resync_node_clients(
     }
 
 
+@router.post("/nodes/{node_id}/backfill-missing-creds")
+def backfill_missing_creds(
+    node_id: int,
+    db: Session = Depends(get_db),
+    admin_token: str = Depends(require_admin),
+    admin_actor: str | None = Header(default=None, alias=ADMIN_ACTOR_HEADER),
+):
+    """Backfill ``Credential`` rows for every enabled config on the node.
+
+    Fixes the historical gap where adding a protocol to a node only wrote
+    credentials for subscriptions provisioned *after* the add. Iterates
+    the enabled configs and hands each to
+    ``ProvisioningOrchestrator.backfill_credentials_for_new_config`` —
+    the helper is idempotent (skips devices that already have a
+    Credential for that config_id) so re-running is safe and a no-op on
+    a healthy node. Once credentials exist, the node-level auto-resync
+    path picks them up and pushes the new protocol into the server's
+    xray config; ``/sub/{token}`` then returns the missing protocol.
+    """
+    node = db.get(models.VPNNode, node_id)
+    if not node:
+        raise HTTPException(status_code=404, detail="Node not found")
+
+    orchestrator = ProvisioningOrchestrator(db)
+    created: dict[int, int] = {}
+    total_created = 0
+    for cfg in node.configs:
+        if not cfg.is_enabled:
+            continue
+        n = orchestrator.backfill_credentials_for_new_config(node, cfg)
+        if n:
+            created[cfg.id] = n
+            total_created += n
+
+    db.commit()
+    actor, actor_type = _resolve_admin_actor(admin_actor)
+    _audit(
+        db, actor, "node_backfill_creds", "vpn_node", node.id,
+        actor_type=actor_type,
+        metadata={"created": created, "total_created": total_created},
+    )
+    return {
+        "node_id": node.id,
+        "created": created,
+        "total_created": total_created,
+    }
+
+
 @router.post("/nodes/{node_id}/bootstrap")
 def rebootstrap_node(
     node_id: int,
