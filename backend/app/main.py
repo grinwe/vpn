@@ -29,19 +29,28 @@ def _check_required_settings() -> None:
         raise RuntimeError("ADMIN_API_TOKEN environment variable is required")
 
 
-def reset_stuck_tasks() -> None:
+def reset_stuck_tasks() -> dict[str, int | bool]:
     """Recover provisioning tasks from a hard restart.
 
     Tasks that were ``running`` when the previous process died are either
     requeued (if the RQ backend is reachable) or marked ``failed``
     (best-effort fallback). Tasks that were ``pending`` but never picked up
     are re-enqueued so they eventually execute.
+
+    Returns a small summary dict so the admin reset-stuck endpoint can
+    surface what happened; the startup caller discards the value.
     """
     from .db import SessionLocal
     from . import models
     from .queue import enqueue_task, get_queue
 
     queue_available = get_queue() is not None
+    summary: dict[str, int | bool] = {
+        "queue_available": queue_available,
+        "requeued": 0,
+        "failed": 0,
+        "pending_requeued": 0,
+    }
 
     db = SessionLocal()
     try:
@@ -53,9 +62,11 @@ def reset_stuck_tasks() -> None:
                 task.status = models.ProvisioningTaskStatus.pending
                 task.error_message = "Requeued after restart"
                 enqueue_task(task.id, None)
+                summary["requeued"] += 1
             else:
                 task.status = models.ProvisioningTaskStatus.failed
                 task.error_message = "Interrupted by server restart"
+                summary["failed"] += 1
 
         if queue_available:
             pending = db.query(models.ProvisioningTask).filter(
@@ -63,10 +74,12 @@ def reset_stuck_tasks() -> None:
             ).all()
             for task in pending:
                 enqueue_task(task.id, None)
+                summary["pending_requeued"] += 1
 
         db.commit()
     finally:
         db.close()
+    return summary
 
 
 _check_required_settings()

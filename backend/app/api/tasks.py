@@ -7,6 +7,9 @@ subscription.
 """
 from __future__ import annotations
 
+import logging
+from typing import Any
+
 from fastapi import APIRouter, Depends, Header, HTTPException, Query
 from sqlalchemy import and_, or_
 from sqlalchemy.orm import Session
@@ -15,6 +18,8 @@ from .. import models, schemas
 from ..auth import require_admin
 from ..services.provisioning import ProvisioningOrchestrator
 from ._common import ADMIN_ACTOR_HEADER, _audit, _resolve_admin_actor, get_db
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
@@ -274,3 +279,129 @@ def batch_tasks(
         metadata={"ids": ids, "results": results},
     )
     return results
+
+
+@router.get("/provisioning/queue-status")
+def queue_status(
+    db: Session = Depends(get_db),
+    admin_token: str = Depends(require_admin),
+):
+    """Snapshot of the RQ backend + the 8 self-rescheduling tick jobs.
+
+    Admins use this to spot when zombie jobs accumulate — pre-F.1 a few
+    worker restarts left 50+ ``scheduled`` entries; a healthy queue
+    shows one per tick_id. ``stuck_tasks`` counts DB rows in ``running``
+    that RQ can no longer see, which is the other half of the "did a
+    worker die mid-job?" diagnosis.
+    """
+    from ..queue import QUEUE_NAME, TICK_IDS, get_queue
+
+    snapshot: dict[str, Any] = {
+        "redis_available": False,
+        "queue_name": QUEUE_NAME,
+        "queued": 0,
+        "started": 0,
+        "scheduled": 0,
+        "deferred": 0,
+        "failed": 0,
+        "finished": 0,
+        "workers": [],
+        "ticks": [],
+        "stuck_tasks": 0,
+    }
+
+    queue = get_queue()
+    if queue is None:
+        return snapshot
+    snapshot["redis_available"] = True
+
+    try:
+        from rq import Worker
+        from rq.job import Job
+        from rq.exceptions import NoSuchJobError
+        from rq.registry import (
+            DeferredJobRegistry,
+            FailedJobRegistry,
+            FinishedJobRegistry,
+            ScheduledJobRegistry,
+            StartedJobRegistry,
+        )
+
+        started = StartedJobRegistry(queue=queue)
+        try:
+            started.cleanup()
+        except Exception:  # noqa: BLE001
+            logger.debug("StartedJobRegistry.cleanup() failed", exc_info=True)
+
+        snapshot["queued"] = queue.count
+        snapshot["started"] = started.count
+        snapshot["scheduled"] = ScheduledJobRegistry(queue=queue).count
+        snapshot["deferred"] = DeferredJobRegistry(queue=queue).count
+        snapshot["failed"] = FailedJobRegistry(queue=queue).count
+        snapshot["finished"] = FinishedJobRegistry(queue=queue).count
+
+        snapshot["workers"] = [
+            {
+                "name": w.name,
+                "state": w.get_state(),
+                "current_job_id": w.get_current_job_id(),
+            }
+            for w in Worker.all(queue=queue)
+        ]
+
+        tick_rows: list[dict[str, Any]] = []
+        for func_name, tick_id in TICK_IDS.items():
+            row: dict[str, Any] = {
+                "tick_id": tick_id,
+                "func": func_name,
+                "status": None,
+                "enqueued_at": None,
+            }
+            try:
+                job = Job.fetch(tick_id, connection=queue.connection)
+                row["status"] = job.get_status(refresh=True)
+                if job.enqueued_at is not None:
+                    row["enqueued_at"] = job.enqueued_at.isoformat()
+            except NoSuchJobError:
+                row["status"] = "missing"
+            except Exception:  # noqa: BLE001
+                logger.debug("Job.fetch(%s) failed", tick_id, exc_info=True)
+                row["status"] = "error"
+            tick_rows.append(row)
+        snapshot["ticks"] = tick_rows
+    except Exception:  # noqa: BLE001
+        logger.exception("queue_status introspection failed")
+
+    stuck = (
+        db.query(models.ProvisioningTask)
+        .filter(models.ProvisioningTask.status == models.ProvisioningTaskStatus.running)
+        .count()
+    )
+    snapshot["stuck_tasks"] = stuck
+    return snapshot
+
+
+@router.post("/provisioning/queue/reset-stuck")
+def queue_reset_stuck(
+    db: Session = Depends(get_db),
+    admin_token: str = Depends(require_admin),
+    admin_actor: str | None = Header(default=None, alias=ADMIN_ACTOR_HEADER),
+):
+    """Rerun the startup "reset stuck" sweep on demand.
+
+    Same code path as ``app.main.reset_stuck_tasks`` — requeues tasks
+    left in ``running`` by a crashed worker and re-enqueues stray
+    ``pending`` rows. Exposed so ops can unblock the queue without
+    restarting the API container. Audited because batch re-enqueue
+    is a load spike on ansible.
+    """
+    from ..main import reset_stuck_tasks
+
+    summary = reset_stuck_tasks()
+    actor, actor_type = _resolve_admin_actor(admin_actor)
+    _audit(
+        db, actor, "queue_reset_stuck", "provisioning_task", None,
+        actor_type=actor_type,
+        metadata=dict(summary),
+    )
+    return summary
