@@ -788,16 +788,46 @@ def refresh_relay_link_health(
     volume для /run/secrets/provisioning_key), поэтому тут мы не
     запускаем коллектор inline — только enqueue через RQ.
 
+    Реюзаем deterministic ``tick-relay-link-health`` job_id (тот же, что
+    ставит периодический self-reschedule), чтобы серии кликов админки не
+    порождали каскад копий в очереди. Если тик уже крутится — возвращаем
+    его id без нового enqueue; если стоит в ``scheduled`` или ``queued``
+    — снимаем и кладём заново без delay, чтобы воркер подхватил прямо
+    сейчас, а не ждал следующего RELAY_LINK_HEALTH_INTERVAL.
+
     Response:
       * ``enqueued=true`` + ``job_id`` — jobs передан воркеру, смотри
         результат обновлением списка links через 10–20 секунд;
       * ``enqueued=false`` — очередь недоступна (Redis down), тогда
         индикаторы не обновятся пока не поднимется очередь.
     """
-    from ..queue import get_queue
+    from ..queue import RESULT_TTL, TICK_IDS, get_queue
+    from rq.exceptions import NoSuchJobError
+    from rq.job import Job
+    from rq.registry import StartedJobRegistry
 
     queue = get_queue()
     if queue is None:
         return {"enqueued": False, "reason": "queue unavailable"}
-    job = queue.enqueue("app.worker.run_relay_link_health_tick")
+
+    tick_id = TICK_IDS["app.worker.run_relay_link_health_tick"]
+
+    try:
+        StartedJobRegistry(queue=queue).cleanup()
+    except Exception:  # noqa: BLE001
+        pass
+
+    try:
+        existing = Job.fetch(tick_id, connection=queue.connection)
+        if existing.get_status(refresh=True) == "started":
+            return {"enqueued": True, "job_id": existing.id, "note": "already running"}
+        existing.delete()
+    except NoSuchJobError:
+        pass
+
+    job = queue.enqueue(
+        "app.worker.run_relay_link_health_tick",
+        job_id=tick_id,
+        result_ttl=RESULT_TTL,
+    )
     return {"enqueued": True, "job_id": job.id}
