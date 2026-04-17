@@ -767,3 +767,37 @@ def reconnect_relay_link(
         "relay_node_id": relay_node_id,
         "task_id": task.id,
     }
+
+
+@router.post("/exits/links/health/refresh", status_code=200)
+def refresh_relay_link_health(
+    admin_token: str = Depends(require_admin),
+):
+    """Форс-прогон relay_link_health тика прямо сейчас.
+
+    Если после деплоя колонка ``last_observed_at`` на всех линках NULL
+    («тик ещё не прошёл»), админка зовёт эту ручку вместо того, чтобы
+    ждать до 5 минут. Enqueue'ится тот же ``run_relay_link_health_tick``,
+    который воркер обычно гоняет периодически: он сам SSH'ит на все
+    relay, читает ``wg show all dump`` и апдейтит health-колонки,
+    а в конце перепланирует себя через RELAY_LINK_HEALTH_INTERVAL —
+    то есть одним нажатием восстанавливается и периодичность, если
+    бутстрап-шаг воркера почему-то не сработал при старте.
+
+    SSH-ключ смонтирован только в worker-контейнер (см. docker-compose
+    volume для /run/secrets/provisioning_key), поэтому тут мы не
+    запускаем коллектор inline — только enqueue через RQ.
+
+    Response:
+      * ``enqueued=true`` + ``job_id`` — jobs передан воркеру, смотри
+        результат обновлением списка links через 10–20 секунд;
+      * ``enqueued=false`` — очередь недоступна (Redis down), тогда
+        индикаторы не обновятся пока не поднимется очередь.
+    """
+    from ..queue import get_queue
+
+    queue = get_queue()
+    if queue is None:
+        return {"enqueued": False, "reason": "queue unavailable"}
+    job = queue.enqueue("app.worker.run_relay_link_health_tick")
+    return {"enqueued": True, "job_id": job.id}

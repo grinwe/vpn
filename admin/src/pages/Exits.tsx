@@ -413,6 +413,31 @@ function ExitLinksPanel({ exitNode }: { exitNode: WGExitNodeOut }) {
     onError: (e: Error) => alert(`Ошибка: ${e.message}`),
   });
 
+  const refreshHealthMut = useMutation({
+    mutationFn: () =>
+      api.post<{
+        enqueued: boolean;
+        job_id?: string;
+        reason?: string;
+      }>(`/exits/links/health/refresh`),
+    onSuccess: (res) => {
+      if (!res.enqueued) {
+        alert(`Не удалось запустить: ${res.reason ?? "очередь недоступна"}`);
+        return;
+      }
+      // Воркер делает SSH на каждый relay, 5–15 сек на пачку.
+      // Ждём с запасом и инвалидируем запрос — табличка перерисуется
+      // сама с обновлёнными last_handshake_at/observed_at.
+      setTimeout(() => {
+        qc.invalidateQueries({ queryKey: ["wg-exit-links", exitNode.id] });
+      }, 15_000);
+      alert(
+        `Health-тик поставлен в очередь (job ${res.job_id}). Подождём 15 сек и обновим список.`,
+      );
+    },
+    onError: (e: Error) => alert(`Ошибка: ${e.message}`),
+  });
+
   const reconnectMut = useMutation({
     mutationFn: (relayId: number) =>
       api.post<{
@@ -446,20 +471,30 @@ function ExitLinksPanel({ exitNode }: { exitNode: WGExitNodeOut }) {
     <div className="space-y-3">
       <div className="flex items-center justify-between">
         <h3 className="text-sm font-semibold text-slate-300">Attached relays</h3>
-        <button
-          disabled={!exitNode.is_active || !exitNode.wg_public_key}
-          title={
-            !exitNode.wg_public_key
-              ? "Сначала сгенерируйте ключ (keygen)"
-              : !exitNode.is_active
-                ? "Exit не активен"
-                : undefined
-          }
-          onClick={() => setShowAttach((v) => !v)}
-          className="text-xs px-3 py-1 rounded bg-green-700 hover:bg-green-600 disabled:opacity-50"
-        >
-          {showAttach ? "Отмена" : "+ Прикрепить relay"}
-        </button>
+        <div className="flex gap-2">
+          <button
+            disabled={refreshHealthMut.isPending}
+            onClick={() => refreshHealthMut.mutate()}
+            title="Форс-прогнать tick health прямо сейчас (воркер SSH'нет на каждый relay, прочитает wg show all dump и обновит индикаторы). Нужно если после деплоя колонка пустая — обычно тик сам идёт каждые 5 минут."
+            className="text-xs px-3 py-1 rounded bg-slate-700 hover:bg-slate-600 disabled:opacity-50"
+          >
+            {refreshHealthMut.isPending ? "Обновляем…" : "обновить health"}
+          </button>
+          <button
+            disabled={!exitNode.is_active || !exitNode.wg_public_key}
+            title={
+              !exitNode.wg_public_key
+                ? "Сначала сгенерируйте ключ (keygen)"
+                : !exitNode.is_active
+                  ? "Exit не активен"
+                  : undefined
+            }
+            onClick={() => setShowAttach((v) => !v)}
+            className="text-xs px-3 py-1 rounded bg-green-700 hover:bg-green-600 disabled:opacity-50"
+          >
+            {showAttach ? "Отмена" : "+ Прикрепить relay"}
+          </button>
+        </div>
       </div>
 
       {showAttach && (
