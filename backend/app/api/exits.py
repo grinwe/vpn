@@ -53,8 +53,24 @@ def _link_to_out(link: models.RelayExitLink) -> schemas.RelayExitLinkOut:
     )
 
 
+def _links_mini(links: list[models.RelayExitLink]) -> list[schemas.ExitLinkHealthMini]:
+    return [
+        schemas.ExitLinkHealthMini(
+            relay_node_id=link.relay_node_id,
+            relay_node_name=link.relay_node.name if link.relay_node else "",
+            wg_interface_name=link.wg_interface_name,
+            last_handshake_at=link.last_handshake_at,
+            last_observed_at=link.last_observed_at,
+        )
+        for link in links
+    ]
+
+
 def _to_out(
-    exit_node: models.WGExitNode, *, peers_count: int = 0
+    exit_node: models.WGExitNode,
+    *,
+    peers_count: int = 0,
+    links: list[models.RelayExitLink] | None = None,
 ) -> schemas.WGExitNodeOut:
     return schemas.WGExitNodeOut(
         id=exit_node.id,
@@ -73,6 +89,7 @@ def _to_out(
         is_active=exit_node.is_active,
         notes=exit_node.notes,
         peers_count=peers_count,
+        links=_links_mini(links or []),
         created_at=exit_node.created_at,
         updated_at=exit_node.updated_at,
     )
@@ -92,15 +109,24 @@ def list_exits(
     admin_token: str = Depends(require_admin),
 ):
     rows = db.query(models.WGExitNode).order_by(models.WGExitNode.id).all()
-    counts: dict[int, int] = dict(
-        db.query(
-            models.RelayExitLink.exit_id,
-            func.count(models.RelayExitLink.id),
-        )
-        .group_by(models.RelayExitLink.exit_id)
+    # Один запрос на все линки — группируем в питоне по exit_id. Дешевле
+    # чем per-row select + даёт peers_count "бесплатно" (len группы).
+    all_links = (
+        db.query(models.RelayExitLink)
+        .join(models.VPNNode, models.VPNNode.id == models.RelayExitLink.relay_node_id)
         .all()
     )
-    return [_to_out(r, peers_count=counts.get(r.id, 0)) for r in rows]
+    links_by_exit: dict[int, list[models.RelayExitLink]] = {}
+    for link in all_links:
+        links_by_exit.setdefault(link.exit_id, []).append(link)
+    return [
+        _to_out(
+            r,
+            peers_count=len(links_by_exit.get(r.id, [])),
+            links=links_by_exit.get(r.id, []),
+        )
+        for r in rows
+    ]
 
 
 @router.post("/exits", response_model=schemas.WGExitNodeOut)

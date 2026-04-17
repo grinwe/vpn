@@ -19,6 +19,7 @@ interface WGExitNodeOut {
   is_active: boolean;
   notes: string | null;
   peers_count: number;
+  links: ExitLinkHealthMini[];
   created_at: string;
   updated_at: string;
 }
@@ -60,7 +61,18 @@ interface RelayExitLinkOut {
   last_observed_at: string | null;
 }
 
-function linkHealth(l: RelayExitLinkOut): {
+interface ExitLinkHealthMini {
+  relay_node_id: number;
+  relay_node_name: string;
+  wg_interface_name: string;
+  last_handshake_at: string | null;
+  last_observed_at: string | null;
+}
+
+function linkHealth(l: {
+  last_handshake_at: string | null;
+  last_observed_at: string | null;
+}): {
   color: string;
   label: string;
   title: string;
@@ -114,6 +126,29 @@ function linkHealth(l: RelayExitLinkOut): {
     label: `${Math.round(handshakeAgeMin)}m`,
     title: `Последний handshake ${Math.round(handshakeAgeMin)} минут назад — скорее всего порвался`,
   };
+}
+
+function HealthDots({ links }: { links: ExitLinkHealthMini[] }) {
+  // Ряд цветных точек — по одной на relay→exit линк. Цвет берём той же
+  // linkHealth(), что и в раскрытой панели, так пороги живут в одном
+  // месте. Пустой массив → серый дефис (линков нет).
+  if (links.length === 0) {
+    return <span className="text-slate-600 text-xs">—</span>;
+  }
+  return (
+    <div className="flex gap-1 items-center">
+      {links.map((l) => {
+        const h = linkHealth(l);
+        return (
+          <span
+            key={`${l.relay_node_id}-${l.wg_interface_name}`}
+            className={`inline-block w-2.5 h-2.5 rounded-full ${h.color}`}
+            title={`${l.relay_node_name} · ${l.wg_interface_name}: ${h.label} — ${h.title}`}
+          />
+        );
+      })}
+    </div>
+  );
 }
 
 function fmtBytes(n: number | null): string {
@@ -181,6 +216,31 @@ export default function Exits() {
     onError: (e: Error) => alert(`Не удалось запустить диагностику: ${e.message}`),
   });
 
+  // Глобальный форс relay_link_health тика: один вызов, воркер обходит
+  // все relay и обновляет health-колонки сразу у всех линков. Реюзает
+  // tick-relay-link-health id на сервере, так что повторные клики не
+  // плодят копии — см. api/exits.py:refresh_relay_link_health.
+  const refreshAllHealthMut = useMutation({
+    mutationFn: () =>
+      api.post<{
+        enqueued: boolean;
+        job_id?: string;
+        reason?: string;
+        note?: string;
+      }>(`/exits/links/health/refresh`),
+    onSuccess: (res) => {
+      if (!res.enqueued) {
+        alert(`Не удалось запустить: ${res.reason ?? "очередь недоступна"}`);
+        return;
+      }
+      setTimeout(() => {
+        qc.invalidateQueries({ queryKey: ["wg-exits"] });
+        qc.invalidateQueries({ queryKey: ["wg-exit-links"] });
+      }, 15_000);
+    },
+    onError: (e: Error) => alert(`Ошибка: ${e.message}`),
+  });
+
   const toggleExpanded = (id: number) => {
     setExpanded((prev) => {
       const next = new Set(prev);
@@ -200,12 +260,22 @@ export default function Exits() {
     <div>
       <div className="flex items-center justify-between mb-4">
         <h1 className="text-xl font-bold">WG Exit Nodes</h1>
-        <button
-          onClick={() => { setShowForm(true); setEditId(null); }}
-          className="text-sm px-3 py-1 rounded bg-green-700 hover:bg-green-600"
-        >
-          + Добавить
-        </button>
+        <div className="flex gap-2">
+          <button
+            disabled={refreshAllHealthMut.isPending}
+            onClick={() => refreshAllHealthMut.mutate()}
+            title="Форс-прогнать relay_link_health тик — воркер SSH'нет на все relay сразу, обновит индикаторы через 10–20 сек"
+            className="text-sm px-3 py-1 rounded bg-slate-700 hover:bg-slate-600 disabled:opacity-50"
+          >
+            {refreshAllHealthMut.isPending ? "Обновляем…" : "↻ health всех"}
+          </button>
+          <button
+            onClick={() => { setShowForm(true); setEditId(null); }}
+            className="text-sm px-3 py-1 rounded bg-green-700 hover:bg-green-600"
+          >
+            + Добавить
+          </button>
+        </div>
       </div>
 
       <p className="text-xs text-slate-400 mb-4">
@@ -225,21 +295,22 @@ export default function Exits() {
       )}
 
       {data && (
-        <table className="w-full text-sm">
+        <table className="w-full text-sm table-fixed">
           <thead className="text-slate-400 border-b border-slate-700">
             <tr>
               <th className="w-6"></th>
-              <th className="text-left py-2 px-2">ID</th>
-              <th className="text-left py-2 px-2">Name</th>
-              <th className="text-left py-2 px-2">Region</th>
-              <th className="text-left py-2 px-2">Host</th>
-              <th className="text-left py-2 px-2">WG port</th>
-              <th className="text-left py-2 px-2">WG addr</th>
-              <th className="text-left py-2 px-2">Public key</th>
-              <th className="text-left py-2 px-2">Provider</th>
-              <th className="text-left py-2 px-2">Peers</th>
-              <th className="text-left py-2 px-2">Status</th>
-              <th className="text-left py-2 px-2">Active</th>
+              <th className="text-left py-2 px-2 w-10">ID</th>
+              <th className="text-left py-2 px-2 w-32">Name</th>
+              <th className="text-left py-2 px-2 w-20">Region</th>
+              <th className="text-left py-2 px-2 w-40">Host</th>
+              <th className="text-left py-2 px-2 w-14">WG port</th>
+              <th className="text-left py-2 px-2 w-28">WG addr</th>
+              <th className="text-left py-2 px-2 w-32">Public key</th>
+              <th className="text-left py-2 px-2 w-28">Provider</th>
+              <th className="text-left py-2 px-2 w-12">Peers</th>
+              <th className="text-left py-2 px-2 w-24">Health</th>
+              <th className="text-left py-2 px-2 w-20">Status</th>
+              <th className="text-left py-2 px-2 w-12">Active</th>
               <th className="text-left py-2 px-2">Actions</th>
             </tr>
           </thead>
@@ -254,12 +325,12 @@ export default function Exits() {
                   >
                     <td className="px-2 text-slate-500">{isOpen ? "▼" : "▶"}</td>
                     <td className="py-2 px-2">{e.id}</td>
-                    <td className="py-2 px-2 font-mono">{e.name}</td>
-                    <td className="py-2 px-2">{e.region}</td>
-                    <td className="py-2 px-2 font-mono text-slate-300">{e.host}</td>
+                    <td className="py-2 px-2 font-mono truncate" title={e.name}>{e.name}</td>
+                    <td className="py-2 px-2 truncate" title={e.region}>{e.region}</td>
+                    <td className="py-2 px-2 font-mono text-slate-300 truncate" title={e.host}>{e.host}</td>
                     <td className="py-2 px-2">{e.wg_port}</td>
-                    <td className="py-2 px-2 font-mono text-slate-400">{e.wg_address_v4}</td>
-                    <td className="py-2 px-2 font-mono text-xs">
+                    <td className="py-2 px-2 font-mono text-slate-400 truncate" title={e.wg_address_v4}>{e.wg_address_v4}</td>
+                    <td className="py-2 px-2 font-mono text-xs truncate">
                       {e.wg_public_key ? (
                         <span title={e.wg_public_key}>{e.wg_public_key.slice(0, 12)}…</span>
                       ) : (
@@ -269,8 +340,11 @@ export default function Exits() {
                         <span className="ml-2 text-yellow-500" title="private key missing">⚠</span>
                       )}
                     </td>
-                    <td className="py-2 px-2 text-slate-400">{providerLabel(e.provider_id)}</td>
+                    <td className="py-2 px-2 text-slate-400 truncate" title={providerLabel(e.provider_id)}>{providerLabel(e.provider_id)}</td>
                     <td className="py-2 px-2">{e.peers_count}</td>
+                    <td className="py-2 px-2" onClick={(ev) => ev.stopPropagation()}>
+                      <HealthDots links={e.links} />
+                    </td>
                     <td className="py-2 px-2">{e.status}</td>
                     <td className="py-2 px-2">{e.is_active ? "✓" : "✕"}</td>
                     <td className="py-2 px-2" onClick={(ev) => ev.stopPropagation()}>
@@ -338,7 +412,7 @@ export default function Exits() {
                   </tr>
                   {isOpen && (
                     <tr className="bg-slate-900/50">
-                      <td colSpan={13} className="p-4">
+                      <td colSpan={14} className="p-4">
                         <ExitLinksPanel exitNode={e} />
                       </td>
                     </tr>

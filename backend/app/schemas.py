@@ -783,6 +783,22 @@ class WGExitNodePatch(BaseModel):
     notes: str | None = None
 
 
+class ExitLinkHealthMini(BaseModel):
+    """Компактный срез health-данных одного relay→exit линка.
+
+    Встраивается в ``WGExitNodeOut.links``, чтобы таблица Exits могла
+    отрисовать ряд цветных кружочков без отдельных запросов на
+    ``/exits/{id}/links`` по каждой ноде. Цвета считаются на клиенте
+    той же ``linkHealth()`` функцией, что и в раскрытой панели, — так
+    порог ``15m/3m`` живёт в одном месте.
+    """
+    relay_node_id: int
+    relay_node_name: str
+    wg_interface_name: str
+    last_handshake_at: UTCDateTime | None = None
+    last_observed_at: UTCDateTime | None = None
+
+
 class WGExitNodeOut(BaseModel):
     id: int
     name: str
@@ -800,6 +816,7 @@ class WGExitNodeOut(BaseModel):
     is_active: bool
     notes: str | None
     peers_count: int = 0
+    links: list[ExitLinkHealthMini] = []
     created_at: datetime
     updated_at: datetime
 
