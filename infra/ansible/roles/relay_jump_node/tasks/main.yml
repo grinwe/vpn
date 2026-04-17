@@ -1,40 +1,38 @@
 ---
 # relay_jump_node
 #
-# Two-mode WireGuard client role for RU VPN nodes.
+# Multi-tunnel WireGuard client role for RU VPN relay nodes.
 #
-# Mode "enable" (relay_wg_private_key defined and non-empty):
+# Mode "enable" (relay_wg_links non-empty):
 #   - Install wireguard package.
-#   - Render /etc/wireguard/wg0.conf from the provided vars.
-#   - Start + enable wg-quick@wg0.
-#   - Patch every /usr/local/etc/xray/config*.json freedom outbound
-#     with sockopt.interface: wg0, so user traffic exits the tunnel
-#     while SSH/Ansible stays on the main interface.
+#   - For each entry in relay_wg_links render
+#     /etc/wireguard/{{item.interface}}.conf + start wg-quick@{{item.interface}}.
+#   - Reconcile drift: remove any /etc/wireguard/wg*.conf not in the list.
+#   - Test connectivity per interface.
+#   - Xray sockopt patching happens only when exactly one link is
+#     active (legacy 1:1 case). Multi-link xray config is the job of
+#     G.6 — leave the config alone so the upcoming role can rewrite
+#     outbounds + routing without fighting with a stale sockopt.
 #
-# Mode "disable" (relay_wg_private_key absent or empty):
-#   - Stop + disable wg-quick@wg0 if /etc/wireguard/wg0.conf exists.
-#   - Remove the config file.
-#   - Unpatch Xray configs: strip streamSettings.sockopt from the
-#     freedom outbound, but only when it's actually set (so a direct
-#     node that never had relay config is a pure no-op).
+# Mode "disable" (relay_wg_links empty or missing):
+#   - Stop + disable every wg-quick@wgN whose config exists.
+#   - Remove /etc/wireguard/wg*.conf.
+#   - Unpatch Xray: strip streamSettings.sockopt from the freedom
+#     outbound if present.
 #
 # The role runs unconditionally from site.yml; gating happens here.
-# This lets a node transition relay → direct in one ansible run by
-# simply clearing ``VPNNode.relay_config`` (stage D.1 of the relay
-# roadmap — RELAY_ROADMAP.md).
+# Nodes with no relay_exit_links sit in the disable branch (pure no-op
+# on direct nodes that never had a tunnel). See RELAY_ROADMAP.md G.5.
 
-- name: Determine relay mode from input variables
+- name: Determine relay mode from relay_wg_links
   set_fact:
     relay_enabled: >-
-      {{
-        (relay_wg_private_key | default('')) | length > 0
-        and (relay_wg_address_v4 | default('')) | length > 0
-        and (relay_wg_endpoint | default('')) | length > 0
-        and (relay_wg_exit_public_key | default('')) | length > 0
-      }}
+      {{ (relay_wg_links | default([])) | length > 0 }}
+    relay_wanted_ifaces: >-
+      {{ (relay_wg_links | default([])) | map(attribute='interface') | list }}
 
 # ── ENABLE branch ────────────────────────────────────────────────
-- name: Relay enable — set up WG client + patch Xray
+- name: Relay enable — set up WG clients + patch Xray
   when: relay_enabled | bool
   block:
     - name: Install WireGuard
@@ -43,46 +41,105 @@
         state: present
         update_cache: yes
 
-    - name: Render WireGuard client config
+    - name: Render WireGuard client config per link
       template:
-        src: wg0-client.conf.j2
-        dest: /etc/wireguard/wg0.conf
+        src: wg-client.conf.j2
+        dest: "/etc/wireguard/{{ item.interface }}.conf"
         owner: root
         group: root
         mode: '0600'
-      notify: restart wg0 client
+      loop: "{{ relay_wg_links }}"
+      loop_control:
+        label: "{{ item.interface }}"
+      register: relay_config_render
 
-    - name: Enable and start WireGuard client
+    - name: Restart wg-quick services whose config changed
       systemd:
-        name: wg-quick@wg0
+        name: "wg-quick@{{ item.item.interface }}"
+        state: restarted
+        daemon_reload: yes
+      loop: "{{ relay_config_render.results }}"
+      loop_control:
+        label: "{{ item.item.interface }}"
+      when: item.changed
+
+    - name: Enable and start WireGuard client per link
+      systemd:
+        name: "wg-quick@{{ item.interface }}"
         enabled: yes
         state: started
+      loop: "{{ relay_wg_links }}"
+      loop_control:
+        label: "{{ item.interface }}"
 
     # Retry with backoff — after the exit peer list was (re)applied
-    # earlier in the same relay_tunnel run, wg needs a few seconds to
-    # handshake. If still down after ~30s, fail the play loudly so a
-    # broken tunnel cannot masquerade as a successful bootstrap (which
-    # is what the previous failed_when:false variant allowed — the
-    # admin saw green, but client traffic silently timed out).
-    - name: Test tunnel connectivity
-      command: curl -s --interface wg0 --connect-timeout 5 https://ifconfig.me
+    # earlier in the same relay_tunnel run, wg needs a few seconds
+    # per link to handshake. If still down after ~30s, fail the play
+    # loudly so a broken tunnel cannot masquerade as a successful
+    # bootstrap.
+    - name: Test tunnel connectivity per link
+      command: curl -s --interface {{ item.interface }} --connect-timeout 5 https://ifconfig.me
+      loop: "{{ relay_wg_links }}"
+      loop_control:
+        label: "{{ item.interface }}"
       register: tunnel_test
       changed_when: false
       retries: 6
       delay: 5
       until: tunnel_test.rc == 0
 
-    - name: Report tunnel status
+    - name: Report tunnel status per link
       debug:
-        msg: "WireGuard tunnel UP — exit IP: {{ tunnel_test.stdout }}"
+        msg: "WG {{ item.item.interface }} UP — exit IP: {{ item.stdout }}"
+      loop: "{{ tunnel_test.results }}"
+      loop_control:
+        label: "{{ item.item.interface }}"
 
+    # ── Drift reconciliation ──
+    # A relay may have had wg0+wg1, then wg1 got detached. The DB no
+    # longer lists wg1 in relay_wg_links, but the config file + systemd
+    # unit are still there. Enumerate existing configs and kill any
+    # that aren't wanted.
+    - name: Enumerate existing WG configs
+      find:
+        paths: /etc/wireguard
+        patterns: "wg*.conf"
+      register: existing_wg_configs
+
+    - name: Stop and disable stale wg-quick units
+      systemd:
+        name: "wg-quick@{{ (item.path | basename | splitext)[0] }}"
+        state: stopped
+        enabled: no
+      failed_when: false
+      loop: "{{ existing_wg_configs.files }}"
+      loop_control:
+        label: "{{ (item.path | basename | splitext)[0] }}"
+      when: (item.path | basename | splitext)[0] not in relay_wanted_ifaces
+
+    - name: Remove stale WG config files
+      file:
+        path: "{{ item.path }}"
+        state: absent
+      loop: "{{ existing_wg_configs.files }}"
+      loop_control:
+        label: "{{ item.path | basename }}"
+      when: (item.path | basename | splitext)[0] not in relay_wanted_ifaces
+
+    # ── Xray sockopt (single-link only for now) ──
+    # Single-link relays keep the 1:1 shortcut: patch the freedom
+    # outbound sockopt.interface to the only wgN in the list so
+    # existing xray configs (which still have one outbound) route
+    # through it. Multi-link mode needs a different xray config
+    # layout (N outbounds + routing rules), handled by G.6.
     - name: Find existing xray configs
       find:
         paths: /usr/local/etc/xray
         patterns: "config*.json"
       register: xray_configs_enable
+      when: (relay_wg_links | length) == 1
 
-    - name: Patch Xray freedom outbound with sockopt.interface wg0
+    - name: Patch Xray freedom outbound with sockopt.interface wgN
       shell: |
         set -euo pipefail
         CONFIG="{{ item.path }}"
@@ -90,7 +147,7 @@
           (.outbounds[]? | select(.tag == "direct" and .protocol == "freedom"))
             | .streamSettings.sockopt.interface // ""
         ' "${CONFIG}")
-        if [ "${EXISTING}" = "wg0" ]; then
+        if [ "${EXISTING}" = "{{ relay_wg_links[0].interface }}" ]; then
           # Already patched — no change.
           exit 78
         fi
@@ -99,7 +156,7 @@
         # jq syntax error because |= cannot be chained into another =.
         jq '
           (.outbounds[] | select(.tag == "direct" and .protocol == "freedom")).streamSettings.sockopt = {
-            "interface": "wg0",
+            "interface": "{{ relay_wg_links[0].interface }}",
             "tcpKeepAliveInterval": 30
           }
         ' "${CONFIG}" > "${TMP}"
@@ -109,11 +166,19 @@
         chmod 0640 "${CONFIG}"
       args:
         executable: /bin/bash
-      loop: "{{ xray_configs_enable.files }}"
+      loop: "{{ xray_configs_enable.files | default([]) }}"
       register: patch_result
       changed_when: patch_result.rc == 0
       failed_when: patch_result.rc not in [0, 78]
+      when: (relay_wg_links | length) == 1
       notify: restart all xray services
+
+    - name: Note multi-link xray config is deferred to G.6
+      debug:
+        msg: >-
+          Relay has {{ relay_wg_links | length }} WG links — xray sockopt
+          patching skipped. G.6 will rewrite outbounds + routing rules.
+      when: (relay_wg_links | length) > 1
 
     - name: Find hysteria2 config
       stat:
@@ -121,7 +186,7 @@
       register: hy2_config
 
     # Hysteria2 is UDP and typically not blocked — it keeps exiting
-    # directly. Moving it onto the tunnel would need policy routing.
+    # directly. Moving it onto a tunnel would need policy routing.
     - name: Note about Hysteria2 on relay nodes
       debug:
         msg: >-
@@ -129,26 +194,32 @@
       when: hy2_config.stat.exists
 
 # ── DISABLE branch ───────────────────────────────────────────────
-- name: Relay disable — tear down WG client + unpatch Xray
+- name: Relay disable — tear every tunnel down + unpatch Xray
   when: not (relay_enabled | bool)
   block:
-    - name: Check if wg0 config exists
-      stat:
-        path: /etc/wireguard/wg0.conf
-      register: wg0_conf_stat
+    - name: Enumerate WG configs for teardown
+      find:
+        paths: /etc/wireguard
+        patterns: "wg*.conf"
+      register: wg_configs_teardown
 
-    - name: Stop and disable wg-quick@wg0
+    - name: Stop and disable each wg-quick unit
       systemd:
-        name: wg-quick@wg0
+        name: "wg-quick@{{ (item.path | basename | splitext)[0] }}"
         state: stopped
         enabled: no
       failed_when: false
-      when: wg0_conf_stat.stat.exists
+      loop: "{{ wg_configs_teardown.files }}"
+      loop_control:
+        label: "{{ (item.path | basename | splitext)[0] }}"
 
-    - name: Remove wg0 client config
+    - name: Remove wg client configs
       file:
-        path: /etc/wireguard/wg0.conf
+        path: "{{ item.path }}"
         state: absent
+      loop: "{{ wg_configs_teardown.files }}"
+      loop_control:
+        label: "{{ item.path | basename }}"
 
     - name: Find existing xray configs (disable mode)
       find:

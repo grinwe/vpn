@@ -1,9 +1,7 @@
 ---
-- name: restart wg0 client
-  systemd:
-    name: wg-quick@wg0
-    state: restarted
-
+# restart-on-change for WG interfaces is now done inline in tasks/main.yml
+# (per-link, driven by register.changed). We only keep the xray handler
+# since multiple tasks in the role can all notify one restart per run.
 - name: restart all xray services
   shell: |
     for svc in xray xray-ws-cdn xray-xhttp; do

@@ -16,12 +16,13 @@ from sqlalchemy.orm import Session
 
 from .. import models, schemas
 from ..auth import require_admin
-from ..security import encrypt as _encrypt
+from ..security import decrypt, encrypt as _encrypt
 from ..services.provisioning import ProvisioningOrchestrator
 from ..services.relay import (
     RelayAllocationError,
     allocate_client_address,
     build_relay_config,
+    next_wg_interface_name,
     validate_requested_address,
 )
 from ..services.vless import generate_wireguard_keypair
@@ -346,13 +347,17 @@ def attach_relay(
     admin_token: str = Depends(require_admin),
     admin_actor: str | None = Header(default=None, alias=ADMIN_ACTOR_HEADER),
 ):
-    """Attach a relay VPN node to this exit.
+    """Attach a relay VPN node to this exit (G.5: multi-exit per relay).
 
     Generates a fresh WG client keypair, allocates a free /32 in the
-    exit's subnet, writes the link row, and populates the relay node's
-    ``relay_config`` in a single transaction, then schedules a
-    ``relay_tunnel`` task on the worker that re-renders the exit's peer
-    list and brings wg0 up on the relay (stage E).
+    exit's subnet, allocates the next free ``wgN`` kernel interface
+    name for this relay, and writes the link row — all in one
+    transaction. The legacy ``relay_config`` JSONB is kept in sync as
+    a "relay mode" flag (first link's snapshot) so UI badges still
+    work; extra_vars for ansible are now sourced from
+    ``relay_exit_links`` directly. Then schedules a ``relay_tunnel``
+    task on the worker that re-renders the exit's peer list and
+    brings wg-quick@wgN up on the relay.
     """
     exit_node = db.get(models.WGExitNode, exit_id)
     if not exit_node:
@@ -364,17 +369,25 @@ def attach_relay(
     if not relay:
         raise HTTPException(status_code=404, detail="Relay node not found")
 
-    existing = (
+    # Idempotency guard — a (relay, exit) pair is still unique, so a
+    # double-attach to the same exit returns 409 instead of producing
+    # two interfaces that tunnel to the same peer. The previous guard
+    # (relay attached to *any* exit) was removed in G.5 to allow
+    # multi-exit.
+    dup = (
         db.query(models.RelayExitLink)
-        .filter(models.RelayExitLink.relay_node_id == relay.id)
+        .filter(
+            models.RelayExitLink.relay_node_id == relay.id,
+            models.RelayExitLink.exit_id == exit_node.id,
+        )
         .first()
     )
-    if existing:
+    if dup:
         raise HTTPException(
             status_code=409,
             detail=(
                 f"Relay {relay.name} is already attached to exit "
-                f"{existing.exit_id}; detach first"
+                f"{exit_node.name} on interface {dup.wg_interface_name}"
             ),
         )
 
@@ -385,6 +398,7 @@ def attach_relay(
             )
         else:
             client_address = allocate_client_address(db, exit_node)
+        iface_name = next_wg_interface_name(db, relay.id)
         pub, priv = generate_wireguard_keypair()
         relay_config = build_relay_config(
             exit_node=exit_node,
@@ -397,11 +411,16 @@ def attach_relay(
     link = models.RelayExitLink(
         relay_node_id=relay.id,
         exit_id=exit_node.id,
+        wg_interface_name=iface_name,
         wg_client_private_key_enc=_encrypt(priv),
         wg_client_public_key=pub,
         wg_client_address_v4=client_address,
     )
     db.add(link)
+    # Keep relay_config populated — it's still the "is this a relay?"
+    # flag for the admin schema (``has_relay_config``). Ansible no
+    # longer reads it; the multi-link case wins last-writer here,
+    # which is fine because the field is only used as a boolean.
     relay.relay_config = relay_config
     db.commit()
     db.refresh(link)
@@ -438,14 +457,18 @@ def detach_relay(
     admin_token: str = Depends(require_admin),
     admin_actor: str | None = Header(default=None, alias=ADMIN_ACTOR_HEADER),
 ):
-    """Detach a relay from this exit.
+    """Detach a relay from this exit (G.5: multi-exit aware).
 
-    Drops the link row and clears the relay's ``relay_config``, then
-    schedules a ``relay_tunnel`` teardown task (re-renders the exit's
-    peer list without this client via ``bootstrap_exit.yml`` +
-    ``wg syncconf``, and brings wg0 down + un-patches Xray on the relay
-    via ``relay_tunnel_apply.yml`` — the ``relay_jump_node`` role reads
-    the empty ``relay_wg_*`` vars and takes the teardown branch).
+    Drops the single matching link row. If the relay has other
+    remaining links, ``relay_config`` is re-snapshotted from one of
+    them so the admin schema still flags this node as a relay; if
+    this was the last link, ``relay_config`` is cleared. Either way
+    a ``relay_tunnel`` task is scheduled — ansible re-renders the
+    exit's peer list without this client (``bootstrap_exit.yml`` +
+    ``wg syncconf``) and re-applies the relay's WG tunnel set from
+    ``relay_wg_links``: the removed ``wgN`` gets torn down by the
+    drift-reconciliation step in the ``relay_jump_node`` role, any
+    remaining ``wgN`` stays up.
 
     Returns ``task_id`` so the admin UI can surface progress in
     /tasks. It is ``None`` only if the relay row was already gone
@@ -464,10 +487,31 @@ def detach_relay(
 
     link_id = link.id
     relay = db.get(models.VPNNode, relay_node_id)
-    if relay:
-        relay.relay_config = None
-
     db.delete(link)
+    db.flush()
+    if relay:
+        # G.5 — ``relay_config`` is now just the "is this a relay?"
+        # signal for the admin schema. Clear it only when the last
+        # link is gone; otherwise keep any remaining link's data as
+        # the snapshot so ``has_relay_config`` still reports True.
+        remaining = (
+            db.query(models.RelayExitLink)
+            .filter(models.RelayExitLink.relay_node_id == relay.id)
+            .order_by(models.RelayExitLink.id)
+            .first()
+        )
+        if remaining is None:
+            relay.relay_config = None
+        else:
+            remaining_exit = db.get(models.WGExitNode, remaining.exit_id)
+            if remaining_exit is not None:
+                relay.relay_config = build_relay_config(
+                    exit_node=remaining_exit,
+                    client_private_key=decrypt(
+                        remaining.wg_client_private_key_enc
+                    ),
+                    client_address_v4=remaining.wg_client_address_v4,
+                )
     db.commit()
     actor, actor_type = _resolve_admin_actor(admin_actor)
     _audit(

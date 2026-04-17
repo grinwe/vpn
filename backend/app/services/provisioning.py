@@ -360,7 +360,9 @@ def _validate_extra_vars(extra: dict[str, Any], *, node_hint: str) -> None:
                 )
 
 
-def _collect_site_extra_vars(node: models.VPNNode) -> dict[str, Any]:
+def _collect_site_extra_vars(
+    db: Session, node: models.VPNNode
+) -> dict[str, Any]:
     """Build extra_vars for a node-level site.yml run.
 
     Inspects all enabled VPNConfig rows on the node and surfaces the
@@ -451,24 +453,16 @@ def _collect_site_extra_vars(node: models.VPNNode) -> dict[str, Any]:
     if health_ports:
         extra["vpn_health_ports"] = sorted(set(health_ports))
 
-    # ── Relay (jump node → WG tunnel → exit) ──
-    rc = node.relay_config
-    if rc:
-        # Stage C: the key is stored encrypted under ``wg_private_key_enc``.
-        # Legacy rows used plaintext ``wg_private_key`` — keep reading both
-        # so existing data (if any) still works during the transition.
-        priv_enc = rc.get("wg_private_key_enc")
-        priv_plain = rc.get("wg_private_key")
-        if priv_enc:
-            priv = decrypt(priv_enc) or ""
-        else:
-            priv = priv_plain or ""
-        extra.update({
-            "relay_wg_private_key": priv,
-            "relay_wg_address_v4": rc.get("wg_address_v4", ""),
-            "relay_wg_endpoint": rc.get("wg_endpoint", ""),
-            "relay_wg_exit_public_key": rc.get("wg_exit_public_key", ""),
-        })
+    # ── Relay (jump node → per-link WG tunnel → exit) ──
+    # G.5: source of truth is ``relay_exit_links``. One wg-quick@wgN
+    # interface per link; the role loops over this list.
+    relay_links = _build_relay_wg_links(db, node)
+    if relay_links:
+        # Validate string fields defensively (endpoint carries admin-
+        # controlled host, decrypted keys come from our own security
+        # module but still string-typed). Same rules as top-level keys.
+        _validate_relay_link_strings(relay_links, node_hint=f"{node.id}/{node.name}")
+        extra["relay_wg_links"] = relay_links
 
     # #56 — last-line defence before this dict gets serialised to
     # --extra-vars. Catches admin-controlled values from VPNConfig.settings
@@ -541,30 +535,85 @@ def _collect_exit_extra_vars(
     return extra
 
 
+def _build_relay_wg_links(
+    db: Session, relay: models.VPNNode
+) -> list[dict[str, Any]]:
+    """Build the ``relay_wg_links`` list from ``RelayExitLink`` rows.
+
+    Each entry carries everything the ``relay_jump_node`` role needs
+    to render one ``wg-quick@wgN`` unit:
+
+      * ``interface``       — kernel interface name (``wg0``, ``wg1``…)
+      * ``private_key``     — plaintext WG private key (from Fernet)
+      * ``address_v4``      — CIDR of the client endpoint (``.../32``)
+      * ``endpoint``        — ``host:port`` of the matching exit
+      * ``exit_public_key`` — exit's server public key
+
+    Links whose exit is missing a ``wg_public_key`` are skipped
+    (defensive — attach_relay refuses to create one without keygen
+    first, but an orphaned row shouldn't sink the whole play).
+    Empty list means "this node has no active tunnels" and puts the
+    role into its teardown branch.
+    """
+    links = (
+        db.query(models.RelayExitLink)
+        .filter(models.RelayExitLink.relay_node_id == relay.id)
+        .order_by(models.RelayExitLink.wg_interface_name)
+        .all()
+    )
+    out: list[dict[str, Any]] = []
+    for link in links:
+        exit_node = link.exit_node
+        if exit_node is None or not exit_node.wg_public_key:
+            logger.warning(
+                "relay %s link id=%s has no valid exit — skipping",
+                relay.name, link.id,
+            )
+            continue
+        out.append({
+            "interface": link.wg_interface_name,
+            "private_key": decrypt(link.wg_client_private_key_enc) or "",
+            "address_v4": link.wg_client_address_v4,
+            "endpoint": f"{exit_node.host}:{exit_node.wg_port}",
+            "exit_public_key": exit_node.wg_public_key,
+        })
+    return out
+
+
+def _validate_relay_link_strings(
+    links: list[dict[str, Any]], *, node_hint: str
+) -> None:
+    """Run ``_validate_extra_vars`` over every stringy field in each link.
+
+    The validator itself only walks top-level keys, so nested dicts in
+    a list wouldn't be scanned. Flatten into ``relay_link_{i}_{field}``
+    keys so any Jinja2/newline/NUL slip is caught before ansible sees
+    the list.
+    """
+    flat: dict[str, Any] = {
+        f"relay_link_{i}_{k}": v
+        for i, link in enumerate(links)
+        for k, v in link.items()
+        if isinstance(v, str)
+    }
+    if flat:
+        _validate_extra_vars(flat, node_hint=f"relay/{node_hint}")
+
+
 def _collect_relay_tunnel_extra_vars(
-    relay: models.VPNNode,
+    db: Session, relay: models.VPNNode
 ) -> dict[str, Any]:
     """Extra_vars for ``relay_tunnel_apply.yml`` on a relay jump node.
 
-    The ``relay_jump_node`` role is two-mode: with all four ``relay_wg_*``
-    vars set it brings wg0 up and patches Xray outbound sockopt; with
-    any of them missing it tears the tunnel down. Detach flows hit the
-    second branch by calling us on a relay whose ``relay_config`` was
-    already cleared.
+    The ``relay_jump_node`` role reads ``relay_wg_links`` (a list built
+    from ``RelayExitLink`` rows): with one or more entries it brings
+    each ``wg-quick@wgN`` up; with an empty list it tears every tunnel
+    down. Detach flows hit the empty branch simply by having no links
+    left for the relay.
     """
-    rc = relay.relay_config or {}
-    priv_enc = rc.get("wg_private_key_enc")
-    priv_plain = rc.get("wg_private_key")
-    if priv_enc:
-        priv = decrypt(priv_enc) or ""
-    else:
-        priv = priv_plain or ""
-    extra: dict[str, Any] = {
-        "relay_wg_private_key": priv,
-        "relay_wg_address_v4": rc.get("wg_address_v4", ""),
-        "relay_wg_endpoint": rc.get("wg_endpoint", ""),
-        "relay_wg_exit_public_key": rc.get("wg_exit_public_key", ""),
-    }
+    links = _build_relay_wg_links(db, relay)
+    _validate_relay_link_strings(links, node_hint=f"{relay.id}/{relay.name}")
+    extra: dict[str, Any] = {"relay_wg_links": links}
     _validate_extra_vars(extra, node_hint=f"relay/{relay.id}/{relay.name}")
     return extra
 
@@ -985,7 +1034,7 @@ class ProvisioningOrchestrator:
                         extra_vars=payload,
                     )
                 else:
-                    site_vars = _collect_site_extra_vars(node)
+                    site_vars = _collect_site_extra_vars(self.db, node)
                     result = run_playbook(
                         "site.yml", inventory, limit=node.name, extra_vars=site_vars,
                     )
@@ -1066,7 +1115,7 @@ class ProvisioningOrchestrator:
                 # Runs even if step 1 failed so the relay side isn't left
                 # stranded; final returncode is the worst of the two.
                 inventory = build_inventory_for_node(relay)
-                relay_vars = _collect_relay_tunnel_extra_vars(relay)
+                relay_vars = _collect_relay_tunnel_extra_vars(self.db, relay)
                 relay_result = run_playbook(
                     "playbooks/relay_tunnel_apply.yml",
                     inventory,
