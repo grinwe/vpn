@@ -45,11 +45,18 @@
     path: /usr/sbin/ufw
   register: wg_exit_ufw_bin
 
+# На Ubuntu 24.04 с inactive UFW + iptables-nft backend обычный
+# ``ufw allow`` первый раз кладёт правило в /etc/ufw/user.rules,
+# но возвращает rc=1 ("ERROR: problem running") — таска падает,
+# хотя правило добавлено (повтор выдаёт "Skipping adding existing
+# rule" и rc=0). Модуль community.general.ufw делает то же самое
+# идемпотентно и не фейлится на этом косметическом несоответствии.
 - name: Allow WireGuard UDP port through UFW
   when: wg_exit_ufw_bin.stat.exists
-  command: ufw allow {{ wg_exit_port | default(51820) }}/udp
-  register: wg_exit_ufw_allow
-  changed_when: "'Skipping adding existing rule' not in (wg_exit_ufw_allow.stdout | default(''))"
+  community.general.ufw:
+    rule: allow
+    port: "{{ wg_exit_port | default(51820) }}"
+    proto: udp
 
 - name: Enable IPv4 forwarding
   sysctl:
