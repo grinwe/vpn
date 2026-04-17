@@ -178,10 +178,31 @@ def collect_all_relay_links(session) -> dict[str, Any]:
             )
             stats["relays_ssh_failed"] += 1
             continue
+        logger.info(
+            "relay_link_health: relay=%s links=%d dump_peers=%d "
+            "dump_sample=%s",
+            relay.name, len(relay_links), len(dump),
+            # Первые 2 ключа (iface, peer_pub_prefix) для отладки
+            # «почему мой линк не матчится» — полный ключ длинный.
+            [(i, p[:12] + "…" if p else p) for (i, p) in list(dump)[:2]],
+        )
 
         for link in relay_links:
             exit_pub = link.exit_node.wg_public_key if link.exit_node else None
             if not exit_pub:
+                # Exit без pubkey — обычно significant: exit удалён
+                # каскадом ORM FK, но link остался, либо keygen не
+                # прогоняли. last_observed_at всё равно выставляем,
+                # чтобы UI отличал «SSH up, но exit сломан» от «тик
+                # никогда не проходил». links_no_match подсветит
+                # количество таких в логах.
+                link.last_observed_at = now
+                stats["links_no_match"] += 1
+                logger.warning(
+                    "relay_link_health: link=%s exit=%s has no wg_public_key",
+                    link.wg_interface_name,
+                    link.exit_node.name if link.exit_node else "<none>",
+                )
                 continue
             row = dump.get((link.wg_interface_name, exit_pub))
             if row is None:
@@ -192,6 +213,11 @@ def collect_all_relay_links(session) -> dict[str, Any]:
                 # handshake_at (последний останется старым/NULL).
                 link.last_observed_at = now
                 stats["links_no_match"] += 1
+                logger.info(
+                    "relay_link_health: no peer match on %s: "
+                    "iface=%s exit_pub=%s…",
+                    relay.name, link.wg_interface_name, exit_pub[:12],
+                )
                 continue
             handshake = row["handshake"]
             link.last_handshake_at = (
@@ -203,4 +229,5 @@ def collect_all_relay_links(session) -> dict[str, Any]:
             stats["links_updated"] += 1
 
     session.commit()
+    logger.info("relay_link_health: summary=%s", stats)
     return stats
