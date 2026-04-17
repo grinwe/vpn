@@ -239,7 +239,7 @@ FROM vpn_nodes WHERE id = <X>;
 - `status='error'` — был fail при bootstrap или `destroy_node`. **Из `error` автомата нет**, см. `infrastructure/nodes.md`.
 - `health_score < MIN_HEALTHY_SCORE` — probe'ы упали. Смотреть `health_probes` таблицу по `node_id`.
 - `cooldown_until > now` — временный lock. Обычно проходит сам через 5–15 минут.
-- `status='draining'` — запущен downscale. **Проверить**: если это случайность, `UPDATE vpn_nodes SET status='active' WHERE id=<X>;`. Если штатно — ждать миграции.
+- `status='draining'` — нода помечена для вывода из пула (автоматика выпилена 2026-04-17; статус меняется руками). Новые subs сюда не едут, старые надо мигрировать через admin SPA. Вернуть в пул: `UPDATE vpn_nodes SET status='active' WHERE id=<X>;`.
 
 **Fix «оживить ноду после error»:**
 

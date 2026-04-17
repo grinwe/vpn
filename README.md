@@ -77,7 +77,6 @@ docker-compose logs -f backend
 - **Auto-renewal** — cron checks expiry, creates invoices, notifies users (legacy plan-purchase flow)
 - **Health probes** with regional granularity + auto-migration
 - **Autoscale** via Hetzner API when utilization > high watermark, with Prometheus visibility (`vpn_autoscale_pool_utilization`, `vpn_autoscale_events_total{outcome=…}`)
-- **Downscale** (Stage 5) — when utilization < low watermark, drain tick flips youngest auto-spawned node to `draining`, migrates active subs to other nodes in the pool (sub_token preserved), destroys VM after grace window. Hysteresis (low << high) + min_nodes floor + 1-draining-per-pool cap. Off by default — `AUTOSCALE_DOWNSCALE_ENABLED=1` to enable.
 - **Telegram Mini App** — full личный кабинет with native Stars checkout (`tg.openInvoice`)
 - **Free trial** — any user can one-shot activate a trial via WebApp: credits the price of Basic 1m (read from DB, not hardcoded) as `kind=bonus` onto the balance. Gated by `User.trial_activated_at IS NULL`, row-locked. Worker sends a warning `TRIAL_EXPIRY_WARN_DAYS` before `trial_expires_at`; on expiry, users without any real `kind=topup` get a `kind=adjust` clawback of `min(15000, balance)`. Paid users keep everything. See [docs/TRIAL_SYSTEM.md](docs/TRIAL_SYSTEM.md).
 - **Referral program** — three-stage, anti-farm: (1) **attribution** happens on any `/start ref_XXX` while `user.referred_by_id IS NULL`, no bonus at this point; (2) **referee bonus** `REFERRAL_BONUS_KOPECKS` is credited when the referee activates their trial; (3) **referrer payout** of the same amount is credited only when the referee makes their **first real `kind=topup`** via a payment webhook. Idempotent via `referral_payout:{user_id}` reference. Fake-account farming yields zero payout until real money flows.
@@ -138,12 +137,6 @@ See [docs/DEPLOY.md](docs/DEPLOY.md) for full deployment guide.
 | `TRIAL_EXPIRY_WARN_DAYS` | No | Warning sent this many days before trial expiry (default 3). |
 | `MIN_TOPUP_KOPECKS` | No | Minimum topup amount (default 10000 = ₽100). |
 | `LOW_BALANCE_WARN_DAYS` | No | Threshold for low-balance bot warning (default 3). |
-| `AUTOSCALE_DOWNSCALE_ENABLED` | No | Master switch for downscale (default 0). |
-| `AUTOSCALE_LOW_WATERMARK` | No | Below this utilization the drain tick fires (default 0.3). |
-| `AUTOSCALE_MIN_NODES` | No | Floor — never shrink a pool below this (default 1). |
-| `AUTOSCALE_DRAIN_GRACE_HOURS` | No | Quiet window before destroying an emptied draining node (default 24). |
-| `DRAIN_TICK_INTERVAL` | No | Drain tick interval, seconds (default 600). |
-| `DRAIN_MIGRATE_BATCH` | No | Subs migrated per draining node per tick (default 10). |
 
 ## Project Structure
 

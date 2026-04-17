@@ -129,7 +129,7 @@ def enqueue_task(task_id: int, node_id: int | None) -> str | None:
         return None
 
 
-# Stable job_ids for the 8 self-rescheduling worker ticks. Each tick's
+# Stable job_ids for the self-rescheduling worker ticks. Each tick's
 # bootstrap call (in worker.main) and its self-reschedule call (at the
 # end of the tick body) MUST pass the same tick_id — that's what makes
 # repeated enqueues collapse into one scheduled job instead of spawning
@@ -137,7 +137,6 @@ def enqueue_task(task_id: int, node_id: int | None) -> str | None:
 TICK_IDS = {
     "app.worker.run_pending_rescue_tick": "tick-pending-rescue",
     "app.worker.run_autoscale_tick": "tick-autoscale",
-    "app.worker.run_drain_tick": "tick-drain",
     "app.worker.run_renewal_check": "tick-renewal",
     "app.worker.run_warm_pool_check": "tick-warm-pool",
     "app.worker.run_balance_charge_tick": "tick-balance-charge",

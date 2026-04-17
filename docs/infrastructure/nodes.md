@@ -103,15 +103,12 @@ id not in exclude_node_ids
 
 ### `draining`
 
-Отдельный статус для downscale-дорожки (stage 5, `autoscale.evaluate_pool_downscale` + `worker.run_drain_tick`). Семантика:
+Статус остался от прежней downscale-дорожки. Auto-drain тика выпилена (2026-04-17); нода в `draining` ведёт себя пассивно:
 
-- **Не** возвращается в `_eligible_nodes` — autoscale не считает ни capacity, ни utilization draining-ноды.
+- **Не** возвращается в `_eligible_nodes` — autoscale не считает её в capacity/utilization.
 - **Не** возвращается в `choose_node` — новые подписки сюда не едут.
-- Старые подписки продолжают работать — `Credential.is_active` не меняется, `Device` остаётся apply'нутым.
-- `run_drain_tick` (`worker.py:72-204`) батчами по `DRAIN_MIGRATE_BATCH` (default 10) мигрирует подписки на другие ноды того же пула через `migrate_subscription_to_new_node`.
-- Когда `live_subs == 0` **и** `(now - updated_at) >= AUTOSCALE_DRAIN_GRACE_HOURS`, вызывается `destroy_node` — cloud API destroy + `status=disabled`.
-
-Grace использует `updated_at`, не момент marking'а — каждый `migrate_subscription_to_new_node` трогает ноду, так что таймер перезапускается. Это не баг: мы хотим `grace_hours` **тишины** после последней миграции, не с момента marking'а.
+- Старые подписки продолжают работать — `Credential.is_active` не меняется.
+- Миграция и destroy делаются **руками** через admin SPA (migrate + `/destroy`).
 
 ### `error`
 

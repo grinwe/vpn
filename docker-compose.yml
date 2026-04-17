@@ -114,15 +114,6 @@ services:
       ANSIBLE_ROOT: /app/infra/ansible
       ANSIBLE_PRIVATE_KEY_FILE: /run/secrets/provisioning_key
       AUTOSCALE_INTERVAL: ${AUTOSCALE_INTERVAL:-300}
-      # Stage 5 — downscale. Master switch is OFF by default; flip to 1
-      # after watching the metrics for a cycle. The drain tick runs
-      # regardless so manually-flipped draining nodes still get cleaned up.
-      AUTOSCALE_DOWNSCALE_ENABLED: ${AUTOSCALE_DOWNSCALE_ENABLED:-0}
-      AUTOSCALE_LOW_WATERMARK: ${AUTOSCALE_LOW_WATERMARK:-0.3}
-      AUTOSCALE_MIN_NODES: ${AUTOSCALE_MIN_NODES:-1}
-      AUTOSCALE_DRAIN_GRACE_HOURS: ${AUTOSCALE_DRAIN_GRACE_HOURS:-24}
-      DRAIN_TICK_INTERVAL: ${DRAIN_TICK_INTERVAL:-6000000}
-      DRAIN_MIGRATE_BATCH: ${DRAIN_MIGRATE_BATCH:-10}
       # Self-heal for stuck pending provisioning tasks.
       PENDING_RESCUE_INTERVAL: ${PENDING_RESCUE_INTERVAL:-60}
       PENDING_RESCUE_AGE: ${PENDING_RESCUE_AGE:-60}

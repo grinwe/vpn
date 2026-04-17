@@ -53,7 +53,6 @@ Backend прогоняет `alembic upgrade head` на старте (`main.py:18
 | Функция                    | Default interval             | Что делает                                       |
 |----------------------------|------------------------------|---------------------------------------------------|
 | `run_autoscale_tick`       | `AUTOSCALE_INTERVAL=300`     | Проходит по server_pools, решает по utilization, спавнит новые ноды |
-| `run_drain_tick`           | `DRAIN_TICK_INTERVAL=600`    | Отмечает ноды как `draining`, мигрирует их subs, уничтожает пустые |
 | `run_renewal_check`        | `RENEWAL_CHECK_INTERVAL=300` | Expire-ит подписки, инициирует renewal reminders, hard-revoke после grace |
 | `run_warm_pool_check`      | `WARM_POOL_CHECK_INTERVAL=120` | Топит warm pool на каждой активной ноде до `WARM_POOL_TARGET` |
 | `run_balance_charge_tick`  | `BALANCE_CHARGE_INTERVAL=3600` | Renew balance-подписок, expire auto_renew=False, auto-unfreeze, clawback trial |
@@ -103,7 +102,6 @@ return summary
 - `run_warm_pool_check` (`worker.py:423-430`): `try: ensure_pool() except Exception: log finally: close` — внутренний catch-all, падать ничего не должно, дойдёт до `enqueue_in`.
 - `run_balance_charge_tick` (`worker.py:674-763`): такой же внешний `try/except Exception` на всё тело + `finally: close`. Дойдёт до `enqueue_in`.
 - `run_autoscale_tick` (`worker.py:50-69`): только `try/finally`, **без `except`**. Если `evaluate_all_pools` кинул — exception пролетает наверх, `enqueue_in` не выполняется, цикл обрывается. RQ залогирует job failed, но следующего enqueue не произойдёт.
-- `run_drain_tick` (`worker.py:107-204`): внутри каждой фазы свой try/except, но явного внешнего catch-all на всё тело нет. Большинство exception'ов ловятся точечно, но не гарантированно все.
 - `run_renewal_check` — аналогично, точечные try/except по проходам (см. `worker.py:207+`).
 
 > ⚠️ `enqueue_in` не в `finally` → частично-защищённый цикл. См. audit/...
@@ -128,14 +126,13 @@ return summary
 |------------------------------|------------------------|
 | `run_pending_rescue_tick`    | `tick-pending-rescue`  |
 | `run_autoscale_tick`         | `tick-autoscale`       |
-| `run_drain_tick`             | `tick-drain`           |
 | `run_renewal_check`          | `tick-renewal`         |
 | `run_warm_pool_check`        | `tick-warm-pool`       |
 | `run_balance_charge_tick`    | `tick-balance-charge`  |
 | `run_traffic_stats_tick`     | `tick-traffic-stats`   |
 | `run_user_health_ping_tick`  | `tick-health-ping`     |
 
-Все 16 мест (8 self-reschedule + 8 bootstrap в `main()`) используют `schedule_tick`. После фикса параллельных цепочек быть не может: даже 10 рестартов подряд оставят ровно 8 jobs в `scheduled` (по одному на тик).
+Все `tick-*` места (self-reschedule + bootstrap в `main()`) используют `schedule_tick`. После фикса параллельных цепочек быть не может: даже 10 рестартов подряд оставят ровно по одному scheduled job на тик.
 
 Смотреть текущее состояние тиков — `GET /api/provisioning/queue-status` (см. § Admin monitoring очереди).
 
@@ -162,21 +159,6 @@ return summary
 ### `run_autoscale_tick`
 
 Одна функция, один проход по всем пулам: `services.autoscale.evaluate_all_pools(session)` возвращает `PoolDecisionOut` на каждый пул. Решения о том, спавнить ли ноду, принимает `evaluate_all_pools`; тика просто исполняет и возвращает summary для RQ result backend.
-
-### `run_drain_tick` — downscale
-
-Две фазы в одной тике (`worker.py:72-204`):
-
-1. **Mark.** `evaluate_all_downscale` ходит по пулам и может перевести **одну** ноду в `draining` при соблюдении hysteresis + `min_nodes` + master-switch (`AUTOSCALE_DOWNSCALE_ENABLED=1`).
-2. **Migrate + destroy.** Для каждой уже `draining` ноды берётся batch `DRAIN_MIGRATE_BATCH=10` активных subs, каждой вызывается `orchestrator.migrate_subscription_to_new_node(sub)`. Если после batch'а подписок не осталось И прошло больше `AUTOSCALE_DRAIN_GRACE_HOURS=24` часов с `updated_at` — вызывается `destroy_node(session, node)`.
-
-Заметка: grace-окно считается от `node.updated_at`, не от момента первой постановки в drain. Любой UPDATE на ноде (health merge, admin edit notes) обновляет `updated_at` и сдвигает окно.
-
-> ⚠️ Drain grace измеряется от `updated_at`. См. audit/...
-
-Mетрика: `autoscale.DRAIN_SUBS_REMAINING.labels(pool, node)` — сколько subs ещё осталось мигрировать. Тика переставляет значение в каждой итерации.
-
-Drain тика продолжает работать даже при `AUTOSCALE_DOWNSCALE_ENABLED=0` — чтобы оператор мог руками перевести ноду в `draining` через admin SPA и ждать, что её мигрируют и уничтожат. `AUTOSCALE_DOWNSCALE_ENABLED` гейтит только фазу Mark.
 
 ### `run_renewal_check`
 
@@ -255,7 +237,6 @@ Drain тика продолжает работать даже при `AUTOSCALE_
 - `vpn_renewal_check_runs_total{outcome}` — количество renewal-тиков (`worker.py:26-28`)
 - `vpn_renewal_check_last_run_timestamp` — unix ts последнего успешного тика
 - `vpn_renewal_revoked_total` — subs auto-revoked после grace
-- `autoscale.DRAIN_SUBS_REMAINING{pool, node}` — см. `services/autoscale.py`
 
 ## Взаимодействие с provisioning
 

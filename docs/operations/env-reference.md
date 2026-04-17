@@ -76,8 +76,6 @@
 | `LOW_BALANCE_WARN_DAYS` | `3` | worker | Триггерит `low_balance_warning` notification, когда runway (balance / daily_rate) < этого. |
 | `WARM_POOL_CHECK_INTERVAL` | `120` | worker | `run_warm_pool_check` — тик warmer'а (ensure_pool + revoke GC). |
 | `AUTOSCALE_INTERVAL` | `0` / `300` | worker | `run_autoscale_check`. `0` — отключить. `.env.example` ставит `300`. |
-| `DRAIN_TICK_INTERVAL` | `600` | worker | `run_drain_tick` (stage 5 downscale). Продолжает тикать даже если `AUTOSCALE_DOWNSCALE_ENABLED=0`, чтобы ручные draining-ноды могли дочиститься. |
-| `DRAIN_MIGRATE_BATCH` | `10` | worker | Сколько подписок за один tick мигрируется с одной draining-ноды. |
 | `PENDING_RESCUE_INTERVAL` | `60` | worker | `run_pending_rescue_tick` — re-enqueue `ProvisioningTask.status=pending` старше `PENDING_RESCUE_AGE`. Закрывает дыру, когда `enqueue_task` упал на Redis-hiccup'е и строка осталась без job'а. `0` отключает. |
 | `PENDING_RESCUE_AGE` | `60` | worker | Минимальный возраст (sec) pending-задачи, чтобы её подхватил rescue-tick. Меньше этого — считается «только что создана, ещё не RQ'нулась». |
 | `ANSIBLE_PLAYBOOK_TIMEOUT` | `300` | backend, worker | subprocess-таймаут (sec) на один `ansible-playbook` run. При регулярно-медленных нодах (package installs, slow SSH) можно поднять, иначе revoke/apply ловят `TimeoutExpired` и таска становится failed. |
@@ -103,14 +101,10 @@
 
 | переменная | default | кто читает | описание |
 |---|---|---|---|
-| `AUTOSCALE_HIGH_WATERMARK` | `0.8` | worker | `utilization >= high` → spawn. Hysteresis с low. |
-| `AUTOSCALE_LOW_WATERMARK` | `0.3` | worker | `utilization < low` → mark draining. |
+| `AUTOSCALE_HIGH_WATERMARK` | `0.8` | worker | `utilization >= high` → spawn. |
 | `AUTOSCALE_MAX_NODES` | `10` | worker | Ceiling для spawn'а. `error`-ноды не считаются в `counted_nodes` (иначе сломанная нода навсегда держала бы cap). |
-| `AUTOSCALE_MIN_NODES` | `1` | worker | Floor — не шринкать ниже этого. |
 | `AUTOSCALE_FALLBACK_CAPACITY` | `50` | worker | Предполагаемая capacity ноды, когда `max_users=NULL`. Используется autoscale math'ом. |
 | `AUTOSCALE_SPAWN_BACKOFF` | `600` | worker | Сколько секунд парковать пул после fail'а spawn'а (in-memory, reset на рестарт). |
-| `AUTOSCALE_DOWNSCALE_ENABLED` | `0` | backend, worker | Мастер-switch для downscale. По дефолту выключен; флипается после cycle наблюдения в проде. |
-| `AUTOSCALE_DRAIN_GRACE_HOURS` | `24` | worker | Grace window между «0 live_subs на draining ноде» и `destroy_node`. Проверяется против `updated_at`, не mark-таймстампа. |
 
 ## VLESS Reality defaults
 

@@ -89,7 +89,7 @@ class ServerPool(Base):
     autoscale_fallback_provider_ids: JSONB    # stage 6 multi-cloud
 ```
 
-`autoscale_*` читаются воркером в `run_autoscale_tick` / `evaluate_pool_downscale`. Если autoscale выключен — поля просто игнорируются.
+`autoscale_*` читаются воркером в `run_autoscale_tick`. Если autoscale выключен — поля просто игнорируются.
 
 ### `vpn_nodes`
 

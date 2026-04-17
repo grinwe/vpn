@@ -11,17 +11,6 @@ call :func:`services.node_spawner.spawn_node` with the pool's default
 provider/region/plan. Nodes that are in cooldown or unhealthy are excluded
 from the denominator — they would not be picked by :func:`choose_node`
 anyway, so counting them would hide real saturation.
-
-Stage 5 adds the symmetric **downscale** path: when a pool's utilization
-drops below ``low_watermark`` and we still have more than ``min_nodes``
-eligible nodes, the youngest auto-spawned node is flipped to
-``draining``. The drain tick (``run_drain_tick`` in worker.py) then walks
-its active subscriptions, migrates each to a different node in the same
-pool's plan, and finally calls ``destroy_node`` once the live-sub count
-hits zero AND the grace window has elapsed. Hysteresis (low << high)
-plus the per-pool 1-draining-node cap keep the algorithm from flapping.
-The whole downscale path is gated by ``AUTOSCALE_DOWNSCALE_ENABLED`` —
-default 0, opt-in per environment.
 """
 from __future__ import annotations
 
@@ -65,44 +54,9 @@ SCALE_EVENTS = Counter(
     "Autoscale tick outcomes per pool",
     ["pool", "outcome"],
 )
-# Downscale outcomes are tracked under a separate counter so dashboards
-# can plot growth and shrinkage independently. Outcomes:
-#   * disabled / misconfigured / above_low_watermark / min_nodes_floor
-#   * already_draining (we only mark one node per pool at a time)
-#   * marked_draining (just flipped status)
-#   * no_drain_target (pool has no auto-spawned nodes to shrink)
-DRAIN_EVENTS = Counter(
-    "vpn_autoscale_drain_events_total",
-    "Downscale tick outcomes per pool",
-    ["pool", "outcome"],
-)
-# Per-node remaining-subs gauge — drives the "drain progress" panel.
-# Stays at 0 for nodes that aren't draining (we still emit so a stale
-# series doesn't pin Grafana to a dead node).
-DRAIN_SUBS_REMAINING = Gauge(
-    "vpn_autoscale_drain_subs_remaining",
-    "Active subscriptions still on a draining node",
-    ["pool", "node"],
-)
 
 DEFAULT_HIGH_WATERMARK = float(os.getenv("AUTOSCALE_HIGH_WATERMARK", "0.8"))
-DEFAULT_LOW_WATERMARK = float(os.getenv("AUTOSCALE_LOW_WATERMARK", "0.3"))
 DEFAULT_MAX_NODES = int(os.getenv("AUTOSCALE_MAX_NODES", "10"))
-DEFAULT_MIN_NODES = int(os.getenv("AUTOSCALE_MIN_NODES", "1"))
-# Master switch for the downscale path. Off by default — operators
-# enable it once after watching the metrics for a cycle. Set to "1"
-# (or true/yes) to let the drain tick actually flip nodes to draining
-# and destroy emptied ones.
-DOWNSCALE_ENABLED = os.getenv("AUTOSCALE_DOWNSCALE_ENABLED", "0").lower() not in {
-    "0",
-    "false",
-    "no",
-    "",
-}
-# Grace window between "node has zero active subs" and "destroy_node".
-# Buys time for in-flight provisioning tasks to settle and for any
-# unfreezes to discover the node before it disappears.
-DRAIN_GRACE_HOURS = int(os.getenv("AUTOSCALE_DRAIN_GRACE_HOURS", "24"))
 # Without explicit per-node capacity we fall back to this so that brand-new
 # pools still have a sane denominator.
 FALLBACK_NODE_CAPACITY = int(os.getenv("AUTOSCALE_FALLBACK_CAPACITY", "50"))
@@ -133,19 +87,8 @@ def _pool_high_watermark(pool: models.ServerPool) -> float:
     return DEFAULT_HIGH_WATERMARK
 
 
-def _pool_low_watermark(pool: models.ServerPool) -> float:
-    if pool.autoscale_low_watermark is not None:
-        value = pool.autoscale_low_watermark
-        return float(value) if not isinstance(value, Decimal) else float(value)
-    return DEFAULT_LOW_WATERMARK
-
-
 def _pool_max_nodes(pool: models.ServerPool) -> int:
     return pool.autoscale_max_nodes or DEFAULT_MAX_NODES
-
-
-def _pool_min_nodes(pool: models.ServerPool) -> int:
-    return pool.autoscale_min_nodes or DEFAULT_MIN_NODES
 
 
 def _eligible_nodes(pool: models.ServerPool) -> list[models.VPNNode]:
@@ -414,210 +357,3 @@ def evaluate_pool(db: Session, pool: models.ServerPool) -> PoolDecision:
 def evaluate_all_pools(db: Session) -> list[PoolDecision]:
     pools = db.query(models.ServerPool).all()
     return [evaluate_pool(db, p) for p in pools]
-
-
-# ── Downscale ────────────────────────────────────────────────────────
-
-
-@dataclass
-class DrainDecision:
-    pool_id: int
-    pool_name: str
-    utilization: float
-    eligible_nodes: int
-    already_draining: int
-    marked_node_id: int | None
-    reason: str
-
-
-def _record_drain(
-    pool_name: str, outcome: str, utilization: float, eligible: int
-) -> None:
-    POOL_UTILIZATION.labels(pool=pool_name).set(utilization)
-    POOL_ELIGIBLE_NODES.labels(pool=pool_name).set(eligible)
-    DRAIN_EVENTS.labels(pool=pool_name, outcome=outcome).inc()
-
-
-def _pick_drain_candidate(
-    pool: models.ServerPool, eligible: list[models.VPNNode]
-) -> models.VPNNode | None:
-    """Pick the best node to drain from the eligible set.
-
-    Heuristic: prefer auto-spawned nodes (notes start with ``auto-scaled``
-    OR have a non-null ``provider_id`` and a name matching the spawn
-    suffix) over manual ones — operators usually want their hand-rolled
-    nodes left alone. Within the eligible candidates, pick the youngest
-    (created_at desc) so we shrink the most recently added capacity, and
-    tiebreak on the lowest active-subscription count to minimize the
-    migration cost.
-    """
-    candidates: list[models.VPNNode] = []
-    for n in eligible:
-        if n.provider_id is None:
-            continue  # manual node, never auto-destroy
-        if not (n.notes or "").startswith("auto-scaled") and "auto-" not in (n.name or ""):
-            continue  # operator-spawned via UI, leave alone
-        candidates.append(n)
-    if not candidates:
-        return None
-    candidates.sort(
-        key=lambda n: (n.created_at or utcnow(), len(n.subscriptions)),
-        reverse=True,  # newest first
-    )
-    return candidates[0]
-
-
-def evaluate_pool_downscale(db: Session, pool: models.ServerPool) -> DrainDecision:
-    """Decide whether to flip a node in this pool to ``draining``.
-
-    Pure decision function: it only mutates the chosen node's status
-    (and commits). The actual subscription migration + node destroy are
-    done by ``run_drain_tick``. Keeping the two split mirrors the
-    spawn/bootstrap split on the upscale side.
-    """
-    # #61 — same distributed lock as upscale. Prevents a race where one
-    # worker spawns while another drains the same pool.
-    if not _try_lock_pool(db, pool.id):
-        _record_drain(pool.name, "locked", 0.0, 0)
-        return DrainDecision(
-            pool_id=pool.id,
-            pool_name=pool.name,
-            utilization=0.0,
-            eligible_nodes=0,
-            already_draining=0,
-            marked_node_id=None,
-            reason="skipped — another worker holds the pool lock",
-        )
-
-    if not DOWNSCALE_ENABLED:
-        _record_drain(pool.name, "disabled", 0.0, 0)
-        return DrainDecision(
-            pool_id=pool.id,
-            pool_name=pool.name,
-            utilization=0.0,
-            eligible_nodes=0,
-            already_draining=0,
-            marked_node_id=None,
-            reason="downscale disabled (AUTOSCALE_DOWNSCALE_ENABLED=0)",
-        )
-
-    if not pool.autoscale_enabled:
-        _record_drain(pool.name, "disabled", 0.0, 0)
-        return DrainDecision(
-            pool_id=pool.id,
-            pool_name=pool.name,
-            utilization=0.0,
-            eligible_nodes=0,
-            already_draining=0,
-            marked_node_id=None,
-            reason="autoscale disabled",
-        )
-
-    eligible = _eligible_nodes(pool)
-    capacity = sum(_node_capacity(n) for n in eligible)
-    active = _active_subs_on_nodes(db, eligible)
-    utilization = (active / capacity) if capacity else 0.0
-
-    already_draining = sum(
-        1 for n in pool.nodes if n.status == models.VPNNodeStatus.draining
-    )
-    if already_draining > 0:
-        _record_drain(pool.name, "already_draining", utilization, len(eligible))
-        return DrainDecision(
-            pool_id=pool.id,
-            pool_name=pool.name,
-            utilization=utilization,
-            eligible_nodes=len(eligible),
-            already_draining=already_draining,
-            marked_node_id=None,
-            reason=f"{already_draining} node(s) already draining",
-        )
-
-    min_nodes = _pool_min_nodes(pool)
-    if len(eligible) <= min_nodes:
-        _record_drain(pool.name, "min_nodes_floor", utilization, len(eligible))
-        return DrainDecision(
-            pool_id=pool.id,
-            pool_name=pool.name,
-            utilization=utilization,
-            eligible_nodes=len(eligible),
-            already_draining=0,
-            marked_node_id=None,
-            reason=f"eligible={len(eligible)} <= min_nodes={min_nodes}",
-        )
-
-    low = _pool_low_watermark(pool)
-    if utilization >= low:
-        _record_drain(pool.name, "above_low_watermark", utilization, len(eligible))
-        return DrainDecision(
-            pool_id=pool.id,
-            pool_name=pool.name,
-            utilization=utilization,
-            eligible_nodes=len(eligible),
-            already_draining=0,
-            marked_node_id=None,
-            reason=f"utilization {utilization:.2f} >= low_watermark {low:.2f}",
-        )
-
-    # Sanity check: would shrinking by one still keep us under the
-    # high_watermark? If not, draining now would just trigger a re-spawn
-    # on the next upscale tick — pointless thrash.
-    high = _pool_high_watermark(pool)
-    remaining_capacity = capacity - max(
-        (_node_capacity(n) for n in eligible), default=0
-    )
-    if remaining_capacity > 0 and (active / remaining_capacity) >= high:
-        _record_drain(pool.name, "above_low_watermark", utilization, len(eligible))
-        return DrainDecision(
-            pool_id=pool.id,
-            pool_name=pool.name,
-            utilization=utilization,
-            eligible_nodes=len(eligible),
-            already_draining=0,
-            marked_node_id=None,
-            reason=(
-                f"shrinking would push utilization to "
-                f"{active / remaining_capacity:.2f} >= {high:.2f}, refusing"
-            ),
-        )
-
-    candidate = _pick_drain_candidate(pool, eligible)
-    if candidate is None:
-        _record_drain(pool.name, "no_drain_target", utilization, len(eligible))
-        return DrainDecision(
-            pool_id=pool.id,
-            pool_name=pool.name,
-            utilization=utilization,
-            eligible_nodes=len(eligible),
-            already_draining=0,
-            marked_node_id=None,
-            reason="no auto-spawned candidate to drain (only manual nodes)",
-        )
-
-    logger.warning(
-        "Downscale: pool %s utilization=%.2f < low=%.2f, marking node %s draining",
-        pool.name,
-        utilization,
-        low,
-        candidate.name,
-    )
-    candidate.status = models.VPNNodeStatus.draining
-    candidate.updated_at = utcnow()
-    db.add(candidate)
-    db.commit()
-
-    _record_drain(pool.name, "marked_draining", utilization, len(eligible))
-    return DrainDecision(
-        pool_id=pool.id,
-        pool_name=pool.name,
-        utilization=utilization,
-        eligible_nodes=len(eligible),
-        already_draining=0,
-        marked_node_id=candidate.id,
-        reason=f"marked node {candidate.name} draining",
-    )
-
-
-def evaluate_all_downscale(db: Session) -> list[DrainDecision]:
-    pools = db.query(models.ServerPool).all()
-    return [evaluate_pool_downscale(db, p) for p in pools]

@@ -50,7 +50,3 @@ deploy_app_stack_bot_webhook_port: 8081
 # ~50 nodes from this single vantage point.
 deploy_app_stack_probe_agent_token: "{{ vault_probe_agent_token | default('') }}"
 deploy_app_stack_probe_agent_region: "eu-nl"
-
-# Autoscale downscale — set to 1 after verifying drain/destroy loop on staging.
-# Code is ready (evaluate_pool_downscale + run_drain_tick), this is the kill switch.
-deploy_app_stack_autoscale_downscale_enabled: 0

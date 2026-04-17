@@ -245,7 +245,7 @@ else:
 
 ## `migrate_subscription_to_new_node` — поток миграции
 
-`provisioning.py:1229-1306`. Используется `worker.run_drain_tick`, когда нода помечена `draining`.
+`provisioning.py:1229-1306`. Вызывается вручную через admin SPA, когда нода помечена `draining` и её надо опустошить.
 
 ```
 1. choose_node(plan, exclude=[old_node.id, ...other_draining])

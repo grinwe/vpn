@@ -154,7 +154,7 @@ Worker автоматически:
 - **Hourly balance tick** (`BALANCE_CHARGE_INTERVAL`, default 3600s) — для каждой активной подписки списывает `daily_rate × devices / 24`. Anchor-based, не дрейфует при пропущенных тиках. Подписки с балансом ≤ 0 фризятся.
 - **Trial expiry tick** — warning за `TRIAL_EXPIRY_WARN_DAYS` до истечения триала, clawback на истечении если юзер не стал платящим. Полная механика — [TRIAL_SYSTEM.md](TRIAL_SYSTEM.md).
 - **Legacy renewal cron** (`RENEWAL_CHECK_INTERVAL`) — создаёт auto-renewal инвойсы для старой модели подписок на 3 дня до истечения. Новые юзеры идут через balance-billing, но старые подписки ещё живы на этом пути.
-- **Autoscale tick** (`AUTOSCALE_INTERVAL`) — если `AUTOSCALE_DOWNSCALE_ENABLED=1`, дополнительно drain-tick (`DRAIN_TICK_INTERVAL`).
+- **Autoscale tick** (`AUTOSCALE_INTERVAL`) — upscale-only, по `high_watermark`. Downscale/drain — не реализован (ручной destroy через admin SPA).
 
 Всё это живёт в [backend/app/worker.py](../backend/app/worker.py) — один `run_balance_charge_tick()` + отдельные phase'ы.
 

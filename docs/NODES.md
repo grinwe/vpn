@@ -67,7 +67,7 @@ return configs[0]
 Опциональная группировка нод для autoscale. Нода без `pool_id` — «ручная», autoscale её не трогает. Нода с `pool_id` — член пула, попадает под:
 
 - **Upscale**: при `utilization > AUTOSCALE_HIGH_WATERMARK` — bootstrap новой ноды через провайдер API (Hetzner и т.д.)
-- **Downscale** (опционально, `AUTOSCALE_DOWNSCALE_ENABLED=1`): при `utilization < AUTOSCALE_LOW_WATERMARK` — флип младшей auto-spawned ноды в `draining`, миграция подписок, destroy VM через `AUTOSCALE_DRAIN_GRACE_HOURS`.
+- **Downscale** — не реализован. Избыточные ноды надо гасить руками через admin SPA (`POST /api/nodes/{id}/destroy`).
 
 Env vars — см. [README.md](../README.md#environment-variables).
 
