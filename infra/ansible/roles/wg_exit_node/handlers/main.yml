@@ -1,9 +1,8 @@
 ---
-- name: syncconf wg0
-  shell: |
-    wg syncconf wg0 <(wg-quick strip wg0)
-  args:
-    executable: /bin/bash
+# syncconf wg0 переехал в tasks/main.yml: handler-based version
+# не стрелял, когда параллельная bootstrap_exit таска уже рендерила
+# тот же wg0.conf (template ok=unchanged → handler skipped), из-за
+# чего running state WG мог отстать от disk.
 
 - name: persist iptables
   shell: |

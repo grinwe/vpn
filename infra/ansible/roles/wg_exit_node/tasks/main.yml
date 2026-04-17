@@ -72,13 +72,27 @@
     owner: root
     group: root
     mode: '0600'
-  notify: syncconf wg0
 
 - name: Enable and start WireGuard
   systemd:
     name: wg-quick@wg0
     enabled: yes
     state: started
+
+# Раньше syncconf висел на handler'е от предыдущей таски. Это ловило
+# race при параллельных bootstrap_exit запусках на один и тот же
+# exit: первая таска уже записала wg0.conf с новым peer и вызвала
+# syncconf; вторая видит template=unchanged, handler не стреляет,
+# но running state WG мог не содержать нужного peer'а (например,
+# syncconf в первой таске прошёл до коммита link#2). Форсим
+# безусловный syncconf — операция идемпотентна: если peer уже
+# соответствует disk state, wg ничего не меняет.
+- name: Sync running WG state with wg0.conf
+  shell: |
+    wg syncconf wg0 <(wg-quick strip wg0)
+  args:
+    executable: /bin/bash
+  changed_when: false
 
 - name: Setup NAT masquerade for tunnel traffic
   iptables:
