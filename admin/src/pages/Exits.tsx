@@ -50,6 +50,7 @@ interface RelayExitLinkOut {
   relay_node_name: string;
   exit_id: number;
   exit_name: string;
+  wg_interface_name: string;
   wg_client_public_key: string;
   wg_client_address_v4: string;
   created_at: string;
@@ -298,8 +299,17 @@ function ExitLinksPanel({ exitNode }: { exitNode: WGExitNodeOut }) {
     onError: (e: Error) => alert(`Ошибка: ${e.message}`),
   });
 
+  // G.7: a relay may be attached to multiple exits simultaneously.
+  // The one-relay-one-exit filter is lifted; the backend still rejects
+  // duplicate (relay, exit) pairs with 409, so the UI offers all
+  // active nodes here and lets the server own uniqueness. Links
+  // already on *this* exit are excluded because re-attaching the
+  // same pair is always a mistake.
+  const alreadyAttached = new Set(
+    (links.data ?? []).map((l) => l.relay_node_id),
+  );
   const attachableNodes = (nodes.data ?? []).filter(
-    (n) => !n.has_relay_config && n.is_active,
+    (n) => n.is_active && !alreadyAttached.has(n.id),
   );
 
   return (
@@ -347,6 +357,7 @@ function ExitLinksPanel({ exitNode }: { exitNode: WGExitNodeOut }) {
           <thead className="text-slate-400">
             <tr>
               <th className="text-left py-1 px-2">Relay</th>
+              <th className="text-left py-1 px-2">Iface</th>
               <th className="text-left py-1 px-2">WG client addr</th>
               <th className="text-left py-1 px-2">Client public key</th>
               <th className="text-left py-1 px-2">Создан</th>
@@ -358,6 +369,9 @@ function ExitLinksPanel({ exitNode }: { exitNode: WGExitNodeOut }) {
               <tr key={l.id} className="border-t border-slate-800">
                 <td className="py-1 px-2 font-mono">
                   #{l.relay_node_id} {l.relay_node_name}
+                </td>
+                <td className="py-1 px-2 font-mono text-slate-300">
+                  {l.wg_interface_name}
                 </td>
                 <td className="py-1 px-2 font-mono text-slate-400">
                   {l.wg_client_address_v4}
@@ -374,11 +388,11 @@ function ExitLinksPanel({ exitNode }: { exitNode: WGExitNodeOut }) {
                     onClick={() => {
                       if (
                         confirm(
-                          `Отсоединить ${l.relay_node_name} от ${exitNode.name}?\n\n` +
+                          `Отсоединить ${l.relay_node_name} (${l.wg_interface_name}) от ${exitNode.name}?\n\n` +
                             "Запустится ansible: bootstrap_exit.yml на exit'е " +
-                            "(peer уйдёт из wg0.conf, wg syncconf подхватит) " +
-                            "и relay_tunnel_apply.yml на relay (wg0 down + " +
-                            "Xray outbound вернётся на прямую).",
+                            `(peer уйдёт из его wg0.conf) и relay_tunnel_apply.yml ` +
+                            `на relay (${l.wg_interface_name} down, Xray direct-${l.wg_interface_name} ` +
+                            "outbound/rule удалятся, остальные линки на этом relay остаются).",
                         )
                       )
                         detachMut.mutate(l.relay_node_id);

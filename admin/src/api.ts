@@ -314,6 +314,17 @@ export interface NodeTrafficHistoryOut {
   samples: NodeTrafficSamplePoint[];
 }
 
+export interface NodeRelayLinkOut {
+  link_id: number;
+  exit_id: number;
+  exit_name: string;
+  wg_interface_name: string;
+  wg_client_address_v4: string;
+  wg_client_public_key: string;
+  credentials_count: number;
+  created_at: string;
+}
+
 export interface PlanOut {
   id: number;
   name: string;

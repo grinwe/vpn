@@ -7,6 +7,7 @@ import {
   NodeActiveUsersOut,
   NodeHealthOut,
   NodeHealthPingStatsOut,
+  NodeRelayLinkOut,
   NodeTrafficHistoryOut,
   ProvisioningTaskOut,
   VPNConfigCreateIn,
@@ -101,6 +102,72 @@ function CooldownBadge({ until }: { until: string | null }) {
     >
       cooldown {label}
     </span>
+  );
+}
+
+function RelayLinksSection({ nodeId }: { nodeId: number }) {
+  const { data, isLoading, error } = useQuery<NodeRelayLinkOut[]>({
+    queryKey: ["node-relay-links", nodeId],
+    queryFn: () => api.get(`/nodes/${nodeId}/links`),
+  });
+
+  if (isLoading) return <div className="text-xs text-slate-400">Загрузка relay-линков…</div>;
+  if (error) return <div className="text-xs text-red-400">{(error as Error).message}</div>;
+  if (!data || data.length === 0) return null;
+
+  const total = data.reduce((acc, l) => acc + l.credentials_count, 0);
+
+  return (
+    <div className="rounded border border-slate-700 p-3 text-xs">
+      <div className="flex items-center justify-between mb-2">
+        <div>
+          <span className="text-slate-400">Relay links: </span>
+          <span className="font-mono">{data.length}</span>
+          <span className="text-slate-500"> · creds pinned: </span>
+          <span className="font-mono">{total}</span>
+        </div>
+        <Link to="/exits" className="text-blue-400 hover:underline">
+          Управление → Exits
+        </Link>
+      </div>
+      <table className="w-full">
+        <thead className="text-slate-400">
+          <tr>
+            <th className="text-left py-1 px-2">Iface</th>
+            <th className="text-left py-1 px-2">Exit</th>
+            <th className="text-left py-1 px-2">WG client addr</th>
+            <th className="text-left py-1 px-2">Creds</th>
+            <th className="text-left py-1 px-2">Public key</th>
+            <th className="text-left py-1 px-2">Создан</th>
+          </tr>
+        </thead>
+        <tbody>
+          {data.map((l) => (
+            <tr key={l.link_id} className="border-t border-slate-800">
+              <td className="py-1 px-2 font-mono text-slate-300">{l.wg_interface_name}</td>
+              <td className="py-1 px-2 font-mono">
+                #{l.exit_id} {l.exit_name}
+              </td>
+              <td className="py-1 px-2 font-mono text-slate-400">
+                {l.wg_client_address_v4}
+              </td>
+              <td className="py-1 px-2 font-mono">{l.credentials_count}</td>
+              <td className="py-1 px-2 font-mono" title={l.wg_client_public_key}>
+                {l.wg_client_public_key.slice(0, 12)}…
+              </td>
+              <td className="py-1 px-2 text-slate-400">
+                {new Date(l.created_at).toLocaleString()}
+              </td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+      <p className="text-slate-500 mt-2">
+        Это relay-нода: трафик клиентов туннелируется через wgN в соответствующий
+        exit. Распределение creds по линкам — least-loaded (см. G.4 в{" "}
+        <code>docs/RELAY_ROADMAP.md</code>).
+      </p>
+    </div>
   );
 }
 
@@ -805,6 +872,7 @@ export default function Nodes() {
                 {expanded && (
                   <tr className="border-b border-slate-800 bg-slate-900/60">
                     <td colSpan={11} className="p-4 space-y-4">
+                      <RelayLinksSection nodeId={n.id} />
                       <NodeHealth nodeId={n.id} />
                       <NodeActiveUsers nodeId={n.id} />
                       <NodeTrafficChart nodeId={n.id} />

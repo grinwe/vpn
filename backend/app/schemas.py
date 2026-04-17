@@ -787,9 +787,32 @@ class RelayExitLinkOut(BaseModel):
     relay_node_name: str
     exit_id: int
     exit_name: str
+    # Kernel interface the relay uses for this link (wg0, wg1, …).
+    # G.5+ every link carries one; older rows were backfilled by the
+    # same migration. Surfaced so the admin UI can label which wgN is
+    # which exit in the multi-link case.
+    wg_interface_name: str
     wg_client_public_key: str
     wg_client_address_v4: str
     created_at: datetime
 
     class Config:
         from_attributes = True
+
+
+class NodeRelayLinkOut(BaseModel):
+    """Per-link view from the *relay* side.
+
+    Same data as ``RelayExitLinkOut`` reshaped for the Nodes admin
+    screen (where the relay is the anchor) plus a live credentials
+    counter so the operator can see how many active users are pinned
+    to each exit via this link.
+    """
+    link_id: int
+    exit_id: int
+    exit_name: str
+    wg_interface_name: str
+    wg_client_address_v4: str
+    wg_client_public_key: str
+    credentials_count: int
+    created_at: datetime

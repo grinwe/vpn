@@ -13,6 +13,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query
+from sqlalchemy import func
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -676,6 +677,63 @@ def list_configs(
 ):
     configs = db.query(models.VPNConfig).filter(models.VPNConfig.node_id == node_id).all()
     return [schemas.VPNConfigOut.from_orm(cfg) for cfg in configs]
+
+
+@router.get("/nodes/{node_id}/links", response_model=list[schemas.NodeRelayLinkOut])
+def list_node_relay_links(
+    node_id: int,
+    db: Session = Depends(get_db),
+    admin_token: str = Depends(require_admin),
+):
+    """Per-exit link view for a relay node (G.7 admin multi-attach).
+
+    Returns one row per ``RelayExitLink`` where ``relay_node_id ==
+    node_id`` with the interface name, the attached exit and a live
+    counter of credentials pinned to this (relay, exit) pair. Non-relay
+    nodes legitimately return ``[]`` (no links). Counter excludes
+    revoked creds but includes warm-pool entries (those still carry
+    ``exit_id`` and occupy a routing slot on the relay).
+    """
+    node = db.get(models.VPNNode, node_id)
+    if not node:
+        raise HTTPException(status_code=404, detail="Node not found")
+
+    links = (
+        db.query(models.RelayExitLink)
+        .filter(models.RelayExitLink.relay_node_id == node_id)
+        .order_by(models.RelayExitLink.wg_interface_name)
+        .all()
+    )
+    if not links:
+        return []
+
+    counts: dict[int, int] = dict(
+        db.query(
+            models.Credential.exit_id,
+            func.count(models.Credential.id),
+        )
+        .filter(
+            models.Credential.node_id == node_id,
+            models.Credential.exit_id.isnot(None),
+            models.Credential.pool_state != models.CredentialPoolState.revoked,
+        )
+        .group_by(models.Credential.exit_id)
+        .all()
+    )
+
+    return [
+        schemas.NodeRelayLinkOut(
+            link_id=link.id,
+            exit_id=link.exit_id,
+            exit_name=link.exit_node.name if link.exit_node else "",
+            wg_interface_name=link.wg_interface_name,
+            wg_client_address_v4=link.wg_client_address_v4,
+            wg_client_public_key=link.wg_client_public_key,
+            credentials_count=counts.get(link.exit_id, 0),
+            created_at=link.created_at,
+        )
+        for link in links
+    ]
 
 
 # Freshness window for "who's on the node right now" — matches the

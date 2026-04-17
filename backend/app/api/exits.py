@@ -38,6 +38,7 @@ def _link_to_out(link: models.RelayExitLink) -> schemas.RelayExitLinkOut:
         relay_node_name=link.relay_node.name if link.relay_node else "",
         exit_id=link.exit_id,
         exit_name=link.exit_node.name if link.exit_node else "",
+        wg_interface_name=link.wg_interface_name,
         wg_client_public_key=link.wg_client_public_key,
         wg_client_address_v4=link.wg_client_address_v4,
         created_at=link.created_at,
