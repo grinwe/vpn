@@ -152,76 +152,35 @@
         patterns: "config*.json"
       register: xray_configs_enable
 
+    # Stage the jq program + shell driver on the target. Both live as
+    # plain files in files/ to dodge an Ansible 2.17 parser bug: its
+    # argument splitter treats jq's curly braces and bash brace-groups
+    # as unbalanced Jinja2 blocks and refuses to load the task if
+    # either appears inside a shell module body. Keeping the jq DSL
+    # and the bash wrapper out of tasks/main.yml entirely means the
+    # invocation here is just `command: /tmp/reconcile_xray.sh ...`
+    # — no jinja interaction, no brace ambiguity.
+    - name: Stage jq reconcile program
+      copy:
+        src: xray_reconcile.jq
+        dest: /tmp/xray_reconcile.jq
+        owner: root
+        group: root
+        mode: '0644'
+
+    - name: Stage reconcile shell driver
+      copy:
+        src: reconcile_xray.sh
+        dest: /tmp/reconcile_xray.sh
+        owner: root
+        group: root
+        mode: '0755'
+
     - name: Reconcile Xray outbounds + routing rules
-      shell: |
-        set -euo pipefail
-        CONFIG="{{ item.path }}"
-        TMP=$(mktemp)
-        # --argjson passes fan_out as JSON; --arg passes the primary
-        # interface as a string. Empty primary means "no sockopt on
-        # direct" — should only happen transiently when relay_wg_links
-        # is non-empty but primary_wg_interface returned falsy (stale
-        # DB view); we still strip any lingering sockopt to stay clean.
-        jq \
-          --argjson fan_out '{{ xray_relay_outbounds | default([]) | to_json }}' \
-          --arg     primary '{{ xray_primary_interface | default("") }}' \
-        '
-        # --- outbounds --------------------------------------------------
-        # Drop every stale direct-wg* outbound; keep direct/block/api/etc.
-        .outbounds = (
-          (.outbounds // [])
-          | map(select(((.tag // "") | startswith("direct-wg")) | not))
-        )
-        # Append a fresh direct-wgN freedom outbound per wanted link.
-        | .outbounds += (
-            $fan_out | map({
-              protocol: "freedom",
-              tag: ("direct-" + .interface),
-              streamSettings: {
-                sockopt: {interface: .interface, tcpKeepAliveInterval: 30}
-              }
-            })
-          )
-        # Patch the default direct outbound sockopt (or strip it).
-        | .outbounds = (.outbounds | map(
-            if (.tag == "direct" and .protocol == "freedom") then
-              if $primary != "" then
-                .streamSettings = {
-                  sockopt: {interface: $primary, tcpKeepAliveInterval: 30}
-                }
-              else
-                del(.streamSettings)
-              end
-            else . end
-          ))
-        # --- routing rules ---------------------------------------------
-        # Drop every stale direct-wg* rule; keep api-in etc.
-        | .routing.rules = (
-            ((.routing.rules // [])
-             | map(select(((.outboundTag // "") | startswith("direct-wg")) | not)))
-            + (
-              $fan_out
-              | map({
-                  type: "field",
-                  user: .emails,
-                  outboundTag: ("direct-" + .interface)
-                })
-              | map(select((.user | length) > 0))
-            )
-          )
-        ' "${CONFIG}" > "${TMP}"
-        jq -e . "${TMP}" > /dev/null || { rm -f "${TMP}"; exit 1; }
-        # Skip the mv when the content is identical so ansible
-        # doesn't report a change on every run.
-        if cmp -s "${TMP}" "${CONFIG}"; then
-          rm -f "${TMP}"
-          exit 78
-        fi
-        mv "${TMP}" "${CONFIG}"
-        chown root:nogroup "${CONFIG}" 2>/dev/null || chown root:root "${CONFIG}"
-        chmod 0640 "${CONFIG}"
-      args:
-        executable: /bin/bash
+      command: /tmp/reconcile_xray.sh "{{ item.path }}"
+      environment:
+        FAN_OUT: "{{ xray_relay_outbounds | default([]) | to_json }}"
+        PRIMARY: "{{ xray_primary_interface | default('') }}"
       loop: "{{ xray_configs_enable.files | default([]) }}"
       loop_control:
         label: "{{ item.path | basename }}"
@@ -277,42 +236,30 @@
         patterns: "config*.json"
       register: xray_configs_disable
 
+    - name: Stage jq unpatch program
+      copy:
+        src: xray_unpatch.jq
+        dest: /tmp/xray_unpatch.jq
+        owner: root
+        group: root
+        mode: '0644'
+
+    - name: Stage unpatch shell driver
+      copy:
+        src: unpatch_xray.sh
+        dest: /tmp/unpatch_xray.sh
+        owner: root
+        group: root
+        mode: '0755'
+
     - name: Unpatch sockopt + strip fan-out from Xray configs
       # G.6: in addition to stripping direct's sockopt, also drop any
       # ``direct-wg*`` outbounds and routing rules left over from a
       # multi-link state. Full teardown path: relay previously had
       # wg0+wg1, admin detached both — we want the config back to
-      # "direct + block" with no sockopt.
-      shell: |
-        set -euo pipefail
-        CONFIG="{{ item.path }}"
-        TMP=$(mktemp)
-        jq '
-          .outbounds = (
-            (.outbounds // [])
-            | map(select(((.tag // "") | startswith("direct-wg")) | not))
-            | map(
-                if (.tag == "direct" and .protocol == "freedom")
-                then del(.streamSettings)
-                else .
-                end
-              )
-          )
-          | .routing.rules = (
-              (.routing.rules // [])
-              | map(select(((.outboundTag // "") | startswith("direct-wg")) | not))
-            )
-        ' "${CONFIG}" > "${TMP}"
-        jq -e . "${TMP}" > /dev/null || { rm -f "${TMP}"; exit 1; }
-        if cmp -s "${TMP}" "${CONFIG}"; then
-          rm -f "${TMP}"
-          exit 78
-        fi
-        mv "${TMP}" "${CONFIG}"
-        chown root:nogroup "${CONFIG}" 2>/dev/null || chown root:root "${CONFIG}"
-        chmod 0640 "${CONFIG}"
-      args:
-        executable: /bin/bash
+      # "direct + block" with no sockopt. Same shell-script pattern
+      # as the enable branch — see the comment on the reconcile task.
+      command: /tmp/unpatch_xray.sh "{{ item.path }}"
       loop: "{{ xray_configs_disable.files }}"
       loop_control:
         label: "{{ item.path | basename }}"
