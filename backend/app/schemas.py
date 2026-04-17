@@ -1,6 +1,23 @@
-from datetime import datetime
-from typing import Any, List, Optional
-from pydantic import BaseModel, Field, field_validator
+from datetime import datetime, timezone
+from typing import Annotated, Any, List, Optional
+from pydantic import BaseModel, Field, PlainSerializer, field_validator
+
+
+def _iso_utc_z(v: datetime) -> str:
+    """Сериализуем naive/aware datetime как ISO 8601 UTC с хвостовым ``Z``.
+
+    В БД колонки DateTime naive (см. ``time_utils.utcnow`` — хранится UTC
+    без tzinfo). Pydantic по умолчанию отдаёт naive как строку без суффикса,
+    а ``new Date("...")`` в браузере трактует такой ISO как local-time —
+    и admin UI видит возраст на ``TZ_offset`` минут больше реального, что
+    ломает арифметические проверки вроде ``observedAgeMin > 15``.
+    """
+    if v.tzinfo is None:
+        v = v.replace(tzinfo=timezone.utc)
+    return v.isoformat().replace("+00:00", "Z")
+
+
+UTCDateTime = Annotated[datetime, PlainSerializer(_iso_utc_z, when_used="json")]
 
 
 class CredentialOut(BaseModel):
@@ -819,10 +836,13 @@ class RelayExitLinkOut(BaseModel):
     # Health telemetry — заполняется worker-тиком
     # run_relay_link_health_tick (см. services/relay_link_health.py).
     # NULL = тик ещё не прошёл / SSH не дошёл / peer не найден в wg.
-    last_handshake_at: datetime | None = None
+    # Используем UTCDateTime — без хвостового ``Z`` браузер парсил бы
+    # строку как local time и админский светофор всегда зажигал бы
+    # красный "ssh N m" = TZ_offset пользователя.
+    last_handshake_at: UTCDateTime | None = None
     last_rx_bytes: int | None = None
     last_tx_bytes: int | None = None
-    last_observed_at: datetime | None = None
+    last_observed_at: UTCDateTime | None = None
 
     class Config:
         from_attributes = True
