@@ -10,6 +10,9 @@ whether keygen is needed.
 """
 from __future__ import annotations
 
+import heapq
+from typing import Any
+
 from fastapi import APIRouter, Depends, Header, HTTPException
 from sqlalchemy import func
 from sqlalchemy.exc import IntegrityError
@@ -529,9 +532,19 @@ def detach_relay(
     drift-reconciliation step in the ``relay_jump_node`` role, any
     remaining ``wgN`` stays up.
 
+    Перед удалением линка все live creds с ``exit_id == exit_id`` и
+    ``node_id == relay.id`` перепиниваются: если остаются другие
+    линки — распределяются least-loaded по ним; если линков больше
+    нет — ``exit_id`` обнуляется в NULL. Без этого шага
+    ``build_xray_relay_outbounds`` выкидывает emails со stale
+    ``exit_id`` из routing rules и юзер идёт по default outbound
+    (direct), а не через оставшийся туннель.
+
     Returns ``task_id`` so the admin UI can surface progress in
-    /tasks. It is ``None`` only if the relay row was already gone
-    (rare — FK cascade order drops the link first).
+    /tasks, plus ``credentials`` summary (migrated count +
+    распределение по exit'ам). ``task_id`` is ``None`` only if the
+    relay row was already gone (rare — FK cascade order drops the
+    link first).
     """
     link = (
         db.query(models.RelayExitLink)
@@ -546,6 +559,95 @@ def detach_relay(
 
     link_id = link.id
     relay = db.get(models.VPNNode, relay_node_id)
+
+    # ── Авто-миграция осиротевших creds ──────────────────────────────
+    # До удаления линка фиксируем, кого надо переносить: каждый живой
+    # cred (``pool_state != revoked``) с ``node_id == relay.id`` и
+    # ``exit_id == exit_id`` указывает на уже отрезаемый exit.
+    # Если у релея остаются другие линки — раскладываем эти creds по
+    # оставшимся exit'ам least-loaded (в памяти, чтобы распределить
+    # пачку равномерно, а не свалить всех на один наименее
+    # загруженный). Если линков больше нет — релей де-факто становится
+    # direct-нодой, чистим ``exit_id`` в NULL, иначе
+    # ``build_xray_relay_outbounds`` будет видеть stale exit_id и
+    # исключать email'ы из routing rules → юзер попадёт на default
+    # outbound без sockopt (= прямой egress из РФ). Ранее этот шаг не
+    # делался вообще — creds жили с указателем на удалённый линк до
+    # следующего ручного switch-exit или миграции.
+    migration_summary: dict[str, Any] = {"migrated": 0, "cleared": 0}
+    orphans = (
+        db.query(models.Credential)
+        .filter(
+            models.Credential.node_id == relay_node_id,
+            models.Credential.exit_id == exit_id,
+            models.Credential.pool_state != models.CredentialPoolState.revoked,
+        )
+        .all()
+    )
+    if orphans:
+        remaining_links = (
+            db.query(models.RelayExitLink)
+            .filter(
+                models.RelayExitLink.relay_node_id == relay_node_id,
+                models.RelayExitLink.id != link.id,
+            )
+            .all()
+        )
+        if remaining_links:
+            orphan_ids = {c.id for c in orphans}
+            counts: dict[int, int] = {rl.exit_id: 0 for rl in remaining_links}
+            rows = (
+                db.query(
+                    models.Credential.exit_id,
+                    func.count(models.Credential.id),
+                )
+                .filter(
+                    models.Credential.node_id == relay_node_id,
+                    models.Credential.exit_id.isnot(None),
+                    models.Credential.pool_state
+                    != models.CredentialPoolState.revoked,
+                    ~models.Credential.id.in_(orphan_ids),
+                )
+                .group_by(models.Credential.exit_id)
+                .all()
+            )
+            for ex_id, cnt in rows:
+                if ex_id in counts:
+                    counts[ex_id] = cnt
+            # Round-robin по heap: (count, exit_id) — при равенстве
+            # exit_id с меньшим id выигрывает (детерминированно между
+            # запусками).
+            heap: list[tuple[int, int]] = [
+                (cnt, ex) for ex, cnt in counts.items()
+            ]
+            heapq.heapify(heap)
+            buckets: dict[int, list[int]] = {}
+            for cred in orphans:
+                cnt, ex = heapq.heappop(heap)
+                buckets.setdefault(ex, []).append(cred.id)
+                heapq.heappush(heap, (cnt + 1, ex))
+            for new_ex, cred_ids in buckets.items():
+                db.query(models.Credential).filter(
+                    models.Credential.id.in_(cred_ids)
+                ).update(
+                    {models.Credential.exit_id: new_ex},
+                    synchronize_session=False,
+                )
+            migration_summary = {
+                "migrated": len(orphans),
+                "distribution": {
+                    str(ex): len(ids) for ex, ids in buckets.items()
+                },
+            }
+        else:
+            db.query(models.Credential).filter(
+                models.Credential.id.in_([c.id for c in orphans])
+            ).update(
+                {models.Credential.exit_id: None},
+                synchronize_session=False,
+            )
+            migration_summary = {"cleared": len(orphans)}
+
     db.delete(link)
     db.flush()
     if relay:
@@ -576,6 +678,11 @@ def detach_relay(
     _audit(
         db, actor, "relay_exit_detached", "relay_exit_link", link_id,
         actor_type=actor_type,
+        metadata={
+            "exit_id": exit_id,
+            "relay_node_id": relay_node_id,
+            "credentials": migration_summary,
+        },
     )
 
     # Stage E — teardown task. Runs bootstrap_exit.yml on the exit
@@ -603,6 +710,9 @@ def detach_relay(
         # task_id lets the admin UI link to /tasks?id=N so the admin
         # sees the ansible run instead of wondering if anything happened.
         "task_id": task_id,
+        # Сколько осиротевших creds переписали и как распределили —
+        # админка показывает это в alert'е после detach'а.
+        "credentials": migration_summary,
     }
 
 

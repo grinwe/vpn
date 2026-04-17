@@ -375,18 +375,39 @@ function ExitLinksPanel({ exitNode }: { exitNode: WGExitNodeOut }) {
         relay_node_id: number;
         deleted: boolean;
         task_id: number | null;
+        credentials: {
+          migrated?: number;
+          cleared?: number;
+          distribution?: Record<string, number>;
+        };
       }>(`/exits/${exitNode.id}/links/${relayId}`),
     onSuccess: (res) => {
       qc.invalidateQueries({ queryKey: ["wg-exit-links", exitNode.id] });
       qc.invalidateQueries({ queryKey: ["wg-exits"] });
       qc.invalidateQueries({ queryKey: ["provisioning-tasks"] });
+      qc.invalidateQueries({ queryKey: ["user-subs"] });
+      const { migrated = 0, cleared = 0, distribution } = res.credentials ?? {};
+      let credMsg = "";
+      if (migrated > 0) {
+        const parts = distribution
+          ? Object.entries(distribution)
+              .map(([ex, n]) => `exit #${ex}: ${n}`)
+              .join(", ")
+          : "";
+        credMsg = `\nПеренесено creds: ${migrated}${parts ? ` (${parts})` : ""}.`;
+      } else if (cleared > 0) {
+        credMsg = `\nОчищен exit_id у ${cleared} creds — это был последний линк, релей становится direct-нодой.`;
+      }
       if (res.task_id) {
         alert(
           `Relay отсоединён. Ansible крутится в фоне, задача #${res.task_id} — ` +
-            `см. вкладку Tasks.`,
+            `см. вкладку Tasks.${credMsg}`,
         );
       } else {
-        alert("Relay отсоединён из БД. Ansible не запущен — relay-нода уже удалена.");
+        alert(
+          "Relay отсоединён из БД. Ansible не запущен — relay-нода уже удалена." +
+            credMsg,
+        );
       }
     },
     onError: (e: Error) => alert(`Ошибка: ${e.message}`),
