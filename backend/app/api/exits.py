@@ -322,6 +322,44 @@ def rebootstrap_exit(
     return {"exit_id": exit_node.id, "task_id": task.id}
 
 
+@router.post("/exits/{exit_id}/diagnose")
+def diagnose_exit(
+    exit_id: int,
+    db: Session = Depends(get_db),
+    admin_token: str = Depends(require_admin),
+    admin_actor: str | None = Header(default=None, alias=ADMIN_ACTOR_HEADER),
+):
+    """Run ``diagnose_exit.yml`` (read-only health probe) on the exit.
+
+    Mirror of :func:`~backend.app.api.nodes.diagnose_node`. Collects
+    ``wg show wg0``, ``wg-quick@wg0`` systemd state, listening UDP
+    sockets and routing/NAT — none of which mutate the exit. The
+    task stdout is surfaced in the admin UI so the operator can see
+    per-peer handshake freshness at a glance. The exit's status is
+    NOT flipped on result (see the ``action == "diagnose"`` guard in
+    ``_handle_task_outcome``) — diagnosing a working exit must never
+    knock it into ``error``.
+    """
+    exit_node = db.get(models.WGExitNode, exit_id)
+    if not exit_node:
+        raise HTTPException(status_code=404, detail="Exit node not found")
+    orchestrator = ProvisioningOrchestrator(db)
+    task = orchestrator.create_task("exit", exit_node.id, "diagnose", {})
+    db.commit()
+    orchestrator.run_task_async(task)
+    actor, actor_type = _resolve_admin_actor(admin_actor)
+    _audit(
+        db,
+        actor,
+        "wg_exit_diagnose",
+        "wg_exit_node",
+        exit_node.id,
+        actor_type=actor_type,
+        metadata={"task_id": task.id},
+    )
+    return {"exit_id": exit_node.id, "task_id": task.id}
+
+
 @router.get("/exits/{exit_id}/links", response_model=list[schemas.RelayExitLinkOut])
 def list_exit_links(
     exit_id: int,

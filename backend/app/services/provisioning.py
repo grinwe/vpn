@@ -1088,13 +1088,27 @@ class ProvisioningOrchestrator:
                     raise RuntimeError("WG exit node not found for provisioning")
                 inventory = build_inventory_for_exit_node(exit_node)
                 exit_vars = _collect_exit_extra_vars(self.db, exit_node)
-                result = run_playbook(
-                    "playbooks/bootstrap_exit.yml",
-                    inventory,
-                    limit=exit_node.name,
-                    extra_vars=exit_vars,
-                    timeout=600,
-                )
+                if task.action == "diagnose":
+                    # Read-only probe — wg show + systemd state + listen
+                    # port assertion. Does not touch configs, so the
+                    # same extra_vars shape is reused (we only need
+                    # wg_exit_port). Status callback skips this action
+                    # so the diagnose run can't flip the exit status.
+                    result = run_playbook(
+                        "playbooks/diagnose_exit.yml",
+                        inventory,
+                        limit=exit_node.name,
+                        extra_vars=exit_vars,
+                        timeout=300,
+                    )
+                else:
+                    result = run_playbook(
+                        "playbooks/bootstrap_exit.yml",
+                        inventory,
+                        limit=exit_node.name,
+                        extra_vars=exit_vars,
+                        timeout=600,
+                    )
             elif task.target_type == "relay_tunnel":
                 # Stage E — reconcile the WireGuard client side of a
                 # relay jump node. Runs two playbooks sequentially so an

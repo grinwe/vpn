@@ -1,0 +1,15 @@
+---
+# Lightweight health probe for a WG exit node. Runs only the
+# check_exit_health role — no config rewrites, no service restarts,
+# safe against a live exit with active peers. Output (wg show, systemd
+# status, listening sockets, routing) lands in the task stdout and is
+# rendered in the admin UI.
+#
+# Required extra vars (same shape as bootstrap_exit.yml, built by
+# services/provisioning._collect_exit_extra_vars):
+#   wg_exit_port  — listen port, defaults to 51820 if unset.
+
+- hosts: wg_exit_nodes
+  become: yes
+  roles:
+    - check_exit_health

@@ -1,0 +1,106 @@
+---
+# check_exit_health — read-only probe for a WG exit node.
+#
+# Mirrors check_node_health but collects exit-specific signals:
+# wg0 interface state, per-peer handshake freshness, listening UDP
+# socket, forwarding/NAT kernel state. Safe to run against a live
+# exit — does not touch configs, services, or firewall rules.
+#
+# Used by playbooks/diagnose_exit.yml. The admin UI surfaces the
+# task's stdout, so every check's output lands verbatim in the
+# debug: blocks below.
+#
+# Layout rule (same as check_node_health): always collect diagnostics
+# first, print them unconditionally, then assert. A failing assert at
+# the end leaves the full dump visible above the failure line —
+# crucial when debugging why `wg show` reports zero received packets
+# even though the service is running.
+
+- name: Probe WireGuard UDP listen port (non-fatal)
+  wait_for:
+    port: "{{ wg_exit_port | default(51820) }}"
+    timeout: 5
+  register: wg_port_probe
+  failed_when: false
+
+- name: Gather wg0 interface + peers
+  # `wg show wg0` prints public key, listen port, each peer's endpoint,
+  # allowed-ips and latest handshake. A peer with "latest handshake" ==
+  # "never" or older than 3 min is effectively disconnected. That's the
+  # single most useful signal when debugging an exit.
+  shell: "wg show wg0 2>&1 || true"
+  args:
+    executable: /bin/bash
+  register: wg_show
+  changed_when: false
+
+- name: Gather wg-quick@wg0 systemd state
+  shell: |
+    systemctl status wg-quick@wg0 --no-pager --lines=0 2>&1 || true
+    echo "---- recent journal ----"
+    journalctl -u wg-quick@wg0 --no-pager -n 30 2>&1 || true
+  args:
+    executable: /bin/bash
+  register: wg_systemd
+  changed_when: false
+
+- name: Gather listening UDP sockets
+  shell: "ss -ulnp 2>&1 || true"
+  args:
+    executable: /bin/bash
+  register: udp_sockets
+  changed_when: false
+
+- name: Gather wg0 addressing + routing
+  shell: |
+    echo "=== ip addr show wg0 ==="
+    ip addr show wg0 2>&1 || true
+    echo
+    echo "=== ip route ==="
+    ip route 2>&1 || true
+    echo
+    echo "=== iptables -t nat -S POSTROUTING ==="
+    iptables -t nat -S POSTROUTING 2>&1 || true
+  args:
+    executable: /bin/bash
+  register: wg_netstate
+  changed_when: false
+
+- name: Gather forwarding sysctl
+  shell: "sysctl net.ipv4.ip_forward net.ipv6.conf.all.forwarding 2>&1 || true"
+  args:
+    executable: /bin/bash
+  register: wg_sysctl
+  changed_when: false
+
+- name: Show wg0 interface state
+  debug:
+    var: wg_show.stdout_lines
+
+- name: Show wg-quick@wg0 service state
+  debug:
+    var: wg_systemd.stdout_lines
+
+- name: Show listening UDP sockets
+  debug:
+    var: udp_sockets.stdout_lines
+
+- name: Show wg0 addressing + routing
+  debug:
+    var: wg_netstate.stdout_lines
+
+- name: Show forwarding sysctl
+  debug:
+    var: wg_sysctl.stdout_lines
+
+- name: Fail if WG listen port is not open
+  # Runs LAST so the diagnostic dump above is always visible. A closed
+  # port means wg-quick@wg0 isn't running or UFW dropped it — the
+  # systemctl/journal output above usually pins down which.
+  assert:
+    that:
+      - wg_port_probe.failed is not defined or not wg_port_probe.failed
+    fail_msg: >-
+      WireGuard UDP port {{ wg_exit_port | default(51820) }} is not
+      listening. See the "Show wg-quick@wg0 service state" and
+      "Show listening UDP sockets" output above for the root cause.

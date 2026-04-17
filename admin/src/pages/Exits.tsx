@@ -96,6 +96,23 @@ export default function Exits() {
     onError: (e: Error) => alert(`Ошибка: ${e.message}`),
   });
 
+  const diagnoseMut = useMutation({
+    mutationFn: (id: number) =>
+      api.post<{ exit_id: number; task_id: number }>(
+        `/exits/${id}/diagnose`,
+        {},
+      ),
+    onSuccess: (res) => {
+      qc.invalidateQueries({ queryKey: ["provisioning-tasks"] });
+      alert(
+        `Диагностика запущена (task #${res.task_id}).\n\n` +
+          "Открой раздел Tasks чтобы увидеть вывод — " +
+          "wg show, systemd, listening sockets, routing.",
+      );
+    },
+    onError: (e: Error) => alert(`Не удалось запустить диагностику: ${e.message}`),
+  });
+
   const toggleExpanded = (id: number) => {
     setExpanded((prev) => {
       const next = new Set(prev);
@@ -228,6 +245,14 @@ export default function Exits() {
                           className="text-xs px-2 py-1 rounded bg-purple-700 hover:bg-purple-600 disabled:opacity-50"
                         >
                           bootstrap
+                        </button>
+                        <button
+                          disabled={diagnoseMut.isPending}
+                          title="Read-only: wg show, systemd, routing, listen port — статус exit'а не меняется"
+                          onClick={() => diagnoseMut.mutate(e.id)}
+                          className="text-xs px-2 py-1 rounded bg-slate-700 hover:bg-slate-600 disabled:opacity-50"
+                        >
+                          diagnose
                         </button>
                         <button
                           disabled={deleteMut.isPending || e.peers_count > 0}
