@@ -143,6 +143,7 @@ TICK_IDS = {
     "app.worker.run_balance_charge_tick": "tick-balance-charge",
     "app.worker.run_traffic_stats_tick": "tick-traffic-stats",
     "app.worker.run_user_health_ping_tick": "tick-health-ping",
+    "app.worker.run_relay_link_health_tick": "tick-relay-link-health",
 }
 
 
