@@ -640,6 +640,13 @@ class RelayExitLink(Base):
             "wg_interface_name",
             name="uq_relay_exit_links_relay_iface",
         ),
+        # Защита от дублей (relay, exit) — до 0031 read-then-insert
+        # guard в attach_relay мог пропустить параллельный запрос.
+        UniqueConstraint(
+            "relay_node_id",
+            "exit_id",
+            name="uq_relay_exit_links_relay_exit",
+        ),
     )
 
     id = Column(Integer, primary_key=True)

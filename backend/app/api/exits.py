@@ -12,6 +12,7 @@ from __future__ import annotations
 
 from fastapi import APIRouter, Depends, Header, HTTPException
 from sqlalchemy import func
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from .. import models, schemas
@@ -461,7 +462,22 @@ def attach_relay(
     # longer reads it; the multi-link case wins last-writer here,
     # which is fine because the field is only used as a boolean.
     relay.relay_config = relay_config
-    db.commit()
+    try:
+        db.commit()
+    except IntegrityError as exc:
+        # Read-then-insert guard выше не race-safe: параллельный
+        # POST для той же (relay, exit) пары мог проскочить. БД
+        # ловит такое через UNIQUE (uq_relay_exit_links_relay_exit,
+        # миграция 0031) — конвертим в 409 Conflict, чтобы клиент
+        # увидел привычный код вместо 500.
+        db.rollback()
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"Relay {relay.name} is already attached to exit "
+                f"{exit_node.name} (race на параллельном attach)"
+            ),
+        ) from exc
     db.refresh(link)
 
     actor, actor_type = _resolve_admin_actor(admin_actor)
