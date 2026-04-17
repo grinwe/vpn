@@ -108,6 +108,11 @@ def _subscriptions_for_user(user_id: int, db: Session) -> list[schemas.Subscript
             if cred.is_active and cred.exit_id is not None:
                 current_exit_id = cred.exit_id
                 break
+        current_exit_name: str | None = None
+        if current_exit_id is not None:
+            exit_row = db.get(models.WGExitNode, current_exit_id)
+            if exit_row is not None:
+                current_exit_name = exit_row.name
         item = schemas.SubscriptionOut(
             id=sub.id,
             plan_name=sub.plan.name,
@@ -124,6 +129,7 @@ def _subscriptions_for_user(user_id: int, db: Session) -> list[schemas.Subscript
             devices=[schemas.DeviceOut.from_orm(d) for d in sub.devices],
             sharing_blocked=_sub_sharing_blocked(db, sub),
             current_exit_id=current_exit_id,
+            current_exit_name=current_exit_name,
         )
         result.append(item)
     return result

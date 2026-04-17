@@ -253,6 +253,10 @@ class SubscriptionOut(BaseModel):
     # dropdown and show which exit the sub egresses through today.
     # NULL for legacy 1:1 relays and warm-pool bundles.
     current_exit_id: int | None = None
+    # Имя exit-ноды для current_exit_id — рядом с node в админке,
+    # чтобы было видно куда юзер выходит после туннеля. NULL в тех же
+    # случаях, что и current_exit_id (плюс если exit-нода удалена).
+    current_exit_name: str | None = None
 
 
 class SubscriptionMigrateIn(BaseModel):

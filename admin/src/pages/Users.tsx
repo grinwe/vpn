@@ -671,6 +671,21 @@ export default function Users() {
                       <div className="text-slate-400">
                         {s.node} ({s.region}) · {s.status}
                       </div>
+                      {/* Exit-нода для текущего роутинга юзера. Показываем
+                          только если есть current_exit_id — на legacy 1:1
+                          релеях поле NULL, показывать "exit: —" шумно. */}
+                      {s.current_exit_id != null && (
+                        <div className="text-slate-400 text-xs">
+                          exit:{" "}
+                          {s.current_exit_name ?? `#${s.current_exit_id}`}
+                          {s.current_exit_name && (
+                            <span className="text-slate-500">
+                              {" "}
+                              (#{s.current_exit_id})
+                            </span>
+                          )}
+                        </div>
+                      )}
                       <div className="text-slate-500 text-xs">
                         до {new Date(s.expires_at).toLocaleDateString()}
                       </div>

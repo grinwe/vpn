@@ -154,6 +154,9 @@ export interface SubscriptionOut {
   // NULL on legacy 1:1 relays where the outbound is implicit. Used by
   // the admin switch-exit dropdown to exclude the current exit.
   current_exit_id?: number | null;
+  // Имя exit-ноды для current_exit_id — рядом с node в карточке
+  // подписки, чтобы админ видел текущий выход без доп. запросов.
+  current_exit_name?: string | null;
 }
 
 export interface SubscriptionMigrateIn {
