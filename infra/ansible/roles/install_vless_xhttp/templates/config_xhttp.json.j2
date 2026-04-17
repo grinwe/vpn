@@ -28,7 +28,7 @@
         "type": "field",
         "inboundTag": ["api-in"],
         "outboundTag": "api"
-      }{% for _rule in _fan_out %},
+      }{% for _rule in _fan_out if _rule.emails %},
       {
         "type": "field",
         "user": {{ _rule.emails | to_json }},

@@ -75,25 +75,34 @@
       loop_control:
         label: "{{ item.interface }}"
 
-    # Retry with backoff — after the exit peer list was (re)applied
-    # earlier in the same relay_tunnel run, wg needs a few seconds
-    # per link to handshake. If still down after ~30s, fail the play
-    # loudly so a broken tunnel cannot masquerade as a successful
-    # bootstrap.
-    - name: Test tunnel connectivity per link
+    # Advisory per-link connectivity check. До этого curl валил всю
+    # таску если ХОТЬ ОДИН линк не хэндшейкался — то есть один
+    # сломанный старый туннель блокировал admin-операции по всем
+    # остальным парам (attach новой ноды, switch юзера между exit'ами,
+    # reconnect другого линка). Теперь сбой curl'а логируем, но play
+    # не рушим: out-of-band health tick (services/relay_link_health.py)
+    # в бэкенде раз в 5 минут фиксирует latest-handshake по каждому
+    # peer и красит индикатор в админке, так что «жив ли туннель»
+    # видно без этого синхронного теста.
+    - name: Test tunnel connectivity per link (advisory)
       command: curl -s --interface {{ item.interface }} --connect-timeout 5 https://ifconfig.me
       loop: "{{ relay_wg_links }}"
       loop_control:
         label: "{{ item.interface }}"
       register: tunnel_test
       changed_when: false
-      retries: 6
+      failed_when: false
+      retries: 3
       delay: 5
       until: tunnel_test.rc == 0
 
     - name: Report tunnel status per link
       debug:
-        msg: "WG {{ item.item.interface }} UP — exit IP: {{ item.stdout }}"
+        msg: >-
+          WG {{ item.item.interface }}
+          {% if item.rc == 0 %}UP — exit IP: {{ item.stdout }}
+          {% else %}DOWN (curl rc={{ item.rc }}) — см. health-индикатор в админке
+          {% endif %}
       loop: "{{ tunnel_test.results }}"
       loop_control:
         label: "{{ item.item.interface }}"

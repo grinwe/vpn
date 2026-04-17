@@ -2118,11 +2118,14 @@ class ProvisioningOrchestrator:
         independent of any in-flight per-device edits that could
         race a per-device ``manage_vless_*_user.sh`` patch.
 
-        We deliberately skip ``exit_id`` in the task payload so the
-        executor's step 1 (``bootstrap_exit.yml`` — peer list
-        rewrite on the exit's wg0.conf) is a no-op: the exit's
-        peer membership hasn't changed, only which email maps to
-        which existing wgN on the relay side.
+        ``exit_id`` передаём в payload: peer membership на exit'е
+        действительно не меняется, но bootstrap_exit заодно гонит
+        ``wg syncconf`` — если running state WG на целевом exit'е
+        разошёлся с диском (handler-скип после ok=unchanged, как
+        ловили на батч-attach, см. коммит 6c849e6), именно syncconf
+        его чинит. Иначе свежий переключённый юзер попадал бы на
+        exit, где peer'а нет в running state → рукопожатие не
+        доходит → юзер видит таймауты, хотя БД говорит «переехал».
 
         Clients keep their VLESS UUID and sub_token; only the xray
         outbound changes, so the visible effect for the user is an
@@ -2170,6 +2173,7 @@ class ProvisioningOrchestrator:
             node.id,
             "apply",
             {
+                "exit_id": new_exit_id,
                 "switch_subscription_id": subscription.id,
                 "new_exit_id": new_exit_id,
                 "new_interface": link.wg_interface_name,
