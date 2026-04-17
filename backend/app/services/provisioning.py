@@ -27,6 +27,7 @@ from .ansible_runner import (
     build_inventory_for_node,
     run_playbook,
 )
+from .relay import choose_exit_for_relay
 
 logger = logging.getLogger(__name__)
 TASK_STATUS_COUNTER = Counter("vpn_provisioning_tasks_total", "Provisioning tasks processed", ["status"])
@@ -1344,6 +1345,11 @@ class ProvisioningOrchestrator:
         self.db.add(device)
         self.db.flush()
 
+        # G.4: on a relay node, pick the least-loaded exit up front so
+        # every credential in this bundle routes through the same egress
+        # (xray will map user UUID → outboundTag → wgN in G.6). ``None``
+        # for non-relay nodes; caller treats it as "leave exit_id NULL".
+        bundle_exit_id = choose_exit_for_relay(self.db, node)
         protocols_payload: list[dict[str, Any]] = []
         for cfg in enabled_configs:
             if cfg.protocol == models.VPNConfigProtocol.shadowtls_ss:
@@ -1366,6 +1372,7 @@ class ProvisioningOrchestrator:
                     device_id=device.id,
                     config_id=cfg.id,
                     node_id=node.id,
+                    exit_id=bundle_exit_id,
                     proto=cfg.protocol.value,
                     config_text=encrypt(cred_text),
                     access_username=username,
@@ -1495,12 +1502,29 @@ class ProvisioningOrchestrator:
                     node, new_config, secrets.token_urlsafe(12)
                 )
 
+            # G.4: reuse the exit_id of an existing sibling credential on
+            # this device so backfilled protos route through the same exit
+            # as the user's VLESS cred. Falls back to least-loaded if this
+            # is the first cred on a relay (rare — usually device already
+            # has at least one proto's cred).
+            sibling_exit = next(
+                (
+                    c.exit_id
+                    for c in device.credentials
+                    if c.node_id == node.id and c.exit_id is not None
+                ),
+                None,
+            )
+            if sibling_exit is None:
+                sibling_exit = choose_exit_for_relay(self.db, node)
+
             self.db.add(
                 models.Credential(
                     subscription_id=device.subscription_id,
                     device_id=device.id,
                     config_id=new_config.id,
                     node_id=node.id,
+                    exit_id=sibling_exit,
                     proto=proto.value,
                     config_text=encrypt(cred_text),
                     access_username=username,
@@ -1750,6 +1774,9 @@ class ProvisioningOrchestrator:
         self.db.add(device)
         self.db.flush()
 
+        # G.4: fresh bundle on (possibly new) node — pick least-loaded
+        # exit once so all protos route through the same egress.
+        bundle_exit_id = choose_exit_for_relay(self.db, node)
         protocols_payload: list[dict[str, Any]] = []
         for cfg in enabled_configs:
             if cfg.protocol == models.VPNConfigProtocol.shadowtls_ss:
@@ -1772,6 +1799,7 @@ class ProvisioningOrchestrator:
                     device_id=device.id,
                     config_id=cfg.id,
                     node_id=node.id,
+                    exit_id=bundle_exit_id,
                     proto=cfg.protocol.value,
                     config_text=encrypt(cred_text),
                     access_username=username,

@@ -45,6 +45,7 @@ from .. import models
 from ..security import encrypt
 from ..time_utils import utcnow
 from .ansible_runner import build_inventory_for_node, run_playbook
+from .relay import choose_exit_for_relay
 
 logger = logging.getLogger(__name__)
 
@@ -168,6 +169,11 @@ def warm_one_bundle(db: Session, node: models.VPNNode) -> int | None:
     password = secrets.token_urlsafe(12)
     user_uuid = str(uuid.uuid4())
 
+    # G.4: pick the least-loaded exit for this whole bundle so all
+    # protocols of one identity share a single egress. ``None`` on
+    # non-relay nodes — legacy single-exit semantics preserved.
+    bundle_exit_id = choose_exit_for_relay(db, node)
+
     protocols_payload: list[dict[str, Any]] = []
     creds_to_insert: list[models.Credential] = []
     for cfg in enabled:
@@ -180,6 +186,7 @@ def warm_one_bundle(db: Session, node: models.VPNNode) -> int | None:
                 device_id=None,
                 config_id=cfg.id,
                 node_id=node.id,
+                exit_id=bundle_exit_id,
                 proto=cfg.protocol.value,
                 config_text=encrypt(cred_text),
                 access_username=username,

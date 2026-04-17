@@ -114,3 +114,80 @@ def build_relay_config(
         "wg_endpoint": f"{exit_node.host}:{exit_node.wg_port}",
         "wg_exit_public_key": exit_node.wg_public_key,
     }
+
+
+# ── G.4 multi-exit helpers ────────────────────────────────────────────
+# Picked up by the credential creation paths (cold + warm-pool) so that
+# every cred already carries the exit it should egress through. In the
+# 1:1 case (legacy) this is just "the single attached exit"; once G.5
+# lifts the attach guard it becomes real least-loaded balancing.
+
+def choose_exit_for_relay(
+    db: Session, relay: "models.VPNNode"
+) -> int | None:
+    """Pick the least-loaded ``exit_id`` among this relay's active links.
+
+    Counts live credentials per exit among credentials bound to this
+    relay's node_id (``pool_state != revoked`` + ``is_active = True``)
+    and returns the exit with the lowest count. Ties break by exit_id
+    ascending so the choice is deterministic under equal load.
+
+    Returns ``None`` when the relay has no links — the caller treats
+    this as "don't set exit_id" (legacy path, relay's own egress).
+    """
+    links = (
+        db.query(models.RelayExitLink)
+        .filter(models.RelayExitLink.relay_node_id == relay.id)
+        .all()
+    )
+    if not links:
+        return None
+    if len(links) == 1:
+        return links[0].exit_id
+
+    from sqlalchemy import func as _func
+
+    counts: dict[int, int] = {link.exit_id: 0 for link in links}
+    rows = (
+        db.query(models.Credential.exit_id, _func.count(models.Credential.id))
+        .filter(
+            models.Credential.node_id == relay.id,
+            models.Credential.exit_id.isnot(None),
+            models.Credential.is_active.is_(True),
+            models.Credential.pool_state != models.CredentialPoolState.revoked,
+        )
+        .group_by(models.Credential.exit_id)
+        .all()
+    )
+    for exit_id, cnt in rows:
+        if exit_id in counts:
+            counts[exit_id] = cnt
+
+    return min(counts.items(), key=lambda kv: (kv[1], kv[0]))[0]
+
+
+def next_wg_interface_name(db: Session, relay_node_id: int) -> str:
+    """Smallest free ``wgN`` interface name for a new link on this relay.
+
+    Walks the relay's existing ``RelayExitLink`` rows, collects their
+    ``wg_interface_name``, and returns the first ``wg{N}`` that isn't
+    taken starting from ``wg0``. Used by G.5+ attach flow once the
+    1:1 guard lifts; in the interim the attach endpoint still short-
+    circuits on the first "already attached" check and this helper is
+    exercised only by unit tests.
+    """
+    taken = {
+        name
+        for (name,) in (
+            db.query(models.RelayExitLink.wg_interface_name)
+            .filter(models.RelayExitLink.relay_node_id == relay_node_id)
+            .all()
+        )
+    }
+    for n in range(128):
+        candidate = f"wg{n}"
+        if candidate not in taken:
+            return candidate
+    raise RelayAllocationError(
+        f"Relay {relay_node_id} has exhausted wg0..wg127 interface names"
+    )
