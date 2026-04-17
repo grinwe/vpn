@@ -447,77 +447,173 @@ function AttachRelayForm({
   loadingNodes: boolean;
   onDone: () => void;
 }) {
-  const [relayId, setRelayId] = useState<string>("");
-  const [address, setAddress] = useState("");
+  // Мультивыбор: чекбоксы по каждой node, кнопка прикрепляет всё
+  // выбранное одним батчем. Ручной ввод WG client addr убран —
+  // смысла при массовом прикреплении нет, backend сам выделяет
+  // свободные /32.
+  const [selected, setSelected] = useState<Set<number>>(new Set());
   const [err, setErr] = useState<string | null>(null);
+  // Гоним POST'ы последовательно: backend allocate_client_address
+  // не защищён от гонки, параллельные запросы могут выдать один
+  // и тот же /32 и упасть на уникальном индексе.
+  const [progress, setProgress] = useState<{
+    done: number;
+    total: number;
+    current: string | null;
+    failures: { name: string; error: string }[];
+  } | null>(null);
 
-  const mutation = useMutation({
-    mutationFn: (body: Record<string, unknown>) =>
-      api.post<RelayExitLinkOut>(`/exits/${exitId}/links`, body),
-    onSuccess: onDone,
-    onError: (e: Error) =>
-      setErr(e instanceof ApiError ? `${e.status}: ${e.message}` : e.message),
-  });
+  function toggle(id: number) {
+    setSelected((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  }
 
-  function submit(e: React.FormEvent) {
+  function selectAll() {
+    setSelected(new Set(nodes.map((n) => n.id)));
+  }
+
+  function clearAll() {
+    setSelected(new Set());
+  }
+
+  async function submit(e: React.FormEvent) {
     e.preventDefault();
     setErr(null);
-    if (!relayId) {
-      setErr("Выберите relay ноду");
+    if (selected.size === 0) {
+      setErr("Выберите хотя бы одну relay ноду");
       return;
     }
-    const body: Record<string, unknown> = {
-      relay_node_id: Number(relayId),
-    };
-    if (address) body.wg_client_address_v4 = address;
-    mutation.mutate(body);
+    const chosen = nodes.filter((n) => selected.has(n.id));
+    const failures: { name: string; error: string }[] = [];
+    setProgress({ done: 0, total: chosen.length, current: null, failures });
+    for (let i = 0; i < chosen.length; i++) {
+      const node = chosen[i];
+      setProgress({
+        done: i,
+        total: chosen.length,
+        current: node.name,
+        failures,
+      });
+      try {
+        await api.post<RelayExitLinkOut>(`/exits/${exitId}/links`, {
+          relay_node_id: node.id,
+        });
+      } catch (apiErr) {
+        const msg =
+          apiErr instanceof ApiError
+            ? `${apiErr.status}: ${apiErr.message}`
+            : apiErr instanceof Error
+              ? apiErr.message
+              : String(apiErr);
+        failures.push({ name: node.name, error: msg });
+      }
+    }
+    setProgress({
+      done: chosen.length,
+      total: chosen.length,
+      current: null,
+      failures,
+    });
+    if (failures.length === 0) {
+      onDone();
+    } else {
+      setErr(
+        `Прикреплено ${chosen.length - failures.length}/${chosen.length}. ` +
+          `Ошибки: ${failures.map((f) => `${f.name} — ${f.error}`).join("; ")}`,
+      );
+    }
   }
+
+  const running = progress !== null && progress.done < progress.total;
 
   return (
     <form
       onSubmit={submit}
-      className="p-3 rounded border border-slate-700 bg-slate-900 grid grid-cols-2 gap-3"
+      className="p-3 rounded border border-slate-700 bg-slate-900 space-y-3"
     >
-      <label className="flex flex-col">
-        <span className="text-slate-400 text-xs mb-1">Relay node</span>
-        <select
-          value={relayId}
-          onChange={(e) => setRelayId(e.target.value)}
-          className="bg-slate-800 border border-slate-700 rounded px-2 py-1 text-sm"
-        >
-          <option value="">
-            {loadingNodes ? "Загрузка…" : "— выберите relay —"}
-          </option>
-          {nodes.map((n) => (
-            <option key={n.id} value={n.id}>
-              #{n.id} {n.name} ({n.region}, {n.status})
-            </option>
-          ))}
-        </select>
-      </label>
-      <label className="flex flex-col">
-        <span className="text-slate-400 text-xs mb-1">
-          WG client addr (опционально — авто если пусто)
+      <div className="flex items-center justify-between">
+        <span className="text-slate-400 text-xs">
+          Выбрано {selected.size} из {nodes.length} доступных
         </span>
-        <input
-          value={address}
-          onChange={(e) => setAddress(e.target.value)}
-          placeholder="10.77.0.5/32"
-          className="bg-slate-800 border border-slate-700 rounded px-2 py-1 text-sm font-mono"
-        />
-      </label>
+        <div className="flex gap-2 text-xs">
+          <button
+            type="button"
+            onClick={selectAll}
+            disabled={running || nodes.length === 0}
+            className="px-2 py-0.5 rounded bg-slate-700 hover:bg-slate-600 disabled:opacity-50"
+          >
+            Все
+          </button>
+          <button
+            type="button"
+            onClick={clearAll}
+            disabled={running || selected.size === 0}
+            className="px-2 py-0.5 rounded bg-slate-700 hover:bg-slate-600 disabled:opacity-50"
+          >
+            Сброс
+          </button>
+        </div>
+      </div>
 
-      {err && <div className="col-span-2 text-red-400 text-xs">{err}</div>}
-      <div className="col-span-2 flex gap-2 justify-end text-xs">
-        <button type="button" onClick={onDone} className="px-3 py-1 rounded bg-slate-700">
-          Отмена
+      {loadingNodes && <div className="text-slate-400 text-xs">Загрузка…</div>}
+      {!loadingNodes && nodes.length === 0 && (
+        <div className="text-slate-500 text-xs italic">
+          Нет доступных relay-нод для прикрепления.
+        </div>
+      )}
+      {nodes.length > 0 && (
+        <div className="max-h-64 overflow-y-auto border border-slate-700 rounded">
+          {nodes.map((n) => (
+            <label
+              key={n.id}
+              className="flex items-center gap-2 px-2 py-1 text-sm hover:bg-slate-800 cursor-pointer"
+            >
+              <input
+                type="checkbox"
+                checked={selected.has(n.id)}
+                onChange={() => toggle(n.id)}
+                disabled={running}
+              />
+              <span className="font-mono text-slate-200">
+                #{n.id} {n.name}
+              </span>
+              <span className="text-slate-400 text-xs">
+                ({n.region}, {n.status})
+              </span>
+            </label>
+          ))}
+        </div>
+      )}
+
+      {progress && (
+        <div className="text-xs text-slate-300">
+          Прогресс: {progress.done}/{progress.total}
+          {progress.current && ` — сейчас: ${progress.current}`}
+        </div>
+      )}
+      {err && <div className="text-red-400 text-xs">{err}</div>}
+
+      <div className="flex gap-2 justify-end text-xs">
+        <button
+          type="button"
+          onClick={onDone}
+          disabled={running}
+          className="px-3 py-1 rounded bg-slate-700 disabled:opacity-50"
+        >
+          {progress && progress.failures.length > 0 ? "Закрыть" : "Отмена"}
         </button>
         <button
           type="submit"
-          disabled={mutation.isPending}
+          disabled={running || selected.size === 0}
           className="px-3 py-1 rounded bg-green-700 hover:bg-green-600 disabled:opacity-50"
         >
-          Прикрепить
+          {running
+            ? `Прикрепляю… ${progress?.done}/${progress?.total}`
+            : `Прикрепить (${selected.size})`}
         </button>
       </div>
     </form>
