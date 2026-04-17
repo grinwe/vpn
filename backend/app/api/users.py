@@ -100,6 +100,14 @@ def _subscriptions_for_user(user_id: int, db: Session) -> list[schemas.Subscript
         raise HTTPException(status_code=404, detail="Subscriptions not found")
     result = []
     for sub in subs:
+        # First live cred's exit_id: every active cred of a sub is
+        # pinned to the same exit (switch_subscription_exit rewrites
+        # them en masse), so any live cred is representative.
+        current_exit_id: int | None = None
+        for cred in sub.credentials:
+            if cred.is_active and cred.exit_id is not None:
+                current_exit_id = cred.exit_id
+                break
         item = schemas.SubscriptionOut(
             id=sub.id,
             plan_name=sub.plan.name,
@@ -115,6 +123,7 @@ def _subscriptions_for_user(user_id: int, db: Session) -> list[schemas.Subscript
             credentials=[schemas.CredentialOut.from_orm(c) for c in sub.credentials],
             devices=[schemas.DeviceOut.from_orm(d) for d in sub.devices],
             sharing_blocked=_sub_sharing_blocked(db, sub),
+            current_exit_id=current_exit_id,
         )
         result.append(item)
     return result

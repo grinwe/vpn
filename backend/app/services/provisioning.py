@@ -2099,3 +2099,115 @@ class ProvisioningOrchestrator:
         subscription.status = models.SubscriptionStatus.blocked
         self.db.commit()
         return tasks
+
+    def switch_subscription_exit(
+        self,
+        subscription: models.Subscription,
+        new_exit_id: int,
+    ) -> list[models.ProvisioningTask]:
+        """Re-pin every cred of ``subscription`` to a different exit.
+
+        Only valid when the sub lives on a multi-link relay. Updates
+        ``Credential.exit_id`` in DB, then enqueues a ``device.apply``
+        task per live device so provision_device.yml re-runs with the
+        new ``EXIT_INTERFACE`` — manage_vless_*_user.sh strips the
+        email from every ``direct-wg*`` routing rule and re-adds it
+        to ``direct-<new_wgN>``. Clients keep their VLESS UUID and
+        sub_token; only the xray outbound changes, so the visible
+        effect for the user is an exit-IP swap on next reconnect.
+
+        Raises RuntimeError on: sub has no node, node isn't a relay,
+        new_exit_id not in the relay's links, sub has no live devices.
+        """
+        node = subscription.node
+        if node is None:
+            raise RuntimeError("subscription has no node")
+        link = (
+            self.db.query(models.RelayExitLink)
+            .filter(
+                models.RelayExitLink.relay_node_id == node.id,
+                models.RelayExitLink.exit_id == new_exit_id,
+            )
+            .first()
+        )
+        if link is None:
+            raise RuntimeError(
+                f"Exit {new_exit_id} is not attached to relay {node.id}"
+            )
+        new_iface = link.wg_interface_name
+
+        # Update every cred on the sub. Includes revoked ones so the
+        # DB stays consistent — a later reprovision of that device
+        # will naturally skip revoked creds, but their exit_id should
+        # not lag behind the new pin.
+        self.db.query(models.Credential).filter(
+            models.Credential.subscription_id == subscription.id
+        ).update(
+            {models.Credential.exit_id: new_exit_id},
+            synchronize_session=False,
+        )
+        self.db.flush()
+
+        tasks: list[models.ProvisioningTask] = []
+        for device in subscription.devices:
+            if device.status != models.DeviceStatus.active:
+                # Disabled/revoked/failed devices don't serve traffic
+                # — no xray rule to rewrite. They keep the updated
+                # exit_id in DB so any future re-apply uses the new pin.
+                continue
+            live_creds = [c for c in device.credentials if c.is_active]
+            if not live_creds:
+                continue
+
+            uuid_src = next(
+                (c for c in live_creds if c.proto.startswith("vless")),
+                None,
+            )
+            user_uuid = (
+                _extract_vless_uuid(uuid_src.config_text) if uuid_src else None
+            )
+
+            protocols_payload: list[dict[str, Any]] = []
+            seen_proto: set[str] = set()
+            for cred in live_creds:
+                if cred.proto in seen_proto:
+                    continue
+                seen_proto.add(cred.proto)
+                entry: dict[str, Any] = {"proto": cred.proto}
+                if cred.config is not None:
+                    entry["port"] = cred.config.port
+                    if cred.proto == "shadowtls+shadowsocks":
+                        entry["method"] = (cred.config.settings or {}).get(
+                            "method", "chacha20-ietf-poly1305"
+                        )
+                protocols_payload.append(entry)
+
+            task_payload: dict[str, Any] = {
+                "username": device.access_username,
+                "protocols": protocols_payload,
+                "state": "present",
+                "exit_interface": new_iface,
+            }
+            if user_uuid:
+                task_payload["uuid"] = user_uuid
+            # Password only needed by hysteria2; re-using the device's
+            # decrypted hy2 cred would require storing password server-
+            # side. For now we skip hy2 in the switch (xray routing is
+            # the only thing affected by exit change — hy2 egresses
+            # directly on the relay regardless of WG links, see the
+            # "Hysteria2 exits directly" debug in relay_jump_node).
+            task_payload["protocols"] = [
+                p for p in protocols_payload if p["proto"] != "hysteria2"
+            ]
+            if not task_payload["protocols"]:
+                continue
+
+            task = self.create_task(
+                "device", device.id, "apply", task_payload
+            )
+            tasks.append(task)
+
+        self.db.commit()
+        for task in tasks:
+            self.run_task_async(task, node=node)
+        return tasks

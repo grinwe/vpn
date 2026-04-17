@@ -150,6 +150,10 @@ export interface SubscriptionOut {
   // on the node. Computed server-side from AuditLog. Gates the
   // "снять sharing-бан" button in the Users page.
   sharing_blocked?: boolean;
+  // Exit the sub currently egresses through (from Credential.exit_id).
+  // NULL on legacy 1:1 relays where the outbound is implicit. Used by
+  // the admin switch-exit dropdown to exclude the current exit.
+  current_exit_id?: number | null;
 }
 
 export interface SubscriptionMigrateIn {
@@ -163,6 +167,18 @@ export interface SubscriptionMigrateOut {
   new_node_id: number;
   new_node_name: string;
   provisioning_task_id: number | null;
+}
+
+export interface SubscriptionSwitchExitIn {
+  exit_id: number;
+}
+
+export interface SubscriptionSwitchExitOut {
+  subscription_id: number;
+  old_exit_id: number | null;
+  new_exit_id: number;
+  new_interface: string;
+  task_ids: number[];
 }
 
 export interface StatsOut {

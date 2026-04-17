@@ -9,8 +9,10 @@ import {
   api,
   batchBanUsers,
   DeviceOut,
+  NodeRelayLinkOut,
   SubscriptionMigrateOut,
   SubscriptionOut,
+  SubscriptionSwitchExitOut,
   UserOut,
   VPNNodeOut,
   adminTopupByTelegram,
@@ -191,6 +193,22 @@ export default function Users() {
       qc.invalidateQueries({ queryKey: ["provisioning-tasks"] });
     },
     onError: (e: Error) => alert(`Не удалось перевести: ${e.message}`),
+  });
+
+  const switchExit = useMutation({
+    mutationFn: ({ subId, exitId }: { subId: number; exitId: number }) =>
+      api.post<SubscriptionSwitchExitOut>(
+        `/subscriptions/${subId}/switch-exit`,
+        { exit_id: exitId },
+      ),
+    onSuccess: (res) => {
+      alert(
+        `Подписка #${res.subscription_id} переведена на exit #${res.new_exit_id} (${res.new_interface}). Запущено таск: ${res.task_ids.length} — следи в Tasks.`,
+      );
+      qc.invalidateQueries({ queryKey: ["user-subs"] });
+      qc.invalidateQueries({ queryKey: ["provisioning-tasks"] });
+    },
+    onError: (e: Error) => alert(`Не удалось сменить exit: ${e.message}`),
   });
 
   const batchBan = useMutation({
@@ -734,6 +752,12 @@ export default function Users() {
                           mutation={migrateSub}
                         />
                       )}
+                      {(s.status === "active" || s.status === "frozen") && (
+                        <SwitchExitControl
+                          sub={s}
+                          mutation={switchExit}
+                        />
+                      )}
                     </li>
                   ))}
                 </ul>
@@ -874,6 +898,74 @@ function MigrateSubControl({
         className="text-xs px-2 py-1 rounded bg-blue-700 hover:bg-blue-600 disabled:opacity-50"
       >
         переселить
+      </button>
+    </div>
+  );
+}
+
+// Per-sub "switch exit" control for subs living on multi-link relays.
+// Шлёт POST /subscriptions/{id}/switch-exit — бэкенд перепишет
+// Credential.exit_id у всех живых кредов и перезапустит
+// provision_device.yml с новым EXIT_INTERFACE (manage_vless_*_user.sh
+// идемпотентно снимет email со всех direct-wg* и добавит в нужный).
+// sub_token + VLESS UUID не меняются, клиент просто видит другой IP
+// на следующем реконнекте.
+function SwitchExitControl({
+  sub,
+  mutation,
+}: {
+  sub: SubscriptionOut;
+  mutation: {
+    mutate: (args: { subId: number; exitId: number }) => void;
+    isPending: boolean;
+  };
+}) {
+  const [targetId, setTargetId] = useState<string>("");
+  // Links запрашиваются только когда знаем node_id — для удалённых нод
+  // (node_id=null) кнопка смены exit'а бессмысленна.
+  const { data: links } = useQuery<NodeRelayLinkOut[]>({
+    queryKey: ["relay-links", sub.node_id],
+    queryFn: () => api.get(`/nodes/${sub.node_id}/links`),
+    enabled: sub.node_id !== null && sub.node_id !== undefined,
+  });
+  if (sub.node_id == null) return null;
+  // Релей без линков (или нода не релей) = нечего показывать.
+  if (!links || links.length === 0) return null;
+  // Один линк — смена exit'а не имеет смысла, нет куда переключать.
+  if (links.length < 2) return null;
+  const candidates = links.filter((l) => l.exit_id !== sub.current_exit_id);
+  const target = candidates.find((l) => String(l.exit_id) === targetId);
+  return (
+    <div className="mt-2 flex gap-1 items-center">
+      <select
+        value={targetId}
+        onChange={(e) => setTargetId(e.target.value)}
+        className="text-xs px-1 py-0.5 rounded bg-slate-800 border border-slate-700 flex-1"
+      >
+        <option value="">
+          — exit: {sub.current_exit_id ?? "—"} —
+        </option>
+        {candidates.map((l) => (
+          <option key={l.exit_id} value={String(l.exit_id)}>
+            #{l.exit_id} {l.exit_name} ({l.wg_interface_name})
+          </option>
+        ))}
+      </select>
+      <button
+        disabled={mutation.isPending || !target}
+        onClick={() => {
+          if (!target) return;
+          if (
+            confirm(
+              `Сменить exit подписки #${sub.id} на «${target.exit_name}» (#${target.exit_id}, ${target.wg_interface_name})?\n\n` +
+                `Релей остаётся тот же. Все живые девайсы получат перепровижн (xray перепишет routing в direct-${target.wg_interface_name}). VLESS UUID + sub_token сохраняются. Hysteria2 пропускается (идёт напрямую с релея).`,
+            )
+          )
+            mutation.mutate({ subId: sub.id, exitId: target.exit_id });
+        }}
+        className="text-xs px-2 py-1 rounded bg-purple-700 hover:bg-purple-600 disabled:opacity-50"
+      >
+        сменить exit
       </button>
     </div>
   );

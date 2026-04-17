@@ -373,6 +373,98 @@ def migrate_subscription(
     )
 
 
+@router.post(
+    "/subscriptions/{subscription_id}/switch-exit",
+    response_model=schemas.SubscriptionSwitchExitOut,
+)
+def switch_subscription_exit(
+    subscription_id: int,
+    payload: schemas.SubscriptionSwitchExitIn,
+    db: Session = Depends(get_db),
+    admin_token: str = Depends(require_admin),
+    admin_actor: str | None = Header(default=None, alias=ADMIN_ACTOR_HEADER),
+):
+    """Re-pin a subscription's creds to a different exit on the same relay.
+
+    Cheaper than a node migration — the user stays on the same VLESS
+    UUID + sub_token; only the relay's xray routing rule changes to
+    point their email at a different ``direct-wgN`` outbound. Works
+    only on multi-link relays where the target exit is already
+    attached (via ``RelayExitLink``); attaching a new exit first is a
+    separate admin action.
+    """
+    sub = db.get(models.Subscription, subscription_id)
+    if not sub:
+        raise HTTPException(status_code=404, detail="Subscription not found")
+    if sub.status not in (
+        models.SubscriptionStatus.active,
+        models.SubscriptionStatus.frozen,
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Subscription is {sub.status.value}, must be active or frozen",
+        )
+    node = sub.node
+    if node is None:
+        raise HTTPException(status_code=400, detail="Subscription has no node")
+
+    old_exit_id: int | None = None
+    first_cred = (
+        db.query(models.Credential)
+        .filter(
+            models.Credential.subscription_id == sub.id,
+            models.Credential.is_active.is_(True),
+        )
+        .first()
+    )
+    if first_cred is not None:
+        old_exit_id = first_cred.exit_id
+    if old_exit_id == payload.exit_id:
+        raise HTTPException(
+            status_code=400,
+            detail="Subscription is already routed through this exit",
+        )
+
+    orchestrator = ProvisioningOrchestrator(db)
+    try:
+        tasks = orchestrator.switch_subscription_exit(sub, payload.exit_id)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    link = (
+        db.query(models.RelayExitLink)
+        .filter(
+            models.RelayExitLink.relay_node_id == node.id,
+            models.RelayExitLink.exit_id == payload.exit_id,
+        )
+        .first()
+    )
+    actor, actor_type = _resolve_admin_actor(admin_actor)
+    _audit(
+        db,
+        actor,
+        "subscription_exit_switched",
+        "subscription",
+        sub.id,
+        actor_type=actor_type,
+        metadata={
+            "relay_node_id": node.id,
+            "old_exit_id": old_exit_id,
+            "new_exit_id": payload.exit_id,
+            "new_interface": link.wg_interface_name if link else None,
+            "task_count": len(tasks),
+        },
+    )
+    db.commit()
+    return schemas.SubscriptionSwitchExitOut(
+        subscription_id=sub.id,
+        old_exit_id=old_exit_id,
+        new_exit_id=payload.exit_id,
+        new_interface=link.wg_interface_name if link else "",
+        task_ids=[t.id for t in tasks],
+    )
+
+
 @router.post("/subscriptions/{subscription_id}/unblock-sharing")
 def unblock_sharing(
     subscription_id: int,

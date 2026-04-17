@@ -248,6 +248,11 @@ class SubscriptionOut(BaseModel):
     # Used by the admin UI to gate the "снять sharing-бан" button so
     # it only shows when there's actually something to unblock.
     sharing_blocked: bool = False
+    # Current exit (pinned via Credential.exit_id) — first active
+    # cred's exit_id. Lets the UI exclude it from the switch-exit
+    # dropdown and show which exit the sub egresses through today.
+    # NULL for legacy 1:1 relays and warm-pool bundles.
+    current_exit_id: int | None = None
 
 
 class SubscriptionMigrateIn(BaseModel):
@@ -264,6 +269,18 @@ class SubscriptionMigrateOut(BaseModel):
     new_node_id: int
     new_node_name: str
     provisioning_task_id: int | None
+
+
+class SubscriptionSwitchExitIn(BaseModel):
+    exit_id: int
+
+
+class SubscriptionSwitchExitOut(BaseModel):
+    subscription_id: int
+    old_exit_id: int | None
+    new_exit_id: int
+    new_interface: str
+    task_ids: list[int]
 
 
 class NodeBulkMigrateFailure(BaseModel):
