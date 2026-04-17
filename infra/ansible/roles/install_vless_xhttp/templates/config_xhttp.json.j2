@@ -1,3 +1,5 @@
+{% set _fan_out = xray_relay_outbounds | default([]) %}
+{% set _primary = xray_primary_interface | default('') %}
 {
   "log": {
     "loglevel": "info",
@@ -26,7 +28,12 @@
         "type": "field",
         "inboundTag": ["api-in"],
         "outboundTag": "api"
-      }
+      }{% for _rule in _fan_out %},
+      {
+        "type": "field",
+        "user": {{ _rule.emails | to_json }},
+        "outboundTag": "direct-{{ _rule.interface }}"
+      }{% endfor %}
     ]
   },
   "inbounds": [
@@ -75,8 +82,24 @@
   "outbounds": [
     {
       "protocol": "freedom",
-      "tag": "direct"
-    },
+      "tag": "direct"{% if _primary %},
+      "streamSettings": {
+        "sockopt": {
+          "interface": "{{ _primary }}",
+          "tcpKeepAliveInterval": 30
+        }
+      }{% endif %}
+    }{% for _ob in _fan_out %},
+    {
+      "protocol": "freedom",
+      "tag": "direct-{{ _ob.interface }}",
+      "streamSettings": {
+        "sockopt": {
+          "interface": "{{ _ob.interface }}",
+          "tcpKeepAliveInterval": 30
+        }
+      }
+    }{% endfor %},
     {
       "protocol": "blackhole",
       "tag": "block"

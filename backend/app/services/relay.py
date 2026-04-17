@@ -191,3 +191,124 @@ def next_wg_interface_name(db: Session, relay_node_id: int) -> str:
     raise RelayAllocationError(
         f"Relay {relay_node_id} has exhausted wg0..wg127 interface names"
     )
+
+
+# ── G.6 xray fan-out helpers ──────────────────────────────────────────
+# Multi-link relays need one freedom outbound per attached exit (each
+# with its own ``sockopt.interface: wgN``) plus routing rules matching
+# user emails to the right outbound tag. The single-link and non-relay
+# cases return empty lists — the template and role degrade to the
+# legacy (pre-G.6) shape transparently.
+
+def resolve_exit_interface(
+    db: Session, relay_node_id: int, exit_id: int | None
+) -> str | None:
+    """Return ``wg_interface_name`` for ``(relay, exit)`` — or ``None``.
+
+    Used by the per-device provisioning path so ``provision_device.yml``
+    can tell the manage_vless_*_user.sh scripts which exit a newly
+    added user should route through. Returns ``None`` when:
+
+      * ``exit_id`` is ``None`` (cred is not pinned to an exit — warm-
+        pool cold entries, legacy pre-G.4 creds, direct nodes);
+      * the relay has no link to that exit (stale exit_id after
+        detach — caller should treat as "default outbound").
+    """
+    if exit_id is None:
+        return None
+    row = (
+        db.query(models.RelayExitLink.wg_interface_name)
+        .filter(
+            models.RelayExitLink.relay_node_id == relay_node_id,
+            models.RelayExitLink.exit_id == exit_id,
+        )
+        .first()
+    )
+    return row[0] if row else None
+
+
+def build_xray_relay_outbounds(
+    db: Session, relay: "models.VPNNode"
+) -> list[dict[str, Any]]:
+    """Build the ``xray_relay_outbounds`` fan-out list for this relay.
+
+    Each entry drives both a freedom outbound (tag ``direct-wgN``,
+    ``sockopt.interface: wgN``) and a routing rule
+    (``user: [emails…]  outboundTag: direct-wgN``) in the three
+    xray config templates.
+
+    Only multi-link relays return a non-empty list — single-link
+    relays keep the legacy "direct + sockopt patch on the only wgN"
+    flow, and direct nodes return ``[]``. Credentials with
+    ``exit_id is NULL`` (cold warm-pool, legacy) are excluded so they
+    fall through to the default ``direct`` outbound; the role picks a
+    primary interface for ``direct`` so even unclassified traffic
+    still egresses via tunnel.
+    """
+    links = (
+        db.query(models.RelayExitLink)
+        .filter(models.RelayExitLink.relay_node_id == relay.id)
+        .order_by(models.RelayExitLink.wg_interface_name)
+        .all()
+    )
+    if len(links) <= 1:
+        return []
+    iface_by_exit = {link.exit_id: link.wg_interface_name for link in links}
+
+    # Include warm bundles (``pool_state=warm``, ``is_active=False``
+    # pre-assignment) alongside assigned creds. Warm emails are already
+    # in the xray clients[] (added by warm_one_bundle's ansible run),
+    # so they must also appear in the routing rule — otherwise a
+    # site.yml re-render would drop the rule and route the user
+    # through ``direct`` (fallback) instead of their pinned exit.
+    from sqlalchemy import or_ as _or
+    rows = (
+        db.query(
+            models.Credential.exit_id,
+            models.Credential.access_username,
+        )
+        .filter(
+            models.Credential.node_id == relay.id,
+            models.Credential.exit_id.isnot(None),
+            _or(
+                models.Credential.is_active.is_(True),
+                models.Credential.pool_state == models.CredentialPoolState.warm,
+            ),
+            models.Credential.pool_state != models.CredentialPoolState.revoked,
+        )
+        .all()
+    )
+    emails_by_iface: dict[str, set[str]] = {
+        iface: set() for iface in iface_by_exit.values()
+    }
+    for exit_id, username in rows:
+        iface = iface_by_exit.get(exit_id)
+        if iface is None or not username:
+            continue
+        emails_by_iface[iface].add(username)
+
+    return [
+        {"interface": iface, "emails": sorted(emails_by_iface[iface])}
+        for iface in sorted(emails_by_iface.keys())
+    ]
+
+
+def primary_wg_interface(
+    db: Session, relay_node_id: int
+) -> str | None:
+    """Return the interface used as the default ``direct`` sockopt.
+
+    Picks the smallest ``wgN`` among this relay's links — deterministic
+    across runs. ``None`` for non-relay nodes (direct egress — no
+    sockopt on the outbound). In the single-link case the caller can
+    skip emitting ``xray_relay_outbounds`` entirely; the template
+    still needs this value to render the ``direct`` outbound's
+    sockopt so unclassified UUIDs tunnel out too.
+    """
+    row = (
+        db.query(models.RelayExitLink.wg_interface_name)
+        .filter(models.RelayExitLink.relay_node_id == relay_node_id)
+        .order_by(models.RelayExitLink.wg_interface_name)
+        .first()
+    )
+    return row[0] if row else None

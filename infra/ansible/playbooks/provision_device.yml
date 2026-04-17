@@ -68,6 +68,11 @@
     - name: Add VLESS+Reality user
       command: >-
         /usr/local/sbin/manage_vless_user.sh add {{ username }} {{ uuid }}
+      # G.6 — manage_vless_user.sh reads EXIT_INTERFACE to attach the
+      # email to the matching direct-wgN routing rule on multi-link
+      # relays. Empty/unset on single-link/direct nodes.
+      environment:
+        EXIT_INTERFACE: "{{ exit_interface | default('') }}"
       loop: "{{ protocols }}"
       when:
         - item.proto == 'vless-reality'
@@ -77,6 +82,10 @@
     - name: Remove VLESS+Reality user
       command: >-
         /usr/local/sbin/manage_vless_user.sh del {{ username }}
+      # G.6 — del strips the email from every direct-wg* rule
+      # regardless of EXIT_INTERFACE; passing the var is harmless.
+      environment:
+        EXIT_INTERFACE: "{{ exit_interface | default('') }}"
       loop: "{{ protocols }}"
       when:
         - item.proto == 'vless-reality'
@@ -100,6 +109,8 @@
     - name: Add VLESS+WS+CDN user
       command: >-
         /usr/local/sbin/manage_vless_ws_user.sh add {{ username }} {{ uuid }}
+      environment:
+        EXIT_INTERFACE: "{{ exit_interface | default('') }}"
       loop: "{{ protocols }}"
       when:
         - item.proto == 'vless-ws-cdn'
@@ -109,6 +120,8 @@
     - name: Remove VLESS+WS+CDN user
       command: >-
         /usr/local/sbin/manage_vless_ws_user.sh del {{ username }}
+      environment:
+        EXIT_INTERFACE: "{{ exit_interface | default('') }}"
       loop: "{{ protocols }}"
       when:
         - item.proto == 'vless-ws-cdn'
@@ -132,6 +145,8 @@
     - name: Add VLESS+XHTTP user
       command: >-
         /usr/local/sbin/manage_vless_xhttp_user.sh add {{ username }} {{ uuid }}
+      environment:
+        EXIT_INTERFACE: "{{ exit_interface | default('') }}"
       loop: "{{ protocols }}"
       when:
         - item.proto == 'vless-xhttp'
@@ -141,6 +156,8 @@
     - name: Remove VLESS+XHTTP user
       command: >-
         /usr/local/sbin/manage_vless_xhttp_user.sh del {{ username }}
+      environment:
+        EXIT_INTERFACE: "{{ exit_interface | default('') }}"
       loop: "{{ protocols }}"
       when:
         - item.proto == 'vless-xhttp'

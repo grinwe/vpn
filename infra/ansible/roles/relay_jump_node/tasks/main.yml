@@ -9,16 +9,19 @@
 #     /etc/wireguard/{{item.interface}}.conf + start wg-quick@{{item.interface}}.
 #   - Reconcile drift: remove any /etc/wireguard/wg*.conf not in the list.
 #   - Test connectivity per interface.
-#   - Xray sockopt patching happens only when exactly one link is
-#     active (legacy 1:1 case). Multi-link xray config is the job of
-#     G.6 — leave the config alone so the upcoming role can rewrite
-#     outbounds + routing without fighting with a stale sockopt.
+#   - Reconcile Xray configs (G.6): set the ``direct`` outbound's
+#     sockopt to ``xray_primary_interface`` (smallest wgN), and for
+#     each entry in ``xray_relay_outbounds`` install a
+#     ``direct-wgN`` freedom outbound with its own sockopt plus a
+#     routing rule pinning user emails to that outbound. Stale
+#     ``direct-wg*`` outbounds/rules (from a demoted multi-link
+#     relay) are stripped in the same pass.
 #
 # Mode "disable" (relay_wg_links empty or missing):
 #   - Stop + disable every wg-quick@wgN whose config exists.
 #   - Remove /etc/wireguard/wg*.conf.
-#   - Unpatch Xray: strip streamSettings.sockopt from the freedom
-#     outbound if present.
+#   - Unpatch Xray: strip sockopt from the default ``direct``
+#     outbound and drop every ``direct-wg*`` outbound/rule.
 #
 # The role runs unconditionally from site.yml; gating happens here.
 # Nodes with no relay_exit_links sit in the disable branch (pure no-op
@@ -126,59 +129,106 @@
         label: "{{ item.path | basename }}"
       when: (item.path | basename | splitext)[0] not in relay_wanted_ifaces
 
-    # ── Xray sockopt (single-link only for now) ──
-    # Single-link relays keep the 1:1 shortcut: patch the freedom
-    # outbound sockopt.interface to the only wgN in the list so
-    # existing xray configs (which still have one outbound) route
-    # through it. Multi-link mode needs a different xray config
-    # layout (N outbounds + routing rules), handled by G.6.
+    # ── Xray reconciliation ──
+    # G.6: a single jq program brings every xray config*.json into
+    # the state the backend asked for — independent of whether this
+    # is a single- or multi-link relay. Inputs:
+    #
+    #   * xray_primary_interface — sets streamSettings.sockopt on the
+    #     default ``direct`` outbound so unmatched UUIDs still egress
+    #     via tunnel (on single-link relays this IS the tunnel;
+    #     on multi-link it's the smallest wgN used as fallback).
+    #   * xray_relay_outbounds   — list of {interface, emails} that
+    #     drives the per-link ``direct-wgN`` freedom outbounds plus
+    #     matching routing rules. Empty on single-link: we add no
+    #     extra outbounds and strip any stale ones left from a prior
+    #     multi-link state (relay demoted back to one link).
+    #
+    # The jq program is idempotent: unchanged file → same bytes out,
+    # so ansible's changed_when compares hashes and skips reload.
     - name: Find existing xray configs
       find:
         paths: /usr/local/etc/xray
         patterns: "config*.json"
       register: xray_configs_enable
-      when: (relay_wg_links | length) == 1
 
-    - name: Patch Xray freedom outbound with sockopt.interface wgN
+    - name: Reconcile Xray outbounds + routing rules
       shell: |
         set -euo pipefail
         CONFIG="{{ item.path }}"
-        EXISTING=$(jq -r '
-          (.outbounds[]? | select(.tag == "direct" and .protocol == "freedom"))
-            | .streamSettings.sockopt.interface // ""
-        ' "${CONFIG}")
-        if [ "${EXISTING}" = "{{ relay_wg_links[0].interface }}" ]; then
-          # Already patched — no change.
-          exit 78
-        fi
         TMP=$(mktemp)
-        # Plain path-assign; the earlier form (path) |= .x = value is a
-        # jq syntax error because |= cannot be chained into another =.
-        jq '
-          (.outbounds[] | select(.tag == "direct" and .protocol == "freedom")).streamSettings.sockopt = {
-            "interface": "{{ relay_wg_links[0].interface }}",
-            "tcpKeepAliveInterval": 30
-          }
+        # --argjson passes fan_out as JSON; --arg passes the primary
+        # interface as a string. Empty primary means "no sockopt on
+        # direct" — should only happen transiently when relay_wg_links
+        # is non-empty but primary_wg_interface returned falsy (stale
+        # DB view); we still strip any lingering sockopt to stay clean.
+        jq \
+          --argjson fan_out '{{ xray_relay_outbounds | default([]) | to_json }}' \
+          --arg     primary '{{ xray_primary_interface | default("") }}' \
+        '
+        # --- outbounds --------------------------------------------------
+        # Drop every stale direct-wg* outbound; keep direct/block/api/etc.
+        .outbounds = (
+          (.outbounds // [])
+          | map(select(((.tag // "") | startswith("direct-wg")) | not))
+        )
+        # Append a fresh direct-wgN freedom outbound per wanted link.
+        | .outbounds += (
+            $fan_out | map({
+              protocol: "freedom",
+              tag: ("direct-" + .interface),
+              streamSettings: {
+                sockopt: {interface: .interface, tcpKeepAliveInterval: 30}
+              }
+            })
+          )
+        # Patch the default direct outbound sockopt (or strip it).
+        | .outbounds = (.outbounds | map(
+            if (.tag == "direct" and .protocol == "freedom") then
+              if $primary != "" then
+                .streamSettings = {
+                  sockopt: {interface: $primary, tcpKeepAliveInterval: 30}
+                }
+              else
+                del(.streamSettings)
+              end
+            else . end
+          ))
+        # --- routing rules ---------------------------------------------
+        # Drop every stale direct-wg* rule; keep api-in etc.
+        | .routing.rules = (
+            ((.routing.rules // [])
+             | map(select(((.outboundTag // "") | startswith("direct-wg")) | not)))
+            + (
+              $fan_out
+              | map({
+                  type: "field",
+                  user: .emails,
+                  outboundTag: ("direct-" + .interface)
+                })
+              | map(select((.user | length) > 0))
+            )
+          )
         ' "${CONFIG}" > "${TMP}"
         jq -e . "${TMP}" > /dev/null || { rm -f "${TMP}"; exit 1; }
+        # Skip the mv when the content is identical so ansible
+        # doesn't report a change on every run.
+        if cmp -s "${TMP}" "${CONFIG}"; then
+          rm -f "${TMP}"
+          exit 78
+        fi
         mv "${TMP}" "${CONFIG}"
         chown root:nogroup "${CONFIG}" 2>/dev/null || chown root:root "${CONFIG}"
         chmod 0640 "${CONFIG}"
       args:
         executable: /bin/bash
       loop: "{{ xray_configs_enable.files | default([]) }}"
+      loop_control:
+        label: "{{ item.path | basename }}"
       register: patch_result
       changed_when: patch_result.rc == 0
       failed_when: patch_result.rc not in [0, 78]
-      when: (relay_wg_links | length) == 1
       notify: restart all xray services
-
-    - name: Note multi-link xray config is deferred to G.6
-      debug:
-        msg: >-
-          Relay has {{ relay_wg_links | length }} WG links — xray sockopt
-          patching skipped. G.6 will rewrite outbounds + routing rules.
-      when: (relay_wg_links | length) > 1
 
     - name: Find hysteria2 config
       stat:
@@ -227,31 +277,45 @@
         patterns: "config*.json"
       register: xray_configs_disable
 
-    - name: Unpatch sockopt from Xray freedom outbound
+    - name: Unpatch sockopt + strip fan-out from Xray configs
+      # G.6: in addition to stripping direct's sockopt, also drop any
+      # ``direct-wg*`` outbounds and routing rules left over from a
+      # multi-link state. Full teardown path: relay previously had
+      # wg0+wg1, admin detached both — we want the config back to
+      # "direct + block" with no sockopt.
       shell: |
         set -euo pipefail
         CONFIG="{{ item.path }}"
-        HAS=$(jq -r '
-          (.outbounds[]? | select(.tag == "direct" and .protocol == "freedom"))
-            | (.streamSettings // {})
-            | has("sockopt")
-        ' "${CONFIG}")
-        if [ "${HAS}" != "true" ]; then
-          # No sockopt — nothing to strip. No-op on fresh direct nodes.
-          exit 78
-        fi
         TMP=$(mktemp)
         jq '
-          (.outbounds[] | select(.tag == "direct" and .protocol == "freedom"))
-            |= (del(.streamSettings.sockopt))
+          .outbounds = (
+            (.outbounds // [])
+            | map(select(((.tag // "") | startswith("direct-wg")) | not))
+            | map(
+                if (.tag == "direct" and .protocol == "freedom")
+                then del(.streamSettings)
+                else .
+                end
+              )
+          )
+          | .routing.rules = (
+              (.routing.rules // [])
+              | map(select(((.outboundTag // "") | startswith("direct-wg")) | not))
+            )
         ' "${CONFIG}" > "${TMP}"
         jq -e . "${TMP}" > /dev/null || { rm -f "${TMP}"; exit 1; }
+        if cmp -s "${TMP}" "${CONFIG}"; then
+          rm -f "${TMP}"
+          exit 78
+        fi
         mv "${TMP}" "${CONFIG}"
         chown root:nogroup "${CONFIG}" 2>/dev/null || chown root:root "${CONFIG}"
         chmod 0640 "${CONFIG}"
       args:
         executable: /bin/bash
       loop: "{{ xray_configs_disable.files }}"
+      loop_control:
+        label: "{{ item.path | basename }}"
       register: unpatch_result
       changed_when: unpatch_result.rc == 0
       failed_when: unpatch_result.rc not in [0, 78]

@@ -6,6 +6,15 @@
 #   manage_vless_user.sh add <email> <uuid> [flow]
 #   manage_vless_user.sh del <email>
 #
+# Env:
+#   EXIT_INTERFACE=wgN   — G.6 (multi-link relays). When set, add
+#                          attaches the email to the xray routing rule
+#                          targeting ``direct-wgN`` (creating the rule
+#                          if absent). Del always strips the email from
+#                          every direct-wg* rule. Unset means fall back
+#                          to the default ``direct`` outbound.
+#   NO_RESTART=1         — skip systemctl restart (batch mode).
+#
 # Design notes:
 #   - Authority for the list is the backend's Device/Credential rows; this
 #     script is only the "apply" step. It therefore does not persist
@@ -51,6 +60,84 @@ reload_xray() {
   systemctl restart xray
 }
 
+# G.6 — keep routing rules in sync with the clients[] edit. Both add
+# and del strip the email from every ``direct-wg*`` rule first; add
+# then appends the email to the rule matching ``$EXIT_INTERFACE``
+# (creating the rule if it doesn't exist yet). No-op when the env var
+# is unset: unmatched users fall through to the default ``direct``
+# outbound (which the role points at primary wgN on single-link
+# relays and at plain egress on direct nodes).
+rewrite_routing() {
+  local email="$1"
+  local action="$2"            # "add" | "del"
+  local iface="${EXIT_INTERFACE:-}"
+
+  # Preserve template-rendered routing state on add-without-iface.
+  # resync_node.yml re-adds every user after a site.yml template
+  # re-render; if we unconditionally stripped emails here, every
+  # resync would wipe the routing rules the template just wrote.
+  # Del always runs — removing a user should clean up every rule.
+  if [[ "${action}" == "add" && -z "${iface}" ]]; then
+    return 0
+  fi
+
+  local tmp
+  tmp=$(mktemp)
+  jq \
+    --arg email "${email}" \
+    --arg iface "${iface}" \
+    --arg action "${action}" \
+    '
+    # Strip email from every direct-wg* rule, drop any rule left with
+    # an empty user list so detach of the last user cleans up the rule.
+    .routing.rules =
+      ( .routing.rules
+        | map(
+            if (.outboundTag // "") | startswith("direct-wg")
+            then .user = ((.user // []) - [$email])
+            else .
+            end
+          )
+        | map(select(
+            ((.outboundTag // "") | startswith("direct-wg") | not)
+            or ((.user // []) | length) > 0
+          ))
+      )
+    |
+    # On add with a target interface, ensure the email is in the
+    # matching rule; create the rule if missing.
+    if $action == "add" and $iface != "" then
+      (.routing.rules
+        | map(select(.outboundTag == ("direct-" + $iface)))
+        | length
+      ) as $has
+      | if $has > 0 then
+          .routing.rules = (.routing.rules | map(
+            if .outboundTag == ("direct-" + $iface)
+            then .user = (((.user // []) + [$email]) | unique)
+            else .
+            end
+          ))
+        else
+          .routing.rules += [{
+            "type": "field",
+            "user": [$email],
+            "outboundTag": ("direct-" + $iface)
+          }]
+        end
+    else . end
+    ' "${CONFIG}" >"${tmp}"
+
+  if ! jq -e . "${tmp}" >/dev/null; then
+    echo "Refusing to write malformed config (routing pass)" >&2
+    rm -f "${tmp}"
+    exit 1
+  fi
+  mv "${tmp}" "${CONFIG}"
+  chown root:nogroup "${CONFIG}"
+  chmod 0640 "${CONFIG}"
+}
+
 cmd_add() {
   local email="$1"
   local uuid="$2"
@@ -84,8 +171,9 @@ cmd_add() {
   # this chown the service exits 23 "permission denied" on next reload.
   chown root:nogroup "${CONFIG}"
   chmod 0640 "${CONFIG}"
+  rewrite_routing "${email}" "add"
   reload_xray
-  echo "added vless user ${email}"
+  echo "added vless user ${email}${EXIT_INTERFACE:+ via ${EXIT_INTERFACE}}"
 }
 
 cmd_del() {
@@ -114,6 +202,7 @@ cmd_del() {
   # this chown the service exits 23 "permission denied" on next reload.
   chown root:nogroup "${CONFIG}"
   chmod 0640 "${CONFIG}"
+  rewrite_routing "${email}" "del"
   reload_xray
   echo "removed vless user ${email}"
 }

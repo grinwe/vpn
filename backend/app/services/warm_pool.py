@@ -45,7 +45,7 @@ from .. import models
 from ..security import encrypt
 from ..time_utils import utcnow
 from .ansible_runner import build_inventory_for_node, run_playbook
-from .relay import choose_exit_for_relay
+from .relay import choose_exit_for_relay, resolve_exit_interface
 
 logger = logging.getLogger(__name__)
 
@@ -204,13 +204,19 @@ def warm_one_bundle(db: Session, node: models.VPNNode) -> int | None:
         logger.warning("warm_pool: nothing to provision for node %s", node.id)
         return None
 
-    payload = {
+    payload: dict[str, Any] = {
         "username": username,
         "uuid": user_uuid,
         "password": password,
         "protocols": protocols_payload,
         "state": "present",
     }
+    # G.6: pin warm identity to its exit's xray outbound (multi-link
+    # relays only). None on single-link/direct — default ``direct``
+    # outbound already routes those through the primary wgN.
+    exit_iface = resolve_exit_interface(db, node.id, bundle_exit_id)
+    if exit_iface:
+        payload["exit_interface"] = exit_iface
 
     inventory = None
     _warmer_semaphore.acquire()

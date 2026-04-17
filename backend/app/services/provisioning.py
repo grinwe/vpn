@@ -27,7 +27,12 @@ from .ansible_runner import (
     build_inventory_for_node,
     run_playbook,
 )
-from .relay import choose_exit_for_relay
+from .relay import (
+    build_xray_relay_outbounds,
+    choose_exit_for_relay,
+    primary_wg_interface,
+    resolve_exit_interface,
+)
 
 logger = logging.getLogger(__name__)
 TASK_STATUS_COUNTER = Counter("vpn_provisioning_tasks_total", "Provisioning tasks processed", ["status"])
@@ -464,6 +469,20 @@ def _collect_site_extra_vars(
         _validate_relay_link_strings(relay_links, node_hint=f"{node.id}/{node.name}")
         extra["relay_wg_links"] = relay_links
 
+    # ── G.6: xray fan-out (multi-link only) ──
+    # Emit every run so site.yml renders (or re-renders) both xray
+    # outbounds + routing rules from the authoritative DB view. Empty
+    # list on single-link/direct nodes — template skips the fan-out
+    # block and just applies ``direct`` sockopt to the primary wgN
+    # (if any). Relay with zero links returns ``None`` for primary —
+    # template emits plain freedom without sockopt.
+    primary_iface = primary_wg_interface(db, node.id)
+    if primary_iface:
+        extra["xray_primary_interface"] = primary_iface
+    fan_out = build_xray_relay_outbounds(db, node)
+    if fan_out:
+        extra["xray_relay_outbounds"] = fan_out
+
     # #56 — last-line defence before this dict gets serialised to
     # --extra-vars. Catches admin-controlled values from VPNConfig.settings
     # that would weaponise an ansible role's ``{{ var }}`` usage. Runs
@@ -614,6 +633,17 @@ def _collect_relay_tunnel_extra_vars(
     links = _build_relay_wg_links(db, relay)
     _validate_relay_link_strings(links, node_hint=f"{relay.id}/{relay.name}")
     extra: dict[str, Any] = {"relay_wg_links": links}
+    # G.6: relay_tunnel_apply.yml only runs the relay_jump_node role,
+    # not site.yml — so any xray reconciliation the role does in its
+    # multi-link branch needs these same extra_vars. The role keeps
+    # xray outbounds + routing rules in sync with DB even when the
+    # full install roles aren't rerun.
+    primary_iface = primary_wg_interface(db, relay.id)
+    if primary_iface:
+        extra["xray_primary_interface"] = primary_iface
+    fan_out = build_xray_relay_outbounds(db, relay)
+    if fan_out:
+        extra["xray_relay_outbounds"] = fan_out
     _validate_extra_vars(extra, node_hint=f"relay/{relay.id}/{relay.name}")
     return extra
 
@@ -1444,6 +1474,15 @@ class ProvisioningOrchestrator:
             "protocols": protocols_payload,
             "state": "present",
         }
+        # G.6: tell provision_device.yml which wgN the new user must
+        # egress through on multi-link relays. manage_vless_*_user.sh
+        # uses this to update the matching xray routing rule's user
+        # list in addition to clients[]. ``None`` (single-link or
+        # non-relay) is omitted — scripts fall through to the default
+        # ``direct`` outbound.
+        exit_iface = resolve_exit_interface(self.db, node.id, bundle_exit_id)
+        if exit_iface:
+            task_payload["exit_interface"] = exit_iface
 
         task = self.create_task("device", device.id, "apply", task_payload)
         self.db.commit()
@@ -1687,9 +1726,16 @@ class ProvisioningOrchestrator:
                     "resync: skipping credential %s (no UUID parsed)", cred.id
                 )
                 return
-            clients_by_proto[cred.proto].append(
-                {"username": username, "uuid": user_uuid}
-            )
+            # G.6: carry per-user target wgN so the resync script can
+            # (re)attach the email to the correct xray routing rule on
+            # multi-link relays. ``None`` (single-link / direct / stale
+            # exit_id) becomes ``""`` in the playbook and the script
+            # no-ops on the routing pass.
+            iface = resolve_exit_interface(self.db, node.id, cred.exit_id)
+            entry: dict[str, str] = {"username": username, "uuid": user_uuid}
+            if iface:
+                entry["exit_interface"] = iface
+            clients_by_proto[cred.proto].append(entry)
             seen.add(key)
 
         for cred, device in assigned_rows:
@@ -1871,6 +1917,10 @@ class ProvisioningOrchestrator:
             "protocols": protocols_payload,
             "state": "present",
         }
+        # G.6: see provision_subscription — same exit_interface injection.
+        exit_iface = resolve_exit_interface(self.db, node.id, bundle_exit_id)
+        if exit_iface:
+            task_payload["exit_interface"] = exit_iface
 
         task = self.create_task("device", device.id, "apply", task_payload)
         self.db.commit()

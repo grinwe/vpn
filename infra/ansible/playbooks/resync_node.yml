@@ -77,6 +77,11 @@
         /usr/local/sbin/manage_vless_user.sh add {{ item.username }} {{ item.uuid }}
       environment:
         NO_RESTART: "1"
+        # G.6 — empty for single-link/direct nodes (script skips the
+        # routing pass). Populated for multi-link relays so the email
+        # stays in the right direct-wgN rule after the template
+        # re-renders routing state during a site.yml run.
+        EXIT_INTERFACE: "{{ item.exit_interface | default('') }}"
       loop: "{{ _reality_clients }}"
       loop_control:
         label: "{{ item.username }}"
@@ -104,6 +109,7 @@
         /usr/local/sbin/manage_vless_xhttp_user.sh add {{ item.username }} {{ item.uuid }}
       environment:
         NO_RESTART: "1"
+        EXIT_INTERFACE: "{{ item.exit_interface | default('') }}"
       loop: "{{ _xhttp_clients }}"
       loop_control:
         label: "{{ item.username }}"
@@ -131,6 +137,7 @@
         /usr/local/sbin/manage_vless_ws_user.sh add {{ item.username }} {{ item.uuid }}
       environment:
         NO_RESTART: "1"
+        EXIT_INTERFACE: "{{ item.exit_interface | default('') }}"
       loop: "{{ _ws_cdn_clients }}"
       loop_control:
         label: "{{ item.username }}"
