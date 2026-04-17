@@ -812,6 +812,13 @@ class RelayExitLinkOut(BaseModel):
     wg_client_public_key: str
     wg_client_address_v4: str
     created_at: datetime
+    # Health telemetry — заполняется worker-тиком
+    # run_relay_link_health_tick (см. services/relay_link_health.py).
+    # NULL = тик ещё не прошёл / SSH не дошёл / peer не найден в wg.
+    last_handshake_at: datetime | None = None
+    last_rx_bytes: int | None = None
+    last_tx_bytes: int | None = None
+    last_observed_at: datetime | None = None
 
     class Config:
         from_attributes = True

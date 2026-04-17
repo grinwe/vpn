@@ -54,6 +54,74 @@ interface RelayExitLinkOut {
   wg_client_public_key: string;
   wg_client_address_v4: string;
   created_at: string;
+  last_handshake_at: string | null;
+  last_rx_bytes: number | null;
+  last_tx_bytes: number | null;
+  last_observed_at: string | null;
+}
+
+function linkHealth(l: RelayExitLinkOut): {
+  color: string;
+  label: string;
+  title: string;
+} {
+  // Светофор для relay↔exit туннеля. Цвет считаем от возраста
+  // последнего handshake'а (WG keepalive = 25s, значит healthy peer
+  // handshook в последние 3 минуты). SSH-фейл (observed_at stale)
+  // рендерится как красный, потому что за >15 min должен был успеть
+  // пройти хотя бы один тик.
+  const now = Date.now();
+  if (!l.last_observed_at) {
+    return {
+      color: "bg-slate-600",
+      label: "—",
+      title: "Тик ещё не прошёл — данных нет",
+    };
+  }
+  const observedAgeMin = (now - Date.parse(l.last_observed_at)) / 60000;
+  if (observedAgeMin > 15) {
+    return {
+      color: "bg-red-500",
+      label: `ssh ${Math.round(observedAgeMin)}m`,
+      title: `SSH-тик не доходил ${Math.round(observedAgeMin)} минут — relay недоступен?`,
+    };
+  }
+  if (!l.last_handshake_at) {
+    return {
+      color: "bg-red-500",
+      label: "no hs",
+      title: "WG peer в dump есть, но handshake ни разу не случился",
+    };
+  }
+  const handshakeAgeMin =
+    (now - Date.parse(l.last_handshake_at)) / 60000;
+  if (handshakeAgeMin < 3) {
+    return {
+      color: "bg-green-500",
+      label: `${Math.round(handshakeAgeMin)}m`,
+      title: `Последний handshake ${Math.round(handshakeAgeMin)} минут назад`,
+    };
+  }
+  if (handshakeAgeMin < 15) {
+    return {
+      color: "bg-yellow-500",
+      label: `${Math.round(handshakeAgeMin)}m`,
+      title: `Последний handshake ${Math.round(handshakeAgeMin)} минут назад — туннель простаивает`,
+    };
+  }
+  return {
+    color: "bg-red-500",
+    label: `${Math.round(handshakeAgeMin)}m`,
+    title: `Последний handshake ${Math.round(handshakeAgeMin)} минут назад — скорее всего порвался`,
+  };
+}
+
+function fmtBytes(n: number | null): string {
+  if (n === null) return "—";
+  if (n < 1024) return `${n} B`;
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
+  if (n < 1024 * 1024 * 1024) return `${(n / 1024 / 1024).toFixed(1)} MB`;
+  return `${(n / 1024 / 1024 / 1024).toFixed(2)} GB`;
 }
 
 const STATUSES = ["registering", "active", "error", "disabled"] as const;
@@ -400,13 +468,16 @@ function ExitLinksPanel({ exitNode }: { exitNode: WGExitNodeOut }) {
               <th className="text-left py-1 px-2">Relay</th>
               <th className="text-left py-1 px-2">Iface</th>
               <th className="text-left py-1 px-2">WG client addr</th>
-              <th className="text-left py-1 px-2">Client public key</th>
+              <th className="text-left py-1 px-2">Status</th>
+              <th className="text-left py-1 px-2">RX / TX</th>
               <th className="text-left py-1 px-2">Создан</th>
               <th className="py-1 px-2"></th>
             </tr>
           </thead>
           <tbody>
-            {links.data.map((l) => (
+            {links.data.map((l) => {
+              const h = linkHealth(l);
+              return (
               <tr key={l.id} className="border-t border-slate-800">
                 <td className="py-1 px-2 font-mono">
                   #{l.relay_node_id} {l.relay_node_name}
@@ -417,8 +488,16 @@ function ExitLinksPanel({ exitNode }: { exitNode: WGExitNodeOut }) {
                 <td className="py-1 px-2 font-mono text-slate-400">
                   {l.wg_client_address_v4}
                 </td>
-                <td className="py-1 px-2 font-mono" title={l.wg_client_public_key}>
-                  {l.wg_client_public_key.slice(0, 12)}…
+                <td className="py-1 px-2" title={h.title}>
+                  <span
+                    className={`inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-medium text-white ${h.color}`}
+                  >
+                    <span className="w-1.5 h-1.5 rounded-full bg-white/70" />
+                    {h.label}
+                  </span>
+                </td>
+                <td className="py-1 px-2 font-mono text-slate-400">
+                  {fmtBytes(l.last_rx_bytes)} / {fmtBytes(l.last_tx_bytes)}
                 </td>
                 <td className="py-1 px-2 text-slate-400">
                   {new Date(l.created_at).toLocaleString()}
@@ -454,7 +533,8 @@ function ExitLinksPanel({ exitNode }: { exitNode: WGExitNodeOut }) {
                   </div>
                 </td>
               </tr>
-            ))}
+              );
+            })}
           </tbody>
         </table>
       )}

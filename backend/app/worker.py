@@ -987,6 +987,49 @@ def run_traffic_stats_tick() -> dict:
     return summary
 
 
+def run_relay_link_health_tick() -> dict:
+    """Периодический WG-handshake poll для relay_exit_links.
+
+    Раз в RELAY_LINK_HEALTH_INTERVAL секунд (default 300) обходит
+    каждый relay с привязанными links, SSH'ит туда и читает
+    ``wg show all dump``. Результат пишется в колонки
+    ``relay_exit_links.last_handshake_at / last_rx_bytes /
+    last_tx_bytes / last_observed_at``, откуда админка читает их
+    для цветного индикатора «жив ли туннель».
+
+    Ошибки per-relay не валят тик — просто пропускают этот relay;
+    см. ``services.relay_link_health.collect_all_relay_links``.
+
+    Self-reschedule через RELAY_LINK_HEALTH_INTERVAL. Disabled при 0.
+    """
+    from .db import SessionLocal
+    from .queue import schedule_tick
+    from .services import relay_link_health
+
+    interval = int(os.getenv("RELAY_LINK_HEALTH_INTERVAL", "300"))
+    summary: dict = {}
+    session = SessionLocal()
+    try:
+        summary = relay_link_health.collect_all_relay_links(session)
+    except Exception:  # noqa: BLE001
+        logger.exception("relay_link_health: tick failed")
+        if session.is_active:
+            session.rollback()
+    finally:
+        session.close()
+
+    if interval > 0:
+        try:
+            schedule_tick(
+                "app.worker.run_relay_link_health_tick",
+                interval,
+                tick_id="tick-relay-link-health",
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("relay_link_health: failed to re-enqueue tick")
+    return summary
+
+
 def run_user_health_ping_tick() -> dict:
     """Phase C — bot health-ping with consent + 24h debounce.
 
@@ -1344,6 +1387,25 @@ def main() -> None:
             )
         except Exception:  # noqa: BLE001
             logger.exception("Failed to schedule traffic stats tick")
+
+    # Health relay↔exit tunnels. Читает wg show all dump с каждого
+    # relay, апдейтит last_handshake_at / rx / tx / observed_at в
+    # relay_exit_links. Интервал RELAY_LINK_HEALTH_INTERVAL (default
+    # 300s), Disabled at 0.
+    relay_link_health_interval = int(os.getenv("RELAY_LINK_HEALTH_INTERVAL", "300"))
+    if relay_link_health_interval > 0:
+        try:
+            schedule_tick(
+                "app.worker.run_relay_link_health_tick",
+                min(relay_link_health_interval, 60),
+                tick_id="tick-relay-link-health",
+            )
+            logger.info(
+                "Relay-link health tick bootstrapped: first run in 60s (interval=%ss)",
+                relay_link_health_interval,
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("Failed to schedule relay-link health tick")
 
     # Phase C — bot health-ping with consent. Queues a friendly
     # "помогите нам улучшить сервис" prompt to active users at most

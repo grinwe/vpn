@@ -673,6 +673,17 @@ class RelayExitLink(Base):
     wg_client_address_v4 = Column(String, nullable=False)
     created_at = Column(DateTime, default=utcnow, nullable=False)
 
+    # Health telemetry — заполняется тиком run_relay_link_health_tick,
+    # который раз в 5 минут SSH'ит на relay и читает wg show all dump.
+    # last_handshake_at = latest-handshake из dump (None если handshake
+    # ни разу не было с момента старта интерфейса). last_observed_at —
+    # время последнего успешного тика (NULL если SSH ни разу не вышел),
+    # помогает отличить «данных ещё нет» от «relay недоступен давно».
+    last_handshake_at = Column(DateTime, nullable=True)
+    last_rx_bytes = Column(BigInteger, nullable=True)
+    last_tx_bytes = Column(BigInteger, nullable=True)
+    last_observed_at = Column(DateTime, nullable=True)
+
     relay_node = relationship("VPNNode")
     exit_node = relationship("WGExitNode")
 

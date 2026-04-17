@@ -43,6 +43,10 @@ def _link_to_out(link: models.RelayExitLink) -> schemas.RelayExitLinkOut:
         wg_client_public_key=link.wg_client_public_key,
         wg_client_address_v4=link.wg_client_address_v4,
         created_at=link.created_at,
+        last_handshake_at=link.last_handshake_at,
+        last_rx_bytes=link.last_rx_bytes,
+        last_tx_bytes=link.last_tx_bytes,
+        last_observed_at=link.last_observed_at,
     )
 
 
