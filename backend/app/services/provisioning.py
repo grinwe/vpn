@@ -917,19 +917,29 @@ class ProvisioningOrchestrator:
             self.db.commit()
             return
 
-        # ── Exit-level outcome: same registering → active flip ──
+        # ── Exit-level outcome: same shape as node, with recovery. ──
         if task.target_type == "exit":
             exit_node = self.db.get(models.WGExitNode, task.target_id)
             if not exit_node:
                 return
+            # Diagnose is read-only (runs a playbook that collects wg
+            # show + peers + routes) — it must not mutate status.
+            if task.action == "diagnose":
+                return
             if success:
-                if exit_node.status == models.WGExitNodeStatus.registering:
-                    exit_node.status = models.WGExitNodeStatus.active
+                # Unconditionally promote to active. Mirrors node logic:
+                # a successful re-bootstrap is the only signal we have
+                # that an exit stuck at ``error`` recovered, so the
+                # ``error → active`` transition must be allowed. Without
+                # this, once an exit ever bounced into error (e.g. the
+                # very first bootstrap raced with DNS) it stayed there
+                # forever until someone PATCHed it by hand.
+                exit_node.status = models.WGExitNodeStatus.active
             else:
-                # Only demote a still-registering exit. Active exits
-                # stay active on a transient bootstrap failure — a broken
-                # peer-list re-render shouldn't kick every attached relay
-                # offline.
+                # Don't demote an already-active exit on a transient
+                # bootstrap failure — a broken peer-list re-render
+                # shouldn't kick every attached relay offline. Only
+                # flip registering → error.
                 if exit_node.status == models.WGExitNodeStatus.registering:
                     exit_node.status = models.WGExitNodeStatus.error
             self.db.add(exit_node)
