@@ -207,6 +207,7 @@ export default function Users() {
       );
       qc.invalidateQueries({ queryKey: ["user-subs"] });
       qc.invalidateQueries({ queryKey: ["provisioning-tasks"] });
+      qc.invalidateQueries({ queryKey: ["relay-links"] });
     },
     onError: (e: Error) => alert(`Не удалось сменить exit: ${e.message}`),
   });

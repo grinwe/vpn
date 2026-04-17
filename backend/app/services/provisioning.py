@@ -2108,16 +2108,32 @@ class ProvisioningOrchestrator:
         """Re-pin every cred of ``subscription`` to a different exit.
 
         Only valid when the sub lives on a multi-link relay. Updates
-        ``Credential.exit_id`` in DB, then enqueues a ``device.apply``
-        task per live device so provision_device.yml re-runs with the
-        new ``EXIT_INTERFACE`` — manage_vless_*_user.sh strips the
-        email from every ``direct-wg*`` routing rule and re-adds it
-        to ``direct-<new_wgN>``. Clients keep their VLESS UUID and
-        sub_token; only the xray outbound changes, so the visible
-        effect for the user is an exit-IP swap on next reconnect.
+        ``Credential.exit_id`` in DB, then enqueues a single
+        ``relay_tunnel`` task that re-runs ``relay_tunnel_apply.yml``
+        on the relay — the ``relay_jump_node`` role's
+        ``reconcile_xray`` step regenerates every xray config*.json
+        from scratch, reading the authoritative ``emails_by_iface``
+        map via :func:`build_xray_relay_outbounds`. The email
+        therefore lands in ``direct-<new_wgN>`` deterministically,
+        independent of any in-flight per-device edits that could
+        race a per-device ``manage_vless_*_user.sh`` patch.
 
-        Raises RuntimeError on: sub has no node, node isn't a relay,
-        new_exit_id not in the relay's links, sub has no live devices.
+        We deliberately skip ``exit_id`` in the task payload so the
+        executor's step 1 (``bootstrap_exit.yml`` — peer list
+        rewrite on the exit's wg0.conf) is a no-op: the exit's
+        peer membership hasn't changed, only which email maps to
+        which existing wgN on the relay side.
+
+        Clients keep their VLESS UUID and sub_token; only the xray
+        outbound changes, so the visible effect for the user is an
+        exit-IP swap on next reconnect. Hysteria2 traffic is not
+        affected — hy2 egresses directly from the relay without
+        going through xray's freedom outbounds, and those always
+        use the relay's primary wgN; the "switch exit" action only
+        re-routes vless-family protocols.
+
+        Raises RuntimeError on: sub has no node, new_exit_id not
+        in the relay's links.
         """
         node = subscription.node
         if node is None:
@@ -2134,12 +2150,13 @@ class ProvisioningOrchestrator:
             raise RuntimeError(
                 f"Exit {new_exit_id} is not attached to relay {node.id}"
             )
-        new_iface = link.wg_interface_name
 
         # Update every cred on the sub. Includes revoked ones so the
         # DB stays consistent — a later reprovision of that device
         # will naturally skip revoked creds, but their exit_id should
-        # not lag behind the new pin.
+        # not lag behind the new pin. reconcile_xray only reads
+        # active (+ warm) creds, so revoked rows don't leak into the
+        # regenerated routing rules.
         self.db.query(models.Credential).filter(
             models.Credential.subscription_id == subscription.id
         ).update(
@@ -2148,66 +2165,16 @@ class ProvisioningOrchestrator:
         )
         self.db.flush()
 
-        tasks: list[models.ProvisioningTask] = []
-        for device in subscription.devices:
-            if device.status != models.DeviceStatus.active:
-                # Disabled/revoked/failed devices don't serve traffic
-                # — no xray rule to rewrite. They keep the updated
-                # exit_id in DB so any future re-apply uses the new pin.
-                continue
-            live_creds = [c for c in device.credentials if c.is_active]
-            if not live_creds:
-                continue
-
-            uuid_src = next(
-                (c for c in live_creds if c.proto.startswith("vless")),
-                None,
-            )
-            user_uuid = (
-                _extract_vless_uuid(uuid_src.config_text) if uuid_src else None
-            )
-
-            protocols_payload: list[dict[str, Any]] = []
-            seen_proto: set[str] = set()
-            for cred in live_creds:
-                if cred.proto in seen_proto:
-                    continue
-                seen_proto.add(cred.proto)
-                entry: dict[str, Any] = {"proto": cred.proto}
-                if cred.config is not None:
-                    entry["port"] = cred.config.port
-                    if cred.proto == "shadowtls+shadowsocks":
-                        entry["method"] = (cred.config.settings or {}).get(
-                            "method", "chacha20-ietf-poly1305"
-                        )
-                protocols_payload.append(entry)
-
-            task_payload: dict[str, Any] = {
-                "username": device.access_username,
-                "protocols": protocols_payload,
-                "state": "present",
-                "exit_interface": new_iface,
-            }
-            if user_uuid:
-                task_payload["uuid"] = user_uuid
-            # Password only needed by hysteria2; re-using the device's
-            # decrypted hy2 cred would require storing password server-
-            # side. For now we skip hy2 in the switch (xray routing is
-            # the only thing affected by exit change — hy2 egresses
-            # directly on the relay regardless of WG links, see the
-            # "Hysteria2 exits directly" debug in relay_jump_node).
-            task_payload["protocols"] = [
-                p for p in protocols_payload if p["proto"] != "hysteria2"
-            ]
-            if not task_payload["protocols"]:
-                continue
-
-            task = self.create_task(
-                "device", device.id, "apply", task_payload
-            )
-            tasks.append(task)
-
+        task = self.create_task(
+            "relay_tunnel",
+            node.id,
+            "apply",
+            {
+                "switch_subscription_id": subscription.id,
+                "new_exit_id": new_exit_id,
+                "new_interface": link.wg_interface_name,
+            },
+        )
         self.db.commit()
-        for task in tasks:
-            self.run_task_async(task, node=node)
-        return tasks
+        self.run_task_async(task)
+        return [task]
