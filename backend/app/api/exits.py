@@ -600,3 +600,56 @@ def detach_relay(
         # sees the ansible run instead of wondering if anything happened.
         "task_id": task_id,
     }
+
+
+@router.post("/exits/{exit_id}/links/{relay_node_id}/reconnect", status_code=200)
+def reconnect_relay_link(
+    exit_id: int,
+    relay_node_id: int,
+    db: Session = Depends(get_db),
+    admin_token: str = Depends(require_admin),
+    admin_actor: str | None = Header(default=None, alias=ADMIN_ACTOR_HEADER),
+):
+    """Перезапустить relay_tunnel ансибл для существующего (relay, exit).
+
+    Link в БД не трогаем — только создаём новую таску с тем же
+    payload, что и attach: bootstrap_exit.yml на exit + relay_tunnel_apply.yml
+    на relay. Полезно, когда исходный attach упал на handshake'е
+    (curl rc=28) и нужно просто прогнать ансибл заново без
+    detach/attach-цикла.
+    """
+    link = (
+        db.query(models.RelayExitLink)
+        .filter(
+            models.RelayExitLink.exit_id == exit_id,
+            models.RelayExitLink.relay_node_id == relay_node_id,
+        )
+        .first()
+    )
+    if not link:
+        raise HTTPException(status_code=404, detail="Link not found")
+
+    relay = db.get(models.VPNNode, relay_node_id)
+    if relay is None:
+        raise HTTPException(status_code=404, detail="Relay node not found")
+
+    orchestrator = ProvisioningOrchestrator(db)
+    task = orchestrator.create_task(
+        "relay_tunnel",
+        relay.id,
+        "apply",
+        {"exit_id": exit_id, "link_id": link.id},
+    )
+    db.commit()
+    actor, actor_type = _resolve_admin_actor(admin_actor)
+    _audit(
+        db, actor, "relay_exit_reconnect", "relay_exit_link", link.id,
+        actor_type=actor_type,
+    )
+    db.commit()
+    orchestrator.run_task_async(task)
+    return {
+        "exit_id": exit_id,
+        "relay_node_id": relay_node_id,
+        "task_id": task.id,
+    }

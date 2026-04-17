@@ -324,6 +324,22 @@ function ExitLinksPanel({ exitNode }: { exitNode: WGExitNodeOut }) {
     onError: (e: Error) => alert(`Ошибка: ${e.message}`),
   });
 
+  const reconnectMut = useMutation({
+    mutationFn: (relayId: number) =>
+      api.post<{
+        exit_id: number;
+        relay_node_id: number;
+        task_id: number;
+      }>(`/exits/${exitNode.id}/links/${relayId}/reconnect`),
+    onSuccess: (res) => {
+      qc.invalidateQueries({ queryKey: ["provisioning-tasks"] });
+      alert(
+        `Ansible перезапущен, задача #${res.task_id} — следи в Tasks.`,
+      );
+    },
+    onError: (e: Error) => alert(`Не удалось перезапустить: ${e.message}`),
+  });
+
   // G.7: a relay may be attached to multiple exits simultaneously.
   // The one-relay-one-exit filter is lifted; the backend still rejects
   // duplicate (relay, exit) pairs with 409, so the UI offers all
@@ -408,24 +424,34 @@ function ExitLinksPanel({ exitNode }: { exitNode: WGExitNodeOut }) {
                   {new Date(l.created_at).toLocaleString()}
                 </td>
                 <td className="py-1 px-2">
-                  <button
-                    disabled={detachMut.isPending}
-                    onClick={() => {
-                      if (
-                        confirm(
-                          `Отсоединить ${l.relay_node_name} (${l.wg_interface_name}) от ${exitNode.name}?\n\n` +
-                            "Запустится ansible: bootstrap_exit.yml на exit'е " +
-                            `(peer уйдёт из его wg0.conf) и relay_tunnel_apply.yml ` +
-                            `на relay (${l.wg_interface_name} down, Xray direct-${l.wg_interface_name} ` +
-                            "outbound/rule удалятся, остальные линки на этом relay остаются).",
+                  <div className="flex gap-1 justify-end">
+                    <button
+                      disabled={reconnectMut.isPending || detachMut.isPending}
+                      onClick={() => reconnectMut.mutate(l.relay_node_id)}
+                      title="Перезапустить ansible без detach/attach — полезно, если таска упала на test-connectivity"
+                      className="text-xs px-2 py-0.5 rounded bg-blue-800 hover:bg-blue-700 disabled:opacity-50"
+                    >
+                      reconnect
+                    </button>
+                    <button
+                      disabled={detachMut.isPending || reconnectMut.isPending}
+                      onClick={() => {
+                        if (
+                          confirm(
+                            `Отсоединить ${l.relay_node_name} (${l.wg_interface_name}) от ${exitNode.name}?\n\n` +
+                              "Запустится ansible: bootstrap_exit.yml на exit'е " +
+                              `(peer уйдёт из его wg0.conf) и relay_tunnel_apply.yml ` +
+                              `на relay (${l.wg_interface_name} down, Xray direct-${l.wg_interface_name} ` +
+                              "outbound/rule удалятся, остальные линки на этом relay остаются).",
+                          )
                         )
-                      )
-                        detachMut.mutate(l.relay_node_id);
-                    }}
-                    className="text-xs px-2 py-0.5 rounded bg-red-800 hover:bg-red-700 disabled:opacity-50"
-                  >
-                    detach
-                  </button>
+                          detachMut.mutate(l.relay_node_id);
+                      }}
+                      className="text-xs px-2 py-0.5 rounded bg-red-800 hover:bg-red-700 disabled:opacity-50"
+                    >
+                      detach
+                    </button>
+                  </div>
                 </td>
               </tr>
             ))}
