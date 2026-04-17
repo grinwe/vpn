@@ -630,22 +630,17 @@ def delete_config(
                 "Rotate them to another node first, or disable the config."
             ),
         )
-    # Hard-delete terminal devices + their credentials that still point
-    # at this config. devices.config_id is NOT NULL so we can't just
-    # null it; and the 409 gate above already guarantees everything
-    # left here is revoked/disabled, so losing the rows is safe.
-    # Also null out any orphan Credential rows whose FK is nullable —
-    # no need to delete history, just unlink.
-    dead_devices = (
-        db.query(models.Device)
-        .filter(models.Device.config_id == config.id)
-        .all()
-    )
-    for dev in dead_devices:
-        db.query(models.Credential).filter(
-            models.Credential.device_id == dev.id
-        ).delete(synchronize_session=False)
-        db.delete(dev)
+    # Null out config_id on terminal devices + any Credential rows still
+    # pointing here. The 409 gate above already guarantees that every
+    # remaining Device is revoked/disabled, so losing the config link is
+    # fine — the rows stay for sub_token aliasing (see the comment block
+    # on the ``revoke`` branch in services/provisioning.py). Pre-migration
+    # 0030 this had to hard-delete the Device rows because config_id was
+    # NOT NULL; now the column is nullable + ON DELETE SET NULL so we
+    # can just detach.
+    db.query(models.Device).filter(
+        models.Device.config_id == config.id
+    ).update({models.Device.config_id: None}, synchronize_session=False)
     db.query(models.Credential).filter(
         models.Credential.config_id == config.id
     ).update({models.Credential.config_id: None}, synchronize_session=False)

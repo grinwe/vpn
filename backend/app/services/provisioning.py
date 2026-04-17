@@ -1403,9 +1403,12 @@ class ProvisioningOrchestrator:
         else:
             device_uri = f"/api/sub/{device_sub_token}"
 
-        # Pick a representative config for Device.config_id (FK is NOT NULL).
-        # VLESS Reality preferred (ShadowTLS deprecated — 0.2), otherwise
-        # the first enabled config.
+        # Pick a representative config for Device.config_id. Since
+        # migration 0030 the column is nullable (NULL means "this
+        # device's config was CASCADEd away with a deleted node"),
+        # but live devices always point at one config. VLESS Reality
+        # preferred (ShadowTLS deprecated — 0.2), otherwise the first
+        # enabled config.
         primary_config = next(
             (c for c in enabled_configs if c.protocol == models.VPNConfigProtocol.vless_reality),
             enabled_configs[0],

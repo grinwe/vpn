@@ -629,22 +629,17 @@ def delete_config(
                 "Rotate them to another node first, or disable the config."
             ),
         )
-    # Hard-delete terminal devices + their credentials that still point
-    # at this config. devices.config_id is NOT NULL so we can't just
-    # null it; and the 409 gate above already guarantees everything
-    # left here is revoked/disabled, so losing the rows is safe.
-    # Also null out any orphan Credential rows whose FK is nullable —
-    # no need to delete history, just unlink.
-    dead_devices = (
-        db.query(models.Device)
-        .filter(models.Device.config_id == config.id)
-        .all()
-    )
-    for dev in dead_devices:
-        db.query(models.Credential).filter(
-            models.Credential.device_id == dev.id
-        ).delete(synchronize_session=False)
-        db.delete(dev)
+    # Null out config_id on terminal devices + any Credential rows still
+    # pointing here. The 409 gate above already guarantees that every
+    # remaining Device is revoked/disabled, so losing the config link is
+    # fine — the rows stay for sub_token aliasing (see the comment block
+    # on the ``revoke`` branch in services/provisioning.py). Pre-migration
+    # 0030 this had to hard-delete the Device rows because config_id was
+    # NOT NULL; now the column is nullable + ON DELETE SET NULL so we
+    # can just detach.
+    db.query(models.Device).filter(
+        models.Device.config_id == config.id
+    ).update({models.Device.config_id: None}, synchronize_session=False)
     db.query(models.Credential).filter(
         models.Credential.config_id == config.id
     ).update({models.Credential.config_id: None}, synchronize_session=False)
@@ -1067,6 +1062,26 @@ def delete_node(
         .update({models.Credential.node_id: None}, synchronize_session=False)
     )
 
+    # Devices point at configs on this node via config_id. The DB-level
+    # ON DELETE SET NULL (migration 0030) would handle it during the
+    # vpn_nodes → vpn_configs → devices cascade, but doing it explicitly
+    # here pre-empties SQLAlchemy's orphan-nullify at flush time (which
+    # would otherwise race with the CASCADE) and gives the admin an
+    # accurate ``devices_detached`` count in the audit row. Those rows
+    # live on for sub_token aliasing (see revoke-branch comment in
+    # services/provisioning.py); only their config link is dropped.
+    devices_detached = (
+        db.query(models.Device)
+        .filter(
+            models.Device.config_id.in_(
+                db.query(models.VPNConfig.id).filter(
+                    models.VPNConfig.node_id == node.id
+                )
+            ),
+        )
+        .update({models.Device.config_id: None}, synchronize_session=False)
+    )
+
     actor, actor_type = _resolve_admin_actor(admin_actor)
     _audit(
         db,
@@ -1078,6 +1093,7 @@ def delete_node(
         metadata={
             "warm_credentials_deleted": warm_deleted,
             "bound_credentials_detached": bound_detached,
+            "devices_detached": devices_detached,
         },
     )
     db.delete(node)
@@ -1102,6 +1118,7 @@ def delete_node(
         "deleted": True,
         "warm_credentials_deleted": warm_deleted,
         "bound_credentials_detached": bound_detached,
+        "devices_detached": devices_detached,
     }
 
 

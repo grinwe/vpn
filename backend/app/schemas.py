@@ -31,7 +31,7 @@ class DeviceOut(BaseModel):
     id: int
     name: str
     status: str
-    config_id: int
+    config_id: int | None = None
     access_username: str | None = None
     connection_uri: str | None = None
 

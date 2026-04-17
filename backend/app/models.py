@@ -421,7 +421,15 @@ class Device(Base):
     id = Column(Integer, primary_key=True)
     user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
     subscription_id = Column(Integer, ForeignKey("subscriptions.id", ondelete="CASCADE"), nullable=False)
-    config_id = Column(Integer, ForeignKey("vpn_configs.id"), nullable=False)
+    # Nullable + ON DELETE SET NULL so deleting a node (which CASCADEs
+    # into its vpn_configs) doesn't trip the FK on historical disabled
+    # Device rows. Those rows survive on purpose — their sub_token keeps
+    # /api/sub/{token} resolving to a live sibling. See migration 0030.
+    config_id = Column(
+        Integer,
+        ForeignKey("vpn_configs.id", ondelete="SET NULL"),
+        nullable=True,
+    )
     name = Column(String, nullable=False)
     status = Column(Enum(DeviceStatus), default=DeviceStatus.pending)
     access_username = Column(String, nullable=True)
