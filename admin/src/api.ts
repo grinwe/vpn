@@ -235,6 +235,7 @@ export interface VPNNodeOut {
   suspect_since: string | null;
   has_relay_config: boolean;
   exit_links: NodeExitLinkHealthMini[];
+  last_ssh_at: string | null;
   created_at: string;
   updated_at: string;
 }

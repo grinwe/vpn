@@ -85,6 +85,39 @@ function HealthBadge({ score, blocked }: { score: number | null; blocked: string
   );
 }
 
+// Бейдж «когда в последний раз tick реально дошёл до ноды по SSH».
+// Источник — max(NodeTrafficSample.observed_at), а traffic_stats-тик
+// пишет эти row'ы каждые 5 минут. Значит без всяких админских кликов
+// видно: жива нода или нет.
+// Пороги: 10 мин = 2 tick-цикла (healthy), 30 мин = tick сломался или
+// SSH отвалился (alarm).
+function SSHStatusBadge({ lastSshAt }: { lastSshAt: string | null }) {
+  if (!lastSshAt) {
+    return (
+      <span
+        className="text-xs px-1 py-0.5 rounded bg-slate-800 text-slate-500"
+        title="Ни одного успешного traffic-stats тика ещё не было"
+      >
+        SSH —
+      </span>
+    );
+  }
+  const ageMin = (Date.now() - Date.parse(lastSshAt)) / 60000;
+  let color = "bg-emerald-900/60 text-emerald-300";
+  if (ageMin > 30) color = "bg-red-900 text-red-300";
+  else if (ageMin > 10) color = "bg-amber-900 text-amber-300";
+  const label =
+    ageMin < 60 ? `${Math.round(ageMin)}m` : `${Math.round(ageMin / 60)}h`;
+  return (
+    <span
+      className={`text-xs px-1 py-0.5 rounded ${color}`}
+      title={`Последний tick дошёл ${new Date(lastSshAt).toLocaleString()}`}
+    >
+      SSH {label}
+    </span>
+  );
+}
+
 // 2026-04 incident: 3/4 нод застряли с cooldown_until в будущем, UI показывал
 // только is_active=✓, админ не видел, что choose_node их игнорит. Теперь в
 // колонке "Активна" рядом с ✓/✕ висит бейдж с оставшимся временем, если
@@ -717,7 +750,7 @@ export default function Nodes() {
             <th>Health</th>
             <th>WG</th>
             <th>Активна</th>
-            <th>Обновлена</th>
+            <th>SSH · обновлено</th>
             <th></th>
           </tr>
         </thead>
@@ -784,7 +817,14 @@ export default function Nodes() {
                       <CooldownBadge until={n.cooldown_until} />
                     </span>
                   </td>
-                  <td>{new Date(n.updated_at).toLocaleString()}</td>
+                  <td>
+                    <div className="flex flex-col gap-0.5">
+                      <SSHStatusBadge lastSshAt={n.last_ssh_at} />
+                      <span className="text-[10px] text-slate-500">
+                        {new Date(n.updated_at).toLocaleString()}
+                      </span>
+                    </div>
+                  </td>
                   <td onClick={(e) => e.stopPropagation()}>
                     <div className="flex gap-1">
                       <button

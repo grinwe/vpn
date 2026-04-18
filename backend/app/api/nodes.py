@@ -115,6 +115,23 @@ def list_nodes(
         for link in links:
             links_by_relay.setdefault(link.relay_node_id, []).append(link)
 
+    # max(observed_at) на NodeTrafficSample = «когда tick последний раз
+    # реально дошёл до ноды по SSH и xray отдал stats». Одной GROUP BY
+    # вместо N отдельных запросов; по node_id уже есть индекс.
+    node_ids = [n.id for n in nodes]
+    last_ssh_by_node: dict[int, datetime] = {}
+    if node_ids:
+        rows = (
+            db.query(
+                models.NodeTrafficSample.node_id,
+                func.max(models.NodeTrafficSample.observed_at).label("latest"),
+            )
+            .filter(models.NodeTrafficSample.node_id.in_(node_ids))
+            .group_by(models.NodeTrafficSample.node_id)
+            .all()
+        )
+        last_ssh_by_node = {node_id: latest for node_id, latest in rows}
+
     def _to_out(n: models.VPNNode) -> schemas.VPNNodeOut:
         out = schemas.VPNNodeOut.from_orm(n)
         out.exit_links = [
@@ -127,6 +144,7 @@ def list_nodes(
             )
             for link in links_by_relay.get(n.id, [])
         ]
+        out.last_ssh_at = last_ssh_by_node.get(n.id)
         return out
 
     return [_to_out(n) for n in nodes]

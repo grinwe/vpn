@@ -193,6 +193,13 @@ class VPNNodeOut(VPNNodeCreate):
     # линки — остальные используют VPNNodeOut как ответ после мутации
     # одной ноды, где dots не нужны.
     exit_links: list[NodeExitLinkHealthMini] = []
+    # Время последнего успешного SSH-тика ``run_traffic_stats_tick`` на
+    # эту ноду — прокси для «нода жива». Тик сам пишет NodeTrafficSample
+    # при каждом успешном ``xray api statsquery``, значит max(observed_at)
+    # это timestamp последнего доказательства что SSH дошёл и xray отдал
+    # stats. Без клика по diagnose. Дефолт None (``list_nodes`` bulk-load,
+    # остальные call-сайты VPNNodeOut его не проставляют — им неактуально).
+    last_ssh_at: UTCDateTime | None = None
     created_at: datetime
     updated_at: datetime
 
