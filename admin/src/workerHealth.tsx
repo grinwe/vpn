@@ -35,6 +35,18 @@ export interface TicksStatusOut {
 
 type Severity = "ok" | "warn" | "down";
 
+// Пороги подобраны так, чтобы светофор не орал раньше чем тик реально
+// пропустил свой слот. RQ heartbeat по default раз в 60с — 180с = три
+// пропущенных, уверенный признак что воркер действительно мёртв, а не
+// просто занят тяжёлым provisioning'ом.
+const WORKER_DEAD_MS = 180_000;
+// Тик может быть overdue из-за того что воркер доделывает долгий job
+// (ansible-run 2-3 мин). Триггерим warn только если пропустили >2 цикла
+// + 60с запас — тогда это не "занят", а реально scheduler не кикает.
+function tickOverdueThreshold(intervalSeconds: number): number {
+  return intervalSeconds * 3 + 60;
+}
+
 function severity(data: TicksStatusOut | undefined): {
   s: Severity;
   label: string;
@@ -46,7 +58,7 @@ function severity(data: TicksStatusOut | undefined): {
   const liveWorkers = data.workers.filter((w) => {
     if (!w.last_heartbeat) return false;
     const ageMs = now - new Date(w.last_heartbeat).getTime();
-    return ageMs < 90_000;
+    return ageMs < WORKER_DEAD_MS;
   });
   if (liveWorkers.length === 0) {
     const anyHb = data.workers.some((w) => w.last_heartbeat);
@@ -57,7 +69,7 @@ function severity(data: TicksStatusOut | undefined): {
     (t) =>
       t.interval_seconds > 0 &&
       t.overdue_by_seconds != null &&
-      t.overdue_by_seconds > t.interval_seconds * 2,
+      t.overdue_by_seconds > tickOverdueThreshold(t.interval_seconds),
   );
   if (overdueTick) {
     return { s: "warn", label: `Tick overdue: ${overdueTick.tick_id}` };
@@ -212,7 +224,7 @@ export function WorkerHealthBadge() {
                   t.job_status === "started"
                     ? "text-emerald-400"
                     : t.job_status === "scheduled" || t.job_status === "queued"
-                      ? t.overdue_by_seconds != null && t.overdue_by_seconds > t.interval_seconds * 2
+                      ? t.overdue_by_seconds != null && t.overdue_by_seconds > tickOverdueThreshold(t.interval_seconds)
                         ? "text-red-400"
                         : "text-emerald-400"
                       : t.job_status === "failed"
@@ -229,7 +241,7 @@ export function WorkerHealthBadge() {
                     <td className="py-1">
                       {t.overdue_by_seconds == null ? (
                         "—"
-                      ) : t.overdue_by_seconds > t.interval_seconds * 2 ? (
+                      ) : t.overdue_by_seconds > tickOverdueThreshold(t.interval_seconds) ? (
                         <span className="text-red-400 font-medium">
                           +{t.overdue_by_seconds}s
                         </span>
