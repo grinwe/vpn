@@ -145,6 +145,23 @@ TICK_IDS = {
     "app.worker.run_relay_link_health_tick": "tick-relay-link-health",
 }
 
+# Per-tick hard timeouts. Без них зависшая SSH (traffic-stats,
+# relay-link-health ходят по всем активным нодам) держит воркер на
+# `DEFAULT_JOB_TIMEOUT=900s` — следующие тики копят overdue, светофор
+# жёлтый. Отдельный timeout запускает RQ kill horse быстро, self-reschedule
+# внутри функции даже не успеет вызваться — но bootstrap на рестарте
+# (и наш own reschedule из тика рядом) вернёт тик в строй.
+TICK_TIMEOUTS = {
+    "tick-traffic-stats": 120,
+    "tick-relay-link-health": 120,
+    "tick-pending-rescue": 60,
+    "tick-warm-pool": 180,
+    "tick-autoscale": 90,
+    "tick-renewal": 300,
+    "tick-balance-charge": 300,
+    "tick-health-ping": 180,
+}
+
 
 def schedule_tick(
     func_name: str,
@@ -152,6 +169,7 @@ def schedule_tick(
     tick_id: str,
     *,
     replace: bool = False,
+    job_timeout: int | None = None,
 ) -> str | None:
     """Enqueue a self-rescheduling tick with deterministic dedup.
 
@@ -206,11 +224,24 @@ def schedule_tick(
         except NoSuchJobError:
             pass
 
+        # job_timeout нужен чтобы зависшая SSH-сессия в traffic-stats /
+        # relay-link-health не держала воркер вечно — RQ kill horse через
+        # timeout, следующий тик поставится по self-reschedule (или
+        # bootstrap'ом на рестарте). Без него SIGKILL воркера или
+        # сетевой blip в SSH = scheduler не получает сигнал о завершении.
+        enqueue_kwargs: dict = {
+            "job_id": tick_id,
+            "result_ttl": RESULT_TTL,
+        }
+        effective_timeout = (
+            job_timeout if job_timeout is not None else TICK_TIMEOUTS.get(tick_id)
+        )
+        if effective_timeout is not None:
+            enqueue_kwargs["job_timeout"] = effective_timeout
         job = queue.enqueue_in(
             timedelta(seconds=interval_seconds),
             func_name,
-            job_id=tick_id,
-            result_ttl=RESULT_TTL,
+            **enqueue_kwargs,
         )
         return job.id
     except Exception:  # noqa: BLE001
