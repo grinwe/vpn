@@ -56,28 +56,144 @@ def _link_to_out(
     )
 
 
-def _active_subs_by_relay(
-    db: Session, relay_ids: list[int]
+def _active_subs_by_exit(
+    db: Session, exit_ids: list[int]
 ) -> dict[int, int]:
-    """Подсчитать active subscriptions по каждой relay-ноде одной GROUP BY.
+    """Distinct active subscriptions pinned to each exit via Credential.exit_id.
 
-    Для UI «сколько юзеров ходит через какой relay/exit» — хотим один
-    запрос по списку relay_ids, а не N per-row. Пустой вход → пустой
-    словарь.
+    Источник правды — Credential.exit_id (G.4+ заполняется provisioning'ом при
+    assign-е). Если relay линкуется к нескольким exit'ам, одна и та же подписка
+    попадёт ровно в один бакет — тот, к которому её cred'ы реально прибиты.
+    COUNT(DISTINCT subscription_id) на случай нескольких cred'ов (разные
+    протоколы) у одной sub'ы.
+
+    Legacy fallback: если cred.exit_id IS NULL (1:1 relay до G.4 миграции или
+    warm-bundle до assign'а), а relay подписки имеет ровно один RelayExitLink
+    — атрибутим такой sub к этому единственному exit'у. Без этого legacy
+    подписки светят 0 на всех exit'ах и UI бесполезен.
     """
-    if not relay_ids:
+    if not exit_ids:
         return {}
-    rows = (
+    out: dict[int, int] = {}
+    explicit = (
         db.query(
-            models.Subscription.node_id,
-            func.count(models.Subscription.id).label("cnt"),
+            models.Credential.exit_id,
+            func.count(func.distinct(models.Credential.subscription_id)).label("cnt"),
+        )
+        .join(
+            models.Subscription,
+            models.Subscription.id == models.Credential.subscription_id,
         )
         .filter(models.Subscription.status == models.SubscriptionStatus.active)
-        .filter(models.Subscription.node_id.in_(relay_ids))
+        .filter(models.Credential.is_active.is_(True))
+        .filter(models.Credential.exit_id.in_(exit_ids))
+        .group_by(models.Credential.exit_id)
+        .all()
+    )
+    for eid, cnt in explicit:
+        out[eid] = cnt
+
+    single_link_rows = (
+        db.query(
+            models.RelayExitLink.relay_node_id,
+            func.max(models.RelayExitLink.exit_id).label("eid"),
+        )
+        .group_by(models.RelayExitLink.relay_node_id)
+        .having(func.count(models.RelayExitLink.id) == 1)
+        .all()
+    )
+    relay_to_sole_exit = {
+        rid: eid for rid, eid in single_link_rows if eid in exit_ids
+    }
+    if not relay_to_sole_exit:
+        return out
+
+    legacy = (
+        db.query(
+            models.Subscription.node_id,
+            func.count(func.distinct(models.Subscription.id)).label("cnt"),
+        )
+        .filter(models.Subscription.status == models.SubscriptionStatus.active)
+        .filter(models.Subscription.node_id.in_(list(relay_to_sole_exit.keys())))
+        .filter(
+            ~models.Subscription.id.in_(
+                db.query(models.Credential.subscription_id)
+                .filter(models.Credential.is_active.is_(True))
+                .filter(models.Credential.exit_id.isnot(None))
+            )
+        )
         .group_by(models.Subscription.node_id)
         .all()
     )
-    return {node_id: cnt for node_id, cnt in rows}
+    for relay_id, cnt in legacy:
+        eid = relay_to_sole_exit.get(relay_id)
+        if eid is not None:
+            out[eid] = out.get(eid, 0) + cnt
+    return out
+
+
+def _active_subs_by_relay_for_exit(
+    db: Session, exit_id: int
+) -> dict[int, int]:
+    """Для заданного exit — сколько подписок ходит через каждую relay-ноду.
+
+    Группируем по Subscription.node_id, но жёстко фильтруем Credential.exit_id
+    = exit_id — чтобы link (relay→exit) показывал только тех юзеров, кого
+    этот link реально обслуживает, а не всех subs релея. Legacy fallback для
+    single-link relay с NULL cred.exit_id — симметрично _active_subs_by_exit.
+    """
+    out: dict[int, int] = {}
+    explicit = (
+        db.query(
+            models.Subscription.node_id,
+            func.count(func.distinct(models.Subscription.id)).label("cnt"),
+        )
+        .join(
+            models.Credential,
+            models.Credential.subscription_id == models.Subscription.id,
+        )
+        .filter(models.Subscription.status == models.SubscriptionStatus.active)
+        .filter(models.Credential.is_active.is_(True))
+        .filter(models.Credential.exit_id == exit_id)
+        .group_by(models.Subscription.node_id)
+        .all()
+    )
+    for relay_id, cnt in explicit:
+        out[relay_id] = cnt
+
+    single_link_rows = (
+        db.query(
+            models.RelayExitLink.relay_node_id,
+            func.max(models.RelayExitLink.exit_id).label("eid"),
+        )
+        .group_by(models.RelayExitLink.relay_node_id)
+        .having(func.count(models.RelayExitLink.id) == 1)
+        .all()
+    )
+    single_link_relays = [rid for rid, eid in single_link_rows if eid == exit_id]
+    if not single_link_relays:
+        return out
+
+    legacy = (
+        db.query(
+            models.Subscription.node_id,
+            func.count(func.distinct(models.Subscription.id)).label("cnt"),
+        )
+        .filter(models.Subscription.status == models.SubscriptionStatus.active)
+        .filter(models.Subscription.node_id.in_(single_link_relays))
+        .filter(
+            ~models.Subscription.id.in_(
+                db.query(models.Credential.subscription_id)
+                .filter(models.Credential.is_active.is_(True))
+                .filter(models.Credential.exit_id.isnot(None))
+            )
+        )
+        .group_by(models.Subscription.node_id)
+        .all()
+    )
+    for relay_id, cnt in legacy:
+        out[relay_id] = out.get(relay_id, 0) + cnt
+    return out
 
 
 def _links_mini(links: list[models.RelayExitLink]) -> list[schemas.ExitLinkHealthMini]:
@@ -148,18 +264,13 @@ def list_exits(
     links_by_exit: dict[int, list[models.RelayExitLink]] = {}
     for link in all_links:
         links_by_exit.setdefault(link.exit_id, []).append(link)
-    subs_by_relay = _active_subs_by_relay(
-        db, [link.relay_node_id for link in all_links]
-    )
+    subs_by_exit = _active_subs_by_exit(db, [r.id for r in rows])
     return [
         _to_out(
             r,
             peers_count=len(links_by_exit.get(r.id, [])),
             links=links_by_exit.get(r.id, []),
-            active_subs_total=sum(
-                subs_by_relay.get(link.relay_node_id, 0)
-                for link in links_by_exit.get(r.id, [])
-            ),
+            active_subs_total=subs_by_exit.get(r.id, 0),
         )
         for r in rows
     ]
@@ -445,9 +556,7 @@ def list_exit_links(
         .order_by(models.RelayExitLink.id)
         .all()
     )
-    subs_by_relay = _active_subs_by_relay(
-        db, [r.relay_node_id for r in rows]
-    )
+    subs_by_relay = _active_subs_by_relay_for_exit(db, exit_id)
     return [
         _link_to_out(r, active_subs=subs_by_relay.get(r.relay_node_id, 0))
         for r in rows
