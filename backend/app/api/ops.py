@@ -22,7 +22,7 @@ from sqlalchemy.orm import Session
 
 from .. import schemas
 from ..auth import require_admin
-from ..queue import RESULT_TTL, TICK_IDS, get_queue
+from ..queue import RESULT_TTL, TICK_IDS, get_queue, get_ticks_queue
 from ._common import ADMIN_ACTOR_HEADER, _audit, _resolve_admin_actor, get_db
 
 router = APIRouter()
@@ -144,12 +144,18 @@ def _describe_job(tick_id: str, queue) -> schemas.TickStatusItem:
 
 
 def _describe_workers(queue) -> list[schemas.WorkerInfo]:
+    """Энумерация воркеров по connection, а не по queue.
+
+    Нам нужно показать и worker-ticks и worker-provisioning в одном списке,
+    даже если они слушают разные очереди. Worker.all(connection=...) идёт
+    через Redis SADD rq:workers — общий для всех ролей.
+    """
     if queue is None:
         return []
     try:
         from rq import Worker
 
-        workers = Worker.all(queue=queue)
+        workers = Worker.all(connection=queue.connection)
     except Exception:  # noqa: BLE001
         return []
 
@@ -189,11 +195,20 @@ def ticks_status(admin_token: str = Depends(require_admin)):
     умер, рестарт воркера освежит всё благодаря ``replace=True`` в
     bootstrap'ах.
     """
-    queue = get_queue()
-    queue_available = queue is not None
+    # Ticks живут в отдельной очереди vpn-ticks (stage 3 split), но
+    # "queue_available" мы всё ещё считаем по provisioning-очереди —
+    # если Redis живой, она тоже есть. Tick lookup же должен идти в
+    # ticks_queue, иначе ScheduledJobRegistry смотрит не туда и все
+    # тики видны как "missing".
+    prov_queue = get_queue()
+    ticks_queue = get_ticks_queue()
+    queue_available = prov_queue is not None or ticks_queue is not None
 
-    workers = _describe_workers(queue)
-    ticks = [_describe_job(tid, queue) for tid in TICK_IDS.values()]
+    # Воркеров enum'им по connection — любой из двух queue.connection
+    # даёт доступ ко всем workers в Redis.
+    enum_queue = ticks_queue or prov_queue
+    workers = _describe_workers(enum_queue)
+    ticks = [_describe_job(tid, ticks_queue) for tid in TICK_IDS.values()]
 
     _ = RESULT_TTL  # keep import eager for traceability
 
@@ -221,7 +236,7 @@ def restart_workers(
     кликом из UI перезапускаем вместо ``docker compose restart worker``
     на хосте.
     """
-    queue = get_queue()
+    queue = get_queue() or get_ticks_queue()
     if queue is None:
         raise HTTPException(status_code=503, detail="Redis queue unavailable")
 
@@ -229,7 +244,9 @@ def restart_workers(
     from rq.command import send_shutdown_command
 
     try:
-        workers = Worker.all(queue=queue)
+        # По connection — ловим и worker-ticks и worker-provisioning
+        # одним запросом.
+        workers = Worker.all(connection=queue.connection)
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(
             status_code=503, detail=f"Failed to enumerate workers: {exc}"

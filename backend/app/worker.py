@@ -1128,7 +1128,18 @@ def main() -> None:
         logger.error("REDIS_URL is required for the worker")
         sys.exit(1)
 
-    queue_name = os.getenv("RQ_QUEUE", "vpn-provisioning")
+    # WORKER_ROLE разделяет один и тот же образ на два docker-сервиса:
+    # * "ticks" — слушает только тиковую очередь, включает with_scheduler,
+    #   бутстрапит все периодики. Лёгкие задачи (секунды), не должен
+    #   забиваться ansible-run'ами.
+    # * "provisioning" — слушает только provisioning-очередь, без
+    #   scheduler'а, без bootstrap'а. Долгие ansible-run'ы живут тут.
+    # * unset (legacy/single-container) — слушает обе очереди,
+    #   bootstrap + scheduler. Старая конфигурация.
+    role = os.getenv("WORKER_ROLE", "").strip().lower()
+    provisioning_queue_name = os.getenv("RQ_QUEUE", "vpn-provisioning")
+    ticks_queue_name = os.getenv("RQ_TICKS_QUEUE", "vpn-ticks")
+
     connection = Redis.from_url(url)
     connection.ping()
 
@@ -1138,7 +1149,22 @@ def main() -> None:
     except Exception:  # noqa: BLE001
         logger.exception("Worker failed to run migrations at startup")
 
-    queue = Queue(queue_name, connection=connection)
+    provisioning_queue = Queue(provisioning_queue_name, connection=connection)
+    ticks_queue = Queue(ticks_queue_name, connection=connection)
+
+    if role == "ticks":
+        queues_to_listen = [ticks_queue]
+        do_bootstrap = True
+        with_scheduler = True
+    elif role == "provisioning":
+        queues_to_listen = [provisioning_queue]
+        do_bootstrap = False
+        with_scheduler = False
+    else:
+        # Legacy: один воркер на всё.
+        queues_to_listen = [provisioning_queue, ticks_queue]
+        do_bootstrap = True
+        with_scheduler = True
 
     # Schedule pending-task rescue (default: every minute). Re-enqueues
     # provisioning tasks stuck in ``pending`` — typically because an RQ
@@ -1153,7 +1179,7 @@ def main() -> None:
     # N restarts → N parallel chains per tick. See ``queue.schedule_tick``
     # and ``docs/components/worker.md`` § Дедупликация тиков.
     pending_rescue_interval = int(os.getenv("PENDING_RESCUE_INTERVAL", "60"))
-    if pending_rescue_interval > 0:
+    if do_bootstrap and pending_rescue_interval > 0:
         try:
             schedule_tick(
                 "app.worker.run_pending_rescue_tick",
@@ -1170,7 +1196,7 @@ def main() -> None:
 
     # Schedule autoscale tick
     autoscale_interval = int(os.getenv("AUTOSCALE_INTERVAL", "0"))
-    if autoscale_interval > 0:
+    if do_bootstrap and autoscale_interval > 0:
         try:
             schedule_tick(
                 "app.worker.run_autoscale_tick",
@@ -1184,7 +1210,7 @@ def main() -> None:
 
     # Schedule renewal check (default: every hour)
     renewal_interval = int(os.getenv("RENEWAL_CHECK_INTERVAL", "3600"))
-    if renewal_interval > 0:
+    if do_bootstrap and renewal_interval > 0:
         try:
             schedule_tick(
                 "app.worker.run_renewal_check",
@@ -1201,7 +1227,7 @@ def main() -> None:
     # purchases hit a warm bundle instead of paying the Ansible cost.
     warm_interval = int(os.getenv("WARM_POOL_CHECK_INTERVAL", "120"))
     warm_enabled = os.getenv("WARM_POOL_ENABLED", "1").lower() not in {"0", "false", "no"}
-    if warm_interval > 0 and warm_enabled:
+    if do_bootstrap and warm_interval > 0 and warm_enabled:
         try:
             schedule_tick(
                 "app.worker.run_warm_pool_check",
@@ -1220,7 +1246,7 @@ def main() -> None:
     # daily-billing ticks for balance subscriptions and auto-unfreezes
     # paused ones whose frozen_until has lapsed.
     balance_interval = int(os.getenv("BALANCE_CHARGE_INTERVAL", "3600"))
-    if balance_interval > 0:
+    if do_bootstrap and balance_interval > 0:
         try:
             schedule_tick(
                 "app.worker.run_balance_charge_tick",
@@ -1239,7 +1265,7 @@ def main() -> None:
     # node every TRAFFIC_STATS_INTERVAL seconds (default 300) and
     # writes a row into node_traffic_samples. Disabled when set to 0.
     traffic_stats_interval = int(os.getenv("TRAFFIC_STATS_INTERVAL", "300"))
-    if traffic_stats_interval > 0:
+    if do_bootstrap and traffic_stats_interval > 0:
         try:
             schedule_tick(
                 "app.worker.run_traffic_stats_tick",
@@ -1259,7 +1285,7 @@ def main() -> None:
     # relay_exit_links. Интервал RELAY_LINK_HEALTH_INTERVAL (default
     # 300s), Disabled at 0.
     relay_link_health_interval = int(os.getenv("RELAY_LINK_HEALTH_INTERVAL", "300"))
-    if relay_link_health_interval > 0:
+    if do_bootstrap and relay_link_health_interval > 0:
         try:
             schedule_tick(
                 "app.worker.run_relay_link_health_tick",
@@ -1279,7 +1305,7 @@ def main() -> None:
     # once per USER_HEALTH_PING_DEBOUNCE_HOURS, capped at
     # USER_HEALTH_PING_BATCH per tick. Disabled when set to 0.
     health_ping_interval = int(os.getenv("USER_HEALTH_PING_INTERVAL", "1800"))
-    if health_ping_interval > 0:
+    if do_bootstrap and health_ping_interval > 0:
         try:
             schedule_tick(
                 "app.worker.run_user_health_ping_tick",
@@ -1295,12 +1321,17 @@ def main() -> None:
             logger.exception("Failed to schedule user health-ping tick")
 
     worker = Worker(
-        [queue],
+        queues_to_listen,
         connection=connection,
         exception_handlers=[dlq_exception_handler],
     )
-    logger.info("Starting RQ worker on queue %s", queue_name)
-    worker.work(with_scheduler=True)
+    logger.info(
+        "Starting RQ worker role=%s queues=%s scheduler=%s",
+        role or "legacy-all",
+        [q.name for q in queues_to_listen],
+        with_scheduler,
+    )
+    worker.work(with_scheduler=with_scheduler)
 
 
 if __name__ == "__main__":

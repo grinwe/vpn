@@ -92,18 +92,24 @@ services:
         condition: service_healthy
     restart: unless-stopped
 
+  # Тяжёлый воркер под ansible-run'ы. Без scheduler'а, без bootstrap'а —
+  # слушает только vpn-provisioning и молотит долгие job'ы. Имя сервиса
+  # оставлено историческим (`worker`), чтобы runbook-команды типа
+  # `docker compose logs worker` продолжали работать. Если зависнет в
+  # сети/SSH — тики это не заденет (они живут в worker-scheduler).
   worker:
     build:
       context: .
       dockerfile: backend/Dockerfile.worker
     deploy:
       replicas: 1
-    environment:
+    environment: &worker-env
       DATABASE_URL: ${DATABASE_URL}
       ADMIN_API_TOKEN: ${ADMIN_API_TOKEN}
       APP_SECRET_KEY: ${APP_SECRET_KEY}
       REDIS_URL: "redis://:${REDIS_PASSWORD}@redis:6379/0"
       QUEUE_BACKEND: "rq"
+      WORKER_ROLE: "provisioning"
       # Migrations are owned by the backend service — it runs
       # `alembic upgrade head` on startup. If the worker also tries to
       # run them, both processes race on the alembic_version advisory
@@ -161,6 +167,29 @@ services:
       USER_HEALTH_PING_INTERVAL: ${USER_HEALTH_PING_INTERVAL:-1800}
       USER_HEALTH_PING_BATCH: ${USER_HEALTH_PING_BATCH:-50}
       USER_HEALTH_PING_DEBOUNCE_HOURS: ${USER_HEALTH_PING_DEBOUNCE_HOURS:-24}
+    volumes:
+      - ${PROVISIONING_SSH_KEY:?Set PROVISIONING_SSH_KEY to the host path of the SSH private key}:/run/secrets/provisioning_key:ro
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # Легковесный воркер под периодические тики. Держит RQScheduler fork,
+  # bootstrap'ит 8 тиков с replace=True при старте. Очередь отдельная
+  # (vpn-ticks) — долгий ansible не блокирует self-reschedule цикл, и
+  # зависшая SSH в traffic-stats держит только этот контейнер, который
+  # авто-рестартует по timeout (job_timeout per-tick из TICK_TIMEOUTS).
+  worker-scheduler:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile.worker
+    deploy:
+      replicas: 1
+    environment:
+      <<: *worker-env
+      WORKER_ROLE: "ticks"
     volumes:
       - ${PROVISIONING_SSH_KEY:?Set PROVISIONING_SSH_KEY to the host path of the SSH private key}:/run/secrets/provisioning_key:ro
     depends_on:

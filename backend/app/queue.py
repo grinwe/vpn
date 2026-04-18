@@ -26,6 +26,13 @@ if TYPE_CHECKING:  # pragma: no cover
 
 
 QUEUE_NAME = os.getenv("RQ_QUEUE", "vpn-provisioning")
+# Отдельная очередь для коротких периодических тиков. Идея — не делить
+# один FIFO с ansible-run'ами (минуты), иначе scheduled ticks копят
+# overdue пока воркер занят деплоем. Worker с WORKER_ROLE=ticks слушает
+# только её и включает with_scheduler=True; провижининговый worker сидит
+# на QUEUE_NAME без scheduler'а. RQScheduler держит lock per-queue,
+# дублей ticks между двумя процессами не будет.
+TICKS_QUEUE_NAME = os.getenv("RQ_TICKS_QUEUE", "vpn-ticks")
 DEFAULT_JOB_TIMEOUT = int(os.getenv("RQ_JOB_TIMEOUT", "900"))  # seconds
 # RQ keeps failed jobs in a dead-letter-ish "failed" registry; we keep them
 # around for a week so ops can inspect them.
@@ -53,18 +60,31 @@ def get_redis() -> "Redis | None":
         return None
 
 
-@lru_cache(maxsize=1)
-def get_queue() -> "Queue | None":
+@lru_cache(maxsize=4)
+def _queue_by_name(name: str) -> "Queue | None":
     redis = get_redis()
     if redis is None:
         return None
     try:
         from rq import Queue
 
-        return Queue(QUEUE_NAME, connection=redis, default_timeout=DEFAULT_JOB_TIMEOUT)
+        return Queue(name, connection=redis, default_timeout=DEFAULT_JOB_TIMEOUT)
     except Exception:  # noqa: BLE001
-        logger.exception("Failed to construct RQ Queue; falling back to inline execution")
+        logger.exception(
+            "Failed to construct RQ Queue %s; falling back to inline execution",
+            name,
+        )
         return None
+
+
+def get_queue() -> "Queue | None":
+    """Provisioning queue (ansible-run jobs). Запросы API пишут сюда."""
+    return _queue_by_name(QUEUE_NAME)
+
+
+def get_ticks_queue() -> "Queue | None":
+    """Tick queue (periodic short jobs). schedule_tick пишет сюда."""
+    return _queue_by_name(TICKS_QUEUE_NAME)
 
 
 def enqueue_task(task_id: int, node_id: int | None) -> str | None:
@@ -197,7 +217,7 @@ def schedule_tick(
     Returns the RQ job id on success or ``None`` if the queue is
     unavailable.
     """
-    queue = get_queue()
+    queue = get_ticks_queue()
     if queue is None:
         return None
     try:
