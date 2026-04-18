@@ -1,0 +1,22 @@
+---
+# Stage E/G of the relay architecture (docs/RELAY_ROADMAP.md).
+#
+# Reconciles the WireGuard client side of a relay VPN node. The
+# relay_jump_node role loops over relay_wg_links (one wg-quick@wgN
+# per RelayExitLink row): a non-empty list enables each tunnel and
+# keeps Xray sockopt patched (single-link case) or deferred to G.6
+# (multi-link case); an empty list tears every tunnel down and
+# unpatches Xray (idempotent cleanup). This lightweight playbook
+# only runs that one role — avoiding the full site.yml cost when we
+# only want to touch tunnel state.
+#
+# Required extra vars (built by services/provisioning
+# ._collect_relay_tunnel_extra_vars — sourced from relay_exit_links):
+#   relay_wg_links — list of {interface, private_key, address_v4,
+#                             endpoint, exit_public_key}.
+#                    An empty list puts the role in teardown mode.
+
+- hosts: vpn_nodes
+  become: yes
+  roles:
+    - relay_jump_node

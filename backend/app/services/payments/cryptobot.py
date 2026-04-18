@@ -51,7 +51,7 @@ class CryptoBotProvider:
         body = {
             "asset": asset,
             "amount": f"{amount:.2f}",
-            "description": description or f"VPN invoice #{invoice_id}",
+            "description": description or f"Order #{invoice_id}",
             # ``payload`` is returned verbatim in webhook events and lets us
             # look up the internal invoice without another round-trip.
             "payload": str(invoice_id),

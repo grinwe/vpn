@@ -24,7 +24,6 @@ from collections import defaultdict
 from datetime import datetime, timedelta
 
 from ..time_utils import utcnow
-from typing import Iterable
 
 from sqlalchemy import func
 from sqlalchemy.orm import Session
@@ -108,7 +107,9 @@ def _aggregate(
         for region in per_region_total
         if per_region_total[region] > 0
     }
-    overall = (ok_total / total) if total else 1.0
+    # #64 — zero probes → None, not 1.0. Prevents fresh/unprobed nodes
+    # from appearing as 100% healthy in UI and autoscale selector.
+    overall = (ok_total / total) if total else None
     return overall, per_region, total, dict(per_region_total)
 
 
@@ -135,26 +136,36 @@ def recompute_node_health(
         if rate < BLOCK_THRESHOLD and per_region_samples.get(region, 0) >= MIN_SAMPLES
     )
     node.blocked_regions = blocked or None
-    node.health_score = int(round(overall * 100))
+    node.health_score = int(round(overall * 100)) if overall is not None else None
     node.last_health_check_at = utcnow()
 
     migrated: list[int] = []
-    # Same gate as per-region: need enough total samples before we'll
-    # pronounce the node dead. Without this, a node that just came up
-    # gets killed by the first probe if it fails.
-    global_death = overall < DEAD_THRESHOLD and total_samples >= MIN_SAMPLES
-    if auto_migrate and (global_death or blocked):
-        logger.warning(
-            "Node %s degraded: health=%.2f blocked_regions=%s — considering migration",
-            node.name,
-            overall,
-            blocked,
-        )
-        if global_death:
-            node.status = models.VPNNodeStatus.error
-            node.is_active = False
-            node.cooldown_until = utcnow() + DEFAULT_COOLDOWN
-            migrated = migrate_subscriptions_off(db, node, reason="node unreachable")
+    # DISABLED 2026-04-15: автомиграция по healthcheck отключена — на
+    # транзиентных сбоях probes (сетевой дребезг, единичные таймауты)
+    # мы флипали ноду в error и переселяли активных пользователей, что
+    # проявлялось как отвал подключения каждые 5-10 минут. До пересмотра
+    # порогов / anti-flap логики оставляем функцию считать score и
+    # blocked_regions, но решения о миграции теперь принимает админ
+    # через ручной маршрут. Чтобы вернуть поведение — расхешировать блок.
+    # global_death = (
+    #     overall is not None
+    #     and overall < DEAD_THRESHOLD
+    #     and total_samples >= MIN_SAMPLES
+    # )
+    # if auto_migrate and (global_death or blocked):
+    #     logger.warning(
+    #         "Node %s degraded: health=%.2f blocked_regions=%s — considering migration",
+    #         node.name,
+    #         overall,
+    #         blocked,
+    #     )
+    #     if global_death:
+    #         node.status = models.VPNNodeStatus.error
+    #         node.is_active = False
+    #         node.cooldown_until = utcnow() + DEFAULT_COOLDOWN
+    #         migrated = migrate_subscriptions_off(db, node, reason="node unreachable")[
+    #             "subscription_ids"
+    #         ]
 
     db.add(node)
     db.commit()
@@ -169,12 +180,36 @@ def recompute_node_health(
 
 
 def migrate_subscriptions_off(
-    db: Session, node: models.VPNNode, *, reason: str
-) -> list[int]:
-    """Move all active subscriptions off ``node`` to a healthy alternative."""
-    from .provisioning import ProvisioningOrchestrator, choose_node
+    db: Session,
+    node: models.VPNNode,
+    *,
+    reason: str,
+    exclude_same_region: bool = False,
+) -> dict:
+    """Move all active subscriptions off ``node`` to a healthy alternative.
 
-    subs: Iterable[models.Subscription] = (
+    Returns a dict with the migrated subscription IDs, the per-target
+    resync task IDs, and the per-device provisioning task IDs. Callers
+    that only care about the migrated count (legacy health-monitor
+    path) can read ``["subscription_ids"]``; the admin migrate route
+    surfaces ``task_ids`` so the UI can render a grouped progress
+    banner for the batch.
+
+    ``considered_count`` is the number of active subs we tried to move;
+    ``no_target_count`` is how many of those ``choose_node`` couldn't
+    find a destination for (every other node in cooldown / unhealthy /
+    out of the plan's pool). The admin UI reads these to distinguish
+    "no active subs on this node" from "had subs but nowhere to send
+    them" — previously both produced an empty ``subscription_ids`` and
+    the UI showed the same misleading "нечего мигрировать" toast.
+    """
+    from .provisioning import (
+        ProvisioningOrchestrator,
+        _node_has_vless_family,
+        choose_node,
+    )
+
+    subs: list[models.Subscription] = (
         db.query(models.Subscription)
         .filter(
             models.Subscription.node_id == node.id,
@@ -182,44 +217,113 @@ def migrate_subscriptions_off(
         )
         .all()
     )
+    considered_count = len(subs)
+    no_target_count = 0
     migrated_ids: list[int] = []
     orchestrator = ProvisioningOrchestrator(db)
+    # Unique target nodes this batch migrated to — we run a single
+    # resync per target at the end. Per-sub resync would be O(subs²)
+    # and redundant: manage_vless_user.sh is idempotent and the resync
+    # reads the full active-subs list from the DB, not the per-sub
+    # delta, so one call after the whole batch is exactly enough.
+    # Also tracks the provisioning task IDs we create so the admin UI
+    # can show a progress banner grouped by this migration run.
+    resync_targets: dict[int, models.VPNNode] = {}
+    device_task_ids: list[int] = []
+    revoke_task_ids: list[int] = []
 
     for sub in subs:
         try:
-            target = choose_node(db, sub.plan, exclude_node_ids=[node.id])
+            target = choose_node(
+                db,
+                sub.plan,
+                exclude_node_ids=[node.id],
+                exclude_regions=[node.region] if exclude_same_region else None,
+            )
         except RuntimeError as exc:
             logger.error("No healthy node available for sub %s: %s", sub.id, exc)
+            no_target_count += 1
             continue
 
         # Revoke the old devices on the (possibly already-dead) node. Best
         # effort — if the node is unreachable Ansible will fail, that's okay.
         for device in list(sub.devices):
             try:
-                orchestrator.revoke_device(device, reason=reason, background=True)
+                revoke_task = orchestrator.revoke_device(device, reason=reason, background=True)
+                revoke_task_ids.append(revoke_task.id)
             except Exception:  # noqa: BLE001
                 logger.exception("Failed to revoke device %s during migration", device.id)
 
-        # Re-provision on a new node. provision_subscription creates a brand
-        # new Subscription — so we mark the old one as blocked and rely on
-        # the new one being associated with the same user+plan.
-        sub.status = models.SubscriptionStatus.blocked
+        # In-place migration: flip node_id on the existing Subscription row
+        # and reprovision. This preserves sub_token (dynamic sub-link keeps
+        # working) and avoids the "two cards in webapp" UX bug where the
+        # old blocked row and new active row both showed up.
+        sub.node_id = target.id
         sub.notes = f"migrated: {reason}"
         db.add(sub)
         db.commit()
+        db.refresh(sub)
 
         try:
-            # Preserve whatever time is left on the original subscription —
-            # users shouldn't get "free" extra days just because we migrated
-            # them off a dead node, and they shouldn't lose time either.
-            new_sub, _task = orchestrator.provision_subscription(
-                sub.user,
-                sub.plan,
-                node_id=target.id,
-                expires_at_override=sub.expires_at,
-            )
-            migrated_ids.append(new_sub.id)
+            _device, _task = orchestrator.reprovision_subscription(sub)
+            migrated_ids.append(sub.id)
+            resync_targets[target.id] = target
+            if _task is not None:
+                device_task_ids.append(_task.id)
+            new_sub = sub
+            # Notify the user. The bot polls /notifications/pending for
+            # audit_log rows with action="migration_notice" and delivers
+            # them as Telegram messages (see api_extensions.py). Without
+            # telegram_id in extra the poller silently drops the row, so
+            # skip the write for non-Telegram users (e.g. email-only).
+            if sub.user and sub.user.telegram_id and sub.user.notify_migrations:
+                db.add(
+                    models.AuditLog(
+                        actor="health_monitor",
+                        actor_type=models.AuditActor.system,
+                        action="migration_notice",
+                        target_type="subscription",
+                        target_id=new_sub.id,
+                        extra={
+                            "telegram_id": sub.user.telegram_id,
+                            "old_node": node.name,
+                            "new_node": target.name,
+                            "reason": reason,
+                        },
+                    )
+                )
+                db.commit()
         except Exception:  # noqa: BLE001
             logger.exception("Failed to re-provision sub %s on node %s", sub.id, target.id)
 
-    return migrated_ids
+    # Resync every target node the batch touched. This covers the
+    # "user migrated but still gets `invalid request user id`" case:
+    # the per-device apply task *does* add the user, but if the target
+    # node's config.json is in a degraded state (partial wipe, stale
+    # cache, race with another provisioning task on the same node) the
+    # resync re-pushes the full authoritative client list via
+    # manage_vless_*_user.sh. Covers every vless-family protocol
+    # (reality / xhttp / ws_cdn) in one shot. Idempotent, so re-running
+    # after the individual applies is safe and costs one extra ansible
+    # run per target node — cheap vs. hunting down flakiness.
+    resync_task_ids: list[int] = []
+    for target_node in resync_targets.values():
+        try:
+            if not _node_has_vless_family(target_node):
+                continue
+            resync_task = orchestrator.resync_node_clients(target_node)
+            if resync_task is not None:
+                resync_task_ids.append(resync_task.id)
+        except Exception:  # noqa: BLE001
+            logger.exception(
+                "Post-migration resync failed for target node %s", target_node.id
+            )
+
+    return {
+        "subscription_ids": migrated_ids,
+        "revoke_task_ids": revoke_task_ids,
+        "device_task_ids": device_task_ids,
+        "resync_task_ids": resync_task_ids,
+        "considered_count": considered_count,
+        "no_target_count": no_target_count,
+    }

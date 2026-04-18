@@ -11,10 +11,6 @@ call :func:`services.node_spawner.spawn_node` with the pool's default
 provider/region/plan. Nodes that are in cooldown or unhealthy are excluded
 from the denominator — they would not be picked by :func:`choose_node`
 anyway, so counting them would hide real saturation.
-
-We intentionally do not auto-destroy nodes here. Shrinking a live pool is
-risky (active users get migrated around) and not worth the complexity
-before real operational data shows it's needed.
 """
 from __future__ import annotations
 
@@ -27,12 +23,37 @@ from ..time_utils import utcnow
 from decimal import Decimal
 from typing import Iterable
 
+from prometheus_client import Counter, Gauge
+from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from .. import models
 from .node_spawner import NodeSpawnError, spawn_node
 
 logger = logging.getLogger(__name__)
+
+# ── Metrics ──────────────────────────────────────────────────────────
+# Operators need to see why autoscale did or did not act. Three views:
+#   * utilization gauge — current load per pool, lets us tune watermark
+#   * eligible nodes gauge — confirms unhealthy nodes really get excluded
+#   * scale event counter labelled by outcome — separates spawned vs.
+#     blocked-by-cap vs. spawn-failed vs. backoff vs. quiet ticks
+
+POOL_UTILIZATION = Gauge(
+    "vpn_autoscale_pool_utilization",
+    "active_subs / sum(max_users of healthy nodes) per pool, last tick",
+    ["pool"],
+)
+POOL_ELIGIBLE_NODES = Gauge(
+    "vpn_autoscale_pool_eligible_nodes",
+    "Count of healthy non-cooldown nodes per pool, last tick",
+    ["pool"],
+)
+SCALE_EVENTS = Counter(
+    "vpn_autoscale_events_total",
+    "Autoscale tick outcomes per pool",
+    ["pool", "outcome"],
+)
 
 DEFAULT_HIGH_WATERMARK = float(os.getenv("AUTOSCALE_HIGH_WATERMARK", "0.8"))
 DEFAULT_MAX_NODES = int(os.getenv("AUTOSCALE_MAX_NODES", "10"))
@@ -97,21 +118,75 @@ def _node_capacity(node: models.VPNNode) -> int:
 
 
 def _active_subs_on_nodes(db: Session, nodes: Iterable[models.VPNNode]) -> int:
+    """Count of **active devices** on the given nodes.
+
+    Stage 7: capacity bookkeeping is per-device, not per-subscription —
+    a Family sub with 3 devices occupies 3 slots in the ``max_users``
+    math, otherwise the autoscaler under-provisions once users start
+    adding extra devices to their plans. The function name is
+    historical; the return value is now ``COUNT(devices)``.
+    """
     ids = [n.id for n in nodes]
     if not ids:
         return 0
     return (
-        db.query(models.Subscription)
+        db.query(models.Device)
+        .join(models.Subscription, models.Subscription.id == models.Device.subscription_id)
         .filter(
             models.Subscription.node_id.in_(ids),
             models.Subscription.status == models.SubscriptionStatus.active,
+            models.Device.status.notin_(
+                [models.DeviceStatus.revoked, models.DeviceStatus.disabled]
+            ),
         )
         .count()
     )
 
 
+# #61 — advisory lock namespace. Two-int form of pg_advisory_xact_lock
+# so different apps sharing the same Postgres don't collide.
+_ADVISORY_NS = 0xA5CA  # mnemonic: "autoscale"
+
+
+def _try_lock_pool(db: Session, pool_id: int) -> bool:
+    """Try to acquire a per-pool advisory lock for this transaction.
+
+    Returns True if the lock was acquired, False if another worker
+    already holds it. The lock is released automatically when the
+    session's transaction commits or rolls back.
+    """
+    row = db.execute(
+        text("SELECT pg_try_advisory_xact_lock(:ns, :pid)"),
+        {"ns": _ADVISORY_NS, "pid": pool_id},
+    )
+    return bool(row.scalar())
+
+
+def _record(pool_name: str, outcome: str, utilization: float, eligible: int) -> None:
+    """Single point that touches Prometheus so every return path stays consistent."""
+    POOL_UTILIZATION.labels(pool=pool_name).set(utilization)
+    POOL_ELIGIBLE_NODES.labels(pool=pool_name).set(eligible)
+    SCALE_EVENTS.labels(pool=pool_name, outcome=outcome).inc()
+
+
 def evaluate_pool(db: Session, pool: models.ServerPool) -> PoolDecision:
+    # #61 — distributed lock. If another worker is already evaluating
+    # this pool, skip it — the next tick will pick it up.
+    if not _try_lock_pool(db, pool.id):
+        _record(pool.name, "locked", 0.0, 0)
+        return PoolDecision(
+            pool_id=pool.id,
+            pool_name=pool.name,
+            utilization=0.0,
+            total_capacity=0,
+            active_subs=0,
+            node_count=len(pool.nodes),
+            scaled_up=False,
+            reason="skipped — another worker holds the pool lock",
+        )
+
     if not pool.autoscale_enabled:
+        _record(pool.name, "disabled", 0.0, 0)
         return PoolDecision(
             pool_id=pool.id,
             pool_name=pool.name,
@@ -124,6 +199,7 @@ def evaluate_pool(db: Session, pool: models.ServerPool) -> PoolDecision:
         )
 
     if not pool.autoscale_provider_id or not pool.autoscale_region or not pool.autoscale_plan:
+        _record(pool.name, "misconfigured", 0.0, 0)
         return PoolDecision(
             pool_id=pool.id,
             pool_name=pool.name,
@@ -149,6 +225,7 @@ def evaluate_pool(db: Session, pool: models.ServerPool) -> PoolDecision:
 
     backoff_until = _spawn_backoff.get(pool.id)
     if backoff_until and backoff_until > utcnow():
+        _record(pool.name, "backoff", utilization, len(eligible))
         return PoolDecision(
             pool_id=pool.id,
             pool_name=pool.name,
@@ -162,6 +239,7 @@ def evaluate_pool(db: Session, pool: models.ServerPool) -> PoolDecision:
 
     max_nodes = _pool_max_nodes(pool)
     if len(counted_nodes) >= max_nodes:
+        _record(pool.name, "max_nodes_reached", utilization, len(eligible))
         return PoolDecision(
             pool_id=pool.id,
             pool_name=pool.name,
@@ -175,6 +253,7 @@ def evaluate_pool(db: Session, pool: models.ServerPool) -> PoolDecision:
 
     watermark = _pool_high_watermark(pool)
     if utilization < watermark:
+        _record(pool.name, "below_watermark", utilization, len(eligible))
         return PoolDecision(
             pool_id=pool.id,
             pool_name=pool.name,
@@ -187,27 +266,67 @@ def evaluate_pool(db: Session, pool: models.ServerPool) -> PoolDecision:
         )
 
     name = f"{pool.name}-auto-{int(utcnow().timestamp())}"
-    logger.warning(
-        "Autoscale: pool %s saturated (%.2f), spawning node %s via provider %s",
-        pool.name,
-        utilization,
-        name,
-        pool.autoscale_provider_id,
-    )
-    try:
-        node, _task = spawn_node(
-            db,
-            provider_id=pool.autoscale_provider_id,
-            name=name,
-            region=pool.autoscale_region,
-            plan=pool.autoscale_plan,
-            image=pool.autoscale_image,
-            pool_id=pool.id,
-            notes=f"auto-scaled at {utcnow().isoformat()}",
+    # Stage 6 — walk the provider chain. Primary first, then any
+    # configured fallbacks. Each entry is just a CloudProvider id;
+    # spawn_node already validates is_active and existence, so we just
+    # collect errors and try the next one.
+    provider_chain: list[int] = [pool.autoscale_provider_id]
+    fallbacks = pool.autoscale_fallback_provider_ids or []
+    if isinstance(fallbacks, list):
+        for pid in fallbacks:
+            try:
+                pid_int = int(pid)
+            except (TypeError, ValueError):
+                continue
+            if pid_int and pid_int not in provider_chain:
+                provider_chain.append(pid_int)
+
+    last_exc: NodeSpawnError | None = None
+    node = None
+    for idx, provider_id in enumerate(provider_chain):
+        attempt_name = name if idx == 0 else f"{name}-fb{idx}"
+        logger.warning(
+            "Autoscale: pool %s saturated (%.2f), spawning %s via provider %s "
+            "(chain pos %d/%d)",
+            pool.name,
+            utilization,
+            attempt_name,
+            provider_id,
+            idx + 1,
+            len(provider_chain),
         )
-    except NodeSpawnError as exc:
-        logger.exception("Autoscale spawn failed for pool %s", pool.name)
+        try:
+            node, _task = spawn_node(
+                db,
+                provider_id=provider_id,
+                name=attempt_name,
+                region=pool.autoscale_region,
+                plan=pool.autoscale_plan,
+                image=pool.autoscale_image,
+                pool_id=pool.id,
+                notes=f"auto-scaled at {utcnow().isoformat()} via provider={provider_id}",
+            )
+            break
+        except NodeSpawnError as exc:
+            last_exc = exc
+            logger.warning(
+                "Autoscale: provider %s failed for pool %s: %s — trying next in chain",
+                provider_id,
+                pool.name,
+                exc,
+            )
+            SCALE_EVENTS.labels(pool=pool.name, outcome="provider_failed").inc()
+            continue
+
+    if node is None:
+        logger.exception(
+            "Autoscale: all %d providers in chain failed for pool %s",
+            len(provider_chain),
+            pool.name,
+            exc_info=last_exc,
+        )
         _spawn_backoff[pool.id] = utcnow() + timedelta(seconds=SPAWN_BACKOFF_SECONDS)
+        _record(pool.name, "spawn_failed", utilization, len(eligible))
         return PoolDecision(
             pool_id=pool.id,
             pool_name=pool.name,
@@ -216,10 +335,11 @@ def evaluate_pool(db: Session, pool: models.ServerPool) -> PoolDecision:
             active_subs=active,
             node_count=len(counted_nodes),
             scaled_up=False,
-            reason=f"spawn failed: {exc}",
+            reason=f"all {len(provider_chain)} providers failed; last: {last_exc}",
         )
 
     _spawn_backoff.pop(pool.id, None)
+    _record(pool.name, "scaled_up", utilization, len(eligible))
 
     return PoolDecision(
         pool_id=pool.id,

@@ -2,6 +2,7 @@ import enum
 
 from .time_utils import utcnow
 from sqlalchemy import (
+    BigInteger,
     Boolean,
     Column,
     DateTime,
@@ -12,6 +13,7 @@ from sqlalchemy import (
     String,
     Table,
     Text,
+    UniqueConstraint,
 )
 from sqlalchemy.dialects.postgresql import ARRAY, JSONB
 from sqlalchemy.orm import relationship
@@ -22,6 +24,10 @@ class SubscriptionStatus(str, enum.Enum):
     active = "active"
     blocked = "blocked"
     expired = "expired"
+    # Stage 4: user-initiated pause. No charges, devices physically
+    # revoked from the node so the slot is freed for others. One freeze
+    # of FREEZE_DAYS per calendar year (tracked via has_frozen_this_year).
+    frozen = "frozen"
 
 
 class PaymentStatus(str, enum.Enum):
@@ -47,11 +53,31 @@ class VPNNodeStatus(str, enum.Enum):
     active = "active"
     disabled = "disabled"
     error = "error"
+    # Stage 5 — downscale: node is being decommissioned. Excluded from
+    # ``choose_node`` (no new subs land here) and from autoscale's
+    # eligibility/utilization math, but its existing subscriptions keep
+    # working until the drain tick migrates them off. Once the live-sub
+    # count hits zero AND the grace window has elapsed, the drain tick
+    # calls ``destroy_node`` which flips the row to ``disabled``.
+    draining = "draining"
+
+
+class WGExitNodeStatus(str, enum.Enum):
+    # Relay-era exit node lifecycle. Separate from VPNNodeStatus because
+    # an exit has no VLESS configs / warm pool / choose_node participation
+    # — it's just a WG server that relays hand-traffic to.
+    registering = "registering"
+    active = "active"
+    error = "error"
+    disabled = "disabled"
 
 
 class VPNConfigProtocol(str, enum.Enum):
     shadowtls_ss = "shadowtls+shadowsocks"
     vless_reality = "vless-reality"
+    vless_ws_cdn = "vless-ws-cdn"
+    hysteria2 = "hysteria2"
+    vless_xhttp = "vless-xhttp"
 
 
 class DeviceStatus(str, enum.Enum):
@@ -87,7 +113,36 @@ class CloudProviderKind(str, enum.Enum):
     hetzner = "hetzner"
     vultr = "vultr"
     digitalocean = "digitalocean"
+    aeza = "aeza"
     manual = "manual"
+
+
+class CredentialPoolState(str, enum.Enum):
+    """Lifecycle state for the warm-credential pool (stage 2.5).
+
+    - ``warm``: provisioned on the node, no subscription bound, ready for
+      atomic assignment on purchase.
+    - ``assigned``: bound to a Subscription, in active use.
+    - ``revoked``: unassigned, scheduled for physical removal from the
+      node by the warm-pool worker. Two-stage revoke means the API
+      doesn't block on Ansible.
+    """
+    warm = "warm"
+    assigned = "assigned"
+    revoked = "revoked"
+
+
+class BalanceTxKind(str, enum.Enum):
+    """Direction of a BalanceTransaction (stage 4).
+
+    Positive for top-ups (from a payment), negative for spend (daily
+    billing tick or one-shot adjustments).
+    """
+    topup = "topup"
+    spend = "spend"
+    refund = "refund"
+    bonus = "bonus"
+    adjust = "adjust"
 
 
 plan_serverpool = Table(
@@ -110,20 +165,27 @@ class ServerPool(Base):
     name = Column(String, unique=True, nullable=False)
     description = Column(Text)
 
-    # Autoscale configuration. ``autoscale_enabled`` acts as the master
-    # switch; when off, the scheduler ignores this pool entirely. The other
-    # fields are defaults passed to :func:`services.node_spawner.spawn_node`
-    # when a scale-up is triggered.
     autoscale_enabled = Column(Boolean, default=False)
     autoscale_provider_id = Column(Integer, ForeignKey("cloud_providers.id"), nullable=True)
     autoscale_region = Column(String, nullable=True)
     autoscale_plan = Column(String, nullable=True)
     autoscale_image = Column(String, nullable=True)
-    # Trigger a scale-up when utilization (active_subs / total_capacity) is
-    # above this fraction (0..1). Leave null to use the service default.
     autoscale_high_watermark = Column(Numeric(4, 3), nullable=True)
-    # Hard upper bound on the number of nodes this pool may have.
     autoscale_max_nodes = Column(Integer, nullable=True)
+    # Stage 5 — downscale knobs. low_watermark is the symmetric counterpart
+    # to high_watermark: when ``active/capacity < low_watermark`` AND we
+    # still have more than ``min_nodes`` eligible nodes, the drain tick
+    # picks the youngest auto-spawned node and starts moving its subs off.
+    # ``min_nodes`` is the floor — never shrink below it, even at 0%
+    # utilization, so the pool always has at least one warm node ready.
+    autoscale_low_watermark = Column(Numeric(4, 3), nullable=True)
+    autoscale_min_nodes = Column(Integer, nullable=True)
+    # Stage 6 — multi-cloud fallback chain. When the primary
+    # autoscale_provider raises NodeSpawnError (Hetzner abuse-locked,
+    # quota hit, region out of stock, ...), the autoscaler walks this
+    # list in order before going into per-pool spawn backoff. Each entry
+    # is a CloudProvider.id; missing/inactive rows are skipped silently.
+    autoscale_fallback_provider_ids = Column(JSONB, nullable=True)
 
     nodes = relationship("VPNNode", back_populates="pool")
     plans = relationship("Plan", secondary=plan_serverpool, back_populates="server_pools")
@@ -144,18 +206,21 @@ class VPNNode(Base):
     updated_at = Column(DateTime, default=utcnow, onupdate=utcnow)
     notes = Column(Text)
 
-    # Capacity / scheduling
     max_users = Column(Integer, nullable=True)
     max_bandwidth_mbps = Column(Integer, nullable=True)
-    # Health: 0..100, updated by health-checker/probing service
-    health_score = Column(Integer, default=100)
+    health_score = Column(Integer, nullable=True)
     last_health_check_at = Column(DateTime, nullable=True)
-    # Regions in which this node is currently considered unreachable
-    # (populated from HealthProbe aggregation). Example: ["ru", "by"].
     blocked_regions = Column(JSONB, nullable=True)
     cooldown_until = Column(DateTime, nullable=True)
+    # Phase D traffic-drop detector: set when active_users drops from
+    # ≥MIN to 0 between two traffic_stats ticks. Cleared on next tick
+    # after confirmation (→ error) or false-alarm (→ None).
+    suspect_since = Column(DateTime, nullable=True)
+    # Relay config: when set, this node is a jump node that tunnels
+    # traffic through a WireGuard tunnel to a foreign exit node.
+    # Keys: wg_private_key, wg_address_v4, wg_endpoint, wg_exit_public_key
+    relay_config = Column(JSONB, nullable=True)
 
-    # Provisioning / cloud provider metadata
     provider_id = Column(Integer, ForeignKey("cloud_providers.id"), nullable=True)
     provider_external_id = Column(String, nullable=True)
     provider_region = Column(String, nullable=True)
@@ -167,6 +232,18 @@ class VPNNode(Base):
     subscriptions = relationship("Subscription", back_populates="node")
     provider = relationship("CloudProvider", back_populates="nodes")
     probes = relationship("HealthProbe", back_populates="node", cascade="all, delete-orphan")
+    traffic_samples = relationship(
+        "NodeTrafficSample", back_populates="node", cascade="all, delete-orphan"
+    )
+
+    @property
+    def has_relay_config(self) -> bool:
+        """True iff this node is configured as a relay (tunnels to an exit).
+
+        Surfaced via ``VPNNodeOut`` so the admin UI can tell whether a
+        node already has an exit link and thus isn't attachable.
+        """
+        return self.relay_config is not None
 
 
 class VPNConfig(Base):
@@ -199,6 +276,12 @@ class Plan(Base):
     max_devices = Column(Integer, default=1)
     price = Column(Numeric(10, 2), default=0)
     traffic_limit_mb = Column(Integer, nullable=True)
+    is_visible = Column(Boolean, default=True)
+    # Pay-as-you-go price per device per day, in kopecks (stage 4).
+    # When NULL, daily_billing() falls back to ``price * 100 / duration_days``.
+    # Set this explicitly when you want to decouple period pricing from
+    # daily charge (e.g. an annual plan with a discounted daily rate).
+    daily_rate_kopecks = Column(Integer, nullable=True)
     server_pools = relationship("ServerPool", secondary=plan_serverpool, back_populates="plans")
 
 
@@ -209,8 +292,55 @@ class User(Base):
     telegram_id = Column(String, unique=True, index=True)
     email = Column(String, unique=True, index=True, nullable=True)
     created_at = Column(DateTime, default=utcnow)
+    referred_by_id = Column(Integer, ForeignKey("users.id"), nullable=True)
+    # Pay-as-you-go balance (stage 4). Stored in kopecks (1₽ = 100 kop)
+    # to dodge floating-point rounding on every daily-billing tick.
+    # The legacy invoice/subscription model still works while
+    # ``BILLING_MODEL=invoice``; this column is dormant until the
+    # operator flips the flag to ``balance``.
+    balance_kopecks = Column(Integer, nullable=False, server_default="0", default=0)
+    # Free-trial bonus (stage "trial"). NULL ⇒ user hasn't claimed their
+    # one-time trial yet — UI shows the banner, POST /api/trial/activate
+    # gates on this being NULL. Set to now() on successful activation.
+    trial_activated_at = Column(DateTime, nullable=True)
+    # Set alongside trial_activated_at to activated_at + TRIAL_DURATION_DAYS.
+    # Worker tick reads this to send the 3-day warning and, at expiry,
+    # clawback the unspent trial bonus iff the user never made a real topup.
+    # Cleared (set to NULL) after clawback so the tick doesn't revisit.
+    trial_expires_at = Column(DateTime, nullable=True)
+    # Per-user notification preferences. Each controls a group of
+    # notification types that the worker/health-monitor emits.
+    notify_renewals = Column(
+        Boolean, nullable=False, server_default="true", default=True
+    )
+    notify_migrations = Column(
+        Boolean, nullable=False, server_default="true", default=True
+    )
+    # Phase C — bot health-ping consent. The worker tick that queues
+    # "помогите нам улучшить сервис" prompts skips users where this is
+    # True. Flipped to True from a `hping:optout` callback handler.
+    health_ping_opt_out = Column(
+        Boolean, nullable=False, server_default="false", default=False
+    )
+    # Per-user 24h debounce on the health-ping prompt. Updated each time
+    # the worker queues a new ping for the user (write happens before
+    # the bot delivers it, so a Telegram retry can't double-send).
+    health_ping_last_at = Column(DateTime, nullable=True)
+    # User-level ban. When set, the bot drops all incoming updates from
+    # this user silently (no ACK — we don't want to give DDoS bots
+    # feedback). Orthogonal to Subscription.status=blocked: banning a
+    # user does NOT touch their subs, and blocking a sub doesn't set
+    # this. Cleared to NULL on unban.
+    banned_at = Column(DateTime, nullable=True)
+
     invoices = relationship("Invoice", back_populates="user")
     devices = relationship("Device", back_populates="user")
+    referral_codes = relationship(
+        "ReferralCode", back_populates="owner", foreign_keys="ReferralCode.owner_id"
+    )
+    balance_transactions = relationship(
+        "BalanceTransaction", back_populates="user", cascade="all, delete-orphan"
+    )
 
 
 class Subscription(Base):
@@ -219,7 +349,14 @@ class Subscription(Base):
     id = Column(Integer, primary_key=True)
     user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
     plan_id = Column(Integer, ForeignKey("plans.id"), nullable=False)
-    node_id = Column(Integer, ForeignKey("vpn_nodes.id"), nullable=False)
+    # Nullable + SET NULL so deleting a VPNNode detaches historical
+    # (terminated/expired) subs instead of hitting an IntegrityError.
+    # Active/frozen subs are guarded at the /nodes/{id} DELETE endpoint.
+    node_id = Column(
+        Integer,
+        ForeignKey("vpn_nodes.id", ondelete="SET NULL"),
+        nullable=True,
+    )
     created_at = Column(DateTime, default=utcnow)
     updated_at = Column(DateTime, default=utcnow, onupdate=utcnow)
     expires_at = Column(DateTime, nullable=False)
@@ -228,6 +365,47 @@ class Subscription(Base):
     traffic_limit_mb = Column(Integer, nullable=True)
     traffic_used_mb = Column(Integer, default=0)
     auto_renew = Column(Boolean, default=False)
+    # Stable token for the dynamic subscription link — survives migrations.
+    sub_token = Column(String, unique=True, index=True, nullable=True)
+
+    # ── Stage 4: balance billing anchor + freeze ────────────────────
+    # Committed prepayment for this subscription's billing window. On
+    # activate the full plan price is debited from User.balance_kopecks
+    # and credited here; charge_subscription spends from this bucket,
+    # not from the user's wallet. Manual revoke refunds the remainder
+    # back to balance as kind=refund; expired subs forfeit whatever is
+    # left (which should be ~0 by construction).
+    prepaid_kopecks = Column(
+        Integer, nullable=False, server_default="0", default=0
+    )
+    # Anchor for the next per-day spend tick. NULL = legacy invoice
+    # subscription, the charge cron skips it. Set on activate, advanced
+    # by +24h on every successful charge_subscription().
+    next_charge_at = Column(DateTime, nullable=True)
+    # When the user paused this sub. Cleared on unfreeze.
+    frozen_at = Column(DateTime, nullable=True)
+    # Hard upper bound on the current freeze window — auto-unfreeze cron
+    # picks subs where frozen_until <= now.
+    frozen_until = Column(DateTime, nullable=True)
+    # Days consumed against this year's freeze budget. Reset when
+    # frozen_year flips to a new calendar year.
+    frozen_days_used = Column(
+        Integer, nullable=False, server_default="0", default=0
+    )
+    frozen_year = Column(Integer, nullable=True)
+    # V2: simple "1 freeze per year" flag. True = already used this year.
+    has_frozen_this_year = Column(
+        Boolean, nullable=False, server_default="false", default=False
+    )
+    # Paid-for device slots *above* the plan's bundled ``max_devices``.
+    # Bumped by ``webapp_add_device`` when the user buys an extra slot,
+    # never decremented — removing the physical device leaves the slot
+    # on the sub so the next renewal still bills for it. Reset to 0 by
+    # ``balance.change_plan`` since the new plan has its own bundle.
+    # Admin add-device does NOT touch this counter (operator override).
+    extra_device_slots = Column(
+        Integer, nullable=False, server_default="0", default=0
+    )
 
     user = relationship("User")
     plan = relationship("Plan")
@@ -243,11 +421,22 @@ class Device(Base):
     id = Column(Integer, primary_key=True)
     user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
     subscription_id = Column(Integer, ForeignKey("subscriptions.id", ondelete="CASCADE"), nullable=False)
-    config_id = Column(Integer, ForeignKey("vpn_configs.id"), nullable=False)
+    # Nullable + ON DELETE SET NULL so deleting a node (which CASCADEs
+    # into its vpn_configs) doesn't trip the FK on historical disabled
+    # Device rows. Those rows survive on purpose — their sub_token keeps
+    # /api/sub/{token} resolving to a live sibling. See migration 0030.
+    config_id = Column(
+        Integer,
+        ForeignKey("vpn_configs.id", ondelete="SET NULL"),
+        nullable=True,
+    )
     name = Column(String, nullable=False)
     status = Column(Enum(DeviceStatus), default=DeviceStatus.pending)
     access_username = Column(String, nullable=True)
     connection_uri = Column(Text, nullable=True)
+    # Per-device dynamic sub-link token — each device gets its own URL
+    # so sharing a link exposes only one device's credentials.
+    sub_token = Column(String, unique=True, index=True, nullable=True)
     created_at = Column(DateTime, default=utcnow)
     updated_at = Column(DateTime, default=utcnow, onupdate=utcnow)
     last_seen_at = Column(DateTime, nullable=True)
@@ -262,14 +451,45 @@ class Credential(Base):
     __tablename__ = "credentials"
 
     id = Column(Integer, primary_key=True)
-    subscription_id = Column(Integer, ForeignKey("subscriptions.id"), nullable=False)
+    # NULL for warm credentials waiting in the pool — bound on assignment.
+    subscription_id = Column(Integer, ForeignKey("subscriptions.id"), nullable=True)
     device_id = Column(Integer, ForeignKey("devices.id"), nullable=True)
     config_id = Column(Integer, ForeignKey("vpn_configs.id"), nullable=True)
-    proto = Column(String, nullable=False)  # 'shadowtls+ss', 'vless-reality'
-    config_text = Column(Text, nullable=False)  # vless://..., ss://..., yaml
+    # Denormalized for the warm-pool partial index. We could derive it
+    # from config_id but the index can't traverse a join, and warm-pool
+    # SELECT must be sub-millisecond.
+    node_id = Column(Integer, ForeignKey("vpn_nodes.id"), nullable=True, index=True)
+    # G.3+: pin this credential (and therefore its xray user UUID) to
+    # one exit. Populated by provisioning in G.4 when the relay has
+    # multiple RelayExitLinks; NULL means "use relay's default outbound"
+    # (legacy 1:1 relays + warm-pool bundles before assignment).
+    exit_id = Column(
+        Integer,
+        ForeignKey("wg_exit_nodes.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    proto = Column(String, nullable=False)
+    config_text = Column(Text, nullable=False)
+    # Username shared across all credentials in the same warm bundle.
+    # When pool_state=warm, the warmer groups credentials by
+    # (node_id, access_username) to atomically assign all protocols of
+    # one identity in a single transaction.
+    access_username = Column(String, nullable=True, index=True)
     created_at = Column(DateTime, default=utcnow)
     is_active = Column(Boolean, default=True)
     revoked_at = Column(DateTime, nullable=True)
+    # Stage 2.5 warm pool. ``warm`` = ready, ``assigned`` = bound to a sub,
+    # ``revoked`` = pending physical removal. Defaults to ``assigned`` so
+    # legacy rows (created before the column existed) keep their semantics.
+    pool_state = Column(
+        Enum(CredentialPoolState),
+        nullable=False,
+        server_default=CredentialPoolState.assigned.value,
+        default=CredentialPoolState.assigned,
+    )
+    warmed_at = Column(DateTime, nullable=True)
+    assigned_at = Column(DateTime, nullable=True)
 
     subscription = relationship("Subscription", back_populates="credentials")
     device = relationship("Device", back_populates="credentials")
@@ -278,6 +498,16 @@ class Credential(Base):
 
 class Payment(Base):
     __tablename__ = "payments"
+    # #52 — composite unique so the same provider can't record the same
+    # external payment twice. NULLs are excluded by Postgres (multiple
+    # rows with external_id=NULL are allowed — manual payments, etc.).
+    __table_args__ = (
+        UniqueConstraint(
+            "provider",
+            "external_id",
+            name="uq_payments_provider_external_id",
+        ),
+    )
 
     id = Column(Integer, primary_key=True)
     subscription_id = Column(Integer, ForeignKey("subscriptions.id"), nullable=True)
@@ -299,12 +529,19 @@ class Invoice(Base):
 
     id = Column(Integer, primary_key=True)
     user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
-    plan_id = Column(Integer, ForeignKey("plans.id"), nullable=False)
+    # Nullable since stage 4 — topup invoices (kind='topup') don't bind
+    # to a plan. Subscription invoices still set this on creation.
+    plan_id = Column(Integer, ForeignKey("plans.id"), nullable=True)
     subscription_id = Column(Integer, ForeignKey("subscriptions.id"), nullable=True)
     amount = Column(Numeric(10, 2), default=0)
     currency = Column(String, default="USD")
     status = Column(Enum(InvoiceStatus), default=InvoiceStatus.pending)
     action = Column(Enum(InvoiceAction), default=InvoiceAction.new_subscription)
+    # Stage 4 discriminator. ``subscription`` = legacy plan-purchase
+    # invoice; on paid the orchestrator provisions/renews a subscription.
+    # ``topup`` = balance topup; on paid we credit user.balance_kopecks
+    # via services.balance.topup() and never touch provisioning.
+    kind = Column(String, nullable=False, server_default="subscription", default="subscription")
     created_at = Column(DateTime, default=utcnow)
     updated_at = Column(DateTime, default=utcnow, onupdate=utcnow)
 
@@ -335,11 +572,9 @@ class CloudProvider(Base):
     id = Column(Integer, primary_key=True)
     name = Column(String, unique=True, nullable=False)
     kind = Column(Enum(CloudProviderKind), nullable=False)
-    # API token stored encrypted via app.security.crypto if key is configured,
-    # otherwise plain text (dev only).
     api_token_enc = Column(Text, nullable=True)
     default_image = Column(String, nullable=True)
-    ssh_key_ids = Column(JSONB, nullable=True)  # list of provider-side ssh key ids
+    ssh_key_ids = Column(JSONB, nullable=True)
     default_region = Column(String, nullable=True)
     default_plan = Column(String, nullable=True)
     is_active = Column(Boolean, default=True)
@@ -348,14 +583,118 @@ class CloudProvider(Base):
     nodes = relationship("VPNNode", back_populates="provider")
 
 
+class WGExitNode(Base):
+    """Foreign exit node in the relay architecture.
+
+    A WireGuard server that RU relay nodes (``VPNNode`` rows with
+    ``relay_config`` set) tunnel to. One exit holds many relays (N:M via
+    ``relay_exit_links``). Not listed in ``vpn_nodes`` on purpose —
+    exits have no VLESS configs, no warm credential pool, and are never
+    passed to ``choose_node`` for subscription placement.
+    """
+    __tablename__ = "wg_exit_nodes"
+
+    id = Column(Integer, primary_key=True)
+    name = Column(String, unique=True, nullable=False)
+    region = Column(String, nullable=False)
+    host = Column(String, nullable=False)
+    ssh_port = Column(Integer, default=22, nullable=False)
+
+    wg_port = Column(Integer, default=51820, nullable=False)
+    wg_address_v4 = Column(String, default="10.77.0.1/24", nullable=False)
+    wg_public_key = Column(String, nullable=True)
+    # Encrypted via ``security.encrypt`` — same Fernet scheme as cloud tokens.
+    wg_private_key_enc = Column(Text, nullable=True)
+
+    provider_id = Column(Integer, ForeignKey("cloud_providers.id"), nullable=True)
+    provider_external_id = Column(String, nullable=True)
+    provider_region = Column(String, nullable=True)
+
+    status = Column(Enum(WGExitNodeStatus), default=WGExitNodeStatus.registering, nullable=False)
+    is_active = Column(Boolean, default=True, nullable=False)
+    notes = Column(Text, nullable=True)
+    created_at = Column(DateTime, default=utcnow, nullable=False)
+    updated_at = Column(DateTime, default=utcnow, onupdate=utcnow, nullable=False)
+
+    provider = relationship("CloudProvider")
+
+
+class RelayExitLink(Base):
+    """N:N link — a relay may tunnel to multiple exits (post-G.3).
+
+    Separate from ``VPNNode.relay_config`` (which the worker reads as a
+    flat dict) to keep the WG client keypair in a properly normalized
+    table. Uniqueness is composite ``(relay_node_id, wg_interface_name)``
+    so each tunnel gets its own kernel interface (``wg0``, ``wg1``, …).
+    Legacy rows rolled forward on migration 0029 carry ``wg0``; the
+    attach endpoint still enforces 1:1 at the app layer until G.4 lands
+    the allocator.
+
+    ``wg_client_private_key_enc`` is Fernet-encrypted (via
+    ``security.encrypt``); the worker decrypts when building extra vars.
+    """
+    __tablename__ = "relay_exit_links"
+    __table_args__ = (
+        UniqueConstraint(
+            "relay_node_id",
+            "wg_interface_name",
+            name="uq_relay_exit_links_relay_iface",
+        ),
+        # Защита от дублей (relay, exit) — до 0031 read-then-insert
+        # guard в attach_relay мог пропустить параллельный запрос.
+        UniqueConstraint(
+            "relay_node_id",
+            "exit_id",
+            name="uq_relay_exit_links_relay_exit",
+        ),
+    )
+
+    id = Column(Integer, primary_key=True)
+    relay_node_id = Column(
+        Integer,
+        ForeignKey("vpn_nodes.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    exit_id = Column(
+        Integer,
+        ForeignKey("wg_exit_nodes.id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    # Kernel interface name on the relay — each link gets its own
+    # wg-quick@wgN unit so the relay_jump_node role can loop cleanly.
+    # Defaults to "wg0" for legacy 1:1 rows; G.4 allocator hands out
+    # wg1/wg2/... when a second exit is attached to the same relay.
+    wg_interface_name = Column(
+        String(16), nullable=False, server_default="wg0"
+    )
+    wg_client_private_key_enc = Column(Text, nullable=False)
+    wg_client_public_key = Column(String, nullable=False)
+    # Client address inside the tunnel subnet, e.g. "10.77.0.5/32".
+    wg_client_address_v4 = Column(String, nullable=False)
+    created_at = Column(DateTime, default=utcnow, nullable=False)
+
+    # Health telemetry — заполняется тиком run_relay_link_health_tick,
+    # который раз в 5 минут SSH'ит на relay и читает wg show all dump.
+    # last_handshake_at = latest-handshake из dump (None если handshake
+    # ни разу не было с момента старта интерфейса). last_observed_at —
+    # время последнего успешного тика (NULL если SSH ни разу не вышел),
+    # помогает отличить «данных ещё нет» от «relay недоступен давно».
+    last_handshake_at = Column(DateTime, nullable=True)
+    last_rx_bytes = Column(BigInteger, nullable=True)
+    last_tx_bytes = Column(BigInteger, nullable=True)
+    last_observed_at = Column(DateTime, nullable=True)
+
+    relay_node = relationship("VPNNode")
+    exit_node = relationship("WGExitNode")
+
+
 class HealthProbe(Base):
     __tablename__ = "health_probes"
 
     id = Column(Integer, primary_key=True)
     node_id = Column(Integer, ForeignKey("vpn_nodes.id", ondelete="CASCADE"), nullable=False, index=True)
-    # Where the probe came from. Free-form label, e.g. "ru-mobile-mts", "kz", "eu".
     source_region = Column(String, nullable=False, index=True)
-    source_kind = Column(String, nullable=True)  # "active" / "passive" / "client"
+    source_kind = Column(String, nullable=True)
     result = Column(Enum(ProbeResult), nullable=False)
     latency_ms = Column(Integer, nullable=True)
     observed_at = Column(DateTime, default=utcnow, index=True)
@@ -364,15 +703,50 @@ class HealthProbe(Base):
     node = relationship("VPNNode", back_populates="probes")
 
 
-class ApiToken(Base):
-    """Scoped API token for non-admin callers (probe rigs, node collectors).
+class NodeTrafficSample(Base):
+    """One periodic snapshot of a node's xray stats counters (Phase B).
 
-    Only the SHA-256 hash of the token is stored — the plaintext is shown
-    once at creation time and never again. ``scopes`` is a list of string
-    capabilities (e.g. ``probe:read``, ``probe:write``, ``traffic:write``);
-    the admin token is treated as having all scopes without a row here.
+    Written by ``services.traffic_stats.collect_node_stats`` once per
+    worker tick (TRAFFIC_STATS_INTERVAL). uplink/downlink are *cumulative
+    bytes since the previous reset* — the collector calls
+    ``xray api statsquery --reset`` so each row is a delta over
+    ``interval_seconds``, not an absolute counter that overflows.
+
+    The detector that uses these rows lives in a follow-up; for the MVP
+    we just collect the time-series so the next iteration has data to
+    baseline against.
     """
+    __tablename__ = "node_traffic_samples"
 
+    id = Column(Integer, primary_key=True)
+    node_id = Column(
+        Integer,
+        ForeignKey("vpn_nodes.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    observed_at = Column(DateTime, default=utcnow, nullable=False)
+    interval_seconds = Column(Integer, nullable=False, default=0, server_default="0")
+    # BigInteger because xray byte counters routinely cross 2^31 (2.1 GB)
+    # per interval on a busy node — Integer would silently overflow.
+    uplink_bytes = Column(BigInteger, nullable=False, default=0, server_default="0")
+    downlink_bytes = Column(BigInteger, nullable=False, default=0, server_default="0")
+    active_users = Column(Integer, nullable=False, default=0, server_default="0")
+    # Per-protocol breakdown:
+    #   {"vless-reality": {
+    #       "uplink": 123, "downlink": 456,
+    #       "users": ["user-1-2", "user-4-7"],    # sorted access_username list
+    #       "user_count": 2                        # == len(users)
+    #   }, ...}
+    # plus a "_errors" key listing protocols whose collection failed.
+    # Legacy rows (pre-2026-04) have ``users`` as a bare int count —
+    # readers must tolerate both formats (see api/nodes.py::list_node_users).
+    details = Column(JSONB, nullable=True)
+
+    node = relationship("VPNNode", back_populates="traffic_samples")
+
+
+class ApiToken(Base):
     __tablename__ = "api_tokens"
 
     id = Column(Integer, primary_key=True)
@@ -394,6 +768,52 @@ class AuditLog(Base):
     target_type = Column(String, nullable=False)
     target_id = Column(Integer, nullable=True)
     created_at = Column(DateTime, default=utcnow)
-    # `metadata` is reserved by SQLAlchemy Declarative; expose as `extra`
-    # but keep the column name for backward compat with existing DBs.
     extra = Column("metadata", JSONB, nullable=True)
+
+
+class ReferralCode(Base):
+    """Referral invite code owned by a user.
+
+    When a new user registers via a referral link containing this code,
+    the invitee gets ``bonus_days`` added to their first subscription and
+    the owner gets ``reward_days`` added to their active subscription.
+    """
+    __tablename__ = "referral_codes"
+
+    id = Column(Integer, primary_key=True)
+    owner_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    code = Column(String(32), unique=True, nullable=False, index=True)
+    bonus_days = Column(Integer, default=3)
+    reward_days = Column(Integer, default=3)
+    uses = Column(Integer, default=0)
+    max_uses = Column(Integer, nullable=True)
+    is_active = Column(Boolean, default=True)
+    created_at = Column(DateTime, default=utcnow)
+
+    owner = relationship("User", back_populates="referral_codes", foreign_keys=[owner_id])
+
+
+class BalanceTransaction(Base):
+    """Append-only ledger of balance changes (stage 4).
+
+    Every top-up, daily-billing tick, refund, bonus and admin adjustment
+    appends a row here. The current balance on ``User.balance_kopecks``
+    must always equal ``SUM(amount_kopecks)`` over this user's rows —
+    we trust the column for reads but reconcile from the ledger nightly
+    in case anything got skewed.
+
+    Amounts are signed: positive = balance went up, negative = went down.
+    """
+
+    __tablename__ = "balance_transactions"
+
+    id = Column(Integer, primary_key=True)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    amount_kopecks = Column(Integer, nullable=False)  # signed
+    kind = Column(Enum(BalanceTxKind), nullable=False)
+    # Free-form reference: invoice id, device id, "daily-billing-2025-12-01", etc.
+    reference = Column(String, nullable=True)
+    note = Column(Text, nullable=True)
+    created_at = Column(DateTime, default=utcnow, nullable=False, index=True)
+
+    user = relationship("User", back_populates="balance_transactions")

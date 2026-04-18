@@ -1,0 +1,17 @@
+[Unit]
+Description=Xray VLESS XHTTP
+After=network.target
+# Raise the default (5 in 10s) so that batch user-add scripts that
+# restart per-user don't hit the rate limiter and leave the unit dead.
+StartLimitBurst=30
+StartLimitIntervalSec=60
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/xray run -config /usr/local/etc/xray/config_xhttp.json
+Restart=on-failure
+RestartSec=5
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

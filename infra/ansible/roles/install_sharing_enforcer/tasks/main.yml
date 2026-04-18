@@ -1,0 +1,71 @@
+---
+# install_sharing_enforcer
+#
+# Deploys xray_enforcer.py — a local daemon that monitors xray access
+# logs for credential sharing (multiple IPs per email within a time
+# window) and uses the xray gRPC API to temporarily disconnect
+# violators (rmuser → delay → adduser cycle).
+#
+# Requires:
+#   - xray-core installed (provides /usr/local/bin/xray with api subcommands)
+#   - python3 on the node (default on Ubuntu 22+)
+#   - Access logs enabled in xray config templates (access-*.log)
+
+- name: Verify xray binary exists
+  stat:
+    path: /usr/local/bin/xray
+  register: _xray_bin
+
+- name: Skip enforcer when xray is not installed
+  meta: end_role
+  when: not _xray_bin.stat.exists
+
+- name: Verify python3 is available
+  command: python3 --version
+  changed_when: false
+  failed_when: false
+  register: _py3_check
+
+- name: Skip enforcer when python3 is not available
+  meta: end_role
+  when: _py3_check.rc != 0
+
+- name: Deploy xray_enforcer.py
+  copy:
+    src: xray_enforcer.py
+    dest: /usr/local/bin/xray_enforcer.py
+    owner: root
+    group: root
+    mode: '0755'
+  notify: restart xray-enforcer
+
+- name: Deploy xray-enforcer systemd unit
+  template:
+    src: xray-enforcer.service.j2
+    dest: /etc/systemd/system/xray-enforcer.service
+    owner: root
+    group: root
+    mode: '0644'
+  notify: restart xray-enforcer
+
+# Soft-off switch. Set `sharing_enforcer_enabled: true` in group_vars
+# (or per-host) when ready to re-enable. Default is off because the
+# v2 enforcer was kicking legitimate users on small-fleet prod — see
+# backend/app/services/traffic_stats.py for matching backend gate.
+# Leaving the role wired (unit file + binary stay deployed) makes it
+# a one-variable flip to re-enable without a full role re-run.
+- name: Ensure xray-enforcer runs (enabled)
+  systemd:
+    name: xray-enforcer
+    enabled: yes
+    state: started
+    daemon_reload: yes
+  when: sharing_enforcer_enabled | default(false) | bool
+
+- name: Ensure xray-enforcer is stopped (disabled)
+  systemd:
+    name: xray-enforcer
+    enabled: no
+    state: stopped
+    daemon_reload: yes
+  when: not (sharing_enforcer_enabled | default(false) | bool)

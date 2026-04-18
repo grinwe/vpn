@@ -1,0 +1,122 @@
+---
+# wg_exit_node
+#
+# Sets up a WireGuard server on a foreign (non-RU) node that acts as
+# the traffic exit point in the relay architecture:
+#
+#   Client → VLESS Reality (RU:443) → WG tunnel → exit node → Internet
+#
+# The exit node:
+#   - Listens on wg_exit_port (default 51820)
+#   - Accepts peers defined in wg_exit_peers list
+#   - Enables IPv4 forwarding + NAT masquerade
+#   - Uses wg syncconf for non-disruptive peer updates
+#
+# Required variables:
+#   wg_exit_port:        WireGuard listen port (default: 51820)
+#   wg_exit_address_v4:  Interface address (default: 10.77.0.1/24)
+#   wg_exit_private_key: Server private key (generate with `wg genkey`)
+#   wg_exit_peers:       List of peer dicts:
+#     - { name: "ru-01", public_key: "...", allowed_ips_v4: "10.77.0.2/32" }
+
+- name: Require WireGuard exit node variables
+  assert:
+    that:
+      - wg_exit_private_key is defined and wg_exit_private_key | length > 0
+      - wg_exit_peers is defined
+    fail_msg: >-
+      wg_exit_node requires wg_exit_private_key and a (possibly empty)
+      wg_exit_peers list. First bootstrap runs with peers=[]; peers are
+      added by later relay_tunnel_apply runs.
+
+- name: Install WireGuard
+  apt:
+    name: [wireguard, wireguard-tools]
+    state: present
+    update_cache: yes
+
+# Many providers ship Ubuntu with UFW active and INPUT policy DROP,
+# allowing only SSH/HTTP(S). Without this rule, WG handshake packets
+# from relays arrive at the interface but are silently dropped before
+# the kernel WG module ever sees them — wg show reports 0 received,
+# no dmesg errors, tunnel is permanently "initiating".
+- name: Detect UFW binary
+  stat:
+    path: /usr/sbin/ufw
+  register: wg_exit_ufw_bin
+
+# На Ubuntu 24.04 с inactive UFW + iptables-nft backend обычный
+# ``ufw allow`` первый раз кладёт правило в /etc/ufw/user.rules,
+# но возвращает rc=1 ("ERROR: problem running") — таска падает,
+# хотя правило добавлено (повтор выдаёт "Skipping adding existing
+# rule" и rc=0). Модуль community.general.ufw делает то же самое
+# идемпотентно и не фейлится на этом косметическом несоответствии.
+- name: Allow WireGuard UDP port through UFW
+  when: wg_exit_ufw_bin.stat.exists
+  community.general.ufw:
+    rule: allow
+    port: "{{ wg_exit_port | default(51820) }}"
+    proto: udp
+
+- name: Enable IPv4 forwarding
+  sysctl:
+    name: net.ipv4.ip_forward
+    value: "1"
+    sysctl_set: yes
+    reload: yes
+
+- name: Render WireGuard server config
+  template:
+    src: wg0.conf.j2
+    dest: /etc/wireguard/wg0.conf
+    owner: root
+    group: root
+    mode: '0600'
+
+- name: Enable and start WireGuard
+  systemd:
+    name: wg-quick@wg0
+    enabled: yes
+    state: started
+
+# Раньше syncconf висел на handler'е от предыдущей таски. Это ловило
+# race при параллельных bootstrap_exit запусках на один и тот же
+# exit: первая таска уже записала wg0.conf с новым peer и вызвала
+# syncconf; вторая видит template=unchanged, handler не стреляет,
+# но running state WG мог не содержать нужного peer'а (например,
+# syncconf в первой таске прошёл до коммита link#2). Форсим
+# безусловный syncconf — операция идемпотентна: если peer уже
+# соответствует disk state, wg ничего не меняет.
+- name: Sync running WG state with wg0.conf
+  shell: |
+    wg syncconf wg0 <(wg-quick strip wg0)
+  args:
+    executable: /bin/bash
+  changed_when: false
+
+- name: Setup NAT masquerade for tunnel traffic
+  iptables:
+    table: nat
+    chain: POSTROUTING
+    # Network CIDR precomputed by the backend (_collect_exit_extra_vars)
+    # to avoid the ansible.utils collection dependency.
+    source: "{{ wg_exit_network_v4 | default('10.77.0.0/24') }}"
+    out_interface: "{{ ansible_default_ipv4.interface }}"
+    jump: MASQUERADE
+  notify: persist iptables
+
+- name: Allow forwarding from wg0
+  iptables:
+    chain: FORWARD
+    in_interface: wg0
+    jump: ACCEPT
+  notify: persist iptables
+
+- name: Allow forwarding to wg0
+  iptables:
+    chain: FORWARD
+    out_interface: wg0
+    match: conntrack
+    ctstate: ESTABLISHED,RELATED
+    jump: ACCEPT
+  notify: persist iptables

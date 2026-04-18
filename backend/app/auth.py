@@ -125,6 +125,32 @@ def _resolve_principal(
     )
 
 
+def require_admin(x_admin_token: str | None = Header(default=None)) -> str:
+    """Shared-secret admin auth. Used by legacy routes that don't need scopes."""
+    settings = get_settings()
+    if not settings.admin_api_token:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="admin token missing",
+        )
+    if not x_admin_token or not hmac.compare_digest(
+        x_admin_token.encode("utf-8"),
+        settings.admin_api_token.encode("utf-8"),
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="invalid admin token",
+        )
+    return x_admin_token
+
+
+def optional_admin(x_admin_token: str | None = Header(default=None)) -> str | None:
+    """Like require_admin, but returns None if no header was sent."""
+    if x_admin_token:
+        return require_admin(x_admin_token)
+    return None
+
+
 def require_scope(scope: str) -> Callable[..., AuthPrincipal]:
     """FastAPI dependency factory enforcing a single scope."""
 

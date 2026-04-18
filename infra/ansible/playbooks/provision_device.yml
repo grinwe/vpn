@@ -1,18 +1,22 @@
 ---
 # provision_device.yml
 #
-# Per-device apply/revoke. Backend passes one of two logical profiles via
-# extra_vars:
+# Per-device apply/revoke. Backend passes:
+#   username, uuid, password               (shared identity, all protocols)
+#   protocols: [{proto, port[, method]}]  (one entry per protocol to provision)
+#   state: present|absent
 #
-#   ShadowTLS+SS: username, password, method, port, config_proto=shadowtls+ss
-#   VLESS+Reality: username, uuid, config_proto=vless-reality
+# Backwards-compat: if `protocols` is not defined we fall back to a single
+# `config_proto` invocation (kept for older revoke tasks in flight).
 #
-# The ``config_proto`` discriminator selects which management helper to
-# run; everything else is per-protocol noise.
 - hosts: vpn_nodes
   become: yes
   vars:
     state: present
+    protocols: "{{ [ {'proto': config_proto | default('shadowtls+shadowsocks'),
+                      'port': port | default(8443),
+                      'method': method | default('chacha20-ietf-poly1305')} ]
+                   if protocols is not defined else protocols }}"
   tasks:
     - name: Validate required username
       fail:
@@ -24,68 +28,177 @@
       stat:
         path: /usr/local/sbin/manage_vpn_user.sh
       register: st_manage_script
-      when: config_proto is not defined or config_proto is match('shadowtls.*')
-
-    - name: Fail if ShadowTLS manage script missing
-      fail:
-        msg: "manage_vpn_user.sh not found on target"
-      when:
-        - config_proto is not defined or config_proto is match('shadowtls.*')
-        - not st_manage_script.stat.exists
 
     - name: Add or remove ShadowTLS user
+      # Placeholder 'x' for password: the legacy shadowtls manage
+      # script is a no-op logger (shared-node credential model) but
+      # still enforces exactly 4 positional args. On revoke we don't
+      # have a per-user password, and ansible's `command:` module
+      # silently drops empty-string args — which would leave 3 and
+      # trip the arg-count check in the script. The value is never
+      # used, so a literal 'x' is the simplest way to keep the count.
       command: >-
         /usr/local/sbin/manage_vpn_user.sh
         {{ 'add-shadowtls-ss' if state == 'present' else 'del-shadowtls-ss' }}
         {{ username }}
-        {{ password | default('') }}
-        {{ method | default('chacha20-ietf-poly1305') }}
-        {{ port | default(8443) }}
-      when: config_proto is not defined or config_proto is match('shadowtls.*')
+        {{ password | default('x') }}
+        {{ item.method | default('chacha20-ietf-poly1305') }}
+        {{ item.port | default(8443) }}
+      loop: "{{ protocols }}"
+      when:
+        - item.proto is match('shadowtls.*')
+        - st_manage_script.stat.exists
       register: st_manage_user
-      changed_when: "'updated' in st_manage_user.stdout or state == 'present'"
+      changed_when: "'updated' in (st_manage_user.stdout | default('')) or state == 'present'"
 
     # ---- VLESS+Reality branch -------------------------------------------
-    - name: Ensure VLESS manage script exists
+    - name: Ensure VLESS Reality manage script exists
       stat:
         path: /usr/local/sbin/manage_vless_user.sh
       register: vless_manage_script
-      when: config_proto is defined and config_proto is match('vless.*')
 
-    - name: Fail if VLESS manage script missing
-      fail:
-        msg: "manage_vless_user.sh not found on target"
-      when:
-        - config_proto is defined and config_proto is match('vless.*')
-        - not vless_manage_script.stat.exists
-
-    - name: Fail if VLESS apply is missing UUID
+    - name: Fail if VLESS Reality apply is missing UUID
       fail:
         msg: "vless provisioning requires uuid when state=present"
       when:
-        - config_proto is defined and config_proto is match('vless.*')
         - state == 'present'
+        - protocols | selectattr('proto', 'equalto', 'vless-reality') | list | length > 0
         - uuid is not defined or uuid | length == 0
 
     - name: Add VLESS+Reality user
       command: >-
-        /usr/local/sbin/manage_vless_user.sh add
-        {{ username }}
-        {{ uuid }}
+        /usr/local/sbin/manage_vless_user.sh add {{ username }} {{ uuid }}
+      # G.6 — manage_vless_user.sh reads EXIT_INTERFACE to attach the
+      # email to the matching direct-wgN routing rule on multi-link
+      # relays. Empty/unset on single-link/direct nodes.
+      environment:
+        EXIT_INTERFACE: "{{ exit_interface | default('') }}"
+      loop: "{{ protocols }}"
       when:
-        - config_proto is defined and config_proto is match('vless.*')
+        - item.proto == 'vless-reality'
         - state == 'present'
+        - vless_manage_script.stat.exists
 
     - name: Remove VLESS+Reality user
       command: >-
-        /usr/local/sbin/manage_vless_user.sh del
-        {{ username }}
+        /usr/local/sbin/manage_vless_user.sh del {{ username }}
+      # G.6 — del strips the email from every direct-wg* rule
+      # regardless of EXIT_INTERFACE; passing the var is harmless.
+      environment:
+        EXIT_INTERFACE: "{{ exit_interface | default('') }}"
+      loop: "{{ protocols }}"
       when:
-        - config_proto is defined and config_proto is match('vless.*')
+        - item.proto == 'vless-reality'
         - state == 'absent'
+        - vless_manage_script.stat.exists
 
+    # ---- VLESS+WS+CDN branch -------------------------------------------
+    - name: Ensure VLESS WS manage script exists
+      stat:
+        path: /usr/local/sbin/manage_vless_ws_user.sh
+      register: vless_ws_manage_script
+
+    - name: Fail if VLESS WS apply is missing UUID
+      fail:
+        msg: "vless-ws-cdn provisioning requires uuid when state=present"
+      when:
+        - state == 'present'
+        - protocols | selectattr('proto', 'equalto', 'vless-ws-cdn') | list | length > 0
+        - uuid is not defined or uuid | length == 0
+
+    - name: Add VLESS+WS+CDN user
+      command: >-
+        /usr/local/sbin/manage_vless_ws_user.sh add {{ username }} {{ uuid }}
+      environment:
+        EXIT_INTERFACE: "{{ exit_interface | default('') }}"
+      loop: "{{ protocols }}"
+      when:
+        - item.proto == 'vless-ws-cdn'
+        - state == 'present'
+        - vless_ws_manage_script.stat.exists
+
+    - name: Remove VLESS+WS+CDN user
+      command: >-
+        /usr/local/sbin/manage_vless_ws_user.sh del {{ username }}
+      environment:
+        EXIT_INTERFACE: "{{ exit_interface | default('') }}"
+      loop: "{{ protocols }}"
+      when:
+        - item.proto == 'vless-ws-cdn'
+        - state == 'absent'
+        - vless_ws_manage_script.stat.exists
+
+    # ---- VLESS+XHTTP branch ---------------------------------------------
+    - name: Ensure VLESS XHTTP manage script exists
+      stat:
+        path: /usr/local/sbin/manage_vless_xhttp_user.sh
+      register: vless_xhttp_manage_script
+
+    - name: Fail if VLESS XHTTP apply is missing UUID
+      fail:
+        msg: "vless-xhttp provisioning requires uuid when state=present"
+      when:
+        - state == 'present'
+        - protocols | selectattr('proto', 'equalto', 'vless-xhttp') | list | length > 0
+        - uuid is not defined or uuid | length == 0
+
+    - name: Add VLESS+XHTTP user
+      command: >-
+        /usr/local/sbin/manage_vless_xhttp_user.sh add {{ username }} {{ uuid }}
+      environment:
+        EXIT_INTERFACE: "{{ exit_interface | default('') }}"
+      loop: "{{ protocols }}"
+      when:
+        - item.proto == 'vless-xhttp'
+        - state == 'present'
+        - vless_xhttp_manage_script.stat.exists
+
+    - name: Remove VLESS+XHTTP user
+      command: >-
+        /usr/local/sbin/manage_vless_xhttp_user.sh del {{ username }}
+      environment:
+        EXIT_INTERFACE: "{{ exit_interface | default('') }}"
+      loop: "{{ protocols }}"
+      when:
+        - item.proto == 'vless-xhttp'
+        - state == 'absent'
+        - vless_xhttp_manage_script.stat.exists
+
+    # ---- Hysteria2 branch -----------------------------------------------
+    - name: Ensure Hysteria2 manage script exists
+      stat:
+        path: /usr/local/sbin/manage_hy2_user.sh
+      register: hy2_manage_script
+
+    - name: Fail if Hysteria2 apply is missing password
+      fail:
+        msg: "hysteria2 provisioning requires password when state=present"
+      when:
+        - state == 'present'
+        - protocols | selectattr('proto', 'equalto', 'hysteria2') | list | length > 0
+        - password is not defined or password | length == 0
+
+    - name: Add Hysteria2 user
+      command: >-
+        /usr/local/sbin/manage_hy2_user.sh add {{ username }} {{ password }}
+      loop: "{{ protocols }}"
+      when:
+        - item.proto == 'hysteria2'
+        - state == 'present'
+        - hy2_manage_script.stat.exists
+
+    - name: Remove Hysteria2 user
+      command: >-
+        /usr/local/sbin/manage_hy2_user.sh del {{ username }}
+      loop: "{{ protocols }}"
+      when:
+        - item.proto == 'hysteria2'
+        - state == 'absent'
+        - hy2_manage_script.stat.exists
+
+    # ---- Log ----
     - name: Log provisioning payload
       debug:
         msg: >-
-          Provisioned {{ username }} proto={{ config_proto | default('shadowtls+ss') }}
-          state={{ state }}
+          Provisioned {{ username }} state={{ state }}
+          protos={{ protocols | map(attribute='proto') | list }}

@@ -1,0 +1,74 @@
+---
+- name: Validate probe agent config
+  assert:
+    that:
+      - probe_agent_backend_url | length > 0
+      - probe_agent_backend_token | length > 0
+    fail_msg: >-
+      probe_agent_backend_url and probe_agent_backend_token must be set
+      before deploying the probe agent. Pass them via group_vars or
+      --extra-vars.
+
+- name: Ensure python3-pip is installed
+  package:
+    name: python3-pip
+    state: present
+
+- name: Install aiohttp
+  pip:
+    name: aiohttp
+    state: present
+    executable: pip3
+
+- name: Ensure probe agent directories
+  file:
+    path: "{{ item }}"
+    state: directory
+    owner: root
+    group: root
+    mode: '0750'
+  loop:
+    - /opt/vpn-probe-agent
+    - /etc/vpn-probe-agent
+
+- name: Copy probe agent script
+  copy:
+    src: "{{ playbook_dir }}/../probes/agent.py"
+    dest: /opt/vpn-probe-agent/agent.py
+    mode: '0644'
+    owner: root
+    group: root
+  register: agent_script
+
+- name: Render probe agent env file
+  template:
+    src: probe.env.j2
+    dest: /etc/vpn-probe-agent/probe.env
+    mode: '0600'
+    owner: root
+    group: root
+  register: agent_env
+
+- name: Install probe agent systemd unit
+  copy:
+    src: vpn-probe-agent.service
+    dest: /etc/systemd/system/vpn-probe-agent.service
+    mode: '0644'
+  register: agent_unit
+
+- name: Reload systemd
+  systemd:
+    daemon_reload: yes
+  when: agent_unit.changed
+
+- name: Enable and start probe agent
+  systemd:
+    name: vpn-probe-agent
+    enabled: yes
+    state: started
+
+- name: Restart probe agent on config change
+  systemd:
+    name: vpn-probe-agent
+    state: restarted
+  when: agent_script.changed or agent_env.changed or agent_unit.changed

@@ -24,6 +24,29 @@ from sqlalchemy import inspect
 from app.db import DATABASE_URL, engine
 
 
+def _schema_snapshot() -> dict[str, dict]:
+    """Return a structural snapshot of the public schema.
+
+    For each table we capture column names + their declared SQL type
+    (rendered as string), nullability, and the set of index column
+    tuples. That's deep enough to catch a downgrade that drops a
+    column / index without recreating it on upgrade — the original
+    test only compared table *names* and would have missed both.
+    """
+    insp = inspect(engine)
+    snap: dict[str, dict] = {}
+    for table in insp.get_table_names():
+        cols = {
+            c["name"]: (str(c["type"]), bool(c["nullable"]))
+            for c in insp.get_columns(table)
+        }
+        idx = sorted(
+            tuple(i["column_names"]) for i in insp.get_indexes(table)
+        )
+        snap[table] = {"columns": cols, "indexes": idx}
+    return snap
+
+
 def _alembic_config() -> Config:
     ini_path = Path(__file__).resolve().parents[1] / "alembic.ini"
     cfg = Config(str(ini_path))
@@ -41,11 +64,12 @@ def _table_set() -> set[str]:
 def test_alembic_downgrade_upgrade_roundtrip() -> None:
     cfg = _alembic_config()
 
-    # Snapshot the schema at head before we start moving versions around.
-    # This is the "known good" state — everything we see after a full
-    # teardown + restore must match it.
-    tables_at_head = _table_set()
-    assert "users" in tables_at_head, (
+    # Deep snapshot at head — columns, types, nullability, indexes per
+    # table. Must match exactly after the round-trip; the previous
+    # version of this test only compared table names and would have
+    # missed a downgrade that dropped a column without recreating it.
+    snap_at_head = _schema_snapshot()
+    assert "users" in snap_at_head, (
         "Schema looks empty at head — is the session fixture doing its job?"
     )
 
@@ -62,14 +86,10 @@ def test_alembic_downgrade_upgrade_roundtrip() -> None:
     # Climb back to head. Every upgrade() must be idempotent-friendly
     # enough to run against a clean DB.
     command.upgrade(cfg, "head")
-    tables_after_roundtrip = _table_set()
+    snap_after_roundtrip = _schema_snapshot()
 
-    # The set of application tables must be identical before and after.
-    # We compare on set-equality rather than just "contains" so that an
-    # accidental DROP TABLE in a downgrade that forgets to recreate on
-    # upgrade is caught.
-    assert tables_after_roundtrip == tables_at_head, (
-        "Schema drift after downgrade→upgrade round-trip:\n"
-        f"  missing: {tables_at_head - tables_after_roundtrip}\n"
-        f"  extra:   {tables_after_roundtrip - tables_at_head}"
+    assert snap_after_roundtrip == snap_at_head, (
+        "Schema drift after downgrade→upgrade round-trip.\n"
+        f"  before: {snap_at_head}\n"
+        f"  after:  {snap_after_roundtrip}"
     )

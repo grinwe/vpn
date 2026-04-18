@@ -53,3 +53,23 @@ def generate_reality_keypair() -> tuple[str, str]:
 def generate_short_id() -> str:
     """Return a Reality ``shortId`` — 8 bytes of hex, xray's typical length."""
     return secrets.token_hex(8)
+
+
+def generate_wireguard_keypair() -> tuple[str, str]:
+    """Return ``(public_key, private_key)`` in WireGuard's wire format.
+
+    WireGuard uses X25519 like Reality but encodes keys with the standard
+    base64 alphabet (``+/=``), not url-safe — matching the output of
+    ``wg genkey`` / ``wg pubkey``.
+    """
+    priv = X25519PrivateKey.generate()
+    priv_raw = priv.private_bytes(
+        encoding=serialization.Encoding.Raw,
+        format=serialization.PrivateFormat.Raw,
+        encryption_algorithm=serialization.NoEncryption(),
+    )
+    pub_raw = priv.public_key().public_bytes(
+        encoding=serialization.Encoding.Raw,
+        format=serialization.PublicFormat.Raw,
+    )
+    return base64.b64encode(pub_raw).decode("ascii"), base64.b64encode(priv_raw).decode("ascii")

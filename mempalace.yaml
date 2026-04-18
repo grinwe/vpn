@@ -1,0 +1,50 @@
+wing: vpn
+rooms:
+- name: backend
+  description: Files from backend/
+  keywords:
+  - backend
+  - backend
+- name: admin
+  description: Files from admin/
+  keywords:
+  - admin
+  - admin
+- name: documentation
+  description: Files from docs/
+  keywords:
+  - documentation
+  - docs
+- name: probes
+  description: Files from probes/
+  keywords:
+  - probes
+  - probes
+- name: bot
+  description: Files from bot/
+  keywords:
+  - bot
+  - bot
+- name: configuration
+  description: Files from infra/
+  keywords:
+  - configuration
+  - infra
+- name: webapp
+  description: Files from webapp/
+  keywords:
+  - webapp
+  - webapp
+- name: testing
+  description: Files from tests/
+  keywords:
+  - testing
+  - tests
+- name: frontend
+  description: Files from components/
+  keywords:
+  - frontend
+  - components
+- name: general
+  description: Files that don't fit other rooms
+  keywords: []

@@ -5,7 +5,13 @@ import Dashboard from "./pages/Dashboard";
 import Users from "./pages/Users";
 import Invoices from "./pages/Invoices";
 import Nodes from "./pages/Nodes";
+import Plans from "./pages/Plans";
 import ApiTokens from "./pages/ApiTokens";
+import Tasks from "./pages/Tasks";
+import AuditLogs from "./pages/AuditLogs";
+import CloudProviders from "./pages/CloudProviders";
+import Exits from "./pages/Exits";
+import HealthPings from "./pages/HealthPings";
 
 function Layout({ children }: { children: React.ReactNode }) {
   const { logout } = useAuth();
@@ -19,8 +25,14 @@ function Layout({ children }: { children: React.ReactNode }) {
           <NavLink to="/" end className={linkCls}>Dashboard</NavLink>
           <NavLink to="/users" className={linkCls}>Users</NavLink>
           <NavLink to="/invoices" className={linkCls}>Invoices</NavLink>
+          <NavLink to="/plans" className={linkCls}>Plans</NavLink>
           <NavLink to="/nodes" className={linkCls}>Nodes</NavLink>
+          <NavLink to="/exits" className={linkCls}>Exits</NavLink>
+          <NavLink to="/tasks" className={linkCls}>Tasks</NavLink>
+          <NavLink to="/health-pings" className={linkCls}>Health</NavLink>
           <NavLink to="/tokens" className={linkCls}>API tokens</NavLink>
+          <NavLink to="/cloud" className={linkCls}>Cloud</NavLink>
+          <NavLink to="/audit" className={linkCls}>Audit</NavLink>
         </nav>
         <button
           onClick={logout}
@@ -51,8 +63,17 @@ export default function App() {
       <Route path="/" element={<Protected><Dashboard /></Protected>} />
       <Route path="/users" element={<Protected><Users /></Protected>} />
       <Route path="/invoices" element={<Protected><Invoices /></Protected>} />
+      <Route path="/plans" element={<Protected><Plans /></Protected>} />
       <Route path="/nodes" element={<Protected><Nodes /></Protected>} />
+      <Route path="/exits" element={<Protected><Exits /></Protected>} />
+      <Route path="/tasks" element={<Protected><Tasks /></Protected>} />
       <Route path="/tokens" element={<Protected><ApiTokens /></Protected>} />
+      <Route path="/cloud" element={<Protected><CloudProviders /></Protected>} />
+      <Route path="/audit" element={<Protected><AuditLogs /></Protected>} />
+      <Route
+        path="/health-pings"
+        element={<Protected><HealthPings /></Protected>}
+      />
       <Route path="*" element={<Navigate to="/" replace />} />
     </Routes>
   );

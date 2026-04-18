@@ -1,0 +1,104 @@
+"""Outer middleware: silent-drop updates from banned users.
+
+Motivating scenario: a DDoS burst where hundreds of throwaway Telegram
+accounts spam ``/start`` and starve the handler loop. We need to shed
+those updates BEFORE any backend call, otherwise the ban mechanism
+itself becomes the amplifier.
+
+Strategy — pull the ban list from backend every ``_TTL_SECONDS``,
+keep it in a process-local set, and gate every incoming update against
+it. One admin API call per TTL window is independent of update rate,
+so the bot's own load during a burst doesn't translate into backend
+load. On cache miss (first update after process start, or backend
+unreachable on refresh) we fail OPEN — better to let a banned user
+through for one window than to black-hole every legit user because
+backend blipped.
+
+"No ACK" is load-bearing: we intentionally don't reply/ack/react to
+dropped updates. Giving feedback (even an error) trains DDoS scripts
+that the account is reachable. The dropped update is simply consumed.
+"""
+from __future__ import annotations
+
+import logging
+import time
+from typing import Any, Awaitable, Callable
+
+import aiohttp
+from aiogram import BaseMiddleware
+from aiogram.types import TelegramObject, Update
+
+from .config import ADMIN_API_TOKEN, BACKEND_URL
+
+logger = logging.getLogger(__name__)
+
+_TTL_SECONDS = 30.0
+_FETCH_TIMEOUT = aiohttp.ClientTimeout(total=5)
+
+
+class BanGuard(BaseMiddleware):
+    def __init__(self) -> None:
+        self._banned: set[str] = set()
+        self._loaded_at: float = 0.0
+
+    async def _refresh(self) -> None:
+        headers: dict[str, str] = {}
+        if ADMIN_API_TOKEN:
+            headers["X-Admin-Token"] = ADMIN_API_TOKEN
+        try:
+            async with aiohttp.ClientSession(timeout=_FETCH_TIMEOUT) as s:
+                async with s.get(
+                    f"{BACKEND_URL}/api/users/banned-telegram-ids",
+                    headers=headers,
+                ) as resp:
+                    if resp.status != 200:
+                        logger.warning(
+                            "ban list fetch got HTTP %s; keeping stale cache",
+                            resp.status,
+                        )
+                        return
+                    data = await resp.json()
+            self._banned = {str(x) for x in data if x is not None}
+            self._loaded_at = time.monotonic()
+        except Exception:
+            logger.exception("ban list fetch failed; keeping stale cache")
+
+    async def _maybe_refresh(self) -> None:
+        if time.monotonic() - self._loaded_at >= _TTL_SECONDS:
+            await self._refresh()
+
+    @staticmethod
+    def _extract_user_id(event: TelegramObject) -> str | None:
+        if isinstance(event, Update):
+            for attr in (
+                "message",
+                "edited_message",
+                "callback_query",
+                "inline_query",
+                "pre_checkout_query",
+                "chat_member",
+                "my_chat_member",
+                "chosen_inline_result",
+                "shipping_query",
+            ):
+                obj = getattr(event, attr, None)
+                if obj is not None:
+                    user = getattr(obj, "from_user", None)
+                    if user is not None:
+                        return str(user.id)
+        user = getattr(event, "from_user", None)
+        if user is not None:
+            return str(user.id)
+        return None
+
+    async def __call__(
+        self,
+        handler: Callable[[TelegramObject, dict[str, Any]], Awaitable[Any]],
+        event: TelegramObject,
+        data: dict[str, Any],
+    ) -> Any:
+        await self._maybe_refresh()
+        tg_id = self._extract_user_id(event)
+        if tg_id and tg_id in self._banned:
+            return None
+        return await handler(event, data)

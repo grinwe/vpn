@@ -54,14 +54,37 @@ ansible-playbook -i inventories/prod/hosts.yml site.yml --tags web
 
 ## Страницы
 
-- `/admin/login` — ввод admin-токена (тот же `ADMIN_API_TOKEN` из .env бэка).
-- `/admin/` — Dashboard: базовые счётчики по последним 200 юзерам.
-  Для полноценных метрик — Grafana (`ssh -L 3000:localhost:3000`).
-- `/admin/users` — список с поиском по `telegram_id`/`email` и
-  боковой панелью с подписками выбранного юзера.
+- `/admin/login` — ввод admin-токена. По умолчанию это общий `ADMIN_API_TOKEN`
+  из `.env` бэка, но можно завести отдельный scoped API-token через
+  страницу «API tokens» и логиниться им — в логах `AuditLog` это развяжет
+  действия человека-админа от серверных (bot/worker).
+- `/admin/` — **Dashboard**: сводные счётчики (users, subs active/total,
+  invoices pending, nodes active/total, devices, provisioning tasks
+  pending/failed). Для графиков и time-series — Grafana.
+- `/admin/users` — **Users**: список с поиском по `telegram_id`/`email`
+  и боковой панелью с подписками выбранного юзера.
+- `/admin/invoices` — **Invoices**: pending/paid/failed инвойсы, фильтры,
+  ручное `mark_paid` для ручных переводов.
+- `/admin/plans` — **Plans**: CRUD по тарифам (цена, длительность,
+  max_devices, traffic_limit_mb, visibility).
+- `/admin/tasks` — **Provisioning tasks**: последние `ProvisioningTask` с
+  фильтрами, expandable строки (error_message / payload / result), кнопка
+  **rerun** на failed/pending. Нужно, чтобы диагностировать застрявший
+  bootstrap без `docker compose logs worker`.
+- `/admin/nodes` — **Nodes**: список VPN-нод с автообновлением раз в 5 сек
+  (для отслеживания `registering → active` во время bootstrap). Кнопка
+  «+ Добавить ноду» открывает форму создания — бэкенд автоматически
+  enqueue'ит таску на `site.yml` через worker. Клик на строку разворачивает
+  панель конфигов протоколов (VLESS Reality, VLESS XHTTP, VLESS+WS+CDN)
+  с формой «+ Добавить конфиг» — протокольные дефолты (порт/SNI)
+  проставляются автоматически.  ShadowTLS+SS и Hysteria2 deprecated
+  (0.2/0.3), через UI не создаются.
+- `/admin/tokens` — **API tokens**: scoped токены с отдельными правами для
+  интеграций (probes, внешние сервисы) и самих админов.
 
 ## Что дальше
 
-- Страницы Invoices / Subscriptions / Nodes (CRUD уже есть в бэке).
+- Delete node из UI и ручной drain.
 - Замена ручных TS-типов на `openapi-typescript` codegen из `/openapi.json`.
-- Отдельный scoped admin-token (сейчас используется тот же, что у бота).
+- Tree-shake страниц на роли: отдельный scoped token → отдельный набор пунктов
+  в навигации.

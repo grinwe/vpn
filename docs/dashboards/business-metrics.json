@@ -1,0 +1,146 @@
+{
+  "dashboard": {
+    "title": "VPN Business Metrics",
+    "uid": "vpn-business",
+    "description": "MRR, Churn, LTV, Active Users, Revenue",
+    "tags": ["vpn", "business"],
+    "timezone": "browser",
+    "panels": [
+      {
+        "title": "Active Subscriptions",
+        "type": "stat",
+        "gridPos": {"h": 4, "w": 6, "x": 0, "y": 0},
+        "targets": [{"expr": "vpn_subscriptions_active", "legendFormat": "Active"}]
+      },
+      {
+        "title": "Total Users",
+        "type": "stat",
+        "gridPos": {"h": 4, "w": 6, "x": 6, "y": 0},
+        "targets": [{"expr": "vpn_users_total", "legendFormat": "Users"}]
+      },
+      {
+        "title": "Pending Invoices",
+        "type": "stat",
+        "gridPos": {"h": 4, "w": 6, "x": 12, "y": 0},
+        "targets": [{"expr": "vpn_invoices_pending", "legendFormat": "Pending"}]
+      },
+      {
+        "title": "Nodes Active / Total",
+        "type": "stat",
+        "gridPos": {"h": 4, "w": 6, "x": 18, "y": 0},
+        "targets": [
+          {"expr": "vpn_nodes_active", "legendFormat": "Active"},
+          {"expr": "vpn_nodes_total", "legendFormat": "Total"}
+        ]
+      },
+      {
+        "title": "HTTP Request Rate",
+        "type": "timeseries",
+        "gridPos": {"h": 8, "w": 12, "x": 0, "y": 4},
+        "targets": [
+          {"expr": "rate(vpn_requests_total[5m])", "legendFormat": "{{path}} {{status}}"}
+        ]
+      },
+      {
+        "title": "Provisioning Tasks",
+        "type": "timeseries",
+        "gridPos": {"h": 8, "w": 12, "x": 12, "y": 4},
+        "targets": [
+          {"expr": "rate(vpn_provisioning_tasks_total[5m])", "legendFormat": "{{status}}"}
+        ]
+      },
+      {
+        "title": "Error Rate",
+        "type": "timeseries",
+        "gridPos": {"h": 8, "w": 24, "x": 0, "y": 12},
+        "targets": [
+          {"expr": "rate(vpn_requests_errors_total[5m])", "legendFormat": "{{path}} {{status}}"}
+        ]
+      },
+      {
+        "title": "Renewal worker — seconds since last tick",
+        "description": "If this climbs above 2× RENEWAL_CHECK_INTERVAL the cron is dead — expired subs are NOT being revoked. Alert > 900s.",
+        "type": "stat",
+        "gridPos": {"h": 4, "w": 8, "x": 0, "y": 20},
+        "targets": [
+          {"expr": "time() - vpn_renewal_check_last_run_timestamp", "legendFormat": "lag"}
+        ],
+        "fieldConfig": {
+          "defaults": {
+            "unit": "s",
+            "thresholds": {
+              "mode": "absolute",
+              "steps": [
+                {"color": "green", "value": null},
+                {"color": "yellow", "value": 600},
+                {"color": "red", "value": 900}
+              ]
+            }
+          }
+        }
+      },
+      {
+        "title": "Renewal ticks (ok / error)",
+        "type": "timeseries",
+        "gridPos": {"h": 4, "w": 8, "x": 8, "y": 20},
+        "targets": [
+          {"expr": "rate(vpn_renewal_check_runs_total[15m])", "legendFormat": "{{outcome}}"}
+        ]
+      },
+      {
+        "title": "Auto-revoked subs (rate)",
+        "type": "timeseries",
+        "gridPos": {"h": 4, "w": 8, "x": 16, "y": 20},
+        "targets": [
+          {"expr": "rate(vpn_renewal_revoked_total[1h])", "legendFormat": "revoked/h"}
+        ]
+      },
+      {
+        "title": "Warm pool depth (per node)",
+        "description": "Stage 2.5 — number of warm credential bundles waiting on each node. Should hover near WARM_POOL_TARGET. If a node line drops to 0 and stays there, the warmer is failing (check ansible/SSH).",
+        "type": "timeseries",
+        "gridPos": {"h": 6, "w": 12, "x": 0, "y": 24},
+        "targets": [
+          {"expr": "vpn_warm_pool_depth", "legendFormat": "{{node}}"}
+        ],
+        "fieldConfig": {
+          "defaults": {
+            "thresholds": {
+              "mode": "absolute",
+              "steps": [
+                {"color": "red", "value": null},
+                {"color": "yellow", "value": 1},
+                {"color": "green", "value": 5}
+              ]
+            }
+          }
+        }
+      },
+      {
+        "title": "Warm pool: hits vs misses (rate)",
+        "description": "A miss means a paying user fell back to cold provisioning (60-120s wait). Sustained misses mean the pool can't keep up — raise WARM_POOL_TARGET or WARM_POOL_BATCH_PER_TICK.",
+        "type": "timeseries",
+        "gridPos": {"h": 6, "w": 12, "x": 12, "y": 24},
+        "targets": [
+          {"expr": "rate(vpn_warm_pool_hits_total[5m])", "legendFormat": "hits {{node}}"},
+          {"expr": "rate(vpn_warm_pool_misses_total[5m])", "legendFormat": "misses {{node}}"}
+        ]
+      },
+      {
+        "title": "Warm credential provisioning (p50/p95)",
+        "description": "How long the warmer takes to push one bundle to a node. p95 should stay under 60s — if it climbs, ansible/SSH is degrading.",
+        "type": "timeseries",
+        "gridPos": {"h": 6, "w": 24, "x": 0, "y": 30},
+        "targets": [
+          {"expr": "histogram_quantile(0.5, rate(vpn_warm_credential_provision_seconds_bucket[10m]))", "legendFormat": "p50 {{node}}"},
+          {"expr": "histogram_quantile(0.95, rate(vpn_warm_credential_provision_seconds_bucket[10m]))", "legendFormat": "p95 {{node}}"}
+        ],
+        "fieldConfig": {
+          "defaults": {"unit": "s"}
+        }
+      }
+    ],
+    "time": {"from": "now-24h", "to": "now"},
+    "refresh": "30s"
+  }
+}

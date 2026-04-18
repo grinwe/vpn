@@ -27,6 +27,12 @@ COPY backend/app ./app
 COPY backend/alembic.ini ./alembic.ini
 COPY infra /app/infra
 
+# Install Galaxy collections the roles depend on (ansible.posix for
+# authorized_key/sysctl, community.general for misc modules). ansible-core
+# ships with nothing bundled, so without this every bootstrap playbook fails
+# with "couldn't resolve module/action 'authorized_key'".
+RUN ansible-galaxy collection install -r /app/infra/ansible/requirements.yml
+
 # The backend expects ANSIBLE_ROOT to resolve to `<backend>/../infra/ansible`
 # relative to the package location. We set it explicitly here so the worker
 # finds the playbooks regardless of the container layout.
@@ -38,4 +44,10 @@ ENV ANSIBLE_ROOT=/app/infra/ansible \
 # /root/.ssh/id_ed25519 (or configure via ANSIBLE_PRIVATE_KEY_FILE).
 RUN mkdir -p /root/.ssh && chmod 700 /root/.ssh
 
-CMD ["python", "-m", "app.worker"]
+# IMPORTANT: launch via `-c "from app.worker import main; main()"`, NOT
+# `python -m app.worker`. The latter loads the module as `__main__`, and RQ
+# later does `importlib.import_module("app.worker")` to execute jobs — which
+# re-runs worker.py top-level code (including the prometheus Counter() calls)
+# under a *different* module name, crashing every job with
+# "Duplicated timeseries in CollectorRegistry". See the comment in worker.py.
+CMD ["python", "-c", "from app.worker import main; main()"]

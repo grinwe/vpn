@@ -1,0 +1,14 @@
+---
+- name: reload systemd
+  systemd:
+    daemon_reload: yes
+
+- name: restart ssserver
+  systemd:
+    name: ssserver
+    state: restarted
+
+- name: restart shadow-tls
+  systemd:
+    name: shadow-tls
+    state: restarted

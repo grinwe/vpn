@@ -1,0 +1,52 @@
+---
+# Public web frontend config. The email is used by Let's Encrypt — put
+# a real mailbox you actually read, expiry notices go there.
+deploy_web_frontend_domain: "grinwer.online"
+deploy_web_frontend_letsencrypt_email: "adept38@gmail.com"
+
+# Cloudflare API token for DNS-01 ACME challenge. Needs
+# Zone → DNS → Edit on the grinwer.online zone. Stored in the vault.
+deploy_web_frontend_cloudflare_api_token: "{{ vault_cloudflare_api_token | default('') }}"
+
+# App stack lives on the same host for now. Override any of the
+# deploy_app_stack_* defaults here; secrets come from vault.yml next
+# to this file.
+deploy_app_stack_dir: "/opt/vpn"
+deploy_app_stack_payment_provider: "cryptobot"
+
+# #53 — TTL for the Telegram initData handshake at /api/webapp/auth.
+# 300s is Telegram's recommended validation window; keep short to
+# bound the replay window. NOT a secret — just a tunable.
+deploy_app_stack_webapp_init_data_ttl_seconds: 300
+
+# Controller-side path to the SSH private key used for provisioning
+# VPN nodes. Leave empty during initial bootstrap; set it once you
+# have the key on disk and re-run the playbook.
+deploy_app_stack_provisioning_key_src: "/opt/vpn/secrets/provisioning_key"
+
+# --- Secrets are pulled from vault.yml (same directory) ---
+# See group_vars/web/vault.yml.example for the required shape. The
+# role refuses to run if any of these are missing or too short.
+deploy_app_stack_postgres_password: "{{ vault_postgres_password | default('') }}"
+deploy_app_stack_admin_api_token: "{{ vault_admin_api_token | default('') }}"
+deploy_app_stack_app_secret_key: "{{ vault_app_secret_key | default('') }}"
+deploy_app_stack_bot_token: "{{ vault_bot_token | default('') }}"
+deploy_app_stack_bot_username: "{{ vault_bot_username | default('') }}"
+deploy_app_stack_admin_ids: "{{ vault_admin_ids | default('') }}"
+deploy_app_stack_telegram_stars_webhook_secret: "{{ vault_telegram_stars_webhook_secret | default('') }}"
+deploy_app_stack_webapp_jwt_secret: "{{ vault_webapp_jwt_secret | default('') }}"
+
+# #62 — native Telegram webhook mode (replaces shared-secret forwarding).
+# Reuses vault_telegram_stars_webhook_secret for both legacy and native webhook.
+deploy_app_stack_telegram_webhook_secret_token: "{{ vault_telegram_stars_webhook_secret | default('') }}"
+deploy_app_stack_telegram_webhook_url: "https://{{ deploy_web_frontend_domain }}/tg-webhook"
+deploy_app_stack_bot_internal_webhook_url: "http://bot:8081/webhook"
+deploy_app_stack_bot_webhook_port: 8081
+
+# Phase A — probe-agent. Token is a *scoped* api-token (probe:read +
+# probe:write) minted via POST /api/api-tokens — see env.j2 for the
+# curl recipe. Store the returned plaintext as vault_probe_agent_token
+# in vault.yml. The other knobs are tunables — defaults are fine for
+# ~50 nodes from this single vantage point.
+deploy_app_stack_probe_agent_token: "{{ vault_probe_agent_token | default('') }}"
+deploy_app_stack_probe_agent_region: "eu-nl"

@@ -35,7 +35,7 @@ _LEGACY_TO_ALEMBIC = {
     "0001_initial": "0001_initial",
     "0002_health_and_cloud": "0002_health_and_cloud",
 }
-_ALEMBIC_HEAD = "0005_api_tokens"
+_ALEMBIC_HEAD = "0009_balance_billing"
 
 
 def _backfill_from_legacy(engine: Engine) -> None:

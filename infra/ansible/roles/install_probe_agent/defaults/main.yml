@@ -1,0 +1,8 @@
+---
+probe_agent_backend_url: ""
+probe_agent_backend_token: ""
+probe_agent_source_region: "{{ inventory_hostname }}"
+probe_agent_source_kind: "node"
+probe_agent_interval: 60
+probe_agent_timeout: 5
+probe_agent_concurrency: 8

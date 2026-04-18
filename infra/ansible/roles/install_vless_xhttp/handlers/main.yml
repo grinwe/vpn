@@ -1,0 +1,6 @@
+---
+- name: restart xray xhttp
+  systemd:
+    name: xray-xhttp
+    state: restarted
+    daemon_reload: yes

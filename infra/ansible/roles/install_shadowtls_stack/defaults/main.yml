@@ -1,0 +1,28 @@
+---
+# Pinned upstream releases. Bump deliberately — a broken binary on a
+# prod node is annoying to roll back, and neither project signs their
+# tarballs, so we rely on the pin + fetched-once-cached logic below.
+shadowtls_binary_version: "v0.2.25"
+shadowtls_binary_url: >-
+  https://github.com/ihciah/shadow-tls/releases/download/{{ shadowtls_binary_version }}/shadow-tls-x86_64-unknown-linux-musl
+shadowtls_binary_dest: /usr/local/bin/shadow-tls
+
+ssrust_version: "v1.20.1"
+ssrust_tarball_url: >-
+  https://github.com/shadowsocks/shadowsocks-rust/releases/download/{{ ssrust_version }}/shadowsocks-{{ ssrust_version }}.x86_64-unknown-linux-gnu.tar.xz
+ssrust_binary_dest: /usr/local/bin/ssserver
+
+# Internal loopback port where ss-rust listens. shadow-tls proxies
+# decrypted-TLS traffic here. Never exposed to the outside world — the
+# only listener on a public interface is shadow-tls.
+shadowtls_ss_loopback_port: 18388
+
+# Encryption method for ss-rust. 2022-blake3-aes-128-gcm is required
+# for EIH multi-user later; single-password v1 still works with it.
+# DO NOT switch to aes-256-gcm without updating the URI builder and
+# verifying Hiddify / v2rayTun still import cleanly.
+shadowtls_ss_method: "2022-blake3-aes-128-gcm"
+
+# Config + working paths.
+shadowtls_config_dir: /etc/shadowtls-ss
+shadowtls_ss_config: "{{ shadowtls_config_dir }}/ssserver.json"

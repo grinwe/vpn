@@ -1,0 +1,10 @@
+---
+# Galaxy collections required by the provisioning roles. Installed into the
+# worker image at build time (see backend/Dockerfile.worker). ansible-core
+# ships with zero bundled collections, so modules like `authorized_key`,
+# `sysctl`, `firewalld` resolve to nothing without this.
+collections:
+  - name: ansible.posix
+    version: ">=1.5.0"
+  - name: community.general
+    version: ">=8.0.0"

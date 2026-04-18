@@ -41,6 +41,7 @@ os.environ.setdefault("APP_SECRET_KEY", "test-secret-key-not-used-in-prod")
 # guard because the monkey-patch below makes it moot, but the env var
 # also keeps import-time code paths happy.
 os.environ.setdefault("ALLOW_INPROCESS_PROVISIONING", "1")
+os.environ.setdefault("WEBAPP_JWT_SECRET", "test-webapp-jwt-secret")
 
 
 # ---------------------------------------------------------------------------

@@ -17,12 +17,20 @@ services:
     restart: unless-stopped
 
   redis:
-    image: redis:7-alpine
-    command: ["redis-server", "--appendonly", "yes"]
+    image: redis:7.4-alpine
+    command:
+      - redis-server
+      - --appendonly
+      - "yes"
+      - --requirepass
+      - ${REDIS_PASSWORD}
+      # NOTE: cannot rename-command EVAL/EVALSHA — RQ uses Lua scripts
+      # internally (register_script in queue.py). requirepass + network
+      # isolation (Docker internal network) is the primary defence.
     volumes:
       - redis_data:/data
     healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
+      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD}", "ping"]
       interval: 5s
       timeout: 3s
       retries: 10
@@ -34,12 +42,47 @@ services:
       DATABASE_URL: ${DATABASE_URL}
       ADMIN_API_TOKEN: ${ADMIN_API_TOKEN}
       APP_SECRET_KEY: ${APP_SECRET_KEY}
-      REDIS_URL: "redis://redis:6379/0"
+      REDIS_URL: "redis://:${REDIS_PASSWORD}@redis:6379/0"
       QUEUE_BACKEND: "rq"
-    # Bind to loopback only. In prod the public nginx vhost
-    # (deploy_web_frontend) proxies /api/ here over the loopback, so
-    # 0.0.0.0 exposure would just add a second unprotected entrypoint.
-    # For local dev, access it from the host via 127.0.0.1:8000.
+      PAYMENT_PROVIDER: ${PAYMENT_PROVIDER:-cryptobot}
+      # Stage 9a: comma-separated rotation pool. If set, the backend
+      # picks one provider per checkout (random). Falls back to
+      # PAYMENT_PROVIDER above when unset.
+      PAYMENT_PROVIDERS: ${PAYMENT_PROVIDERS:-}
+      CRYPTOBOT_TOKEN: ${CRYPTOBOT_TOKEN:-}
+      TELEGRAM_STARS_WEBHOOK_SECRET: ${TELEGRAM_STARS_WEBHOOK_SECRET:-}
+      # #62 — native Telegram webhook mode. When set, the backend
+      # registers itself as the Bot API webhook receiver on startup
+      # and processes Stars payments directly — no shared secret.
+      TELEGRAM_WEBHOOK_SECRET_TOKEN: ${TELEGRAM_WEBHOOK_SECRET_TOKEN:-}
+      TELEGRAM_WEBHOOK_URL: ${TELEGRAM_WEBHOOK_URL:-}
+      BOT_INTERNAL_WEBHOOK_URL: ${BOT_INTERNAL_WEBHOOK_URL:-http://bot:8081/webhook}
+      BOT_TOKEN: ${BOT_TOKEN}
+      # Needed by /api/webapp/referral to build the full t.me share link.
+      # Without it share_url comes back None and the webapp falls back to
+      # showing the bare referral code.
+      BOT_USERNAME: ${BOT_USERNAME:-}
+      WEBAPP_JWT_SECRET: ${WEBAPP_JWT_SECRET}
+      WEBAPP_JWT_TTL_SECONDS: ${WEBAPP_JWT_TTL_SECONDS:-1800}
+      # #53 — short-lived replay window for Telegram initData handshake.
+      WEBAPP_INIT_DATA_TTL_SECONDS: ${WEBAPP_INIT_DATA_TTL_SECONDS:-300}
+      # Stage 2.5 — read by ProvisioningOrchestrator to bypass the warm
+      # pool entirely when set to "0". Worker has its own copy because
+      # it also reads the var to gate the periodic warmer.
+      WARM_POOL_ENABLED: ${WARM_POOL_ENABLED:-1}
+      # Stage 4 — balance billing. Backend reads these for the
+      # WebApp endpoints (freeze caps, min topup, referral bonus).
+      FREEZE_DAYS: ${FREEZE_DAYS:-14}
+      REFERRAL_BONUS_KOPECKS: ${REFERRAL_BONUS_KOPECKS:-5000}
+      MIN_TOPUP_KOPECKS: ${MIN_TOPUP_KOPECKS:-10000}
+      EXTRA_DEVICE_KOPECKS_PER_MONTH: ${EXTRA_DEVICE_KOPECKS_PER_MONTH:-10000}
+      # Stage 8 — public base URL for the dynamic sub link. When set,
+      # provisioning bakes <SUB_LINK_BASE_URL>/<token> into Device rows
+      # and the WebApp surfaces it for copy/QR. Point this at a "boring"
+      # CDN-fronted domain (Cloudflare Worker proxy etc.) so an RKN
+      # block on grinwer.online does not kill installed clients.
+      SUB_LINK_BASE_URL: ${SUB_LINK_BASE_URL:-}
+      ANSIBLE_PLAYBOOK_TIMEOUT: ${ANSIBLE_PLAYBOOK_TIMEOUT:-300}
     ports:
       - "127.0.0.1:8000:8000"
     depends_on:
@@ -49,26 +92,106 @@ services:
         condition: service_healthy
     restart: unless-stopped
 
+  # Тяжёлый воркер под ansible-run'ы. Без scheduler'а, без bootstrap'а —
+  # слушает только vpn-provisioning и молотит долгие job'ы. Имя сервиса
+  # оставлено историческим (`worker`), чтобы runbook-команды типа
+  # `docker compose logs worker` продолжали работать. Если зависнет в
+  # сети/SSH — тики это не заденет (они живут в worker-scheduler).
   worker:
     build:
-      # Build from the repository root so the Dockerfile can COPY both
-      # `backend/` (the Python package) and `infra/` (the Ansible playbooks).
       context: .
       dockerfile: backend/Dockerfile.worker
-    environment:
+    deploy:
+      replicas: 1
+    environment: &worker-env
       DATABASE_URL: ${DATABASE_URL}
       ADMIN_API_TOKEN: ${ADMIN_API_TOKEN}
       APP_SECRET_KEY: ${APP_SECRET_KEY}
-      REDIS_URL: "redis://redis:6379/0"
+      REDIS_URL: "redis://:${REDIS_PASSWORD}@redis:6379/0"
       QUEUE_BACKEND: "rq"
+      WORKER_ROLE: "provisioning"
+      # Migrations are owned by the backend service — it runs
+      # `alembic upgrade head` on startup. If the worker also tries to
+      # run them, both processes race on the alembic_version advisory
+      # lock and whichever loses hangs forever before ever reaching
+      # `Worker.work()`, which in turn leaves every provisioning task
+      # stuck in `pending` with no one to execute it. Keep this pinned.
+      SKIP_MIGRATIONS: "1"
       ANSIBLE_ROOT: /app/infra/ansible
-      # Tell ansible where the provisioning private key lives. The key MUST
-      # be provided via a read-only bind mount — do not bake it into the image.
       ANSIBLE_PRIVATE_KEY_FILE: /run/secrets/provisioning_key
+      AUTOSCALE_INTERVAL: ${AUTOSCALE_INTERVAL:-300}
+      # Self-heal for stuck pending provisioning tasks.
+      PENDING_RESCUE_INTERVAL: ${PENDING_RESCUE_INTERVAL:-60}
+      PENDING_RESCUE_AGE: ${PENDING_RESCUE_AGE:-60}
+      ANSIBLE_PLAYBOOK_TIMEOUT: ${ANSIBLE_PLAYBOOK_TIMEOUT:-300}
+      RENEWAL_CHECK_INTERVAL: ${RENEWAL_CHECK_INTERVAL:-300}
+      RENEWAL_GRACE_HOURS: ${RENEWAL_GRACE_HOURS:-24}
+      # Stage 2.5 — warm credential pool. Worker tops up each active
+      # node to WARM_POOL_TARGET bundles every WARM_POOL_CHECK_INTERVAL
+      # seconds, capped to WARM_POOL_BATCH_PER_TICK provisions per node
+      # per tick. Set WARM_POOL_ENABLED=0 to fully disable and force
+      # the cold ansible path on every purchase.
+      WARM_POOL_ENABLED: ${WARM_POOL_ENABLED:-1}
+      WARM_POOL_TARGET: ${WARM_POOL_TARGET:-10}
+      WARM_POOL_BATCH_PER_TICK: ${WARM_POOL_BATCH_PER_TICK:-3}
+      WARM_POOL_CHECK_INTERVAL: ${WARM_POOL_CHECK_INTERVAL:-120}
+      WARM_POOL_MAX_CONCURRENT: ${WARM_POOL_MAX_CONCURRENT:-2}
+      # Cold-path throttle — sliding-window cap on warm-pool-miss
+      # activations (migrations/reprovision bypass). Prevents a bot
+      # burst from chaining ansible runs faster than xray tolerates.
+      COLD_PROVISION_MAX_PER_WINDOW: ${COLD_PROVISION_MAX_PER_WINDOW:-5}
+      COLD_PROVISION_WINDOW_SECONDS: ${COLD_PROVISION_WINDOW_SECONDS:-60}
+      # Stage 4 — balance billing. Hourly tick charges due subs and
+      # auto-unfreezes paused ones whose frozen_until lapsed. Tunables
+      # cover the freeze caps, referral bonus and minimum topup.
+      BALANCE_CHARGE_INTERVAL: ${BALANCE_CHARGE_INTERVAL:-3600}
+      FREEZE_DAYS: ${FREEZE_DAYS:-14}
+      REFERRAL_BONUS_KOPECKS: ${REFERRAL_BONUS_KOPECKS:-5000}
+      MIN_TOPUP_KOPECKS: ${MIN_TOPUP_KOPECKS:-10000}
+      EXTRA_DEVICE_KOPECKS_PER_MONTH: ${EXTRA_DEVICE_KOPECKS_PER_MONTH:-10000}
+      # Stage 8 — same SUB_LINK_BASE_URL the backend reads, propagated to
+      # the worker because the warm-pool / migration code paths in
+      # provisioning.py also bake the sub URL into Device.connection_uri
+      # when running off the queue.
+      SUB_LINK_BASE_URL: ${SUB_LINK_BASE_URL:-}
+      LOW_BALANCE_WARN_DAYS: ${LOW_BALANCE_WARN_DAYS:-3}
+      # Phase B — passive xray traffic stats collector. Worker SSHs
+      # into each active node every TRAFFIC_STATS_INTERVAL seconds and
+      # writes per-node uplink/downlink/active_users into
+      # node_traffic_samples. 0 disables the tick.
+      TRAFFIC_STATS_INTERVAL: ${TRAFFIC_STATS_INTERVAL:-300}
+      # Phase C — bot health-ping with consent. Worker queues a
+      # friendly "помогите нам улучшить сервис" prompt to active users
+      # at most once per USER_HEALTH_PING_DEBOUNCE_HOURS, capped at
+      # USER_HEALTH_PING_BATCH per tick. 0 disables the tick.
+      USER_HEALTH_PING_INTERVAL: ${USER_HEALTH_PING_INTERVAL:-1800}
+      USER_HEALTH_PING_BATCH: ${USER_HEALTH_PING_BATCH:-50}
+      USER_HEALTH_PING_DEBOUNCE_HOURS: ${USER_HEALTH_PING_DEBOUNCE_HOURS:-24}
     volumes:
-      # Read-only mount of the provisioning SSH private key. Point SSH_KEY
-      # at the key on the host (e.g. ~/.ssh/vpn_provisioning_ed25519).
-      - ${PROVISIONING_SSH_KEY:-/dev/null}:/run/secrets/provisioning_key:ro
+      - ${PROVISIONING_SSH_KEY:?Set PROVISIONING_SSH_KEY to the host path of the SSH private key}:/run/secrets/provisioning_key:ro
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # Легковесный воркер под периодические тики. Держит RQScheduler fork,
+  # bootstrap'ит 8 тиков с replace=True при старте. Очередь отдельная
+  # (vpn-ticks) — долгий ansible не блокирует self-reschedule цикл, и
+  # зависшая SSH в traffic-stats держит только этот контейнер, который
+  # авто-рестартует по timeout (job_timeout per-tick из TICK_TIMEOUTS).
+  worker-scheduler:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile.worker
+    deploy:
+      replicas: 1
+    environment:
+      <<: *worker-env
+      WORKER_ROLE: "ticks"
+    volumes:
+      - ${PROVISIONING_SSH_KEY:?Set PROVISIONING_SSH_KEY to the host path of the SSH private key}:/run/secrets/provisioning_key:ro
     depends_on:
       db:
         condition: service_healthy
@@ -78,11 +201,14 @@ services:
 
   admin:
     build: ./admin
-    # Bind to loopback only — the public-facing nginx on the host
-    # terminates TLS and proxies /admin/ here. Nothing should touch the
-    # admin container directly from the public internet.
     ports:
       - "127.0.0.1:8080:80"
+    restart: unless-stopped
+
+  webapp:
+    build: ./webapp
+    ports:
+      - "127.0.0.1:8082:80"
     restart: unless-stopped
 
   bot:
@@ -92,6 +218,53 @@ services:
       BACKEND_URL: "http://backend:8000"
       ADMIN_API_TOKEN: ${ADMIN_API_TOKEN}
       ADMIN_IDS: ${ADMIN_IDS}
+      PAYMENT_PROVIDER: ${PAYMENT_PROVIDER:-cryptobot}
+      # Stage 9a: comma-separated rotation pool. If set, the backend
+      # picks one provider per checkout (random). Falls back to
+      # PAYMENT_PROVIDER above when unset.
+      PAYMENT_PROVIDERS: ${PAYMENT_PROVIDERS:-}
+      TELEGRAM_STARS_WEBHOOK_SECRET: ${TELEGRAM_STARS_WEBHOOK_SECRET:-}
+      SUB_LINK_BASE_URL: ${SUB_LINK_BASE_URL:-}
+      WEBAPP_BASE_URL: ${WEBAPP_BASE_URL:-}
+      NOTIFICATION_POLL_INTERVAL: ${NOTIFICATION_POLL_INTERVAL:-10}
+      # #62 — webhook mode port. >0 switches from polling to an internal
+      # aiohttp server that receives forwarded updates from the backend.
+      BOT_WEBHOOK_PORT: ${BOT_WEBHOOK_PORT:-0}
+    depends_on:
+      - backend
+    restart: unless-stopped
+
+  # ────────────────────────────────────────────────────────────────
+  # Probe agent — observes every VPN node from this host's vantage
+  # point (EU datacenter). Co-located with the backend on nl-web for
+  # the MVP signal: catches "node is physically dead from outside RU"
+  # cases that passive client telemetry would only see with delay.
+  # Talks to the backend over the internal Docker network — the
+  # PROBE_AGENT_TOKEN never leaves this host.
+  #
+  # NOT a substitute for in-RU observation: a DC vantage point cannot
+  # see RKN edge blocking that hits residential ISPs. That signal
+  # comes from passive user telemetry (xray stats trend + bot ping).
+  #
+  # First-time setup: mint a scoped token via the admin API,
+  #   curl -sS -X POST \
+  #     -H "X-Admin-Token: $ADMIN_API_TOKEN" \
+  #     -H "Content-Type: application/json" \
+  #     -d '{"name":"probe-nl-web","scopes":["probe:read","probe:write"]}' \
+  #     http://127.0.0.1:8000/api/api-tokens
+  # copy the returned `token` field into .env as PROBE_AGENT_TOKEN.
+  # ────────────────────────────────────────────────────────────────
+  probe-agent:
+    build: ./probes
+    environment:
+      BACKEND_URL: "http://backend:8000"
+      BACKEND_TOKEN: ${PROBE_AGENT_TOKEN}
+      SOURCE_REGION: ${PROBE_AGENT_REGION:-eu-nl}
+      SOURCE_KIND: datacenter
+      PROBE_INTERVAL: ${PROBE_AGENT_INTERVAL:-60}
+      PROBE_TIMEOUT: ${PROBE_AGENT_TIMEOUT:-5}
+      PROBE_CONCURRENCY: ${PROBE_AGENT_CONCURRENCY:-16}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
     depends_on:
       - backend
     restart: unless-stopped

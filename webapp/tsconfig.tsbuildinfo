@@ -1,0 +1,1 @@
+{"root":["./src/App.tsx","./src/api.ts","./src/errors.ts","./src/main.tsx","./src/router.ts","./src/telegram.ts","./src/pages/CheckoutPending.tsx","./src/pages/Help.tsx","./src/pages/History.tsx","./src/pages/Home.tsx","./src/pages/Plans.tsx"],"version":"5.9.3"}

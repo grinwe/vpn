@@ -8,3 +8,9 @@ dist/
 build/
 .venv/
 venv/
+infra/ansible/group_vars/web/vault*
+.gitnexus
+.claude/
+.codegraph/
+AGENTS.md
+CLAUDE.md

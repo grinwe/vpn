@@ -1,0 +1,18 @@
+---
+# Stage E of the relay architecture (docs/RELAY_ROADMAP.md).
+#
+# Installs WireGuard server on a foreign (non-RU) exit node and
+# re-renders /etc/wireguard/wg0.conf with the current peer list. The
+# role is idempotent: used both for first-time bootstrap (empty peers)
+# and for every subsequent peer-list change.
+#
+# Required extra vars (built by services/provisioning._collect_exit_extra_vars):
+#   wg_exit_private_key   — exit's server private key (decrypted)
+#   wg_exit_peers         — list of {name, public_key, allowed_ips_v4}
+#   wg_exit_port          — listen port (optional, default 51820)
+#   wg_exit_address_v4    — interface CIDR (optional, default 10.77.0.1/24)
+
+- hosts: wg_exit_nodes
+  become: yes
+  roles:
+    - wg_exit_node

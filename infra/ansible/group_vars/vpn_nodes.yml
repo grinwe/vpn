@@ -6,8 +6,21 @@ firewall_allowed_ports:
   - 443
   - 8443
   - 9443
-# REQUIRED: Replace with your actual SSH public key
+# Публичные ключи, которые роль bootstrap_node прописывает в
+# /root/.ssh/authorized_keys на каждой VPN-ноде. Обязательно должен
+# быть ключ бэкенда (provisioning@grinwer) — иначе после ротации
+# authorized_keys вручную или пере-заливки ноды мы потеряем доступ
+# и ansible-прогон обратно её поднять не сможет.
 ssh_public_keys:
-  - "ssh-ed25519 AAAA... your_key"
+  - "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIE8IrzyHuBdSXDnBCE9XthETlDDrD4nsOqeubIt6oMkS provisioning@grinwer"
 domain_mask: "www.cloudflare.com"
 vless_enabled: true
+
+# Sharing enforcer daemon на ноде (install_sharing_enforcer role).
+# Отключён 2026-04-15: v2 enforcer рвал коннект легитимным юзерам
+# (телефон+ноут под CGNAT = "concurrent IP") циклом rmuser→sleep→adduser
+# раз в KICK_COOLDOWN (120s), в UX это воспринималось как разрывы
+# каждые 5-10 минут. До перетюнинга порогов оставляем false.
+# Роль по-прежнему ставит бинарь + unit-файл, но systemd unit будет
+# stopped + disabled.
+sharing_enforcer_enabled: false

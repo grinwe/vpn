@@ -1,20 +1,72 @@
 ---
-- name: Wait for expected ports
+# Node health probe.
+#
+# The old layout called wait_for as the first task; a timeout there
+# aborted the play before any diagnostics were collected, leaving the
+# operator with "Timeout waiting for 127.0.0.1:443" and nothing else.
+# That is useless when debugging a node that silently refuses to bind
+# — you need ss/systemctl output to see *why*.
+#
+# New layout:
+#   1. Always gather ss, systemctl, and recent journal lines for the
+#      relevant services.
+#   2. Show them unconditionally (debug task).
+#   3. Only then assert the expected ports are listening — and if the
+#      assertion fails, the full diagnostic dump is already in the
+#      playbook output above the failure line.
+- name: Probe expected ports (non-fatal)
   wait_for:
     port: "{{ item }}"
     timeout: 10
-  loop: "{{ vpn_health_ports | default([443,8443,9443]) }}"
+  loop: "{{ vpn_health_ports | default([443, 8443, 9443]) }}"
+  register: port_probe
+  failed_when: false
 
-- name: Check running services
-  # set -o pipefail so ``ss`` failing doesn't get silently masked by
-  # ``grep`` succeeding on empty input. Still ``|| true`` because an
-  # empty match is a legitimate "no relevant service" outcome.
-  shell: "set -o pipefail; ss -tulpn | grep -E 'xray|shadowsocks' || true"
+- name: Gather listening sockets
+  shell: "ss -tulpn || true"
   args:
     executable: /bin/bash
-  register: service_status
+  register: ss_output
   changed_when: false
 
-- name: Show service status
+- name: Gather systemd unit status
+  shell: |
+    for svc in xray shadow-tls ssserver hysteria-server; do
+      if systemctl list-unit-files "${svc}.service" 2>/dev/null | grep -q "${svc}.service"; then
+        echo "=== ${svc} ==="
+        systemctl status "${svc}" --no-pager --lines=0 2>&1 || true
+        echo "---- recent journal ----"
+        journalctl -u "${svc}" --no-pager -n 20 2>&1 || true
+        echo
+      fi
+    done
+  args:
+    executable: /bin/bash
+  register: systemd_diag
+  changed_when: false
+
+- name: Show listening sockets
   debug:
-    var: service_status.stdout_lines
+    var: ss_output.stdout_lines
+
+- name: Show service diagnostics
+  debug:
+    var: systemd_diag.stdout_lines
+
+- name: Fail if any expected port is not listening
+  # Build a list of ports whose wait_for failed, then assert it is
+  # empty. This runs LAST so that the debug output above is always
+  # visible even when the node isn't healthy.
+  assert:
+    that:
+      - port_probe.results | selectattr('failed', 'defined')
+                          | selectattr('failed')
+                          | list | length == 0
+    fail_msg: >-
+      Expected ports did not open in time:
+      {{ port_probe.results | selectattr('failed', 'defined')
+                           | selectattr('failed')
+                           | map(attribute='item') | list }}.
+      See the "Show listening sockets" and "Show service diagnostics"
+      output above for the reason — usually a crashed systemd unit,
+      a config.json the service refused to load, or a port conflict.

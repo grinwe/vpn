@@ -11,6 +11,9 @@ deploy_web_frontend_letsencrypt_email: ""
 # publishes 127.0.0.1:8000 via compose port mapping.
 deploy_web_frontend_admin_upstream: "127.0.0.1:8080"
 deploy_web_frontend_api_upstream: "127.0.0.1:8000"
+# Telegram WebApp SPA container — published on 127.0.0.1:8082 by compose
+# (8081 is taken by mediscribe-telegram-bot-api on the shared VPS).
+deploy_web_frontend_webapp_upstream: "127.0.0.1:8082"
 
 # nginx vhost file name under /etc/nginx/sites-available.
 deploy_web_frontend_site_name: "grinwer"
@@ -19,3 +22,34 @@ deploy_web_frontend_site_name: "grinwer"
 # run. Useful to set to false on first bootstrap if you want to install
 # nginx and eyeball the HTTP vhost before going through the ACME dance.
 deploy_web_frontend_request_cert: true
+
+# ── Cloudflare / DNS-01 challenge ────────────────────────────────────
+#
+# The domain sits behind Cloudflare's proxy (orange cloud), so the
+# nginx-plugin http-01 challenge is flaky — CF may intercept
+# ``/.well-known/acme-challenge/`` or terminate TLS on its side with a
+# mismatched cert. DNS-01 bypasses all of that: certbot asks the CF API
+# to write a TXT record for ``_acme-challenge.<domain>``, waits for
+# propagation, then Let's Encrypt validates against authoritative NS.
+# Works the same for wildcard certs if we ever need them.
+deploy_web_frontend_use_dns_challenge: true
+
+# Cloudflare API token with ``Zone → DNS → Edit`` on the target zone.
+# Pulled from the vault — the role refuses to run if DNS challenge is
+# enabled and this is empty.
+deploy_web_frontend_cloudflare_api_token: ""
+
+# Seconds to wait for the TXT record to propagate before Let's Encrypt
+# queries it. 30s is comfortable for CF; bump if you see validation
+# failures with "DNS problem: NXDOMAIN".
+deploy_web_frontend_dns_propagation_seconds: 30
+
+# Where the certbot-dns-cloudflare credentials file lands on the target.
+# mode 0600, root:root — contains the API token in plaintext.
+deploy_web_frontend_cloudflare_credentials_path: "/etc/letsencrypt/cloudflare.ini"
+
+# Whether to trust Cloudflare's edge IPs as proxies and pull the real
+# client IP from the ``CF-Connecting-IP`` header. Turn off if you ever
+# move the site off CF — otherwise clients could spoof their IP by
+# sending a fake header.
+deploy_web_frontend_trust_cloudflare: true

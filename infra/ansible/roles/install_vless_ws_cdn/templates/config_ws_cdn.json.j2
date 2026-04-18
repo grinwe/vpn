@@ -1,0 +1,96 @@
+{% set _fan_out = xray_relay_outbounds | default([]) %}
+{% set _primary = xray_primary_interface | default('') %}
+{
+  "log": {
+    "loglevel": "info",
+    "access": "/var/log/xray/access-ws-cdn.log"
+  },
+  "api": {
+    "tag": "api",
+    "services": ["StatsService"]
+  },
+  "stats": {},
+  "policy": {
+    "levels": {
+      "0": {
+        "statsUserUplink": true,
+        "statsUserDownlink": true
+      }
+    },
+    "system": {
+      "statsInboundUplink": true,
+      "statsInboundDownlink": true
+    }
+  },
+  "routing": {
+    "rules": [
+      {
+        "type": "field",
+        "inboundTag": ["api-in"],
+        "outboundTag": "api"
+      }{% for _rule in _fan_out if _rule.emails %},
+      {
+        "type": "field",
+        "user": {{ _rule.emails | to_json }},
+        "outboundTag": "direct-{{ _rule.interface }}"
+      }{% endfor %}
+    ]
+  },
+  "inbounds": [
+    {
+      "tag": "api-in",
+      "listen": "127.0.0.1",
+      "port": {{ vless_ws_cdn_api_port | default(10086) }},
+      "protocol": "dokodemo-door",
+      "settings": {
+        "address": "127.0.0.1"
+      }
+    },
+    {
+      "tag": "vless-ws-cdn",
+      "listen": "0.0.0.0",
+      "port": {{ vless_ws_cdn_port | int }},
+      "protocol": "vless",
+      "settings": {
+        "clients": {{ vless_ws_cdn_existing_clients | default([]) | to_json }},
+        "decryption": "none"
+      },
+      "streamSettings": {
+        "network": "ws",
+        "wsSettings": {
+          "path": "{{ vless_ws_cdn_path }}"
+        }
+      },
+      "sniffing": {
+        "enabled": true,
+        "destOverride": ["http", "tls"]
+      }
+    }
+  ],
+  "outbounds": [
+    {
+      "protocol": "freedom",
+      "tag": "direct"{% if _primary %},
+      "streamSettings": {
+        "sockopt": {
+          "interface": "{{ _primary }}",
+          "tcpKeepAliveInterval": 30
+        }
+      }{% endif %}
+    }{% for _ob in _fan_out %},
+    {
+      "protocol": "freedom",
+      "tag": "direct-{{ _ob.interface }}",
+      "streamSettings": {
+        "sockopt": {
+          "interface": "{{ _ob.interface }}",
+          "tcpKeepAliveInterval": 30
+        }
+      }
+    }{% endfor %},
+    {
+      "protocol": "blackhole",
+      "tag": "block"
+    }
+  ]
+}

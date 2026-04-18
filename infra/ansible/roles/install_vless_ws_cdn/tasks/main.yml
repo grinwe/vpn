@@ -1,0 +1,169 @@
+---
+# install_vless_ws_cdn
+#
+# Installs xray-core configured for VLESS+WebSocket inbound, designed
+# to sit behind Cloudflare CDN. TLS termination is handled either by
+# Cloudflare (Full Strict mode with origin cert) or locally with
+# certbot. The WebSocket transport allows Cloudflare to proxy traffic,
+# making the origin IP invisible to TSPU.
+#
+# The role is a no-op unless ``vless_ws_cdn_domain`` is defined.
+
+- name: Stop xray-ws-cdn when VLESS WS+CDN is removed
+  systemd:
+    name: xray-ws-cdn
+    state: stopped
+    enabled: no
+  when: vless_ws_cdn_domain is not defined or vless_ws_cdn_domain | length == 0
+  failed_when: false
+
+- name: Skip role when VLESS WS+CDN is not configured
+  meta: end_role
+  when: vless_ws_cdn_domain is not defined or vless_ws_cdn_domain | length == 0
+
+- name: Require WS+CDN config variables
+  assert:
+    that:
+      - vless_ws_cdn_domain is defined and vless_ws_cdn_domain | length > 0
+      - vless_ws_cdn_port is defined
+      - vless_ws_cdn_path is defined and vless_ws_cdn_path | length > 0
+    fail_msg: >-
+      install_vless_ws_cdn requires vless_ws_cdn_domain, vless_ws_cdn_port,
+      and vless_ws_cdn_path.
+
+- name: Ensure dependencies
+  apt:
+    name: [curl, unzip, jq, ca-certificates]
+    state: present
+    update_cache: yes
+
+- name: Install xray-core (idempotent)
+  shell: |
+    set -euo pipefail
+    if command -v xray >/dev/null 2>&1; then
+      echo "xray already installed"
+      exit 0
+    fi
+    bash -c "$(curl -fsSL https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install
+  args:
+    executable: /bin/bash
+  register: xray_ws_install
+  changed_when: "'already installed' not in xray_ws_install.stdout"
+
+# Also in bootstrap_node (the authoritative one). Kept here as a
+# safety net in case bootstrap order changes.
+- name: Ensure xray log directory
+  file:
+    path: /var/log/xray
+    state: directory
+    owner: nobody
+    group: nogroup
+    mode: '0750'
+    recurse: yes
+
+# Directory is shared with install_vless_reality whose xray process
+# runs as nobody:nogroup (upstream xray.service has User=nobody).
+# group=root + mode=0750 would strip traverse permission for nobody
+# and cause "permission denied" on the next reality xray restart.
+- name: Ensure xray config directory
+  file:
+    path: /usr/local/etc/xray
+    state: directory
+    owner: root
+    group: nogroup
+    mode: '0750'
+
+# Preserve clients added dynamically by manage_vless_ws_user.sh across
+# re-runs of this role. Without the slurp+re-inject the template's
+# hardcoded ``clients: []`` would wipe every ws-cdn user on the node on
+# every routine site.yml run — the xhttp and ws_cdn variants are exactly
+# where the "invalid request user id" bug was reproducible, because the
+# original role had no preservation logic at all.
+- name: Check for existing xray ws-cdn config
+  stat:
+    path: /usr/local/etc/xray/config_ws_cdn.json
+  register: vless_ws_cdn_existing_config
+
+- name: Slurp existing xray ws-cdn config
+  slurp:
+    src: /usr/local/etc/xray/config_ws_cdn.json
+  register: vless_ws_cdn_existing_config_raw
+  when: vless_ws_cdn_existing_config.stat.exists
+
+- name: Extract existing vless-ws-cdn clients
+  set_fact:
+    vless_ws_cdn_existing_clients: >-
+      {{
+        (vless_ws_cdn_existing_config_raw.content | b64decode | from_json).inbounds
+        | selectattr('tag', 'equalto', 'vless-ws-cdn')
+        | map(attribute='settings.clients')
+        | list
+        | first
+        | default([])
+      }}
+  when: vless_ws_cdn_existing_config.stat.exists
+  # If the existing file is unparseable (half-written, truncated) we'd
+  # rather fall through to an empty list than abort the whole play —
+  # the backend resync path will re-add users after the render anyway.
+  ignore_errors: true
+
+- name: Default to empty ws-cdn clients list on first bootstrap
+  set_fact:
+    vless_ws_cdn_existing_clients: []
+  when: vless_ws_cdn_existing_clients is not defined
+
+- name: Render xray WS+CDN config
+  template:
+    src: config_ws_cdn.json.j2
+    dest: /usr/local/etc/xray/config_ws_cdn.json
+    owner: root
+    group: root
+    mode: '0640'
+    backup: yes
+  notify: restart xray ws cdn
+
+- name: Install VLESS WS user management helper
+  copy:
+    src: manage_vless_ws_user.sh
+    dest: /usr/local/sbin/manage_vless_ws_user.sh
+    owner: root
+    group: root
+    mode: '0750'
+
+- name: Install xray WS+CDN systemd unit
+  template:
+    src: xray-ws-cdn.service.j2
+    dest: /etc/systemd/system/xray-ws-cdn.service
+    owner: root
+    group: root
+    mode: '0644'
+  notify: restart xray ws cdn
+
+- name: Enable and start xray WS+CDN service
+  systemd:
+    name: xray-ws-cdn
+    enabled: yes
+    state: started
+    daemon_reload: yes
+
+- name: Flush xray-ws-cdn handlers before leaving the role
+  meta: flush_handlers
+
+- name: Check if xray-ws-cdn is actually running
+  command: systemctl is-active xray-ws-cdn
+  register: _xray_ws_cdn_active
+  changed_when: false
+  failed_when: false
+
+- name: Reset xray-ws-cdn failed state
+  command: systemctl reset-failed xray-ws-cdn
+  when: _xray_ws_cdn_active.stdout != 'active'
+  changed_when: false
+  failed_when: false
+
+- name: Force-start xray-ws-cdn after clearing failed state
+  systemd:
+    name: xray-ws-cdn
+    state: restarted
+    daemon_reload: yes
+  when: _xray_ws_cdn_active.stdout != 'active'

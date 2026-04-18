@@ -1,0 +1,7 @@
+---
+# Lightweight health check — runs only the check_node_health role
+# without touching any service configs. Safe to run on a live node.
+- hosts: vpn_nodes
+  become: yes
+  roles:
+    - check_node_health

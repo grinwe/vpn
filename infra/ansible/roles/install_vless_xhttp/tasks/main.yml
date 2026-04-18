@@ -1,0 +1,196 @@
+---
+# install_vless_xhttp
+#
+# Installs xray-core configured for VLESS+XHTTP inbound with TLS.
+# XHTTP multiplexes VPN traffic through standard HTTP requests,
+# bypassing ТСПУ's 16KB curtain that kills raw TLS/TCP tunnels.
+# Requires a valid domain pointing at the server and TLS certs
+# (ACME/certbot or pre-provisioned).
+#
+# The role is a no-op unless ``vless_xhttp_domain`` is defined.
+
+- name: Stop xray-xhttp when VLESS XHTTP is removed
+  systemd:
+    name: xray-xhttp
+    state: stopped
+    enabled: no
+  when: vless_xhttp_domain is not defined or vless_xhttp_domain | length == 0
+  failed_when: false
+
+- name: Skip role when VLESS XHTTP is not configured
+  meta: end_role
+  when: vless_xhttp_domain is not defined or vless_xhttp_domain | length == 0
+
+- name: Require XHTTP config variables
+  assert:
+    that:
+      - vless_xhttp_domain is defined and vless_xhttp_domain | length > 0
+      - vless_xhttp_port is defined
+    fail_msg: >-
+      install_vless_xhttp requires vless_xhttp_domain and vless_xhttp_port.
+
+- name: Ensure dependencies
+  apt:
+    name: [curl, unzip, jq, ca-certificates]
+    state: present
+    update_cache: yes
+
+- name: Install xray-core (idempotent)
+  shell: |
+    set -euo pipefail
+    if command -v xray >/dev/null 2>&1; then
+      echo "xray already installed"
+      exit 0
+    fi
+    bash -c "$(curl -fsSL https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install
+  args:
+    executable: /bin/bash
+  register: xray_xhttp_install
+  changed_when: "'already installed' not in xray_xhttp_install.stdout"
+
+# Also in bootstrap_node (the authoritative one). Kept here as a
+# safety net in case bootstrap order changes.
+- name: Ensure xray log directory
+  file:
+    path: /var/log/xray
+    state: directory
+    owner: nobody
+    group: nogroup
+    mode: '0750'
+    recurse: yes
+
+# Directory is shared with install_vless_reality whose xray process
+# runs as nobody:nogroup (upstream xray.service has User=nobody).
+# group=root + mode=0750 would strip traverse permission for nobody
+# and cause "permission denied" on the next reality xray restart.
+- name: Ensure xray config directory
+  file:
+    path: /usr/local/etc/xray
+    state: directory
+    owner: root
+    group: nogroup
+    mode: '0750'
+
+- name: Obtain TLS certificate via certbot (if no cert path provided)
+  when: (vless_xhttp_cert_path | default('')) == ''
+  block:
+    - name: Install certbot
+      apt:
+        name: [certbot]
+        state: present
+
+    - name: Issue certificate (standalone)
+      command: >-
+        certbot certonly --standalone
+        --non-interactive --agree-tos
+        --email {{ vless_xhttp_acme_email | default('admin@' + vless_xhttp_domain) }}
+        -d {{ vless_xhttp_domain }}
+        --preferred-challenges http
+      args:
+        creates: /etc/letsencrypt/live/{{ vless_xhttp_domain }}/fullchain.pem
+
+    - name: Set cert paths from certbot
+      set_fact:
+        _xhttp_cert_path: /etc/letsencrypt/live/{{ vless_xhttp_domain }}/fullchain.pem
+        _xhttp_key_path: /etc/letsencrypt/live/{{ vless_xhttp_domain }}/privkey.pem
+
+- name: Set cert paths from variables (if provided)
+  when: (vless_xhttp_cert_path | default('')) != ''
+  set_fact:
+    _xhttp_cert_path: "{{ vless_xhttp_cert_path }}"
+    _xhttp_key_path: "{{ vless_xhttp_key_path }}"
+
+# Preserve clients added dynamically by manage_vless_xhttp_user.sh across
+# re-runs of this role. Without the slurp+re-inject the template's
+# hardcoded ``clients: []`` would wipe every xhttp user on the node on
+# every routine site.yml run — the xhttp and ws_cdn variants are exactly
+# where the "invalid request user id" bug was reproducible, because the
+# original role had no preservation logic at all.
+- name: Check for existing xray xhttp config
+  stat:
+    path: /usr/local/etc/xray/config_xhttp.json
+  register: vless_xhttp_existing_config
+
+- name: Slurp existing xray xhttp config
+  slurp:
+    src: /usr/local/etc/xray/config_xhttp.json
+  register: vless_xhttp_existing_config_raw
+  when: vless_xhttp_existing_config.stat.exists
+
+- name: Extract existing vless-xhttp clients
+  set_fact:
+    vless_xhttp_existing_clients: >-
+      {{
+        (vless_xhttp_existing_config_raw.content | b64decode | from_json).inbounds
+        | selectattr('tag', 'equalto', 'vless-xhttp')
+        | map(attribute='settings.clients')
+        | list
+        | first
+        | default([])
+      }}
+  when: vless_xhttp_existing_config.stat.exists
+  # If the existing file is unparseable (half-written, truncated) we'd
+  # rather fall through to an empty list than abort the whole play —
+  # the backend resync path will re-add users after the render anyway.
+  ignore_errors: true
+
+- name: Default to empty xhttp clients list on first bootstrap
+  set_fact:
+    vless_xhttp_existing_clients: []
+  when: vless_xhttp_existing_clients is not defined
+
+- name: Render xray XHTTP config
+  template:
+    src: config_xhttp.json.j2
+    dest: /usr/local/etc/xray/config_xhttp.json
+    owner: root
+    group: root
+    mode: '0640'
+    backup: yes
+  notify: restart xray xhttp
+
+- name: Install VLESS XHTTP user management helper
+  copy:
+    src: manage_vless_xhttp_user.sh
+    dest: /usr/local/sbin/manage_vless_xhttp_user.sh
+    owner: root
+    group: root
+    mode: '0750'
+
+- name: Install xray XHTTP systemd unit
+  template:
+    src: xray-xhttp.service.j2
+    dest: /etc/systemd/system/xray-xhttp.service
+    owner: root
+    group: root
+    mode: '0644'
+  notify: restart xray xhttp
+
+- name: Enable and start xray XHTTP service
+  systemd:
+    name: xray-xhttp
+    enabled: yes
+    state: started
+    daemon_reload: yes
+
+- name: Flush xray-xhttp handlers before leaving the role
+  meta: flush_handlers
+
+- name: Check if xray-xhttp is actually running
+  command: systemctl is-active xray-xhttp
+  register: _xray_xhttp_active
+  changed_when: false
+  failed_when: false
+
+- name: Reset xray-xhttp failed state
+  command: systemctl reset-failed xray-xhttp
+  when: _xray_xhttp_active.stdout != 'active'
+  changed_when: false
+  failed_when: false
+
+- name: Force-start xray-xhttp after clearing failed state
+  systemd:
+    name: xray-xhttp
+    state: restarted
+    daemon_reload: yes
+  when: _xray_xhttp_active.stdout != 'active'

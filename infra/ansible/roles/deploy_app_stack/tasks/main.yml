@@ -11,18 +11,39 @@
       - deploy_app_stack_app_secret_key | default('', true) | length >= 16
       - deploy_app_stack_bot_token | default('', true) | length > 0
       - deploy_app_stack_admin_ids | default('', true) | length > 0
+      - deploy_app_stack_webapp_jwt_secret | default('', true) | length >= 32
     fail_msg: >
       Missing or too-short secret. Check group_vars/*/vault.yml —
       every deploy_app_stack_* secret must be set and non-trivial.
 
-- name: Install docker engine and compose plugin
+# Some hosts already have Docker from a sibling role (e.g. the CDN
+# stack in vpn-setup installs docker-ce + containerd.io from docker.com
+# directly). Installing docker.io on top of that blows up because
+# Ubuntu's containerd package conflicts with containerd.io. So we probe
+# for an existing docker binary first and only install from the distro
+# repo on truly fresh hosts.
+- name: Check if docker is already installed
+  command: docker --version
+  register: _docker_probe
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+- name: Install docker engine and compose plugin (fresh hosts only)
   apt:
     name:
       - docker.io
-      - docker-compose-plugin
+      - docker-compose-v2
       - rsync
     state: present
     update_cache: true
+  when: _docker_probe.rc != 0
+
+- name: Ensure rsync is installed
+  apt:
+    name: rsync
+    state: present
+  when: _docker_probe.rc == 0
 
 - name: Ensure docker service is running
   service:
@@ -63,6 +84,8 @@
       - "--exclude=.pytest_cache"
       - "--exclude=admin/node_modules"
       - "--exclude=admin/dist"
+      - "--exclude=webapp/node_modules"
+      - "--exclude=webapp/dist"
       - "--exclude=backend/.venv"
       - "--exclude=bot/.venv"
       - "--exclude=.env"
@@ -98,7 +121,7 @@
 - name: Build docker images
   # Rebuild only when the synced tree actually changed. Re-running the
   # role against an unchanged repo is then essentially free.
-  command: docker compose build
+  command: docker compose build --no-cache
   args:
     chdir: "{{ deploy_app_stack_dir }}"
   when:
@@ -122,3 +145,29 @@
   retries: 30
   delay: 2
   until: backend_health.status == 200
+
+# ``backend`` having a /healthz endpoint is enough to gate on, but the
+# bot and worker containers have no HTTP surface — so a classic crash
+# loop (wrong config, aiogram API drift, whatever) leaves the playbook
+# green while the process restart-loops forever. Give docker a chance
+# to settle, then refuse to declare success if any of our compose
+# services are in a Restarting state.
+- name: Settle compose (give crash loops time to become visible)
+  pause:
+    seconds: 10
+
+- name: Collect compose service status
+  command: docker compose ps --format '{% raw %}{{.Name}} {{.State}}{% endraw %}'
+  args:
+    chdir: "{{ deploy_app_stack_dir }}"
+  register: compose_ps
+  changed_when: false
+
+- name: Fail if any compose service is restarting or exited
+  assert:
+    that:
+      - "'restarting' not in compose_ps.stdout | lower"
+      - "'exited' not in compose_ps.stdout | lower"
+    fail_msg: |
+      One or more app-stack containers are unhealthy:
+      {{ compose_ps.stdout }}

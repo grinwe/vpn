@@ -1,0 +1,278 @@
+---
+# relay_jump_node
+#
+# Multi-tunnel WireGuard client role for RU VPN relay nodes.
+#
+# Mode "enable" (relay_wg_links non-empty):
+#   - Install wireguard package.
+#   - For each entry in relay_wg_links render
+#     /etc/wireguard/{{item.interface}}.conf + start wg-quick@{{item.interface}}.
+#   - Reconcile drift: remove any /etc/wireguard/wg*.conf not in the list.
+#   - Test connectivity per interface.
+#   - Reconcile Xray configs (G.6): set the ``direct`` outbound's
+#     sockopt to ``xray_primary_interface`` (smallest wgN), and for
+#     each entry in ``xray_relay_outbounds`` install a
+#     ``direct-wgN`` freedom outbound with its own sockopt plus a
+#     routing rule pinning user emails to that outbound. Stale
+#     ``direct-wg*`` outbounds/rules (from a demoted multi-link
+#     relay) are stripped in the same pass.
+#
+# Mode "disable" (relay_wg_links empty or missing):
+#   - Stop + disable every wg-quick@wgN whose config exists.
+#   - Remove /etc/wireguard/wg*.conf.
+#   - Unpatch Xray: strip sockopt from the default ``direct``
+#     outbound and drop every ``direct-wg*`` outbound/rule.
+#
+# The role runs unconditionally from site.yml; gating happens here.
+# Nodes with no relay_exit_links sit in the disable branch (pure no-op
+# on direct nodes that never had a tunnel). See RELAY_ROADMAP.md G.5.
+
+- name: Determine relay mode from relay_wg_links
+  set_fact:
+    relay_enabled: >-
+      {{ (relay_wg_links | default([])) | length > 0 }}
+    relay_wanted_ifaces: >-
+      {{ (relay_wg_links | default([])) | map(attribute='interface') | list }}
+
+# ── ENABLE branch ────────────────────────────────────────────────
+- name: Relay enable — set up WG clients + patch Xray
+  when: relay_enabled | bool
+  block:
+    - name: Install WireGuard
+      apt:
+        name: [wireguard, wireguard-tools]
+        state: present
+        update_cache: yes
+
+    - name: Render WireGuard client config per link
+      template:
+        src: wg-client.conf.j2
+        dest: "/etc/wireguard/{{ item.interface }}.conf"
+        owner: root
+        group: root
+        mode: '0600'
+      loop: "{{ relay_wg_links }}"
+      loop_control:
+        label: "{{ item.interface }}"
+      register: relay_config_render
+
+    - name: Restart wg-quick services whose config changed
+      systemd:
+        name: "wg-quick@{{ item.item.interface }}"
+        state: restarted
+        daemon_reload: yes
+      loop: "{{ relay_config_render.results }}"
+      loop_control:
+        label: "{{ item.item.interface }}"
+      when: item.changed
+
+    - name: Enable and start WireGuard client per link
+      systemd:
+        name: "wg-quick@{{ item.interface }}"
+        enabled: yes
+        state: started
+      loop: "{{ relay_wg_links }}"
+      loop_control:
+        label: "{{ item.interface }}"
+
+    # Advisory per-link connectivity check. До этого curl валил всю
+    # таску если ХОТЬ ОДИН линк не хэндшейкался — то есть один
+    # сломанный старый туннель блокировал admin-операции по всем
+    # остальным парам (attach новой ноды, switch юзера между exit'ами,
+    # reconnect другого линка). Теперь сбой curl'а логируем, но play
+    # не рушим: out-of-band health tick (services/relay_link_health.py)
+    # в бэкенде раз в 5 минут фиксирует latest-handshake по каждому
+    # peer и красит индикатор в админке, так что «жив ли туннель»
+    # видно без этого синхронного теста.
+    - name: Test tunnel connectivity per link (advisory)
+      command: curl -s --interface {{ item.interface }} --connect-timeout 5 https://ifconfig.me
+      loop: "{{ relay_wg_links }}"
+      loop_control:
+        label: "{{ item.interface }}"
+      register: tunnel_test
+      changed_when: false
+      failed_when: false
+      retries: 3
+      delay: 5
+      until: tunnel_test.rc == 0
+
+    - name: Report tunnel status per link
+      debug:
+        msg: >-
+          WG {{ item.item.interface }}
+          {% if item.rc == 0 %}UP — exit IP: {{ item.stdout }}
+          {% else %}DOWN (curl rc={{ item.rc }}) — см. health-индикатор в админке
+          {% endif %}
+      loop: "{{ tunnel_test.results }}"
+      loop_control:
+        label: "{{ item.item.interface }}"
+
+    # ── Drift reconciliation ──
+    # A relay may have had wg0+wg1, then wg1 got detached. The DB no
+    # longer lists wg1 in relay_wg_links, but the config file + systemd
+    # unit are still there. Enumerate existing configs and kill any
+    # that aren't wanted.
+    - name: Enumerate existing WG configs
+      find:
+        paths: /etc/wireguard
+        patterns: "wg*.conf"
+      register: existing_wg_configs
+
+    - name: Stop and disable stale wg-quick units
+      systemd:
+        name: "wg-quick@{{ (item.path | basename | splitext)[0] }}"
+        state: stopped
+        enabled: no
+      failed_when: false
+      loop: "{{ existing_wg_configs.files }}"
+      loop_control:
+        label: "{{ (item.path | basename | splitext)[0] }}"
+      when: (item.path | basename | splitext)[0] not in relay_wanted_ifaces
+
+    - name: Remove stale WG config files
+      file:
+        path: "{{ item.path }}"
+        state: absent
+      loop: "{{ existing_wg_configs.files }}"
+      loop_control:
+        label: "{{ item.path | basename }}"
+      when: (item.path | basename | splitext)[0] not in relay_wanted_ifaces
+
+    # ── Xray reconciliation ──
+    # G.6: a single jq program brings every xray config*.json into
+    # the state the backend asked for — independent of whether this
+    # is a single- or multi-link relay. Inputs:
+    #
+    #   * xray_primary_interface — sets streamSettings.sockopt on the
+    #     default ``direct`` outbound so unmatched UUIDs still egress
+    #     via tunnel (on single-link relays this IS the tunnel;
+    #     on multi-link it's the smallest wgN used as fallback).
+    #   * xray_relay_outbounds   — list of {interface, emails} that
+    #     drives the per-link ``direct-wgN`` freedom outbounds plus
+    #     matching routing rules. Empty on single-link: we add no
+    #     extra outbounds and strip any stale ones left from a prior
+    #     multi-link state (relay demoted back to one link).
+    #
+    # The jq program is idempotent: unchanged file → same bytes out,
+    # so ansible's changed_when compares hashes and skips reload.
+    - name: Find existing xray configs
+      find:
+        paths: /usr/local/etc/xray
+        patterns: "config*.json"
+      register: xray_configs_enable
+
+    # Stage the jq program + shell driver on the target. Both live as
+    # plain files in files/ to dodge an Ansible 2.17 parser bug: its
+    # argument splitter treats jq's curly braces and bash brace-groups
+    # as unbalanced Jinja2 blocks and refuses to load the task if
+    # either appears inside a shell module body. Keeping the jq DSL
+    # and the bash wrapper out of tasks/main.yml entirely means the
+    # invocation here is just `command: /tmp/reconcile_xray.sh ...`
+    # — no jinja interaction, no brace ambiguity.
+    - name: Stage jq reconcile program
+      copy:
+        src: xray_reconcile.jq
+        dest: /tmp/xray_reconcile.jq
+        owner: root
+        group: root
+        mode: '0644'
+
+    - name: Stage reconcile shell driver
+      copy:
+        src: reconcile_xray.sh
+        dest: /tmp/reconcile_xray.sh
+        owner: root
+        group: root
+        mode: '0755'
+
+    - name: Reconcile Xray outbounds + routing rules
+      command: /tmp/reconcile_xray.sh "{{ item.path }}"
+      environment:
+        FAN_OUT: "{{ xray_relay_outbounds | default([]) | to_json }}"
+        PRIMARY: "{{ xray_primary_interface | default('') }}"
+      loop: "{{ xray_configs_enable.files | default([]) }}"
+      loop_control:
+        label: "{{ item.path | basename }}"
+      register: patch_result
+      changed_when: patch_result.rc == 0
+      failed_when: patch_result.rc not in [0, 78]
+      notify: restart all xray services
+
+    - name: Find hysteria2 config
+      stat:
+        path: /etc/hysteria/config.yaml
+      register: hy2_config
+
+    # Hysteria2 is UDP and typically not blocked — it keeps exiting
+    # directly. Moving it onto a tunnel would need policy routing.
+    - name: Note about Hysteria2 on relay nodes
+      debug:
+        msg: >-
+          Hysteria2 traffic exits directly (not through WG tunnel).
+      when: hy2_config.stat.exists
+
+# ── DISABLE branch ───────────────────────────────────────────────
+- name: Relay disable — tear every tunnel down + unpatch Xray
+  when: not (relay_enabled | bool)
+  block:
+    - name: Enumerate WG configs for teardown
+      find:
+        paths: /etc/wireguard
+        patterns: "wg*.conf"
+      register: wg_configs_teardown
+
+    - name: Stop and disable each wg-quick unit
+      systemd:
+        name: "wg-quick@{{ (item.path | basename | splitext)[0] }}"
+        state: stopped
+        enabled: no
+      failed_when: false
+      loop: "{{ wg_configs_teardown.files }}"
+      loop_control:
+        label: "{{ (item.path | basename | splitext)[0] }}"
+
+    - name: Remove wg client configs
+      file:
+        path: "{{ item.path }}"
+        state: absent
+      loop: "{{ wg_configs_teardown.files }}"
+      loop_control:
+        label: "{{ item.path | basename }}"
+
+    - name: Find existing xray configs (disable mode)
+      find:
+        paths: /usr/local/etc/xray
+        patterns: "config*.json"
+      register: xray_configs_disable
+
+    - name: Stage jq unpatch program
+      copy:
+        src: xray_unpatch.jq
+        dest: /tmp/xray_unpatch.jq
+        owner: root
+        group: root
+        mode: '0644'
+
+    - name: Stage unpatch shell driver
+      copy:
+        src: unpatch_xray.sh
+        dest: /tmp/unpatch_xray.sh
+        owner: root
+        group: root
+        mode: '0755'
+
+    - name: Unpatch sockopt + strip fan-out from Xray configs
+      # G.6: in addition to stripping direct's sockopt, also drop any
+      # ``direct-wg*`` outbounds and routing rules left over from a
+      # multi-link state. Full teardown path: relay previously had
+      # wg0+wg1, admin detached both — we want the config back to
+      # "direct + block" with no sockopt. Same shell-script pattern
+      # as the enable branch — see the comment on the reconcile task.
+      command: /tmp/unpatch_xray.sh "{{ item.path }}"
+      loop: "{{ xray_configs_disable.files }}"
+      loop_control:
+        label: "{{ item.path | basename }}"
+      register: unpatch_result
+      changed_when: unpatch_result.rc == 0
+      failed_when: unpatch_result.rc not in [0, 78]
+      notify: restart all xray services

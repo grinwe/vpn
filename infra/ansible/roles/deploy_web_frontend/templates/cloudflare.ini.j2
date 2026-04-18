@@ -1,0 +1,7 @@
+# {{ ansible_managed }}
+#
+# certbot-dns-cloudflare credentials. Used by the DNS-01 challenge to
+# write the ``_acme-challenge.<domain>`` TXT record during certificate
+# issuance and renewal. Must be mode 0600 root:root — certbot refuses
+# to use world-readable credentials.
+dns_cloudflare_api_token = {{ deploy_web_frontend_cloudflare_api_token }}

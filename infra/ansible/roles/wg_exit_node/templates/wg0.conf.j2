@@ -1,0 +1,11 @@
+[Interface]
+PrivateKey = {{ wg_exit_private_key }}
+Address = {{ wg_exit_address_v4 | default('10.77.0.1/24') }}
+ListenPort = {{ wg_exit_port | default(51820) }}
+
+{% for peer in wg_exit_peers %}
+[Peer]
+# {{ peer.name }}
+PublicKey = {{ peer.public_key }}
+AllowedIPs = {{ peer.allowed_ips_v4 }}
+{% endfor %}

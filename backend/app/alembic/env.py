@@ -10,7 +10,7 @@ import os
 from logging.config import fileConfig
 
 from alembic import context
-from sqlalchemy import engine_from_config, pool
+from sqlalchemy import engine_from_config, pool, text
 
 from app.db import Base  # noqa: F401 — imported for metadata side-effects
 from app import models  # noqa: F401 — register all models on Base.metadata
@@ -47,6 +47,20 @@ def run_migrations_online() -> None:
         poolclass=pool.NullPool,
     )
     with connectable.connect() as connection:
+        # Alembic's default alembic_version.version_num column is
+        # VARCHAR(32), but our revision IDs are descriptive and longer
+        # (e.g. ``0004_payment_nullable_subscription`` = 35 chars). Create
+        # the bookkeeping table up front with a roomier column so fresh
+        # databases don't blow up the first time we stamp a revision.
+        connection.execute(
+            text(
+                "CREATE TABLE IF NOT EXISTS alembic_version ("
+                "version_num VARCHAR(128) NOT NULL, "
+                "CONSTRAINT alembic_version_pkc PRIMARY KEY (version_num)"
+                ")"
+            )
+        )
+        connection.commit()
         context.configure(
             connection=connection,
             target_metadata=target_metadata,

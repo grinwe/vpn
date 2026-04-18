@@ -115,6 +115,31 @@ def make_subscription(
     return sub
 
 
+def make_subscription_with_device(
+    db: Session,
+    user: models.User,
+    plan: models.Plan,
+    node: models.VPNNode,
+    *,
+    access_username: str | None = None,
+) -> models.Subscription:
+    """Stage 7 helper: a sub plus one active Device, since capacity
+    bookkeeping is now per-device. Reuses the first config on the node
+    or makes a fresh one if the node has none yet."""
+    sub = make_subscription(db, user, plan, node)
+    cfg = next(iter(node.configs), None) if node.configs else None
+    if cfg is None:
+        cfg = make_config(db, node)
+    make_device(
+        db,
+        sub,
+        cfg,
+        access_username=access_username or f"user-{user.id}-{sub.id}",
+    )
+    db.refresh(sub)
+    return sub
+
+
 def make_device(
     db: Session,
     sub: models.Subscription,

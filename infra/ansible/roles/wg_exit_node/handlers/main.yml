@@ -1,0 +1,15 @@
+---
+# syncconf wg0 переехал в tasks/main.yml: handler-based version
+# не стрелял, когда параллельная bootstrap_exit таска уже рендерила
+# тот же wg0.conf (template ok=unchanged → handler skipped), из-за
+# чего running state WG мог отстать от disk.
+
+- name: persist iptables
+  shell: |
+    if command -v netfilter-persistent >/dev/null 2>&1; then
+      netfilter-persistent save
+    elif command -v iptables-save >/dev/null 2>&1; then
+      iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
+    fi
+  args:
+    executable: /bin/bash
