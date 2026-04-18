@@ -1378,3 +1378,65 @@ def migrate_node_to_target_route(
         device_task_ids=device_task_ids,
         resync_task_ids=resync_task_ids,
     )
+
+
+@router.post("/nodes/ssh/ping/refresh", status_code=200)
+def refresh_traffic_stats_tick(
+    admin_token: str = Depends(require_admin),
+):
+    """Форс-прогон traffic_stats тика прямо сейчас.
+
+    Симметрично ``POST /exits/links/health/refresh`` для relay-link
+    health: админка зовёт эту ручку если в таблице нод колонка
+    ``SSH · обновлено`` показывает 10+ минут у кого-то и не понятно,
+    тик ли умер или конкретная нода недоступна. Один клик — tick
+    сразу ставится в очередь, воркер SSH'ит на все active/draining
+    ноды, каждая успешная читается как строка в
+    ``node_traffic_samples`` (а ``last_ssh_at`` = max(observed_at)
+    в ответе list_nodes). Если после 20 сек у ноды всё ещё старый
+    ``observed_at`` — значит SSH или Xray API именно у неё сломаны,
+    а не воркер.
+
+    SSH-ключ смонтирован только в worker-контейнер, поэтому здесь
+    inline не собираем — только enqueue через RQ на тот же
+    deterministic ``tick-traffic-stats`` job_id, что и периодический
+    scheduler из worker.main. Каскада копий не будет: если тик уже
+    крутится — вернём его id без нового enqueue; если в scheduled —
+    снимаем и кладём без delay, чтобы воркер подхватил сразу.
+
+    Response identical to ``refresh_relay_link_health``:
+      * ``enqueued=true`` + ``job_id`` — tick в очереди, обновляй
+        список нод через 15–30 сек;
+      * ``enqueued=false`` — Redis недоступен, индикаторы не
+        обновятся пока очередь не поднимется.
+    """
+    from ..queue import RESULT_TTL, TICK_IDS, get_queue
+    from rq.exceptions import NoSuchJobError
+    from rq.job import Job
+    from rq.registry import StartedJobRegistry
+
+    queue = get_queue()
+    if queue is None:
+        return {"enqueued": False, "reason": "queue unavailable"}
+
+    tick_id = TICK_IDS["app.worker.run_traffic_stats_tick"]
+
+    try:
+        StartedJobRegistry(queue=queue).cleanup()
+    except Exception:  # noqa: BLE001
+        pass
+
+    try:
+        existing = Job.fetch(tick_id, connection=queue.connection)
+        if existing.get_status(refresh=True) == "started":
+            return {"enqueued": True, "job_id": existing.id, "note": "already running"}
+        existing.delete()
+    except NoSuchJobError:
+        pass
+
+    job = queue.enqueue(
+        "app.worker.run_traffic_stats_tick",
+        job_id=tick_id,
+        result_ttl=RESULT_TTL,
+    )
+    return {"enqueued": True, "job_id": job.id}

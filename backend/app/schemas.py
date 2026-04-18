@@ -344,6 +344,26 @@ class NodeBulkMigrateOut(BaseModel):
     resync_task_ids: list[int] = Field(default_factory=list)
 
 
+class ExitEvacuateOut(BaseModel):
+    """Результат массового переезда подписок с exit A на exit B.
+
+    В отличие от node-миграции, тут меняется только ``Credential.exit_id``
+    и гоняется один relay_tunnel apply на каждый уникальный relay, где
+    жили evacuated сабы. Сабы сами остаются на тех же relay-нодах.
+
+    ``failed_relays`` содержит те relay'и, к которым не прикреплён
+    target exit — их сабы не переехали, админ должен сначала прикрепить
+    exit или выбрать другой target.
+    """
+    from_exit_id: int
+    to_exit_id: int
+    considered_count: int
+    migrated: list[int] = Field(default_factory=list)
+    failed: list[NodeBulkMigrateFailure] = Field(default_factory=list)
+    task_ids: list[int] = Field(default_factory=list)
+    failed_relays: list[int] = Field(default_factory=list)
+
+
 class DisableRequest(BaseModel):
     reason: str | None = None
 

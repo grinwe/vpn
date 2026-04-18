@@ -642,6 +642,32 @@ export default function Nodes() {
     onError: (e: Error) => alert(`Ошибка: ${e.message}`),
   });
 
+  // Форс-прогон tick-traffic-stats: воркер SSH'ит на все
+  // active/draining ноды, пишет NodeTrafficSample — после этого
+  // list_nodes увидит свежий max(observed_at) и колонка "SSH ·
+  // обновлено" перестанет быть мёртвой. Нужен если scheduler
+  // раскис (redis restart, воркер лёг) и автоматический 5-мин
+  // тик не догоняет; обычно с ним ничего делать не нужно.
+  const refreshSshMut = useMutation({
+    mutationFn: () =>
+      api.post<{
+        enqueued: boolean;
+        job_id?: string;
+        reason?: string;
+        note?: string;
+      }>(`/nodes/ssh/ping/refresh`),
+    onSuccess: (res) => {
+      if (!res.enqueued) {
+        alert(`Не удалось запустить: ${res.reason ?? "очередь недоступна"}`);
+        return;
+      }
+      setTimeout(() => {
+        qc.invalidateQueries({ queryKey: ["nodes"] });
+      }, 20_000);
+    },
+    onError: (e: Error) => alert(`Ошибка: ${e.message}`),
+  });
+
   const { data, isLoading, error, refetch, isFetching } = useQuery<VPNNodeOut[]>({
     queryKey: ["nodes"],
     queryFn: () => api.get("/nodes"),
@@ -688,6 +714,14 @@ export default function Nodes() {
       <div className="flex items-center justify-between mb-4">
         <h1 className="text-2xl font-semibold">Nodes</h1>
         <div className="flex gap-2">
+          <button
+            disabled={refreshSshMut.isPending}
+            onClick={() => refreshSshMut.mutate()}
+            title="Форс-прогнать traffic_stats тик — воркер SSH'нет на все active/draining ноды и запишет observed_at. Обновит колонку SSH через 15–30 сек. Нужно если автоматический 5-мин scheduler раскис."
+            className="text-sm px-3 py-1.5 rounded bg-slate-700 hover:bg-slate-600 disabled:opacity-50"
+          >
+            {refreshSshMut.isPending ? "Пингуем…" : "↻ SSH-пинг всех"}
+          </button>
           <button
             disabled={refreshAllHealthMut.isPending}
             onClick={() => refreshAllHealthMut.mutate()}

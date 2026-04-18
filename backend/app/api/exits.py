@@ -899,3 +899,174 @@ def refresh_relay_link_health(
         result_ttl=RESULT_TTL,
     )
     return {"enqueued": True, "job_id": job.id}
+
+
+@router.post(
+    "/exits/{from_id}/evacuate-to/{to_id}",
+    response_model=schemas.ExitEvacuateOut,
+)
+def evacuate_exit_to(
+    from_id: int,
+    to_id: int,
+    db: Session = Depends(get_db),
+    admin_token: str = Depends(require_admin),
+    admin_actor: str | None = Header(default=None, alias=ADMIN_ACTOR_HEADER),
+):
+    """Переселить все активные подписки с exit A на exit B.
+
+    Аналог ``POST /nodes/{from}/migrate-to/{to}``, но на уровне exit:
+    сами сабы остаются на своих relay-нодах, меняется только outbound —
+    ``Credential.exit_id`` с ``from_id`` на ``to_id`` и relay_tunnel_apply
+    на затронутых relay перегенерирует routing rules в xray. Используется
+    когда foreign exit A залочили / он умер / уезжаем на другого провайдера:
+    один клик вместо ручного per-sub switch-exit на десятки подписок.
+
+    **Prerequisite**: target exit должен быть уже прикреплён к relay'ям,
+    на которых живут evacuated-сабы (``RelayExitLink`` exists). Для
+    relay'ев без линка на ``to_id`` все их сабы попадают в ``failed`` с
+    причиной «target not attached» — админ сам решает прикрепить или
+    скипнуть. Релей попадает в ``failed_relays``.
+
+    **Батчинг**: все creds сабов на одном relay обновляются одним UPDATE,
+    и генерируется ОДИН ``relay_tunnel apply`` task per relay — reconcile_xray
+    в роли перечитывает authoritative emails_by_iface из БД и регенерит
+    каждый ``config*.json``, так что разницы между «перещёлкнули 1 саб» и
+    «перещёлкнули 50» для него нет. Это заметно дешевле N вызовов
+    ``switch_subscription_exit`` подряд (N apply-тасков через семафор).
+
+    Non-goals: creds на других exit'ах у сабов НЕ трогаются. Если у саба
+    была cred на from_id — ок, переедет; если на другом exit — остаётся
+    как было. Смешанных sub'ов быть не должно (switch_subscription_exit
+    выше переключает все creds разом), но на всякий случай UPDATE фильтрует
+    по ``exit_id = from_id`` явно.
+    """
+    if from_id == to_id:
+        raise HTTPException(status_code=400, detail="from_id and to_id must differ")
+    from_exit = db.get(models.WGExitNode, from_id)
+    if not from_exit:
+        raise HTTPException(status_code=404, detail="Source exit not found")
+    to_exit = db.get(models.WGExitNode, to_id)
+    if not to_exit:
+        raise HTTPException(status_code=404, detail="Target exit not found")
+    if not to_exit.is_active:
+        raise HTTPException(status_code=400, detail="Target exit is not active")
+
+    subs: list[models.Subscription] = (
+        db.query(models.Subscription)
+        .join(
+            models.Credential,
+            models.Credential.subscription_id == models.Subscription.id,
+        )
+        .filter(
+            models.Subscription.status == models.SubscriptionStatus.active,
+            models.Credential.exit_id == from_id,
+            models.Credential.is_active.is_(True),
+        )
+        .distinct()
+        .all()
+    )
+    considered = len(subs)
+
+    # Group by relay — one apply per relay regardless of sub count.
+    subs_by_relay: dict[int, list[models.Subscription]] = {}
+    subs_without_relay: list[models.Subscription] = []
+    for sub in subs:
+        if sub.node_id is None:
+            subs_without_relay.append(sub)
+            continue
+        subs_by_relay.setdefault(sub.node_id, []).append(sub)
+
+    migrated: list[int] = []
+    failed: list[schemas.NodeBulkMigrateFailure] = []
+    task_ids: list[int] = []
+    failed_relays: list[int] = []
+
+    for sub in subs_without_relay:
+        failed.append(
+            schemas.NodeBulkMigrateFailure(
+                subscription_id=sub.id, error="subscription has no relay node"
+            )
+        )
+
+    orchestrator = ProvisioningOrchestrator(db)
+    for relay_id, relay_subs in subs_by_relay.items():
+        link = (
+            db.query(models.RelayExitLink)
+            .filter(
+                models.RelayExitLink.relay_node_id == relay_id,
+                models.RelayExitLink.exit_id == to_id,
+            )
+            .first()
+        )
+        if link is None:
+            failed_relays.append(relay_id)
+            for sub in relay_subs:
+                failed.append(
+                    schemas.NodeBulkMigrateFailure(
+                        subscription_id=sub.id,
+                        error=f"target exit {to_id} not attached to relay {relay_id}",
+                    )
+                )
+            continue
+
+        sub_ids = [s.id for s in relay_subs]
+        # Обновляем только creds указывающие на from-exit — не трогаем
+        # соседние exit'ы у смешанных сабов (защита, хотя обычно их нет).
+        db.query(models.Credential).filter(
+            models.Credential.subscription_id.in_(sub_ids),
+            models.Credential.exit_id == from_id,
+        ).update(
+            {models.Credential.exit_id: to_id},
+            synchronize_session=False,
+        )
+        db.flush()
+
+        task = orchestrator.create_task(
+            "relay_tunnel",
+            relay_id,
+            "apply",
+            {
+                "exit_id": to_id,
+                "evacuated_from_exit_id": from_id,
+                "evacuated_subscription_ids": sub_ids,
+                "new_interface": link.wg_interface_name,
+            },
+        )
+        db.commit()
+        orchestrator.run_task_async(task)
+        task_ids.append(task.id)
+        migrated.extend(sub_ids)
+
+    actor, actor_type = _resolve_admin_actor(admin_actor)
+    _audit(
+        db,
+        actor,
+        "exit_bulk_evacuated",
+        "wg_exit_node",
+        from_exit.id,
+        actor_type=actor_type,
+        metadata={
+            "from_exit_id": from_exit.id,
+            "from_exit_name": from_exit.name,
+            "to_exit_id": to_exit.id,
+            "to_exit_name": to_exit.name,
+            "considered_count": considered,
+            "migrated_count": len(migrated),
+            "failed_count": len(failed),
+            "migrated_subscription_ids": migrated,
+            "failed_subscription_ids": [f.subscription_id for f in failed],
+            "failed_relays": failed_relays,
+            "task_ids": task_ids,
+        },
+    )
+    db.commit()
+
+    return schemas.ExitEvacuateOut(
+        from_exit_id=from_exit.id,
+        to_exit_id=to_exit.id,
+        considered_count=considered,
+        migrated=migrated,
+        failed=failed,
+        task_ids=task_ids,
+        failed_relays=failed_relays,
+    )

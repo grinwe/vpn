@@ -64,6 +64,16 @@ interface RelayExitLinkOut {
   active_subs: number;
 }
 
+interface ExitEvacuateOut {
+  from_exit_id: number;
+  to_exit_id: number;
+  considered_count: number;
+  migrated: number[];
+  failed: { subscription_id: number; error: string }[];
+  task_ids: number[];
+  failed_relays: number[];
+}
+
 interface ExitLinkHealthMini {
   relay_node_id: number;
   relay_node_name: string;
@@ -87,6 +97,7 @@ export default function Exits() {
   const [showForm, setShowForm] = useState(false);
   const [editId, setEditId] = useState<number | null>(null);
   const [expanded, setExpanded] = useState<Set<number>>(new Set());
+  const [evacuateFromId, setEvacuateFromId] = useState<number | null>(null);
 
   const { data, isLoading, error } = useQuery<WGExitNodeOut[]>({
     queryKey: ["wg-exits"],
@@ -215,6 +226,14 @@ export default function Exits() {
         />
       )}
 
+      {evacuateFromId != null && data && (
+        <EvacuateExitModal
+          fromExit={data.find((e) => e.id === evacuateFromId)!}
+          allExits={data}
+          onDone={() => setEvacuateFromId(null)}
+        />
+      )}
+
       {data && (
         <table className="w-full text-sm table-fixed">
           <thead className="text-slate-400 border-b border-slate-700">
@@ -330,6 +349,18 @@ export default function Exits() {
                           diagnose
                         </button>
                         <button
+                          disabled={e.active_subs_total === 0}
+                          title={
+                            e.active_subs_total === 0
+                              ? "Нет активных подписок для эвакуации"
+                              : "Переселить все активные подписки с этого exit'а на другой. Полезно когда этот exit залочили / умер провайдер."
+                          }
+                          onClick={() => setEvacuateFromId(e.id)}
+                          className="text-xs px-2 py-1 rounded bg-amber-700 hover:bg-amber-600 disabled:opacity-50"
+                        >
+                          evacuate
+                        </button>
+                        <button
                           disabled={deleteMut.isPending || e.peers_count > 0}
                           title={e.peers_count > 0 ? "Сначала отсоедините relay'и" : undefined}
                           onClick={() => {
@@ -356,6 +387,154 @@ export default function Exits() {
           </tbody>
         </table>
       )}
+    </div>
+  );
+}
+
+function EvacuateExitModal({
+  fromExit,
+  allExits,
+  onDone,
+}: {
+  fromExit: WGExitNodeOut;
+  allExits: WGExitNodeOut[];
+  onDone: () => void;
+}) {
+  const qc = useQueryClient();
+  const candidates = allExits.filter(
+    (e) => e.id !== fromExit.id && e.is_active && e.has_private_key,
+  );
+  const [toId, setToId] = useState<number | null>(candidates[0]?.id ?? null);
+  const [result, setResult] = useState<ExitEvacuateOut | null>(null);
+
+  const evacuateMut = useMutation({
+    mutationFn: (targetId: number) =>
+      api.post<ExitEvacuateOut>(
+        `/exits/${fromExit.id}/evacuate-to/${targetId}`,
+      ),
+    onSuccess: (res) => {
+      setResult(res);
+      qc.invalidateQueries({ queryKey: ["wg-exits"] });
+      qc.invalidateQueries({ queryKey: ["wg-exit-links"] });
+      qc.invalidateQueries({ queryKey: ["provisioning-tasks"] });
+    },
+    onError: (e: Error) => alert(`Ошибка: ${e.message}`),
+  });
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60">
+      <div className="bg-slate-900 border border-slate-700 rounded-lg p-6 w-[540px] max-w-full text-sm space-y-4">
+        <div>
+          <h3 className="text-lg font-semibold text-slate-100">
+            Эвакуация подписок
+          </h3>
+          <p className="text-slate-400 text-xs mt-1">
+            Перенести все активные подписки ({fromExit.active_subs_total} шт.) с
+            exit <span className="font-mono text-slate-200">{fromExit.name}</span>{" "}
+            на другой exit. Сабы остаются на своих relay-нодах, меняется только
+            outbound — UUID и sub_token не трогаются.
+          </p>
+        </div>
+
+        {result == null && (
+          <>
+            {candidates.length === 0 ? (
+              <div className="text-red-400 text-xs p-3 rounded bg-red-950/40 border border-red-900/50">
+                Нет доступных target exit'ов: нужен активный exit с private-key'ом.
+                Сначала создай/активируй другой exit.
+              </div>
+            ) : (
+              <label className="flex flex-col">
+                <span className="text-slate-400 mb-1 text-xs">Target exit</span>
+                <select
+                  value={toId ?? ""}
+                  onChange={(ev) => setToId(Number(ev.target.value) || null)}
+                  className="bg-slate-800 border border-slate-700 rounded px-2 py-1"
+                >
+                  {candidates.map((c) => (
+                    <option key={c.id} value={c.id}>
+                      #{c.id} {c.name} ({c.region}, peers={c.peers_count}, subs=
+                      {c.active_subs_total})
+                    </option>
+                  ))}
+                </select>
+              </label>
+            )}
+
+            <div className="text-xs text-amber-300 bg-amber-950/30 border border-amber-900/40 p-2 rounded">
+              ⚠ Target exit должен быть уже прикреплён к relay'ям, на которых
+              живут эти подписки. Relay без линка на target — его сабы попадут
+              в failed, прикрепи вручную и повтори.
+            </div>
+
+            <div className="flex justify-end gap-2">
+              <button
+                onClick={onDone}
+                disabled={evacuateMut.isPending}
+                className="text-xs px-3 py-1 rounded bg-slate-700 hover:bg-slate-600 disabled:opacity-50"
+              >
+                Отмена
+              </button>
+              <button
+                onClick={() => toId != null && evacuateMut.mutate(toId)}
+                disabled={evacuateMut.isPending || toId == null}
+                className="text-xs px-3 py-1 rounded bg-amber-700 hover:bg-amber-600 disabled:opacity-50"
+              >
+                {evacuateMut.isPending ? "Переселяю…" : "Эвакуировать"}
+              </button>
+            </div>
+          </>
+        )}
+
+        {result != null && (
+          <div className="space-y-2 text-xs">
+            <div className="grid grid-cols-2 gap-1 font-mono">
+              <span className="text-slate-400">Рассмотрено:</span>
+              <span>{result.considered_count}</span>
+              <span className="text-slate-400">Переехало:</span>
+              <span className="text-emerald-400">{result.migrated.length}</span>
+              <span className="text-slate-400">Не удалось:</span>
+              <span className={result.failed.length > 0 ? "text-red-400" : ""}>
+                {result.failed.length}
+              </span>
+              <span className="text-slate-400">Ansible-задач:</span>
+              <span>{result.task_ids.length}</span>
+            </div>
+            {result.failed_relays.length > 0 && (
+              <div className="text-amber-300 bg-amber-950/30 border border-amber-900/40 p-2 rounded">
+                На relay [{result.failed_relays.join(", ")}] target exit не
+                прикреплён — подписки на них не переехали. Прикрепи через "+
+                Прикрепить relay" у target exit'а и повтори.
+              </div>
+            )}
+            {result.failed.length > 0 && (
+              <details className="text-slate-400">
+                <summary className="cursor-pointer">
+                  Показать ошибки ({result.failed.length})
+                </summary>
+                <ul className="mt-1 space-y-0.5 font-mono text-[11px]">
+                  {result.failed.slice(0, 20).map((f) => (
+                    <li key={f.subscription_id}>
+                      sub #{f.subscription_id}: {f.error}
+                    </li>
+                  ))}
+                  {result.failed.length > 20 && (
+                    <li>… ещё {result.failed.length - 20}</li>
+                  )}
+                </ul>
+              </details>
+            )}
+            <div className="flex justify-end">
+              <button
+                onClick={onDone}
+                className="text-xs px-3 py-1 rounded bg-slate-700 hover:bg-slate-600"
+              >
+                Закрыть
+              </button>
+            </div>
+          </div>
+        )}
+      </div>
     </div>
   );
 }
