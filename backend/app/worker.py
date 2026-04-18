@@ -1104,6 +1104,16 @@ def dlq_exception_handler(job, exc_type, exc_value, tb):  # noqa: ARG001
 
 def main() -> None:
     from .logging_config import configure_logging
+    # ``schedule_tick`` тут критически важный импорт: все 8 bootstrap'ов
+    # ниже обёрнуты в ``try/except Exception`` — без явного импорта
+    # ``schedule_tick`` в scope main() NameError молча глотался, тики
+    # НИКОГДА не становились в scheduled при старте воркера, и
+    # периодический автохелз работал ТОЛЬКО после ручного
+    # force-refresh через UI (который стартует цепочку self-reschedule
+    # из тела самого tick'а, где импорт локальный). После рестарта
+    # воркера цепочка рвалась — админ видел "последний SSH 600 мин"
+    # и должен был кликать кнопку заново.
+    from .queue import schedule_tick
 
     configure_logging()
     try:
@@ -1149,6 +1159,7 @@ def main() -> None:
                 "app.worker.run_pending_rescue_tick",
                 min(pending_rescue_interval, 30),
                 tick_id="tick-pending-rescue",
+                replace=True,
             )
             logger.info(
                 "Pending-rescue tick bootstrapped: first run in 30s "
@@ -1165,6 +1176,7 @@ def main() -> None:
                 "app.worker.run_autoscale_tick",
                 autoscale_interval,
                 tick_id="tick-autoscale",
+                replace=True,
             )
             logger.info("Autoscale bootstrapped: first tick in %ss", autoscale_interval)
         except Exception:  # noqa: BLE001
@@ -1178,6 +1190,7 @@ def main() -> None:
                 "app.worker.run_renewal_check",
                 min(renewal_interval, 60),
                 tick_id="tick-renewal",
+                replace=True,
             )
             logger.info("Renewal check bootstrapped: first run in 60s (interval=%ss)", renewal_interval)
         except Exception:  # noqa: BLE001
@@ -1194,6 +1207,7 @@ def main() -> None:
                 "app.worker.run_warm_pool_check",
                 min(warm_interval, 30),
                 tick_id="tick-warm-pool",
+                replace=True,
             )
             logger.info(
                 "Warm pool check bootstrapped: first run in 30s (interval=%ss, target=%s)",
@@ -1212,6 +1226,7 @@ def main() -> None:
                 "app.worker.run_balance_charge_tick",
                 min(balance_interval, 60),
                 tick_id="tick-balance-charge",
+                replace=True,
             )
             logger.info(
                 "Balance charge tick bootstrapped: first run in 60s (interval=%ss)",
@@ -1230,6 +1245,7 @@ def main() -> None:
                 "app.worker.run_traffic_stats_tick",
                 min(traffic_stats_interval, 60),
                 tick_id="tick-traffic-stats",
+                replace=True,
             )
             logger.info(
                 "Traffic stats tick bootstrapped: first run in 60s (interval=%ss)",
@@ -1249,6 +1265,7 @@ def main() -> None:
                 "app.worker.run_relay_link_health_tick",
                 min(relay_link_health_interval, 60),
                 tick_id="tick-relay-link-health",
+                replace=True,
             )
             logger.info(
                 "Relay-link health tick bootstrapped: first run in 60s (interval=%ss)",
@@ -1268,6 +1285,7 @@ def main() -> None:
                 "app.worker.run_user_health_ping_tick",
                 min(health_ping_interval, 60),
                 tick_id="tick-health-ping",
+                replace=True,
             )
             logger.info(
                 "User health-ping tick bootstrapped: first run in 60s (interval=%ss)",

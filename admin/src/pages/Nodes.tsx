@@ -18,6 +18,7 @@ import {
   VPNNodeOut,
 } from "../api";
 import { HealthDots } from "../linkHealth";
+import { WorkerHealthBadge } from "../workerHealth";
 
 // ── Tracked operation types ─────────────────────────────────────────
 // Persisted to localStorage so banners survive page navigation.
@@ -713,7 +714,8 @@ export default function Nodes() {
     <div>
       <div className="flex items-center justify-between mb-4">
         <h1 className="text-2xl font-semibold">Nodes</h1>
-        <div className="flex gap-2">
+        <div className="flex gap-2 items-center">
+          <WorkerHealthBadge />
           <button
             disabled={refreshSshMut.isPending}
             onClick={() => refreshSshMut.mutate()}

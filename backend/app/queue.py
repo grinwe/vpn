@@ -150,6 +150,8 @@ def schedule_tick(
     func_name: str,
     interval_seconds: int,
     tick_id: str,
+    *,
+    replace: bool = False,
 ) -> str | None:
     """Enqueue a self-rescheduling tick with deterministic dedup.
 
@@ -162,6 +164,17 @@ def schedule_tick(
     restarts left 50+ duplicate ticks in ``scheduled``, each one debiting
     balance twice per cycle and multiplying SSH load from
     ``run_traffic_stats_tick``. See ``docs/components/worker.md``.
+
+    ``replace=True`` forces a fresh enqueue even when the previous tick
+    is still sitting in ``scheduled`` / ``queued`` / ``deferred`` /
+    ``started``. This is the correct mode for **bootstrap at worker
+    start-up**: if the RQScheduler fork died between deploys (or the
+    worker crashed mid-tick and left its job in ``started`` with no
+    owner), dedup-mode would see the stale entry and return early,
+    leaving the tick frozen until someone clicks the UI refresh button.
+    Self-reschedule calls at the end of a tick body should still use
+    dedup (default) because there we *know* the queue is clean for the
+    just-executed tick_id.
 
     Returns the RQ job id on success or ``None`` if the queue is
     unavailable.
@@ -182,7 +195,12 @@ def schedule_tick(
 
         try:
             existing = Job.fetch(tick_id, connection=queue.connection)
-            if existing.get_status(refresh=True) in {"queued", "started", "deferred", "scheduled"}:
+            if not replace and existing.get_status(refresh=True) in {
+                "queued",
+                "started",
+                "deferred",
+                "scheduled",
+            }:
                 return existing.id
             existing.delete()
         except NoSuchJobError:

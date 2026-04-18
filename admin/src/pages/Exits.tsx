@@ -2,6 +2,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Fragment, useState } from "react";
 import { api, ApiError } from "../api";
 import { HealthDots, linkHealth } from "../linkHealth";
+import { WorkerHealthBadge } from "../workerHealth";
 
 interface WGExitNodeOut {
   id: number;
@@ -192,7 +193,8 @@ export default function Exits() {
     <div>
       <div className="flex items-center justify-between mb-4">
         <h1 className="text-xl font-bold">WG Exit Nodes</h1>
-        <div className="flex gap-2">
+        <div className="flex gap-2 items-center">
+          <WorkerHealthBadge />
           <button
             disabled={refreshAllHealthMut.isPending}
             onClick={() => refreshAllHealthMut.mutate()}

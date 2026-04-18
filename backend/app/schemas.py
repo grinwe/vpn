@@ -344,6 +344,40 @@ class NodeBulkMigrateOut(BaseModel):
     resync_task_ids: list[int] = Field(default_factory=list)
 
 
+class TickStatusItem(BaseModel):
+    """Снимок одного worker-tick'а.
+
+    ``job_status`` — стандартный RQ enum или ``missing`` если Job
+    вообще нет (никогда не запускался после чистого Redis) / ``unknown``
+    если Redis отсутствует. ``overdue_by_seconds`` > 0 значит
+    scheduler должен был уже запустить этот тик, но не запустил —
+    сильный сигнал что RQScheduler-форк умер.
+    """
+    tick_id: str
+    func_name: str
+    interval_seconds: int
+    job_status: str
+    enqueued_at: UTCDateTime | None = None
+    started_at: UTCDateTime | None = None
+    ended_at: UTCDateTime | None = None
+    scheduled_for: UTCDateTime | None = None
+    overdue_by_seconds: int | None = None
+    last_exc_type: str | None = None
+
+
+class WorkerInfo(BaseModel):
+    name: str
+    state: str
+    last_heartbeat: UTCDateTime | None = None
+    current_job_id: str | None = None
+
+
+class TicksStatusOut(BaseModel):
+    queue_available: bool
+    workers: list[WorkerInfo] = Field(default_factory=list)
+    ticks: list[TickStatusItem] = Field(default_factory=list)
+
+
 class ExitEvacuateOut(BaseModel):
     """Результат массового переезда подписок с exit A на exit B.
 
