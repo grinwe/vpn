@@ -20,6 +20,7 @@ interface WGExitNodeOut {
   is_active: boolean;
   notes: string | null;
   peers_count: number;
+  active_subs_total: number;
   links: ExitLinkHealthMini[];
   created_at: string;
   updated_at: string;
@@ -60,6 +61,7 @@ interface RelayExitLinkOut {
   last_rx_bytes: number | null;
   last_tx_bytes: number | null;
   last_observed_at: string | null;
+  active_subs: number;
 }
 
 interface ExitLinkHealthMini {
@@ -227,6 +229,7 @@ export default function Exits() {
               <th className="text-left py-2 px-2 w-32">Public key</th>
               <th className="text-left py-2 px-2 w-28">Provider</th>
               <th className="text-left py-2 px-2 w-12">Peers</th>
+              <th className="text-left py-2 px-2 w-12" title="Активных подписок, идущих через этот exit (суммарно по всем relay-линкам)">Subs</th>
               <th className="text-left py-2 px-2 w-24">Health</th>
               <th className="text-left py-2 px-2 w-20">Status</th>
               <th className="text-left py-2 px-2 w-12">Active</th>
@@ -261,6 +264,13 @@ export default function Exits() {
                     </td>
                     <td className="py-2 px-2 text-slate-400 truncate" title={providerLabel(e.provider_id)}>{providerLabel(e.provider_id)}</td>
                     <td className="py-2 px-2">{e.peers_count}</td>
+                    <td className="py-2 px-2" title="Активных подписок через этот exit">
+                      {e.active_subs_total > 0 ? (
+                        <span className="text-emerald-400 font-medium">{e.active_subs_total}</span>
+                      ) : (
+                        <span className="text-slate-500">0</span>
+                      )}
+                    </td>
                     <td className="py-2 px-2" onClick={(ev) => ev.stopPropagation()}>
                       <HealthDots
                         links={e.links}
@@ -335,7 +345,7 @@ export default function Exits() {
                   </tr>
                   {isOpen && (
                     <tr className="bg-slate-900/50">
-                      <td colSpan={14} className="p-4">
+                      <td colSpan={15} className="p-4">
                         <ExitLinksPanel exitNode={e} />
                       </td>
                     </tr>
@@ -522,6 +532,7 @@ function ExitLinksPanel({ exitNode }: { exitNode: WGExitNodeOut }) {
               <th className="text-left py-1 px-2">Iface</th>
               <th className="text-left py-1 px-2">WG client addr</th>
               <th className="text-left py-1 px-2">Status</th>
+              <th className="text-left py-1 px-2" title="Активных подписок, которые сейчас егрессят через этот relay именно на этом exit">Subs</th>
               <th className="text-left py-1 px-2">RX / TX</th>
               <th className="text-left py-1 px-2">Создан</th>
               <th className="py-1 px-2"></th>
@@ -548,6 +559,13 @@ function ExitLinksPanel({ exitNode }: { exitNode: WGExitNodeOut }) {
                     <span className="w-1.5 h-1.5 rounded-full bg-white/70" />
                     {h.label}
                   </span>
+                </td>
+                <td className="py-1 px-2">
+                  {l.active_subs > 0 ? (
+                    <span className="text-emerald-400 font-medium">{l.active_subs}</span>
+                  ) : (
+                    <span className="text-slate-500">0</span>
+                  )}
                 </td>
                 <td className="py-1 px-2 font-mono text-slate-400">
                   {fmtBytes(l.last_rx_bytes)} / {fmtBytes(l.last_tx_bytes)}

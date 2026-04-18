@@ -35,7 +35,9 @@ from ._common import ADMIN_ACTOR_HEADER, _audit, _resolve_admin_actor, get_db
 router = APIRouter()
 
 
-def _link_to_out(link: models.RelayExitLink) -> schemas.RelayExitLinkOut:
+def _link_to_out(
+    link: models.RelayExitLink, *, active_subs: int = 0
+) -> schemas.RelayExitLinkOut:
     return schemas.RelayExitLinkOut(
         id=link.id,
         relay_node_id=link.relay_node_id,
@@ -50,7 +52,32 @@ def _link_to_out(link: models.RelayExitLink) -> schemas.RelayExitLinkOut:
         last_rx_bytes=link.last_rx_bytes,
         last_tx_bytes=link.last_tx_bytes,
         last_observed_at=link.last_observed_at,
+        active_subs=active_subs,
     )
+
+
+def _active_subs_by_relay(
+    db: Session, relay_ids: list[int]
+) -> dict[int, int]:
+    """Подсчитать active subscriptions по каждой relay-ноде одной GROUP BY.
+
+    Для UI «сколько юзеров ходит через какой relay/exit» — хотим один
+    запрос по списку relay_ids, а не N per-row. Пустой вход → пустой
+    словарь.
+    """
+    if not relay_ids:
+        return {}
+    rows = (
+        db.query(
+            models.Subscription.node_id,
+            func.count(models.Subscription.id).label("cnt"),
+        )
+        .filter(models.Subscription.status == models.SubscriptionStatus.active)
+        .filter(models.Subscription.node_id.in_(relay_ids))
+        .group_by(models.Subscription.node_id)
+        .all()
+    )
+    return {node_id: cnt for node_id, cnt in rows}
 
 
 def _links_mini(links: list[models.RelayExitLink]) -> list[schemas.ExitLinkHealthMini]:
@@ -71,6 +98,7 @@ def _to_out(
     *,
     peers_count: int = 0,
     links: list[models.RelayExitLink] | None = None,
+    active_subs_total: int = 0,
 ) -> schemas.WGExitNodeOut:
     return schemas.WGExitNodeOut(
         id=exit_node.id,
@@ -90,6 +118,7 @@ def _to_out(
         notes=exit_node.notes,
         peers_count=peers_count,
         links=_links_mini(links or []),
+        active_subs_total=active_subs_total,
         created_at=exit_node.created_at,
         updated_at=exit_node.updated_at,
     )
@@ -119,11 +148,18 @@ def list_exits(
     links_by_exit: dict[int, list[models.RelayExitLink]] = {}
     for link in all_links:
         links_by_exit.setdefault(link.exit_id, []).append(link)
+    subs_by_relay = _active_subs_by_relay(
+        db, [link.relay_node_id for link in all_links]
+    )
     return [
         _to_out(
             r,
             peers_count=len(links_by_exit.get(r.id, [])),
             links=links_by_exit.get(r.id, []),
+            active_subs_total=sum(
+                subs_by_relay.get(link.relay_node_id, 0)
+                for link in links_by_exit.get(r.id, [])
+            ),
         )
         for r in rows
     ]
@@ -409,7 +445,13 @@ def list_exit_links(
         .order_by(models.RelayExitLink.id)
         .all()
     )
-    return [_link_to_out(r) for r in rows]
+    subs_by_relay = _active_subs_by_relay(
+        db, [r.relay_node_id for r in rows]
+    )
+    return [
+        _link_to_out(r, active_subs=subs_by_relay.get(r.relay_node_id, 0))
+        for r in rows
+    ]
 
 
 @router.post("/exits/{exit_id}/links", response_model=schemas.RelayExitLinkOut)

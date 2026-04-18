@@ -840,6 +840,10 @@ class WGExitNodeOut(BaseModel):
     notes: str | None
     peers_count: int = 0
     links: list[ExitLinkHealthMini] = []
+    # Сумма active subscriptions по всем relay-нодам, прикреплённым к
+    # этому exit'у. «Сколько юзеров реально ходит через этот exit».
+    # Дефолт 0 — одно-нодовые ответы (create/patch) не считают.
+    active_subs_total: int = 0
     created_at: datetime
     updated_at: datetime
 
@@ -883,6 +887,11 @@ class RelayExitLinkOut(BaseModel):
     last_rx_bytes: int | None = None
     last_tx_bytes: int | None = None
     last_observed_at: UTCDateTime | None = None
+    # Количество active subscriptions, привязанных к relay-ноде этого
+    # линка. Отвечает на вопрос «сколько юзеров реально ходит через этот
+    # relay (и, косвенно, через этот exit)». Дефолт 0 — вычисляется в
+    # ``list_exit_links`` и ``list_exits`` одним GROUP BY.
+    active_subs: int = 0
 
     class Config:
         from_attributes = True
