@@ -584,6 +584,31 @@ export default function Nodes() {
     onError: (e: Error) => alert(`Не удалось сменить статус: ${e.message}`),
   });
 
+  // Тот же endpoint, что и на странице Exits — форс-прогоняет тик
+  // run_relay_link_health, обновляя last_handshake_at/last_observed_at
+  // на всех relay-нодах разом. Инвалидируем nodes-query с задержкой,
+  // потому что тику нужно время на SSH к relay'ям (10–20 сек).
+  const refreshAllHealthMut = useMutation({
+    mutationFn: () =>
+      api.post<{
+        enqueued: boolean;
+        job_id?: string;
+        reason?: string;
+        note?: string;
+      }>(`/exits/links/health/refresh`),
+    onSuccess: (res) => {
+      if (!res.enqueued) {
+        alert(`Не удалось запустить: ${res.reason ?? "очередь недоступна"}`);
+        return;
+      }
+      setTimeout(() => {
+        qc.invalidateQueries({ queryKey: ["nodes"] });
+        qc.invalidateQueries({ queryKey: ["node-relay-links"] });
+      }, 15_000);
+    },
+    onError: (e: Error) => alert(`Ошибка: ${e.message}`),
+  });
+
   const { data, isLoading, error, refetch, isFetching } = useQuery<VPNNodeOut[]>({
     queryKey: ["nodes"],
     queryFn: () => api.get("/nodes"),
@@ -629,12 +654,22 @@ export default function Nodes() {
     <div>
       <div className="flex items-center justify-between mb-4">
         <h1 className="text-2xl font-semibold">Nodes</h1>
-        <button
-          className="px-3 py-1.5 rounded bg-emerald-600 hover:bg-emerald-500 text-sm font-semibold"
-          onClick={() => setCreateOpen((v) => !v)}
-        >
-          {createOpen ? "Отмена" : "+ Добавить ноду"}
-        </button>
+        <div className="flex gap-2">
+          <button
+            disabled={refreshAllHealthMut.isPending}
+            onClick={() => refreshAllHealthMut.mutate()}
+            title="Форс-прогнать relay_link_health тик — воркер SSH'нет на все relay сразу, обновит WG-индикаторы через 10–20 сек"
+            className="text-sm px-3 py-1.5 rounded bg-slate-700 hover:bg-slate-600 disabled:opacity-50"
+          >
+            {refreshAllHealthMut.isPending ? "Обновляем…" : "↻ health всех"}
+          </button>
+          <button
+            className="px-3 py-1.5 rounded bg-emerald-600 hover:bg-emerald-500 text-sm font-semibold"
+            onClick={() => setCreateOpen((v) => !v)}
+          >
+            {createOpen ? "Отмена" : "+ Добавить ноду"}
+          </button>
+        </div>
       </div>
 
       {createOpen && (
