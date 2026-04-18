@@ -17,6 +17,7 @@ import {
   VPNNodeCreateIn,
   VPNNodeOut,
 } from "../api";
+import { HealthDots } from "../linkHealth";
 
 // ── Tracked operation types ─────────────────────────────────────────
 // Persisted to localStorage so banners survive page navigation.
@@ -679,6 +680,7 @@ export default function Nodes() {
             <th>Pool</th>
             <th>Статус</th>
             <th>Health</th>
+            <th>WG</th>
             <th>Активна</th>
             <th>Обновлена</th>
             <th></th>
@@ -733,6 +735,13 @@ export default function Nodes() {
                   </td>
                   <td>
                     <HealthBadge score={n.health_score} blocked={n.blocked_regions} />
+                  </td>
+                  <td>
+                    <HealthDots
+                      links={n.exit_links}
+                      peerLabel={(l) => `${l.exit_name} · ${l.wg_interface_name}`}
+                      peerKey={(l) => `${l.exit_id}-${l.wg_interface_name}`}
+                    />
                   </td>
                   <td>
                     <span className="inline-flex items-center gap-1">
@@ -871,7 +880,7 @@ export default function Nodes() {
                 </tr>
                 {expanded && (
                   <tr className="border-b border-slate-800 bg-slate-900/60">
-                    <td colSpan={11} className="p-4 space-y-4">
+                    <td colSpan={12} className="p-4 space-y-4">
                       <RelayLinksSection nodeId={n.id} />
                       <NodeHealth nodeId={n.id} />
                       <NodeActiveUsers nodeId={n.id} />
@@ -886,7 +895,7 @@ export default function Nodes() {
           })}
           {data && data.length === 0 && (
             <tr>
-              <td colSpan={11} className="py-4 text-slate-500 text-center">
+              <td colSpan={12} className="py-4 text-slate-500 text-center">
                 Нод нет
               </td>
             </tr>

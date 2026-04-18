@@ -98,7 +98,38 @@ def list_nodes(
         .limit(limit)
         .all()
     )
-    return [schemas.VPNNodeOut.from_orm(n) for n in nodes]
+    # Bulk-load relay→exit links для health-dots в строке. Грузим одной
+    # JOIN-кой (вместо per-row), потом раскладываем по relay_node_id.
+    relay_ids = [n.id for n in nodes if n.relay_config is not None]
+    links_by_relay: dict[int, list[models.RelayExitLink]] = {}
+    if relay_ids:
+        links = (
+            db.query(models.RelayExitLink)
+            .join(
+                models.WGExitNode,
+                models.WGExitNode.id == models.RelayExitLink.exit_id,
+            )
+            .filter(models.RelayExitLink.relay_node_id.in_(relay_ids))
+            .all()
+        )
+        for link in links:
+            links_by_relay.setdefault(link.relay_node_id, []).append(link)
+
+    def _to_out(n: models.VPNNode) -> schemas.VPNNodeOut:
+        out = schemas.VPNNodeOut.from_orm(n)
+        out.exit_links = [
+            schemas.NodeExitLinkHealthMini(
+                exit_id=link.exit_id,
+                exit_name=link.exit_node.name if link.exit_node else "",
+                wg_interface_name=link.wg_interface_name,
+                last_handshake_at=link.last_handshake_at,
+                last_observed_at=link.last_observed_at,
+            )
+            for link in links_by_relay.get(n.id, [])
+        ]
+        return out
+
+    return [_to_out(n) for n in nodes]
 
 
 @router.post("/nodes/{node_id}/resync")

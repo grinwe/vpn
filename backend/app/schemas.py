@@ -159,6 +159,17 @@ class VPNNodeCreate(BaseModel):
     notes: str | None = None
 
 
+class NodeExitLinkHealthMini(BaseModel):
+    """Mini-view одного relay→exit линка для отрисовки health-dots в строке
+    таблицы Nodes (симметрично ``ExitLinkHealthMini``, но с точки зрения relay).
+    """
+    exit_id: int
+    exit_name: str
+    wg_interface_name: str
+    last_handshake_at: UTCDateTime | None = None
+    last_observed_at: UTCDateTime | None = None
+
+
 class VPNNodeOut(VPNNodeCreate):
     id: int
     provider_id: int | None = None
@@ -177,6 +188,11 @@ class VPNNodeOut(VPNNodeCreate):
     # we only expose the boolean so the admin UI can filter attachable
     # nodes without learning the tunnel metadata.
     has_relay_config: bool = False
+    # Health-dots для relay-нод. Дефолт пустой, потому что из семи
+    # call-сайтов ``from_orm`` только ``list_nodes`` реально bulk-load'ит
+    # линки — остальные используют VPNNodeOut как ответ после мутации
+    # одной ноды, где dots не нужны.
+    exit_links: list[NodeExitLinkHealthMini] = []
     created_at: datetime
     updated_at: datetime
 

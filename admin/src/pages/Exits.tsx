@@ -1,6 +1,7 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Fragment, useState } from "react";
 import { api, ApiError } from "../api";
+import { HealthDots, linkHealth } from "../linkHealth";
 
 interface WGExitNodeOut {
   id: number;
@@ -67,88 +68,6 @@ interface ExitLinkHealthMini {
   wg_interface_name: string;
   last_handshake_at: string | null;
   last_observed_at: string | null;
-}
-
-function linkHealth(l: {
-  last_handshake_at: string | null;
-  last_observed_at: string | null;
-}): {
-  color: string;
-  label: string;
-  title: string;
-} {
-  // Светофор для relay↔exit туннеля. Цвет считаем от возраста
-  // последнего handshake'а (WG keepalive = 25s, значит healthy peer
-  // handshook в последние 3 минуты). SSH-фейл (observed_at stale)
-  // рендерится как красный, потому что за >15 min должен был успеть
-  // пройти хотя бы один тик.
-  const now = Date.now();
-  if (!l.last_observed_at) {
-    return {
-      color: "bg-slate-600",
-      label: "—",
-      title: "Тик ещё не прошёл — данных нет",
-    };
-  }
-  const observedAgeMin = (now - Date.parse(l.last_observed_at)) / 60000;
-  if (observedAgeMin > 15) {
-    return {
-      color: "bg-red-500",
-      label: `ssh ${Math.round(observedAgeMin)}m`,
-      title: `SSH-тик не доходил ${Math.round(observedAgeMin)} минут — relay недоступен?`,
-    };
-  }
-  if (!l.last_handshake_at) {
-    return {
-      color: "bg-red-500",
-      label: "no hs",
-      title: "WG peer в dump есть, но handshake ни разу не случился",
-    };
-  }
-  const handshakeAgeMin =
-    (now - Date.parse(l.last_handshake_at)) / 60000;
-  if (handshakeAgeMin < 3) {
-    return {
-      color: "bg-green-500",
-      label: `${Math.round(handshakeAgeMin)}m`,
-      title: `Последний handshake ${Math.round(handshakeAgeMin)} минут назад`,
-    };
-  }
-  if (handshakeAgeMin < 15) {
-    return {
-      color: "bg-yellow-500",
-      label: `${Math.round(handshakeAgeMin)}m`,
-      title: `Последний handshake ${Math.round(handshakeAgeMin)} минут назад — туннель простаивает`,
-    };
-  }
-  return {
-    color: "bg-red-500",
-    label: `${Math.round(handshakeAgeMin)}m`,
-    title: `Последний handshake ${Math.round(handshakeAgeMin)} минут назад — скорее всего порвался`,
-  };
-}
-
-function HealthDots({ links }: { links: ExitLinkHealthMini[] }) {
-  // Ряд цветных точек — по одной на relay→exit линк. Цвет берём той же
-  // linkHealth(), что и в раскрытой панели, так пороги живут в одном
-  // месте. Пустой массив → серый дефис (линков нет).
-  if (links.length === 0) {
-    return <span className="text-slate-600 text-xs">—</span>;
-  }
-  return (
-    <div className="flex gap-1 items-center">
-      {links.map((l) => {
-        const h = linkHealth(l);
-        return (
-          <span
-            key={`${l.relay_node_id}-${l.wg_interface_name}`}
-            className={`inline-block w-2.5 h-2.5 rounded-full ${h.color}`}
-            title={`${l.relay_node_name} · ${l.wg_interface_name}: ${h.label} — ${h.title}`}
-          />
-        );
-      })}
-    </div>
-  );
 }
 
 function fmtBytes(n: number | null): string {
@@ -343,7 +262,11 @@ export default function Exits() {
                     <td className="py-2 px-2 text-slate-400 truncate" title={providerLabel(e.provider_id)}>{providerLabel(e.provider_id)}</td>
                     <td className="py-2 px-2">{e.peers_count}</td>
                     <td className="py-2 px-2" onClick={(ev) => ev.stopPropagation()}>
-                      <HealthDots links={e.links} />
+                      <HealthDots
+                        links={e.links}
+                        peerLabel={(l) => `${l.relay_node_name} · ${l.wg_interface_name}`}
+                        peerKey={(l) => `${l.relay_node_id}-${l.wg_interface_name}`}
+                      />
                     </td>
                     <td className="py-2 px-2">{e.status}</td>
                     <td className="py-2 px-2">{e.is_active ? "✓" : "✕"}</td>

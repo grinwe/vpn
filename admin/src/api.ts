@@ -210,6 +210,14 @@ export interface InvoiceListItem {
   created_at: string;
 }
 
+export interface NodeExitLinkHealthMini {
+  exit_id: number;
+  exit_name: string;
+  wg_interface_name: string;
+  last_handshake_at: string | null;
+  last_observed_at: string | null;
+}
+
 export interface VPNNodeOut {
   id: number;
   name: string;
@@ -225,6 +233,8 @@ export interface VPNNodeOut {
   blocked_regions: string[];
   cooldown_until: string | null;
   suspect_since: string | null;
+  has_relay_config: boolean;
+  exit_links: NodeExitLinkHealthMini[];
   created_at: string;
   updated_at: string;
 }
