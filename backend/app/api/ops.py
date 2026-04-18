@@ -101,28 +101,36 @@ def _describe_job(tick_id: str, queue) -> schemas.TickStatusItem:
     started_at = _aware(job.started_at)
     ended_at = _aware(job.ended_at)
 
-    # RQ хранит scheduled-ts в ZSET rq:scheduler-ranking и не
-    # прокидывает в Job напрямую. Достаём из ScheduledJobRegistry
-    # когда статус == scheduled.
+    # RQ хранит scheduled-ts в ZSET rq:scheduled:<queue> и не
+    # прокидывает в Job напрямую. ВСЕГДА смотрим в ZSET, не только
+    # когда hash.status==scheduled: после переноса self-reschedule в
+    # начало тика, между окончанием run'а и scheduler-fire hash имеет
+    # status=finished (worker перезаписал его при handle_job_success),
+    # но tick_id уже лежит в ScheduledJobRegistry с future-score —
+    # ZSET здесь source of truth для "когда следующий запуск".
     scheduled_for: datetime | None = None
     overdue: int | None = None
-    if status == "scheduled":
-        try:
-            from rq.registry import ScheduledJobRegistry
+    try:
+        from rq.registry import ScheduledJobRegistry
 
-            reg = ScheduledJobRegistry(queue=queue)
-            score = queue.connection.zscore(reg.key, tick_id)
-            if score is not None:
-                scheduled_for = datetime.fromtimestamp(
-                    float(score), tz=timezone.utc
-                )
-                now = datetime.now(tz=timezone.utc)
-                if scheduled_for < now:
-                    overdue = int((now - scheduled_for).total_seconds())
-                else:
-                    overdue = 0
-        except Exception:  # noqa: BLE001
-            pass
+        reg = ScheduledJobRegistry(queue=queue)
+        score = queue.connection.zscore(reg.key, tick_id)
+        if score is not None:
+            scheduled_for = datetime.fromtimestamp(
+                float(score), tz=timezone.utc
+            )
+            now = datetime.now(tz=timezone.utc)
+            if scheduled_for < now:
+                overdue = int((now - scheduled_for).total_seconds())
+            else:
+                overdue = 0
+            # Hash может показывать finished/failed от предыдущего
+            # запуска — для UI показываем "scheduled", потому что
+            # следующий запуск реально запланирован.
+            if status in ("finished", "failed"):
+                status = "scheduled"
+    except Exception:  # noqa: BLE001
+        pass
 
     exc_type: str | None = None
     if status == "failed" and job.exc_info:

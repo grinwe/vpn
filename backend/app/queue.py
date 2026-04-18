@@ -205,14 +205,27 @@ def schedule_tick(
 
     ``replace=True`` forces a fresh enqueue even when the previous tick
     is still sitting in ``scheduled`` / ``queued`` / ``deferred`` /
-    ``started``. This is the correct mode for **bootstrap at worker
-    start-up**: if the RQScheduler fork died between deploys (or the
-    worker crashed mid-tick and left its job in ``started`` with no
-    owner), dedup-mode would see the stale entry and return early,
-    leaving the tick frozen until someone clicks the UI refresh button.
-    Self-reschedule calls at the end of a tick body should still use
-    dedup (default) because there we *know* the queue is clean for the
-    just-executed tick_id.
+    ``started``. Это нужно в ДВУХ случаях:
+
+    1. **Bootstrap на старте воркера**: если RQScheduler-форк умер между
+       деплоями (или воркер крашнулся посреди тика и оставил job в
+       ``started`` без owner'а), dedup-режим увидел бы stale-запись и
+       вернулся early, оставив тик замороженным до ручного клика по UI.
+
+    2. **Self-reschedule в НАЧАЛЕ тела тика**: текущий job находится в
+       ``started`` state, default-dedup блокнул бы планирование. Перенос
+       reschedule в начало + ``replace=True`` гарантирует, что следующий
+       запуск в ScheduledJobRegistry до того, как body начнёт реальную
+       работу — если SSH повиснет и RQ убьёт job по timeout, тик
+       выживает. См. все 8 функций в ``worker.py``.
+
+    Worker'у в памяти остаётся Job-объект от старого run'а. По
+    завершении body он вызывает handle_job_success → job.save(), который
+    перезапишет hash данными старого run'а. Но ScheduledJobRegistry —
+    отдельный ZSET, его save не трогает; когда scheduler fires,
+    queue.enqueue_job() выставляет status=QUEUED и пересохраняет hash
+    чисто. result_ttl (24h) >> tick interval (60–3600s), так что
+    FinishedJobRegistry hash не удалит до следующего scheduler-fire.
 
     Returns the RQ job id on success or ``None`` if the queue is
     unavailable.

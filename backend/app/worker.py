@@ -68,6 +68,21 @@ def run_pending_rescue_tick() -> dict:
     from .queue import enqueue_task, schedule_tick
     from .time_utils import utcnow
 
+    # Перепланируем ДО начала работы. Если body упадёт / будет убит по
+    # job_timeout — следующий запуск уже в ScheduledJobRegistry. replace=True
+    # обязателен: текущий job в "started", default-dedup вернул бы early.
+    interval = int(os.getenv("PENDING_RESCUE_INTERVAL", "60"))
+    if interval > 0:
+        try:
+            schedule_tick(
+                "app.worker.run_pending_rescue_tick",
+                interval,
+                tick_id="tick-pending-rescue",
+                replace=True,
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("pending_rescue: failed to re-enqueue tick (at start)")
+
     age = int(os.getenv("PENDING_RESCUE_AGE", "60"))
     rescued = 0
     scanned = 0
@@ -104,17 +119,6 @@ def run_pending_rescue_tick() -> dict:
             rescued, scanned,
         )
 
-    interval = int(os.getenv("PENDING_RESCUE_INTERVAL", "60"))
-    if interval > 0:
-        try:
-            schedule_tick(
-                "app.worker.run_pending_rescue_tick",
-                interval,
-                tick_id="tick-pending-rescue",
-            )
-        except Exception:  # noqa: BLE001
-            logger.exception("pending_rescue: failed to re-enqueue tick")
-
     return {"scanned": scanned, "rescued": rescued}
 
 
@@ -126,13 +130,7 @@ def run_autoscale_tick() -> list[dict]:
     from .queue import schedule_tick
     from .services.autoscale import evaluate_all_pools
 
-    session = SessionLocal()
-    try:
-        decisions = evaluate_all_pools(session)
-        result = [asdict(d) for d in decisions]
-    finally:
-        session.close()
-
+    # Reschedule в начале — см. run_pending_rescue_tick.
     interval = int(os.getenv("AUTOSCALE_INTERVAL", "0"))
     if interval > 0:
         try:
@@ -140,9 +138,18 @@ def run_autoscale_tick() -> list[dict]:
                 "app.worker.run_autoscale_tick",
                 interval,
                 tick_id="tick-autoscale",
+                replace=True,
             )
         except Exception:  # noqa: BLE001
-            logger.exception("Failed to re-enqueue autoscale tick")
+            logger.exception("Failed to re-enqueue autoscale tick (at start)")
+
+    session = SessionLocal()
+    try:
+        decisions = evaluate_all_pools(session)
+        result = [asdict(d) for d in decisions]
+    finally:
+        session.close()
+
     return result
 
 
@@ -163,8 +170,22 @@ def run_renewal_check() -> dict:
 
     from .db import SessionLocal
     from . import models
+    from .queue import schedule_tick
     from .services.provisioning import ProvisioningOrchestrator
     from .time_utils import utcnow
+
+    # Reschedule в начале — см. run_pending_rescue_tick.
+    interval = int(os.getenv("RENEWAL_CHECK_INTERVAL", "3600"))
+    if interval > 0:
+        try:
+            schedule_tick(
+                "app.worker.run_renewal_check",
+                interval,
+                tick_id="tick-renewal",
+                replace=True,
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("Failed to re-enqueue renewal check (at start)")
 
     session = SessionLocal()
     stats = {"reminded": 0, "reminded_1d": 0, "expired": 0, "revoked": 0, "errors": 0}
@@ -407,18 +428,6 @@ def run_renewal_check() -> dict:
     finally:
         session.close()
 
-    # Re-enqueue self
-    interval = int(os.getenv("RENEWAL_CHECK_INTERVAL", "3600"))
-    if interval > 0:
-        from .queue import schedule_tick
-        try:
-            schedule_tick(
-                "app.worker.run_renewal_check",
-                interval,
-                tick_id="tick-renewal",
-            )
-        except Exception:  # noqa: BLE001
-            logger.exception("Failed to re-enqueue renewal check")
     return stats
 
 
@@ -438,6 +447,19 @@ def run_warm_pool_check() -> dict:
     from .queue import schedule_tick
     from .services import warm_pool
 
+    # Reschedule в начале — см. run_pending_rescue_tick.
+    interval = int(os.getenv("WARM_POOL_CHECK_INTERVAL", "120"))
+    if interval > 0:
+        try:
+            schedule_tick(
+                "app.worker.run_warm_pool_check",
+                interval,
+                tick_id="tick-warm-pool",
+                replace=True,
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("warm_pool: failed to re-enqueue tick (at start)")
+
     session = SessionLocal()
     summary: dict = {}
     try:
@@ -447,16 +469,6 @@ def run_warm_pool_check() -> dict:
     finally:
         session.close()
 
-    interval = int(os.getenv("WARM_POOL_CHECK_INTERVAL", "120"))
-    if interval > 0:
-        try:
-            schedule_tick(
-                "app.worker.run_warm_pool_check",
-                interval,
-                tick_id="tick-warm-pool",
-            )
-        except Exception:  # noqa: BLE001
-            logger.exception("warm_pool: failed to re-enqueue tick")
     return summary
 
 
@@ -684,6 +696,19 @@ def run_balance_charge_tick() -> dict:
     from .services import balance
     from .time_utils import utcnow
 
+    # Reschedule в начале — см. run_pending_rescue_tick.
+    interval = int(os.getenv("BALANCE_CHARGE_INTERVAL", "3600"))
+    if interval > 0:
+        try:
+            schedule_tick(
+                "app.worker.run_balance_charge_tick",
+                interval,
+                tick_id="tick-balance-charge",
+                replace=True,
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("Failed to re-enqueue balance charge tick (at start)")
+
     session = SessionLocal()
     stats = {"renewed": 0, "insufficient": 0, "expired_norenew": 0,
              "unfrozen": 0, "errors": 0}
@@ -778,16 +803,6 @@ def run_balance_charge_tick() -> dict:
     finally:
         session.close()
 
-    interval = int(os.getenv("BALANCE_CHARGE_INTERVAL", "3600"))
-    if interval > 0:
-        try:
-            schedule_tick(
-                "app.worker.run_balance_charge_tick",
-                interval,
-                tick_id="tick-balance-charge",
-            )
-        except Exception:  # noqa: BLE001
-            logger.exception("Failed to re-enqueue balance charge tick")
     return stats
 
 
@@ -813,7 +828,22 @@ def run_traffic_stats_tick() -> dict:
     from .queue import schedule_tick
     from .services import traffic_stats
 
+    # Reschedule в начале — см. run_pending_rescue_tick. Для traffic-stats
+    # это особенно критично: SSH-сессии по всем нодам регулярно зависают
+    # и job убивается по job_timeout=120s, end-of-body reschedule бы не
+    # выполнился.
     interval = int(os.getenv("TRAFFIC_STATS_INTERVAL", "300"))
+    if interval > 0:
+        try:
+            schedule_tick(
+                "app.worker.run_traffic_stats_tick",
+                interval,
+                tick_id="tick-traffic-stats",
+                replace=True,
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("traffic_stats: failed to re-enqueue tick (at start)")
+
     summary: dict = {"collected": 0, "nodes": [], "traffic_drops": []}
     session = SessionLocal()
     try:
@@ -844,15 +874,6 @@ def run_traffic_stats_tick() -> dict:
     finally:
         session.close()
 
-    if interval > 0:
-        try:
-            schedule_tick(
-                "app.worker.run_traffic_stats_tick",
-                interval,
-                tick_id="tick-traffic-stats",
-            )
-        except Exception:  # noqa: BLE001
-            logger.exception("traffic_stats: failed to re-enqueue tick")
     return summary
 
 
@@ -875,7 +896,21 @@ def run_relay_link_health_tick() -> dict:
     from .queue import schedule_tick
     from .services import relay_link_health
 
+    # Reschedule в начале — см. run_pending_rescue_tick. Аналогично
+    # traffic-stats, SSH ходит по всем relay нодам и периодически
+    # зависает, поэтому reschedule ДО работы обязателен.
     interval = int(os.getenv("RELAY_LINK_HEALTH_INTERVAL", "300"))
+    if interval > 0:
+        try:
+            schedule_tick(
+                "app.worker.run_relay_link_health_tick",
+                interval,
+                tick_id="tick-relay-link-health",
+                replace=True,
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("relay_link_health: failed to re-enqueue tick (at start)")
+
     summary: dict = {}
     session = SessionLocal()
     try:
@@ -887,15 +922,6 @@ def run_relay_link_health_tick() -> dict:
     finally:
         session.close()
 
-    if interval > 0:
-        try:
-            schedule_tick(
-                "app.worker.run_relay_link_health_tick",
-                interval,
-                tick_id="tick-relay-link-health",
-            )
-        except Exception:  # noqa: BLE001
-            logger.exception("relay_link_health: failed to re-enqueue tick")
     return summary
 
 
@@ -928,6 +954,19 @@ def run_user_health_ping_tick() -> dict:
     interval = int(os.getenv("USER_HEALTH_PING_INTERVAL", "1800"))
     batch = int(os.getenv("USER_HEALTH_PING_BATCH", "50"))
     debounce_hours = int(os.getenv("USER_HEALTH_PING_DEBOUNCE_HOURS", "24"))
+
+    # Reschedule в начале — см. run_pending_rescue_tick. Важно: ставим
+    # reschedule ДО early-return по MSK-окну, иначе вне окна тик умрёт.
+    if interval > 0:
+        try:
+            schedule_tick(
+                "app.worker.run_user_health_ping_tick",
+                interval,
+                tick_id="tick-health-ping",
+                replace=True,
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("user_health_ping: failed to re-enqueue tick (at start)")
 
     # Only send health pings during MSK lunch window (11:00–14:00)
     # to avoid waking users at night. Configurable via env.
@@ -1013,15 +1052,6 @@ def run_user_health_ping_tick() -> dict:
     finally:
         session.close()
 
-    if interval > 0:
-        try:
-            schedule_tick(
-                "app.worker.run_user_health_ping_tick",
-                interval,
-                tick_id="tick-health-ping",
-            )
-        except Exception:  # noqa: BLE001
-            logger.exception("user_health_ping: failed to re-enqueue tick")
     return summary
 
 
