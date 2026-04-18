@@ -129,7 +129,7 @@ class NodeActiveUserOut(BaseModel):
 
 class NodeActiveUsersOut(BaseModel):
     node_id: int
-    observed_at: datetime | None = None
+    observed_at: UTCDateTime | None = None
     # ``True`` if the latest NodeTrafficSample is older than 15 minutes
     # (or doesn't exist) — UI should surface "нет свежих данных".
     stale: bool
@@ -137,7 +137,7 @@ class NodeActiveUsersOut(BaseModel):
 
 
 class NodeTrafficSamplePoint(BaseModel):
-    observed_at: datetime
+    observed_at: UTCDateTime
     active_users: int
     uplink_bytes: int
     downlink_bytes: int
@@ -145,8 +145,8 @@ class NodeTrafficSamplePoint(BaseModel):
 
 class NodeTrafficHistoryOut(BaseModel):
     node_id: int
-    from_ts: datetime
-    to_ts: datetime
+    from_ts: UTCDateTime
+    to_ts: UTCDateTime
     samples: list[NodeTrafficSamplePoint] = Field(default_factory=list)
 
 
@@ -170,8 +170,8 @@ class VPNNodeOut(VPNNodeCreate):
     # ``is_active=True``. Surfaced so the admin UI can warn operators —
     # otherwise a node that's toggled "active" but still cooling down
     # looks eligible and silently gets no traffic.
-    cooldown_until: datetime | None = None
-    suspect_since: datetime | None = None
+    cooldown_until: UTCDateTime | None = None
+    suspect_since: UTCDateTime | None = None
     # True iff node.relay_config is populated (i.e. it's a relay attached
     # to some wg_exit_node). Private key lives encrypted in the link row;
     # we only expose the boolean so the admin UI can filter attachable
@@ -604,9 +604,9 @@ class ProvisioningTaskOut(BaseModel):
     payload: dict[str, Any] | None
     result: dict[str, Any] | None = None
     error_message: str | None
-    created_at: datetime
-    started_at: datetime | None
-    finished_at: datetime | None
+    created_at: UTCDateTime
+    started_at: UTCDateTime | None
+    finished_at: UTCDateTime | None
     # Best-effort lookup: for device/subscription tasks we resolve the
     # owning user's telegram_id so the admin Tasks table can show who
     # the job belongs to without a second round-trip. None for node
@@ -709,14 +709,14 @@ class HealthPingPerNode(BaseModel):
 
 
 class HealthPingTimeseriesPoint(BaseModel):
-    bucket_ts: datetime
+    bucket_ts: UTCDateTime
     ok: int
     bad: int
 
 
 class HealthPingSummaryOut(BaseModel):
-    from_ts: datetime
-    to_ts: datetime
+    from_ts: UTCDateTime
+    to_ts: UTCDateTime
     hours: int
     bucket: str  # "hour" | "day"
     totals: HealthPingTotals
