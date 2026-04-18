@@ -1,4 +1,4 @@
-import { useQuery } from "@tanstack/react-query";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useState } from "react";
 import { api } from "./api";
 
@@ -83,11 +83,36 @@ function fmtAge(iso: string | null): string {
 
 export function WorkerHealthBadge() {
   const [open, setOpen] = useState(false);
+  const qc = useQueryClient();
   const { data } = useQuery<TicksStatusOut>({
     queryKey: ["ops-ticks-status"],
     queryFn: () => api.get("/ops/ticks/status"),
     refetchInterval: 15_000,
     retry: false,
+  });
+
+  const restart = useMutation({
+    mutationFn: () =>
+      api.post<{ signalled: string[]; failed: string[] }>(
+        "/ops/worker/restart",
+        {},
+      ),
+    onSuccess: (res) => {
+      const ok = res.signalled.length;
+      const bad = res.failed.length;
+      alert(
+        bad
+          ? `Сигнал shutdown отправлен ${ok} воркер(ам), ошибок: ${bad}\n${res.failed.join("\n")}`
+          : `Сигнал shutdown отправлен ${ok} воркер(ам). Docker перезапустит их автоматически.`,
+      );
+      // Дать воркеру секунд 20 на graceful exit + рестарт контейнера, потом
+      // прогоним опрос заново чтобы светофор отразил новую жизнь.
+      setTimeout(
+        () => qc.invalidateQueries({ queryKey: ["ops-ticks-status"] }),
+        20_000,
+      );
+    },
+    onError: (e: Error) => alert(`Не удалось: ${e.message}`),
   });
 
   const { s, label } = severity(data);
@@ -113,12 +138,30 @@ export function WorkerHealthBadge() {
         >
           <div className="flex justify-between items-center">
             <span className="font-semibold text-slate-200">Workers ({data.workers.length})</span>
-            <button
-              onClick={() => setOpen(false)}
-              className="text-slate-400 hover:text-slate-200"
-            >
-              ✕
-            </button>
+            <div className="flex gap-2 items-center">
+              <button
+                onClick={() => {
+                  if (
+                    confirm(
+                      "Рестартовать воркер? Graceful shutdown — текущий job доработает до конца, docker поднимет контейнер заново (~20 сек). Юзеры не увидят обрыва.",
+                    )
+                  ) {
+                    restart.mutate();
+                  }
+                }}
+                disabled={restart.isPending || data.workers.length === 0}
+                className="text-[11px] px-2 py-0.5 rounded bg-amber-700 hover:bg-amber-600 text-white disabled:opacity-50 disabled:cursor-not-allowed"
+                title="Graceful RQ shutdown. Docker с restart: unless-stopped поднимет воркер заново, bootstrap переставит тики."
+              >
+                {restart.isPending ? "…" : "↻ Рестарт"}
+              </button>
+              <button
+                onClick={() => setOpen(false)}
+                className="text-slate-400 hover:text-slate-200"
+              >
+                ✕
+              </button>
+            </div>
           </div>
           {data.workers.length === 0 ? (
             <div className="text-red-400">

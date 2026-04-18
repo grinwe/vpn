@@ -378,6 +378,16 @@ class TicksStatusOut(BaseModel):
     ticks: list[TickStatusItem] = Field(default_factory=list)
 
 
+class WorkerRestartOut(BaseModel):
+    """Кого удалось пнуть shutdown'ом через pubsub, кого — нет.
+
+    Docker restart policy поднимет контейнер заново; воркер гарантированно
+    доделает текущий job до выхода (warm shutdown RQ).
+    """
+    signalled: list[str] = Field(default_factory=list)
+    failed: list[str] = Field(default_factory=list)
+
+
 class ExitEvacuateOut(BaseModel):
     """Результат массового переезда подписок с exit A на exit B.
 

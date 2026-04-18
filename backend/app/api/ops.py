@@ -17,11 +17,13 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Header, HTTPException
+from sqlalchemy.orm import Session
 
 from .. import schemas
 from ..auth import require_admin
 from ..queue import RESULT_TTL, TICK_IDS, get_queue
+from ._common import ADMIN_ACTOR_HEADER, _audit, _resolve_admin_actor, get_db
 
 router = APIRouter()
 
@@ -199,4 +201,64 @@ def ticks_status(admin_token: str = Depends(require_admin)):
         queue_available=queue_available,
         workers=workers,
         ticks=ticks,
+    )
+
+
+@router.post("/ops/worker/restart", response_model=schemas.WorkerRestartOut)
+def restart_workers(
+    db: Session = Depends(get_db),
+    admin_token: str = Depends(require_admin),
+    admin_actor: str | None = Header(default=None, alias=ADMIN_ACTOR_HEADER),
+):
+    """Graceful shutdown всех RQ-воркеров через Redis pub/sub.
+
+    RQ слушает команду в своём pubsub-треде и завершается после текущего
+    job'а (warm shutdown — in-flight provisioning не оборвётся). Docker
+    compose с ``restart: unless-stopped`` поднимет контейнер заново,
+    bootstrap в ``main()`` переставит все tick'и с ``replace=True``.
+
+    Удобно когда scheduler-форк молча умер и светофор красный — одним
+    кликом из UI перезапускаем вместо ``docker compose restart worker``
+    на хосте.
+    """
+    queue = get_queue()
+    if queue is None:
+        raise HTTPException(status_code=503, detail="Redis queue unavailable")
+
+    from rq import Worker
+    from rq.command import send_shutdown_command
+
+    try:
+        workers = Worker.all(queue=queue)
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(
+            status_code=503, detail=f"Failed to enumerate workers: {exc}"
+        ) from exc
+
+    if not workers:
+        raise HTTPException(status_code=404, detail="No registered workers")
+
+    signalled: list[str] = []
+    failed: list[str] = []
+    for w in workers:
+        try:
+            send_shutdown_command(queue.connection, w.name)
+            signalled.append(w.name)
+        except Exception as exc:  # noqa: BLE001
+            failed.append(f"{w.name}: {exc}")
+
+    actor, actor_type = _resolve_admin_actor(admin_actor)
+    _audit(
+        db,
+        actor,
+        "worker_restart",
+        "worker",
+        None,
+        actor_type=actor_type,
+        metadata={"signalled": signalled, "failed": failed},
+    )
+
+    return schemas.WorkerRestartOut(
+        signalled=signalled,
+        failed=failed,
     )
