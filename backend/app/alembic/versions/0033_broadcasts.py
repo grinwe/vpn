@@ -22,6 +22,7 @@ from __future__ import annotations
 
 from alembic import op
 import sqlalchemy as sa
+from sqlalchemy.dialects import postgresql
 from sqlalchemy.dialects.postgresql import JSONB
 
 
@@ -32,12 +33,20 @@ depends_on = None
 
 
 def upgrade() -> None:
-    # create_type=False: явный .create(..., checkfirst=True) ниже сам
-    # идемпотентно заведёт тип. Без этого флага op.create_table повесит
-    # before_create-хук, который дёрнет CREATE TYPE ещё раз — уже без
-    # checkfirst — и упадёт на DuplicateObject, если на прошлой попытке
-    # миграция уже создала тип, но завалилась на create_table.
-    status_enum = sa.Enum(
+    # Идемпотентное CREATE TYPE через raw DO-block — как в 0026/0008.
+    # sa.Enum(..., create_type=False) в колонке не надёжен: родительский
+    # sa.Enum при _resolve_for_create создаёт новый PG-impl без флага,
+    # и _on_table_create всё равно дёргает CREATE TYPE. postgresql.ENUM
+    # с create_type=False железно пропускает before_create-хук.
+    op.execute(
+        "DO $$ BEGIN "
+        "IF NOT EXISTS (SELECT 1 FROM pg_type WHERE typname='broadcast_status') "
+        "THEN CREATE TYPE broadcast_status AS ENUM "
+        "('queued','sending','completed','cancelled','failed'); "
+        "END IF; END $$;"
+    )
+
+    status_enum = postgresql.ENUM(
         "queued",
         "sending",
         "completed",
@@ -46,14 +55,10 @@ def upgrade() -> None:
         name="broadcast_status",
         create_type=False,
     )
-    sa.Enum(
-        "queued",
-        "sending",
-        "completed",
-        "cancelled",
-        "failed",
-        name="broadcast_status",
-    ).create(op.get_bind(), checkfirst=True)
+
+    bind = op.get_bind()
+    if sa.inspect(bind).has_table("broadcasts"):
+        return
 
     op.create_table(
         "broadcasts",
@@ -102,4 +107,4 @@ def downgrade() -> None:
     op.drop_index("ix_broadcasts_created_at", table_name="broadcasts")
     op.drop_index("ix_broadcasts_status", table_name="broadcasts")
     op.drop_table("broadcasts")
-    sa.Enum(name="broadcast_status").drop(op.get_bind(), checkfirst=True)
+    op.execute("DROP TYPE IF EXISTS broadcast_status")
