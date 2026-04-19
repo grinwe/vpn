@@ -1093,6 +1093,138 @@ def run_user_health_ping_tick() -> dict:
     return summary
 
 
+def run_broadcast_dispatch_tick() -> dict:
+    """Admin broadcast dispatcher — батч-рассылка юзерам из Broadcast-очереди.
+
+    Раз в BROADCAST_DISPATCH_INTERVAL (default 10s) проверяет, есть ли
+    broadcast в `queued/sending`. Берёт один (старый сначала) и режет
+    юзеров по target_filter'у батчем BROADCAST_BATCH_SIZE (default 50).
+    На каждого пишет AuditLog(admin_broadcast), который поднимет
+    bot-поллер и доставит через `send_message`.
+
+    Почему один broadcast за тик, а не все сразу
+    ---------------------------------------------
+    Тик запускается каждые 10s. Если броадкастов в очереди два, второй
+    подождёт 10s — это OK, bot всё равно через rate-limit не пропустит
+    два залпа одновременно (0.05s sleep между send_message для
+    admin_broadcast).
+
+    Курсор: `last_user_id_cursor` монотонно растёт. Исчерпали batch
+    (len < BROADCAST_BATCH_SIZE) → `status=completed`, `completed_at=now`.
+    Отменённый broadcast (`status=cancelled`) просто пропускается — ни
+    один ещё-не-отправленный батч ему не уйдёт.
+
+    Self-reschedule в начале тела (см. run_pending_rescue_tick).
+    """
+    from . import models
+    from .api.broadcasts import resolve_target_query, TargetFilter
+    from .db import SessionLocal
+    from .queue import schedule_tick
+    from .time_utils import utcnow
+
+    interval = int(os.getenv("BROADCAST_DISPATCH_INTERVAL", "10"))
+    batch_size = int(os.getenv("BROADCAST_BATCH_SIZE", "50"))
+
+    if interval > 0:
+        try:
+            schedule_tick(
+                "app.worker.run_broadcast_dispatch_tick",
+                interval,
+                tick_id="tick-broadcast-dispatch",
+                replace=True,
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("broadcast_dispatch: failed to re-enqueue tick")
+
+    summary: dict = {
+        "processed": 0,
+        "sent": 0,
+        "completed": 0,
+    }
+    session = SessionLocal()
+    try:
+        bc = (
+            session.query(models.Broadcast)
+            .filter(
+                models.Broadcast.status.in_(
+                    [
+                        models.BroadcastStatus.queued,
+                        models.BroadcastStatus.sending,
+                    ]
+                )
+            )
+            .order_by(models.Broadcast.id.asc())
+            .first()
+        )
+        if bc is None:
+            return summary
+
+        now = utcnow()
+        if bc.status == models.BroadcastStatus.queued:
+            bc.status = models.BroadcastStatus.sending
+            bc.started_at = now
+
+        try:
+            tf = TargetFilter(**bc.target_filter)
+        except Exception:  # noqa: BLE001
+            # Шейп в БД битый — помечаем failed, больше не трогаем.
+            logger.exception(
+                "broadcast_dispatch: bad target_filter on broadcast %s: %r",
+                bc.id, bc.target_filter,
+            )
+            bc.status = models.BroadcastStatus.failed
+            bc.completed_at = now
+            session.commit()
+            return summary
+
+        q = resolve_target_query(session, tf)
+        users = (
+            q.filter(models.User.id > bc.last_user_id_cursor)
+            .order_by(models.User.id.asc())
+            .limit(batch_size)
+            .all()
+        )
+
+        if not users:
+            # Исчерпали фильтр — финализируем.
+            bc.status = models.BroadcastStatus.completed
+            bc.completed_at = now
+            session.commit()
+            summary["completed"] = 1
+            summary["processed"] = 1
+            return summary
+
+        for u in users:
+            session.add(
+                models.AuditLog(
+                    actor="broadcast_dispatch",
+                    actor_type=models.AuditActor.system,
+                    action="admin_broadcast",
+                    target_type="broadcast",
+                    target_id=bc.id,
+                    extra={
+                        "telegram_id": str(u.telegram_id),
+                        "text": bc.text,
+                        "broadcast_id": bc.id,
+                    },
+                )
+            )
+            bc.sent_count += 1
+            bc.last_user_id_cursor = max(bc.last_user_id_cursor, u.id)
+
+        summary["sent"] = len(users)
+        summary["processed"] = 1
+        session.commit()
+    except Exception:  # noqa: BLE001
+        logger.exception("broadcast_dispatch: tick failed")
+        if session.is_active:
+            session.rollback()
+    finally:
+        session.close()
+
+    return summary
+
+
 def run_provisioning_task(task_id: int, node_id: int | None = None) -> dict:
     """RQ job — executed by the worker process."""
     from .db import SessionLocal
@@ -1423,6 +1555,27 @@ def main() -> None:
             )
         except Exception:  # noqa: BLE001
             logger.exception("Failed to schedule user health-ping tick")
+
+    # Admin broadcast dispatcher — тянет Broadcast-рассылки батчами из
+    # таблицы broadcasts и пишет AuditLog(admin_broadcast) по одной
+    # строке на юзера. Интервал BROADCAST_DISPATCH_INTERVAL (default 10s),
+    # disabled при 0.
+    broadcast_interval = int(os.getenv("BROADCAST_DISPATCH_INTERVAL", "10"))
+    if do_bootstrap and broadcast_interval > 0:
+        try:
+            schedule_tick(
+                "app.worker.run_broadcast_dispatch_tick",
+                min(broadcast_interval, 30),
+                tick_id="tick-broadcast-dispatch",
+                replace=True,
+            )
+            logger.info(
+                "Broadcast dispatch tick bootstrapped: first run in %ss (interval=%ss)",
+                min(broadcast_interval, 30),
+                broadcast_interval,
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("Failed to schedule broadcast dispatch tick")
 
     worker = Worker(
         queues_to_listen,

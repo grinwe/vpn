@@ -46,9 +46,10 @@ async def notification_poller(bot: Bot):
                     continue
                 try:
                     keyboard = None
-                    if notif.get("type") == "config_ready":
+                    notif_type = notif.get("type")
+                    if notif_type == "config_ready":
                         keyboard = onboarding_keyboard()
-                    elif notif.get("type") == "health_ping_request":
+                    elif notif_type == "health_ping_request":
                         keyboard = health_ping_keyboard(notif.get("subscription_id"))
                     await bot.send_message(
                         chat_id=int(telegram_id),
@@ -63,6 +64,13 @@ async def notification_poller(bot: Bot):
                             headers=headers,
                         ):
                             pass  # Best-effort ack
+                    # Для admin_broadcast спим между сообщениями, чтобы не
+                    # упереться в Telegram rate-limit ~30 msg/sec. При
+                    # батче в 50 рассылок тик отпустится за ~2.5s. Для
+                    # остальных типов (config_ready, health_ping_request,
+                    # admin_alert_*) задержка не нужна — их мало.
+                    if notif_type == "admin_broadcast":
+                        await asyncio.sleep(0.05)
                 except Exception:
                     logger.exception("Failed to deliver notification to %s", telegram_id)
 

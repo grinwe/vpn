@@ -37,6 +37,7 @@ _TICK_INTERVAL_ENV = {
     "tick-traffic-stats": ("TRAFFIC_STATS_INTERVAL", "300"),
     "tick-relay-link-health": ("RELAY_LINK_HEALTH_INTERVAL", "300"),
     "tick-health-ping": ("USER_HEALTH_PING_INTERVAL", "1800"),
+    "tick-broadcast-dispatch": ("BROADCAST_DISPATCH_INTERVAL", "10"),
 }
 
 

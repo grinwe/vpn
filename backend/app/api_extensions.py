@@ -531,6 +531,12 @@ def get_pending_notifications(
         "admin_alert_user_report",
         "admin_alert_infra_ssh",
         "admin_alert_infra_dlq",
+        # Admin broadcast — кастомная рассылка юзерам через /admin/broadcasts.
+        # Текст готовится на backend-е при create и режется батчами в
+        # run_broadcast_dispatch_tick (см. worker.py). Bot-поллер доставляет
+        # с дополнительной задержкой 0.05s на send, чтобы не упереться
+        # в Telegram rate-limit ~30 msg/sec.
+        "admin_broadcast",
     ]
     logs = (
         db.query(models.AuditLog)
@@ -615,10 +621,11 @@ def get_pending_notifications(
                 "быстрее находить и устранять проблемы.\n\n"
                 "Спасибо, что вы с нами! 💛"
             )
-        elif log.action.startswith("admin_alert_"):
+        elif log.action.startswith("admin_alert_") or log.action == "admin_broadcast":
             # Текст готов на backend-е в hook-site (submit_health_ping_response,
-            # run_relay_link_health_tick, dlq_exception_handler). Если extra.text
-            # пуст — AuditLog-строка битая, тихо пропускаем.
+            # run_relay_link_health_tick, dlq_exception_handler, а для
+            # broadcast — в POST /api/broadcasts). Если extra.text пуст —
+            # AuditLog-строка битая, тихо пропускаем.
             text = extra.get("text") or ""
             if not text:
                 continue

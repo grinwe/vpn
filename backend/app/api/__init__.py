@@ -21,6 +21,7 @@ from ..auth import require_admin
 from . import (
     audit,
     autoscale,
+    broadcasts,
     cloud,
     exits,
     health,
@@ -63,6 +64,7 @@ router.include_router(cloud.router)
 router.include_router(autoscale.router)
 router.include_router(exits.router)
 router.include_router(ops.router)
+router.include_router(broadcasts.router)
 
 
 __all__ = [

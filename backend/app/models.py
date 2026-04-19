@@ -817,3 +817,52 @@ class BalanceTransaction(Base):
     created_at = Column(DateTime, default=utcnow, nullable=False, index=True)
 
     user = relationship("User", back_populates="balance_transactions")
+
+
+class BroadcastStatus(str, enum.Enum):
+    queued = "queued"
+    sending = "sending"
+    completed = "completed"
+    cancelled = "cancelled"
+    failed = "failed"
+
+
+class Broadcast(Base):
+    """Админская рассылка сообщений юзерам через бота.
+
+    Логика dispatch-а — в `run_broadcast_dispatch_tick`: тик берёт
+    следующий `queued/sending` broadcast, режет юзеров по target_filter
+    батчами по BROADCAST_BATCH_SIZE, пишет `AuditLog(admin_broadcast)`
+    по одной строке на юзера. Bot-поллер подхватывает и шлёт в телегу
+    с задержкой 0.05s (≤20 msg/sec, под Telegram API).
+
+    target_filter shapes:
+      * {"type": "all"}      — все юзеры с telegram_id
+      * {"type": "active"}   — юзеры с активной подпиской
+      * {"type": "ids", "ids": [1,2,3]}  — конкретные User.id
+
+    Курсор `last_user_id_cursor` сохраняется между тиками — tick
+    стартует с `User.id > cursor ORDER BY id ASC LIMIT batch`. На первом
+    проходе считается и запоминается `total_recipients` для прогресс-бара.
+    """
+
+    __tablename__ = "broadcasts"
+
+    id = Column(Integer, primary_key=True)
+    created_at = Column(DateTime, default=utcnow, nullable=False, index=True)
+    created_by = Column(String(64), nullable=False)
+    text = Column(Text, nullable=False)
+    target_filter = Column(JSONB, nullable=False)
+    status = Column(
+        Enum(BroadcastStatus, name="broadcast_status"),
+        default=BroadcastStatus.queued,
+        nullable=False,
+        index=True,
+    )
+    total_recipients = Column(Integer, nullable=True)
+    sent_count = Column(Integer, default=0, nullable=False)
+    failed_count = Column(Integer, default=0, nullable=False)
+    last_user_id_cursor = Column(Integer, default=0, nullable=False)
+    started_at = Column(DateTime, nullable=True)
+    completed_at = Column(DateTime, nullable=True)
+    cancelled_reason = Column(String(255), nullable=True)

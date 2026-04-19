@@ -466,3 +466,73 @@ export interface NodeHealthPingStatsOut {
   bad_ratio: number;
   last_bad_at: string | null;
 }
+
+// ---- Broadcasts ----
+
+export type BroadcastStatus =
+  | "queued"
+  | "sending"
+  | "completed"
+  | "cancelled"
+  | "failed";
+
+export type BroadcastTargetFilter =
+  | { type: "all" }
+  | { type: "active" }
+  | { type: "ids"; ids: number[] };
+
+export interface BroadcastOut {
+  id: number;
+  created_at: string;
+  created_by: string;
+  text: string;
+  target_filter: BroadcastTargetFilter;
+  status: BroadcastStatus;
+  total_recipients: number | null;
+  sent_count: number;
+  failed_count: number;
+  last_user_id_cursor: number;
+  started_at: string | null;
+  completed_at: string | null;
+  cancelled_reason: string | null;
+}
+
+export interface BroadcastListResponse {
+  items: BroadcastOut[];
+  total: number;
+  has_more: boolean;
+}
+
+export function listBroadcasts(
+  params: { limit?: number; offset?: number; status?: string } = {},
+) {
+  const qs = new URLSearchParams();
+  if (params.limit !== undefined) qs.set("limit", String(params.limit));
+  if (params.offset !== undefined) qs.set("offset", String(params.offset));
+  if (params.status) qs.set("status", params.status);
+  const suffix = qs.toString() ? `?${qs}` : "";
+  return api.get<BroadcastListResponse>(`/broadcasts${suffix}`);
+}
+
+export function getBroadcast(id: number) {
+  return api.get<BroadcastOut>(`/broadcasts/${id}`);
+}
+
+export function createBroadcast(body: {
+  text: string;
+  target_filter: BroadcastTargetFilter;
+}) {
+  return api.post<BroadcastOut>("/broadcasts", body);
+}
+
+export function previewBroadcast(body: {
+  target_filter: BroadcastTargetFilter;
+}) {
+  return api.post<{ recipient_count: number }>("/broadcasts/preview", body);
+}
+
+export function cancelBroadcast(id: number, reason?: string) {
+  return api.post<BroadcastOut>(`/broadcasts/${id}/cancel`, {
+    reason: reason ?? null,
+  });
+}
