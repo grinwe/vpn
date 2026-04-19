@@ -32,6 +32,11 @@ depends_on = None
 
 
 def upgrade() -> None:
+    # create_type=False: явный .create(..., checkfirst=True) ниже сам
+    # идемпотентно заведёт тип. Без этого флага op.create_table повесит
+    # before_create-хук, который дёрнет CREATE TYPE ещё раз — уже без
+    # checkfirst — и упадёт на DuplicateObject, если на прошлой попытке
+    # миграция уже создала тип, но завалилась на create_table.
     status_enum = sa.Enum(
         "queued",
         "sending",
@@ -39,8 +44,16 @@ def upgrade() -> None:
         "cancelled",
         "failed",
         name="broadcast_status",
+        create_type=False,
     )
-    status_enum.create(op.get_bind(), checkfirst=True)
+    sa.Enum(
+        "queued",
+        "sending",
+        "completed",
+        "cancelled",
+        "failed",
+        name="broadcast_status",
+    ).create(op.get_bind(), checkfirst=True)
 
     op.create_table(
         "broadcasts",
