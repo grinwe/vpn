@@ -915,6 +915,44 @@ def run_relay_link_health_tick() -> dict:
     session = SessionLocal()
     try:
         summary = relay_link_health.collect_all_relay_links(session)
+
+        # Admin push-алерт при серийных SSH/WG-фейлах. Дедуп по пустому
+        # ключу — «не чаще раза в ADMIN_ALERT_DEDUP_WINDOW_SEC, независимо
+        # от того какие relay упали». Имена упавших relay уходят в текст,
+        # числа — в extra для admin-UI.
+        failed = int(summary.get("relays_ssh_failed", 0) or 0)
+        threshold = int(os.getenv("ADMIN_ALERT_SSH_FAILED_THRESHOLD", "1"))
+        if failed >= threshold:
+            try:
+                from .services.admin_notify import notify_admins
+
+                names = summary.get("failed_relay_names") or []
+                names_line = (
+                    f"Ноды: {', '.join(names)}\n" if names else ""
+                )
+                no_match = int(summary.get("links_no_match", 0) or 0)
+                alert_text = (
+                    f"⚠️ WireGuard/SSH проблемы на {failed} relay-нодах.\n"
+                    f"{names_line}"
+                    f"links_no_match={no_match}.\n"
+                    f"Проверь /admin/nodes."
+                )
+                notify_admins(
+                    session,
+                    kind="infra_ssh",
+                    text=alert_text,
+                    dedup_key={},
+                    extra={
+                        "relays_ssh_failed": failed,
+                        "failed_relay_names": list(names),
+                        "links_no_match": no_match,
+                    },
+                    autocommit=True,
+                )
+            except Exception:  # noqa: BLE001
+                logger.exception(
+                    "relay_link_health: notify_admins failed"
+                )
     except Exception:  # noqa: BLE001
         logger.exception("relay_link_health: tick failed")
         if session.is_active:
@@ -1124,6 +1162,42 @@ def dlq_exception_handler(job, exc_type, exc_value, tb):  # noqa: ARG001
                 )
             )
             session.commit()
+
+            # Admin push-алерт на DLQ-событие. Дедуп по task_id —
+            # разные таски пушатся независимо, повтор того же task_id
+            # за ADMIN_ALERT_DLQ_WINDOW_SEC (5 мин по умолчанию) —
+            # подавляется. Окно короче общего ADMIN_ALERT_DEDUP_WINDOW_SEC,
+            # потому что повтор DLQ по тому же task_id — патологический
+            # случай, но хоть один такой за 5 минут интересен ровно
+            # один раз.
+            try:
+                from .services.admin_notify import notify_admins
+
+                exc_name = exc_type.__name__ if exc_type else "?"
+                err_preview = str(exc_value)[:300]
+                dlq_text = (
+                    f"❌ Провижининг упал: task={task_id} "
+                    f"job={job.id}\n"
+                    f"{exc_name}: {err_preview}"
+                )
+                notify_admins(
+                    session,
+                    kind="infra_dlq",
+                    text=dlq_text,
+                    dedup_key={"task_id": task_id},
+                    extra={
+                        "job_id": job.id,
+                        "exc_type": exc_name,
+                    },
+                    window_sec=int(
+                        os.getenv("ADMIN_ALERT_DLQ_WINDOW_SEC", "300")
+                    ),
+                    autocommit=True,
+                )
+            except Exception:  # noqa: BLE001
+                logger.exception(
+                    "notify_admins не отработал для DLQ task %s", task_id
+                )
         finally:
             session.close()
     except Exception:  # noqa: BLE001

@@ -27,6 +27,7 @@ from .config import get_settings
 from .db import SessionLocal
 from .rate_limit import limiter
 from .security import decrypt as _decrypt
+from .services.admin_notify import notify_admins
 from .time_utils import utcnow
 
 logger = logging.getLogger(__name__)
@@ -523,6 +524,13 @@ def get_pending_notifications(
         "renewal_reminder_1d", "expiry_reminder_1d",
         "config_ready", "migration_notice",
         "low_balance_warning", "trial_expiry_warning", "health_ping_request",
+        # Admin push-уведомления (см. services/admin_notify.py).
+        # Текст полностью рендерится на backend-е и кладётся в
+        # extra["text"] — бот отдаёт as-is, без собственного
+        # форматирования по kind.
+        "admin_alert_user_report",
+        "admin_alert_infra_ssh",
+        "admin_alert_infra_dlq",
     ]
     logs = (
         db.query(models.AuditLog)
@@ -607,6 +615,13 @@ def get_pending_notifications(
                 "быстрее находить и устранять проблемы.\n\n"
                 "Спасибо, что вы с нами! 💛"
             )
+        elif log.action.startswith("admin_alert_"):
+            # Текст готов на backend-е в hook-site (submit_health_ping_response,
+            # run_relay_link_health_tick, dlq_exception_handler). Если extra.text
+            # пуст — AuditLog-строка битая, тихо пропускаем.
+            text = extra.get("text") or ""
+            if not text:
+                continue
         # elif log.action == "sharing_warning":
         #     text = (
         #         "Привет! 👋 Мы заметили, что к твоему аккаунту "
@@ -717,6 +732,40 @@ def submit_health_ping_response(
             },
         )
     )
+
+    # Плохой ответ (или self-reported «VPN не работает») → алерт
+    # админам через бота. Дедуп по (node_id, user_id) за окно
+    # ADMIN_ALERT_DEDUP_WINDOW_SEC, чтобы один юзер, жмущий кнопку
+    # 50 раз за минуту, не захламил пуши. Не коммитим внутри хелпера —
+    # db.commit() ниже положит и user-report-row, и admin-alert-rows
+    # одной транзакцией (или обе откатятся).
+    if body.answer == "bad":
+        node_label = f"#{node_id}" if node_id else "?"
+        sub_label = f"#{body.subscription_id}" if body.subscription_id else "?"
+        admin_text = (
+            f"🚨 Юзер tg={body.telegram_id} (id={user.id}) жалуется: "
+            f"VPN не работает.\n"
+            f"Нода: {node_label}, подписка: {sub_label}, источник: {source}"
+        )
+        try:
+            notify_admins(
+                db,
+                kind="user_report",
+                text=admin_text,
+                dedup_key={"node_id": node_id, "user_id": user.id},
+                extra={
+                    "source": source,
+                    "subscription_id": body.subscription_id,
+                },
+            )
+        except Exception:  # noqa: BLE001
+            # Алерт админу — best effort, не ломаем user-facing flow,
+            # если notify_admins упал (DB-race, missing ADMIN_TELEGRAM_IDS
+            # уже покрыт внутри хелпера, но мало ли).
+            logger.exception(
+                "notify_admins не отработал для health-ping-response"
+            )
+
     db.commit()
     return {"ok": True}
 

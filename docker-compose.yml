@@ -83,6 +83,16 @@ services:
       # block on grinwer.online does not kill installed clients.
       SUB_LINK_BASE_URL: ${SUB_LINK_BASE_URL:-}
       ANSIBLE_PLAYBOOK_TIMEOUT: ${ANSIBLE_PLAYBOOK_TIMEOUT:-300}
+      # Admin push-уведомления: backend шлёт в телегу по тем же
+      # telegram_id'шникам, что бот считает админами. Одна переменная
+      # в .env (ADMIN_IDS), два контейнерных алиаса — бот читает
+      # ADMIN_IDS, backend ADMIN_TELEGRAM_IDS (имя говорит куда шлём).
+      ADMIN_TELEGRAM_IDS: ${ADMIN_IDS}
+      # Дедуп окна для разных типов алертов (см. services/admin_notify.py
+      # и worker.dlq_exception_handler).
+      ADMIN_ALERT_DEDUP_WINDOW_SEC: ${ADMIN_ALERT_DEDUP_WINDOW_SEC:-600}
+      ADMIN_ALERT_SSH_FAILED_THRESHOLD: ${ADMIN_ALERT_SSH_FAILED_THRESHOLD:-1}
+      ADMIN_ALERT_DLQ_WINDOW_SEC: ${ADMIN_ALERT_DLQ_WINDOW_SEC:-300}
     ports:
       - "127.0.0.1:8000:8000"
     depends_on:
@@ -167,6 +177,13 @@ services:
       USER_HEALTH_PING_INTERVAL: ${USER_HEALTH_PING_INTERVAL:-1800}
       USER_HEALTH_PING_BATCH: ${USER_HEALTH_PING_BATCH:-50}
       USER_HEALTH_PING_DEBOUNCE_HOURS: ${USER_HEALTH_PING_DEBOUNCE_HOURS:-24}
+      # Admin push-уведомления: тиковый воркер читает те же ADMIN_IDS,
+      # чтобы alert-ы из run_relay_link_health_tick / dlq_exception_handler
+      # пошли нужным людям.
+      ADMIN_TELEGRAM_IDS: ${ADMIN_IDS}
+      ADMIN_ALERT_DEDUP_WINDOW_SEC: ${ADMIN_ALERT_DEDUP_WINDOW_SEC:-600}
+      ADMIN_ALERT_SSH_FAILED_THRESHOLD: ${ADMIN_ALERT_SSH_FAILED_THRESHOLD:-1}
+      ADMIN_ALERT_DLQ_WINDOW_SEC: ${ADMIN_ALERT_DLQ_WINDOW_SEC:-300}
     volumes:
       - ${PROVISIONING_SSH_KEY:?Set PROVISIONING_SSH_KEY to the host path of the SSH private key}:/run/secrets/provisioning_key:ro
     depends_on:

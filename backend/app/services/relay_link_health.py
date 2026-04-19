@@ -157,11 +157,17 @@ def collect_all_relay_links(session) -> dict[str, Any]:
     for link in links:
         links_by_relay.setdefault(link.relay_node_id, []).append(link)
 
-    stats = {
+    stats: dict[str, Any] = {
         "relays_total": len(links_by_relay),
         "relays_ssh_failed": 0,
         "links_updated": 0,
         "links_no_match": 0,
+        # Список имён relay, у которых SSH упал — нужен для текста
+        # admin-alert-а («SSH упал на нодах: node-5, node-8»). Счётчик
+        # relays_ssh_failed остаётся для обратной совместимости
+        # (старые callers могут на него смотреть), а имена — для
+        # человекочитаемого рендеринга.
+        "failed_relay_names": [],
     }
     now = utcnow()
 
@@ -177,6 +183,7 @@ def collect_all_relay_links(session) -> dict[str, Any]:
                 relay.id, relay.name, exc,
             )
             stats["relays_ssh_failed"] += 1
+            stats["failed_relay_names"].append(relay.name)
             continue
         logger.info(
             "relay_link_health: relay=%s links=%d dump_peers=%d "
