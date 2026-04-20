@@ -21,6 +21,7 @@ import logging
 import os
 import time
 from datetime import datetime
+from typing import Literal
 from urllib.parse import parse_qsl
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Request
@@ -262,8 +263,20 @@ class SubscriptionWebAppExtra(BaseModel):
     # device still fits in the already-paid envelope (e.g. user had
     # bought a slot then removed a device).
     next_extra_fee_kopecks: int
-    # Total monthly cost including extra device surcharge. UI should
-    # display this instead of plan_price_kopecks when showing "N ₽/мес".
+    # Renewal period derived from ``plan.duration_days`` (>=365 → year,
+    # else month). Frontend uses it to pick the "₽/год" vs "₽/мес"
+    # label and the correct amount from ``total_per_period_kopecks``.
+    period: Literal["month", "year"]
+    # What the user will be charged on the next renewal. For monthly
+    # plans: ``price + slots * EXTRA_DEVICE_MONTHLY_KOPECKS``. For
+    # annual: ``price + slots * EXTRA_DEVICE_MONTHLY_KOPECKS * 12``
+    # (device-slots are prepaid for the whole year on activation). This
+    # is the honest "N ₽/period" number the UI should show.
+    total_per_period_kopecks: int
+    # Deprecated alias of ``total_per_period_kopecks``, kept for ~2
+    # releases because Telegram caches the WebApp bundle aggressively
+    # and old clients still read this field. New code must use
+    # ``total_per_period_kopecks``.
     total_monthly_kopecks: int
     devices: list[DeviceSummary]
 
@@ -351,6 +364,10 @@ def _build_subscription_extras(
             if plan and live_devices + 1 > capacity
             else 0
         )
+        period: Literal["month", "year"] = "year" if duration >= 365 else "month"
+        total_per_period = (
+            balance_svc.total_renewal_cost_kopecks(sub) if plan else price
+        )
         extras.append(
             SubscriptionWebAppExtra(
                 subscription_id=sub.id,
@@ -366,7 +383,9 @@ def _build_subscription_extras(
                 extra_device_slots=slots,
                 extra_device_monthly_kopecks=balance_svc.EXTRA_DEVICE_MONTHLY_KOPECKS,
                 next_extra_fee_kopecks=next_extra_fee,
-                total_monthly_kopecks=price + slots * balance_svc.EXTRA_DEVICE_MONTHLY_KOPECKS,
+                period=period,
+                total_per_period_kopecks=total_per_period,
+                total_monthly_kopecks=total_per_period,
                 devices=[
                     DeviceSummary(
                         id=d.id,
@@ -383,11 +402,17 @@ def _build_subscription_extras(
         if days_left is not None and sub.status == models.SubscriptionStatus.active:
             # Total runway = current period remaining + future renewals
             # the balance can cover (only if auto_renew is on).
+            # Renewal cost includes the device-slot surcharge — see
+            # balance.total_renewal_cost_kopecks. Pre-fix this used bare
+            # plan price, so users with paid slots saw an inflated
+            # runway (e.g. 532 дн вместо ~120 дн при 2 слотах).
             runway = days_left
-            if sub.auto_renew and price > 0:
-                balance = user.balance_kopecks or 0
-                future_renewals = balance // price
-                runway += future_renewals * duration
+            if sub.auto_renew and plan:
+                renewal_cost = balance_svc.total_renewal_cost_kopecks(sub)
+                if renewal_cost > 0:
+                    balance = user.balance_kopecks or 0
+                    future_renewals = balance // renewal_cost
+                    runway += future_renewals * duration
             min_days = runway if min_days is None else min(min_days, runway)
 
     return extras, min_days

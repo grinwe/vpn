@@ -326,7 +326,11 @@ function SubscriptionCard({
     }
   }
 
-  const priceRub = extra ? (extra.total_monthly_kopecks / 100).toFixed(0) : null;
+  const priceKopecks = extra
+    ? extra.total_per_period_kopecks ?? extra.total_monthly_kopecks
+    : null;
+  const priceRub = priceKopecks !== null ? (priceKopecks / 100).toFixed(0) : null;
+  const periodLabel = extra?.period === "year" ? "год" : "мес";
   const expiresDate = extra?.expires_at
     ? new Date(extra.expires_at).toLocaleDateString("ru-RU", { day: "numeric", month: "long" })
     : null;
@@ -340,7 +344,7 @@ function SubscriptionCard({
       <div className="text-tg-hint text-sm">{sub.region}</div>
       {extra && priceRub && (
         <div className="text-tg-hint text-xs mt-1">
-          {priceRub} ₽/мес
+          {priceRub} ₽/{periodLabel}
           {expiresDate && !isFrozen && (
             <> · {extra.auto_renew ? "до" : "истекает"} {expiresDate}</>
           )}
