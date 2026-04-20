@@ -149,7 +149,7 @@
 
 | переменная | default | кто читает | описание |
 |---|---|---|---|
-| `SUB_LINK_BASE_URL` | `""` | backend, worker, bot | Base URL sub-links вида `<base>/<sub_token>`. Пусто → sub links disabled, клиенты получают raw URIs. **Зеркалится** в backend и worker, потому что обе стороны пишут `Device.connection_uri`. Указывать на «boring» CDN-домен, не на основной grinwer.online — RKN-блокировка основного не убьёт installed-клиентов. |
+| `SUB_LINK_BASE_URL` | `""` | backend, worker, bot | Base URL sub-links вида `<base>/<sub_token>`. Пусто → sub links disabled, клиенты получают raw URIs. **Зеркалится** в backend и worker, потому что обе стороны пишут `Device.connection_uri`. Указывать на «boring» CDN-домен, не на основной grinwer.online — RKN-блокировка основного не убьёт installed-клиентов. **CDN-фронт обязан отдавать HTTP/1.1**: RKN DPI на мобильных операторах режет H2 stream после TLS-handshake (headers доходят, тело — нет), H1.1 проскакивает. На Cloudflare отключение HTTP/2 требует Pro-плана (Free-план оставляет H2 включённым). Текущий фронт — `grn-ssync.pro` (CF Worker `v8-sub`, проксирует `/<token>` → `https://grinwer.online/api/sub/<token>`). |
 
 ## Warm credential pool
 

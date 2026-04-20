@@ -18,13 +18,20 @@
       Put it in a vaulted group_vars file, e.g.
       group_vars/monitoring/vault.yml with ansible-vault encrypt.
 
-- name: Install docker + compose plugin
+- name: Check if docker is installed
+  ansible.builtin.command: docker --version
+  register: docker_check
+  changed_when: false
+  failed_when: false
+
+- name: Install docker + compose plugin (Ubuntu packages)
   ansible.builtin.apt:
     name:
       - docker.io
       - docker-compose-plugin
     state: present
     update_cache: true
+  when: docker_check.rc != 0
 
 - name: Ensure docker is running
   ansible.builtin.systemd:

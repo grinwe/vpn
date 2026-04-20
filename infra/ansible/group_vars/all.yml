@@ -1,0 +1,8 @@
+---
+# Global vars applied to every host in the inventory.
+
+# Public IP of the monitoring host — node_exporter firewall rules
+# allow scraping only from this address. Shared across vpn_nodes and
+# wg_exit_nodes so we don't have to duplicate it per-group.
+node_exporter_allowed_ips:
+  - "45.14.244.140"

@@ -70,17 +70,19 @@ pipelining = True
 
 ## Inventory
 
-**Статический inventory** — `inventories/prod/hosts.yml` — содержит **только инфраструктуру**:
+**Статический inventory** — `inventories/prod/hosts.yml` — содержит инфраструктуру **и snapshot fleet'а для static plays**:
 
 ```yaml
-db_host:     { mgmt-1       → 45.14.244.140 }
-monitoring:  { nl-monitoring → 45.14.244.140 }
-web:         { nl-web       → 45.14.244.140 }
+db_host:        { mgmt-1       → 45.14.244.140 }
+monitoring:     { nl-monitoring → 45.14.244.140 }
+web:            { nl-web       → 45.14.244.140 }
+vpn_nodes:      { ru-*         → RU relay-ноды }
+wg_exit_nodes:  { kr-*, fr-*, tq-*, uk-*, ur-* → non-RU exit-ноды }
 ```
 
-Все три — один и тот же IP. Разделение только логическое: когда появится вторая машина, это тривиальный inventory-edit.
+Первые три — один и тот же IP. Разделение только логическое: когда появится вторая машина, это тривиальный inventory-edit. Группы `vpn_nodes`/`wg_exit_nodes` нужны для **bulk/static operator-plays** (`monitoring`, ручной rollout bootstrap'а, fleet-wide audit). Это **snapshot**, не источник истины.
 
-**VPN-ноды в inventory не записываются.** Секция `vpn_nodes:` закомментирована. Реальные ноды приходят из **базы данных** и материализуются в **temp-inventory на лету** при каждом `run_playbook`-вызове (функция `build_inventory_for_node` в `backend/app/services/ansible_runner.py`, рендерит через `.format()` шаблон вида):
+**Provisioning runtime inventory — всё ещё dynamic из БД.** Реальные ноды для ad-hoc `run_playbook`-вызовов из backend'а материализуются в **temp-inventory на лету** (функция `build_inventory_for_node` в `backend/app/services/ansible_runner.py`, рендерит через `.format()` шаблон вида):
 
 ```yaml
 all:
@@ -109,7 +111,7 @@ all:
 
 **Cleanup контракт.** `build_inventory_for_node` возвращает путь к файлу с `delete=False`, и **каллер обязан** вызвать `inventory.unlink()` в `finally`-блоке — иначе `/tmp` забивается по одному файлу на каждый прогон. Текущие вызовы (`provisioning.py::_run_ansible`, `warm_pool.py::_warm_bundle`/`_physical_revoke`) это делают; перед добавлением нового caller'а проверьте grep'ом.
 
-Для ручных операторских прогонов (`ansible-playbook site.yml`) inventory с реальными VPN-нодами просто не существует в git-репо — это сознательное решение. Заливку с оператор-машины предполагается делать с подменой через `-i`.
+Для ручных операторских прогонов (`ansible-playbook site.yml`) используется snapshot из `hosts.yml`. **Дрейф-риск:** fleet ведётся в БД (`VPNNode`-таблица) как источник истины; `hosts.yml` — ручной snapshot, обновляется оператором при добавлении/выводе нод. Если после спавна новой ноды забыть добавить её в `hosts.yml`, monitoring play её не накроет (node_exporter не встанет, Prometheus target не появится). Pre-flight check отсутствует — жить с этим, пока fleet маленький; при росте — либо dynamic inventory script из БД, либо обязательный step в runbook'е спавна ноды.
 
 ## `site.yml` — главный playbook
 

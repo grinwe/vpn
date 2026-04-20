@@ -269,7 +269,25 @@ rsync --delete --exclude=.git --exclude=__pycache__ --exclude=admin/node_modules
 
 Prometheus + Grafana живут в отдельном `docker-compose.yml` под `/opt/vpn-monitoring` (роль `monitoring_stack`). Порты Prometheus/Grafana bind'ятся на `127.0.0.1` — доступ через SSH-tunnel (`ssh -L 3000:127.0.0.1:3000 root@45.14.244.140`). Это сознательный выбор: ничего дополнительного наружу не торчит, auth делегирован SSH'у.
 
-Prometheus scrape'ит `http://backend:8000/metrics` через docker network (сеть compose backend'а). Подробнее — вне скоупа этого документа, см. код роли.
+Prometheus scrape'ит `http://backend:8000/metrics` через docker network (сеть compose backend'а).
+
+**Node coverage.** Prometheus job'ы рендерятся из inventory: `vpn-nodes` (группа `vpn_nodes`, RU-relay) и `wg-exit-nodes` (группа `wg_exit_nodes`, non-RU exit). Monitoring play в `site.yml` запускается на объединении этих групп (`vpn_nodes:wg_exit_nodes`) — роль `node_exporter` ставит экспортёр на каждой ноде, firewall-правило открывает порт 9100 **только** для IP из `node_exporter_allowed_ips` (см. `group_vars/all.yml`). Добавили ноду в inventory — перекатили `--tags monitoring`, в `prometheus.yml` появится новая target'а.
+
+**Docker install идемпотентен.** Роль сначала проверяет `docker --version`; если Docker уже стоит (например, Docker CE из официального репо), `apt install docker.io` пропускается — иначе apt ломается на конфликте пакетов `docker.io` vs `docker-ce` + `containerd.io`.
+
+**Grafana datasource uid.** Provisioned datasource шаблон явно задаёт `uid: prometheus` — дашборды в `docs/dashboards/` ссылаются на `{ type: prometheus, uid: "prometheus" }`, без явного uid они отваливались с «Datasource prometheus was not found».
+
+## Sub-link CDN proxy
+
+`Device.connection_uri` содержит «dynamic subscription URL» формата `<SUB_LINK_BASE_URL>/<sub_token>`. Если указать прямой `https://grinwer.online/api/sub/<token>` — RKN-блок основного домена уложит всех installed-клиентов. Поэтому фронт — отдельный «boring» домен на Cloudflare.
+
+Текущий рабочий конфиг:
+
+- **Домен:** `grn-ssync.pro` (CF-зона, Pro plan).
+- **Worker:** `v8-sub` — делает `fetch(https://grinwer.online/api/sub/${token})` и стримит ответ обратно. Код есть в CF Dashboard Workers; в репо не коммитим (короткий, держим ближе к инфре).
+- **CF Protocol settings:** `HTTP/2 = off`, `HTTP/3 = off`. **Критично**: RKN DPI на мобильном 4G режет H2 stream после TLS-handshake — headers доходят, тело 584 байта теряется. HTTP/1.1 проскакивает. На Free-плане CF тумблер HTTP/2 заблокирован — нужен Pro.
+- **env:** `SUB_LINK_BASE_URL=https://grn-ssync.pro`. Зеркалится в backend и worker (см. `operations/env-reference.md`).
+- **Миграция существующих Device'ов:** **не делаем**. Старые строки с `https://grinwer.online/...` остаются; установленные клиенты продолжают работать до тех пор, пока домен не заблочат окончательно. Новые Device'ы (provisioning после деплоя env) получают новый URL. По жалобам — правим `connection_uri` вручную по `id`.
 
 ## Volumes и persistence
 

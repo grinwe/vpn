@@ -51,7 +51,7 @@
   roles:
     - db_host
 
-- hosts: vpn_nodes
+- hosts: vpn_nodes:wg_exit_nodes
   become: yes
   tags: [monitoring]
   roles:

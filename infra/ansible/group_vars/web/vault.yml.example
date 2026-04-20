@@ -55,3 +55,10 @@ vault_cloudflare_api_token: "replace-me-cf-dns-edit-token"
 # Mint via POST /api/api-tokens, then paste the returned plaintext here.
 # Leave empty to skip — probe-agent container will restart-loop on 401.
 vault_probe_agent_token: ""
+
+# Public base URL baked into Device.connection_uri. Point at a CF
+# Worker (or other CDN-fronted proxy) that forwards /<token> to
+# https://grinwer.online/api/sub/<token> — this insulates installed
+# clients from an RKN block on grinwer.online. Leave empty to fall
+# back to the backend's own domain. See Worker code in the ops notes.
+vault_sub_link_base_url: ""
