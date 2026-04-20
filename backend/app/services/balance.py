@@ -111,6 +111,29 @@ def plan_price_kopecks(plan: models.Plan) -> int:
     return int(round(float(plan.price) * 100))
 
 
+def total_renewal_cost_kopecks(sub: models.Subscription) -> int:
+    """Full kopecks that the next renewal will bill: plan + slots.
+
+    ``EXTRA_DEVICE_MONTHLY_KOPECKS`` is a *per calendar month* price, so
+    an annual plan with N slots prepays ``N * EXTRA * 12`` on renewal —
+    device-slots are scoped to the sub's period, not the calendar
+    month. Without this scaling a user with 2 slots on a yearly plan
+    would look like they only owe 2 × monthly_fee for the whole year,
+    and UI runway (``balance // renewal_cost``) would overstate by 11×.
+
+    Used by every surface that asks "can this wallet afford the next
+    renewal / how many renewals fit": webapp /me, bot /balance, worker
+    low-balance warning, legacy days_remaining.
+    """
+    plan = sub.plan
+    if plan is None:
+        return 0
+    base = plan_price_kopecks(plan)
+    slots = sub.extra_device_slots or 0
+    months = max(1, (plan.duration_days or 30) // 30)
+    return base + slots * EXTRA_DEVICE_MONTHLY_KOPECKS * months
+
+
 def min_topup_kopecks(db: Session) -> int:
     """Dynamic minimum topup = cheapest visible plan price."""
     cheapest = (
@@ -595,12 +618,34 @@ def sub_days_remaining(
 
 
 def days_remaining(user: models.User, plan: models.Plan, devices: int) -> int:
-    """V1 compat — how many months this balance can buy."""
-    price = plan_price_kopecks(plan)
-    if price <= 0:
+    """V1 compat — how many days this balance can buy at the sub level.
+
+    Picks the user's active sub on this plan so device-slot surcharge
+    is included via ``total_renewal_cost_kopecks``. Falls back to bare
+    plan price when there's no live sub yet (e.g. pre-activation
+    preview).
+    """
+    sub = next(
+        (
+            s
+            for s in (user.subscriptions or [])
+            if s.plan_id == plan.id
+            and s.status
+            in (
+                models.SubscriptionStatus.active,
+                models.SubscriptionStatus.frozen,
+            )
+        ),
+        None,
+    )
+    if sub is not None:
+        cost = total_renewal_cost_kopecks(sub)
+    else:
+        cost = plan_price_kopecks(plan)
+    if cost <= 0:
         return 0
-    months = (user.balance_kopecks or 0) // price
-    return months * (plan.duration_days or 30)
+    periods = (user.balance_kopecks or 0) // cost
+    return periods * (plan.duration_days or 30)
 
 
 def _daily_cost_kopecks(plan: models.Plan, device_count: int) -> int:

@@ -493,9 +493,7 @@ def _maybe_emit_low_balance_warning(session, sub) -> None:
     if not user or not user.telegram_id or not user.notify_renewals:
         return
 
-    base_price = balance_svc.plan_price_kopecks(plan)
-    extra_slots = sub.extra_device_slots or 0
-    price = base_price + extra_slots * balance_svc.EXTRA_DEVICE_MONTHLY_KOPECKS
+    price = balance_svc.total_renewal_cost_kopecks(sub)
     if price <= 0:
         return
     wallet = user.balance_kopecks or 0

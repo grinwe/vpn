@@ -486,6 +486,7 @@ def get_balance_by_telegram(
     for sub in subs:
         plan = sub.plan
         price = balance_svc.plan_price_kopecks(plan) if plan else 0
+        duration = plan.duration_days if plan else 30
         days_left = None
         if sub.expires_at:
             delta = (sub.expires_at - now).total_seconds()
@@ -496,13 +497,23 @@ def get_balance_by_telegram(
             "plan_name": plan.name if plan else "",
             "status": sub.status.value,
             "plan_price_kopecks": price,
-            "plan_duration_days": plan.duration_days if plan else 30,
+            "plan_duration_days": duration,
             "expires_at": sub.expires_at.isoformat() if sub.expires_at else None,
             "auto_renew": bool(sub.auto_renew),
             "frozen_until": sub.frozen_until.isoformat() if sub.frozen_until else None,
         })
         if days_left is not None and sub.status == models.SubscriptionStatus.active:
-            min_days = days_left if min_days is None else min(min_days, days_left)
+            # Mirror the webapp runway: days_left + future renewals the
+            # wallet can cover. Must use total_renewal_cost_kopecks so
+            # device-slot surcharge is counted (bare plan_price would
+            # overstate runway for users with paid slots).
+            runway = days_left
+            if sub.auto_renew and plan:
+                renewal_cost = balance_svc.total_renewal_cost_kopecks(sub)
+                if renewal_cost > 0:
+                    balance_k = user.balance_kopecks or 0
+                    runway += (balance_k // renewal_cost) * duration
+            min_days = runway if min_days is None else min(min_days, runway)
 
     return {
         "user_id": user.id,

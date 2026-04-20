@@ -371,3 +371,75 @@ def test_referral_bonus_credits_balance_with_kind_bonus(db_session):
     assert tx.kind == models.BalanceTxKind.bonus
     assert tx.amount_kopecks == balance.REFERRAL_BONUS_KOPECKS
     assert user.balance_kopecks == balance.REFERRAL_BONUS_KOPECKS
+
+
+# ── total_renewal_cost_kopecks ───────────────────────────────────────
+#
+# Truth table: plan period × extra slots. The monthly+slots row is the
+# 2026-04 regression source (webapp runway showed 532 days instead of
+# ~120 because the helper didn't exist and callers divided balance by
+# bare plan price). The yearly+slots row guards against a subtler bug —
+# EXTRA_DEVICE_MONTHLY_KOPECKS is per calendar month, so annual renewal
+# prepays 12× that per slot, not 1×.
+
+def _annual_plan(db):
+    plan = make_plan(db, name="annual")
+    plan.duration_days = 365
+    plan.price = 39  # 39 ₽ → 3900 копеек base
+    db.add(plan)
+    db.commit()
+    db.refresh(plan)
+    return plan
+
+
+def _monthly_plan(db):
+    plan = make_plan(db, name="monthly")
+    plan.price = 7
+    db.add(plan)
+    db.commit()
+    db.refresh(plan)
+    return plan
+
+
+def _sub_with_slots(db, plan, slots: int):
+    node = make_node(db)
+    user = make_user(db, telegram_id=f"tg-slots-{plan.id}-{slots}")
+    sub = make_subscription(db, user, plan, node)
+    sub.extra_device_slots = slots
+    db.add(sub)
+    db.commit()
+    db.refresh(sub)
+    return sub
+
+
+def test_total_renewal_cost_monthly_no_slots(db_session):
+    plan = _monthly_plan(db_session)
+    sub = _sub_with_slots(db_session, plan, 0)
+    assert balance.total_renewal_cost_kopecks(sub) == 700
+
+
+def test_total_renewal_cost_monthly_with_slots(db_session):
+    plan = _monthly_plan(db_session)
+    sub = _sub_with_slots(db_session, plan, 2)
+    # 700 + 2 * 10000 * 1 month
+    assert balance.total_renewal_cost_kopecks(sub) == 700 + 2 * balance.EXTRA_DEVICE_MONTHLY_KOPECKS
+
+
+def test_total_renewal_cost_annual_no_slots(db_session):
+    plan = _annual_plan(db_session)
+    sub = _sub_with_slots(db_session, plan, 0)
+    assert balance.total_renewal_cost_kopecks(sub) == 3900
+
+
+def test_total_renewal_cost_annual_with_slots(db_session):
+    plan = _annual_plan(db_session)
+    sub = _sub_with_slots(db_session, plan, 2)
+    # 3900 + 2 * 10000 * 12 months (365 // 30 == 12)
+    expected = 3900 + 2 * balance.EXTRA_DEVICE_MONTHLY_KOPECKS * 12
+    assert balance.total_renewal_cost_kopecks(sub) == expected
+
+
+def test_total_renewal_cost_no_plan_returns_zero():
+    """Defensive path: detached/orphan sub should not crash callers."""
+    sub = models.Subscription()
+    assert balance.total_renewal_cost_kopecks(sub) == 0
