@@ -269,4 +269,23 @@ def run_playbook(
             cwd=str(ANSIBLE_ROOT),
         )
     except subprocess.TimeoutExpired as exc:
-        raise RuntimeError("Ansible playbook timed out") from exc
+        # subprocess.TimeoutExpired несёт частичный stdout/stderr до
+        # момента kill — без этого в UI /admin/tasks видно только
+        # голое "timed out" и непонятно какой play/task завис.
+        # Пишем tail в сообщение, чтобы _mark_task->error_message
+        # показывало последний прогресс Ansible.
+        def _tail(buf: bytes | str | None, n: int = 40) -> str:
+            if not buf:
+                return ""
+            s = buf.decode(errors="replace") if isinstance(buf, bytes) else buf
+            lines = [ln for ln in s.splitlines() if ln.strip()]
+            return "\n".join(lines[-n:])
+
+        tail_stdout = _tail(exc.stdout)
+        tail_stderr = _tail(exc.stderr)
+        parts = [f"Ansible playbook timed out after {timeout}s"]
+        if tail_stderr:
+            parts.append(f"--- stderr tail ---\n{tail_stderr}")
+        if tail_stdout:
+            parts.append(f"--- stdout tail ---\n{tail_stdout}")
+        raise RuntimeError("\n".join(parts)) from exc

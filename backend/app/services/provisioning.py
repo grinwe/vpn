@@ -1075,8 +1075,20 @@ class ProvisioningOrchestrator:
                     )
                 else:
                     site_vars = _collect_site_extra_vars(self.db, node)
+                    # 900s (15мин) потому что site.yml на свежей relay/jump-ноде
+                    # гонит подряд bootstrap_node + install_vless_reality +
+                    # install_vless_xhttp (certbot/ACME) + relay_jump_node (wg)
+                    # + traffic_collector + probe_agent + sharing_enforcer +
+                    # check_node_health. Дефолт ANSIBLE_PLAYBOOK_TIMEOUT=300
+                    # мал — на первом прогоне xray-download + certbot съедают
+                    # больше половины. Exit/relay_tunnel уже идут на 600, site
+                    # делает строго больше работы → 900 с запасом.
                     result = run_playbook(
-                        "site.yml", inventory, limit=node.name, extra_vars=site_vars,
+                        "site.yml",
+                        inventory,
+                        limit=node.name,
+                        extra_vars=site_vars,
+                        timeout=900,
                     )
             elif task.target_type == "exit":
                 # Stage E — bootstrap/re-bootstrap a WG exit node. Same
