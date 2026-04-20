@@ -51,12 +51,38 @@ class DeviceOut(BaseModel):
     config_id: int | None = None
     access_username: str | None = None
     connection_uri: str | None = None
+    # Per-device placement context for the admin UI. Populated by the
+    # admin serializer (_subscriptions_for_user in api/users.py) from
+    # the sub's already-loaded ``node`` + the first active cred's
+    # ``exit_id``. Left as None/False for non-admin callers (bot
+    # ``_subscriptions_for_user`` in api.py, webapp flows) so the field
+    # additions don't leak sub-level data onto user-facing endpoints.
+    node_name: str | None = None
+    node_region: str | None = None
+    # True iff the sub's VPNNode has ``relay_config`` set — admin UI
+    # renders a red "relay" badge and shows the exit alongside so ops
+    # can tell at a glance which devices tunnel out via WG.
+    is_relay: bool = False
+    # Exit the sub currently egresses through (same value as
+    # SubscriptionOut.current_exit_id; duplicated onto each device so
+    # per-device cards in the admin UI stay self-contained).
+    exit_id: int | None = None
+    exit_name: str | None = None
 
     class Config:
         from_attributes = True
 
     @classmethod
-    def from_orm(cls, obj):  # type: ignore[override]
+    def from_orm(
+        cls,
+        obj,  # type: ignore[override]
+        *,
+        node_name: str | None = None,
+        node_region: str | None = None,
+        is_relay: bool = False,
+        exit_id: int | None = None,
+        exit_name: str | None = None,
+    ):
         from .security import decrypt
 
         return cls(
@@ -66,6 +92,11 @@ class DeviceOut(BaseModel):
             config_id=obj.config_id,
             access_username=obj.access_username,
             connection_uri=decrypt(obj.connection_uri),
+            node_name=node_name,
+            node_region=node_region,
+            is_relay=is_relay,
+            exit_id=exit_id,
+            exit_name=exit_name,
         )
 
 

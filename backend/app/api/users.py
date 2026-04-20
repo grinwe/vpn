@@ -113,6 +113,9 @@ def _subscriptions_for_user(user_id: int, db: Session) -> list[schemas.Subscript
             exit_row = db.get(models.WGExitNode, current_exit_id)
             if exit_row is not None:
                 current_exit_name = exit_row.name
+        node_name = sub.node.name if sub.node else None
+        node_region = sub.node.region if sub.node else None
+        is_relay = bool(sub.node.has_relay_config) if sub.node else False
         item = schemas.SubscriptionOut(
             id=sub.id,
             plan_name=sub.plan.name,
@@ -126,7 +129,17 @@ def _subscriptions_for_user(user_id: int, db: Session) -> list[schemas.Subscript
             auto_renew=sub.auto_renew or False,
             sub_token=sub.sub_token,
             credentials=[schemas.CredentialOut.from_orm(c) for c in sub.credentials],
-            devices=[schemas.DeviceOut.from_orm(d) for d in sub.devices],
+            devices=[
+                schemas.DeviceOut.from_orm(
+                    d,
+                    node_name=node_name,
+                    node_region=node_region,
+                    is_relay=is_relay,
+                    exit_id=current_exit_id,
+                    exit_name=current_exit_name,
+                )
+                for d in sub.devices
+            ],
             sharing_blocked=_sub_sharing_blocked(db, sub),
             current_exit_id=current_exit_id,
             current_exit_name=current_exit_name,

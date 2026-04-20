@@ -786,6 +786,100 @@ export default function Users() {
   );
 }
 
+function DeviceCard({
+  d,
+  revokeDevice,
+}: {
+  d: DeviceOut;
+  revokeDevice: { mutate: (id: number) => void; isPending: boolean };
+}) {
+  const [copied, setCopied] = useState(false);
+  const uri = d.connection_uri ?? "";
+  const exitLabel = d.exit_name
+    ? `${d.exit_name}${d.exit_id ? ` (#${d.exit_id})` : ""}`
+    : d.exit_id
+      ? `#${d.exit_id}`
+      : null;
+
+  async function copyUri() {
+    if (!uri) return;
+    try {
+      await navigator.clipboard.writeText(uri);
+    } catch {
+      const ta = document.createElement("textarea");
+      ta.value = uri;
+      document.body.appendChild(ta);
+      ta.select();
+      try {
+        document.execCommand("copy");
+      } catch {
+        /* empty */
+      }
+      document.body.removeChild(ta);
+    }
+    setCopied(true);
+    setTimeout(() => setCopied(false), 1500);
+  }
+
+  return (
+    <div className="bg-slate-800 rounded px-2 py-1.5 text-xs space-y-1">
+      <div className="flex items-center justify-between gap-2">
+        <span className="truncate">
+          #{d.id}
+          {d.name ? ` · ${d.name}` : ""} · {d.status}
+          {d.is_relay && (
+            <span className="ml-1 px-1 rounded bg-red-900/60 text-red-300">
+              relay
+            </span>
+          )}
+        </span>
+        <button
+          disabled={revokeDevice.isPending}
+          onClick={() => {
+            if (
+              confirm(
+                `Отвязать девайс #${d.id}?\n\nЮзер будет отключён от ноды через Ansible.`,
+              )
+            )
+              revokeDevice.mutate(d.id);
+          }}
+          className="text-xs px-2 py-0.5 rounded bg-red-800 hover:bg-red-700 disabled:opacity-50"
+        >
+          unbind
+        </button>
+      </div>
+      {(d.node_name || d.node_region || exitLabel) && (
+        <div className="text-slate-400 text-[11px]">
+          {d.node_name ?? "—"}
+          {d.node_region && ` · ${d.node_region}`}
+          {exitLabel && (
+            <>
+              {" → exit: "}
+              <span className="text-slate-300">{exitLabel}</span>
+            </>
+          )}
+        </div>
+      )}
+      {uri && (
+        <div className="flex items-center gap-1">
+          <code
+            className="flex-1 truncate font-mono text-[11px] text-slate-300 bg-slate-900/60 rounded px-1 py-0.5"
+            title={uri}
+          >
+            {uri}
+          </code>
+          <button
+            onClick={copyUri}
+            className="text-[11px] px-2 py-0.5 rounded bg-slate-700 hover:bg-slate-600"
+          >
+            {copied ? "✓" : "copy"}
+          </button>
+        </div>
+      )}
+    </div>
+  );
+}
+
 function DeviceList({
   devices,
   revokeDevice,
@@ -804,28 +898,7 @@ function DeviceList({
   return (
     <div className="mt-2 space-y-1">
       {live.map((d) => (
-        <div
-          key={d.id}
-          className="flex items-center justify-between gap-2 bg-slate-800 rounded px-2 py-1 text-xs"
-        >
-          <span className="truncate">
-            #{d.id} · {d.status}
-          </span>
-          <button
-            disabled={revokeDevice.isPending}
-            onClick={() => {
-              if (
-                confirm(
-                  `Отвязать девайс #${d.id}?\n\nЮзер будет отключён от ноды через Ansible.`,
-                )
-              )
-                revokeDevice.mutate(d.id);
-            }}
-            className="text-xs px-2 py-0.5 rounded bg-red-800 hover:bg-red-700 disabled:opacity-50"
-          >
-            unbind
-          </button>
-        </div>
+        <DeviceCard key={d.id} d={d} revokeDevice={revokeDevice} />
       ))}
       {dead.length > 0 && (
         <>
@@ -842,7 +915,8 @@ function DeviceList({
                 className="flex items-center gap-2 bg-slate-900/60 rounded px-2 py-1 text-xs text-slate-500"
               >
                 <span className="truncate">
-                  #{d.id} · {d.status}
+                  #{d.id}
+                  {d.name ? ` · ${d.name}` : ""} · {d.status}
                 </span>
               </div>
             ))}

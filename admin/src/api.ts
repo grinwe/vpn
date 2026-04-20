@@ -133,6 +133,11 @@ export interface DeviceOut {
   config_id: number;
   access_username: string | null;
   connection_uri: string | null;
+  node_name?: string | null;
+  node_region?: string | null;
+  is_relay?: boolean;
+  exit_id?: number | null;
+  exit_name?: string | null;
 }
 
 export interface SubscriptionOut {
