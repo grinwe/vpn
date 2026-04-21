@@ -34,7 +34,7 @@
       {
         "type": "field",
         "ip": ["geoip:ru", "geoip:private"],
-        "outboundTag": "direct"
+        "outboundTag": "direct-local"
       }{% for _rule in _fan_out if _rule.emails %},
       {
         "type": "field",
@@ -96,6 +96,10 @@
           "tcpKeepAliveInterval": 30
         }
       }{% endif %}
+    },
+    {
+      "protocol": "freedom",
+      "tag": "direct-local"
     }{% for _ob in _fan_out %},
     {
       "protocol": "freedom",
