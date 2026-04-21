@@ -407,6 +407,19 @@ class NodeBulkMigrateOut(BaseModel):
     resync_task_ids: list[int] = Field(default_factory=list)
 
 
+class NodeRefreshDestIn(BaseModel):
+    sni: str | None = None
+
+
+class NodeRefreshDestOut(BaseModel):
+    node_id: int
+    old_sni: str
+    new_sni: str
+    sub_count: int
+    failed_subs: list[int] = Field(default_factory=list)
+    task_ids: list[int] = Field(default_factory=list)
+
+
 class TickStatusItem(BaseModel):
     """Снимок одного worker-tick'а.
 

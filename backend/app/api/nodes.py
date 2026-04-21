@@ -27,7 +27,13 @@ from ..services.ansible_runner import (
 from ..services.health import recompute_node_health
 from ..services.node_spawner import NodeSpawnError, destroy_node, spawn_node
 from ..services.provisioning import ProvisioningOrchestrator
-from ._common import ADMIN_ACTOR_HEADER, _audit, _resolve_admin_actor, get_db
+from ._common import (
+    ADMIN_ACTOR_HEADER,
+    _audit,
+    _resolve_admin_actor,
+    get_db,
+    logger,
+)
 
 router = APIRouter()
 
@@ -1377,6 +1383,149 @@ def migrate_node_to_target_route(
         revoke_task_ids=[],
         device_task_ids=device_task_ids,
         resync_task_ids=resync_task_ids,
+    )
+
+
+@router.post(
+    "/nodes/{node_id}/refresh-reality-dest",
+    response_model=schemas.NodeRefreshDestOut,
+)
+def refresh_reality_dest(
+    node_id: int,
+    payload: schemas.NodeRefreshDestIn,
+    db: Session = Depends(get_db),
+    admin_token: str = Depends(require_admin),
+    admin_actor: str | None = Header(default=None, alias=ADMIN_ACTOR_HEADER),
+):
+    """Сменить Reality SNI/dest для ноды и пере-провижинить её активных
+    Device'ов под новый SNI.
+
+    ``payload.sni`` — явный домен (должен быть реальный TLS 1.3 host, НЕ
+    заблокированный в target market). ``None`` → ``pick_reality_sni``
+    выберет наименее используемый домен из ``REALITY_DEST_POOL``.
+
+    Flow:
+        1. Обновляем ``VPNConfig.sni`` + ``fallback`` + ``settings.dest``
+           в БД (source of truth для ansible extra_vars и для URI
+           в ``_build_vless_reality_credential``).
+        2. Для каждой активной Subscription на ноде: revoke_device
+           по каждому Device + reprovision_subscription → свежий Device
+           с новым UUID и cred_text, отражающим новый SNI. Sub-status
+           остаётся active (revoke_device не трогает sub.status).
+        3. Ansible apply внутри reprovision перерендерит xray config
+           с новым ``vless_reality_sni``/``vless_reality_dest``.
+
+    Клиентский flow: Hiddify/v2rayN пуллят /sub/{token} → получают
+    новые URI с новым SNI → handshake идёт с новым fallback cert'ом.
+    Старый URI → handshake reject на xray → клиент пуллит sub-link
+    раньше (force refresh), и восстанавливается.
+    """
+    from sqlalchemy.orm.attributes import flag_modified
+
+    from ..services.node_spawner import REALITY_DEST_POOL, pick_reality_sni
+
+    node = db.get(models.VPNNode, node_id)
+    if not node:
+        raise HTTPException(status_code=404, detail="Node not found")
+
+    cfg = (
+        db.query(models.VPNConfig)
+        .filter(
+            models.VPNConfig.node_id == node_id,
+            models.VPNConfig.protocol == models.VPNConfigProtocol.vless_reality,
+        )
+        .one_or_none()
+    )
+    if cfg is None:
+        raise HTTPException(
+            status_code=400,
+            detail="Node has no vless_reality config to refresh",
+        )
+
+    old_sni = cfg.sni or ""
+    new_sni = payload.sni or pick_reality_sni(db)
+    # Допускаем и sni вне пула — callsite может захотеть форсить
+    # конкретный fallback для ноды (edge-case, whitelist RKN). Но
+    # warn'им если domen явно подозрительный — в MVP только проверяем
+    # что не пустой.
+    if not new_sni:
+        raise HTTPException(status_code=400, detail="Resolved SNI is empty")
+    if new_sni == old_sni:
+        raise HTTPException(
+            status_code=400,
+            detail=f"SNI already equals {new_sni}; noop",
+        )
+
+    new_dest = f"{new_sni}:443"
+    cfg.sni = new_sni
+    cfg.fallback = new_dest
+    cfg.settings = {**(cfg.settings or {}), "dest": new_dest}
+    flag_modified(cfg, "settings")
+    db.commit()
+    db.refresh(cfg)
+
+    # Warm-pool bundles уже содержат ``cred.config_text`` с ОЛД sni
+    # (они построены через ``_build_vless_reality_credential`` в
+    # момент warm_pool refill'а). Если не выбросить — первый юзер на
+    # ноде получит bundle с старым URI и клиент будет handshake'ить
+    # с прежним fallback cert'ом. Invalidate чистит flag'и в БД +
+    # next apply tick с state=absent уберёт их c ноды.
+    from ..services.warm_pool import invalidate_node_warm_pool
+
+    invalidate_node_warm_pool(db, node_id, reason="reality-dest refresh")
+
+    orchestrator = ProvisioningOrchestrator(db)
+    subs = (
+        db.query(models.Subscription)
+        .filter(
+            models.Subscription.node_id == node_id,
+            models.Subscription.status == models.SubscriptionStatus.active,
+        )
+        .all()
+    )
+    failed: list[int] = []
+    task_ids: list[int] = []
+    for sub in subs:
+        try:
+            for device in list(sub.devices):
+                if device.status == models.DeviceStatus.active:
+                    orchestrator.revoke_device(
+                        device, reason="reality-dest refresh"
+                    )
+            _device, task = orchestrator.reprovision_subscription(sub)
+            if task is not None:
+                task_ids.append(task.id)
+        except Exception:  # noqa: BLE001
+            logger.exception(
+                "refresh-reality-dest: reprovision failed sub=%s", sub.id
+            )
+            failed.append(sub.id)
+
+    actor, actor_type = _resolve_admin_actor(admin_actor)
+    _audit(
+        db,
+        actor,
+        "node_reality_dest_refreshed",
+        "vpn_node",
+        node.id,
+        actor_type=actor_type,
+        metadata={
+            "old_sni": old_sni,
+            "new_sni": new_sni,
+            "from_pool": new_sni in REALITY_DEST_POOL,
+            "sub_count": len(subs),
+            "failed_subs": failed,
+            "task_ids": task_ids,
+        },
+    )
+
+    return schemas.NodeRefreshDestOut(
+        node_id=node.id,
+        old_sni=old_sni,
+        new_sni=new_sni,
+        sub_count=len(subs),
+        failed_subs=failed,
+        task_ids=task_ids,
     )
 
 
