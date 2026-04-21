@@ -133,6 +133,7 @@ export interface DeviceOut {
   config_id: number;
   access_username: string | null;
   connection_uri: string | null;
+  node_id?: number | null;
   node_name?: string | null;
   node_region?: string | null;
   is_relay?: boolean;
@@ -183,6 +184,32 @@ export interface SubscriptionSwitchExitIn {
 
 export interface SubscriptionSwitchExitOut {
   subscription_id: number;
+  old_exit_id: number | null;
+  new_exit_id: number;
+  new_interface: string;
+  task_ids: number[];
+}
+
+export interface DeviceMigrateIn {
+  target_node_id: number;
+}
+
+export interface DeviceMigrateOut {
+  old_device_id: number;
+  device_id: number;
+  old_node_id: number;
+  old_node_name: string;
+  new_node_id: number;
+  new_node_name: string;
+  provisioning_task_id: number | null;
+}
+
+export interface DeviceSwitchExitIn {
+  exit_id: number;
+}
+
+export interface DeviceSwitchExitOut {
+  device_id: number;
   old_exit_id: number | null;
   new_exit_id: number;
   new_interface: string;

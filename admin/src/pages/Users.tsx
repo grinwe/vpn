@@ -8,7 +8,9 @@ import {
 import {
   api,
   batchBanUsers,
+  DeviceMigrateOut,
   DeviceOut,
+  DeviceSwitchExitOut,
   NodeRelayLinkOut,
   SubscriptionMigrateOut,
   SubscriptionOut,
@@ -210,6 +212,43 @@ export default function Users() {
       qc.invalidateQueries({ queryKey: ["relay-links"] });
     },
     onError: (e: Error) => alert(`Не удалось сменить exit: ${e.message}`),
+  });
+
+  const migrateDevice = useMutation({
+    mutationFn: ({
+      deviceId,
+      targetNodeId,
+    }: {
+      deviceId: number;
+      targetNodeId: number;
+    }) =>
+      api.post<DeviceMigrateOut>(`/devices/${deviceId}/migrate`, {
+        target_node_id: targetNodeId,
+      }),
+    onSuccess: (res) => {
+      alert(
+        `Device #${res.old_device_id} → #${res.device_id}: ${res.old_node_name} → ${res.new_node_name}. Таск провиженинга #${res.provisioning_task_id ?? "—"} в фоне.`,
+      );
+      qc.invalidateQueries({ queryKey: ["user-subs"] });
+      qc.invalidateQueries({ queryKey: ["provisioning-tasks"] });
+    },
+    onError: (e: Error) => alert(`Не удалось переселить устройство: ${e.message}`),
+  });
+
+  const switchDeviceExit = useMutation({
+    mutationFn: ({ deviceId, exitId }: { deviceId: number; exitId: number }) =>
+      api.post<DeviceSwitchExitOut>(`/devices/${deviceId}/switch-exit`, {
+        exit_id: exitId,
+      }),
+    onSuccess: (res) => {
+      alert(
+        `Device #${res.device_id} переключён на exit #${res.new_exit_id} (${res.new_interface}). Запущено таск: ${res.task_ids.length}.`,
+      );
+      qc.invalidateQueries({ queryKey: ["user-subs"] });
+      qc.invalidateQueries({ queryKey: ["provisioning-tasks"] });
+      qc.invalidateQueries({ queryKey: ["relay-links"] });
+    },
+    onError: (e: Error) => alert(`Не удалось сменить exit устройства: ${e.message}`),
   });
 
   const batchBan = useMutation({
@@ -693,6 +732,9 @@ export default function Users() {
                         <DeviceList
                           devices={s.devices}
                           revokeDevice={revokeDevice}
+                          nodes={allNodes}
+                          migrateDevice={migrateDevice}
+                          switchDeviceExit={switchDeviceExit}
                         />
                       )}
                       <div className="mt-2 flex gap-2">
@@ -789,9 +831,21 @@ export default function Users() {
 function DeviceCard({
   d,
   revokeDevice,
+  nodes,
+  migrateDevice,
+  switchDeviceExit,
 }: {
   d: DeviceOut;
   revokeDevice: { mutate: (id: number) => void; isPending: boolean };
+  nodes: VPNNodeOut[] | undefined;
+  migrateDevice: {
+    mutate: (args: { deviceId: number; targetNodeId: number }) => void;
+    isPending: boolean;
+  };
+  switchDeviceExit: {
+    mutate: (args: { deviceId: number; exitId: number }) => void;
+    isPending: boolean;
+  };
 }) {
   const [copied, setCopied] = useState(false);
   const uri = d.connection_uri ?? "";
@@ -800,6 +854,7 @@ function DeviceCard({
     : d.exit_id
       ? `#${d.exit_id}`
       : null;
+  const isLive = d.status !== "revoked" && d.status !== "disabled";
 
   async function copyUri() {
     if (!uri) return;
@@ -876,6 +931,135 @@ function DeviceCard({
           </button>
         </div>
       )}
+      {isLive && (
+        <MigrateDeviceControl
+          device={d}
+          nodes={nodes}
+          mutation={migrateDevice}
+        />
+      )}
+      {isLive && d.is_relay && d.node_id != null && (
+        <SwitchDeviceExitControl
+          device={d}
+          mutation={switchDeviceExit}
+        />
+      )}
+    </div>
+  );
+}
+
+// Per-device "move to specific node" control. Unlike MigrateSubControl,
+// this keeps sub.node_id in place — the sub becomes split across nodes.
+// Confirmation copy warns the admin that pool/health/cooldown bypass
+// the same way as the sub-level override.
+function MigrateDeviceControl({
+  device,
+  nodes,
+  mutation,
+}: {
+  device: DeviceOut;
+  nodes: VPNNodeOut[] | undefined;
+  mutation: {
+    mutate: (args: { deviceId: number; targetNodeId: number }) => void;
+    isPending: boolean;
+  };
+}) {
+  const [targetId, setTargetId] = useState<string>("");
+  const candidates = (nodes ?? []).filter(
+    (n) => n.is_active && n.id !== device.node_id,
+  );
+  if (candidates.length === 0) return null;
+  const target = candidates.find((n) => String(n.id) === targetId);
+  return (
+    <div className="flex gap-1 items-center">
+      <select
+        value={targetId}
+        onChange={(e) => setTargetId(e.target.value)}
+        className="text-[11px] px-1 py-0.5 rounded bg-slate-800 border border-slate-700 flex-1"
+      >
+        <option value="">— переселить на ноду —</option>
+        {candidates.map((n) => (
+          <option key={n.id} value={String(n.id)}>
+            #{n.id} {n.name} ({n.region})
+          </option>
+        ))}
+      </select>
+      <button
+        disabled={mutation.isPending || !target}
+        onClick={() => {
+          if (!target) return;
+          if (
+            confirm(
+              `Перевести устройство #${device.id} с ноды «${device.node_name ?? "—"}» на «${target.name}» (#${target.id}, ${target.region})?\n\n` +
+                `Остальные устройства подписки остаются на текущей ноде. Пул/health/cooldown НЕ проверяются — ручной override. Старое устройство revoke'нется в фоне, новое поднимется через ansible.`,
+            )
+          )
+            mutation.mutate({
+              deviceId: device.id,
+              targetNodeId: target.id,
+            });
+        }}
+        className="text-[11px] px-2 py-0.5 rounded bg-blue-700 hover:bg-blue-600 disabled:opacity-50"
+      >
+        migrate
+      </button>
+    </div>
+  );
+}
+
+// Per-device exit switch for devices on multi-link relays. Обновляет
+// Credential.exit_id только у кредов этого device'а — соседи по
+// подписке остаются на своём exit'е. Видно только когда links≥2.
+function SwitchDeviceExitControl({
+  device,
+  mutation,
+}: {
+  device: DeviceOut;
+  mutation: {
+    mutate: (args: { deviceId: number; exitId: number }) => void;
+    isPending: boolean;
+  };
+}) {
+  const [targetId, setTargetId] = useState<string>("");
+  const { data: links } = useQuery<NodeRelayLinkOut[]>({
+    queryKey: ["relay-links", device.node_id],
+    queryFn: () => api.get(`/nodes/${device.node_id}/links`),
+    enabled: device.node_id != null,
+  });
+  if (!links || links.length < 2) return null;
+  const candidates = links.filter((l) => l.exit_id !== device.exit_id);
+  if (candidates.length === 0) return null;
+  const target = candidates.find((l) => String(l.exit_id) === targetId);
+  return (
+    <div className="flex gap-1 items-center">
+      <select
+        value={targetId}
+        onChange={(e) => setTargetId(e.target.value)}
+        className="text-[11px] px-1 py-0.5 rounded bg-slate-800 border border-slate-700 flex-1"
+      >
+        <option value="">— сменить exit —</option>
+        {candidates.map((l) => (
+          <option key={l.exit_id} value={String(l.exit_id)}>
+            #{l.exit_id} {l.exit_name ?? ""} ({l.wg_interface_name})
+          </option>
+        ))}
+      </select>
+      <button
+        disabled={mutation.isPending || !target}
+        onClick={() => {
+          if (!target) return;
+          if (
+            confirm(
+              `Переключить устройство #${device.id} с exit #${device.exit_id ?? "—"} на exit #${target.exit_id} (${target.wg_interface_name})?\n\n` +
+                `Остальные устройства подписки не трогаются. reconcile_xray на relay'е сам переместит email в новый direct-wgN. sub_token не меняется.`,
+            )
+          )
+            mutation.mutate({ deviceId: device.id, exitId: target.exit_id });
+        }}
+        className="text-[11px] px-2 py-0.5 rounded bg-purple-700 hover:bg-purple-600 disabled:opacity-50"
+      >
+        switch exit
+      </button>
     </div>
   );
 }
@@ -883,9 +1067,21 @@ function DeviceCard({
 function DeviceList({
   devices,
   revokeDevice,
+  nodes,
+  migrateDevice,
+  switchDeviceExit,
 }: {
   devices: DeviceOut[];
   revokeDevice: { mutate: (id: number) => void; isPending: boolean };
+  nodes: VPNNodeOut[] | undefined;
+  migrateDevice: {
+    mutate: (args: { deviceId: number; targetNodeId: number }) => void;
+    isPending: boolean;
+  };
+  switchDeviceExit: {
+    mutate: (args: { deviceId: number; exitId: number }) => void;
+    isPending: boolean;
+  };
 }) {
   const [showDead, setShowDead] = useState(false);
   const live = devices.filter(
@@ -898,7 +1094,14 @@ function DeviceList({
   return (
     <div className="mt-2 space-y-1">
       {live.map((d) => (
-        <DeviceCard key={d.id} d={d} revokeDevice={revokeDevice} />
+        <DeviceCard
+          key={d.id}
+          d={d}
+          revokeDevice={revokeDevice}
+          nodes={nodes}
+          migrateDevice={migrateDevice}
+          switchDeviceExit={switchDeviceExit}
+        />
       ))}
       {dead.length > 0 && (
         <>
