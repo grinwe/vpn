@@ -296,7 +296,7 @@ export interface VPNNodeCreateIn {
 // роундтрип при открытии модалки — не нужен.
 export const REALITY_DEST_POOL_SUGGESTIONS = [
   "www.yandex.ru",
-  "vk.com",
+  "vk.ru",
   "mail.ru",
   "rutube.ru",
   "lenta.ru",

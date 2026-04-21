@@ -49,7 +49,7 @@ from .vless import generate_reality_keypair, generate_short_id
 # на ``<sni>:443`` — меняйте только вместе с sni.
 REALITY_DEST_POOL: tuple[str, ...] = (
     "www.yandex.ru",
-    "vk.com",
+    "vk.ru",
     "mail.ru",
     "rutube.ru",
     "lenta.ru",

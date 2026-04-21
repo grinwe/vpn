@@ -112,7 +112,7 @@
 
 | переменная | default | кто читает | описание |
 |---|---|---|---|
-| `REALITY_SNI` | _empty_ → pool rotation | backend, worker | «Borrowed» SNI в Reality handshake. Пустое значение включает выбор из `REALITY_DEST_POOL` (`www.yandex.ru`, `vk.com`, `mail.ru`, `rutube.ru`, `lenta.ru`) — наименее используемый домен per-node. Задайте явное значение только чтобы форснуть один SNI для всех новых нод (dev/test). |
+| `REALITY_SNI` | _empty_ → pool rotation | backend, worker | «Borrowed» SNI в Reality handshake. Пустое значение включает выбор из `REALITY_DEST_POOL` (`www.yandex.ru`, `vk.ru`, `mail.ru`, `rutube.ru`, `lenta.ru`) — наименее используемый домен per-node. Задайте явное значение только чтобы форснуть один SNI для всех новых нод (dev/test). |
 | `REALITY_DEST` | `<sni>:443` | backend, worker | Куда Reality проксирует трафик не-VPN клиента. Если не задан — автоматически выводится из выбранного SNI. |
 | `REALITY_PORT` | `443` | backend, worker | Порт inbound'а. Менять только если конфликт с другим сервисом на :443. |
 

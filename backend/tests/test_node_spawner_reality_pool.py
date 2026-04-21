@@ -69,14 +69,14 @@ def test_ensure_reality_config_explicit_sni_wins(db_session) -> None:
 def test_ensure_reality_config_idempotent_preserves_sni(db_session) -> None:
     """Повторный вызов не перезаписывает уже существующий sni."""
     node = make_node(db_session, name="spawn-idem", host="203.0.113.52")
-    first = node_spawner.ensure_reality_config(db_session, node, sni="vk.com")
+    first = node_spawner.ensure_reality_config(db_session, node, sni="vk.ru")
     second = node_spawner.ensure_reality_config(db_session, node, sni="mail.ru")
     assert first.id == second.id
-    assert second.sni == "vk.com"
+    assert second.sni == "vk.ru"
 
 
 def test_reality_dest_pool_has_expected_ru_hosts() -> None:
     """Smoke: пул не пустой, все хосты выглядят как RU-ASN домены."""
     assert len(node_spawner.REALITY_DEST_POOL) >= 3
     assert "www.yandex.ru" in node_spawner.REALITY_DEST_POOL
-    assert "vk.com" in node_spawner.REALITY_DEST_POOL
+    assert "vk.ru" in node_spawner.REALITY_DEST_POOL
