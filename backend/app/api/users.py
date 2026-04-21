@@ -99,23 +99,59 @@ def _subscriptions_for_user(user_id: int, db: Session) -> list[schemas.Subscript
     if not subs:
         raise HTTPException(status_code=404, detail="Subscriptions not found")
     result = []
+    # Cache exit rows across subs/devices to avoid N+1 on the admin
+    # "show user" page when a user has many devices across several subs.
+    exit_name_cache: dict[int, str | None] = {}
+
+    def _exit_name(exit_id: int | None) -> str | None:
+        if exit_id is None:
+            return None
+        if exit_id in exit_name_cache:
+            return exit_name_cache[exit_id]
+        exit_row = db.get(models.WGExitNode, exit_id)
+        exit_name_cache[exit_id] = exit_row.name if exit_row is not None else None
+        return exit_name_cache[exit_id]
+
     for sub in subs:
-        # First live cred's exit_id: every active cred of a sub is
-        # pinned to the same exit (switch_subscription_exit rewrites
-        # them en masse), so any live cred is representative.
-        current_exit_id: int | None = None
+        # Sub-level representative cred → used for SubscriptionOut
+        # aggregate fields (current_exit_*). Per-device routing is
+        # resolved below inside the device loop — after per-device
+        # migrate a sub can be split across nodes/exits.
+        sub_exit_id: int | None = None
         for cred in sub.credentials:
             if cred.is_active and cred.exit_id is not None:
-                current_exit_id = cred.exit_id
+                sub_exit_id = cred.exit_id
                 break
-        current_exit_name: str | None = None
-        if current_exit_id is not None:
-            exit_row = db.get(models.WGExitNode, current_exit_id)
-            if exit_row is not None:
-                current_exit_name = exit_row.name
-        node_name = sub.node.name if sub.node else None
-        node_region = sub.node.region if sub.node else None
-        is_relay = bool(sub.node.has_relay_config) if sub.node else False
+        sub_exit_name = _exit_name(sub_exit_id)
+
+        device_outs: list[schemas.DeviceOut] = []
+        for d in sub.devices:
+            # Resolve the device's actual home: device.config.node is
+            # authoritative post-migrate; fall back to sub.node for
+            # terminal devices whose config_id was nulled out by
+            # config-delete cleanup.
+            d_node = d.config.node if d.config else sub.node
+            d_node_id = d_node.id if d_node else None
+            d_node_name = d_node.name if d_node else None
+            d_node_region = d_node.region if d_node else None
+            d_is_relay = bool(d_node.has_relay_config) if d_node else False
+            d_exit_id: int | None = None
+            for cred in d.credentials:
+                if cred.is_active and cred.exit_id is not None:
+                    d_exit_id = cred.exit_id
+                    break
+            device_outs.append(
+                schemas.DeviceOut.from_orm(
+                    d,
+                    node_id=d_node_id,
+                    node_name=d_node_name,
+                    node_region=d_node_region,
+                    is_relay=d_is_relay,
+                    exit_id=d_exit_id,
+                    exit_name=_exit_name(d_exit_id),
+                )
+            )
+
         item = schemas.SubscriptionOut(
             id=sub.id,
             plan_name=sub.plan.name,
@@ -129,20 +165,10 @@ def _subscriptions_for_user(user_id: int, db: Session) -> list[schemas.Subscript
             auto_renew=sub.auto_renew or False,
             sub_token=sub.sub_token,
             credentials=[schemas.CredentialOut.from_orm(c) for c in sub.credentials],
-            devices=[
-                schemas.DeviceOut.from_orm(
-                    d,
-                    node_name=node_name,
-                    node_region=node_region,
-                    is_relay=is_relay,
-                    exit_id=current_exit_id,
-                    exit_name=current_exit_name,
-                )
-                for d in sub.devices
-            ],
+            devices=device_outs,
             sharing_blocked=_sub_sharing_blocked(db, sub),
-            current_exit_id=current_exit_id,
-            current_exit_name=current_exit_name,
+            current_exit_id=sub_exit_id,
+            current_exit_name=sub_exit_name,
         )
         result.append(item)
     return result

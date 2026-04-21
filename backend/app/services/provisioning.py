@@ -1821,6 +1821,7 @@ class ProvisioningOrchestrator:
         subscription: models.Subscription,
         *,
         device_name: str | None = None,
+        target_node: models.VPNNode | None = None,
     ) -> tuple[models.Device, models.ProvisioningTask]:
         """Add a fresh device to an existing subscription.
 
@@ -1835,9 +1836,16 @@ class ProvisioningOrchestrator:
         ansible apply task. Skips device-limit checks because the
         caller has already validated state (frozen subs have zero
         live devices by construction).
+
+        ``target_node`` — provision the new device on a specific node
+        instead of ``subscription.node``. Used by
+        :meth:`migrate_device_to_node` to relocate a single device
+        without touching ``subscription.node_id``. Warm-pool is bypassed
+        when a target_node is explicitly passed — warm bundles are
+        keyed by sub.node_id and can't be reused on a foreign node.
         """
         user = subscription.user
-        node = subscription.node
+        node = target_node if target_node is not None else subscription.node
         if node is None:
             raise RuntimeError("subscription has no node — cannot reprovision")
         if not node.is_active:
@@ -1850,20 +1858,21 @@ class ProvisioningOrchestrator:
         # ── Warm-pool fast path ─────────────────────────────────────────
         from . import warm_pool
 
-        warm_bundle = warm_pool.try_assign_bundle(self.db, node.id, subscription.id)
-        if warm_bundle:
-            try:
-                device, task = self._wire_warm_bundle(
-                    user, subscription, warm_bundle, device_name
-                )
-                self.db.refresh(subscription)
-                return device, task
-            except Exception:
-                logger.exception("warm-pool wiring failed during reprovision, rolling back")
-                self.db.rollback()
-                raise
-        else:
-            warm_pool.record_pool_miss(self.db, node.id)
+        if target_node is None:
+            warm_bundle = warm_pool.try_assign_bundle(self.db, node.id, subscription.id)
+            if warm_bundle:
+                try:
+                    device, task = self._wire_warm_bundle(
+                        user, subscription, warm_bundle, device_name
+                    )
+                    self.db.refresh(subscription)
+                    return device, task
+                except Exception:
+                    logger.exception("warm-pool wiring failed during reprovision, rolling back")
+                    self.db.rollback()
+                    raise
+            else:
+                warm_pool.record_pool_miss(self.db, node.id)
 
         # ── Cold path ───────────────────────────────────────────────────
         device_label = device_name or "primary"
@@ -2063,6 +2072,60 @@ class ProvisioningOrchestrator:
         device, task = self.reprovision_subscription(subscription)
         return target, device, task
 
+    def migrate_device_to_node(
+        self,
+        device: models.Device,
+        *,
+        target_node_id: int,
+    ) -> tuple[models.VPNNode, models.Device, models.ProvisioningTask]:
+        """Move a single device to a different node, leaving siblings alone.
+
+        Unlike :meth:`migrate_subscription_to_new_node`, ``sub.node_id``
+        stays on the old node — the sub becomes "split" across nodes.
+        Use when admin wants surgical relocation of one client install
+        (e.g. user says "my phone is slow", rest of devices are fine).
+
+        New ``add_device`` calls will still default to the old
+        ``sub.node`` — split state is visible but not sticky for
+        future provisions; admin repeats the override per device.
+
+        ``target_node_id`` bypasses pool/health/capacity/cooldown
+        filters — only ``is_active=True`` is enforced (same semantics
+        as sub-level migrate with explicit target).
+        """
+        if device.status in (
+            models.DeviceStatus.disabled,
+            models.DeviceStatus.revoked,
+        ):
+            raise RuntimeError(
+                f"device is {device.status.value}, must be active/pending"
+            )
+        sub = device.subscription
+        if sub is None:
+            raise RuntimeError("device has no subscription")
+        plan = sub.plan
+        if plan is None:
+            raise RuntimeError("subscription has no plan")
+        old_node = device.config.node if device.config else sub.node
+        if old_node is None:
+            raise RuntimeError("device has no current node")
+        if target_node_id == old_node.id:
+            raise RuntimeError(
+                "target_node_id matches device's current node"
+            )
+
+        target = choose_node(self.db, plan, node_id=target_node_id)
+
+        self.revoke_device(
+            device,
+            reason=f"device-migrate {old_node.id}->{target.id}",
+            background=True,
+        )
+        new_device, task = self.reprovision_subscription(
+            sub, device_name=device.name, target_node=target,
+        )
+        return target, new_device, task
+
     def revoke_device(
         self, device: models.Device, *, reason: str | None = None, background: bool = True
     ) -> models.ProvisioningTask:
@@ -2194,3 +2257,78 @@ class ProvisioningOrchestrator:
         self.db.commit()
         self.run_task_async(task)
         return [task]
+
+    def switch_device_exit(
+        self,
+        device: models.Device,
+        new_exit_id: int,
+    ) -> tuple[int | None, str, list[models.ProvisioningTask]]:
+        """Re-pin one device's creds to a different exit on the same relay.
+
+        Unlike :meth:`switch_subscription_exit`, only credentials with
+        ``device_id=device.id`` are updated — siblings on the same sub
+        stay on their current exits. The relay_tunnel apply task
+        rebuilds xray configs from ``emails_by_iface`` (DB truth):
+        ``reconcile_xray`` reads active creds grouped by
+        ``Credential.exit_id`` via :func:`build_xray_relay_outbounds`,
+        so moving one cred row is enough — no ansible-role changes
+        needed.
+
+        Returns ``(old_exit_id, new_interface, [task])`` so the HTTP
+        route can echo the transition back to the admin.
+        """
+        sub = device.subscription
+        node = device.config.node if device.config else (
+            sub.node if sub is not None else None
+        )
+        if node is None:
+            raise RuntimeError("device has no node")
+        link = (
+            self.db.query(models.RelayExitLink)
+            .filter(
+                models.RelayExitLink.relay_node_id == node.id,
+                models.RelayExitLink.exit_id == new_exit_id,
+            )
+            .first()
+        )
+        if link is None:
+            raise RuntimeError(
+                f"Exit {new_exit_id} is not attached to relay {node.id}"
+            )
+
+        first_cred = (
+            self.db.query(models.Credential)
+            .filter(
+                models.Credential.device_id == device.id,
+                models.Credential.is_active.is_(True),
+            )
+            .first()
+        )
+        old_exit_id = first_cred.exit_id if first_cred is not None else None
+        if old_exit_id == new_exit_id:
+            raise RuntimeError(
+                "device is already routed through this exit"
+            )
+
+        self.db.query(models.Credential).filter(
+            models.Credential.device_id == device.id
+        ).update(
+            {models.Credential.exit_id: new_exit_id},
+            synchronize_session=False,
+        )
+        self.db.flush()
+
+        task = self.create_task(
+            "relay_tunnel",
+            node.id,
+            "apply",
+            {
+                "exit_id": new_exit_id,
+                "switch_device_id": device.id,
+                "new_exit_id": new_exit_id,
+                "new_interface": link.wg_interface_name,
+            },
+        )
+        self.db.commit()
+        self.run_task_async(task)
+        return old_exit_id, link.wg_interface_name, [task]

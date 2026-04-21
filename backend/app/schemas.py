@@ -57,6 +57,7 @@ class DeviceOut(BaseModel):
     # ``exit_id``. Left as None/False for non-admin callers (bot
     # ``_subscriptions_for_user`` in api.py, webapp flows) so the field
     # additions don't leak sub-level data onto user-facing endpoints.
+    node_id: int | None = None
     node_name: str | None = None
     node_region: str | None = None
     # True iff the sub's VPNNode has ``relay_config`` set — admin UI
@@ -77,6 +78,7 @@ class DeviceOut(BaseModel):
         cls,
         obj,  # type: ignore[override]
         *,
+        node_id: int | None = None,
         node_name: str | None = None,
         node_region: str | None = None,
         is_relay: bool = False,
@@ -92,6 +94,7 @@ class DeviceOut(BaseModel):
             config_id=obj.config_id,
             access_username=obj.access_username,
             connection_uri=decrypt(obj.connection_uri),
+            node_id=node_id,
             node_name=node_name,
             node_region=node_region,
             is_relay=is_relay,
@@ -352,6 +355,35 @@ class SubscriptionSwitchExitIn(BaseModel):
 
 class SubscriptionSwitchExitOut(BaseModel):
     subscription_id: int
+    old_exit_id: int | None
+    new_exit_id: int
+    new_interface: str
+    task_ids: list[int]
+
+
+class DeviceMigrateIn(BaseModel):
+    target_node_id: int
+
+
+class DeviceMigrateOut(BaseModel):
+    # old_device_id is the row revoked by the migrate (now status=disabled
+    # but kept in DB for sub_token aliasing); device_id is the freshly
+    # provisioned row on the target node.
+    old_device_id: int
+    device_id: int
+    old_node_id: int
+    old_node_name: str
+    new_node_id: int
+    new_node_name: str
+    provisioning_task_id: int | None
+
+
+class DeviceSwitchExitIn(BaseModel):
+    exit_id: int
+
+
+class DeviceSwitchExitOut(BaseModel):
+    device_id: int
     old_exit_id: int | None
     new_exit_id: int
     new_interface: str

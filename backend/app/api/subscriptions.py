@@ -465,6 +465,139 @@ def switch_subscription_exit(
     )
 
 
+@router.post(
+    "/devices/{device_id}/migrate",
+    response_model=schemas.DeviceMigrateOut,
+)
+def migrate_device(
+    device_id: int,
+    payload: schemas.DeviceMigrateIn,
+    db: Session = Depends(get_db),
+    admin_token: str = Depends(require_admin),
+    admin_actor: str | None = Header(default=None, alias=ADMIN_ACTOR_HEADER),
+):
+    """Admin override: relocate ONE device to a target node.
+
+    Per-device counterpart to ``POST /subscriptions/{id}/migrate``.
+    Leaves ``subscription.node_id`` on the old node — the sub becomes
+    "split" across nodes (future add_device defaults back to sub.node).
+    Use for surgical fixes ("user says only their phone is slow").
+    """
+    device = db.get(models.Device, device_id)
+    if not device:
+        raise HTTPException(status_code=404, detail="Device not found")
+
+    old_node = device.config.node if device.config else (
+        device.subscription.node if device.subscription else None
+    )
+    if old_node is None:
+        raise HTTPException(status_code=400, detail="Device has no node")
+    if payload.target_node_id == old_node.id:
+        raise HTTPException(
+            status_code=400, detail="target_node_id matches device's current node"
+        )
+
+    orchestrator = ProvisioningOrchestrator(db)
+    try:
+        new_node, new_device, task = orchestrator.migrate_device_to_node(
+            device, target_node_id=payload.target_node_id
+        )
+    except RuntimeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    actor, actor_type = _resolve_admin_actor(admin_actor)
+    _audit(
+        db,
+        actor,
+        "device_migrated",
+        "device",
+        new_device.id,
+        actor_type=actor_type,
+        metadata={
+            "old_device_id": device.id,
+            "old_node_id": old_node.id,
+            "old_node_name": old_node.name,
+            "new_node_id": new_node.id,
+            "new_node_name": new_node.name,
+            "subscription_id": device.subscription_id,
+        },
+    )
+    db.commit()
+    return schemas.DeviceMigrateOut(
+        old_device_id=device.id,
+        device_id=new_device.id,
+        old_node_id=old_node.id,
+        old_node_name=old_node.name,
+        new_node_id=new_node.id,
+        new_node_name=new_node.name,
+        provisioning_task_id=task.id if task else None,
+    )
+
+
+@router.post(
+    "/devices/{device_id}/switch-exit",
+    response_model=schemas.DeviceSwitchExitOut,
+)
+def switch_device_exit(
+    device_id: int,
+    payload: schemas.DeviceSwitchExitIn,
+    db: Session = Depends(get_db),
+    admin_token: str = Depends(require_admin),
+    admin_actor: str | None = Header(default=None, alias=ADMIN_ACTOR_HEADER),
+):
+    """Re-pin a single device's creds to a different exit on its relay.
+
+    Per-device counterpart to ``POST /subscriptions/{id}/switch-exit``.
+    Siblings on the same sub stay on their current exits — useful when
+    admin wants to test exit-Y performance on one device before moving
+    the whole sub.
+    """
+    device = db.get(models.Device, device_id)
+    if not device:
+        raise HTTPException(status_code=404, detail="Device not found")
+    if device.status in (
+        models.DeviceStatus.disabled,
+        models.DeviceStatus.revoked,
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail=f"device is {device.status.value}, must be active/pending",
+        )
+
+    orchestrator = ProvisioningOrchestrator(db)
+    try:
+        old_exit_id, new_interface, tasks = orchestrator.switch_device_exit(
+            device, payload.exit_id
+        )
+    except RuntimeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    actor, actor_type = _resolve_admin_actor(admin_actor)
+    _audit(
+        db,
+        actor,
+        "device_exit_switched",
+        "device",
+        device.id,
+        actor_type=actor_type,
+        metadata={
+            "old_exit_id": old_exit_id,
+            "new_exit_id": payload.exit_id,
+            "new_interface": new_interface,
+            "subscription_id": device.subscription_id,
+            "task_count": len(tasks),
+        },
+    )
+    db.commit()
+    return schemas.DeviceSwitchExitOut(
+        device_id=device.id,
+        old_exit_id=old_exit_id,
+        new_exit_id=payload.exit_id,
+        new_interface=new_interface,
+        task_ids=[t.id for t in tasks],
+    )
+
+
 @router.post("/subscriptions/{subscription_id}/unblock-sharing")
 def unblock_sharing(
     subscription_id: int,
