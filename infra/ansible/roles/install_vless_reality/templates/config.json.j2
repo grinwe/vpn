@@ -30,6 +30,11 @@
         "type": "field",
         "inboundTag": ["api-in"],
         "outboundTag": "api"
+      },
+      {
+        "type": "field",
+        "ip": ["geoip:ru", "geoip:private"],
+        "outboundTag": "direct"
       }{% for _rule in _fan_out if _rule.emails %},
       {
         "type": "field",

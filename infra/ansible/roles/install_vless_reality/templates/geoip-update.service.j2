@@ -1,0 +1,20 @@
+[Unit]
+Description=Refresh xray geoip.dat (v2fly community data)
+After=network-online.target
+Wants=network-online.target
+ConditionPathExists=/usr/local/bin/xray
+
+[Service]
+Type=oneshot
+# Atomic replace: если curl упадёт посреди скачивания, старый geoip.dat цел,
+# xray продолжает жить на предыдущей копии. mv и последующий restart xray
+# срабатывают только после успешной выкачки.
+ExecStart=/usr/bin/curl --fail --silent --show-error --location \
+  --max-time 120 \
+  --output /usr/local/share/xray/geoip.dat.new \
+  https://github.com/v2fly/geoip/releases/latest/download/geoip.dat
+ExecStart=/bin/mv /usr/local/share/xray/geoip.dat.new /usr/local/share/xray/geoip.dat
+ExecStart=/bin/systemctl restart xray
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7

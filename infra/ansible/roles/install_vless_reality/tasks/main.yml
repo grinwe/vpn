@@ -56,6 +56,46 @@
     state: present
     update_cache: yes
 
+# geoip.dat нужен до первого рендера config.json: routing-правило
+# `ip: ["geoip:ru", "geoip:private"]` без файла данных не резолвится
+# и xray падает с "failed to load geoip" на старте. force: no значит
+# файл выкачивается один раз на bootstrap; еженедельное обновление —
+# через systemd timer ниже (atomic rename + restart xray).
+- name: Ensure xray data directory
+  file:
+    path: /usr/local/share/xray
+    state: directory
+    owner: root
+    group: root
+    mode: '0755'
+
+- name: Download geoip.dat (v2fly community, MIT)
+  get_url:
+    url: https://github.com/v2fly/geoip/releases/latest/download/geoip.dat
+    dest: /usr/local/share/xray/geoip.dat
+    mode: '0644'
+    force: no
+  notify: restart xray
+
+- name: Install geoip-update systemd units
+  template:
+    src: "{{ item.src }}"
+    dest: "{{ item.dest }}"
+    owner: root
+    group: root
+    mode: '0644'
+  loop:
+    - { src: geoip-update.service.j2, dest: /etc/systemd/system/geoip-update.service }
+    - { src: geoip-update.timer.j2,   dest: /etc/systemd/system/geoip-update.timer }
+  notify: reload systemd
+
+- name: Enable weekly geoip refresh timer
+  systemd:
+    name: geoip-update.timer
+    enabled: yes
+    state: started
+    daemon_reload: yes
+
 - name: Install xray-core from upstream (idempotent)
   shell: |
     set -euo pipefail

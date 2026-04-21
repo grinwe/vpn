@@ -13,7 +13,7 @@ infra/ansible/
 ├── requirements.yml              ← галакси-зависимости (если есть)
 ├── group_vars/
 │   ├── vpn_nodes.yml             ← роли: ansible_user, firewall_allowed_ports,
-│   │                                    vpn_system_user, ssh_public_keys, domain_mask
+│   │                                    vpn_system_user, ssh_public_keys
 │   ├── db.yml
 │   ├── monitoring.yml
 │   ├── web.yml
