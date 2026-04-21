@@ -7,15 +7,18 @@ import {
   NodeActiveUsersOut,
   NodeHealthOut,
   NodeHealthPingStatsOut,
+  NodeRefreshDestOut,
   NodeRelayLinkOut,
   NodeTrafficHistoryOut,
   ProvisioningTaskOut,
+  REALITY_DEST_POOL_SUGGESTIONS,
   VPNConfigCreateIn,
   VPNConfigOut,
   VPNConfigProtocol,
   VPNConfigUpdateIn,
   VPNNodeCreateIn,
   VPNNodeOut,
+  refreshNodeRealityDest,
 } from "../api";
 import { HealthDots } from "../linkHealth";
 import { WorkerHealthBadge } from "../workerHealth";
@@ -279,6 +282,10 @@ export default function Nodes() {
   const [migrateToModal, setMigrateToModal] = useState<
     { from_id: number; from_name: string } | null
   >(null);
+  const [refreshDestModal, setRefreshDestModal] = useState<{
+    node_id: number;
+    node_name: string;
+  } | null>(null);
   const qc = useQueryClient();
 
   // Sync tracked ops from localStorage whenever the component mounts
@@ -611,6 +618,40 @@ export default function Nodes() {
     onError: (e: Error) => alert(`Не удалось запустить диагностику: ${e.message}`),
   });
 
+  const refreshRealityDest = useMutation({
+    mutationFn: (args: {
+      node_id: number;
+      node_name: string;
+      sni: string | null;
+    }) =>
+      refreshNodeRealityDest(args.node_id, { sni: args.sni }).then(
+        (res) => ({ ...res, node_name: args.node_name }),
+      ),
+    onSuccess: (res: NodeRefreshDestOut & { node_name: string }) => {
+      qc.invalidateQueries({ queryKey: ["nodes"] });
+      qc.invalidateQueries({ queryKey: ["node-configs", res.node_id] });
+      qc.invalidateQueries({ queryKey: ["provisioning-tasks"] });
+      qc.invalidateQueries({ queryKey: ["user-subs"] });
+      setRefreshDestModal(null);
+      const failedNote =
+        res.failed_subs.length > 0
+          ? `\n\n⚠ Проваленные подписки (${res.failed_subs.length}): ${res.failed_subs.slice(0, 10).join(", ")}${res.failed_subs.length > 10 ? "…" : ""}`
+          : "";
+      alert(
+        `Reality dest на «${res.node_name}» обновлён: ${res.old_sni} → ${res.new_sni}.\n` +
+          `Затронуто активных подписок: ${res.sub_count}, задач в фоне: ${res.task_ids.length}.` +
+          failedNote,
+      );
+    },
+    onError: (e: Error) => {
+      const extra =
+        e instanceof ApiError && typeof e.detail === "object" && e.detail
+          ? `\n\nДетали: ${JSON.stringify(e.detail, null, 2)}`
+          : "";
+      alert(`Не удалось обновить Reality dest: ${e.message}${extra}`);
+    },
+  });
+
   const setStatus = useMutation({
     mutationFn: ({ id, status }: { id: number; status: string }) =>
       api.patch<VPNNodeOut>(`/nodes/${id}/status`, { status }),
@@ -760,6 +801,22 @@ export default function Nodes() {
               from_name: migrateToModal.from_name,
               to_id,
               to_name,
+            })
+          }
+        />
+      )}
+
+      {refreshDestModal && (
+        <RefreshRealityDestModal
+          nodeId={refreshDestModal.node_id}
+          nodeName={refreshDestModal.node_name}
+          pending={refreshRealityDest.isPending}
+          onCancel={() => setRefreshDestModal(null)}
+          onSubmit={(sni) =>
+            refreshRealityDest.mutate({
+              node_id: refreshDestModal.node_id,
+              node_name: refreshDestModal.node_name,
+              sni,
             })
           }
         />
@@ -963,6 +1020,16 @@ export default function Nodes() {
                         диагностика
                       </button>
                       <button
+                        disabled={refreshRealityDest.isPending}
+                        onClick={() =>
+                          setRefreshDestModal({ node_id: n.id, node_name: n.name })
+                        }
+                        className="text-xs px-2 py-1 rounded bg-indigo-700 hover:bg-indigo-600 disabled:opacity-50"
+                        title="Сменить Reality SNI/dest и перепровижинить активные подписки ноды"
+                      >
+                        обновить reality dest
+                      </button>
+                      <button
                         disabled={deleteNode.isPending}
                         onClick={() => {
                           if (
@@ -1118,6 +1185,149 @@ function MigrateToModal({
             }}
           >
             {pending ? "Переселяем…" : "Переселить"}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ── Refresh Reality dest modal ──────────────────────────────────────
+// Меняет sni/dest у vless_reality конфига ноды + перепровижинит все
+// активные подписки (revoke старого Device + cold reprovision нового).
+// Клиенты подхватят новый URI через sub-refresh (окно деградации 1-2
+// реконнекта). "auto" = _pick_reality_sni по пулу на бэке.
+
+function RefreshRealityDestModal({
+  nodeId,
+  nodeName,
+  pending,
+  onCancel,
+  onSubmit,
+}: {
+  nodeId: number;
+  nodeName: string;
+  pending: boolean;
+  onCancel: () => void;
+  onSubmit: (sni: string | null) => void;
+}) {
+  type Mode = "auto" | "pool" | "custom";
+  const [mode, setMode] = useState<Mode>("auto");
+  const [poolChoice, setPoolChoice] = useState<string>(
+    REALITY_DEST_POOL_SUGGESTIONS[0],
+  );
+  const [custom, setCustom] = useState<string>("");
+
+  const resolvedSni =
+    mode === "auto" ? null : mode === "pool" ? poolChoice : custom.trim();
+  const submitDisabled =
+    pending || (mode === "custom" && !custom.trim());
+
+  return (
+    <div
+      className="fixed inset-0 bg-black/60 flex items-center justify-center z-50"
+      onClick={onCancel}
+    >
+      <div
+        className="bg-slate-800 border border-slate-700 rounded-lg p-6 max-w-lg w-full mx-4"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <h2 className="text-lg font-semibold mb-3">
+          Обновить Reality dest на «{nodeName}»
+        </h2>
+        <p className="text-sm text-slate-400 mb-2">
+          На ноде #{nodeId} обновится sni/dest у vless_reality конфига, и все
+          активные подписки будут перепровижинены с новым UUID + новым sni.
+        </p>
+        <p className="text-sm text-red-400 mb-4">
+          Окно деградации: клиенты, уже подключённые к ноде, увидят 1-2
+          реконнекта. Sub-refresh у клиента (~каждые 6ч или при reject) подтянет
+          новый URI — fix сам.
+        </p>
+
+        <div className="space-y-2 mb-4">
+          <label className="flex items-center gap-2 text-sm">
+            <input
+              type="radio"
+              name="refresh-mode"
+              checked={mode === "auto"}
+              onChange={() => setMode("auto")}
+              disabled={pending}
+            />
+            <span>
+              Авто-выбор из пула{" "}
+              <span className="text-slate-500">
+                (бэк возьмёт наименее используемый SNI)
+              </span>
+            </span>
+          </label>
+          <label className="flex items-center gap-2 text-sm">
+            <input
+              type="radio"
+              name="refresh-mode"
+              checked={mode === "pool"}
+              onChange={() => setMode("pool")}
+              disabled={pending}
+            />
+            <span>Явно из пула:</span>
+            <select
+              className="bg-slate-900 border border-slate-600 rounded px-2 py-1 text-sm disabled:opacity-50"
+              value={poolChoice}
+              onChange={(e) => setPoolChoice(e.target.value)}
+              disabled={pending || mode !== "pool"}
+            >
+              {REALITY_DEST_POOL_SUGGESTIONS.map((sni) => (
+                <option key={sni} value={sni}>
+                  {sni}
+                </option>
+              ))}
+            </select>
+          </label>
+          <label className="flex items-center gap-2 text-sm">
+            <input
+              type="radio"
+              name="refresh-mode"
+              checked={mode === "custom"}
+              onChange={() => setMode("custom")}
+              disabled={pending}
+            />
+            <span>Свой домен:</span>
+            <input
+              type="text"
+              placeholder="example.com"
+              className="flex-1 bg-slate-900 border border-slate-600 rounded px-2 py-1 text-sm font-mono disabled:opacity-50"
+              value={custom}
+              onChange={(e) => setCustom(e.target.value)}
+              disabled={pending || mode !== "custom"}
+            />
+          </label>
+        </div>
+
+        <div className="flex justify-end gap-2">
+          <button
+            className="px-3 py-1.5 rounded bg-slate-700 hover:bg-slate-600 text-sm"
+            onClick={onCancel}
+            disabled={pending}
+          >
+            Отмена
+          </button>
+          <button
+            className="px-3 py-1.5 rounded bg-indigo-700 hover:bg-indigo-600 text-sm disabled:opacity-50"
+            disabled={submitDisabled}
+            onClick={() => {
+              const label =
+                mode === "auto" ? "авто-выбор из пула" : `sni = ${resolvedSni}`;
+              if (
+                confirm(
+                  `Сменить Reality dest на ноде #${nodeId} (${nodeName})?\n\n` +
+                    `Режим: ${label}.\n\n` +
+                    `Все активные подписки ноды будут перепровижинены. Клиенты увидят 1-2 реконнекта.`,
+                )
+              )
+                onSubmit(resolvedSni);
+            }}
+          >
+            {pending ? "Обновляем…" : "Обновить"}
           </button>
         </div>
       </div>

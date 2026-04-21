@@ -290,6 +290,43 @@ export interface VPNNodeCreateIn {
   notes: string | null;
 }
 
+// Список в синке с REALITY_DEST_POOL в backend/app/services/node_spawner.py.
+// Используется как suggestion'ы в refresh-dest модалке. Захардкожен
+// вместо fetch'а из API сознательно: пул меняется редко, лишний
+// роундтрип при открытии модалки — не нужен.
+export const REALITY_DEST_POOL_SUGGESTIONS = [
+  "www.yandex.ru",
+  "vk.com",
+  "mail.ru",
+  "rutube.ru",
+  "lenta.ru",
+] as const;
+
+export interface NodeRefreshDestIn {
+  // null/undefined → бэкенд автоматически выберет из пула наименее
+  // используемый домен.
+  sni?: string | null;
+}
+
+export interface NodeRefreshDestOut {
+  node_id: number;
+  old_sni: string;
+  new_sni: string;
+  sub_count: number;
+  failed_subs: number[];
+  task_ids: number[];
+}
+
+export function refreshNodeRealityDest(
+  nodeId: number,
+  payload: NodeRefreshDestIn,
+): Promise<NodeRefreshDestOut> {
+  return api.post<NodeRefreshDestOut>(
+    `/nodes/${nodeId}/refresh-reality-dest`,
+    payload,
+  );
+}
+
 // Протоколы должны быть в синке с VPNConfigProtocol enum в
 // backend/app/models.py — backend ругнётся 400 на неизвестный.
 // shadowtls+shadowsocks и hysteria2 оставлены в типе, так как их всё
