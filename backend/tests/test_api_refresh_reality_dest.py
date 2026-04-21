@@ -16,6 +16,7 @@ from app.services import node_spawner
 
 from .factories import (
     make_config,
+    make_device,
     make_node,
     make_plan,
     make_subscription_with_device,
@@ -26,7 +27,7 @@ from .factories import (
 def test_refresh_reality_dest_node_not_found(client):
     resp = client.post(
         "/api/nodes/9999/refresh-reality-dest",
-        json={"sni": "vk.com"},
+        json={"sni": "vk.ru"},
     )
     assert resp.status_code == 404
 
@@ -35,7 +36,7 @@ def test_refresh_reality_dest_no_reality_config(client, db_session):
     node = make_node(db_session, name="n-no-reality", host="203.0.113.1")
     resp = client.post(
         f"/api/nodes/{node.id}/refresh-reality-dest",
-        json={"sni": "vk.com"},
+        json={"sni": "vk.ru"},
     )
     assert resp.status_code == 400
     assert "vless_reality" in resp.json()["detail"]
@@ -43,10 +44,10 @@ def test_refresh_reality_dest_no_reality_config(client, db_session):
 
 def test_refresh_reality_dest_noop_when_same_sni(client, db_session):
     node = make_node(db_session, name="n-same", host="203.0.113.2")
-    make_config(db_session, node, sni="vk.com")
+    make_config(db_session, node, sni="vk.ru")
     resp = client.post(
         f"/api/nodes/{node.id}/refresh-reality-dest",
-        json={"sni": "vk.com"},
+        json={"sni": "vk.ru"},
     )
     assert resp.status_code == 400
     assert "already" in resp.json()["detail"].lower()
@@ -61,20 +62,20 @@ def test_refresh_reality_dest_updates_config_and_reprovisions(client, db_session
 
     resp = client.post(
         f"/api/nodes/{node.id}/refresh-reality-dest",
-        json={"sni": "vk.com"},
+        json={"sni": "vk.ru"},
     )
     assert resp.status_code == 200, resp.text
     body = resp.json()
     assert body["node_id"] == node.id
     assert body["old_sni"] == "www.yandex.ru"
-    assert body["new_sni"] == "vk.com"
+    assert body["new_sni"] == "vk.ru"
     assert body["sub_count"] == 1
     assert body["failed_subs"] == []
 
     db_session.refresh(cfg)
-    assert cfg.sni == "vk.com"
-    assert cfg.fallback == "vk.com:443"
-    assert cfg.settings["dest"] == "vk.com:443"
+    assert cfg.sni == "vk.ru"
+    assert cfg.fallback == "vk.ru:443"
+    assert cfg.settings["dest"] == "vk.ru:443"
 
     # sub остаётся active, на ноде появляется новый device с свежим
     # cred_text (UUID и sni — новые). Старый device disabled.
@@ -91,7 +92,7 @@ def test_refresh_reality_dest_updates_config_and_reprovisions(client, db_session
     )
     assert audit is not None
     assert audit.extra["old_sni"] == "www.yandex.ru"
-    assert audit.extra["new_sni"] == "vk.com"
+    assert audit.extra["new_sni"] == "vk.ru"
     assert audit.extra["sub_count"] == 1
 
 
@@ -111,6 +112,44 @@ def test_refresh_reality_dest_auto_picks_from_pool(client, db_session):
     assert cfg.sni == body["new_sni"]
 
 
+def test_refresh_reality_dest_preserves_multi_device_count(client, db_session):
+    """Регрессия: до фикса refresh схлопывал N девайсов сабы в один
+    "primary" — админ терял купленные extra-slots. Сейчас каждый
+    active Device получает свою reprovision пару (revoke old + add new
+    с тем же device_name)."""
+    node = make_node(db_session, name="n-multi", host="203.0.113.40")
+    make_config(db_session, node, sni="www.yandex.ru")
+    plan = make_plan(db_session, max_devices=5)
+    user = make_user(db_session, telegram_id="tg-multi")
+    sub = make_subscription_with_device(
+        db_session, user, plan, node, access_username="u-primary"
+    )
+    cfg_node = node.configs[0]
+    # Два дополнительных девайса в сабу, чтобы sub имел 3 активных.
+    make_device(db_session, sub, cfg_node, access_username="u-extra-1")
+    make_device(db_session, sub, cfg_node, access_username="u-extra-2")
+    db_session.refresh(sub)
+    assert (
+        sum(1 for d in sub.devices if d.status == models.DeviceStatus.active) == 3
+    )
+
+    resp = client.post(
+        f"/api/nodes/{node.id}/refresh-reality-dest",
+        json={"sni": "vk.ru"},
+    )
+    assert resp.status_code == 200, resp.text
+
+    db_session.refresh(sub)
+    active = [d for d in sub.devices if d.status == models.DeviceStatus.active]
+    # После refresh на ноде должно быть 3 fresh Device'а (по одному на
+    # каждый снапшотнутый старый). Ревокнутые остались в БД для
+    # sub_token-aliasing'а, но как disabled.
+    assert len(active) == 3, (
+        f"expected 3 active devices post-refresh, got {len(active)}; "
+        f"statuses: {[d.status.value for d in sub.devices]}"
+    )
+
+
 def test_refresh_reality_dest_accepts_sni_outside_pool(client, db_session):
     """Явный sni вне пула разрешён — admin может форсить whitelist-домен."""
     node = make_node(db_session, name="n-custom", host="203.0.113.30")
@@ -128,7 +167,7 @@ def test_refresh_reality_dest_requires_admin_token(client):
     """Без X-Admin-Token → 401/403 (зависит от require_admin)."""
     resp = client.post(
         "/api/nodes/1/refresh-reality-dest",
-        json={"sni": "vk.com"},
+        json={"sni": "vk.ru"},
         headers={"X-Admin-Token": "wrong"},
     )
     assert resp.status_code in (401, 403)

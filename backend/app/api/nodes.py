@@ -1475,6 +1475,24 @@ def refresh_reality_dest(
     invalidate_node_warm_pool(db, node_id, reason="reality-dest refresh")
 
     orchestrator = ProvisioningOrchestrator(db)
+
+    # Xray на ноде всё ещё держит старый sni в realitySettings.serverNames
+    # и старый dest в fallback cert'е — без re-render'а config.json клиент
+    # с новым URI получит handshake reject. Триггерим bootstrap ПЕРЕД
+    # reprovision'ом девайсов, install_vless_reality рендерит новый
+    # config.json с обновлённым sni/dest (extra_vars подтянет их из
+    # cfg.sni/cfg.settings.dest). Device-apply таски встанут в очередь
+    # ПОСЛЕ bootstrap'а ноды — xray к тому моменту уже рестартнёт с
+    # новым конфигом, новые UUID'ы добавятся штатно через API.
+    bootstrap_task = orchestrator.create_task(
+        "node",
+        node.id,
+        "bootstrap",
+        {"pool_id": node.pool_id, "rerun": True, "reason": "reality-dest refresh"},
+    )
+    db.commit()
+    orchestrator.run_task_async(bootstrap_task, node=node)
+
     subs = (
         db.query(models.Subscription)
         .filter(
@@ -1484,17 +1502,35 @@ def refresh_reality_dest(
         .all()
     )
     failed: list[int] = []
-    task_ids: list[int] = []
+    task_ids: list[int] = [bootstrap_task.id]
     for sub in subs:
         try:
+            # Снимок имён активных девайсов ДО revoke — чтобы не
+            # схлопнуть N девайсов в один "primary" (см. комментарий
+            # в migrate_subscription_to_new_node).
+            live_names = [
+                d.name or "primary"
+                for d in list(sub.devices)
+                if d.status
+                not in (models.DeviceStatus.disabled, models.DeviceStatus.revoked)
+            ]
             for device in list(sub.devices):
-                if device.status == models.DeviceStatus.active:
-                    orchestrator.revoke_device(
-                        device, reason="reality-dest refresh"
-                    )
-            _device, task = orchestrator.reprovision_subscription(sub)
-            if task is not None:
-                task_ids.append(task.id)
+                if device.status in (
+                    models.DeviceStatus.disabled,
+                    models.DeviceStatus.revoked,
+                ):
+                    continue
+                orchestrator.revoke_device(
+                    device, reason="reality-dest refresh", background=True
+                )
+            if not live_names:
+                live_names = ["primary"]
+            for name in live_names:
+                _device, task = orchestrator.reprovision_subscription(
+                    sub, device_name=name
+                )
+                if task is not None:
+                    task_ids.append(task.id)
         except Exception:  # noqa: BLE001
             logger.exception(
                 "refresh-reality-dest: reprovision failed sub=%s", sub.id
@@ -1515,6 +1551,7 @@ def refresh_reality_dest(
             "from_pool": new_sni in REALITY_DEST_POOL,
             "sub_count": len(subs),
             "failed_subs": failed,
+            "bootstrap_task_id": bootstrap_task.id,
             "task_ids": task_ids,
         },
     )

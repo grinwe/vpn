@@ -2040,6 +2040,17 @@ class ProvisioningOrchestrator:
             # the same draining node would deadlock the drain forever.
             raise RuntimeError("choose_node returned the same draining node")
 
+        # Snapshot names of every live device BEFORE revoke so we can
+        # mirror N:N on the target node. Without this the sub collapses
+        # to a single "primary" on the target and users lose every extra
+        # device they'd bought — sub-link aliasing then points every
+        # saved client at the same UUID, which is unusable in parallel.
+        live_names = [
+            d.name or "primary"
+            for d in list(subscription.devices)
+            if d.status
+            not in (models.DeviceStatus.disabled, models.DeviceStatus.revoked)
+        ]
         # Revoke old devices first so the slot frees up on the old node
         # before the drain tick re-evaluates capacity. Background is fine:
         # the new device on the target node is the user-visible thing.
@@ -2069,8 +2080,21 @@ class ProvisioningOrchestrator:
         # the new node when it walks ``subscription.node.configs``.
         self.db.refresh(subscription)
 
-        device, task = self.reprovision_subscription(subscription)
-        return target, device, task
+        if not live_names:
+            # Sub had zero live devices — still create one so /sub/{token}
+            # aliasing on old revoked rows has a sibling to point at.
+            live_names = ["primary"]
+        first_device: models.Device | None = None
+        first_task: models.ProvisioningTask | None = None
+        for name in live_names:
+            device, task = self.reprovision_subscription(
+                subscription, device_name=name
+            )
+            if first_device is None:
+                first_device = device
+                first_task = task
+        assert first_device is not None and first_task is not None
+        return target, first_device, first_task
 
     def migrate_device_to_node(
         self,
