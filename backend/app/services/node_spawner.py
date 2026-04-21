@@ -18,6 +18,7 @@ from __future__ import annotations
 import logging
 import os
 
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from .. import models
@@ -38,22 +39,47 @@ from .shadowtls import (
 )
 from .vless import generate_reality_keypair, generate_short_id
 
-# Reality's "borrowed" SNI. Must be a real TLS 1.3 host that is NOT
-# censored in the target market — if it is, the whole Reality handshake
-# stops looking legitimate. The default is Microsoft (stays up in RU as
-# of 2026-04); override per deployment via env, or per spawn via the
-# ``reality_sni`` argument below (e.g. autoscaler picking region-specific
-# camouflage). ``REALITY_DEST`` can be set to point somewhere else than
-# ``<sni>:443`` but 99% of the time you want them aligned.
-DEFAULT_REALITY_SNI = os.getenv("REALITY_SNI", "www.microsoft.com")
+# Reality's "borrowed" SNI. Must be real TLS 1.3 host, НЕ заблокированный
+# в целевом рынке — иначе Reality handshake перестаёт выглядеть легитимным.
+# Пул RU-популярных доменов, распределяется по нодам через
+# ``_pick_reality_sni`` — per-node рандомизация снижает blast radius
+# RKN-события по одному SNI (июнь 2025: RKN душит connections с SNI вне
+# whitelist после ~15-20KB). ``REALITY_SNI`` env-override форсит один
+# SNI для всех новых нод (dev/test). ``REALITY_DEST`` нацеливается
+# на ``<sni>:443`` — меняйте только вместе с sni.
+REALITY_DEST_POOL: tuple[str, ...] = (
+    "www.yandex.ru",
+    "vk.com",
+    "mail.ru",
+    "rutube.ru",
+    "lenta.ru",
+)
+DEFAULT_REALITY_SNI = os.getenv("REALITY_SNI") or REALITY_DEST_POOL[0]
 DEFAULT_REALITY_DEST = os.getenv("REALITY_DEST", f"{DEFAULT_REALITY_SNI}:443")
 DEFAULT_REALITY_PORT = int(os.getenv("REALITY_PORT", "443"))
+_REALITY_SNI_ENV_OVERRIDE: str | None = os.getenv("REALITY_SNI") or None
 
 logger = logging.getLogger(__name__)
 
 
 class NodeSpawnError(RuntimeError):
     pass
+
+
+def pick_reality_sni(db: Session) -> str:
+    """Выбор SNI из пула: наименее используемый среди уже сконфигурированных
+    vless-reality нод. Разносим ноды по разным SNI чтобы RKN-событие по
+    одному домену не клало весь флот. Env ``REALITY_SNI`` форсит один SNI
+    для всех новых нод (dev/test override)."""
+    if _REALITY_SNI_ENV_OVERRIDE:
+        return _REALITY_SNI_ENV_OVERRIDE
+    used: dict[str, int] = dict(
+        db.query(models.VPNConfig.sni, func.count(models.VPNConfig.id))
+        .filter(models.VPNConfig.protocol == models.VPNConfigProtocol.vless_reality)
+        .group_by(models.VPNConfig.sni)
+        .all()
+    )
+    return min(REALITY_DEST_POOL, key=lambda s: used.get(s, 0))
 
 
 def ensure_reality_config(
@@ -70,6 +96,10 @@ def ensure_reality_config(
     Reality on manually-registered nodes. Keys are generated here so every
     caller goes through the same authoritative path (see services/vless.py).
     Idempotent: if the node already has a Reality config, returns it as-is.
+
+    When ``sni`` не передан — выбираем из ``REALITY_DEST_POOL`` наименее
+    используемый домен (per-node рандомизация). Явный ``sni`` имеет
+    приоритет.
     """
     existing = (
         db.query(models.VPNConfig)
@@ -84,8 +114,8 @@ def ensure_reality_config(
 
     public_key, private_key = generate_reality_keypair()
     short_id = generate_short_id()
-    sni_value = sni or DEFAULT_REALITY_SNI
-    dest_value = dest or (f"{sni_value}:443" if sni else DEFAULT_REALITY_DEST)
+    sni_value = sni or pick_reality_sni(db)
+    dest_value = dest or f"{sni_value}:443"
     cfg = models.VPNConfig(
         node_id=node.id,
         name=f"{node.name}-vless-reality",
