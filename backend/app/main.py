@@ -1,7 +1,7 @@
 import os
 import uuid
 
-from fastapi import Depends, FastAPI, Request
+from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, PlainTextResponse
 from prometheus_client import Counter, generate_latest
@@ -85,7 +85,13 @@ def reset_stuck_tasks() -> dict[str, int | bool]:
 _check_required_settings()
 reset_stuck_tasks()
 
-app = FastAPI(title="VPN backend")
+_is_prod = os.getenv("APP_ENV", "dev").lower() == "production"
+app = FastAPI(
+    title="VPN backend",
+    docs_url=None if _is_prod else "/api/docs",
+    redoc_url=None if _is_prod else "/api/redoc",
+    openapi_url=None if _is_prod else "/api/openapi.json",
+)
 
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
@@ -157,9 +163,9 @@ def _startup_register_telegram_webhook():
     register_webhook()
 
 
-@app.get("/")
+@app.get("/", include_in_schema=False)
 def root():
-    return {"status": "ok", "service": "vpn-backend"}
+    raise HTTPException(status_code=404)
 
 
 @app.get("/healthz")

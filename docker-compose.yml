@@ -39,6 +39,7 @@ services:
   backend:
     build: ./backend
     environment:
+      APP_ENV: ${APP_ENV:-dev}
       DATABASE_URL: ${DATABASE_URL}
       ADMIN_API_TOKEN: ${ADMIN_API_TOKEN}
       APP_SECRET_KEY: ${APP_SECRET_KEY}

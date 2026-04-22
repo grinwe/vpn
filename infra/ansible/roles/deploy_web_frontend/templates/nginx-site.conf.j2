@@ -43,6 +43,13 @@ server {
     ssl_session_cache shared:SSL:10m;
     ssl_session_tickets off;
 
+    # Strip the nginx version from the Server: header so an active
+    # prober can't fingerprint the exact build. `proxy_hide_header` in
+    # each proxy location below drops upstream Server/X-Powered-By for
+    # the same reason (ngx_headers_more is not guaranteed to be built
+    # in, so we use the stock directives).
+    server_tokens off;
+
     # HSTS. CF also sets it, but belt-and-braces — if someone ever
     # points straight at origin bypassing CF, this still applies.
     add_header Strict-Transport-Security "max-age=15768000" always;
@@ -66,6 +73,8 @@ server {
         proxy_set_header X-Real-IP $remote_addr;
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_hide_header X-Powered-By;
+        proxy_hide_header Server;
     }
 
     # Admin SPA. trailing slash on both sides preserves the /admin/
@@ -76,6 +85,8 @@ server {
         proxy_set_header X-Real-IP $remote_addr;
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_hide_header X-Powered-By;
+        proxy_hide_header Server;
     }
 
     # Backend API. proxy_pass without a trailing slash preserves the
@@ -87,6 +98,8 @@ server {
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto $scheme;
         proxy_read_timeout 60s;
+        proxy_hide_header X-Powered-By;
+        proxy_hide_header Server;
     }
 
     # #62 — Telegram Bot API webhook. Telegram sends updates here
@@ -99,6 +112,8 @@ server {
         proxy_set_header X-Real-IP $remote_addr;
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_hide_header X-Powered-By;
+        proxy_hide_header Server;
     }
 
     # Dynamic subscription link endpoint — lives outside /api/ by
@@ -110,6 +125,8 @@ server {
         proxy_set_header X-Real-IP $remote_addr;
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_hide_header X-Powered-By;
+        proxy_hide_header Server;
     }
 
     # Block anything else — no static site, no root index. Keeps the
