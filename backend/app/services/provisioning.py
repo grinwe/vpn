@@ -1255,6 +1255,9 @@ class ProvisioningOrchestrator:
         subscription: models.Subscription,
         bundle: list[models.Credential],
         device_name: str | None,
+        *,
+        reuse_sub_token: str | None = None,
+        reuse_connection_uri: str | None = None,
     ) -> tuple[models.Device, models.ProvisioningTask]:
         """Bind an already-warmed credential bundle to a fresh subscription.
 
@@ -1286,12 +1289,25 @@ class ProvisioningOrchestrator:
             raise RuntimeError("warm bundle anchor has no config_id")
 
         device_label = device_name or "primary"
-        device_sub_token = secrets.token_urlsafe(32)
-        sub_base = os.getenv("SUB_LINK_BASE_URL", "").rstrip("/")
-        if sub_base:
-            device_uri = f"{sub_base}/{device_sub_token}"
+        # Migration-stable URI reuse: if the caller passes the previous
+        # device's sub_token/connection_uri, carry them over so every
+        # client URL (subscription button AND per-device buttons in the
+        # admin UI) stays byte-identical across node migrations. Missing
+        # kwargs ⇒ mint fresh, same as the pre-reuse behaviour.
+        if reuse_sub_token is not None:
+            device_sub_token = reuse_sub_token
         else:
-            device_uri = f"/api/sub/{device_sub_token}"
+            device_sub_token = secrets.token_urlsafe(32)
+
+        if reuse_connection_uri is not None:
+            connection_uri_encrypted = reuse_connection_uri
+        else:
+            sub_base = os.getenv("SUB_LINK_BASE_URL", "").rstrip("/")
+            if sub_base:
+                device_uri = f"{sub_base}/{device_sub_token}"
+            else:
+                device_uri = f"/api/sub/{device_sub_token}"
+            connection_uri_encrypted = encrypt(device_uri)
 
         device = models.Device(
             user_id=user.id,
@@ -1300,7 +1316,7 @@ class ProvisioningOrchestrator:
             name=device_label,
             status=models.DeviceStatus.active,  # already live on the node
             access_username=bundle[0].access_username,
-            connection_uri=encrypt(device_uri),
+            connection_uri=connection_uri_encrypted,
             sub_token=device_sub_token,
         )
         self.db.add(device)
@@ -1822,6 +1838,8 @@ class ProvisioningOrchestrator:
         *,
         device_name: str | None = None,
         target_node: models.VPNNode | None = None,
+        reuse_sub_token: str | None = None,
+        reuse_connection_uri: str | None = None,
     ) -> tuple[models.Device, models.ProvisioningTask]:
         """Add a fresh device to an existing subscription.
 
@@ -1863,7 +1881,12 @@ class ProvisioningOrchestrator:
             if warm_bundle:
                 try:
                     device, task = self._wire_warm_bundle(
-                        user, subscription, warm_bundle, device_name
+                        user,
+                        subscription,
+                        warm_bundle,
+                        device_name,
+                        reuse_sub_token=reuse_sub_token,
+                        reuse_connection_uri=reuse_connection_uri,
                     )
                     self.db.refresh(subscription)
                     return device, task
@@ -1892,12 +1915,27 @@ class ProvisioningOrchestrator:
         password = secrets.token_urlsafe(12)
         user_uuid = uuid.uuid4()
 
-        device_sub_token = secrets.token_urlsafe(32)
-        sub_base = os.getenv("SUB_LINK_BASE_URL", "").rstrip("/")
-        if sub_base:
-            device_uri = f"{sub_base}/{device_sub_token}"
+        # Migration-stable URI reuse: see _wire_warm_bundle for rationale.
+        # Both the sub_token (used in /sub/{token}) AND the encrypted
+        # connection_uri (copied verbatim into Device.connection_uri, the
+        # string admin UI renders as the per-device "copy link" button)
+        # must match the pre-migration values byte-for-byte. If only one
+        # is reused, the two UI buttons diverge and users get different
+        # URLs from the same row post-migration.
+        if reuse_sub_token is not None:
+            device_sub_token = reuse_sub_token
         else:
-            device_uri = f"/api/sub/{device_sub_token}"
+            device_sub_token = secrets.token_urlsafe(32)
+
+        if reuse_connection_uri is not None:
+            connection_uri_encrypted = reuse_connection_uri
+        else:
+            sub_base = os.getenv("SUB_LINK_BASE_URL", "").rstrip("/")
+            if sub_base:
+                device_uri = f"{sub_base}/{device_sub_token}"
+            else:
+                device_uri = f"/api/sub/{device_sub_token}"
+            connection_uri_encrypted = encrypt(device_uri)
 
         primary_config = next(
             (c for c in enabled_configs if c.protocol == models.VPNConfigProtocol.vless_reality),
@@ -1911,7 +1949,7 @@ class ProvisioningOrchestrator:
             name=device_label,
             status=models.DeviceStatus.pending,
             access_username=username,
-            connection_uri=encrypt(device_uri),
+            connection_uri=connection_uri_encrypted,
             sub_token=device_sub_token,
         )
         self.db.add(device)
@@ -2045,12 +2083,35 @@ class ProvisioningOrchestrator:
         # to a single "primary" on the target and users lose every extra
         # device they'd bought — sub-link aliasing then points every
         # saved client at the same UUID, which is unusable in parallel.
-        live_names = [
-            d.name or "primary"
+        #
+        # ``reuse_map`` carries the (sub_token, connection_uri) pair per
+        # device-name into the reprovision loop so migration preserves
+        # every URL users have installed. Without reuse the new Device
+        # gets a fresh sub_token and the alias mechanism in /sub/{token}
+        # would papers over it — but admin UI "copy link" buttons on the
+        # new row render a brand-new URL, so user#1 (on the migrated sub)
+        # and user#2 (who received user#1's old URL earlier) end up
+        # looking at two different strings. Reusing the tokens keeps all
+        # user-visible URLs byte-identical across migration, which is
+        # the original pre-regression behaviour.
+        live_devices_snapshot = [
+            d
             for d in list(subscription.devices)
             if d.status
             not in (models.DeviceStatus.disabled, models.DeviceStatus.revoked)
         ]
+        live_names: list[str] = []
+        reuse_map: dict[str, tuple[str | None, str | None]] = {}
+        for d in live_devices_snapshot:
+            name_key = d.name or "primary"
+            live_names.append(name_key)
+            # First occurrence wins — if the user somehow has two live
+            # devices with the same name (shouldn't happen but defensive),
+            # we only carry one token pair; the second reprovision gets a
+            # fresh token.
+            if name_key not in reuse_map:
+                reuse_map[name_key] = (d.sub_token, d.connection_uri)
+
         # Revoke old devices first so the slot frees up on the old node
         # before the drain tick re-evaluates capacity. Background is fine:
         # the new device on the target node is the user-visible thing.
@@ -2073,6 +2134,21 @@ class ProvisioningOrchestrator:
                     device.id,
                 )
 
+        # Free the unique(sub_token) slot on every just-revoked device
+        # whose token we intend to reuse on the target node. Without this
+        # the reprovision INSERT trips the unique constraint — two rows
+        # can't share the same non-null sub_token. Nullable column lets
+        # multiple NULLs coexist, which is exactly what we need (the old
+        # revoked row keeps its connection_uri for history/audit, just
+        # loses its routable token). Alias resolution via /sub/{token}
+        # still works because the NEW row carries the token.
+        reused_tokens = {t for t, _ in reuse_map.values() if t}
+        if reused_tokens:
+            for d in live_devices_snapshot:
+                if d.sub_token and d.sub_token in reused_tokens:
+                    d.sub_token = None
+            self.db.flush()
+
         subscription.node_id = target.id
         self.db.add(subscription)
         self.db.flush()
@@ -2087,8 +2163,12 @@ class ProvisioningOrchestrator:
         first_device: models.Device | None = None
         first_task: models.ProvisioningTask | None = None
         for name in live_names:
+            reuse_token, reuse_uri = reuse_map.get(name, (None, None))
             device, task = self.reprovision_subscription(
-                subscription, device_name=name
+                subscription,
+                device_name=name,
+                reuse_sub_token=reuse_token,
+                reuse_connection_uri=reuse_uri,
             )
             if first_device is None:
                 first_device = device
@@ -2140,13 +2220,27 @@ class ProvisioningOrchestrator:
 
         target = choose_node(self.db, plan, node_id=target_node_id)
 
+        # Migration-stable URI reuse (per-device variant). Siblings on
+        # the old node are untouched, so only *this* device's token/uri
+        # can be safely carried over. See migrate_subscription_to_new_node
+        # for the full rationale on the snapshot/NULL/reuse dance.
+        reuse_token = device.sub_token
+        reuse_uri = device.connection_uri
+
         self.revoke_device(
             device,
             reason=f"device-migrate {old_node.id}->{target.id}",
             background=True,
         )
+        if reuse_token:
+            device.sub_token = None
+            self.db.flush()
         new_device, task = self.reprovision_subscription(
-            sub, device_name=device.name, target_node=target,
+            sub,
+            device_name=device.name,
+            target_node=target,
+            reuse_sub_token=reuse_token,
+            reuse_connection_uri=reuse_uri,
         )
         return target, new_device, task
 
