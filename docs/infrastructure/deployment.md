@@ -284,7 +284,7 @@ Prometheus scrape'ит `http://backend:8000/metrics` через docker network (
 Текущий рабочий конфиг:
 
 - **Домен:** `grn-ssync.pro` (CF-зона, Pro plan).
-- **Worker:** `v8-sub` — делает `fetch(https://grinwer.online/api/sub/${token})` и стримит ответ обратно. Код есть в CF Dashboard Workers; в репо не коммитим (короткий, держим ближе к инфре).
+- **Worker:** `v8-sub` — делает `fetch(https://grinwer.online/api/sub/${token})` и стримит ответ обратно. Код есть в CF Dashboard Workers; в репо не коммитим (короткий, держим ближе к инфре). Процедура правок/ротации landing'а — `operations/worker-v8-sub.md`.
 - **CF Protocol settings:** `HTTP/2 = off`, `HTTP/3 = off`. **Критично**: RKN DPI на мобильном 4G режет H2 stream после TLS-handshake — headers доходят, тело 584 байта теряется. HTTP/1.1 проскакивает. На Free-плане CF тумблер HTTP/2 заблокирован — нужен Pro.
 - **env:** `SUB_LINK_BASE_URL=https://grn-ssync.pro`. Зеркалится в backend и worker (см. `operations/env-reference.md`).
 - **Миграция существующих Device'ов:** **не делаем**. Старые строки с `https://grinwer.online/...` остаются; установленные клиенты продолжают работать до тех пор, пока домен не заблочат окончательно. Новые Device'ы (provisioning после деплоя env) получают новый URL. По жалобам — правим `connection_uri` вручную по `id`.

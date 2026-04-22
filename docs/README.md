@@ -45,6 +45,7 @@
 
 - **[env-reference.md](operations/env-reference.md)** — полный справочник env-переменных, кто читает (backend/worker/bot), что значит дефолт, какие обязательные, какие зеркалятся между сервисами.
 - **[runbook.md](operations/runbook.md)** — 12 сценариев «сломалось → что делать»: crash-loop, зависший provisioning, ansible fail на ноде, warm-pool пустой, webhook не приходит, disk grow, полный rollback, и т.д.
+- **[worker-v8-sub.md](operations/worker-v8-sub.md)** — CF-worker `v8-sub` на `grn-ssync.pro` (sub-link CDN-прокси): где живёт, paste-ready код с camo-landing'ом, rotation, отладка.
 
 ## Как читать и обновлять
 
@@ -92,7 +93,9 @@ docs/
 │   └── nodes.md                  (289)
 └── operations/
     ├── runbook.md                (387)
-    └── env-reference.md          (212)
+    ├── env-reference.md          (212)
+    ├── relay-migration.md        (RU-relay → WG-exit миграция)
+    └── worker-v8-sub.md          (CF-worker runbook)
 ```
 
 Итого: 13 файлов, ~3.5к строк. Каждый файл в диапазоне 200–400 строк — читается за один сеанс.
