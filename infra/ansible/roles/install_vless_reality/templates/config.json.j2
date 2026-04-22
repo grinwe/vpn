@@ -42,6 +42,16 @@
       },
       {
         "type": "field",
+        "domain": [
+          "regexp:\\.ru$",
+          "regexp:\\.su$",
+          "regexp:\\.xn--p1ai$",
+          "regexp:^(yandex|mail|vk|ok|rutube|sberbank|gosuslugi|tinkoff|wildberries|ozon|avito|rambler|2gis|kinopoisk|dzen|hh|lenta|ria|tass|rbc|habr|dtf)\\..+$"
+        ],
+        "outboundTag": "direct-local"
+      },
+      {
+        "type": "field",
         "ip": ["geoip:ru", "geoip:private"],
         "outboundTag": "direct-local"
       }{% for _rule in _fan_out if _rule.emails %},
