@@ -48,8 +48,8 @@
     },
     {
       "tag": "vless-xhttp",
-      "listen": "0.0.0.0",
-      "port": {{ vless_xhttp_port | int }},
+      "listen": "127.0.0.1",
+      "port": {{ vless_xhttp_internal_port | int }},
       "protocol": "vless",
       "settings": {
         "clients": {{ vless_xhttp_existing_clients | default([]) | to_json }},
@@ -60,17 +60,6 @@
         "xhttpSettings": {
           "path": "{{ vless_xhttp_path | default('/xh') }}",
           "mode": "{{ vless_xhttp_mode | default('auto') }}"
-        },
-        "security": "tls",
-        "tlsSettings": {
-          "serverName": "{{ vless_xhttp_domain }}",
-          "certificates": [
-            {
-              "certificateFile": "{{ _xhttp_cert_path }}",
-              "keyFile": "{{ _xhttp_key_path }}"
-            }
-          ],
-          "alpn": ["h2", "http/1.1"]
         }
       },
       "sniffing": {

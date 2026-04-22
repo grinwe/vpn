@@ -1,0 +1,24 @@
+---
+# ── Stage-4 anti-probing defaults ───────────────────────────────────
+#
+# До Stage-4 xray слушал 0.0.0.0:443 напрямую и сам терминировал TLS.
+# Активный пробер, прилетая на любой не-``/xh`` путь, получал 404 от
+# Go-stack с характерным ``Server:`` заголовком и таймингами — VPN
+# идентифицировался за один probe. Теперь поверх xray встаёт nginx,
+# xray переезжает на loopback, неизвестные пути уходят на camo-landing.
+#
+# Публичный порт (тот, к которому коннектится клиент и который
+# вшивается в VLESS URI) остаётся ``vless_xhttp_port`` — обычно 443.
+# ``vless_xhttp_internal_port`` — это loopback-порт xray, никуда
+# наружу не торчит, nginx проксирует 443→этот порт для matched path'а.
+vless_xhttp_internal_port: 10443
+
+# Путь, по которому xhttp-клиент общается с сервером. Менять не нужно
+# без синхронного обновления клиентских URL. Дефолт согласован с
+# xhttpSettings.path в config_xhttp.json.j2 и c `location` в vhost'е.
+vless_xhttp_path: "/xh"
+
+# Корень, из которого nginx отдаёт camo-landing на любые не-xhttp пути
+# и не-ACME запросы. До Stage-4 таких запросов xray отвечал 404 от
+# Go-http — характерный фингерпринт. Теперь — generic corp landing.
+vless_xhttp_camo_root: "/var/www/xhttp-camo"
