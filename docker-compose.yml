@@ -218,7 +218,19 @@ services:
     restart: unless-stopped
 
   admin:
-    build: ./admin
+    build:
+      context: ./admin
+      args:
+        # Rebuild required on change — Vite bakes the base into every
+        # asset URL. Default "admin" сохраняет старое поведение;
+        # прод передаёт secret path из ansible vault.
+        VITE_ADMIN_BASE_PATH: ${ADMIN_BASE_PATH:-admin}
+    environment:
+      # Runtime env для envsubst нашего nginx.conf template'а.
+      ADMIN_BASE_PATH: ${ADMIN_BASE_PATH:-admin}
+      # Ограничиваем envsubst только этой переменной, чтобы не
+      # попортить $uri / $http_upgrade / $remote_addr в конфиге.
+      NGINX_ENVSUBST_FILTER: "^ADMIN_BASE_PATH$$"
     ports:
       - "127.0.0.1:8080:80"
     restart: unless-stopped

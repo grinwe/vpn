@@ -373,6 +373,42 @@ docker compose exec backend alembic -c /app/alembic.ini history | head -20
 
 ---
 
+## 13. Ротация `vault_admin_secret_path` (secret admin URL)
+
+Admin-панель публикуется по secret-пути `/mgmt-<hex>/` вместо `/admin/` (см. anti-probing camo). Ротировать нужно редко — при подозрении на утечку пути (засветился в чужих логах / referer'ах, кто-то прислал скрин и т.п.).
+
+**Как поменять:**
+
+```bash
+# 1. На контроллере — выбрать новое значение.
+NEW_PATH="mgmt-$(openssl rand -hex 4)"
+echo "$NEW_PATH"   # например mgmt-9f21a0c4
+
+# 2. Вписать в vault.
+cd infra/ansible
+ansible-vault edit group_vars/web/vault.yml
+#   vault_admin_secret_path: "mgmt-9f21a0c4"
+
+# 3. Прогнать плей для web-группы. deploy_app_stack увидит changed .env
+#    → triggers recreate admin-контейнера (build-arg VITE_ADMIN_BASE_PATH
+#    поменялся, образ пересобирается); deploy_web_frontend перерендерит
+#    nginx vhost с новым location.
+ansible-playbook -i inventories/prod/hosts.yml site.yml -l nl-web --ask-vault-pass
+
+# 4. На web-хосте — убедиться, что старый путь отдаёт camo, а новый живой.
+ssh root@45.14.244.140
+curl -sI https://grinwer.online/admin/              # → 200 от camo-landing'а (не 302!)
+curl -sI https://grinwer.online/${NEW_PATH}/        # → 200 от admin SPA
+```
+
+**Что сломается, если путь в compose не совпадёт с path'ом в nginx'е:** admin-контейнер внутри собран с `VITE_ADMIN_BASE_PATH=<старый>`, а nginx проксирует в `<новый>` — upstream отдаст 404 по неправильной base. Поэтому ВАЖНО: `deploy_app_stack_admin_base_path` и `deploy_web_frontend_admin_path` оба читают одну переменную (`vault_admin_secret_path`); менять нельзя что-то одно руками.
+
+**Инвариант:** после ротации старый путь должен стать camo (404 → 200 landing), а не 302 на новый (такой 302 был бы leak'ом). Проверка — `curl -sI https://grinwer.online/admin/` должен возвращать 200 с `content-type: text/html`, а не `location: /mgmt-xxx/`.
+
+**Откат:** если после ротации не можешь зайти — снова `ansible-vault edit`, вернуть старое значение, прогнать play. Без доступа к админке откатить можно и вручную на хосте: `docker compose exec admin ls /usr/share/nginx/html` покажет, какой именно base baked в образ.
+
+---
+
 ## Что делать, если ничего не помогает
 
 1. **Снять снапшот:** `docker compose logs > /tmp/vpn-logs-$(date +%s).txt`, `pg_dump`, `redis-cli -a $REDIS_PASSWORD save`.

@@ -169,6 +169,29 @@
     enabled: true
   when: deploy_web_frontend_request_cert | bool
 
+# ── Camo landing (anti-probing) ─────────────────────────────────────
+#
+# Вместо катч-олл 404 на /, nginx выше теперь отдаёт статический
+# "internal tools portal". Контент должен лежать ДО рендера vhost'а —
+# иначе первый reload увидит пустой root и отдаст 404 до следующего
+# copy'я.
+- name: Ensure camo root directory exists
+  file:
+    path: "{{ deploy_web_frontend_camo_root }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Deploy camo landing HTML
+  copy:
+    src: camo-index.html
+    dest: "{{ deploy_web_frontend_camo_root }}/index.html"
+    owner: root
+    group: root
+    mode: "0644"
+  notify: reload nginx
+
 # ── Render and enable the real vhost (TLS-aware) ────────────────────
 - name: Render nginx vhost
   template:

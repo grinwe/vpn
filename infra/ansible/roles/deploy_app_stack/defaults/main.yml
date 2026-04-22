@@ -50,6 +50,13 @@ deploy_app_stack_force_recreate: false
 deploy_app_stack_payment_provider: "cryptobot"
 deploy_app_stack_telegram_stars_webhook_secret: ""
 
+# Admin SPA base path. Default "admin" keeps the legacy /admin/ URL;
+# override via vault_admin_secret_path in group_vars/web/vault.yml to
+# bury the panel behind a secret path (anti-probing — see docs). Must
+# match deploy_web_frontend_admin_path so nginx and the admin container
+# agree on the exposed prefix. Change triggers docker image rebuild.
+deploy_app_stack_admin_base_path: "{{ vault_admin_secret_path | default('admin') }}"
+
 # Telegram WebApp / Mini App.
 #
 #   deploy_app_stack_webapp_jwt_secret  — REQUIRED, min 32 chars.

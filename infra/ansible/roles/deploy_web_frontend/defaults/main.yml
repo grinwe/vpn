@@ -18,6 +18,20 @@ deploy_web_frontend_webapp_upstream: "127.0.0.1:8082"
 # nginx vhost file name under /etc/nginx/sites-available.
 deploy_web_frontend_site_name: "grinwer"
 
+# Base path за которым публикуется admin SPA. Default "admin" — старое
+# поведение (https://grinwer.online/admin/). Чтобы убрать панель из
+# сканов активных проберов, положи в group_vars/web/vault.yml переменную
+# vault_admin_secret_path со значением вида "mgmt-<8hex>" — этот default
+# подхватит её автоматически и прогонит через nginx-template. Должно
+# совпадать с deploy_app_stack_admin_base_path (admin-контейнер собирается
+# с VITE_ADMIN_BASE_PATH=<это же значение>).
+deploy_web_frontend_admin_path: "{{ vault_admin_secret_path | default('admin') }}"
+
+# Корень, из которого nginx отдаёт camo-landing на любые не-admin/не-API
+# пути. Перед stage-3 это был 404; теперь — статичный HTML-корпоратив,
+# чтобы пробер видел «что-то внутреннее» вместо маркера VPN-стека.
+deploy_web_frontend_camo_root: "/var/www/grinwer-camo"
+
 # Whether to actually request the Let's Encrypt certificate in this
 # run. Useful to set to false on first bootstrap if you want to install
 # nginx and eyeball the HTTP vhost before going through the ACME dance.
