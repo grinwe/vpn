@@ -32,12 +32,22 @@ monitoring_stack_prometheus_bind: "127.0.0.1:9090"
 monitoring_stack_grafana_admin_user: admin
 monitoring_stack_grafana_admin_password: "CHANGE_ME_IN_VAULT"
 
-# Prometheus scrape targets.
+# Prometheus scrape target for the backend FastAPI service.
 #
-# ``backend`` is the FastAPI service exposing /metrics. Override the URL
-# when the backend runs on a different host (the default assumes it sits
-# on the same box as the monitoring stack).
-monitoring_stack_backend_metrics_url: "host.docker.internal:8000"
+# Default ``backend:8000`` works when Prometheus joins the backend's
+# docker network (``monitoring_stack_backend_network`` below) — Docker
+# DNS resolves ``backend`` to the app-stack container's internal IP.
+# If the monitoring host and backend split to different machines,
+# override to ``<ip>:<port>`` AND remove the ``backend_net`` external
+# network from the compose template.
+monitoring_stack_backend_metrics_url: "backend:8000"
+
+# External docker network name of the app-stack (backend/worker/bot).
+# Compose default pattern: ``<project>_<network>``, project = basename
+# of the compose dir. ``deploy_app_stack_dir = /opt/vpn`` → project
+# ``vpn`` → auto-created network ``vpn_default``. Override here only if
+# app-stack уехал в другой compose-каталог или переименован.
+monitoring_stack_backend_network: "vpn_default"
 
 # Scrape interval — 15s is the Prometheus default and plenty for us.
 monitoring_stack_scrape_interval: "15s"

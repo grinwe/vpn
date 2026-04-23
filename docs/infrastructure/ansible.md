@@ -77,7 +77,7 @@ db_host:        { mgmt-1       → 45.14.244.140 }
 monitoring:     { nl-monitoring → 45.14.244.140 }
 web:            { nl-web       → 45.14.244.140 }
 vpn_nodes:      { ru-*         → RU relay-ноды }
-wg_exit_nodes:  { kr-*, fr-*, tq-*, uk-*, ur-* → non-RU exit-ноды }
+wg_exit_nodes:  { kr-*, fr-*, tq-*, uk-*, ur-*, cz-*, nl-* → non-RU exit-ноды }
 ```
 
 Первые три — один и тот же IP. Разделение только логическое: когда появится вторая машина, это тривиальный inventory-edit. Группы `vpn_nodes`/`wg_exit_nodes` нужны для **bulk/static operator-plays** (`monitoring`, ручной rollout bootstrap'а, fleet-wide audit). Это **snapshot**, не источник истины.
@@ -272,7 +272,7 @@ Xray биндит исходящий freedom-socket на интерфейс `wg0
 
 `roles/wg_exit_node/tasks/main.yml`. Настраивает WireGuard **сервер** на чужой (не-RU) машине: устанавливает wg-tools, рендерит `wg0.conf` с peers, включает NAT masquerade и IP forwarding. Эта нода — terminus трафика относительно relay'ев.
 
-Отдельная hosts-секция в `site.yml` (`- hosts: wg_exit_nodes`), но в inventory эта группа **не определена** — предполагается, что exit-ноды добавляются динамически через `-i` или через group_vars на стороне оператора. (`inventories/prod/hosts.yml` их не содержит.)
+Отдельная hosts-секция в `site.yml` (`- hosts: wg_exit_nodes`). Группа **описана** в `inventories/prod/hosts.yml` — это статический snapshot для operator-plays (monitoring, rollout node_exporter, fleet audit). Для ad-hoc provisioning из backend'а используется dynamic inventory из БД.
 
 ## Как backend использует ansible
 
@@ -316,8 +316,7 @@ Matching вызовов backend → ansible (из `provisioning.py:692-773` и `
 
 - **`host_key_checking = False` + динамический inventory.** Каждый новый ansible-run backend'а открывает SSH в ноду, взятую из БД, без какой-либо записи в `known_hosts`. MITM между backend'ом и нодой полностью незаметен ansible'у. Защита остаётся только «доверие к IPv4-адресу в `vpn_nodes.host`».
 - **Секреты в CLI-строке `--extra-vars`.** `shadowtls_password`, `shadowtls_ss_password`, `relay_wg_private_key`, `vless_reality_private_key` — все попадают в ansible через `json.dumps(extra_vars)` как аргумент команды. В `ps auxf` на worker-хосте это видно любому пользователю, имеющему читать `/proc/*/cmdline`. В контейнере worker'а root — только process owner'а, но host-level инспектор (если кто-то получит host) увидит секреты в аргументах.
-- **`wg_exit_nodes` группа не описана в `inventories/prod/hosts.yml`.** Роль есть, playbook'ная секция есть, но `ansible-playbook site.yml` на бэкенде ничего не сделает с exit-нодами, потому что группа пустая. Как реально развёрнуты существующие exit-ноды — нигде не видно.
-- **Реальные VPN-ноды НЕ в git'е inventory.** Запрос «посмотреть, какие ноды сейчас в проде» возможен только через backend.db (`vpn_nodes`), не через `git log` ansible-репо. Для disaster recovery оператору нужен доступ к БД, иначе он не знает, куда деплоиться.
+- **`hosts.yml` vs БД — дрейф-риск.** Fleet ведётся в БД (`VPNNode` / `WGExitNode`) как источник истины для provisioning'а; `hosts.yml` — ручной snapshot для operator-plays (monitoring, bulk rollout). Если после спавна ноды забыть добавить её в `hosts.yml`, monitoring play её не накроет: node_exporter не встанет, Prometheus target не появится, нода «пропадёт» из Grafana.
 - **Playbook `diagnose_node.yml` не упомянут в `deployment.md`-роутах.** В `playbooks/` есть, orchestrator его зовёт (`action=diagnose`), но как именно оператор триггерит диагностику — через API-эндпоинт `/api/nodes/{id}/diagnose` или напрямую `ansible-playbook` — не документировано в коде однозначно.
 - **`forks = 20` в defaults** — но backend процесс ограничивает параллельность через `MAX_CONCURRENT_ANSIBLE=3` (и warm_pool — ещё два). Эффективно используется только один fork на запуск (одна нода в temp-inventory). Высокий `forks` — это наследие, когда site.yml мог бить по нескольким нодам сразу вручную; сейчас никогда не стреляет.
 

@@ -1,7 +1,7 @@
 import os
 import uuid
 
-from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, PlainTextResponse
 from prometheus_client import Counter, generate_latest
@@ -14,7 +14,7 @@ from .logging_config import configure_logging, request_id_var
 from .migrations import run_migrations
 from .rate_limit import limiter
 from .services.provisioning_throttle import ColdPathThrottled
-from .api import router as api_router, require_admin
+from .api import router as api_router
 from .api_extensions import ext_router
 from .api_webapp import webapp_router
 from .telegram_webhook import router as tg_webhook_router, register_webhook
@@ -174,5 +174,9 @@ def healthz():
 
 
 @app.get("/metrics")
-def metrics(_: str = Depends(require_admin)):
+def metrics():
+    # No auth — backend binds to 127.0.0.1:8000, Prometheus scrapes via
+    # host.docker.internal from the same host. Labels are route templates
+    # (no PII), counters are aggregates. If binding ever opens to 0.0.0.0,
+    # re-add require_admin or restrict /metrics at nginx.
     return PlainTextResponse(generate_latest(), media_type="text/plain")

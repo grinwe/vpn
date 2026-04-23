@@ -101,6 +101,7 @@
   loop:
     - vpn-overview.json
     - fleet.json
+    - exits.json
   notify: restart monitoring stack
 
 - name: Bring the stack up

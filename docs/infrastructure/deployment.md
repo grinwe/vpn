@@ -277,6 +277,13 @@ Prometheus scrape'ит `http://backend:8000/metrics` через docker network (
 
 **Grafana datasource uid.** Provisioned datasource шаблон явно задаёт `uid: prometheus` — дашборды в `docs/dashboards/` ссылаются на `{ type: prometheus, uid: "prometheus" }`, без явного uid они отваливались с «Datasource prometheus was not found».
 
+**Дашборды** (`infra/ansible/roles/monitoring_stack/files/dashboards/`, авто-провижинятся в папке Grafana «VPN»):
+- `vpn-overview.json` — бэкенд: HTTP rate/errors, provisioning tasks, rollup статусы (Backend up, Relay fleet, Exit fleet).
+- `fleet.json` — относы: отдельные секции «Relay nodes (RU)» и «Exit nodes (WireGuard, non-RU)» с симметричными панелями CPU/Mem/Net/Disk по `job="vpn-nodes"` и `job="wg-exit-nodes"`.
+- `exits.json` — детальный разрез exit'ов: per-WG-interface RX/TX (`device=~"wg[0-9]+"`), physical egress RX/TX, CPU/Mem/Load/TCP established. Отдельно от `fleet.json` чтобы operationally следить за exit-перегрузкой (какой exit какими wgN-пирами качает больше).
+
+Файл `grafana-dashboards.yml` (provisioning provider) watch'ит `/var/lib/grafana/dashboards/` каждые 30 секунд — правка JSON + `--tags monitoring` → перезапуск контейнеров не нужен, Grafana подхватит.
+
 ## Sub-link CDN proxy
 
 `Device.connection_uri` содержит «dynamic subscription URL» формата `<SUB_LINK_BASE_URL>/<sub_token>`. Если указать прямой `https://grinwer.online/api/sub/<token>` — RKN-блок основного домена уложит всех installed-клиентов. Поэтому фронт — отдельный «boring» домен на Cloudflare.

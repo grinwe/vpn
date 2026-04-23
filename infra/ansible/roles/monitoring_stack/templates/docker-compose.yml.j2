@@ -6,11 +6,16 @@ services:
     image: {{ monitoring_stack_prometheus_image }}
     container_name: vpn-prometheus
     restart: unless-stopped
-    # host.docker.internal lets containers reach a service bound to
-    # 127.0.0.1 on the host — used for scraping the backend when it runs
-    # on the same box as the monitoring stack.
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
+    # Prometheus присоединяется к внешней docker-сети backend'а
+    # ({{ monitoring_stack_backend_network }}), чтобы scrape'ить бэкенд
+    # по container-DNS ``backend:8000``. На Linux ``host.docker.internal``
+    # резолвится в IP docker-bridge gateway, а backend биндится
+    # на 127.0.0.1 хоста — это разные интерфейсы, connection refused.
+    # Co-location monitoring+web обязательна для этой схемы (one host,
+    # one docker daemon). Если стеки разъедутся на разные машины —
+    # убрать ``{{ monitoring_stack_backend_network }}`` из networks
+    # + override ``monitoring_stack_backend_metrics_url`` в IP:port
+    # + открыть firewall.
     command:
       - "--config.file=/etc/prometheus/prometheus.yml"
       - "--storage.tsdb.path=/prometheus"
@@ -21,6 +26,9 @@ services:
       - ./data/prometheus:/prometheus
     ports:
       - "{{ monitoring_stack_prometheus_bind }}:9090"
+    networks:
+      - default
+      - backend_net
 
   grafana:
     image: {{ monitoring_stack_grafana_image }}
@@ -43,3 +51,16 @@ services:
       - ./data/grafana:/var/lib/grafana
     ports:
       - "{{ monitoring_stack_grafana_bind }}:3000"
+
+networks:
+  # ``default`` — обычная сеть monitoring-стека, prometheus ↔ grafana.
+  default:
+    name: vpn-monitoring_default
+  # ``backend_net`` — внешняя ссылка на сеть app-stack'а (создаётся
+  # compose'ом под /opt/vpn: проект vpn → сеть ``vpn_default``).
+  # external: true означает что compose не создаёт/удаляет её —
+  # только подключает prometheus. Имя переопределяется переменной
+  # monitoring_stack_backend_network для multi-host сценариев.
+  backend_net:
+    external: true
+    name: {{ monitoring_stack_backend_network }}
