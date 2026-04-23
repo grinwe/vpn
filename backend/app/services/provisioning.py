@@ -706,6 +706,23 @@ def _extract_vless_uuid(config_text_enc: str) -> str | None:
     return match.group(1) if match else None
 
 
+def _device_vless_uuid(device: models.Device) -> str | None:
+    """Return the VLESS user UUID currently bound to ``device``.
+
+    Walks ``device.credentials`` until it finds a vless-family row whose
+    encrypted ``config_text`` parses cleanly. Used by migrate paths so
+    the new device on the target node inherits the old UUID — without
+    this, every relay move forces installed clients to refetch and
+    rebind, which is the bug this helper exists to nail down.
+    """
+    for cred in device.credentials:
+        if cred.proto in _VLESS_FAMILY_PROTOS:
+            extracted = _extract_vless_uuid(cred.config_text)
+            if extracted:
+                return extracted
+    return None
+
+
 class ProvisioningOrchestrator:
     """Coordinates provisioning tasks and Ansible execution."""
 
@@ -1840,6 +1857,7 @@ class ProvisioningOrchestrator:
         target_node: models.VPNNode | None = None,
         reuse_sub_token: str | None = None,
         reuse_connection_uri: str | None = None,
+        reuse_uuid: str | None = None,
     ) -> tuple[models.Device, models.ProvisioningTask]:
         """Add a fresh device to an existing subscription.
 
@@ -1861,6 +1879,15 @@ class ProvisioningOrchestrator:
         without touching ``subscription.node_id``. Warm-pool is bypassed
         when a target_node is explicitly passed — warm bundles are
         keyed by sub.node_id and can't be reused on a foreign node.
+
+        ``reuse_uuid`` — pin the VLESS user UUID of the new device to
+        an existing value instead of minting a fresh one. Migrate paths
+        pass the old device's UUID so installed clients keep their
+        per-user identifier across relay moves (the VLESS URI their
+        subscription file resolves to stays byte-identical). Warm-pool
+        is also bypassed — warm bundles carry their own pre-provisioned
+        UUIDs and can't be rebranded without a re-provision round-trip,
+        which would defeat the whole point of the warm path.
         """
         user = subscription.user
         node = target_node if target_node is not None else subscription.node
@@ -1876,7 +1903,7 @@ class ProvisioningOrchestrator:
         # ── Warm-pool fast path ─────────────────────────────────────────
         from . import warm_pool
 
-        if target_node is None:
+        if target_node is None and reuse_uuid is None:
             warm_bundle = warm_pool.try_assign_bundle(self.db, node.id, subscription.id)
             if warm_bundle:
                 try:
@@ -1913,7 +1940,23 @@ class ProvisioningOrchestrator:
             f"{int(utcnow().timestamp())}-{secrets.token_hex(2)}"
         )
         password = secrets.token_urlsafe(12)
-        user_uuid = uuid.uuid4()
+        # Migrate paths thread the old device's UUID here so its VLESS
+        # URI survives relay relocation byte-for-byte. A malformed value
+        # (shouldn't happen — it comes from _extract_vless_uuid which
+        # already validated the regex) falls back to a fresh UUID so
+        # the reprovision still completes rather than blowing up mid-way.
+        if reuse_uuid is not None:
+            try:
+                user_uuid = uuid.UUID(reuse_uuid)
+            except ValueError:
+                logger.warning(
+                    "reprovision_subscription: reuse_uuid %r is not a valid UUID, "
+                    "falling back to freshly generated one",
+                    reuse_uuid,
+                )
+                user_uuid = uuid.uuid4()
+        else:
+            user_uuid = uuid.uuid4()
 
         # Migration-stable URI reuse: see _wire_warm_bundle for rationale.
         # Both the sub_token (used in /sub/{token}) AND the encrypted
@@ -2101,7 +2144,11 @@ class ProvisioningOrchestrator:
             not in (models.DeviceStatus.disabled, models.DeviceStatus.revoked)
         ]
         live_names: list[str] = []
-        reuse_map: dict[str, tuple[str | None, str | None]] = {}
+        # Per-device (sub_token, connection_uri, vless_uuid) — all three
+        # must be carried across the migrate boundary so the new rows on
+        # the target node render identical user-facing URIs (admin UI
+        # "copy link" and the vless:// payload inside the sub file).
+        reuse_map: dict[str, tuple[str | None, str | None, str | None]] = {}
         for d in live_devices_snapshot:
             name_key = d.name or "primary"
             live_names.append(name_key)
@@ -2110,7 +2157,11 @@ class ProvisioningOrchestrator:
             # we only carry one token pair; the second reprovision gets a
             # fresh token.
             if name_key not in reuse_map:
-                reuse_map[name_key] = (d.sub_token, d.connection_uri)
+                reuse_map[name_key] = (
+                    d.sub_token,
+                    d.connection_uri,
+                    _device_vless_uuid(d),
+                )
 
         # Revoke old devices first so the slot frees up on the old node
         # before the drain tick re-evaluates capacity. Background is fine:
@@ -2142,7 +2193,7 @@ class ProvisioningOrchestrator:
         # revoked row keeps its connection_uri for history/audit, just
         # loses its routable token). Alias resolution via /sub/{token}
         # still works because the NEW row carries the token.
-        reused_tokens = {t for t, _ in reuse_map.values() if t}
+        reused_tokens = {t for t, _, _ in reuse_map.values() if t}
         if reused_tokens:
             for d in live_devices_snapshot:
                 if d.sub_token and d.sub_token in reused_tokens:
@@ -2163,12 +2214,15 @@ class ProvisioningOrchestrator:
         first_device: models.Device | None = None
         first_task: models.ProvisioningTask | None = None
         for name in live_names:
-            reuse_token, reuse_uri = reuse_map.get(name, (None, None))
+            reuse_token, reuse_uri, reuse_uuid = reuse_map.get(
+                name, (None, None, None)
+            )
             device, task = self.reprovision_subscription(
                 subscription,
                 device_name=name,
                 reuse_sub_token=reuse_token,
                 reuse_connection_uri=reuse_uri,
+                reuse_uuid=reuse_uuid,
             )
             if first_device is None:
                 first_device = device
@@ -2224,8 +2278,13 @@ class ProvisioningOrchestrator:
         # the old node are untouched, so only *this* device's token/uri
         # can be safely carried over. See migrate_subscription_to_new_node
         # for the full rationale on the snapshot/NULL/reuse dance.
+        # ``reuse_uuid`` pins the new Credential's VLESS user id to the
+        # old one so the subscription file the user has installed keeps
+        # the exact same vless:// URI — without this the client sees a
+        # "new" account on every relay move and has to refetch/rebind.
         reuse_token = device.sub_token
         reuse_uri = device.connection_uri
+        reuse_uuid = _device_vless_uuid(device)
 
         self.revoke_device(
             device,
@@ -2241,6 +2300,7 @@ class ProvisioningOrchestrator:
             target_node=target,
             reuse_sub_token=reuse_token,
             reuse_connection_uri=reuse_uri,
+            reuse_uuid=reuse_uuid,
         )
         return target, new_device, task
 
