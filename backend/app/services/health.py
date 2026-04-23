@@ -205,6 +205,7 @@ def migrate_subscriptions_off(
     """
     from .provisioning import (
         ProvisioningOrchestrator,
+        _device_vless_uuid,
         _node_has_vless_family,
         choose_node,
     )
@@ -245,6 +246,34 @@ def migrate_subscriptions_off(
             no_target_count += 1
             continue
 
+        # Snapshot every live device's identity BEFORE revoke so the
+        # reprovision loop on the target can preserve per-user URIs
+        # byte-for-byte. Without this two regressions come back:
+        #   - N-device subs collapse to a single "primary" on the new
+        #     node because we only called reprovision once per sub.
+        #   - Every device's vless:// URI rerolls (fresh UUID + fresh
+        #     sub_token) and the clients users have installed start
+        #     refetching their subscription file on every migrate.
+        # See ``migrate_subscription_to_new_node`` for the full rationale
+        # on the snapshot/NULL/reuse dance — this block mirrors it.
+        live_devices_snapshot = [
+            d
+            for d in list(sub.devices)
+            if d.status
+            not in (models.DeviceStatus.disabled, models.DeviceStatus.revoked)
+        ]
+        live_names: list[str] = []
+        reuse_map: dict[str, tuple[str | None, str | None, str | None]] = {}
+        for d in live_devices_snapshot:
+            name_key = d.name or "primary"
+            live_names.append(name_key)
+            if name_key not in reuse_map:
+                reuse_map[name_key] = (
+                    d.sub_token,
+                    d.connection_uri,
+                    _device_vless_uuid(d),
+                )
+
         # Revoke the old devices on the (possibly already-dead) node. Best
         # effort — if the node is unreachable Ansible will fail, that's okay.
         for device in list(sub.devices):
@@ -253,6 +282,17 @@ def migrate_subscriptions_off(
                 revoke_task_ids.append(revoke_task.id)
             except Exception:  # noqa: BLE001
                 logger.exception("Failed to revoke device %s during migration", device.id)
+
+        # Free the unique(sub_token) slot on every just-revoked device
+        # whose token we intend to reuse on the target node — without
+        # NULL-ing here the reprovision INSERT trips the unique
+        # constraint (two rows can't share the same non-null sub_token).
+        reused_tokens = {t for t, _, _ in reuse_map.values() if t}
+        if reused_tokens:
+            for d in live_devices_snapshot:
+                if d.sub_token and d.sub_token in reused_tokens:
+                    d.sub_token = None
+            db.flush()
 
         # In-place migration: flip node_id on the existing Subscription row
         # and reprovision. This preserves sub_token (dynamic sub-link keeps
@@ -264,35 +304,51 @@ def migrate_subscriptions_off(
         db.commit()
         db.refresh(sub)
 
+        if not live_names:
+            # Sub had zero live devices — still create one so /sub/{token}
+            # aliasing on old revoked rows has a sibling to resolve.
+            live_names = ["primary"]
+        sub_succeeded = False
         try:
-            _device, _task = orchestrator.reprovision_subscription(sub)
-            migrated_ids.append(sub.id)
-            resync_targets[target.id] = target
-            if _task is not None:
-                device_task_ids.append(_task.id)
-            new_sub = sub
-            # Notify the user. The bot polls /notifications/pending for
-            # audit_log rows with action="migration_notice" and delivers
-            # them as Telegram messages (see api_extensions.py). Without
-            # telegram_id in extra the poller silently drops the row, so
-            # skip the write for non-Telegram users (e.g. email-only).
-            if sub.user and sub.user.telegram_id and sub.user.notify_migrations:
-                db.add(
-                    models.AuditLog(
-                        actor="health_monitor",
-                        actor_type=models.AuditActor.system,
-                        action="migration_notice",
-                        target_type="subscription",
-                        target_id=new_sub.id,
-                        extra={
-                            "telegram_id": sub.user.telegram_id,
-                            "old_node": node.name,
-                            "new_node": target.name,
-                            "reason": reason,
-                        },
-                    )
+            for name in live_names:
+                reuse_token, reuse_uri, reuse_uuid = reuse_map.get(
+                    name, (None, None, None)
                 )
-                db.commit()
+                _device, _task = orchestrator.reprovision_subscription(
+                    sub,
+                    device_name=name,
+                    reuse_sub_token=reuse_token,
+                    reuse_connection_uri=reuse_uri,
+                    reuse_uuid=reuse_uuid,
+                )
+                if _task is not None:
+                    device_task_ids.append(_task.id)
+                sub_succeeded = True
+            if sub_succeeded:
+                migrated_ids.append(sub.id)
+                resync_targets[target.id] = target
+                # Notify the user. The bot polls /notifications/pending for
+                # audit_log rows with action="migration_notice" and delivers
+                # them as Telegram messages (see api_extensions.py). Without
+                # telegram_id in extra the poller silently drops the row, so
+                # skip the write for non-Telegram users (e.g. email-only).
+                if sub.user and sub.user.telegram_id and sub.user.notify_migrations:
+                    db.add(
+                        models.AuditLog(
+                            actor="health_monitor",
+                            actor_type=models.AuditActor.system,
+                            action="migration_notice",
+                            target_type="subscription",
+                            target_id=sub.id,
+                            extra={
+                                "telegram_id": sub.user.telegram_id,
+                                "old_node": node.name,
+                                "new_node": target.name,
+                                "reason": reason,
+                            },
+                        )
+                    )
+                    db.commit()
         except Exception:  # noqa: BLE001
             logger.exception("Failed to re-provision sub %s on node %s", sub.id, target.id)
 
