@@ -196,6 +196,13 @@ def run_renewal_check() -> dict:
         revoke_cutoff = now - timedelta(hours=RENEWAL_GRACE_HOURS)
 
         # ── Mark overdue subscriptions as expired (status flip only). ──
+        # Для auto_renew=True сначала пробуем V2 balance.renew_subscription:
+        # `run_renewal_check` живёт на 5-min cadence, `run_balance_charge_tick`
+        # на часовом — без этого race-fix-а час между balance-тиками означает,
+        # что мы успеваем флипнуть в expired раньше, чем balance успеет
+        # списать с кошелька, и подписка с достаточным балансом и тумблером
+        # auto_renew=ON всё равно не продлевается.
+        from .services import balance as balance_svc
         overdue = (
             session.query(models.Subscription)
             .filter(
@@ -205,6 +212,17 @@ def run_renewal_check() -> dict:
             .all()
         )
         for sub in overdue:
+            if sub.auto_renew:
+                try:
+                    if balance_svc.renew_subscription(session, sub):
+                        stats["renewed"] = stats.get("renewed", 0) + 1
+                        continue
+                except Exception:  # noqa: BLE001
+                    logger.exception(
+                        "renewal_check: balance.renew failed sub=%s", sub.id
+                    )
+                    if session.is_active:
+                        session.rollback()
             sub.status = models.SubscriptionStatus.expired
             session.add(sub)
             stats["expired"] += 1
@@ -278,20 +296,46 @@ def run_renewal_check() -> dict:
             session.flush()
 
             user = session.get(models.User, sub.user_id)
-            if user and user.telegram_id and user.notify_renewals:
-                log = models.AuditLog(
-                    actor="system",
-                    actor_type=models.AuditActor.system,
-                    action="renewal_reminder",
-                    target_type="subscription",
-                    target_id=sub.id,
-                    extra={
-                        "telegram_id": user.telegram_id,
-                        "invoice_id": invoice.id,
-                        "expires_at": sub.expires_at.isoformat(),
-                    },
+            if not user or not user.telegram_id or not user.notify_renewals:
+                stats["reminded"] += 1
+                continue
+            # Skip notification if balance covers next renewal — V2
+            # balance tick will silently auto-renew, no need to bug user.
+            wallet = user.balance_kopecks or 0
+            cost = balance_svc.total_renewal_cost_kopecks(sub)
+            if cost > 0 and wallet >= cost:
+                stats["reminded"] += 1
+                continue
+            # Idempotency in addition to invoice-check: invoice can be
+            # marked paid/cancelled by admin, after which the existing
+            # invoice query returns nothing and we'd otherwise re-spam.
+            existing_log = (
+                session.query(models.AuditLog)
+                .filter(
+                    models.AuditLog.action.in_(
+                        ["renewal_reminder", "renewal_reminder:delivered"]
+                    ),
+                    models.AuditLog.target_type == "subscription",
+                    models.AuditLog.target_id == sub.id,
                 )
-                session.add(log)
+                .first()
+            )
+            if existing_log:
+                stats["reminded"] += 1
+                continue
+            log = models.AuditLog(
+                actor="system",
+                actor_type=models.AuditActor.system,
+                action="renewal_reminder",
+                target_type="subscription",
+                target_id=sub.id,
+                extra={
+                    "telegram_id": user.telegram_id,
+                    "invoice_id": invoice.id,
+                    "expires_at": sub.expires_at.isoformat(),
+                },
+            )
+            session.add(log)
             stats["reminded"] += 1
         session.commit()
 
@@ -310,10 +354,20 @@ def run_renewal_check() -> dict:
             user = session.get(models.User, sub.user_id)
             if not user or not user.telegram_id or not user.notify_renewals:
                 continue
+            # Same balance-gate as 3-day: silent auto-renew, no need to bug.
+            wallet = user.balance_kopecks or 0
+            cost = balance_svc.total_renewal_cost_kopecks(sub)
+            if cost > 0 and wallet >= cost:
+                continue
+            # `.in_(...)` covers post-ACK state: bot's POST /ack appends
+            # `:delivered` to action, so a plain `== "renewal_reminder_1d"`
+            # check would miss the prior log and re-spam every 5-min tick.
             existing_log = (
                 session.query(models.AuditLog)
                 .filter(
-                    models.AuditLog.action == "renewal_reminder_1d",
+                    models.AuditLog.action.in_(
+                        ["renewal_reminder_1d", "renewal_reminder_1d:delivered"]
+                    ),
                     models.AuditLog.target_type == "subscription",
                     models.AuditLog.target_id == sub.id,
                 )
@@ -354,7 +408,9 @@ def run_renewal_check() -> dict:
             existing_log = (
                 session.query(models.AuditLog)
                 .filter(
-                    models.AuditLog.action == "expiry_reminder",
+                    models.AuditLog.action.in_(
+                        ["expiry_reminder", "expiry_reminder:delivered"]
+                    ),
                     models.AuditLog.target_type == "subscription",
                     models.AuditLog.target_id == sub.id,
                 )
@@ -394,7 +450,9 @@ def run_renewal_check() -> dict:
             existing_log = (
                 session.query(models.AuditLog)
                 .filter(
-                    models.AuditLog.action == "expiry_reminder_1d",
+                    models.AuditLog.action.in_(
+                        ["expiry_reminder_1d", "expiry_reminder_1d:delivered"]
+                    ),
                     models.AuditLog.target_type == "subscription",
                     models.AuditLog.target_id == sub.id,
                 )
