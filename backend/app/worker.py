@@ -350,14 +350,26 @@ def run_renewal_check() -> dict:
             )
             .all()
         )
+        logger.info(
+            "renewal_check.expiring_1d: %d sub(s) in window [now, now+1d]",
+            len(expiring_1d),
+        )
         for sub in expiring_1d:
             user = session.get(models.User, sub.user_id)
             if not user or not user.telegram_id or not user.notify_renewals:
+                logger.info(
+                    "renewal_check.1d: sub=%s skip (no user/tg/notify_renewals)",
+                    sub.id,
+                )
                 continue
             # Same balance-gate as 3-day: silent auto-renew, no need to bug.
             wallet = user.balance_kopecks or 0
             cost = balance_svc.total_renewal_cost_kopecks(sub)
             if cost > 0 and wallet >= cost:
+                logger.info(
+                    "renewal_check.1d: sub=%s skip balance-gate wallet=%s cost=%s",
+                    sub.id, wallet, cost,
+                )
                 continue
             # `.in_(...)` covers post-ACK state: bot's POST /ack appends
             # `:delivered` to action, so a plain `== "renewal_reminder_1d"`
@@ -373,9 +385,29 @@ def run_renewal_check() -> dict:
                 )
                 .first()
             )
+            # Дополнительная диагностика для разбора майского спама: смотрим
+            # ВСЁ, что лежит в audit_logs по этой подписке, чтобы поймать
+            # action со странным суффиксом (типа ":delivered:delivered"),
+            # mismatched target_id, NULL target_id и т.д.
+            all_for_sub = (
+                session.query(models.AuditLog.id, models.AuditLog.action)
+                .filter(
+                    models.AuditLog.target_type == "subscription",
+                    models.AuditLog.target_id == sub.id,
+                )
+                .order_by(models.AuditLog.created_at.desc())
+                .limit(10)
+                .all()
+            )
             if existing_log:
+                logger.info(
+                    "renewal_check.1d: sub=%s SKIP dedup matched log_id=%s action=%r "
+                    "(all_recent=%s)",
+                    sub.id, existing_log.id, existing_log.action,
+                    [(i, a) for (i, a) in all_for_sub],
+                )
                 continue
-            session.add(models.AuditLog(
+            new_log = models.AuditLog(
                 actor="system",
                 actor_type=models.AuditActor.system,
                 action="renewal_reminder_1d",
@@ -386,7 +418,14 @@ def run_renewal_check() -> dict:
                     "subscription_id": sub.id,
                     "expires_at": sub.expires_at.isoformat(),
                 },
-            ))
+            )
+            session.add(new_log)
+            logger.warning(
+                "renewal_check.1d: sub=%s CREATED new log user=%s wallet=%s cost=%s "
+                "(all_recent_for_sub=%s) — investigate why dedup missed",
+                sub.id, user.id, wallet, cost,
+                [(i, a) for (i, a) in all_for_sub],
+            )
             stats["reminded_1d"] += 1
         session.commit()
 
@@ -443,9 +482,17 @@ def run_renewal_check() -> dict:
             )
             .all()
         )
+        logger.info(
+            "renewal_check.expiring_manual_1d: %d sub(s) in window",
+            len(expiring_manual_1d),
+        )
         for sub in expiring_manual_1d:
             user = session.get(models.User, sub.user_id)
             if not user or not user.telegram_id or not user.notify_renewals:
+                logger.info(
+                    "renewal_check.manual_1d: sub=%s skip (no user/tg/notify)",
+                    sub.id,
+                )
                 continue
             existing_log = (
                 session.query(models.AuditLog)
@@ -458,7 +505,23 @@ def run_renewal_check() -> dict:
                 )
                 .first()
             )
+            all_for_sub = (
+                session.query(models.AuditLog.id, models.AuditLog.action)
+                .filter(
+                    models.AuditLog.target_type == "subscription",
+                    models.AuditLog.target_id == sub.id,
+                )
+                .order_by(models.AuditLog.created_at.desc())
+                .limit(10)
+                .all()
+            )
             if existing_log:
+                logger.info(
+                    "renewal_check.manual_1d: sub=%s SKIP dedup matched "
+                    "log_id=%s action=%r (all_recent=%s)",
+                    sub.id, existing_log.id, existing_log.action,
+                    [(i, a) for (i, a) in all_for_sub],
+                )
                 continue
             session.add(models.AuditLog(
                 actor="system",
@@ -472,6 +535,11 @@ def run_renewal_check() -> dict:
                     "expires_at": sub.expires_at.isoformat(),
                 },
             ))
+            logger.warning(
+                "renewal_check.manual_1d: sub=%s CREATED new log "
+                "(all_recent_for_sub=%s) — investigate why dedup missed",
+                sub.id, [(i, a) for (i, a) in all_for_sub],
+            )
             stats["reminded_1d"] += 1
         session.commit()
 
