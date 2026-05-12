@@ -1113,9 +1113,19 @@ def run_user_health_ping_tick() -> dict:
     from .queue import schedule_tick
     from .time_utils import utcnow
 
+    import random as _random
+
     interval = int(os.getenv("USER_HEALTH_PING_INTERVAL", "1800"))
     batch = int(os.getenv("USER_HEALTH_PING_BATCH", "50"))
-    debounce_hours = int(os.getenv("USER_HEALTH_PING_DEBOUNCE_HOURS", "24"))
+    # Базовая дебаунс-дельта = минимум между ping'ами. Jitter (random
+    # forward-offset) добавляется к `health_ping_last_at` при записи,
+    # чтобы фактический интервал растянулся в [base, base+jitter] на
+    # юзера. Дефолты: 168ч (7 дн.) base + 168ч (7 дн.) jitter → ping
+    # каждые 7-14 дней случайно. Раньше было 24ч fixed — юзеры жали
+    # «не работает» в игнор из-за фоновой усталости, и реальные
+    # жалобы тонули в шуме.
+    debounce_hours = int(os.getenv("USER_HEALTH_PING_DEBOUNCE_HOURS", "168"))
+    jitter_hours = int(os.getenv("USER_HEALTH_PING_DEBOUNCE_JITTER_HOURS", "168"))
 
     # Reschedule в начале — см. run_pending_rescue_tick. Важно: ставим
     # reschedule ДО early-return по MSK-окну, иначе вне окна тик умрёт.
@@ -1201,7 +1211,15 @@ def run_user_health_ping_tick() -> dict:
                     },
                 )
             )
-            user.health_ping_last_at = now
+            # Future-time stretch: записываем не `now`, а `now + random(0, jitter)`.
+            # Поле `health_ping_last_at` дальше сравнивается только с
+            # `now - debounce_hours` в фильтре отбора, поэтому смещение
+            # вперёд эквивалентно отсрочке «следующего eligible» на ту же
+            # величину. Range: [debounce_hours, debounce_hours + jitter_hours].
+            jitter_offset = timedelta(
+                hours=_random.uniform(0.0, max(0, jitter_hours))
+            ) if jitter_hours > 0 else timedelta(0)
+            user.health_ping_last_at = now + jitter_offset
             session.add(user)
             summary["queued"] += 1
 

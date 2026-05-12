@@ -139,6 +139,29 @@ _SELF_REPORT_COOLDOWN_S = 300  # 5 минут
 _self_report_last: dict[int, float] = {}
 
 
+# Удаляем ack-сообщение опроса «Помогите нам улучшить сервис» через N сек.
+# после ответа юзера, чтобы чат не захламлялся. Telegram даёт боту удалять
+# свои сообщения в private chat без админ-прав в течение 48ч — этого
+# окна с большим запасом хватает.
+HEALTH_PING_ACK_DELETE_DELAY_S = int(
+    os.getenv("HEALTH_PING_ACK_DELETE_DELAY_S", "60")
+)
+
+
+async def _delete_message_after(
+    bot, chat_id: int, message_id: int, delay_s: int
+) -> None:
+    """Fire-and-forget delete с задержкой. Best-effort: любые исключения
+    Telegram (сообщение уже удалено юзером, бот без прав, network) тихо
+    глотаем — это всегда косметика, никогда не критично.
+    """
+    try:
+        await asyncio.sleep(delay_s)
+        await bot.delete_message(chat_id=chat_id, message_id=message_id)
+    except Exception:  # noqa: BLE001
+        pass
+
+
 # ── Onboarding instructions ──────────────────────────────────────────
 
 ONBOARDING_INSTRUCTIONS = {
@@ -753,11 +776,24 @@ async def health_ping_response(callback_query: types.CallbackQuery):
         await callback_query.message.edit_text(ack_text)
     except Exception:
         pass
+    # Авто-удаление ack-сообщения через HEALTH_PING_ACK_DELETE_DELAY_S.
+    # Применяется к обоим веткам (ok/bad) — для bad важная инфа продублирована
+    # в toast `callback_query.answer("Спасибо! Чиним.")` и админы уже
+    # оповещены через notify_admins, повторное чтение бабла юзеру не нужно.
+    if HEALTH_PING_ACK_DELETE_DELAY_S > 0:
+        asyncio.create_task(
+            _delete_message_after(
+                callback_query.bot,
+                callback_query.message.chat.id,
+                callback_query.message.message_id,
+                HEALTH_PING_ACK_DELETE_DELAY_S,
+            )
+        )
 
 
 # Self-report: юзер жмёт «🆘 VPN не работает» в reply-клавиатуре.
-# Плановый health-ping приходит юзеру не чаще раза в сутки и только в
-# обеденное окно МСК (USER_HEALTH_PING_DEBOUNCE_HOURS=24, окно 11–14) —
+# Плановый health-ping приходит юзеру раз в 7-14 дней (random jitter),
+# только в обеденное окно МСК (11–14) —
 # self-report закрывает эту дыру и позволяет пожаловаться прямо сейчас.
 # source="self_reported" помечает запись, чтобы админка выделяла такие
 # жалобы красным как более сильный сигнал, чем ответ на плановый пинг.

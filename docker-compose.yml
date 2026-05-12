@@ -173,11 +173,14 @@ services:
       TRAFFIC_STATS_INTERVAL: ${TRAFFIC_STATS_INTERVAL:-300}
       # Phase C — bot health-ping with consent. Worker queues a
       # friendly "помогите нам улучшить сервис" prompt to active users
-      # at most once per USER_HEALTH_PING_DEBOUNCE_HOURS, capped at
-      # USER_HEALTH_PING_BATCH per tick. 0 disables the tick.
+      # раз в [DEBOUNCE_HOURS, DEBOUNCE_HOURS + DEBOUNCE_JITTER_HOURS]
+      # — random per-user. Дефолт 168+168 = 7-14 дней, чтобы юзеры
+      # не привыкали игнорить ежедневный спам и реальные «не работает»
+      # не тонули в шуме. Batch — sanity-cap на тик.
       USER_HEALTH_PING_INTERVAL: ${USER_HEALTH_PING_INTERVAL:-1800}
       USER_HEALTH_PING_BATCH: ${USER_HEALTH_PING_BATCH:-50}
-      USER_HEALTH_PING_DEBOUNCE_HOURS: ${USER_HEALTH_PING_DEBOUNCE_HOURS:-24}
+      USER_HEALTH_PING_DEBOUNCE_HOURS: ${USER_HEALTH_PING_DEBOUNCE_HOURS:-168}
+      USER_HEALTH_PING_DEBOUNCE_JITTER_HOURS: ${USER_HEALTH_PING_DEBOUNCE_JITTER_HOURS:-168}
       # Admin push-уведомления: тиковый воркер читает те же ADMIN_IDS,
       # чтобы alert-ы из run_relay_link_health_tick / dlq_exception_handler
       # пошли нужным людям.
@@ -257,6 +260,9 @@ services:
       SUB_LINK_BASE_URL: ${SUB_LINK_BASE_URL:-}
       WEBAPP_BASE_URL: ${WEBAPP_BASE_URL:-}
       NOTIFICATION_POLL_INTERVAL: ${NOTIFICATION_POLL_INTERVAL:-10}
+      # Auto-delete ack-сообщения health-ping опроса через N секунд после
+      # ответа юзера. 0 — выключить (оставить «Спасибо!» в чате навсегда).
+      HEALTH_PING_ACK_DELETE_DELAY_S: ${HEALTH_PING_ACK_DELETE_DELAY_S:-60}
       # #62 — webhook mode port. >0 switches from polling to an internal
       # aiohttp server that receives forwarded updates from the backend.
       BOT_WEBHOOK_PORT: ${BOT_WEBHOOK_PORT:-0}
