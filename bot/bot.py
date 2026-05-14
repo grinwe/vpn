@@ -2,6 +2,7 @@ import asyncio
 import logging
 from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
+from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
 from aiogram.fsm.storage.memory import MemoryStorage
 from .config import BOT_TOKEN, BACKEND_URL, ADMIN_API_TOKEN, NOTIFICATION_POLL_INTERVAL, BOT_WEBHOOK_PORT
 from .handlers import close_session, router, get_session, onboarding_keyboard, health_ping_keyboard
@@ -38,6 +39,22 @@ async def notification_poller(bot: Bot):
                     continue
                 notifications = await resp.json()
 
+            async def _ack(notif_id_inner: int) -> None:
+                """ACK helper: помечает запись в audit_logs как `:delivered`,
+                чтобы /pending её больше не возвращал. Best-effort — сетевой
+                сбой здесь не должен валить весь поллер.
+                """
+                if not notif_id_inner:
+                    return
+                try:
+                    async with session.post(
+                        f"{BACKEND_URL}/api/notifications/{notif_id_inner}/ack",
+                        headers=headers,
+                    ):
+                        pass
+                except Exception:  # noqa: BLE001
+                    logger.exception("ACK failed for notif=%s", notif_id_inner)
+
             for notif in notifications:
                 telegram_id = notif.get("telegram_id")
                 text = notif.get("text", "")
@@ -57,13 +74,7 @@ async def notification_poller(bot: Bot):
                         parse_mode="HTML",
                         reply_markup=keyboard,
                     )
-                    # Acknowledge delivery
-                    if notif_id:
-                        async with session.post(
-                            f"{BACKEND_URL}/api/notifications/{notif_id}/ack",
-                            headers=headers,
-                        ):
-                            pass  # Best-effort ack
+                    await _ack(notif_id)
                     # Для admin_broadcast спим между сообщениями, чтобы не
                     # упереться в Telegram rate-limit ~30 msg/sec. При
                     # батче в 50 рассылок тик отпустится за ~2.5s. Для
@@ -71,7 +82,31 @@ async def notification_poller(bot: Bot):
                     # admin_alert_*) задержка не нужна — их мало.
                     if notif_type == "admin_broadcast":
                         await asyncio.sleep(0.05)
+                except TelegramForbiddenError:
+                    # Юзер заблокировал бота / удалил чат / деактивировал
+                    # аккаунт. Без ACK эта запись будет возвращаться из
+                    # /pending каждые NOTIFICATION_POLL_INTERVAL секунд
+                    # и поллер залипнет в loop, забивая весь cluster
+                    # (Failed to deliver спамом в логах, /pending в DoS).
+                    # Терминальная ошибка — ACK-аем и идём дальше.
+                    logger.warning(
+                        "TG forbidden for chat=%s (blocked/deactivated), "
+                        "marking notif=%s as delivered",
+                        telegram_id, notif_id,
+                    )
+                    await _ack(notif_id)
+                except TelegramBadRequest as e:
+                    # «chat not found», «user not found», «message is too
+                    # long» и пр. — все терминальные с точки зрения именно
+                    # этой записи. Ретрай не поможет, нужен ACK.
+                    logger.warning(
+                        "TG bad request for chat=%s: %s, ack notif=%s",
+                        telegram_id, e.message, notif_id,
+                    )
+                    await _ack(notif_id)
                 except Exception:
+                    # Сетевые/временные ошибки — НЕ ACK-аем, поллер
+                    # попробует снова на следующем тике.
                     logger.exception("Failed to deliver notification to %s", telegram_id)
 
         except asyncio.CancelledError:
