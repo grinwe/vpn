@@ -1,0 +1,102 @@
+---
+# Disaster-recovery — собрать xray RUNTIME-state со всех vpn_nodes.
+#
+# Зачем: config.json содержит только pre-provisioned warm-bundles. Когда
+# юзер покупает подписку, backend кладёт mapping warm_uuid → subscription_id
+# в БД, БЕЗ переименования email в xray. Email на ноде остаётся
+# "warm-<node_id>-<hex>", а связь живёт ТОЛЬКО в DB.Credential.
+# БД мы потеряли → mapping разорван.
+#
+# НО xray runtime в памяти всё ещё знает кто куда коннектился — через
+# счётчики статистики `user>>>warm-N-hex>>>traffic>>>uplink`. Они
+# выживают до рестарта процесса. Поэтому **до перезапуска xray** мы
+# вытаскиваем эти счётчики и узнаём, какие из warm-bundle'ов реально
+# используются юзерами (= имели трафик) — это и есть наш «assigned» pool.
+#
+# Output: infra/ansible/recovered-runtime/<host>.json со структурой:
+#   {
+#     "host": "ru-pq-01",
+#     "reality_stats_emails": [...],   # warm-N-hex с трафиком на :10085
+#     "xhttp_stats_emails":   [...],   # то же для :10087
+#     "access_emails_seen":   [...]    # ВСЕ emails из access-log (включая .gz)
+#   }
+#
+# Aggregator на следующем шаге сматчит warm-N-hex с uuid из nodes.json
+# и сгенерит INSERT'ы для таблицы credentials.
+
+- name: Pull xray runtime state from all VPN nodes
+  hosts: vpn_nodes
+  become: yes
+  gather_facts: no
+  ignore_unreachable: yes
+  tags: [recovery, runtime]
+  vars:
+    runtime_output_dir: "{{ playbook_dir }}/../recovered-runtime"
+
+  tasks:
+    - name: Wait for SSH (retry transient timeouts)
+      ansible.builtin.wait_for_connection:
+        delay: 0
+        timeout: 60
+        sleep: 5
+      ignore_errors: yes
+      ignore_unreachable: yes
+
+    - name: Query reality stats (port 10085)
+      ansible.builtin.shell: |
+        /usr/local/bin/xray api statsquery --server=127.0.0.1:10085 -pattern 'user>>>' 2>/dev/null \
+          | grep -oE '"name":\s*"user>>>[^"]*"' \
+          | sed -E 's/"name":\s*"user>>>([^>]+)>>>.*/\1/' \
+          | sort -u
+      register: _reality_stats
+      changed_when: false
+      failed_when: false
+
+    - name: Query xhttp stats (port 10087)
+      ansible.builtin.shell: |
+        /usr/local/bin/xray api statsquery --server=127.0.0.1:10087 -pattern 'user>>>' 2>/dev/null \
+          | grep -oE '"name":\s*"user>>>[^"]*"' \
+          | sed -E 's/"name":\s*"user>>>([^>]+)>>>.*/\1/' \
+          | sort -u
+      register: _xhttp_stats
+      changed_when: false
+      failed_when: false
+
+    - name: Grep access-logs (including rotated .gz) for emails
+      ansible.builtin.shell: |
+        {
+          for log in /var/log/xray/access-reality.log /var/log/xray/access-xhttp.log; do
+            [ -f "$log" ] && grep -hoE '(warm|user)-[0-9]+-[0-9a-f]+[-0-9a-fA-F]*' "$log" 2>/dev/null
+          done
+          for gz in /var/log/xray/access-*.log.*.gz; do
+            [ -f "$gz" ] && zgrep -hoE '(warm|user)-[0-9]+-[0-9a-f]+[-0-9a-fA-F]*' "$gz" 2>/dev/null
+          done
+        } | sort -u
+      register: _access_emails
+      changed_when: false
+      failed_when: false
+
+    - name: Ensure output dir on controller
+      ansible.builtin.file:
+        path: "{{ runtime_output_dir }}"
+        state: directory
+        mode: "0755"
+      delegate_to: localhost
+      become: false
+      run_once: true
+
+    - name: Write per-host runtime.json
+      ansible.builtin.copy:
+        dest: "{{ runtime_output_dir }}/{{ inventory_hostname }}.json"
+        content: |
+          {{
+            {
+              "host": inventory_hostname,
+              "reality_stats_emails": (_reality_stats.stdout_lines | default([])),
+              "xhttp_stats_emails":   (_xhttp_stats.stdout_lines | default([])),
+              "access_emails_seen":   (_access_emails.stdout_lines | default([])),
+            } | to_nice_json
+          }}
+        mode: "0644"
+      delegate_to: localhost
+      become: false
