@@ -14,3 +14,13 @@ infra/ansible/group_vars/web/vault*
 .codegraph/
 AGENTS.md
 CLAUDE.md
+# Build artifacts
+admin/tsconfig.tsbuildinfo
+# Disaster-recovery local dumps. Содержат приватные ключи, telegram_id,
+# балансы — никогда не коммитим. Воссоздаётся прогонкой recover_*-playbook'а.
+infra/ansible/recovered/
+infra/ansible/recovered-runtime/
+infra/ansible/recovered-wg/
+# Diag-выводы scratch — для одноразовых сессий.
+diag.out
+runtime.out
