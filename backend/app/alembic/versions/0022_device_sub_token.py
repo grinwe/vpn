@@ -16,18 +16,26 @@ import secrets
 from alembic import op
 from sqlalchemy import Column, String, text
 
+from app.alembic._idempotent import has_column, has_index
+
 revision = "0022_device_sub_token"
 down_revision = "0021_payment_unique_provider_external_id"
 
 
 def upgrade() -> None:
     # 1. Add nullable column first (can't add UNIQUE + NOT NULL in one step
-    #    when existing rows have no value).
-    op.add_column("devices", Column("sub_token", String, nullable=True))
+    #    when existing rows have no value). has_column-guard: 0001
+    #    create_all() уже создаёт колонку из модели.
+    if not has_column("devices", "sub_token"):
+        op.add_column("devices", Column("sub_token", String, nullable=True))
 
-    # 2. Backfill existing devices with unique tokens.
+    # 2. Backfill existing devices with unique tokens. NULL only — на
+    #    fresh DB колонка уже есть, но строк нет, no-op. На исторической
+    #    DB апдейтит только те, что без токена.
     bind = op.get_bind()
-    rows = bind.execute(text("SELECT id FROM devices")).fetchall()
+    rows = bind.execute(
+        text("SELECT id FROM devices WHERE sub_token IS NULL")
+    ).fetchall()
     for (device_id,) in rows:
         token = secrets.token_urlsafe(32)
         bind.execute(
@@ -35,8 +43,11 @@ def upgrade() -> None:
             {"token": token, "id": device_id},
         )
 
-    # 3. Add unique index.
-    op.create_index("ix_devices_sub_token", "devices", ["sub_token"], unique=True)
+    # 3. Add unique index. has_index-guard.
+    if not has_index("devices", "ix_devices_sub_token"):
+        op.create_index(
+            "ix_devices_sub_token", "devices", ["sub_token"], unique=True
+        )
 
 
 def downgrade() -> None:

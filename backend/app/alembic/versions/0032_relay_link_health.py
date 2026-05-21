@@ -25,6 +25,8 @@ from __future__ import annotations
 from alembic import op
 import sqlalchemy as sa
 
+from app.alembic._idempotent import has_column
+
 
 revision = "0032_relay_link_health"
 down_revision = "0031_uniq_relay_exit_pair"
@@ -33,22 +35,27 @@ depends_on = None
 
 
 def upgrade() -> None:
-    op.add_column(
-        "relay_exit_links",
-        sa.Column("last_handshake_at", sa.DateTime(), nullable=True),
-    )
-    op.add_column(
-        "relay_exit_links",
-        sa.Column("last_rx_bytes", sa.BigInteger(), nullable=True),
-    )
-    op.add_column(
-        "relay_exit_links",
-        sa.Column("last_tx_bytes", sa.BigInteger(), nullable=True),
-    )
-    op.add_column(
-        "relay_exit_links",
-        sa.Column("last_observed_at", sa.DateTime(), nullable=True),
-    )
+    # has_column-guards: 0001 create_all() уже создаёт колонки из модели.
+    if not has_column("relay_exit_links", "last_handshake_at"):
+        op.add_column(
+            "relay_exit_links",
+            sa.Column("last_handshake_at", sa.DateTime(), nullable=True),
+        )
+    if not has_column("relay_exit_links", "last_rx_bytes"):
+        op.add_column(
+            "relay_exit_links",
+            sa.Column("last_rx_bytes", sa.BigInteger(), nullable=True),
+        )
+    if not has_column("relay_exit_links", "last_tx_bytes"):
+        op.add_column(
+            "relay_exit_links",
+            sa.Column("last_tx_bytes", sa.BigInteger(), nullable=True),
+        )
+    if not has_column("relay_exit_links", "last_observed_at"):
+        op.add_column(
+            "relay_exit_links",
+            sa.Column("last_observed_at", sa.DateTime(), nullable=True),
+        )
 
 
 def downgrade() -> None:
