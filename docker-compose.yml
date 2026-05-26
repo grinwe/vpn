@@ -113,7 +113,11 @@ services:
       context: .
       dockerfile: backend/Dockerfile.worker
     deploy:
-      replicas: 1
+      # WORKER_REPLICAS параметризован для bulk-provisioning: дефолт 1 на
+      # обычный prod нагрузке, бамп до 5 на массовый bootstrap/resync
+      # (5×3 concurrent ansible = 15 параллельных playbook-ранов, на 4×8
+      # VPS укладывается с запасом).
+      replicas: ${WORKER_REPLICAS:-1}
     environment: &worker-env
       DATABASE_URL: ${DATABASE_URL}
       ADMIN_API_TOKEN: ${ADMIN_API_TOKEN}

@@ -20,12 +20,21 @@
   loop: "{{ ssh_public_keys | default([]) }}"
 
 - name: Wait for unattended-upgrades to finish
+  # fuser по dpkg/lock-frontend пропускает кейс когда unattended-upgrades
+  # уже отпустил frontend, но его python3 ещё держит apt/lists/lock
+  # (apt-get update под капотом). Чекаем все 4 lock-файла — после этого
+  # apt: install точно стартует без "Failed to lock".
   shell: >-
-    while fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1; do
+    while fuser
+      /var/lib/dpkg/lock-frontend
+      /var/lib/dpkg/lock
+      /var/lib/apt/lists/lock
+      /var/cache/apt/archives/lock
+      >/dev/null 2>&1; do
       sleep 5;
     done
   changed_when: false
-  timeout: 300
+  timeout: 600
 
 - name: Install base packages
   apt:
