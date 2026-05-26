@@ -8,6 +8,7 @@ import {
 import {
   api,
   batchBanUsers,
+  claimOrphanSubscription,
   DeviceMigrateOut,
   DeviceOut,
   DeviceSwitchExitOut,
@@ -46,6 +47,11 @@ export default function Users() {
   const [selected, setSelected] = useState<UserOut | null>(null);
   const [topupRub, setTopupRub] = useState("");
   const [topupNote, setTopupNote] = useState("");
+  // claim-orphan form state — operator pastes either a bare UUID or
+  // the full vless:// URL the user sent from Hiddify. Device name is
+  // optional (existing device's name is kept if blank).
+  const [claimInput, setClaimInput] = useState("");
+  const [claimDeviceName, setClaimDeviceName] = useState("");
   // Bulk selection lives next to single-row selection. Single-row
   // selection (`selected`) drives the detail sidebar; `selectedIds` is
   // the set used by bulk ban/unban. They are intentionally independent —
@@ -128,6 +134,38 @@ export default function Users() {
       qc.invalidateQueries({ queryKey: ["users"] });
     },
     onError: (e: Error) => alert(`Не удалось пополнить: ${e.message}`),
+  });
+
+  const claimOrphan = useMutation({
+    mutationFn: ({
+      userId,
+      uuidOrUrl,
+      deviceName,
+    }: {
+      userId: number;
+      uuidOrUrl: string;
+      deviceName: string;
+    }) =>
+      claimOrphanSubscription({
+        user_id: userId,
+        uuid: uuidOrUrl,
+        device_name: deviceName || null,
+      }),
+    onSuccess: (res) => {
+      setClaimInput("");
+      setClaimDeviceName("");
+      const expires = new Date(res.new_expires_at).toLocaleString();
+      const protos = res.claimed_credentials.map((c) => c.proto).join(", ");
+      alert(
+        `Подписка #${res.subscription_id} передана user_id=${res.new_user_id}.\n` +
+          `Девайс #${res.device_id}. Протоколы: ${protos}.\n` +
+          `expires_at: ${expires}.\n` +
+          `Existing connection в Hiddify не прерывается — UUID остался прежним.`,
+      );
+      qc.invalidateQueries({ queryKey: ["user-subs"] });
+      qc.invalidateQueries({ queryKey: ["users"] });
+    },
+    onError: (e: Error) => alert(`Не удалось восстановить: ${e.message}`),
   });
 
   const revokeNow = useMutation({
@@ -694,6 +732,63 @@ export default function Users() {
                   только email). Добавь telegram_id, чтобы пополнять.
                 </div>
               )}
+            </div>
+
+            <div className="pt-2 border-t border-slate-700">
+              <div className="font-semibold mb-1">
+                Восстановить orphan-подписку
+              </div>
+              <div className="text-xs text-slate-400 mb-2">
+                Передаёт подписку, висящую на placeholder-юзере{" "}
+                <span className="font-mono">999999</span>, текущему
+                выбранному юзеру. Подключение в Hiddify не прерывается —
+                UUID на ноде не меняется. Подробнее: docs/operations/
+                admin_claim_orphans.md.
+              </div>
+              <div className="space-y-2">
+                <textarea
+                  placeholder="UUID или vless://… ссылка от юзера"
+                  rows={2}
+                  value={claimInput}
+                  onChange={(e) => setClaimInput(e.target.value)}
+                  className="w-full px-2 py-1 rounded bg-slate-900 border border-slate-700 font-mono text-xs"
+                />
+                <input
+                  type="text"
+                  placeholder="Имя устройства (необязательно)"
+                  value={claimDeviceName}
+                  onChange={(e) => setClaimDeviceName(e.target.value)}
+                  maxLength={64}
+                  className="w-full px-2 py-1 rounded bg-slate-900 border border-slate-700"
+                />
+                <button
+                  disabled={claimOrphan.isPending || !claimInput.trim()}
+                  onClick={() => {
+                    const value = claimInput.trim();
+                    if (!value) return;
+                    if (
+                      !confirm(
+                        `Восстановить orphan-подписку юзеру #${selected.id}` +
+                          (selected.telegram_id
+                            ? ` (tg ${selected.telegram_id})`
+                            : "") +
+                          `?\n\nПодписка будет передана от placeholder-юзера 999999. Existing connection в Hiddify не прервётся — UUID на ноде тот же.`,
+                      )
+                    )
+                      return;
+                    claimOrphan.mutate({
+                      userId: selected.id,
+                      uuidOrUrl: value,
+                      deviceName: claimDeviceName.trim(),
+                    });
+                  }}
+                  className="w-full text-xs px-2 py-1 rounded bg-indigo-700 hover:bg-indigo-600 disabled:opacity-50"
+                >
+                  {claimOrphan.isPending
+                    ? "Восстанавливаем…"
+                    : "Восстановить"}
+                </button>
+              </div>
             </div>
 
             <div className="pt-2 border-t border-slate-700">

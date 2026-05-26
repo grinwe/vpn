@@ -19,6 +19,7 @@ from fastapi import APIRouter
 
 from ..auth import require_admin
 from . import (
+    admin_claim,
     audit,
     autoscale,
     broadcasts,
@@ -65,6 +66,7 @@ router.include_router(autoscale.router)
 router.include_router(exits.router)
 router.include_router(ops.router)
 router.include_router(broadcasts.router)
+router.include_router(admin_claim.router)
 
 
 __all__ = [

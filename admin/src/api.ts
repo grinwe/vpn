@@ -126,6 +126,40 @@ export function adminTopupByTelegram(
   );
 }
 
+// Orphan-claim — transfers a placeholder-owned Subscription/Device/Credential
+// bundle to a real user by UUID. See docs/operations/admin_claim_orphans.md
+// and POSTMORTEM_2026-05-19.md for context.
+export interface ClaimOrphanRequest {
+  user_id?: number | null;
+  telegram_id?: string | null;
+  // Bare UUID OR full vless://… URL — backend extracts the UUID.
+  uuid: string;
+  plan_id?: number | null;
+  // ISO-8601 string; null/undefined ⇒ backend uses now()+plan.duration_days.
+  expires_at?: string | null;
+  device_name?: string | null;
+}
+
+export interface ClaimedCredentialOut {
+  id: number;
+  proto: string;
+}
+
+export interface ClaimOrphanResponse {
+  subscription_id: number;
+  device_id: number;
+  old_user_id: number;
+  new_user_id: number;
+  new_expires_at: string;
+  claimed_credentials: ClaimedCredentialOut[];
+}
+
+export function claimOrphanSubscription(
+  body: ClaimOrphanRequest,
+): Promise<ClaimOrphanResponse> {
+  return api.post<ClaimOrphanResponse>("/admin/claim-orphan", body);
+}
+
 export interface DeviceOut {
   id: number;
   name: string;

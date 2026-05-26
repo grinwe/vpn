@@ -1,8 +1,13 @@
 # Admin-claim для orphan-credentials (post-incident recovery)
 
-Спецификация админ-эндпоинта, которым оператор поддержки привязывает
+Описание админ-эндпоинта, которым оператор поддержки привязывает
 warm-pool credential к реальному юзеру, после того как тот написал
 «я был юзером, у меня не работает после ваших обновлений».
+
+> **Статус v1 (реализована):** backend-эндпоинт + UI-форма в Users.tsx.
+> Не реализованы: отдельная страница `/orphan-credentials`, авто-Telegram
+> уведомление юзеру, авто-compensation за дни бесплатного пользования.
+> См. § «Что НЕ вошло в v1» в конце документа.
 
 ## Контекст
 
@@ -41,92 +46,78 @@ ORDER BY s.node_id, d.access_username;
 
 ## API: POST /api/admin/claim-orphan
 
-Только `require_admin`. Принимает JSON:
+Реализация: [backend/app/api/admin_claim.py](../../backend/app/api/admin_claim.py).
+Только `require_admin` (заголовок `X-Admin-Token`). Опциональный
+`X-Admin-Actor` пишется в `audit_log.actor`. Принимает JSON:
 
 ```json
 {
   "user_id": 9,                                    // ИЛИ telegram_id ниже
   "telegram_id": "1678661092",                     // одно из двух обязательно
-  "uuid": "abcdef12-3456-...",                     // из vless://UUID@... юзера
-  "plan_id": 1,                                    // по умолчанию = Solo
+  "uuid": "vless://abcdef12-...@host:443?...",     // bare UUID ИЛИ полный vless:// URL
+  "plan_id": 1,                                    // дефолт = текущий plan_id подписки
   "expires_at": "2026-06-19T00:00:00Z",            // default = NOW + plan.duration_days
-  "device_name": "primary"                         // default = "primary"
+  "device_name": "iPhone мамы"                     // дефолт = текущее имя девайса (не переименовываем)
 }
 ```
+
+Поле `uuid` принимает либо чистый UUID, либо полную `vless://UUID@host:port?...`
+строку — backend выпарсивает UUID через
+[`extract_uuid_from_vless_url`](../../backend/app/services/vless.py).
+Юзер обычно копипастит готовую ссылку из Hiddify, оператор просто вставляет
+в форму без ручной обработки.
 
 Ответ:
 ```json
 {
   "subscription_id": 100,
   "device_id": 12,
+  "old_user_id": 999999,
+  "new_user_id": 9,
+  "new_expires_at": "2026-06-19T00:00:00Z",
   "claimed_credentials": [
-    {"id": 5,  "proto": "vless-reality"},
-    {"id": 6,  "proto": "vless-xhttp"}
+    {"id": 5, "proto": "vless-reality"},
+    {"id": 6, "proto": "vless-xhttp"}
   ]
 }
 ```
+
+`device_id` — id «primary» девайса (минимальный из всех девайсов сабки).
+На multi-device подписках все девайсы получают `user_id = new_user_id`
+в одной транзакции, но в ответе фиксируется один stable handle.
 
 ## Внутренняя логика
 
 Subscription+Device+Credentials уже **существуют** на placeholder-юзера —
 admin-claim просто **TRANSFER'ит** ownership, не пересоздаёт. Это
 важно, потому что:
-* xray.clients[] хранит UUID = backend не должен дёргать `manage_vless_user.sh add`
+* `xray.clients[]` хранит UUID → backend не должен дёргать `manage_vless_user.sh add`
 * `sub_token` уже есть → юзер сразу видит подписку в боте без переоформления
+* Sub-link invariant (`/api/sub/{token}` оставляет revoked Device rows
+  и алиасит к живому sibling'у) сохраняется — мы не трогаем токены.
 
-```python
-@router.post("/admin/claim-orphan")
-def claim_orphan(body: ClaimRequest, db: Session = Depends(get_db),
-                 admin = Depends(require_admin)):
-    # 1. Найти юзера-таргета
-    user = _resolve_user(db, body.user_id, body.telegram_id)
-    if user is None:
-        raise HTTPException(404, "User not found")
+Алгоритм (реальный код: `backend/app/api/admin_claim.py:claim_orphan`):
 
-    # 2. Найти orphan-subscription по UUID, искомому в config_text
-    #    кредов. UUID встречается в URL `vless://UUID@...`. Все creds
-    #    этого bundle привязаны к одной Subscription.
-    cred = (
-        db.query(models.Credential)
-        .filter(
-            models.Credential.config_text.like(f"%{body.uuid}%"),
-            models.Subscription.user_id == ORPHAN_OWNER_ID,  # 999999
-        )
-        .join(models.Subscription, models.Credential.subscription_id == models.Subscription.id)
-        .first()
-    )
-    if cred is None:
-        raise HTTPException(404, "Orphan with this UUID not found")
-    sub = cred.subscription
-    device = cred.device
+1. Распарсить UUID из payload через `extract_uuid_from_vless_url`. Помимо
+   ошибки парсинга, отказываем если target user — сам placeholder (999999).
+2. Найти все `Credential` где `config_text ilike '%<uuid>%'`. Сгруппировать
+   по `subscription_id`. Ожидаем ровно один (409 на multiple matches,
+   404 на none).
+3. Проверить инвариант: `subscription.user_id == ORPHAN_OWNER_ID` (409
+   иначе — либо уже claim'нута, либо вообще не orphan).
+4. Подтянуть **все** sibling devices/credentials этой Subscription —
+   перенос атомарен. На multi-device подписках (см. POSTMORTEM §3.3.4)
+   каждый Device получает `user_id = new_user_id` в той же транзакции.
+5. Резолвить план (по умолчанию — текущий `sub.plan_id`) и
+   `expires_at` (по умолчанию `utcnow() + plan.duration_days`).
+6. `UPDATE` на одном `db.commit()`: `sub.user_id`, `sub.plan_id`,
+   `sub.expires_at`, `sub.notes` (append-only audit line), `d.user_id`
+   на каждом девайсе, опционально `d.name`. Плюс `AuditLog` row с
+   `action='orphan_claimed'` и `extra={uuid, old_user_id, new_user_id,
+   plan_id, credential_ids, device_ids}`.
 
-    # 3. TRANSFER ownership на real-юзера. sub_id/device_id/credential_id
-    #    не меняются. Перенос expires_at — пересчитываем от сегодня.
-    plan = db.query(models.Plan).get(body.plan_id or sub.plan_id or 1)
-    new_expires = body.expires_at or utcnow() + timedelta(days=plan.duration_days)
-
-    sub.user_id = user.id
-    sub.plan_id = plan.id
-    sub.expires_at = new_expires
-    sub.notes = (sub.notes or "") + f" | claimed by admin {admin.actor} @ {utcnow().isoformat()}"
-    device.user_id = user.id
-    if body.device_name:
-        device.name = body.device_name
-    db.add(sub)
-    db.add(device)
-    db.commit()
-
-    _audit(db, admin.actor, "orphan_claimed", "subscription", sub.id,
-           extra={"uuid": body.uuid, "to_user_id": user.id, "old_expires": str(sub.expires_at)})
-
-    return {
-        "subscription_id": sub.id,
-        "device_id": device.id,
-        "old_user_id": ORPHAN_OWNER_ID,
-        "new_user_id": user.id,
-        "new_expires_at": new_expires.isoformat(),
-    }
-```
+Insert-free transfer на уровне 2-3 `UPDATE`'ов в одной транзакции — ни
+ansible-run, ни `sub_token` mutation, ни перевыдачи UUID не происходит.
 
 ## Что про баланс
 
@@ -141,20 +132,58 @@ to_charge = daily_rate * days_used
 # user.balance_kopecks -= to_charge   ← опционально, по решению оператора
 ```
 
-В первой версии endpoint'а это **не** делаем автоматически — пусть оператор
+В v1 endpoint'а это **не** делается автоматически — пусть оператор
 сам решает, не хочется ловить негативные балансы при недостаче.
 
 ## Admin-UI
 
-В админке `/users/<id>` добавить кнопку «Восстановить orphan-подписку»,
-открывает модал с полями: UUID, Plan, Expires_at. После успеха — рефреш
-страницы юзера.
+Реализована inline-форма в detail-sidebar страницы `/users`
+(`admin/src/pages/Users.tsx`, секция «Восстановить orphan-подписку»),
+сразу под блоком «Пополнить баланс». Поля:
 
-В `/orphan-credentials` страница: таблица всех `Credential WHERE
-subscription_id IS NULL AND pool_state = 'assigned'`. По строке — кнопка
-«claim» с автозаполненным UUID, оператор указывает только юзера.
+* **textarea** — UUID или полная `vless://…` ссылка от юзера (обязательно)
+* **input** — имя устройства (опционально, по умолчанию не переименовываем)
+* кнопка **«Восстановить»** — confirm dialog → POST `/admin/claim-orphan`
+  → alert с `subscription_id`, `device_id`, протоколами и новым `expires_at`
+  → invalidate `user-subs` и `users` queries
 
-## Когда удалить эту страницу
+Plan и Expires_at в UI не выставляются — операторы в реальном flow всегда
+берут дефолт (текущий план подписки + NOW + plan.duration_days). Если
+понадобится — добавить поля в форму, бэк уже принимает оба override'а.
+
+Отдельная страница `/orphan-credentials` (список всех placeholder-подписок)
+в v1 не сделана — flow «юзер прислал свою vless-ссылку» работает и без
+обзора пула. Запросная sql:
+```sql
+SELECT s.id, s.node_id, s.expires_at, d.access_username, c.proto, c.config_text
+FROM subscriptions s
+JOIN devices d ON d.subscription_id = s.id
+JOIN credentials c ON c.subscription_id = s.id
+WHERE s.user_id = 999999
+ORDER BY s.node_id, d.access_username;
+```
+
+## Что НЕ вошло в v1
+
+Сознательно отложено из MVP. По мере необходимости — добавлять отдельными
+PR.
+
+1. **Отдельная страница `/orphan-credentials`** — таблица всех Subscription
+   `WHERE user_id = 999999` с превью VLESS-URL первого credential'а. Полезно
+   если оператор хочет видеть, что вообще ещё не разобрано. Real-world flow
+   («юзер прислал свою ссылку, оператор копипастит») работает без этого.
+2. **Telegram-нотификация юзеру** после успешного claim'а — оператор сейчас
+   копипастит вручную. Можно добавить опциональный флаг `notify=true` в
+   body эндпоинта, тогда бэк через bot API отправит юзеру «Восстановили,
+   держи ссылку: …».
+3. **Авто-charge за прошедшие дни** (compensation за бесплатное
+   пользование с инцидента). Описано в § «Что про баланс» — на дату
+   реализации (2026-05-26) компенсация решена не в этом эндпоинте.
+4. **Парсер диапазона UUID** или batch-режим — если юзер прислал две
+   ссылки (по одной на каждое из двух устройств), оператор сейчас зовёт
+   эндпоинт дважды. На объёмах ≤15 это терпимо.
+
+## Когда удалить эту фичу
 
 После того как все 15 orphan-credentials распределены или удалены вручную.
 Скорее всего за 30-60 дней после инцидента все, кто реально пользуется,
@@ -163,4 +192,8 @@ subscription_id IS NULL AND pool_state = 'assigned'`. По строке — кн
 DELETE FROM credentials WHERE pool_state = 'assigned' AND subscription_id IS NULL;
 ```
 А заодно `manage_vless_user.sh delete-user warm-<N>-<hex>` на ноде, чтобы
-xray вычистил clients[].
+xray вычистил `clients[]`.
+
+Сам эндпоинт можно оставить как штатную «admin transfer subscription»
+утилиту — пригодится для миграций между аккаунтами, семейного шеринга
+и пр., где нужно перевесить ownership без пересоздания.
