@@ -19,24 +19,38 @@
     state: present
   loop: "{{ ssh_public_keys | default([]) }}"
 
-- name: Wait for unattended-upgrades to finish
-  # fuser по dpkg/lock-frontend пропускает кейс когда unattended-upgrades
-  # уже отпустил frontend, но его python3 ещё держит apt/lists/lock
-  # (apt-get update под капотом). Чекаем все 4 lock-файла — после этого
-  # apt: install точно стартует без "Failed to lock".
-  shell: >-
-    while fuser
-      /var/lib/dpkg/lock-frontend
-      /var/lib/dpkg/lock
-      /var/lib/apt/lists/lock
-      /var/cache/apt/archives/lock
-      >/dev/null 2>&1; do
-      sleep 5;
-    done
-  changed_when: false
-  timeout: 600
+- name: Mask apt-daily timers (no auto-updates during bootstrap)
+  # Ubuntu по умолчанию ставит apt-daily.timer + apt-daily-upgrade.timer
+  # с OnBootSec=15min — после reboot'а они через 15 минут стартанут
+  # apt-get update / unattended-upgrade, конкурируя с нашим bootstrap'ом
+  # за apt/lists/lock. На свежей ноде это особенно злобно: первый
+  # bootstrap начинается одновременно с первым auto-update'ом, оба
+  # дерутся за lock, wait-task'ы попадают в бесконечный sleep-loop.
+  #
+  # Мы сам manage apt через ansible, авто-апдейты только мешают.
+  # mask блокирует FUTURE старты timer'а/сервиса (даже manual systemctl
+  # start не сработает). НЕ ставим state: stopped — apt-операция в
+  # полёте сама закончится корректно, нам важно только запретить
+  # СЛЕДУЮЩИЙ запуск. Текущий полёт дренируем через fuser wait ниже.
+  systemd:
+    name: "{{ item }}"
+    enabled: no
+    masked: yes
+  loop:
+    - apt-daily.timer
+    - apt-daily.service
+    - apt-daily-upgrade.timer
+    - apt-daily-upgrade.service
+  failed_when: false
 
 - name: Install base packages
+  # lock_timeout=600 — apt-модуль СAM ждёт apt/dpkg lock через
+  # DPkg::Lock::Timeout, без shell-loop с fuser. Прошлая версия делала
+  # `while fuser ... sleep 5`; при ansible-таймауте sh-процесс
+  # orphan'ился под systemd (PID 1) и продолжал крутиться вечно — на
+  # ноде накапливались "сироты" с каждого неудачного bootstrap'а, и при
+  # дальнейших диагностиках они мимикрировали под "lock держится".
+  # См. POSTMORTEM § wait-storm.
   apt:
     name:
       - ufw
@@ -47,6 +61,7 @@
       - unattended-upgrades
     state: present
     update_cache: yes
+    lock_timeout: 600
 
 # ВРЕМЕННО ЗАКОММЕНТИРОВАНО — ufw rate-limit на 22/tcp блокировал сам
 # ansible-раннер (6+ коннектов/30с с одного egress-IP → drop), из-за
