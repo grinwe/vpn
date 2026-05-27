@@ -99,6 +99,13 @@ export default function Exits() {
   const [editId, setEditId] = useState<number | null>(null);
   const [expanded, setExpanded] = useState<Set<number>>(new Set());
   const [evacuateFromId, setEvacuateFromId] = useState<number | null>(null);
+  const [batchAttachOpen, setBatchAttachOpen] = useState(false);
+  // batchProgressId != null — открыт drawer-sidebar с прогрессом batch'а.
+  // Установлен либо сразу после успешного POST /exits/batch-attach
+  // (из модалки), либо вручную из таблицы /tasks через клик на batch_id
+  // badge — но второй путь не реализован, нынешний flow только из
+  // модалки выше.
+  const [batchProgressId, setBatchProgressId] = useState<string | null>(null);
 
   const { data, isLoading, error } = useQuery<WGExitNodeOut[]>({
     queryKey: ["wg-exits"],
@@ -204,6 +211,13 @@ export default function Exits() {
             {refreshAllHealthMut.isPending ? "Обновляем…" : "↻ health всех"}
           </button>
           <button
+            onClick={() => setBatchAttachOpen(true)}
+            title="Прицепить один relay сразу к нескольким exit'ам — одной транзакцией"
+            className="text-sm px-3 py-1 rounded bg-blue-700 hover:bg-blue-600"
+          >
+            ⇆ Batch attach relay
+          </button>
+          <button
             onClick={() => { setShowForm(true); setEditId(null); }}
             className="text-sm px-3 py-1 rounded bg-green-700 hover:bg-green-600"
           >
@@ -233,6 +247,27 @@ export default function Exits() {
           fromExit={data.find((e) => e.id === evacuateFromId)!}
           allExits={data}
           onDone={() => setEvacuateFromId(null)}
+        />
+      )}
+
+      {batchAttachOpen && data && (
+        <BatchAttachToExitsModal
+          exits={data}
+          onDone={(batchId) => {
+            setBatchAttachOpen(false);
+            if (batchId) {
+              setBatchProgressId(batchId);
+              qc.invalidateQueries({ queryKey: ["wg-exits"] });
+              qc.invalidateQueries({ queryKey: ["wg-exit-links"] });
+            }
+          }}
+        />
+      )}
+
+      {batchProgressId && (
+        <BatchProgressDrawer
+          batchId={batchProgressId}
+          onClose={() => setBatchProgressId(null)}
         />
       )}
 
@@ -1224,5 +1259,459 @@ function ExitForm({
         </button>
       </div>
     </form>
+  );
+}
+
+
+// ─── Batch attach: один relay → много exits ────────────────────────────
+// Симметричный flow к AttachRelayForm (тот цепляет N relay'ев к одному
+// exit'у). Open'ится из bar'а наверху страницы /exits. POST'ит в новый
+// /exits/batch-attach, получает batch_id, передаёт его в BatchProgress
+// Drawer. См. docs/RELAY_ROADMAP.md G.5+ + commit "batch-attach API".
+
+interface BatchAttachLinkOut {
+  exit_id: number;
+  exit_name: string;
+  link_id: number;
+  task_id: number;
+  wg_interface_name: string;
+  wg_client_address_v4: string;
+}
+
+interface BatchAttachRelayResponse {
+  batch_id: string;
+  relay_node_id: number;
+  relay_node_name: string;
+  links: BatchAttachLinkOut[];
+}
+
+function BatchAttachToExitsModal({
+  exits,
+  onDone,
+}: {
+  exits: WGExitNodeOut[];
+  onDone: (batchId: string | null) => void;
+}) {
+  const [relayId, setRelayId] = useState<number | null>(null);
+  const [selected, setSelected] = useState<Set<number>>(new Set());
+  const [err, setErr] = useState<string | null>(null);
+  const [submitting, setSubmitting] = useState(false);
+
+  const nodes = useQuery<VPNNodeMini[]>({
+    queryKey: ["nodes-mini"],
+    queryFn: () => api.get("/nodes"),
+  });
+
+  // Active-only exits — inactive не пройдут серверную валидацию,
+  // показывать их в чекбоксах = напрашиваться на красную ошибку.
+  const activeExits = exits.filter((e) => e.is_active);
+
+  // Для выбранного relay'я отфильтруем exit'ы, к которым он уже прицеплен:
+  // их не имеет смысла показывать, бэк ответит 409. WGExitNodeOut.links
+  // несёт уже attached relay'ев на этот exit, проверяем по relay_node_id.
+  const eligibleExits = relayId == null
+    ? activeExits
+    : activeExits.filter(
+        (e) => !e.links.some((l) => l.relay_node_id === relayId),
+      );
+
+  function toggle(id: number) {
+    setSelected((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  }
+
+  function selectAll() {
+    setSelected(new Set(eligibleExits.map((e) => e.id)));
+  }
+  function clearAll() {
+    setSelected(new Set());
+  }
+
+  async function submit(e: React.FormEvent) {
+    e.preventDefault();
+    setErr(null);
+    if (relayId == null) {
+      setErr("Выберите relay");
+      return;
+    }
+    if (selected.size === 0) {
+      setErr("Выберите хотя бы один exit");
+      return;
+    }
+    setSubmitting(true);
+    try {
+      const res = await api.post<BatchAttachRelayResponse>(
+        "/exits/batch-attach",
+        { relay_node_id: relayId, exit_ids: Array.from(selected) },
+      );
+      onDone(res.batch_id);
+    } catch (apiErr) {
+      const msg =
+        apiErr instanceof ApiError
+          ? `${apiErr.status}: ${apiErr.message}`
+          : apiErr instanceof Error
+            ? apiErr.message
+            : String(apiErr);
+      setErr(msg);
+      setSubmitting(false);
+    }
+  }
+
+  return (
+    <div className="fixed inset-0 z-40 flex items-center justify-center bg-black/60">
+      <div className="bg-slate-900 border border-slate-700 rounded-lg p-5 w-[640px] max-h-[80vh] flex flex-col">
+        <div className="flex items-center justify-between mb-3">
+          <h2 className="text-lg font-bold">Batch-attach relay → exits</h2>
+          <button
+            onClick={() => onDone(null)}
+            className="text-slate-400 hover:text-white text-xl leading-none"
+            disabled={submitting}
+            title="Закрыть"
+          >
+            ×
+          </button>
+        </div>
+        <p className="text-xs text-slate-400 mb-3">
+          Выбираете один relay и галочками — exit'ы. На каждом attach'е бэк
+          выделяет свой /32 и keypair, заводит ProvisioningTask с общим
+          batch_id. После submit'а откроется панель с прогрессом — там
+          retry отдельных upal'нувших.
+        </p>
+
+        <form onSubmit={submit} className="flex flex-col gap-3 overflow-hidden">
+          <label className="flex flex-col text-xs">
+            <span className="text-slate-400 mb-1">Relay node</span>
+            <select
+              value={relayId ?? ""}
+              onChange={(e) => {
+                setRelayId(e.target.value ? Number(e.target.value) : null);
+                setSelected(new Set());
+              }}
+              className="bg-slate-800 border border-slate-700 rounded px-2 py-1"
+              disabled={submitting || nodes.isLoading}
+              required
+            >
+              <option value="">— выбрать relay —</option>
+              {(nodes.data ?? [])
+                .filter((n) => n.is_active)
+                .map((n) => (
+                  <option key={n.id} value={n.id}>
+                    {n.name} — {n.host}
+                    {n.has_relay_config ? " (уже relay)" : ""}
+                  </option>
+                ))}
+            </select>
+          </label>
+
+          <div className="flex items-center justify-between text-xs">
+            <span className="text-slate-400">
+              Exit'ы ({eligibleExits.length} доступно
+              {relayId != null &&
+                activeExits.length > eligibleExits.length &&
+                `, ${activeExits.length - eligibleExits.length} уже прицеплены`}
+              )
+            </span>
+            <div className="flex gap-2">
+              <button
+                type="button"
+                onClick={selectAll}
+                className="px-2 py-0.5 rounded bg-slate-700 hover:bg-slate-600"
+                disabled={submitting || relayId == null}
+              >
+                все
+              </button>
+              <button
+                type="button"
+                onClick={clearAll}
+                className="px-2 py-0.5 rounded bg-slate-700 hover:bg-slate-600"
+                disabled={submitting}
+              >
+                очистить
+              </button>
+            </div>
+          </div>
+
+          <div className="overflow-y-auto border border-slate-800 rounded p-2 flex-1 min-h-[150px] max-h-[40vh]">
+            {relayId == null && (
+              <div className="text-xs text-slate-500">
+                Выберите relay сверху — отфильтруем уже-прицепленные exit'ы.
+              </div>
+            )}
+            {relayId != null && eligibleExits.length === 0 && (
+              <div className="text-xs text-yellow-400">
+                Этот relay уже прицеплен ко всем активным exit'ам.
+              </div>
+            )}
+            {eligibleExits.map((e) => (
+              <label
+                key={e.id}
+                className="flex items-center gap-2 py-1 text-xs hover:bg-slate-800/50 rounded px-1 cursor-pointer"
+              >
+                <input
+                  type="checkbox"
+                  checked={selected.has(e.id)}
+                  onChange={() => toggle(e.id)}
+                  disabled={submitting}
+                />
+                <span className="font-mono w-32 truncate" title={e.name}>
+                  {e.name}
+                </span>
+                <span className="text-slate-400 w-16 truncate">{e.region}</span>
+                <span className="text-slate-500 font-mono truncate" title={e.host}>
+                  {e.host}
+                </span>
+              </label>
+            ))}
+          </div>
+
+          {err && <div className="text-red-400 text-xs">{err}</div>}
+
+          <div className="flex justify-end gap-2">
+            <button
+              type="button"
+              onClick={() => onDone(null)}
+              disabled={submitting}
+              className="text-xs px-3 py-1 rounded bg-slate-700 hover:bg-slate-600"
+            >
+              Отмена
+            </button>
+            <button
+              type="submit"
+              disabled={submitting || relayId == null || selected.size === 0}
+              className="text-xs px-3 py-1 rounded bg-blue-700 hover:bg-blue-600 disabled:opacity-50"
+            >
+              {submitting
+                ? "Создаём…"
+                : `Прицепить к ${selected.size} exit'ам`}
+            </button>
+          </div>
+        </form>
+      </div>
+    </div>
+  );
+}
+
+
+// ─── Batch progress drawer ─────────────────────────────────────────────
+// Polling-сводка по batch_id: GET /provisioning/batches/{id} раз в 2.5s,
+// останавливается когда нет pending/running. Per-task retry — обычный
+// /provisioning/tasks/{id}/rerun. error_message задачи (если failed)
+// разворачивается inline под строкой.
+
+interface BatchTaskOut {
+  id: number;
+  target_type: string;
+  target_id: number;
+  action: string;
+  status: string;
+  payload: { exit_id?: number; link_id?: number } | null;
+  error_message: string | null;
+  created_at: string;
+  finished_at: string | null;
+  batch_id: string | null;
+}
+
+interface BatchSummaryOut {
+  batch_id: string;
+  total: number;
+  status_counts: Record<string, number>;
+  tasks: BatchTaskOut[];
+}
+
+function BatchProgressDrawer({
+  batchId,
+  onClose,
+}: {
+  batchId: string;
+  onClose: () => void;
+}) {
+  const qc = useQueryClient();
+  const [expandedTaskId, setExpandedTaskId] = useState<number | null>(null);
+
+  const summary = useQuery<BatchSummaryOut>({
+    queryKey: ["batch-summary", batchId],
+    queryFn: () => api.get(`/provisioning/batches/${batchId}`),
+    // Polling: пока хоть один task в pending/running — раз в 2.5s.
+    // Когда все терминалы — refetchInterval=false (стопит polling).
+    refetchInterval: (q) => {
+      const sc = q.state.data?.status_counts ?? {};
+      const live = (sc["pending"] ?? 0) + (sc["running"] ?? 0);
+      return live > 0 ? 2500 : false;
+    },
+  });
+
+  const rerunMut = useMutation({
+    mutationFn: (taskId: number) =>
+      api.post(`/provisioning/tasks/${taskId}/rerun`),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["batch-summary", batchId] });
+    },
+    onError: (e: Error) => alert(`Не удалось retry: ${e.message}`),
+  });
+
+  const sc = summary.data?.status_counts ?? {};
+  const done = (sc["success"] ?? 0) + (sc["failed"] ?? 0);
+  const total = summary.data?.total ?? 0;
+  const allDone = total > 0 && done === total;
+  const anyFailed = (sc["failed"] ?? 0) > 0;
+
+  function statusBadge(s: string) {
+    const map: Record<string, string> = {
+      pending: "bg-slate-700 text-slate-300",
+      running: "bg-blue-700/60 text-blue-200",
+      success: "bg-green-700/60 text-green-200",
+      failed: "bg-red-700/60 text-red-200",
+    };
+    return (
+      <span className={`px-2 py-0.5 rounded text-[10px] ${map[s] ?? "bg-slate-700"}`}>
+        {s}
+      </span>
+    );
+  }
+
+  return (
+    <>
+      <div
+        className="fixed inset-0 z-30 bg-black/50"
+        onClick={onClose}
+      />
+      <div className="fixed right-0 top-0 bottom-0 z-40 w-[480px] bg-slate-900 border-l border-slate-700 flex flex-col">
+        <div className="flex items-center justify-between p-4 border-b border-slate-800">
+          <div>
+            <div className="text-sm font-bold">Batch attach</div>
+            <div className="text-[11px] text-slate-500 font-mono truncate" title={batchId}>
+              {batchId.slice(0, 8)}…
+            </div>
+          </div>
+          <button
+            onClick={onClose}
+            className="text-slate-400 hover:text-white text-xl leading-none"
+          >
+            ×
+          </button>
+        </div>
+
+        <div className="p-4 border-b border-slate-800">
+          {summary.isLoading && <div className="text-slate-400 text-xs">Загрузка…</div>}
+          {summary.error && (
+            <div className="text-red-400 text-xs">
+              {(summary.error as Error).message}
+            </div>
+          )}
+          {summary.data && (
+            <>
+              <div className="flex items-center justify-between text-xs mb-2">
+                <span className="text-slate-400">
+                  Прогресс: <span className="text-white font-bold">{done}/{total}</span>
+                </span>
+                <div className="flex gap-2 text-[10px]">
+                  {Object.entries(sc).map(([k, v]) => (
+                    <span key={k}>
+                      {statusBadge(k)} {v}
+                    </span>
+                  ))}
+                </div>
+              </div>
+              <div className="h-2 rounded bg-slate-800 overflow-hidden flex">
+                <div
+                  className="bg-green-600 h-full"
+                  style={{ width: `${total ? ((sc["success"] ?? 0) / total) * 100 : 0}%` }}
+                />
+                <div
+                  className="bg-red-600 h-full"
+                  style={{ width: `${total ? ((sc["failed"] ?? 0) / total) * 100 : 0}%` }}
+                />
+                <div
+                  className="bg-blue-600 h-full"
+                  style={{ width: `${total ? ((sc["running"] ?? 0) / total) * 100 : 0}%` }}
+                />
+              </div>
+              <div className="mt-2 text-[11px] text-slate-500">
+                {allDone
+                  ? anyFailed
+                    ? "Готово, есть упавшие — попробуйте retry."
+                    : "Все attach'и прошли."
+                  : "Polling каждые 2.5с — драйвер обновляется автоматически."}
+              </div>
+            </>
+          )}
+        </div>
+
+        <div className="overflow-y-auto flex-1 p-2">
+          {summary.data?.tasks.map((t) => {
+            const isExpanded = expandedTaskId === t.id;
+            const exit_id = t.payload?.exit_id;
+            return (
+              <div
+                key={t.id}
+                className="border border-slate-800 rounded mb-2 text-xs"
+              >
+                <div
+                  className="flex items-center justify-between p-2 cursor-pointer hover:bg-slate-800/50"
+                  onClick={() =>
+                    setExpandedTaskId(isExpanded ? null : t.id)
+                  }
+                >
+                  <div className="flex items-center gap-2 min-w-0">
+                    {statusBadge(t.status)}
+                    <span className="font-mono text-slate-300">
+                      task #{t.id}
+                    </span>
+                    {exit_id != null && (
+                      <span className="text-slate-500">→ exit {exit_id}</span>
+                    )}
+                  </div>
+                  <div className="flex items-center gap-1">
+                    {t.status === "failed" && (
+                      <button
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          rerunMut.mutate(t.id);
+                        }}
+                        disabled={rerunMut.isPending}
+                        className="px-2 py-0.5 rounded bg-blue-700 hover:bg-blue-600 text-[10px]"
+                      >
+                        ↻ retry
+                      </button>
+                    )}
+                    <a
+                      href={`/tasks?id=${t.id}`}
+                      onClick={(e) => e.stopPropagation()}
+                      className="px-2 py-0.5 rounded bg-slate-700 hover:bg-slate-600 text-[10px]"
+                      title="Открыть в Tasks"
+                    >
+                      ↗
+                    </a>
+                  </div>
+                </div>
+                {isExpanded && (
+                  <div className="px-3 pb-2 text-[11px] text-slate-400 border-t border-slate-800 pt-2">
+                    <div>
+                      <span className="text-slate-500">created:</span>{" "}
+                      {new Date(t.created_at).toLocaleString()}
+                    </div>
+                    {t.finished_at && (
+                      <div>
+                        <span className="text-slate-500">finished:</span>{" "}
+                        {new Date(t.finished_at).toLocaleString()}
+                      </div>
+                    )}
+                    {t.error_message && (
+                      <pre className="mt-2 bg-slate-950 border border-slate-800 rounded p-2 whitespace-pre-wrap text-red-300 text-[10px] max-h-40 overflow-y-auto">
+                        {t.error_message}
+                      </pre>
+                    )}
+                  </div>
+                )}
+              </div>
+            );
+          })}
+        </div>
+      </div>
+    </>
   );
 }
