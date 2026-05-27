@@ -527,6 +527,23 @@ export interface NodeRelayLinkOut {
   last_auto_diagnose_at?: string | null;
   last_auto_diagnose_task_id?: number | null;
   last_auto_diagnose_symptom?: string | null;
+  // NULL = auto-trigger работает; timestamp = оператор замьютил линк.
+  // Управление: POST /exits/links/{id}/auto-diagnose/{disable|enable}.
+  auto_diagnose_disabled_at?: string | null;
+}
+
+export function disableLinkAutoDiagnose(linkId: number) {
+  return api.post<{ link_id: number; auto_diagnose_disabled_at: string | null }>(
+    `/exits/links/${linkId}/auto-diagnose/disable`,
+    {},
+  );
+}
+
+export function enableLinkAutoDiagnose(linkId: number) {
+  return api.post<{ link_id: number; auto_diagnose_disabled_at: string | null }>(
+    `/exits/links/${linkId}/auto-diagnose/enable`,
+    {},
+  );
 }
 
 export interface PlanOut {

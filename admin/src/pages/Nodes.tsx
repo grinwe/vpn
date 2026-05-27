@@ -24,6 +24,8 @@ import { HealthDots } from "../linkHealth";
 import { DiagnoseResult } from "../diagnoseResult";
 import {
   diagnoseRelayLink,
+  disableLinkAutoDiagnose,
+  enableLinkAutoDiagnose,
   DiagnoseCheckEntry,
   DiagnoseMeta,
 } from "../api";
@@ -151,6 +153,53 @@ function CooldownBadge({ until }: { until: string | null }) {
     >
       cooldown {label}
     </span>
+  );
+}
+
+function AutoDiagnoseToggle({
+  linkId,
+  disabledAt,
+  exitName,
+}: {
+  linkId: number;
+  disabledAt: string | null | undefined;
+  exitName: string;
+}) {
+  const qc = useQueryClient();
+  const isDisabled = !!disabledAt;
+  const mutation = useMutation({
+    mutationFn: () =>
+      isDisabled
+        ? enableLinkAutoDiagnose(linkId)
+        : disableLinkAutoDiagnose(linkId),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["node-relay-links"] });
+    },
+    onError: (e: Error) => alert(`Не удалось переключить: ${e.message}`),
+  });
+  return (
+    <button
+      onClick={() => {
+        const confirmMsg = isDisabled
+          ? `Включить автодиагностику для link → ${exitName}?`
+          : `Замьютить автодиагностику для link → ${exitName}?\n\nWorker tick перестанет ENQUEUE'ить diagnose для этого линка. Ручная кнопка «Диагностировать» продолжит работать.`;
+        if (confirm(confirmMsg)) mutation.mutate();
+      }}
+      disabled={mutation.isPending}
+      title={
+        isDisabled
+          ? "Auto-trigger отключён — клик включит"
+          : "Auto-trigger активен — клик отключит smart-диагностику для этого линка"
+      }
+      className={
+        "text-[10px] px-2 py-0.5 rounded disabled:opacity-50 " +
+        (isDisabled
+          ? "bg-emerald-700 hover:bg-emerald-600 text-white"
+          : "bg-slate-700 hover:bg-slate-600 text-slate-200")
+      }
+    >
+      {mutation.isPending ? "…" : isDisabled ? "🔔 unmute" : "🔕 mute"}
+    </button>
   );
 }
 
@@ -303,13 +352,28 @@ function RelayLinksSection({
                 {new Date(l.created_at).toLocaleString()}
               </td>
               <td className="py-1 px-2 space-y-1">
-                <LinkDiagnoseButton
-                  linkId={l.link_id}
-                  exitName={l.exit_name}
-                  nodeId={nodeId}
-                  nodeName={nodeName}
-                  addOp={addOp}
-                />
+                <div className="flex items-center gap-1 flex-wrap">
+                  <LinkDiagnoseButton
+                    linkId={l.link_id}
+                    exitName={l.exit_name}
+                    nodeId={nodeId}
+                    nodeName={nodeName}
+                    addOp={addOp}
+                  />
+                  <AutoDiagnoseToggle
+                    linkId={l.link_id}
+                    disabledAt={l.auto_diagnose_disabled_at}
+                    exitName={l.exit_name}
+                  />
+                </div>
+                {l.auto_diagnose_disabled_at && (
+                  <span
+                    title={`Автодиагностика выключена ${new Date(l.auto_diagnose_disabled_at).toLocaleString()}`}
+                    className="inline-flex items-center text-[10px] px-1.5 py-0.5 rounded bg-slate-800 border border-slate-600 text-slate-300"
+                  >
+                    🔕 auto off
+                  </span>
+                )}
                 {l.last_auto_diagnose_at && (
                   <AutoDiagnoseBadge
                     at={l.last_auto_diagnose_at}

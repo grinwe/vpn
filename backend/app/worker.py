@@ -1021,11 +1021,14 @@ def _auto_diagnose_stale_links(session) -> dict:
       AUTO_DIAGNOSE_HANDSHAKE_STALE_MIN     default 10
       AUTO_DIAGNOSE_OBSERVED_FRESH_MIN      default 8  (=relay тик прошёл недавно)
       AUTO_DIAGNOSE_DEBOUNCE_MIN            default 30 (per-link дедуп)
+      AUTO_DIAGNOSE_MAX_PER_TICK            default 3  (rate-limit на tick)
     """
     if os.getenv("AUTO_DIAGNOSE_ENABLED", "true").lower() not in {"1", "true", "yes"}:
         return {"enabled": False, "enqueued": []}
 
     from datetime import timedelta
+
+    from sqlalchemy import func as sa_func
 
     from . import models
     from .services.provisioning import ProvisioningOrchestrator
@@ -1034,6 +1037,7 @@ def _auto_diagnose_stale_links(session) -> dict:
     stale_hs_min = int(os.getenv("AUTO_DIAGNOSE_HANDSHAKE_STALE_MIN", "10"))
     observed_fresh_min = int(os.getenv("AUTO_DIAGNOSE_OBSERVED_FRESH_MIN", "8"))
     debounce_min = int(os.getenv("AUTO_DIAGNOSE_DEBOUNCE_MIN", "30"))
+    max_per_tick = int(os.getenv("AUTO_DIAGNOSE_MAX_PER_TICK", "3"))
 
     now = utcnow()
     observed_cutoff = now - timedelta(minutes=observed_fresh_min)
@@ -1044,7 +1048,22 @@ def _auto_diagnose_stale_links(session) -> dict:
     # пустой, либо старый. last_observed_at IS NULL отсекаем — пока
     # один SSH ни разу не прошёл, диагностика всё равно не сможет
     # сделать `wg show` со стороны jump.
-    candidates = (
+    #
+    # Skip links с auto_diagnose_disabled_at IS NOT NULL — оператор
+    # явно выключил автодиагностику для известно-проблемных линков
+    # (например, нода ещё bootstrap'ится, или мы ждём ручного fix'а
+    # и не хотим, чтобы шум от падающего auto-trigger'а отвлекал).
+    # Поле добавит миграция 0035 — getattr-guard здесь для
+    # backward-compat с пре-миграционными deploy'ями.
+    disabled_col = getattr(models.RelayExitLink, "auto_diagnose_disabled_at", None)
+
+    # ORDER BY (handshake_at IS NULL DESC, handshake_at ASC) — NULL первыми
+    # (never observed = worst), потом самые stale → за один tick покрываем
+    # худшие случаи раньше всего. LIMIT max_per_tick прямо в запросе —
+    # candidate-list не превышает rate-limit, дебаунс не нужно скипать
+    # лишние раз. Остальные unhealthy подождут следующего tick (через
+    # 5 мин, что safely ниже debounce window 30 мин).
+    candidates_q = (
         session.query(models.RelayExitLink)
         .filter(models.RelayExitLink.last_observed_at.isnot(None))
         .filter(models.RelayExitLink.last_observed_at >= observed_cutoff)
@@ -1052,14 +1071,32 @@ def _auto_diagnose_stale_links(session) -> dict:
             (models.RelayExitLink.last_handshake_at.is_(None))
             | (models.RelayExitLink.last_handshake_at < stale_hs_cutoff)
         )
+    )
+    if disabled_col is not None:
+        candidates_q = candidates_q.filter(disabled_col.is_(None))
+    candidates = (
+        candidates_q
+        .order_by(
+            sa_func.coalesce(
+                models.RelayExitLink.last_handshake_at,
+                # epoch для NULL — на 1970-01-01 (=максимальная stale)
+                # чтобы они отсортировались первыми.
+                sa_func.cast("1970-01-01", models.RelayExitLink.last_handshake_at.type),
+            ).asc(),
+            models.RelayExitLink.id.asc(),
+        )
+        .limit(max_per_tick * 4)  # с запасом — дебаунс может выкинуть часть
         .all()
     )
 
     enqueued: list[dict] = []
     skipped_debounced: list[int] = []
+    skipped_disabled: list[int] = []
     auto_check_types = ["peer_on_jump", "handshake_age", "ping_endpoint"]
 
     for link in candidates:
+        if len(enqueued) >= max_per_tick:
+            break
         # Debounce: пропускаем, если symptom_detected уже логнут
         # за последние debounce_min минут.
         recent = (
@@ -1130,6 +1167,8 @@ def _auto_diagnose_stale_links(session) -> dict:
         "candidates": len(candidates),
         "enqueued": enqueued,
         "skipped_debounced": skipped_debounced,
+        "skipped_disabled": skipped_disabled,
+        "max_per_tick": max_per_tick,
     }
 
 

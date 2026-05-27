@@ -99,9 +99,21 @@
 
 - name: "handshake_age :: extract epoch"
   ansible.builtin.set_fact:
+    # Двойная защита перед `[4]`:
+    #   1) сам список peer-lines не пустой
+    #   2) split на табы дал ≥5 элементов (нормальная peer-line = 8 полей)
+    # На ru-adminvps-01 видели падение `'list' has no attribute 4` —
+    # один из peer'ов на этой ноде имел peer-line с < 5 полями (вероятно
+    # пустой endpoint/PSK выглядел как двойной таб + truncate). Без guard
+    # ansible-core 2.19 (stricter Jinja) валит весь play на out-of-bounds
+    # вместо undefined-fallback, который был в 2.17.
     diag_hs_epoch: >-
       {{ (diag_hs_lines[0].split('\t')[4] | int)
-         if (diag_hs_lines | length > 0) else 0 }}
+         if (
+              diag_hs_lines | length > 0
+              and (diag_hs_lines[0].split('\t') | length) > 4
+            )
+         else 0 }}
   when: "'handshake_age' in diag_check_types"
   tags: handshake_age
 

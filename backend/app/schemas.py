@@ -1123,3 +1123,6 @@ class NodeRelayLinkOut(BaseModel):
     last_auto_diagnose_at: datetime | None = None
     last_auto_diagnose_task_id: int | None = None
     last_auto_diagnose_symptom: str | None = None
+    # NULL = auto-trigger работает. Timestamp = оператор замьютил.
+    # См. POST /exits/links/{id}/auto-diagnose/{disable|enable}.
+    auto_diagnose_disabled_at: datetime | None = None

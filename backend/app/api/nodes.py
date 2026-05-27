@@ -825,6 +825,7 @@ def list_node_relay_links(
                 last_auto_diagnose_at=diag_at,
                 last_auto_diagnose_task_id=diag_task_id,
                 last_auto_diagnose_symptom=diag_symptom,
+                auto_diagnose_disabled_at=link.auto_diagnose_disabled_at,
             )
         )
     return out
