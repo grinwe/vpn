@@ -15,7 +15,7 @@ from sqlalchemy import (
     Text,
     UniqueConstraint,
 )
-from sqlalchemy.dialects.postgresql import ARRAY, JSONB
+from sqlalchemy.dialects.postgresql import ARRAY, JSONB, UUID
 from sqlalchemy.orm import relationship
 from .db import Base
 
@@ -564,6 +564,10 @@ class ProvisioningTask(Base):
     created_at = Column(DateTime, default=utcnow)
     started_at = Column(DateTime, nullable=True)
     finished_at = Column(DateTime, nullable=True)
+    # NULL для одиночных task'ов, общий UUID для всех children одного
+    # batch-attach (POST /admin/exits/batch-attach). UI группирует по
+    # этому полю и считает прогресс N/M; orchestrator его не читает.
+    batch_id = Column(UUID(as_uuid=True), nullable=True, index=True)
 
 
 class CloudProvider(Base):

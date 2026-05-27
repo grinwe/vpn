@@ -732,7 +732,13 @@ class ProvisioningOrchestrator:
         self.db = db
 
     def create_task(
-        self, target_type: str, target_id: int, action: str, payload: dict[str, Any] | None
+        self,
+        target_type: str,
+        target_id: int,
+        action: str,
+        payload: dict[str, Any] | None,
+        *,
+        batch_id: uuid.UUID | None = None,
     ) -> models.ProvisioningTask:
         task = models.ProvisioningTask(
             target_type=target_type,
@@ -740,6 +746,7 @@ class ProvisioningOrchestrator:
             action=action,
             payload=payload or {},
             status=models.ProvisioningTaskStatus.pending,
+            batch_id=batch_id,
         )
         self.db.add(task)
         self.db.flush()

@@ -8,10 +8,11 @@ subscription.
 from __future__ import annotations
 
 import logging
+import uuid
 from typing import Any
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query
-from sqlalchemy import and_, or_
+from sqlalchemy import and_, func, or_
 from sqlalchemy.orm import Session
 
 from .. import models, schemas
@@ -75,6 +76,10 @@ def list_tasks(
     offset: int = Query(default=0, ge=0),
     status_filter: str | None = Query(default=None, alias="status"),
     target_type: str | None = None,
+    batch_id: uuid.UUID | None = Query(
+        default=None,
+        description="Filter tasks to ones created by a batch-attach (UUID)",
+    ),
     telegram_id: str | None = Query(
         default=None,
         description="Filter tasks to ones owned by this telegram_id (via device→sub→user chain)",
@@ -92,6 +97,8 @@ def list_tasks(
             raise HTTPException(status_code=400, detail="Invalid status") from exc
     if target_type:
         query = query.filter(models.ProvisioningTask.target_type == target_type)
+    if batch_id is not None:
+        query = query.filter(models.ProvisioningTask.batch_id == batch_id)
 
     if telegram_id:
         # Narrow by telegram_id: collect the device/subscription ids
@@ -169,6 +176,58 @@ def delete_task(
     actor, actor_type = _resolve_admin_actor(admin_actor)
     _audit(db, actor, "task_deleted", "provisioning_task", task_id, actor_type=actor_type)
     return None
+
+
+@router.get(
+    "/provisioning/batches/{batch_id}",
+    response_model=schemas.BatchSummary,
+)
+def get_batch(
+    batch_id: uuid.UUID,
+    db: Session = Depends(get_db),
+    admin_token: str = Depends(require_admin),
+):
+    """Сводка по batch-attach: всего task'ов + breakdown статусов + список.
+
+    Drawer-sidebar в UI POLL'ит этот endpoint раз в 2-3 секунды пока
+    есть pending/running в status_counts. Когда всё success/failed —
+    polling останавливается, юзер видит финальный результат.
+
+    404 если batch_id не существует — это и невалидный UUID шаблон, и
+    легитимный «никаких задач не создано» (например тут же удалили).
+    """
+    tasks = (
+        db.query(models.ProvisioningTask)
+        .filter(models.ProvisioningTask.batch_id == batch_id)
+        .order_by(models.ProvisioningTask.created_at.asc())
+        .all()
+    )
+    if not tasks:
+        raise HTTPException(status_code=404, detail="Batch not found")
+
+    counts_rows = (
+        db.query(
+            models.ProvisioningTask.status, func.count(models.ProvisioningTask.id)
+        )
+        .filter(models.ProvisioningTask.batch_id == batch_id)
+        .group_by(models.ProvisioningTask.status)
+        .all()
+    )
+    status_counts = {row[0].value: int(row[1]) for row in counts_rows}
+
+    tg_map = _enrich_task_telegram(db, tasks)
+    task_dtos: list[schemas.ProvisioningTaskOut] = []
+    for t in tasks:
+        dto = schemas.ProvisioningTaskOut.from_orm(t)
+        dto.telegram_id = tg_map.get(t.id)
+        task_dtos.append(dto)
+
+    return schemas.BatchSummary(
+        batch_id=batch_id,
+        total=len(tasks),
+        status_counts=status_counts,
+        tasks=task_dtos,
+    )
 
 
 @router.get("/provisioning/tasks/{task_id}", response_model=schemas.ProvisioningTaskOut)

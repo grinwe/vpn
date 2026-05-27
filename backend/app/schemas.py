@@ -1,3 +1,4 @@
+import uuid
 from datetime import datetime, timezone
 from typing import Annotated, Any, List, Optional
 from pydantic import BaseModel, Field, PlainSerializer, field_validator
@@ -775,9 +776,27 @@ class ProvisioningTaskOut(BaseModel):
     # the job belongs to without a second round-trip. None for node
     # tasks and for orphan rows whose FK chain got nulled.
     telegram_id: str | None = None
+    # Группировка задач из одного batch-attach (POST /exits/batch-attach).
+    # NULL для одиночных task'ов. UI рендерит badge «batch N/M» когда есть.
+    batch_id: uuid.UUID | None = None
 
     class Config:
         from_attributes = True
+
+
+class BatchSummary(BaseModel):
+    """Сводка по batch_id для drawer-sidebar в UI.
+
+    ``total`` — всего task'ов в батче, ``status_counts`` — гистограмма
+    по ProvisioningTaskStatus. ``tasks`` — полный список child task'ов
+    (обычно 5-15 шт., возвращаем целиком без пагинации). Drawer на
+    polling'е считает прогресс по ``status_counts``, индивидуальные
+    retry/logs пользуется ``tasks``.
+    """
+    batch_id: uuid.UUID
+    total: int
+    status_counts: dict[str, int]
+    tasks: list[ProvisioningTaskOut]
 
 
 class ApiTokenCreate(BaseModel):
@@ -1001,6 +1020,42 @@ class RelayExitLinkCreate(BaseModel):
     # Optional — if omitted, the server picks the next free /32 in the
     # exit's subnet. Must be host-form CIDR like "10.77.0.5/32".
     wg_client_address_v4: str | None = None
+
+
+class BatchAttachRelayRequest(BaseModel):
+    """Прицепить один relay сразу к N exit'ам одним POST'ом.
+
+    Каждой паре (relay, exit) выделяется свой keypair, свой /32 в
+    подсети exit'а и свой ``wgN`` interface на relay'е. WG-клиент-адрес
+    нельзя задать руками — на batch'е это бессмыслено, пусть выделяет
+    автоматом.
+    """
+    relay_node_id: int
+    exit_ids: list[int]
+
+
+class BatchAttachLinkOut(BaseModel):
+    """Один созданный link + порождённая task внутри batch-ответа."""
+    exit_id: int
+    exit_name: str
+    link_id: int
+    task_id: int
+    wg_interface_name: str
+    wg_client_address_v4: str
+
+
+class BatchAttachRelayResponse(BaseModel):
+    """Ответ batch-attach: общий batch_id + список созданных пар.
+
+    Все валидируется ДО транзакции — частичных attach'ей не бывает.
+    Если хоть один exit_id невалид/duplicate/inactive — endpoint
+    возвращает 400/404/409 c деталями и ничего не пишет в БД. Сами
+    же task'и независимы и retry'ятся per-task в UI через batch_id.
+    """
+    batch_id: uuid.UUID
+    relay_node_id: int
+    relay_node_name: str
+    links: list[BatchAttachLinkOut]
 
 
 class RelayExitLinkOut(BaseModel):
