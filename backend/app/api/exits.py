@@ -14,6 +14,7 @@ import heapq
 from typing import Any
 
 from fastapi import APIRouter, Depends, Header, HTTPException
+from pydantic import BaseModel
 from sqlalchemy import func
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
@@ -942,6 +943,78 @@ def reconnect_relay_link(
     return {
         "exit_id": exit_id,
         "relay_node_id": relay_node_id,
+        "task_id": task.id,
+    }
+
+
+class DiagnoseLinkRequest(BaseModel):
+    """Body для POST /exits/links/{link_id}/diagnose.
+
+    `check_types` опционален — если пуст/отсутствует, оркестратор
+    подставит `DEFAULT_DIAGNOSE_CHECKS` (все 6 jump-side checks).
+    `xray_port` тоже опционален; по умолчанию 9443 (Reality).
+    """
+
+    check_types: list[str] | None = None
+    xray_port: int | None = None
+
+
+@router.post("/exits/links/{link_id}/diagnose", status_code=200)
+def diagnose_relay_link(
+    link_id: int,
+    body: DiagnoseLinkRequest | None = None,
+    db: Session = Depends(get_db),
+    admin_token: str = Depends(require_admin),
+    admin_actor: str | None = Header(default=None, alias=ADMIN_ACTOR_HEADER),
+):
+    """Read-only диагностика конкретного relay→exit WG-линка.
+
+    Создаёт ProvisioningTask с target_type='relay_tunnel', target_id=
+    relay.id, action='diagnose'. На worker'е оркестратор зовёт
+    `playbooks/diagnose_relay_link.yml`, парсит структурированный JSON
+    и кладёт `checks: [{name,status,latency_ms,message,details}, ...]`
+    в `task.result` рядом со stdout/stderr/rc. UI рендерит `checks`
+    карточками — raw stdout уходит в collapsible details.
+
+    Безопасно: `_handle_task_outcome` для relay_tunnel — no-op, поэтому
+    диагностика никогда не флипает статусы и не дёргает credentials.
+    """
+    link = db.get(models.RelayExitLink, link_id)
+    if link is None:
+        raise HTTPException(status_code=404, detail="Link not found")
+    relay = db.get(models.VPNNode, link.relay_node_id)
+    if relay is None:
+        raise HTTPException(status_code=404, detail="Relay node not found")
+
+    task_payload: dict[str, Any] = {
+        "link_id": link.id,
+        "exit_id": link.exit_id,
+    }
+    if body is not None:
+        if body.check_types:
+            task_payload["check_types"] = list(body.check_types)
+        if body.xray_port is not None:
+            task_payload["xray_port"] = int(body.xray_port)
+
+    orchestrator = ProvisioningOrchestrator(db)
+    task = orchestrator.create_task(
+        "relay_tunnel", relay.id, "diagnose", task_payload,
+    )
+    db.commit()
+    orchestrator.run_task_async(task)
+    actor, actor_type = _resolve_admin_actor(admin_actor)
+    _audit(
+        db, actor, "relay_link_diagnose", "relay_exit_link", link.id,
+        actor_type=actor_type,
+        metadata={
+            "task_id": task.id,
+            "check_types": task_payload.get("check_types"),
+        },
+    )
+    return {
+        "link_id": link.id,
+        "relay_node_id": relay.id,
+        "exit_id": link.exit_id,
         "task_id": task.id,
     }
 

@@ -771,19 +771,63 @@ def list_node_relay_links(
         .all()
     )
 
-    return [
-        schemas.NodeRelayLinkOut(
-            link_id=link.id,
-            exit_id=link.exit_id,
-            exit_name=link.exit_node.name if link.exit_node else "",
-            wg_interface_name=link.wg_interface_name,
-            wg_client_address_v4=link.wg_client_address_v4,
-            wg_client_public_key=link.wg_client_public_key,
-            credentials_count=counts.get(link.exit_id, 0),
-            created_at=link.created_at,
+    # ── Auto-diagnose badge data ────────────────────────────────────
+    # Latest symptom_detected audit entry per link_id. Subquery: ROW_NUMBER()
+    # would be cleaner на PG, но per-link массив маленький (макс ~5-10
+    # линков на одну ноду), поэтому one query + python-group дешевле и
+    # переноcимее. extra→symptom + extra→action_taken вытаскиваем JSON-ом.
+    link_ids = [link.id for link in links]
+    latest_audit_by_link: dict[int, models.AuditLog] = {}
+    if link_ids:
+        audit_rows = (
+            db.query(models.AuditLog)
+            .filter(models.AuditLog.target_type == "relay_exit_link")
+            .filter(models.AuditLog.target_id.in_(link_ids))
+            .filter(models.AuditLog.action == "symptom_detected")
+            .order_by(models.AuditLog.created_at.desc())
+            .all()
         )
-        for link in links
-    ]
+        for row in audit_rows:
+            if row.target_id not in latest_audit_by_link:
+                latest_audit_by_link[row.target_id] = row
+
+    def _audit_to_diag(
+        link_id: int,
+    ) -> tuple[datetime | None, int | None, str | None]:
+        row = latest_audit_by_link.get(link_id)
+        if row is None:
+            return (None, None, None)
+        extra = row.extra or {}
+        action_taken = str(extra.get("action_taken") or "")
+        # action_taken формата "enqueued_task:<id>" — извлекаем числовой id.
+        task_id: int | None = None
+        if action_taken.startswith("enqueued_task:"):
+            try:
+                task_id = int(action_taken.split(":", 1)[1])
+            except ValueError:
+                task_id = None
+        symptom = extra.get("symptom")
+        return (row.created_at, task_id, str(symptom) if symptom else None)
+
+    out: list[schemas.NodeRelayLinkOut] = []
+    for link in links:
+        diag_at, diag_task_id, diag_symptom = _audit_to_diag(link.id)
+        out.append(
+            schemas.NodeRelayLinkOut(
+                link_id=link.id,
+                exit_id=link.exit_id,
+                exit_name=link.exit_node.name if link.exit_node else "",
+                wg_interface_name=link.wg_interface_name,
+                wg_client_address_v4=link.wg_client_address_v4,
+                wg_client_public_key=link.wg_client_public_key,
+                credentials_count=counts.get(link.exit_id, 0),
+                created_at=link.created_at,
+                last_auto_diagnose_at=diag_at,
+                last_auto_diagnose_task_id=diag_task_id,
+                last_auto_diagnose_symptom=diag_symptom,
+            )
+        )
+    return out
 
 
 # Freshness window for "who's on the node right now" — matches the

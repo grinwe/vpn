@@ -1001,6 +1001,138 @@ def run_traffic_stats_tick() -> dict:
     return summary
 
 
+def _auto_diagnose_stale_links(session) -> dict:
+    """Auto-trigger diagnostics for relay→exit WG links with stale handshakes.
+
+    Сценарий: WG-туннель прицеплен, last_observed_at свежий (= relay
+    отвечает на SSH тик и `wg show all dump` парсится), но
+    last_handshake_at либо NULL (handshake никогда не проходил), либо
+    отстал больше чем AUTO_DIAGNOSE_HANDSHAKE_STALE_MIN минут. Это
+    тот самый паттерн, который оператор ловил руками на новой ноде
+    после attach к exit'у.
+
+    Каждому подозрительному линку ENQUEUE'ится diagnose-task с урезанным
+    набором check_types (handshake-side только — full набор ~20s, этот
+    ~5s) и audit_log запись `symptom_detected`, по которой потом дебаунс
+    решает «уже бежал недавно, ждём результата».
+
+    Env vars:
+      AUTO_DIAGNOSE_ENABLED                 default true
+      AUTO_DIAGNOSE_HANDSHAKE_STALE_MIN     default 10
+      AUTO_DIAGNOSE_OBSERVED_FRESH_MIN      default 8  (=relay тик прошёл недавно)
+      AUTO_DIAGNOSE_DEBOUNCE_MIN            default 30 (per-link дедуп)
+    """
+    if os.getenv("AUTO_DIAGNOSE_ENABLED", "true").lower() not in {"1", "true", "yes"}:
+        return {"enabled": False, "enqueued": []}
+
+    from datetime import timedelta
+
+    from . import models
+    from .services.provisioning import ProvisioningOrchestrator
+    from .time_utils import utcnow
+
+    stale_hs_min = int(os.getenv("AUTO_DIAGNOSE_HANDSHAKE_STALE_MIN", "10"))
+    observed_fresh_min = int(os.getenv("AUTO_DIAGNOSE_OBSERVED_FRESH_MIN", "8"))
+    debounce_min = int(os.getenv("AUTO_DIAGNOSE_DEBOUNCE_MIN", "30"))
+
+    now = utcnow()
+    observed_cutoff = now - timedelta(minutes=observed_fresh_min)
+    stale_hs_cutoff = now - timedelta(minutes=stale_hs_min)
+    debounce_cutoff = now - timedelta(minutes=debounce_min)
+
+    # Кандидаты: тик отработал по этому relay недавно, handshake либо
+    # пустой, либо старый. last_observed_at IS NULL отсекаем — пока
+    # один SSH ни разу не прошёл, диагностика всё равно не сможет
+    # сделать `wg show` со стороны jump.
+    candidates = (
+        session.query(models.RelayExitLink)
+        .filter(models.RelayExitLink.last_observed_at.isnot(None))
+        .filter(models.RelayExitLink.last_observed_at >= observed_cutoff)
+        .filter(
+            (models.RelayExitLink.last_handshake_at.is_(None))
+            | (models.RelayExitLink.last_handshake_at < stale_hs_cutoff)
+        )
+        .all()
+    )
+
+    enqueued: list[dict] = []
+    skipped_debounced: list[int] = []
+    auto_check_types = ["peer_on_jump", "handshake_age", "ping_endpoint"]
+
+    for link in candidates:
+        # Debounce: пропускаем, если symptom_detected уже логнут
+        # за последние debounce_min минут.
+        recent = (
+            session.query(models.AuditLog)
+            .filter(models.AuditLog.target_type == "relay_exit_link")
+            .filter(models.AuditLog.target_id == link.id)
+            .filter(models.AuditLog.action == "symptom_detected")
+            .filter(models.AuditLog.created_at >= debounce_cutoff)
+            .first()
+        )
+        if recent:
+            skipped_debounced.append(link.id)
+            continue
+
+        last_hs = link.last_handshake_at
+        hs_age_min = (
+            int((now - last_hs).total_seconds() // 60) if last_hs else None
+        )
+        symptom = "no_handshake" if last_hs is None else "stale_handshake"
+
+        orchestrator = ProvisioningOrchestrator(session)
+        task = orchestrator.create_task(
+            "relay_tunnel",
+            link.relay_node_id,
+            "diagnose",
+            {
+                "link_id": link.id,
+                "exit_id": link.exit_id,
+                "check_types": auto_check_types,
+                "auto_triggered": True,
+            },
+        )
+        session.add(
+            models.AuditLog(
+                actor="auto-diagnose",
+                actor_type=models.AuditActor.system,
+                action="symptom_detected",
+                target_type="relay_exit_link",
+                target_id=link.id,
+                extra={
+                    "symptom": symptom,
+                    "last_hs_age_min": hs_age_min,
+                    "link_id": link.id,
+                    "relay_node_id": link.relay_node_id,
+                    "exit_id": link.exit_id,
+                    "action_taken": f"enqueued_task:{task.id}",
+                    "check_types": auto_check_types,
+                    "stale_threshold_min": stale_hs_min,
+                },
+            )
+        )
+        session.commit()
+        # run_task_async читает task.id из DB — коммит перед enqueue обязателен.
+        orchestrator.run_task_async(task)
+        enqueued.append({
+            "link_id": link.id,
+            "task_id": task.id,
+            "symptom": symptom,
+            "hs_age_min": hs_age_min,
+        })
+        logger.info(
+            "auto_diagnose: link=%s relay=%s exit=%s symptom=%s task=%s",
+            link.id, link.relay_node_id, link.exit_id, symptom, task.id,
+        )
+
+    return {
+        "enabled": True,
+        "candidates": len(candidates),
+        "enqueued": enqueued,
+        "skipped_debounced": skipped_debounced,
+    }
+
+
 def run_relay_link_health_tick() -> dict:
     """Периодический WG-handshake poll для relay_exit_links.
 
@@ -1039,6 +1171,19 @@ def run_relay_link_health_tick() -> dict:
     session = SessionLocal()
     try:
         summary = relay_link_health.collect_all_relay_links(session)
+
+        # Smart-trigger автодиагностики для stale-handshake линков. Тик уже
+        # обновил last_handshake_at/last_observed_at — на их основе мы
+        # выявляем links где WG явно жив со стороны мониторинга (SSH
+        # прошёл = last_observed_at свежий), но handshake'и не текут.
+        # Это симптом «attach прошёл, но trafficу не идёт» — exactly
+        # тот сценарий, что юзер ловил руками на ru-adminvps-01.
+        try:
+            auto_summary = _auto_diagnose_stale_links(session)
+            if auto_summary.get("enqueued"):
+                summary["auto_diagnose"] = auto_summary
+        except Exception:  # noqa: BLE001
+            logger.exception("relay_link_health: auto_diagnose failed")
 
         # Admin push-алерт при серийных SSH/WG-фейлах. Дедуп по пустому
         # ключу — «не чаще раза в ADMIN_ALERT_DEDUP_WINDOW_SEC, независимо

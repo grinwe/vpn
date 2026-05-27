@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import base64
 import ipaddress
+import json
 import logging
 import os
 import re
@@ -10,6 +11,7 @@ import secrets
 import threading
 import uuid
 from datetime import datetime, timedelta
+from types import SimpleNamespace
 from urllib.parse import quote as urlquote
 
 from ..time_utils import utcnow
@@ -1139,88 +1141,36 @@ class ProvisioningOrchestrator:
                         timeout=600,
                     )
             elif task.target_type == "relay_tunnel":
-                # Stage E — reconcile the WireGuard client side of a
-                # relay jump node. Runs two playbooks sequentially so an
-                # attach/detach produces a consistent state across both
-                # ends in a single task:
-                #   1) bootstrap_exit.yml on the current (or formerly
-                #      attached) exit — re-renders its peer list so the
-                #      relay is added/removed from the server config.
-                #   2) relay_tunnel_apply.yml on the relay itself —
-                #      brings wg0 up + patches Xray when relay_config is
-                #      set; tears both down when it isn't (detach path).
-                #
-                # ``exit_id`` is carried on task.payload because detach
-                # clears ``relay_config`` before the task fires, so we'd
-                # have no other way to find the exit whose wg0.conf still
-                # holds the now-stale peer line.
                 relay = self.db.get(models.VPNNode, task.target_id)
                 if not relay:
                     raise RuntimeError("Relay VPN node not found for provisioning")
-                exit_id = (payload or {}).get("exit_id")
-                exit_node = None
-                if exit_id is not None:
-                    exit_node = self.db.get(models.WGExitNode, int(exit_id))
 
-                combined_stdout: list[str] = []
-                combined_stderr: list[str] = []
-                rc = 0
-                # Step 1 — refresh the exit's peer list. Skipped if the
-                # exit row is already gone (admin deleted it after
-                # detaching every relay).
-                if exit_node is not None:
-                    exit_inv = build_inventory_for_exit_node(exit_node)
-                    try:
-                        exit_vars = _collect_exit_extra_vars(self.db, exit_node)
-                        exit_result = run_playbook(
-                            "playbooks/bootstrap_exit.yml",
-                            exit_inv,
-                            limit=exit_node.name,
-                            extra_vars=exit_vars,
-                            timeout=600,
-                        )
-                        combined_stdout.append(
-                            f"=== bootstrap_exit on {exit_node.name} ===\n"
-                            + (exit_result.stdout or "")
-                        )
-                        combined_stderr.append(exit_result.stderr or "")
-                        if exit_result.returncode:
-                            rc = exit_result.returncode
-                    finally:
-                        try:
-                            exit_inv.unlink()
-                        except OSError:
-                            logger.warning(
-                                "Failed to remove exit inventory %s", exit_inv
-                            )
-
-                # Step 2 — apply (or tear down) the tunnel on the relay.
-                # Runs even if step 1 failed so the relay side isn't left
-                # stranded; final returncode is the worst of the two.
-                inventory = build_inventory_for_node(relay)
-                relay_vars = _collect_relay_tunnel_extra_vars(self.db, relay)
-                relay_result = run_playbook(
-                    "playbooks/relay_tunnel_apply.yml",
-                    inventory,
-                    limit=relay.name,
-                    extra_vars=relay_vars,
-                    timeout=600,
-                )
-                combined_stdout.append(
-                    f"=== relay_tunnel_apply on {relay.name} ===\n"
-                    + (relay_result.stdout or "")
-                )
-                combined_stderr.append(relay_result.stderr or "")
-                if relay_result.returncode:
-                    rc = relay_result.returncode
-
-                class _CombinedResult:
-                    """Matches the subset of CompletedProcess fields run_task() reads."""
-
-                result = _CombinedResult()
-                result.stdout = "\n".join(combined_stdout)
-                result.stderr = "\n".join(s for s in combined_stderr if s)
-                result.returncode = rc
+                if task.action == "diagnose":
+                    # Read-only WG link diagnostics — handled in a separate
+                    # helper that runs `diagnose_relay_link.yml`, reads the
+                    # structured JSON the role writes on the controller, and
+                    # returns a `SimpleNamespace` with `.checks` so the
+                    # outer return-dict picks it up alongside stdout/rc.
+                    # _handle_task_outcome for relay_tunnel is a no-op, so
+                    # diagnose can't accidentally flip any DB state.
+                    result = self._run_relay_link_diagnose(task, relay, payload)
+                else:
+                    # Stage E — reconcile the WireGuard client side of a
+                    # relay jump node. Runs two playbooks sequentially so an
+                    # attach/detach produces a consistent state across both
+                    # ends in a single task:
+                    #   1) bootstrap_exit.yml on the current (or formerly
+                    #      attached) exit — re-renders its peer list so the
+                    #      relay is added/removed from the server config.
+                    #   2) relay_tunnel_apply.yml on the relay itself —
+                    #      brings wg0 up + patches Xray when relay_config is
+                    #      set; tears both down when it isn't (detach path).
+                    #
+                    # ``exit_id`` is carried on task.payload because detach
+                    # clears ``relay_config`` before the task fires, so we'd
+                    # have no other way to find the exit whose wg0.conf still
+                    # holds the now-stale peer line.
+                    result = self._run_relay_tunnel_apply(task, relay, payload)
             elif task.target_type == "device":
                 # Fallback node resolution: callers that don't pre-load
                 # the node (rerun from /admin/tasks, RQ worker with no
@@ -1260,11 +1210,293 @@ class ProvisioningOrchestrator:
         # branches on returncode and marks the task failed without losing
         # stdout — for UNREACHABLE hosts the real error (Permission denied,
         # bad key perms, etc) is in stdout, not stderr.
-        return {
+        #
+        # diagnose tasks attach a `.checks` list of structured probe results
+        # to the result object (via _run_relay_link_diagnose / SimpleNamespace).
+        # Surface it as `checks` field on the task.result JSON so the admin UI
+        # can render OK/FAIL cards instead of the raw stdout blob.
+        payload: dict[str, Any] = {
             "stdout": result.stdout,
             "stderr": result.stderr,
             "returncode": result.returncode,
         }
+        diagnose_checks = getattr(result, "checks", None)
+        if diagnose_checks is not None:
+            payload["checks"] = diagnose_checks
+        diagnose_meta = getattr(result, "diagnose_meta", None)
+        if diagnose_meta is not None:
+            payload["diagnose_meta"] = diagnose_meta
+        return payload
+
+    # ── relay_tunnel apply (attach/detach) ─────────────────────────────
+    def _run_relay_tunnel_apply(
+        self,
+        task: models.ProvisioningTask,
+        relay: models.VPNNode,
+        payload: dict[str, Any],
+    ) -> SimpleNamespace:
+        """Bootstrap exit + apply/teardown WG tunnel on relay in one task.
+
+        Vintage logic extracted from `_execute_task` so the relay_tunnel
+        branch can dispatch by action without nesting massive blocks.
+        Returns a SimpleNamespace shaped like the standard ansible result
+        (stdout/stderr/returncode) so the outer return-dict packaging
+        keeps working unchanged.
+        """
+        exit_id = (payload or {}).get("exit_id")
+        exit_node: models.WGExitNode | None = None
+        if exit_id is not None:
+            exit_node = self.db.get(models.WGExitNode, int(exit_id))
+
+        combined_stdout: list[str] = []
+        combined_stderr: list[str] = []
+        rc = 0
+        # Step 1 — refresh the exit's peer list. Skipped if the
+        # exit row is already gone (admin deleted it after
+        # detaching every relay).
+        if exit_node is not None:
+            exit_inv = build_inventory_for_exit_node(exit_node)
+            try:
+                exit_vars = _collect_exit_extra_vars(self.db, exit_node)
+                exit_result = run_playbook(
+                    "playbooks/bootstrap_exit.yml",
+                    exit_inv,
+                    limit=exit_node.name,
+                    extra_vars=exit_vars,
+                    timeout=600,
+                )
+                combined_stdout.append(
+                    f"=== bootstrap_exit on {exit_node.name} ===\n"
+                    + (exit_result.stdout or "")
+                )
+                combined_stderr.append(exit_result.stderr or "")
+                if exit_result.returncode:
+                    rc = exit_result.returncode
+            finally:
+                try:
+                    exit_inv.unlink()
+                except OSError:
+                    logger.warning("Failed to remove exit inventory %s", exit_inv)
+
+        # Step 2 — apply (or tear down) the tunnel on the relay.
+        # Runs even if step 1 failed so the relay side isn't left
+        # stranded; final returncode is the worst of the two.
+        relay_inv = build_inventory_for_node(relay)
+        try:
+            relay_vars = _collect_relay_tunnel_extra_vars(self.db, relay)
+            relay_result = run_playbook(
+                "playbooks/relay_tunnel_apply.yml",
+                relay_inv,
+                limit=relay.name,
+                extra_vars=relay_vars,
+                timeout=600,
+            )
+            combined_stdout.append(
+                f"=== relay_tunnel_apply on {relay.name} ===\n"
+                + (relay_result.stdout or "")
+            )
+            combined_stderr.append(relay_result.stderr or "")
+            if relay_result.returncode:
+                rc = relay_result.returncode
+        finally:
+            try:
+                relay_inv.unlink()
+            except OSError:
+                logger.warning("Failed to remove relay inventory %s", relay_inv)
+
+        return SimpleNamespace(
+            stdout="\n".join(combined_stdout),
+            stderr="\n".join(s for s in combined_stderr if s),
+            returncode=rc,
+        )
+
+    # ── relay_tunnel diagnose ─────────────────────────────────────────
+    # Default check_types when payload omits them. Mirrors the role's
+    # defaults so a manual `create_task("relay_tunnel", relay.id, "diagnose", {})`
+    # from a Python shell or the smart-trigger gets a sensible set.
+    DEFAULT_DIAGNOSE_CHECKS: list[str] = [
+        "peer_on_jump",
+        "handshake_age",
+        "ping_endpoint",
+        "ping_internet_through",
+        "xray_port",
+        "listening_sockets",
+    ]
+
+    def _resolve_diagnose_link(
+        self, relay: models.VPNNode, payload: dict[str, Any]
+    ) -> models.RelayExitLink:
+        """Find the RelayExitLink the diagnose task is talking about.
+
+        Two ways callers identify the link:
+          * `payload.link_id` — explicit. Preferred when the link is known
+            (auto-trigger, link-level endpoint).
+          * `payload.exit_id` + relay.id — fallback for callers that only
+            know which exit they're checking on which relay.
+        """
+        link_id = (payload or {}).get("link_id")
+        if link_id is not None:
+            link = self.db.get(models.RelayExitLink, int(link_id))
+            if link and link.relay_node_id == relay.id:
+                return link
+            raise RuntimeError(
+                f"RelayExitLink #{link_id} not found or not on relay #{relay.id}"
+            )
+        exit_id = (payload or {}).get("exit_id")
+        if exit_id is not None:
+            link = (
+                self.db.query(models.RelayExitLink)
+                .filter(
+                    models.RelayExitLink.relay_node_id == relay.id,
+                    models.RelayExitLink.exit_id == int(exit_id),
+                )
+                .first()
+            )
+            if link:
+                return link
+            raise RuntimeError(
+                f"No link between relay #{relay.id} and exit #{exit_id}"
+            )
+        raise RuntimeError("diagnose payload must include link_id or exit_id")
+
+    def _run_relay_link_diagnose(
+        self,
+        task: models.ProvisioningTask,
+        relay: models.VPNNode,
+        payload: dict[str, Any],
+    ) -> SimpleNamespace:
+        """Run `diagnose_relay_link.yml` and parse the structured JSON output.
+
+        Returns a SimpleNamespace with stdout/stderr/returncode plus a
+        `.checks` attribute carrying the parsed per-check results. The
+        caller in `_execute_task` packages `.checks` into the task.result
+        JSON so the admin UI can render OK/FAIL/warn cards instead of
+        raw ansible stdout.
+
+        Layout of the structured payload (written by the role on the
+        controller via `delegate_to: localhost` + `copy:`):
+            {
+              "started_at": "<iso>",
+              "finished_at": "<iso>",
+              "relay_iface": "wg1",
+              "exit_pubkey_prefix": "AbCdEfGh1234",
+              "requested_checks": ["peer_on_jump", ...],
+              "checks": [
+                {"name", "status", "latency_ms", "message", "details"},
+                ...
+              ]
+            }
+        """
+        link = self._resolve_diagnose_link(relay, payload)
+        exit_node = self.db.get(models.WGExitNode, link.exit_id)
+        if exit_node is None:
+            raise RuntimeError(
+                f"Exit #{link.exit_id} for link #{link.id} not found"
+            )
+
+        check_types = (payload or {}).get("check_types") or self.DEFAULT_DIAGNOSE_CHECKS
+        xray_port = int((payload or {}).get("xray_port", 9443))
+        warn_min = int((payload or {}).get("handshake_warn_min", 5))
+        fail_min = int((payload or {}).get("handshake_fail_min", 15))
+
+        # Strip CIDR suffix off exit's WG address — `ping` wants a bare IP.
+        exit_wg_addr_raw = exit_node.wg_address_v4 or ""
+        exit_wg_addr = exit_wg_addr_raw.split("/", 1)[0]
+        client_wg_addr_raw = link.wg_client_address_v4 or ""
+        client_wg_addr = client_wg_addr_raw.split("/", 1)[0]
+
+        # /tmp inside the backend/worker container — same FS where ansible
+        # callbacks land. Per-task filename so concurrent diagnose runs
+        # don't trample each other.
+        result_file = f"/tmp/diagnose-result-{task.id}.json"
+        try:
+            os.unlink(result_file)
+        except OSError:
+            pass
+
+        extra_vars: dict[str, Any] = {
+            "diag_wg_iface": link.wg_interface_name,
+            "diag_exit_pubkey": exit_node.wg_public_key or "",
+            "diag_exit_wg_addr": exit_wg_addr,
+            "diag_client_wg_addr": client_wg_addr,
+            "diag_xray_port": xray_port,
+            "diag_check_types": list(check_types),
+            "diag_result_file": result_file,
+            "diag_handshake_warn_min": warn_min,
+            "diag_handshake_fail_min": fail_min,
+        }
+
+        inventory = build_inventory_for_node(relay)
+        try:
+            ansible_result = run_playbook(
+                "playbooks/diagnose_relay_link.yml",
+                inventory,
+                limit=relay.name,
+                extra_vars=extra_vars,
+                timeout=300,
+            )
+        finally:
+            try:
+                inventory.unlink()
+            except OSError:
+                logger.warning("Failed to remove relay inventory %s", inventory)
+
+        checks: list[dict[str, Any]] = []
+        diagnose_meta: dict[str, Any] = {
+            "link_id": link.id,
+            "exit_id": exit_node.id,
+            "relay_id": relay.id,
+            "wg_interface": link.wg_interface_name,
+            "requested_checks": list(check_types),
+        }
+        # The role writes the structured JSON via copy:delegate_to:localhost.
+        # On a clean run it always exists; if ansible exited 0 but the file
+        # is missing we surface a synthetic "infrastructure" check failure
+        # so the admin sees something concrete instead of empty card list.
+        if os.path.exists(result_file):
+            try:
+                with open(result_file, "r", encoding="utf-8") as f:
+                    parsed = json.load(f)
+                checks = parsed.get("checks") or []
+                for key in ("started_at", "finished_at", "exit_pubkey_prefix"):
+                    if key in parsed:
+                        diagnose_meta[key] = parsed[key]
+            except (OSError, json.JSONDecodeError) as exc:
+                logger.warning(
+                    "diagnose: failed to parse %s for task %s: %s",
+                    result_file, task.id, exc,
+                )
+                checks = [{
+                    "name": "_result_file_unreadable",
+                    "status": "fail",
+                    "latency_ms": None,
+                    "message": f"could not parse {result_file}: {exc}",
+                    "details": {},
+                }]
+            finally:
+                try:
+                    os.unlink(result_file)
+                except OSError:
+                    pass
+        else:
+            checks = [{
+                "name": "_result_file_missing",
+                "status": "fail",
+                "latency_ms": None,
+                "message": (
+                    f"role finished без записи {result_file} — playbook упал "
+                    f"до финального copy:, см. stdout/stderr"
+                ),
+                "details": {},
+            }]
+
+        return SimpleNamespace(
+            stdout=ansible_result.stdout,
+            stderr=ansible_result.stderr,
+            returncode=ansible_result.returncode,
+            checks=checks,
+            diagnose_meta=diagnose_meta,
+        )
 
     def _wire_warm_bundle(
         self,

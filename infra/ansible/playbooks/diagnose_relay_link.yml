@@ -1,0 +1,25 @@
+---
+# Diagnose one relay→exit WireGuard link.
+#
+# Read-only — only `wg show`, `ping`, `curl`, `ss`. No config changes,
+# no service restarts. Safe to run on a live relay with active traffic.
+#
+# Required extra vars (orchestrator passes via -e):
+#   diag_wg_iface       — wg0 / wg1 (RelayExitLink.wg_interface_name)
+#   diag_exit_pubkey    — WGExitNode.wg_public_key (for peer match)
+#   diag_exit_wg_addr   — exit's inner WG IP (e.g. 10.77.0.1)
+#   diag_client_wg_addr — relay's inner WG IP (e.g. 10.77.0.5)
+#   diag_xray_port      — usually 9443 (Reality)
+#   diag_check_types    — list of checks to run (see role defaults)
+#   diag_result_file    — controller path for structured JSON output
+#
+# The orchestrator targets a specific relay via `--limit <relay_name>`
+# (mirroring how diagnose_node.yml is called from provisioning.py),
+# so `hosts: vpn_nodes` is the inventory group filter.
+
+- name: Diagnose relay→exit WG link (read-only)
+  hosts: vpn_nodes
+  become: true
+  gather_facts: false
+  roles:
+    - diagnose_relay_link

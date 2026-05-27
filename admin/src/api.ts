@@ -160,6 +160,69 @@ export function claimOrphanSubscription(
   return api.post<ClaimOrphanResponse>("/admin/claim-orphan", body);
 }
 
+// ── Relay-link diagnostics ────────────────────────────────────────────
+// POST /exits/links/{link_id}/diagnose — структурированная проверка
+// одного relay→exit WG-линка. Backend кладёт structured `checks`
+// в task.result, UI рендерит карточками вместо raw stdout. Подробнее:
+// docs/operations/diagnostics.md.
+
+export type DiagnoseCheckStatus = "ok" | "warn" | "fail" | "skip" | "info";
+
+export interface DiagnoseCheckEntry {
+  name: string;
+  status: DiagnoseCheckStatus;
+  latency_ms?: number | null;
+  message?: string;
+  details?: Record<string, unknown>;
+}
+
+export interface DiagnoseMeta {
+  link_id: number;
+  exit_id: number;
+  relay_id: number;
+  wg_interface: string;
+  requested_checks: string[];
+  started_at?: string;
+  finished_at?: string;
+  exit_pubkey_prefix?: string;
+}
+
+export interface DiagnoseRelayLinkRequest {
+  check_types?: string[] | null;
+  xray_port?: number | null;
+}
+
+export interface DiagnoseRelayLinkResponse {
+  link_id: number;
+  relay_node_id: number;
+  exit_id: number;
+  task_id: number;
+}
+
+// Все check_types, поддерживаемые ansible-ролью diagnose_relay_link.
+// Если бэк добавит новые — допиши сюда; роль игнорирует неизвестные
+// имена молча (только запросит у себя в `when:` фильтре).
+export const RELAY_LINK_CHECKS = [
+  "peer_on_jump",
+  "handshake_age",
+  "ping_endpoint",
+  "ping_internet_through",
+  "xray_port",
+  "listening_sockets",
+] as const;
+
+export type RelayLinkCheckName = (typeof RELAY_LINK_CHECKS)[number];
+
+export function diagnoseRelayLink(
+  linkId: number,
+  body?: DiagnoseRelayLinkRequest,
+): Promise<DiagnoseRelayLinkResponse> {
+  return api.post<DiagnoseRelayLinkResponse>(
+    `/exits/links/${linkId}/diagnose`,
+    body ?? {},
+  );
+}
+
 export interface DeviceOut {
   id: number;
   name: string;
@@ -456,6 +519,12 @@ export interface NodeRelayLinkOut {
   wg_client_public_key: string;
   credentials_count: number;
   created_at: string;
+  // Filled by run_relay_link_health_tick → _auto_diagnose_stale_links
+  // when a stale-handshake symptom was detected for this link. UI
+  // renders a small "автодиагностика N мин назад" badge.
+  last_auto_diagnose_at?: string | null;
+  last_auto_diagnose_task_id?: number | null;
+  last_auto_diagnose_symptom?: string | null;
 }
 
 export interface PlanOut {

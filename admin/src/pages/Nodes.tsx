@@ -21,6 +21,12 @@ import {
   refreshNodeRealityDest,
 } from "../api";
 import { HealthDots } from "../linkHealth";
+import { DiagnoseResult } from "../diagnoseResult";
+import {
+  diagnoseRelayLink,
+  DiagnoseCheckEntry,
+  DiagnoseMeta,
+} from "../api";
 import { WorkerHealthBadge } from "../workerHealth";
 
 // ── Tracked operation types ─────────────────────────────────────────
@@ -29,9 +35,14 @@ import { WorkerHealthBadge } from "../workerHealth";
 // is the full set to poll; the sub-arrays break down by phase.
 
 type TrackedOp = {
-  kind: "migration" | "bootstrap" | "resync" | "diagnose";
+  kind: "migration" | "bootstrap" | "resync" | "diagnose" | "diagnose_link";
   nodeId: number;
   nodeName: string;
+  // For kind=diagnose_link only — id of the RelayExitLink the diagnose was
+  // run against, so the banner can render the structured `checks` block
+  // out of task.result.checks (set by ansible role + orchestrator).
+  linkId?: number;
+  exitName?: string;
   taskIds: number[];
   revokeTaskIds: number[];
   deviceTaskIds: number[];
@@ -143,7 +154,101 @@ function CooldownBadge({ until }: { until: string | null }) {
   );
 }
 
-function RelayLinksSection({ nodeId }: { nodeId: number }) {
+function AutoDiagnoseBadge({
+  at,
+  taskId,
+  symptom,
+}: {
+  at: string;
+  taskId: number | null;
+  symptom: string | null;
+}) {
+  // Возраст последнего auto-trigger'а в человеко-читаемом виде.
+  // Backend tick — раз в 5 мин, debounce — 30 мин на link, так что
+  // практический диапазон тут — минуты-часы, не дни.
+  const ageMs = Date.now() - new Date(at).getTime();
+  const ageMin = Math.max(0, Math.round(ageMs / 60_000));
+  const label =
+    ageMin < 60 ? `${ageMin} мин назад` : `${Math.round(ageMin / 60)} ч назад`;
+  const tooltip = `Автодиагностика по симптому "${symptom ?? "?"}" в ${new Date(at).toLocaleString()}. Клик → задача в /tasks.`;
+  const badge = (
+    <span
+      title={tooltip}
+      className="inline-flex items-center gap-1 text-[10px] px-1.5 py-0.5 rounded bg-amber-900/60 border border-amber-700 text-amber-200"
+    >
+      ⚙ авто {label}
+    </span>
+  );
+  if (taskId) {
+    return (
+      <Link to={`/tasks?id=${taskId}`} className="hover:opacity-80">
+        {badge}
+      </Link>
+    );
+  }
+  return badge;
+}
+
+function LinkDiagnoseButton({
+  linkId,
+  exitName,
+  nodeId,
+  nodeName,
+  addOp,
+}: {
+  linkId: number;
+  exitName: string;
+  nodeId: number;
+  nodeName: string;
+  addOp: (op: TrackedOp) => void;
+}) {
+  const [busy, setBusy] = useState(false);
+  async function handleClick() {
+    if (busy) return;
+    setBusy(true);
+    try {
+      // V1: дефолтный набор check_types (роль возьмёт свои defaults).
+      // Multi-select UI добавим в V1.1 — сейчас один клик → весь набор.
+      const res = await diagnoseRelayLink(linkId);
+      addOp({
+        kind: "diagnose_link",
+        nodeId,
+        nodeName,
+        linkId,
+        exitName,
+        taskIds: [res.task_id],
+        revokeTaskIds: [],
+        deviceTaskIds: [],
+        resyncTaskIds: [],
+        startedAt: Date.now(),
+      });
+    } catch (e) {
+      alert(`Не удалось запустить diagnose: ${(e as Error).message}`);
+    } finally {
+      setBusy(false);
+    }
+  }
+  return (
+    <button
+      onClick={handleClick}
+      disabled={busy}
+      title="Прогнать read-only диагностику WG-линка: peer, handshake, ping, curl, xray-port"
+      className="text-[10px] px-2 py-0.5 rounded bg-indigo-700 hover:bg-indigo-600 disabled:opacity-50"
+    >
+      {busy ? "…" : "Диагностировать"}
+    </button>
+  );
+}
+
+function RelayLinksSection({
+  nodeId,
+  nodeName,
+  addOp,
+}: {
+  nodeId: number;
+  nodeName: string;
+  addOp: (op: TrackedOp) => void;
+}) {
   const { data, isLoading, error } = useQuery<NodeRelayLinkOut[]>({
     queryKey: ["node-relay-links", nodeId],
     queryFn: () => api.get(`/nodes/${nodeId}/links`),
@@ -177,6 +282,7 @@ function RelayLinksSection({ nodeId }: { nodeId: number }) {
             <th className="text-left py-1 px-2">Creds</th>
             <th className="text-left py-1 px-2">Public key</th>
             <th className="text-left py-1 px-2">Создан</th>
+            <th className="text-left py-1 px-2">Диагностика</th>
           </tr>
         </thead>
         <tbody>
@@ -196,6 +302,22 @@ function RelayLinksSection({ nodeId }: { nodeId: number }) {
               <td className="py-1 px-2 text-slate-400">
                 {new Date(l.created_at).toLocaleString()}
               </td>
+              <td className="py-1 px-2 space-y-1">
+                <LinkDiagnoseButton
+                  linkId={l.link_id}
+                  exitName={l.exit_name}
+                  nodeId={nodeId}
+                  nodeName={nodeName}
+                  addOp={addOp}
+                />
+                {l.last_auto_diagnose_at && (
+                  <AutoDiagnoseBadge
+                    at={l.last_auto_diagnose_at}
+                    taskId={l.last_auto_diagnose_task_id ?? null}
+                    symptom={l.last_auto_diagnose_symptom ?? null}
+                  />
+                )}
+              </td>
             </tr>
           ))}
         </tbody>
@@ -203,7 +325,10 @@ function RelayLinksSection({ nodeId }: { nodeId: number }) {
       <p className="text-slate-500 mt-2">
         Это relay-нода: трафик клиентов туннелируется через wgN в соответствующий
         exit. Распределение creds по линкам — least-loaded (см. G.4 в{" "}
-        <code>docs/RELAY_ROADMAP.md</code>).
+        <code>docs/RELAY_ROADMAP.md</code>). Кнопка «Диагностировать» —
+        read-only прогон <code>diagnose_relay_link.yml</code>: peer на jump,
+        handshake age, ping/curl через WG, xray port. Прогресс и результат —
+        в баннере наверху страницы.
       </p>
     </div>
   );
@@ -1059,7 +1184,11 @@ export default function Nodes() {
                 {expanded && (
                   <tr className="border-b border-slate-800 bg-slate-900/60">
                     <td colSpan={12} className="p-4 space-y-4">
-                      <RelayLinksSection nodeId={n.id} />
+                      <RelayLinksSection
+                        nodeId={n.id}
+                        nodeName={n.name}
+                        addOp={addOp}
+                      />
                       <NodeHealth nodeId={n.id} />
                       <NodeActiveUsers nodeId={n.id} />
                       <NodeTrafficChart nodeId={n.id} />
@@ -2171,6 +2300,7 @@ const KIND_LABELS: Record<string, string> = {
   bootstrap: "Bootstrap",
   resync: "Resync",
   diagnose: "Диагностика",
+  diagnose_link: "Диагностика link",
 };
 
 function OperationProgressBanner({
@@ -2288,6 +2418,74 @@ function OperationProgressBanner({
           <span className="text-red-400">failed: {counts.failed}</span>
         )}
       </div>
+      {op.kind === "diagnose_link" && (
+        <DiagnoseLinkResultPane op={op} task={related[0]} />
+      )}
+    </div>
+  );
+}
+
+// Структурированный блок результата под progress-bar для kind=diagnose_link.
+// Показывает карточки `checks` из task.result. Пока task ещё running —
+// отображает spinner-аналог; после completion — раскладку DiagnoseResult.
+function DiagnoseLinkResultPane({
+  op,
+  task,
+}: {
+  op: TrackedOp;
+  task: ProvisioningTaskOut | undefined;
+}) {
+  if (!task) {
+    return (
+      <div className="mt-3 text-xs text-slate-400 italic">
+        Ждём, когда воркер подхватит таску #{op.taskIds[0]}…
+      </div>
+    );
+  }
+  if (task.status === "pending" || task.status === "running") {
+    return (
+      <div className="mt-3 text-xs text-slate-400 italic">
+        Прогоняется ansible на ноде {op.nodeName}
+        {op.exitName ? ` (link → ${op.exitName})` : ""}…
+      </div>
+    );
+  }
+  const result = (task.result ?? {}) as {
+    checks?: DiagnoseCheckEntry[];
+    diagnose_meta?: DiagnoseMeta;
+    stdout?: string;
+    stderr?: string;
+    returncode?: number;
+  };
+  const checks = result.checks ?? [];
+  return (
+    <div className="mt-3 space-y-2">
+      <div className="text-xs text-slate-300">
+        Link → <span className="font-mono">{op.exitName ?? `exit#${op.linkId}`}</span>
+        {result.diagnose_meta && (
+          <span className="text-slate-500">
+            {" "}· iface {result.diagnose_meta.wg_interface}
+          </span>
+        )}
+      </div>
+      <DiagnoseResult checks={checks} meta={result.diagnose_meta} />
+      {(result.stdout || result.stderr) && (
+        <details className="text-xs text-slate-400">
+          <summary className="cursor-pointer hover:text-slate-200">
+            raw ansible stdout / stderr (для отладки)
+          </summary>
+          {result.stdout && (
+            <pre className="mt-1 bg-black/40 p-2 rounded font-mono text-[10px] overflow-x-auto whitespace-pre-wrap text-slate-300">
+              {result.stdout}
+            </pre>
+          )}
+          {result.stderr && (
+            <pre className="mt-1 bg-black/40 p-2 rounded font-mono text-[10px] overflow-x-auto whitespace-pre-wrap text-red-300">
+              {result.stderr}
+            </pre>
+          )}
+        </details>
+      )}
     </div>
   );
 }

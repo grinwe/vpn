@@ -1044,6 +1044,11 @@ class NodeRelayLinkOut(BaseModel):
     screen (where the relay is the anchor) plus a live credentials
     counter so the operator can see how many active users are pinned
     to each exit via this link.
+
+    ``last_auto_diagnose_*`` triplet exposes the most recent auto-trigger
+    by `_auto_diagnose_stale_links` (worker_relay_link_health_tick).
+    Frontend renders a small badge "автодиагностика N мин назад" with
+    a click-through to the task's structured `checks` block.
     """
     link_id: int
     exit_id: int
@@ -1053,3 +1058,6 @@ class NodeRelayLinkOut(BaseModel):
     wg_client_public_key: str
     credentials_count: int
     created_at: datetime
+    last_auto_diagnose_at: datetime | None = None
+    last_auto_diagnose_task_id: int | None = None
+    last_auto_diagnose_symptom: str | None = None
