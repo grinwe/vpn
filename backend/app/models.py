@@ -445,6 +445,12 @@ class Device(Base):
     # Per-device dynamic sub-link token — each device gets its own URL
     # so sharing a link exposes only one device's credentials.
     sub_token = Column(String, unique=True, index=True, nullable=True)
+    # HMAC-SHA256(APP_SECRET_KEY, sub_token)[:12] base64-urlsafe без padding.
+    # Идентификатор юзера в control-channel'е (Phase A roadmap'а): клиент
+    # шлёт этот hash на /api/client/report-failure, backend O(1) lookup'ит
+    # Device по индексу. sub_token не передаётся в plain. Подробнее —
+    # docs/operations/control_channel_roadmap.md §4.3.
+    client_id_hmac = Column(String(24), unique=True, index=True, nullable=True)
     created_at = Column(DateTime, default=utcnow)
     updated_at = Column(DateTime, default=utcnow, onupdate=utcnow)
     last_seen_at = Column(DateTime, nullable=True)

@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import hmac
 import logging
 import os
 from functools import lru_cache
@@ -69,3 +70,53 @@ def decrypt(value: str | None) -> str | None:
     except InvalidToken:
         logger.exception("Failed to decrypt value — wrong APP_SECRET_KEY?")
         return None
+
+
+# ── Control-channel HMAC ────────────────────────────────────────────────
+# Custom-клиент (Phase B) шлёт сигналы на /api/client/report-failure через
+# CF Worker. Чтобы бэк мог найти юзера по сигналу не передавая sub_token в
+# plain, клиент шлёт `client_id_hmac = HMAC(APP_SECRET_KEY, sub_token)[:12]`
+# (base64-url, 16 chars). Backend ищет Device по индексу client_id_hmac.
+#
+# Длина 12 байт = 96 бит — достаточно против brute force в обозримые сроки
+# (~7.9e28 комбинаций). Конструкция HMAC-SHA256 криптографически stable —
+# зная client_id_hmac, восстановить sub_token нельзя (вторая препятствие
+# к злоупотреблениям если client_id куда-то утёк).
+#
+# APP_SECRET_KEY переиспользуется намеренно — он уже доступен в worker/
+# backend контейнерах через env, не требует новой vault-переменной. При
+# смене APP_SECRET_KEY все client_id_hmac инвалидируются — это редкое
+# событие (compromise scenario), там придётся перевыпустить всем
+# sub_token'ы в любом случае.
+
+_CLIENT_ID_HMAC_LEN = 12  # bytes → 16 chars urlsafe-base64 без padding
+
+
+def compute_client_id_hmac(sub_token: str | None) -> str | None:
+    """Вернуть `client_id_hmac` для control-channel'а.
+
+    None в → None out (для Device без sub_token, например только что
+    создан и pending'ом ждёт provisioning'а). Иначе — 16-символьная
+    urlsafe-base64 строка без padding (12 байт HMAC-SHA256 → 16 chars).
+
+    Идемпотентен: дважды вызвать с тем же sub_token → тот же результат,
+    что критично для DB-индекса (UNIQUE по client_id_hmac).
+
+    Если APP_SECRET_KEY не задан — fallback на пустую строку и warning;
+    в этом случае control-channel не работает (все client_id одинаковые),
+    но запуск приложения не падает. Production должен задавать ключ.
+    """
+    if sub_token is None or sub_token == "":
+        return None
+    raw = os.getenv("APP_SECRET_KEY")
+    if not raw:
+        logger.warning(
+            "compute_client_id_hmac: APP_SECRET_KEY not set, client_id will be empty"
+        )
+        return ""
+    mac = hmac.new(
+        raw.encode("utf-8"),
+        sub_token.encode("utf-8"),
+        hashlib.sha256,
+    ).digest()[:_CLIENT_ID_HMAC_LEN]
+    return base64.urlsafe_b64encode(mac).rstrip(b"=").decode("ascii")

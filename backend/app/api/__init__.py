@@ -23,6 +23,7 @@ from . import (
     audit,
     autoscale,
     broadcasts,
+    client_control,
     cloud,
     exits,
     health,
@@ -67,6 +68,7 @@ router.include_router(exits.router)
 router.include_router(ops.router)
 router.include_router(broadcasts.router)
 router.include_router(admin_claim.router)
+router.include_router(client_control.router)
 
 
 __all__ = [

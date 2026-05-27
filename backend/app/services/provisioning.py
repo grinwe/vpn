@@ -23,7 +23,7 @@ from sqlalchemy.orm import Session
 
 from .. import models
 from ..db import SessionLocal
-from ..security import decrypt, encrypt
+from ..security import compute_client_id_hmac, decrypt, encrypt
 from .ansible_runner import (
     build_inventory_for_exit_node,
     build_inventory_for_node,
@@ -1625,6 +1625,7 @@ class ProvisioningOrchestrator:
             access_username=bundle[0].access_username,
             connection_uri=connection_uri_encrypted,
             sub_token=device_sub_token,
+            client_id_hmac=compute_client_id_hmac(device_sub_token),
         )
         self.db.add(device)
         self.db.flush()
@@ -1782,6 +1783,7 @@ class ProvisioningOrchestrator:
             access_username=username,
             connection_uri=encrypt(device_uri),
             sub_token=device_sub_token,
+            client_id_hmac=compute_client_id_hmac(device_sub_token),
         )
         self.db.add(device)
         self.db.flush()
@@ -2284,6 +2286,7 @@ class ProvisioningOrchestrator:
             access_username=username,
             connection_uri=connection_uri_encrypted,
             sub_token=device_sub_token,
+            client_id_hmac=compute_client_id_hmac(device_sub_token),
         )
         self.db.add(device)
         self.db.flush()
@@ -2583,6 +2586,10 @@ class ProvisioningOrchestrator:
         )
         if reuse_token:
             device.sub_token = None
+            # client_id_hmac производный от sub_token — сбрасываем
+            # вместе, иначе UNIQUE-индекс заблокирует reuse этого
+            # client_id_hmac на новом Device.
+            device.client_id_hmac = None
             self.db.flush()
         new_device, task = self.reprovision_subscription(
             sub,

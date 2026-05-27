@@ -1,0 +1,33 @@
+# wrangler config для control-channel Worker'а.
+#
+# Деплой 3 instance'ов через одну codebase — name override'ит через CLI:
+#   wrangler deploy --name control-1
+#   wrangler deploy --name control-2
+#   wrangler deploy --name control-3
+#
+# URL после deploy'а: https://control-N.<account>.workers.dev
+# Эти 3 URL'а попадают в подписочные данные клиента (поле control_urls).
+
+name = "control-channel"
+main = "index.js"
+# Закреплённая дата compatibility — обновлять осознанно через
+# `wrangler deploy --compatibility-date YYYY-MM-DD`. Локает поведение
+# runtime'а CF от breaking changes.
+compatibility_date = "2026-05-27"
+
+# Логи Worker'а — НЕ tail'им в CF Logpush, чтобы не плодить копии
+# control-channel событий вне нашего origin'а (privacy).
+# Если нужно дебажить — `wrangler tail --name control-1`.
+
+[observability]
+enabled = false
+
+# ── Secrets ────────────────────────────────────────────────────────────
+# НЕ хранятся в этом файле. Задаются через CLI:
+#   wrangler secret put CONTROL_CHANNEL_SECRET --name control-1
+#   wrangler secret put BACKEND_URL --name control-1
+# Повторить для control-2, control-3 (одинаковыми значениями).
+#
+# CONTROL_CHANNEL_SECRET — shared с backend'ом (env переменная воркера +
+#                          env переменная backend контейнера).
+# BACKEND_URL — https://mgmt.grinwer.online (без trailing slash, без /api).
