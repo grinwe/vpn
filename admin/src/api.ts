@@ -367,6 +367,8 @@ export interface VPNNodeOut {
   has_relay_config: boolean;
   exit_links: NodeExitLinkHealthMini[];
   last_ssh_at: string | null;
+  // NULL = auto-trigger и Telegram-алёрты включены. Timestamp = mute.
+  auto_diagnose_disabled_at?: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -527,21 +529,22 @@ export interface NodeRelayLinkOut {
   last_auto_diagnose_at?: string | null;
   last_auto_diagnose_task_id?: number | null;
   last_auto_diagnose_symptom?: string | null;
-  // NULL = auto-trigger работает; timestamp = оператор замьютил линк.
-  // Управление: POST /exits/links/{id}/auto-diagnose/{disable|enable}.
-  auto_diagnose_disabled_at?: string | null;
 }
 
-export function disableLinkAutoDiagnose(linkId: number) {
-  return api.post<{ link_id: number; auto_diagnose_disabled_at: string | null }>(
-    `/exits/links/${linkId}/auto-diagnose/disable`,
+// Node-level mute (заменяет link-level в миграции 0036). Глушит:
+//   - smart-диагностику всех link'ов этой ноды
+//   - Telegram-алёрты infra_ssh с этой нодой
+//   - node-level smart-diagnose (consecutive SSH fails)
+export function disableNodeAutoDiagnose(nodeId: number) {
+  return api.post<{ node_id: number; auto_diagnose_disabled_at: string | null }>(
+    `/nodes/${nodeId}/auto-diagnose/disable`,
     {},
   );
 }
 
-export function enableLinkAutoDiagnose(linkId: number) {
-  return api.post<{ link_id: number; auto_diagnose_disabled_at: string | null }>(
-    `/exits/links/${linkId}/auto-diagnose/enable`,
+export function enableNodeAutoDiagnose(nodeId: number) {
+  return api.post<{ node_id: number; auto_diagnose_disabled_at: string | null }>(
+    `/nodes/${nodeId}/auto-diagnose/enable`,
     {},
   );
 }

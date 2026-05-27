@@ -235,6 +235,10 @@ class VPNNodeOut(VPNNodeCreate):
     # stats. Без клика по diagnose. Дефолт None (``list_nodes`` bulk-load,
     # остальные call-сайты VPNNodeOut его не проставляют — им неактуально).
     last_ssh_at: UTCDateTime | None = None
+    # NULL = auto-trigger и Telegram-алерты на эту ноду работают.
+    # Timestamp = оператор замьютил (см. POST /nodes/{id}/auto-diagnose/
+    # {disable|enable}). UI рендерит badge «🔕 muted» в строке.
+    auto_diagnose_disabled_at: UTCDateTime | None = None
     created_at: datetime
     updated_at: datetime
 
@@ -1123,6 +1127,3 @@ class NodeRelayLinkOut(BaseModel):
     last_auto_diagnose_at: datetime | None = None
     last_auto_diagnose_task_id: int | None = None
     last_auto_diagnose_symptom: str | None = None
-    # NULL = auto-trigger работает. Timestamp = оператор замьютил.
-    # См. POST /exits/links/{id}/auto-diagnose/{disable|enable}.
-    auto_diagnose_disabled_at: datetime | None = None

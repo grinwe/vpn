@@ -1049,13 +1049,14 @@ def _auto_diagnose_stale_links(session) -> dict:
     # один SSH ни разу не прошёл, диагностика всё равно не сможет
     # сделать `wg show` со стороны jump.
     #
-    # Skip links с auto_diagnose_disabled_at IS NOT NULL — оператор
-    # явно выключил автодиагностику для известно-проблемных линков
-    # (например, нода ещё bootstrap'ится, или мы ждём ручного fix'а
-    # и не хотим, чтобы шум от падающего auto-trigger'а отвлекал).
-    # Поле добавит миграция 0035 — getattr-guard здесь для
-    # backward-compat с пре-миграционными deploy'ями.
-    disabled_col = getattr(models.RelayExitLink, "auto_diagnose_disabled_at", None)
+    # JOIN с VPNNode + filter VPNNode.auto_diagnose_disabled_at IS NULL —
+    # оператор замьютил ноду через /nodes/{id}/auto-diagnose/disable
+    # (миграция 0036 перенесла mute-флаг с link-level на node-level,
+    # чтобы один клик глушил все link'и этой ноды и Telegram-алёрты).
+    # getattr-guard на новой колонке для backward-compat — если миграция
+    # 0036 ещё не накатилась, фильтр пропускаем (worst case: лишние
+    # diagnose тики, но не падение).
+    node_disabled_col = getattr(models.VPNNode, "auto_diagnose_disabled_at", None)
 
     # ORDER BY (handshake_at IS NULL DESC, handshake_at ASC) — NULL первыми
     # (never observed = worst), потом самые stale → за один tick покрываем
@@ -1065,6 +1066,7 @@ def _auto_diagnose_stale_links(session) -> dict:
     # 5 мин, что safely ниже debounce window 30 мин).
     candidates_q = (
         session.query(models.RelayExitLink)
+        .join(models.VPNNode, models.VPNNode.id == models.RelayExitLink.relay_node_id)
         .filter(models.RelayExitLink.last_observed_at.isnot(None))
         .filter(models.RelayExitLink.last_observed_at >= observed_cutoff)
         .filter(
@@ -1072,8 +1074,8 @@ def _auto_diagnose_stale_links(session) -> dict:
             | (models.RelayExitLink.last_handshake_at < stale_hs_cutoff)
         )
     )
-    if disabled_col is not None:
-        candidates_q = candidates_q.filter(disabled_col.is_(None))
+    if node_disabled_col is not None:
+        candidates_q = candidates_q.filter(node_disabled_col.is_(None))
     candidates = (
         candidates_q
         .order_by(
@@ -1172,6 +1174,124 @@ def _auto_diagnose_stale_links(session) -> dict:
     }
 
 
+def _auto_diagnose_unreachable_nodes(
+    session, failed_relay_names: list[str]
+) -> dict:
+    """Auto-trigger node-level diagnose для нод, на которые SSH не дошёл.
+
+    Сценарий: relay_link_health tick попытался достучаться до relay по
+    SSH (paramiko в collect_all_relay_links), упал — записал имя в
+    `failed_relay_names`. Это node-level симптом: «нода не отвечает по
+    SSH» — link-level smart-diagnose не поможет (ему тоже нужен SSH).
+
+    Что делаем: per-failed-node enqueue ProvisioningTask с target_type=
+    'node', action='diagnose' (это уже work'ает — `playbooks/diagnose_
+    node.yml` гоняет `check_node_health` через ansible, который сам
+    retry'ит SSH с другими таймаутами + соберёт listening sockets и
+    systemd state если хоть на чуть дотянется). + audit_log symptom_
+    detected с target_type='vpn_node'.
+
+    Mute: skip nodes где VPNNode.auto_diagnose_disabled_at IS NOT NULL.
+    Debounce: 30 мин per-node через audit_log lookup — иначе при stale
+    SSH-проблеме каждые 5 мин будем спамить tasks.
+
+    Env vars:
+      AUTO_DIAGNOSE_NODE_ENABLED         default true
+      AUTO_DIAGNOSE_NODE_DEBOUNCE_MIN    default 30
+      AUTO_DIAGNOSE_NODE_MAX_PER_TICK    default 2
+    """
+    if not failed_relay_names:
+        return {"enabled": True, "enqueued": [], "candidates": 0}
+    if os.getenv("AUTO_DIAGNOSE_NODE_ENABLED", "true").lower() not in {"1", "true", "yes"}:
+        return {"enabled": False, "enqueued": []}
+
+    from datetime import timedelta
+
+    from . import models
+    from .services.provisioning import ProvisioningOrchestrator
+    from .time_utils import utcnow
+
+    debounce_min = int(os.getenv("AUTO_DIAGNOSE_NODE_DEBOUNCE_MIN", "30"))
+    max_per_tick = int(os.getenv("AUTO_DIAGNOSE_NODE_MAX_PER_TICK", "2"))
+
+    now = utcnow()
+    debounce_cutoff = now - timedelta(minutes=debounce_min)
+
+    # Resolve names → VPNNode rows. Filter muted сразу — saves audit query.
+    disabled_col = getattr(models.VPNNode, "auto_diagnose_disabled_at", None)
+    nodes_q = (
+        session.query(models.VPNNode)
+        .filter(models.VPNNode.name.in_(failed_relay_names))
+    )
+    if disabled_col is not None:
+        nodes_q = nodes_q.filter(disabled_col.is_(None))
+    nodes = nodes_q.all()
+
+    enqueued: list[dict] = []
+    skipped_debounced: list[int] = []
+
+    for node in nodes:
+        if len(enqueued) >= max_per_tick:
+            break
+        # Per-node debounce. Action имя другое чем у link-level
+        # ('node_unreachable_detected'), чтобы две дебаунс-зоны не
+        # пересекались — link-level и node-level могут срабатывать
+        # независимо для одной и той же ноды.
+        recent = (
+            session.query(models.AuditLog)
+            .filter(models.AuditLog.target_type == "vpn_node")
+            .filter(models.AuditLog.target_id == node.id)
+            .filter(models.AuditLog.action == "node_unreachable_detected")
+            .filter(models.AuditLog.created_at >= debounce_cutoff)
+            .first()
+        )
+        if recent:
+            skipped_debounced.append(node.id)
+            continue
+
+        orchestrator = ProvisioningOrchestrator(session)
+        task = orchestrator.create_task(
+            "node",
+            node.id,
+            "diagnose",
+            {"auto_triggered": True, "symptom": "node_unreachable"},
+        )
+        session.add(
+            models.AuditLog(
+                actor="auto-diagnose",
+                actor_type=models.AuditActor.system,
+                action="node_unreachable_detected",
+                target_type="vpn_node",
+                target_id=node.id,
+                extra={
+                    "symptom": "node_unreachable",
+                    "node_name": node.name,
+                    "action_taken": f"enqueued_task:{task.id}",
+                    "trigger": "relay_link_health_ssh_fail",
+                },
+            )
+        )
+        session.commit()
+        orchestrator.run_task_async(task, node=node)
+        enqueued.append({
+            "node_id": node.id,
+            "node_name": node.name,
+            "task_id": task.id,
+        })
+        logger.info(
+            "auto_diagnose_node: node=%s (%s) unreachable → diagnose task=%s",
+            node.id, node.name, task.id,
+        )
+
+    return {
+        "enabled": True,
+        "candidates": len(nodes),
+        "enqueued": enqueued,
+        "skipped_debounced": skipped_debounced,
+        "max_per_tick": max_per_tick,
+    }
+
+
 def run_relay_link_health_tick() -> dict:
     """Периодический WG-handshake poll для relay_exit_links.
 
@@ -1224,39 +1344,90 @@ def run_relay_link_health_tick() -> dict:
         except Exception:  # noqa: BLE001
             logger.exception("relay_link_health: auto_diagnose failed")
 
-        # Admin push-алерт при серийных SSH/WG-фейлах. Дедуп по пустому
-        # ключу — «не чаще раза в ADMIN_ALERT_DEDUP_WINDOW_SEC, независимо
-        # от того какие relay упали». Имена упавших relay уходят в текст,
-        # числа — в extra для admin-UI.
+        # Node-level smart-diagnose: ноды на которые SSH не дошёл вообще
+        # (relay_link_health.collect_all_relay_links вернул их в
+        # failed_relay_names) — это симптом «нода не отвечает», link-
+        # level diagnose тут не поможет (он тоже SSH-зависим). Enqueue
+        # `playbooks/diagnose_node.yml` который через ансибл умеет
+        # ретраить SSH с другими таймаутами + соберёт systemd state.
+        try:
+            node_summary = _auto_diagnose_unreachable_nodes(
+                session, list(summary.get("failed_relay_names") or [])
+            )
+            if node_summary.get("enqueued"):
+                summary["auto_diagnose_node"] = node_summary
+        except Exception:  # noqa: BLE001
+            logger.exception(
+                "relay_link_health: auto_diagnose_node failed"
+            )
+
+        # Admin push-алерт при серийных SSH/WG-фейлах. Перед отправкой
+        # фильтруем failed_relay_names против muted nodes (VPNNode.
+        # auto_diagnose_disabled_at) — если оператор уже знает, что
+        # нода проблемная, и явно замьютил её, не шлём по ней повторные
+        # пинг'и в Telegram. Если ВСЕ упавшие ноды замьючены — alert не
+        # уходит вообще.
         failed = int(summary.get("relays_ssh_failed", 0) or 0)
         threshold = int(os.getenv("ADMIN_ALERT_SSH_FAILED_THRESHOLD", "1"))
         if failed >= threshold:
             try:
+                from . import models as _m
                 from .services.admin_notify import notify_admins
 
-                names = summary.get("failed_relay_names") or []
-                names_line = (
-                    f"Ноды: {', '.join(names)}\n" if names else ""
-                )
-                no_match = int(summary.get("links_no_match", 0) or 0)
-                alert_text = (
-                    f"⚠️ WireGuard/SSH проблемы на {failed} relay-нодах.\n"
-                    f"{names_line}"
-                    f"links_no_match={no_match}.\n"
-                    f"Проверь /admin/nodes."
-                )
-                notify_admins(
-                    session,
-                    kind="infra_ssh",
-                    text=alert_text,
-                    dedup_key={},
-                    extra={
-                        "relays_ssh_failed": failed,
-                        "failed_relay_names": list(names),
-                        "links_no_match": no_match,
-                    },
-                    autocommit=True,
-                )
+                all_names = list(summary.get("failed_relay_names") or [])
+                # Подтягиваем muted имена одним запросом — обычно их 0-3.
+                muted_names: set[str] = set()
+                disabled_col = getattr(_m.VPNNode, "auto_diagnose_disabled_at", None)
+                if disabled_col is not None and all_names:
+                    rows = (
+                        session.query(_m.VPNNode.name)
+                        .filter(_m.VPNNode.name.in_(all_names))
+                        .filter(disabled_col.isnot(None))
+                        .all()
+                    )
+                    muted_names = {n for (n,) in rows}
+                unmuted_names = [n for n in all_names if n not in muted_names]
+                unmuted_failed = len(unmuted_names)
+
+                if unmuted_failed >= threshold:
+                    names_line = (
+                        f"Ноды: {', '.join(unmuted_names)}\n"
+                        if unmuted_names
+                        else ""
+                    )
+                    no_match = int(summary.get("links_no_match", 0) or 0)
+                    muted_suffix = (
+                        f" (ещё {len(muted_names)} muted: "
+                        f"{', '.join(sorted(muted_names))})"
+                        if muted_names
+                        else ""
+                    )
+                    alert_text = (
+                        f"⚠️ WireGuard/SSH проблемы на {unmuted_failed} "
+                        f"relay-нодах{muted_suffix}.\n"
+                        f"{names_line}"
+                        f"links_no_match={no_match}.\n"
+                        f"Проверь /admin/nodes."
+                    )
+                    notify_admins(
+                        session,
+                        kind="infra_ssh",
+                        text=alert_text,
+                        dedup_key={},
+                        extra={
+                            "relays_ssh_failed": unmuted_failed,
+                            "failed_relay_names": unmuted_names,
+                            "muted_relay_names": sorted(muted_names),
+                            "links_no_match": no_match,
+                        },
+                        autocommit=True,
+                    )
+                else:
+                    # Все ноды замьючены — alert не идёт, но логнуть стоит.
+                    logger.info(
+                        "relay_link_health: %s nodes failed, all muted (%s) — alert skipped",
+                        failed, sorted(muted_names),
+                    )
             except Exception:  # noqa: BLE001
                 logger.exception(
                     "relay_link_health: notify_admins failed"

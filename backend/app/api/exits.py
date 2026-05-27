@@ -1233,68 +1233,6 @@ def diagnose_relay_link(
     }
 
 
-@router.post("/exits/links/{link_id}/auto-diagnose/disable", status_code=200)
-def disable_link_auto_diagnose(
-    link_id: int,
-    db: Session = Depends(get_db),
-    admin_token: str = Depends(require_admin),
-    admin_actor: str | None = Header(default=None, alias=ADMIN_ACTOR_HEADER),
-):
-    """Mute smart-диагностику для конкретного линка.
-
-    Worker `_auto_diagnose_stale_links` пропускает links с
-    `auto_diagnose_disabled_at IS NOT NULL`. Ручная диагностика через
-    `POST /exits/links/{id}/diagnose` остаётся доступной — это только
-    отключение АВТОматического trigger'а из tick'а.
-    """
-    from ..time_utils import utcnow
-
-    link = db.get(models.RelayExitLink, link_id)
-    if link is None:
-        raise HTTPException(status_code=404, detail="Link not found")
-    if link.auto_diagnose_disabled_at is not None:
-        return {
-            "link_id": link.id,
-            "auto_diagnose_disabled_at": link.auto_diagnose_disabled_at,
-            "already_disabled": True,
-        }
-    link.auto_diagnose_disabled_at = utcnow()
-    db.commit()
-    db.refresh(link)
-    actor, actor_type = _resolve_admin_actor(admin_actor)
-    _audit(
-        db, actor, "relay_link_auto_diagnose_disabled", "relay_exit_link",
-        link.id, actor_type=actor_type,
-    )
-    return {
-        "link_id": link.id,
-        "auto_diagnose_disabled_at": link.auto_diagnose_disabled_at,
-    }
-
-
-@router.post("/exits/links/{link_id}/auto-diagnose/enable", status_code=200)
-def enable_link_auto_diagnose(
-    link_id: int,
-    db: Session = Depends(get_db),
-    admin_token: str = Depends(require_admin),
-    admin_actor: str | None = Header(default=None, alias=ADMIN_ACTOR_HEADER),
-):
-    """Снять mute с smart-диагностики для линка."""
-    link = db.get(models.RelayExitLink, link_id)
-    if link is None:
-        raise HTTPException(status_code=404, detail="Link not found")
-    if link.auto_diagnose_disabled_at is None:
-        return {"link_id": link.id, "already_enabled": True}
-    link.auto_diagnose_disabled_at = None
-    db.commit()
-    actor, actor_type = _resolve_admin_actor(admin_actor)
-    _audit(
-        db, actor, "relay_link_auto_diagnose_enabled", "relay_exit_link",
-        link.id, actor_type=actor_type,
-    )
-    return {"link_id": link.id, "auto_diagnose_disabled_at": None}
-
-
 @router.post("/exits/links/health/refresh", status_code=200)
 def refresh_relay_link_health(
     admin_token: str = Depends(require_admin),

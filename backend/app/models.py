@@ -227,6 +227,14 @@ class VPNNode(Base):
     provider_plan = Column(String, nullable=True)
     monthly_cost = Column(Numeric(10, 2), nullable=True)
 
+    # Mute-флаг для smart-диагностики и Telegram-алертов на эту ноду.
+    # NULL = всё работает (default). Timestamp = оператор выключил
+    # auto-trigger И заглушил admin_notify (notify_admins фильтрует
+    # failed_relay_names против muted nodes перед отправкой).
+    # Управление: POST /nodes/{id}/auto-diagnose/{disable|enable}.
+    # Покрывает оба уровня — relay→exit linkи у этой ноды + сам ноду.
+    auto_diagnose_disabled_at = Column(DateTime, nullable=True)
+
     pool = relationship("ServerPool", back_populates="nodes")
     configs = relationship("VPNConfig", back_populates="node", cascade="all, delete-orphan")
     subscriptions = relationship("Subscription", back_populates="node")
@@ -687,13 +695,6 @@ class RelayExitLink(Base):
     last_rx_bytes = Column(BigInteger, nullable=True)
     last_tx_bytes = Column(BigInteger, nullable=True)
     last_observed_at = Column(DateTime, nullable=True)
-
-    # Mute-флаг для smart-диагностики. NULL = auto-trigger работает
-    # (default). Timestamp = оператор явно выключил автодиагностику —
-    # worker.py:_auto_diagnose_stale_links фильтрует таких. Используется
-    # на проблемных линках, где симптом известен и auto-trigger только
-    # шумит в /admin/tasks. Управление через POST /exits/links/{id}/auto-diagnose/{disable|enable}.
-    auto_diagnose_disabled_at = Column(DateTime, nullable=True)
 
     relay_node = relationship("VPNNode")
     exit_node = relationship("WGExitNode")

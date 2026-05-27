@@ -326,6 +326,72 @@ def diagnose_node(
     return {"node_id": node.id, "task_id": task.id}
 
 
+@router.post("/nodes/{node_id}/auto-diagnose/disable", status_code=200)
+def disable_node_auto_diagnose(
+    node_id: int,
+    db: Session = Depends(get_db),
+    admin_token: str = Depends(require_admin),
+    admin_actor: str | None = Header(default=None, alias=ADMIN_ACTOR_HEADER),
+):
+    """Mute smart-диагностику и Telegram-алерты для этой ноды и ВСЕХ её link'ов.
+
+    Worker `_auto_diagnose_stale_links` skip'ает links у этой ноды.
+    `run_relay_link_health_tick` фильтрует `failed_relay_names` против
+    muted nodes перед `notify_admins(kind=infra_ssh)` — в Telegram алёрт
+    не уходит. Ручная диагностика (`POST /nodes/{id}/diagnose`,
+    `POST /exits/links/{id}/diagnose`) остаётся доступной — это только
+    выключение АВТОматического trigger'а + алёртов.
+
+    Idempotent: повторный disable не перезаписывает timestamp.
+    """
+    from ..time_utils import utcnow
+
+    node = db.get(models.VPNNode, node_id)
+    if not node:
+        raise HTTPException(status_code=404, detail="Node not found")
+    if node.auto_diagnose_disabled_at is not None:
+        return {
+            "node_id": node.id,
+            "auto_diagnose_disabled_at": node.auto_diagnose_disabled_at,
+            "already_disabled": True,
+        }
+    node.auto_diagnose_disabled_at = utcnow()
+    db.commit()
+    db.refresh(node)
+    actor, actor_type = _resolve_admin_actor(admin_actor)
+    _audit(
+        db, actor, "node_auto_diagnose_disabled", "vpn_node",
+        node.id, actor_type=actor_type,
+    )
+    return {
+        "node_id": node.id,
+        "auto_diagnose_disabled_at": node.auto_diagnose_disabled_at,
+    }
+
+
+@router.post("/nodes/{node_id}/auto-diagnose/enable", status_code=200)
+def enable_node_auto_diagnose(
+    node_id: int,
+    db: Session = Depends(get_db),
+    admin_token: str = Depends(require_admin),
+    admin_actor: str | None = Header(default=None, alias=ADMIN_ACTOR_HEADER),
+):
+    """Снять mute с smart-диагностики и Telegram-алертов для ноды."""
+    node = db.get(models.VPNNode, node_id)
+    if not node:
+        raise HTTPException(status_code=404, detail="Node not found")
+    if node.auto_diagnose_disabled_at is None:
+        return {"node_id": node.id, "already_enabled": True}
+    node.auto_diagnose_disabled_at = None
+    db.commit()
+    actor, actor_type = _resolve_admin_actor(admin_actor)
+    _audit(
+        db, actor, "node_auto_diagnose_enabled", "vpn_node",
+        node.id, actor_type=actor_type,
+    )
+    return {"node_id": node.id, "auto_diagnose_disabled_at": None}
+
+
 @router.post("/nodes/{node_id}/active", response_model=schemas.VPNNodeOut)
 def set_node_active(
     node_id: int,
@@ -825,7 +891,6 @@ def list_node_relay_links(
                 last_auto_diagnose_at=diag_at,
                 last_auto_diagnose_task_id=diag_task_id,
                 last_auto_diagnose_symptom=diag_symptom,
-                auto_diagnose_disabled_at=link.auto_diagnose_disabled_at,
             )
         )
     return out
