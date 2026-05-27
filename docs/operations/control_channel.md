@@ -19,8 +19,13 @@ day-to-day operator-документ; **архитектурные решени�
 | URL | Кто шлёт | Auth |
 |---|---|---|
 | `https://control-N.<acct>.workers.dev/report` | custom-клиент | `X-Client-ID` header (HMAC) |
-| `https://mgmt.grinwer.online/api/client/report-failure` | CF Worker forward | `X-Control-Channel-Secret` |
+| `https://mgmt.grinwer.online/api/client/report-failure` | CF Worker forward | `X-Control-Channel-Secret: <APP_SECRET_KEY>` |
 | `https://mgmt.grinwer.online/api/admin/client-control/report-for-subscription` | админка | `X-Admin-Token` |
+
+`X-Control-Channel-Secret` несёт значение `APP_SECRET_KEY` (тот же что
+Fernet'ит секреты в БД) — отдельной vault-переменной нет. На Worker'е
+лежит как `env.APP_SECRET_KEY` через `wrangler secret put`. На backend
+читается из env (уже там был).
 
 ## Что происходит за один report
 
@@ -50,7 +55,7 @@ generator).
 
 При block'е одного Worker'а:
 1. Deploy новый Worker: `wrangler deploy --name control-4`.
-2. Push secrets: `wrangler secret put` x2 (CONTROL_CHANNEL_SECRET, BACKEND_URL).
+2. Push secrets: `wrangler secret put` x2 (`APP_SECRET_KEY` + `BACKEND_URL`).
 3. Добавить `control-4` в env `CONTROL_WORKER_URLS` backend'а.
 4. Restart backend → новые подписочные данные содержат все 4 Worker'а.
 5. Через ~60 дней (время чтобы клиенты подхватили) — `wrangler delete control-1`.
@@ -60,7 +65,8 @@ generator).
 ```bash
 # Замена реальных значений:
 # - SUB_TOKEN — из БД, у любого тестового Device.sub_token
-# - APP_SECRET_KEY — из vault.yml (vault_app_secret_key)
+# - APP_SECRET_KEY — из vault.yml (vault_app_secret_key), он же служит
+#                    как shared secret для Worker↔backend.
 CLIENT_ID=$(
     python3 -c "
 import os, hashlib, hmac, base64
@@ -71,10 +77,11 @@ print(compute_client_id_hmac('$SUB_TOKEN'))
 )
 echo "client_id_hmac = $CLIENT_ID"
 
-# 1. Прямой POST на backend (минуя Worker) с правильным secret:
+# 1. Прямой POST на backend (минуя Worker). В X-Control-Channel-Secret
+#    передаём APP_SECRET_KEY (тот же что у Fernet'а):
 curl -sS -X POST https://mgmt.grinwer.online/api/client/report-failure \
     -H "Content-Type: application/json" \
-    -H "X-Control-Channel-Secret: $CONTROL_CHANNEL_SECRET" \
+    -H "X-Control-Channel-Secret: $APP_SECRET_KEY" \
     -H "X-Client-ID: $CLIENT_ID" \
     -d '{"kind":"user_reported","ts":'$(date +%s)',"current_node_id":12,"fail_count":1}' \
     | jq
@@ -103,16 +110,15 @@ curl -sS -X POST https://mgmt.grinwer.online/api/admin/client-control/report-for
 | Симптом | Где искать |
 |---|---|
 | `{action: "no_target_available"}` | `SELECT id,name,status,is_active,auto_diagnose_disabled_at FROM vpn_nodes WHERE status='active' AND is_active=true AND auto_diagnose_disabled_at IS NULL;` — есть ли вообще куда мигрировать? |
-| `401 invalid control-channel secret` | env `CONTROL_CHANNEL_SECRET` в backend контейнере **!=** secret на CF Worker'е. `docker compose exec worker env \| grep CONTROL_CHANNEL_SECRET` + `wrangler secret list --name control-1`. |
+| `401 invalid control-channel secret` | `APP_SECRET_KEY` в backend контейнере **!=** secret на CF Worker'е (рассинхрон при rotation). `docker compose exec worker env \| grep APP_SECRET_KEY` + `wrangler secret list --name control-1`. Push'нуть синхронно через `wrangler secret put` на все 3 Worker'а. |
 | `401 unknown client_id` | Device с этим `client_id_hmac` нет. Миграция 0037 backfill'ит при naличии APP_SECRET_KEY — если env не было при миграции, backfill пропустился. Пересоздать через ручной UPDATE: `SELECT id, sub_token, client_id_hmac FROM devices WHERE client_id_hmac IS NULL AND sub_token IS NOT NULL;` → пересчитать через `compute_client_id_hmac` + UPDATE. |
 | `429 Too Many Requests` | Rate-limit slowapi: 5 reports / 30 мин per client_id. Это by design — клиент дёргает повторно слишком часто. Подождать. |
-| `503 control channel secret is not configured` | env `CONTROL_CHANNEL_SECRET` пустой на backend контейнере. Проверь `env.j2` + `vault.yml`. |
+| `503 APP_SECRET_KEY is not configured` | env `APP_SECRET_KEY` пустой на backend контейнере (мало вероятно — без него и Fernet/encrypt тоже не работает). Проверь `env.j2` + `vault.yml`. |
 
 ## Security threat model
 
 * **Leak X-Client-ID** (например через CF logs или MITM) → злоумышленник может дёргать report-failure от имени юзера. Защита: rate-limit + `5-min` дедуп per subscription. Worst-case impact: один лишний migrate за 30 мин, не критично.
-* **Leak `CONTROL_CHANNEL_SECRET`** → возможность отправить любой report напрямую на backend без CF. Защита: secret ротируется одновременно на Worker'ах и backend env через ansible. При подозрении на compromise — `wrangler secret put` новое + backend `.env` update + restart.
-* **Leak `APP_SECRET_KEY`** → можно вычислить любой client_id_hmac. Это catastrophic (Fernet-encrypted creds, WG keys тоже на нём). Защита: APP_SECRET_KEY в vault, не в env-файлах в plain.
+* **Leak `APP_SECRET_KEY`** → одновременно (1) можно отправить любой report напрямую на backend без CF и (2) вычислить любой client_id_hmac (3) расшифровать все Fernet-encrypted creds/WG keys в БД. Это catastrophic — главный rotation event. Защита: APP_SECRET_KEY только в vault, никогда не в plain. При compromise rotation:  ansible push нового vault → backend `.env` update + restart → `wrangler secret put APP_SECRET_KEY` на все 3 Worker'а → backfill `Device.client_id_hmac` с новым ключом (или принять что старые клиенты потеряют control-channel до следующего refresh sub_token).
 * **Leak `sub_token`** → клиент уже имеет доступ к credentials, control-channel это не делает хуже.
 
 ## Что НЕ делаем

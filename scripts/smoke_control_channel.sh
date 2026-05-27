@@ -10,8 +10,12 @@
 #   6. Rate-limit срабатывает после 5 запросов в 30 мин.
 #
 # Запуск:
-#   APP_SECRET_KEY=... CONTROL_CHANNEL_SECRET=... ADMIN_API_TOKEN=... \
+#   APP_SECRET_KEY=... ADMIN_API_TOKEN=... \
 #     scripts/smoke_control_channel.sh <sub_token>
+#
+# APP_SECRET_KEY используется для (1) вычисления client_id_hmac локально
+# и (2) как shared secret в X-Control-Channel-Secret header — отдельной
+# CONTROL_CHANNEL_SECRET переменной нет (см. control_channel.md).
 #
 # Опциональные env vars:
 #   BACKEND_URL — default https://mgmt.grinwer.online
@@ -28,7 +32,6 @@ if [[ -z "$SUB_TOKEN" ]]; then
 fi
 
 : "${APP_SECRET_KEY:?need APP_SECRET_KEY}"
-: "${CONTROL_CHANNEL_SECRET:?need CONTROL_CHANNEL_SECRET (если шлём прямо на backend)}"
 
 BACKEND_URL="${BACKEND_URL:-https://mgmt.grinwer.online}"
 WORKER_URL="${WORKER_URL:-}"
@@ -64,7 +67,7 @@ else
     URL="$BACKEND_URL/api/client/report-failure"
     HEADERS=(
         "-H" "Content-Type: application/json"
-        "-H" "X-Control-Channel-Secret: $CONTROL_CHANNEL_SECRET"
+        "-H" "X-Control-Channel-Secret: $APP_SECRET_KEY"
         "-H" "X-Client-ID: $CLIENT_ID"
     )
     echo "(direct to backend: $URL)"

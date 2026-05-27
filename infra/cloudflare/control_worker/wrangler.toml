@@ -24,10 +24,12 @@ enabled = false
 
 # ── Secrets ────────────────────────────────────────────────────────────
 # НЕ хранятся в этом файле. Задаются через CLI:
-#   wrangler secret put CONTROL_CHANNEL_SECRET --name control-1
+#   wrangler secret put APP_SECRET_KEY --name control-1
 #   wrangler secret put BACKEND_URL --name control-1
 # Повторить для control-2, control-3 (одинаковыми значениями).
 #
-# CONTROL_CHANNEL_SECRET — shared с backend'ом (env переменная воркера +
-#                          env переменная backend контейнера).
-# BACKEND_URL — https://mgmt.grinwer.online (без trailing slash, без /api).
+# APP_SECRET_KEY — тот же что у backend контейнера (vault_app_secret_key).
+#                  Используется как shared secret между Worker и backend.
+#                  При rotation APP_SECRET_KEY — `wrangler secret put` на
+#                  все Worker'ы синхронно с ansible-rollout'ом backend'а.
+# BACKEND_URL    — https://mgmt.grinwer.online (без trailing slash, без /api).

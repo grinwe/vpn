@@ -30,12 +30,14 @@ for n in 1 2 3; do
 done
 
 # Задать secrets для каждого Worker'а:
-for n in 1 2 3; do
-    echo -n "Secret value: "
-    read -s SECRET
-    echo "$SECRET" | wrangler secret put CONTROL_CHANNEL_SECRET --name "control-$n"
+# APP_SECRET_KEY — тот же что в backend контейнере (vault_app_secret_key).
+# Достать на mgmt:  docker compose exec -T worker env | grep APP_SECRET_KEY
+APP_SECRET_KEY="<value-from-mgmt-env>"
+BACKEND_URL="https://mgmt.grinwer.online"
 
-    echo "https://mgmt.grinwer.online" | wrangler secret put BACKEND_URL --name "control-$n"
+for n in 1 2 3; do
+    echo "$APP_SECRET_KEY" | wrangler secret put APP_SECRET_KEY --name "control-$n"
+    echo "$BACKEND_URL" | wrangler secret put BACKEND_URL --name "control-$n"
 done
 ```
 
@@ -44,16 +46,16 @@ URL'ы Worker'ов:
 - `https://control-2.<account>.workers.dev`
 - `https://control-3.<account>.workers.dev`
 
-После deploy'а — обновить backend env с тем же `CONTROL_CHANNEL_SECRET` +
-прописать список Worker URL'ов в подписочных данных (`/api/sub/{token}`
-extra block для custom-клиента).
+После deploy'а — прописать список Worker URL'ов в подписочных данных
+(`/api/sub/{token}` extra block для custom-клиента, Phase B). Backend
+env'у дополнительных правок не требуется — APP_SECRET_KEY уже там.
 
 ## Rotation (при block'е RKN)
 
 ```bash
 # Деплоим новый Worker:
 wrangler deploy --name control-N+1
-echo "$SECRET" | wrangler secret put CONTROL_CHANNEL_SECRET --name "control-N+1"
+echo "$APP_SECRET_KEY" | wrangler secret put APP_SECRET_KEY --name "control-N+1"
 echo "$BACKEND_URL" | wrangler secret put BACKEND_URL --name "control-N+1"
 
 # Обновить подписочный generator на backend'е (env CONTROL_WORKER_URLS),
@@ -70,7 +72,7 @@ wrangler delete --name control-old
 cd infra/cloudflare/control_worker
 wrangler dev --local
 # Будет на http://127.0.0.1:8787/report
-# Не забыть set CONTROL_CHANNEL_SECRET + BACKEND_URL через --var.
+# Не забыть set APP_SECRET_KEY + BACKEND_URL через --var.
 ```
 
 ## Smoke-тест после deploy'а

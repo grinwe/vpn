@@ -8,9 +8,11 @@
 // клиент перебирает random'ом, retry на следующий при error/timeout.
 //
 // Secrets (через `wrangler secret put`):
-//   CONTROL_CHANNEL_SECRET — shared с backend (env CONTROL_CHANNEL_SECRET)
-//   BACKEND_URL            — https://mgmt.grinwer.online (не палится клиенту,
-//                            живёт в Worker'е, не в подписочных данных)
+//   APP_SECRET_KEY — переиспользует существующий backend-секрет (тот же
+//                    что Fernet'ит WG keys/cred'ы в БД). Один rotation
+//                    point для всего control-channel'а.
+//   BACKEND_URL    — https://mgmt.grinwer.online (не палится клиенту,
+//                    живёт в Worker'е, не в подписочных данных)
 //
 // Не делаем здесь:
 //   - Rate-limit per client_id — на backend'е через slowapi.
@@ -50,7 +52,7 @@ export default {
     // Если злоумышленник перехватит ответ от Worker'а — он не увидит
     // BACKEND_URL, только Worker forwards.
     const backendUrl = env.BACKEND_URL;
-    const secret = env.CONTROL_CHANNEL_SECRET;
+    const secret = env.APP_SECRET_KEY;
     if (!backendUrl || !secret) {
       // Deployment misconfig — не пропускаем POST к origin'у.
       return jsonResp(503, { error: "control channel misconfigured" });

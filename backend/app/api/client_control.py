@@ -15,12 +15,14 @@ implementation Phase A §3.
 Auth-цепочка:
   Client ──HTTPS──► CF Worker ──HTTPS + X-Control-Channel-Secret──► Backend
 
-X-Control-Channel-Secret — shared secret между Worker и backend
-(env CONTROL_CHANNEL_SECRET). Защита от:
+X-Control-Channel-Secret — APP_SECRET_KEY проекта (тот же что Fernet'ит
+WG private keys и др. секреты). Он уже есть в env'е worker'а и backend
+контейнера, отдельную vault-переменную не заводим. CF Worker узнаёт
+его через `wrangler secret put APP_SECRET_KEY`. Защита от:
   * прямого hit'а на наш origin без Worker'а (= обход rate-limit
-    Durable Objects на Worker'е),
+    на Worker'е, если когда-нибудь добавим Durable Objects),
   * leak'нувшего client_id (он не даёт сам по себе доступ — нужен
-    ещё shared secret).
+    ещё APP_SECRET_KEY).
 
 Client identity — через `X-Client-ID` header. Backend O(1) ищет
 Device по индексу `client_id_hmac` (миграция 0037).
@@ -51,7 +53,11 @@ router = APIRouter()
 
 
 def _verify_control_secret(secret_header: str | None) -> None:
-    """Compare `X-Control-Channel-Secret` against env CONTROL_CHANNEL_SECRET.
+    """Compare `X-Control-Channel-Secret` against env APP_SECRET_KEY.
+
+    Используется тот же ключ что Fernet'ит секреты в БД — отдельную
+    vault-переменную не заводим, чтобы не плодить rotation surface
+    (один compromise scenario = всё равно обновлять APP_SECRET_KEY).
 
     Если env не задан — 503 с понятным сообщением (deployment misconfig).
     Если headers нет или не совпадает — 401. Постоянное время сравнения
@@ -59,13 +65,13 @@ def _verify_control_secret(secret_header: str | None) -> None:
     """
     import hmac
 
-    expected = os.getenv("CONTROL_CHANNEL_SECRET", "")
+    expected = os.getenv("APP_SECRET_KEY", "")
     if not expected:
         # Deployment misconfig — endpoint висит, но никто не пройдёт
         # auth (что лучше чем accepting random posts на raw origin).
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="control channel secret is not configured",
+            detail="APP_SECRET_KEY is not configured",
         )
     if not secret_header or not hmac.compare_digest(secret_header, expected):
         raise HTTPException(
