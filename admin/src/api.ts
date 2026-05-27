@@ -549,6 +549,40 @@ export function enableNodeAutoDiagnose(nodeId: number) {
   );
 }
 
+// ── Client control channel (admin trigger) ────────────────────────────
+// Имитирует client report от имени оператора — юзер написал в саппорт
+// через второй канал, оператор кликает кнопку → backend мигрирует
+// сабку на другую healthy ноду. См. docs/operations/control_channel_roadmap.md.
+
+export type ClientReportKind =
+  | "connect_failed"
+  | "user_reported"
+  | "health_check_failed";
+
+export interface AdminReportFailureRequest {
+  subscription_id: number;
+  kind?: ClientReportKind;
+}
+
+export interface AdminReportFailureResponse {
+  ok: boolean;
+  subscription_id: number;
+  retry_after_sec: number;
+  target_node_id: number | null;
+  target_node_name: string | null;
+  task_id: number | null;
+  action: string;
+}
+
+export function adminReportFailureForSubscription(
+  body: AdminReportFailureRequest,
+): Promise<AdminReportFailureResponse> {
+  return api.post<AdminReportFailureResponse>(
+    "/admin/client-control/report-for-subscription",
+    body,
+  );
+}
+
 export interface PlanOut {
   id: number;
   name: string;

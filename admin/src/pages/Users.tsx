@@ -6,6 +6,7 @@ import {
   useQueryClient,
 } from "@tanstack/react-query";
 import {
+  adminReportFailureForSubscription,
   api,
   batchBanUsers,
   claimOrphanSubscription,
@@ -250,6 +251,36 @@ export default function Users() {
       qc.invalidateQueries({ queryKey: ["relay-links"] });
     },
     onError: (e: Error) => alert(`Не удалось сменить exit: ${e.message}`),
+  });
+
+  // Control-channel admin trigger — оператор имитирует сигнал клиента,
+  // backend select_target_node + migrate_subscription_to_new_node.
+  // Используется когда юзер написал в саппорт через 2й канал (e-mail,
+  // друг с работающим VPN), и его нужно срочно переселить на healthy
+  // ноду без custom-клиента (Phase B).
+  const reportFailure = useMutation({
+    mutationFn: (subId: number) =>
+      adminReportFailureForSubscription({
+        subscription_id: subId,
+        kind: "user_reported",
+      }),
+    onSuccess: (res) => {
+      const detail =
+        res.action === "migrated"
+          ? `Подписка #${res.subscription_id} переведена на ноду #${res.target_node_id} (${res.target_node_name}). Таск #${res.task_id ?? "—"} — следи в /tasks.`
+          : res.action === "throttled"
+            ? `Уже мигрировали #${res.subscription_id} в последние 5 мин — подожди ${res.retry_after_sec}s.`
+            : res.action === "no_target_available"
+              ? `❌ Нет healthy target ноды для #${res.subscription_id}. Проверь /admin/nodes — все active/unmuted?`
+              : res.action === "subscription_inactive"
+                ? `Подписка #${res.subscription_id} не active — нечего мигрировать.`
+                : `action=${res.action} (retry через ${res.retry_after_sec}s)`;
+      alert(detail);
+      qc.invalidateQueries({ queryKey: ["user-subs"] });
+      qc.invalidateQueries({ queryKey: ["provisioning-tasks"] });
+    },
+    onError: (e: Error) =>
+      alert(`Не удалось имитировать сигнал: ${e.message}`),
   });
 
   const migrateDevice = useMutation({
@@ -863,6 +894,18 @@ export default function Users() {
                             className="text-xs px-2 py-1 rounded bg-emerald-700 hover:bg-emerald-600 disabled:opacity-50"
                           >
                             + add device
+                          </button>
+                        )}
+                        {s.status === "active" && (
+                          <button
+                            disabled={reportFailure.isPending}
+                            onClick={() => reportFailure.mutate(s.id)}
+                            title="Имитирует client report failure: backend выберет healthy target ноду и перенесёт подписку. Используй когда юзер написал через 2й канал что VPN сломан и нет custom-клиента чтобы сигнал прислать."
+                            className="text-xs px-2 py-1 rounded bg-orange-700 hover:bg-orange-600 disabled:opacity-50"
+                          >
+                            {reportFailure.isPending
+                              ? "…"
+                              : "🚨 report failure"}
                           </button>
                         )}
                         {s.status !== "active" && (
