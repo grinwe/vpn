@@ -1276,6 +1276,7 @@ interface BatchAttachLinkOut {
   task_id: number;
   wg_interface_name: string;
   wg_client_address_v4: string;
+  mode: string; // "attached" | "reapplied"
 }
 
 interface BatchAttachRelayResponse {
@@ -1306,14 +1307,14 @@ function BatchAttachToExitsModal({
   // показывать их в чекбоксах = напрашиваться на красную ошибку.
   const activeExits = exits.filter((e) => e.is_active);
 
-  // Для выбранного relay'я отфильтруем exit'ы, к которым он уже прицеплен:
-  // их не имеет смысла показывать, бэк ответит 409. WGExitNodeOut.links
-  // несёт уже attached relay'ев на этот exit, проверяем по relay_node_id.
-  const eligibleExits = relayId == null
-    ? activeExits
-    : activeExits.filter(
-        (e) => !e.links.some((l) => l.relay_node_id === relayId),
-      );
+  // Ensure-режим: бэк сам решает attach vs re-apply по факту наличия
+  // link'а. UI показывает ВСЕ active exit'ы; для уже-прицепленных к
+  // выбранному relay'ю рисуем бейдж «re-apply» в строке, чтобы юзер
+  // понимал что INSERT'а не будет.
+  function isAttachedToSelectedRelay(e: WGExitNodeOut): boolean {
+    if (relayId == null) return false;
+    return e.links.some((l) => l.relay_node_id === relayId);
+  }
 
   function toggle(id: number) {
     setSelected((prev) => {
@@ -1325,11 +1326,21 @@ function BatchAttachToExitsModal({
   }
 
   function selectAll() {
-    setSelected(new Set(eligibleExits.map((e) => e.id)));
+    setSelected(new Set(activeExits.map((e) => e.id)));
   }
   function clearAll() {
     setSelected(new Set());
   }
+
+  // Подсчёт привязки выбранного к attach/reapply — для footer'а submit-кнопки.
+  const selectedAttach = relayId == null
+    ? 0
+    : Array.from(selected).filter(
+        (id) => !activeExits.find((e) => e.id === id)?.links.some(
+          (l) => l.relay_node_id === relayId,
+        ),
+      ).length;
+  const selectedReapply = selected.size - selectedAttach;
 
   async function submit(e: React.FormEvent) {
     e.preventDefault();
@@ -1376,10 +1387,11 @@ function BatchAttachToExitsModal({
           </button>
         </div>
         <p className="text-xs text-slate-400 mb-3">
-          Выбираете один relay и галочками — exit'ы. На каждом attach'е бэк
-          выделяет свой /32 и keypair, заводит ProvisioningTask с общим
-          batch_id. После submit'а откроется панель с прогрессом — там
-          retry отдельных upal'нувших.
+          Выбираете один relay и галочками — exit'ы. Бэк делает «ensure»:
+          для новых exit'ов alloc'ает /32 + keypair и INSERT'ит link, для
+          уже-прицепленных просто re-apply ansible'а на существующий
+          link. Все task'и под общим batch_id — drawer покажет прогресс,
+          retry отдельных upal'нувших обычной кнопкой.
         </p>
 
         <form onSubmit={submit} className="flex flex-col gap-3 overflow-hidden">
@@ -1409,18 +1421,14 @@ function BatchAttachToExitsModal({
 
           <div className="flex items-center justify-between text-xs">
             <span className="text-slate-400">
-              Exit'ы ({eligibleExits.length} доступно
-              {relayId != null &&
-                activeExits.length > eligibleExits.length &&
-                `, ${activeExits.length - eligibleExits.length} уже прицеплены`}
-              )
+              Exit'ы ({activeExits.length} active)
             </span>
             <div className="flex gap-2">
               <button
                 type="button"
                 onClick={selectAll}
                 className="px-2 py-0.5 rounded bg-slate-700 hover:bg-slate-600"
-                disabled={submitting || relayId == null}
+                disabled={submitting || activeExits.length === 0}
               >
                 все
               </button>
@@ -1436,36 +1444,42 @@ function BatchAttachToExitsModal({
           </div>
 
           <div className="overflow-y-auto border border-slate-800 rounded p-2 flex-1 min-h-[150px] max-h-[40vh]">
-            {relayId == null && (
-              <div className="text-xs text-slate-500">
-                Выберите relay сверху — отфильтруем уже-прицепленные exit'ы.
-              </div>
-            )}
-            {relayId != null && eligibleExits.length === 0 && (
+            {activeExits.length === 0 && (
               <div className="text-xs text-yellow-400">
-                Этот relay уже прицеплен ко всем активным exit'ам.
+                Нет активных exit'ов.
               </div>
             )}
-            {eligibleExits.map((e) => (
-              <label
-                key={e.id}
-                className="flex items-center gap-2 py-1 text-xs hover:bg-slate-800/50 rounded px-1 cursor-pointer"
-              >
-                <input
-                  type="checkbox"
-                  checked={selected.has(e.id)}
-                  onChange={() => toggle(e.id)}
-                  disabled={submitting}
-                />
-                <span className="font-mono w-32 truncate" title={e.name}>
-                  {e.name}
-                </span>
-                <span className="text-slate-400 w-16 truncate">{e.region}</span>
-                <span className="text-slate-500 font-mono truncate" title={e.host}>
-                  {e.host}
-                </span>
-              </label>
-            ))}
+            {activeExits.map((e) => {
+              const attached = isAttachedToSelectedRelay(e);
+              return (
+                <label
+                  key={e.id}
+                  className="flex items-center gap-2 py-1 text-xs hover:bg-slate-800/50 rounded px-1 cursor-pointer"
+                >
+                  <input
+                    type="checkbox"
+                    checked={selected.has(e.id)}
+                    onChange={() => toggle(e.id)}
+                    disabled={submitting}
+                  />
+                  <span className="font-mono w-32 truncate" title={e.name}>
+                    {e.name}
+                  </span>
+                  <span className="text-slate-400 w-16 truncate">{e.region}</span>
+                  <span className="text-slate-500 font-mono truncate flex-1" title={e.host}>
+                    {e.host}
+                  </span>
+                  {attached && (
+                    <span
+                      className="text-[10px] px-1.5 py-0.5 rounded bg-yellow-700/40 text-yellow-200"
+                      title="Уже прицеплен — submit пере-применит ansible на существующем link'е"
+                    >
+                      re-apply
+                    </span>
+                  )}
+                </label>
+              );
+            })}
           </div>
 
           {err && <div className="text-red-400 text-xs">{err}</div>}
@@ -1486,7 +1500,13 @@ function BatchAttachToExitsModal({
             >
               {submitting
                 ? "Создаём…"
-                : `Прицепить к ${selected.size} exit'ам`}
+                : selected.size === 0
+                  ? "Выберите exit'ы"
+                  : selectedReapply === 0
+                    ? `Attach к ${selectedAttach} exit'ам`
+                    : selectedAttach === 0
+                      ? `Re-apply на ${selectedReapply} exit'ах`
+                      : `Прогнать на ${selected.size} (${selectedAttach} attach + ${selectedReapply} re-apply)`}
             </button>
           </div>
         </form>

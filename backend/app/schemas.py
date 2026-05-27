@@ -1035,13 +1035,20 @@ class BatchAttachRelayRequest(BaseModel):
 
 
 class BatchAttachLinkOut(BaseModel):
-    """Один созданный link + порождённая task внутри batch-ответа."""
+    """Один link + порождённая task внутри batch-ответа.
+
+    ``mode='attached'`` — link создан с нуля (INSERT + new keypair + /32).
+    ``mode='reapplied'`` — link уже существовал, бэк не INSERT'ил, просто
+    запустил relay_tunnel apply task на нём (привести wgN.conf к
+    желаемому состоянию).
+    """
     exit_id: int
     exit_name: str
     link_id: int
     task_id: int
     wg_interface_name: str
     wg_client_address_v4: str
+    mode: str  # "attached" | "reapplied"
 
 
 class BatchAttachRelayResponse(BaseModel):

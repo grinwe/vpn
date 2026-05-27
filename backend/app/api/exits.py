@@ -703,26 +703,30 @@ def batch_attach_relay(
     admin_token: str = Depends(require_admin),
     admin_actor: str | None = Header(default=None, alias=ADMIN_ACTOR_HEADER),
 ):
-    """Прицепить один relay сразу к N exit'ам одним запросом.
+    """Ensure: один relay прицеплен ко всем выбранным exit'ам одним запросом.
 
-    Симметричный flow к ``attach_relay``: на /exits page bar сверху
-    позволяет выбрать один relay и проклацать чекбоксами exit'ы. UI
-    шлёт сюда один POST вместо N последовательных, бэк делает
-    аллокацию + INSERT всех link'ов в одной транзакции и создаёт N
-    independent ProvisioningTask'ов с общим ``batch_id``. Drawer
-    рендерит прогресс N/M, per-task retry — обычной кнопкой в /tasks.
+    Семантика «ensure», не «strict attach»:
+      - exit_id, к которому relay ещё НЕ прицеплен → INSERT link + new
+        ``relay_tunnel apply`` task. ``mode="attached"`` в ответе.
+      - exit_id, к которому relay уже прицеплен → re-apply: НЕ
+        INSERT'им новый link (keypair и /32 сохраняются), просто
+        создаём свежий ``relay_tunnel apply`` task на существующем
+        link'е. ``mode="reapplied"`` в ответе.
 
-    Валидация ВСЕХ входов до транзакции. Если хоть один exit_id
-    невалид/duplicate/inactive — 400/404/409, ничего не пишем в БД.
-    Lenient mode не предусмотрен: смысл batch'а — один UI-клик создал
-    консистентный набор link'ов; partial-attach породил бы UI-state,
-    где «сабка через 4 exit'а из 5» неотличима от полноценной N=4.
+    Зачем так: оператор открывает модалку на /exits и хочет «прогнать
+    relay-tunnel для этих exit'ов» — независимо от того, новые они
+    или уже прицеплены. Strict-режим с 409 на дубликаты делал re-apply
+    невозможным через тот же UI (см. issue 2026-05-27).
 
-    Защита от race в ``allocate_client_address``: каждый link добавляем
-    через ``db.add()`` + ``db.flush()`` ДО следующего allocate в той же
-    транзакции — следующий ``_taken_hosts`` уже видит свежий address
-    как pending-INSERT и пропустит его. То же для
-    ``next_wg_interface_name``.
+    Все task'и (attach'и и re-apply'и) идут под общим ``batch_id`` —
+    UI рендерит их одной таблицей с прогрессом N/M, retry отдельных
+    upal'нувших через обычную /tasks-кнопку.
+
+    Защита от race в ``allocate_client_address`` для НОВЫХ link'ов:
+    каждый link добавляем через ``db.add()`` + ``db.flush()`` ДО
+    следующего allocate в той же транзакции — следующий
+    ``_taken_hosts`` уже видит свежий address как pending-INSERT и
+    пропустит его. То же для ``next_wg_interface_name``.
     """
     if not payload.exit_ids:
         raise HTTPException(
@@ -739,7 +743,7 @@ def batch_attach_relay(
     if not relay:
         raise HTTPException(status_code=404, detail="Relay node not found")
 
-    exits: list[models.WGExitNode] = []
+    exits_by_id: dict[int, models.WGExitNode] = {}
     for eid in payload.exit_ids:
         exit_node = db.get(models.WGExitNode, eid)
         if not exit_node:
@@ -751,10 +755,10 @@ def batch_attach_relay(
                 status_code=400,
                 detail=f"Exit {exit_node.name} is not active",
             )
-        exits.append(exit_node)
+        exits_by_id[eid] = exit_node
 
-    existing_pairs = {
-        row.exit_id
+    existing_links_by_exit: dict[int, models.RelayExitLink] = {
+        row.exit_id: row
         for row in (
             db.query(models.RelayExitLink)
             .filter(
@@ -764,25 +768,36 @@ def batch_attach_relay(
             .all()
         )
     }
-    if existing_pairs:
-        dup_names = [e.name for e in exits if e.id in existing_pairs]
-        raise HTTPException(
-            status_code=409,
-            detail=(
-                f"Relay {relay.name} уже прицеплен к: "
-                f"{', '.join(dup_names)} — открепите эти exit'ы перед batch'ем"
-            ),
-        )
 
     batch_id = uuid.uuid4()
     orchestrator = ProvisioningOrchestrator(db)
-    created_pairs: list[
-        tuple[models.RelayExitLink, models.WGExitNode, models.ProvisioningTask]
+    # mode → (link, exit_node, task). Сохраняем порядок payload.exit_ids
+    # чтобы в ответе links шли в том же порядке, что выбрал юзер.
+    created_entries: list[
+        tuple[str, models.RelayExitLink, models.WGExitNode, models.ProvisioningTask]
     ] = []
     relay_config_snapshot: dict[str, Any] | None = None
 
     try:
-        for exit_node in exits:
+        for exit_id in payload.exit_ids:
+            exit_node = exits_by_id[exit_id]
+            existing = existing_links_by_exit.get(exit_id)
+            if existing is not None:
+                # Re-apply на существующем link'е: новый task с тем же
+                # link_id, никаких INSERT'ов. keypair и /32 сохранены —
+                # клиент-сторона WG-конфига и так корректна, ansible
+                # должен лишь привести iface/peer-state на нодах.
+                task = orchestrator.create_task(
+                    "relay_tunnel",
+                    relay.id,
+                    "apply",
+                    {"exit_id": exit_node.id, "link_id": existing.id},
+                    batch_id=batch_id,
+                )
+                created_entries.append(("reapplied", existing, exit_node, task))
+                continue
+
+            # Новый attach: alloc + keygen + INSERT + task.
             client_address = allocate_client_address(db, exit_node)
             iface_name = next_wg_interface_name(db, relay.id)
             pub, priv = generate_wireguard_keypair()
@@ -800,9 +815,6 @@ def batch_attach_relay(
                 wg_client_address_v4=client_address,
             )
             db.add(link)
-            # flush обязателен ДО следующей итерации: _taken_hosts +
-            # next_wg_interface_name читают из БД, без flush'а наш
-            # свежий INSERT не виден и второй exit заберёт тот же /32.
             db.flush()
             task = orchestrator.create_task(
                 "relay_tunnel",
@@ -811,13 +823,13 @@ def batch_attach_relay(
                 {"exit_id": exit_node.id, "link_id": link.id},
                 batch_id=batch_id,
             )
-            created_pairs.append((link, exit_node, task))
+            created_entries.append(("attached", link, exit_node, task))
     except RelayAllocationError as exc:
         db.rollback()
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except IntegrityError as exc:
         # UNIQUE на (relay_id, exit_id) — race с single attach из другого
-        # запроса между нашим dup-check'ом и flush'ем. uq_relay_exit_pair
+        # запроса между нашим existing-check'ом и flush'ем. uq_relay_exit_pair
         # migration 0031.
         db.rollback()
         raise HTTPException(
@@ -827,22 +839,33 @@ def batch_attach_relay(
 
     if relay_config_snapshot is not None:
         # relay_config — флажок «это relay» для admin badge'а; ansible
-        # его не читает (см. attach_relay комментарий). last-writer wins,
-        # ok для boolean-семантики.
+        # его не читает (см. attach_relay комментарий). Обновляем
+        # только если был хоть один новый attach — для чистого re-apply
+        # batch'а флаг уже стоит.
         relay.relay_config = relay_config_snapshot
 
     db.commit()
 
     actor, actor_type = _resolve_admin_actor(admin_actor)
-    for link, _exit, _task in created_pairs:
-        _audit(
-            db, actor, "relay_exit_attached", "relay_exit_link", link.id,
-            actor_type=actor_type,
-        )
+    for mode, link, _exit, _task in created_entries:
+        if mode == "attached":
+            _audit(
+                db, actor, "relay_exit_attached", "relay_exit_link", link.id,
+                actor_type=actor_type,
+            )
     _audit(
         db, actor, "relay_batch_attach", "relay_node", relay.id,
         actor_type=actor_type,
-        metadata={"batch_id": str(batch_id), "exit_ids": payload.exit_ids},
+        metadata={
+            "batch_id": str(batch_id),
+            "exit_ids": payload.exit_ids,
+            "attached": [
+                e.id for m, _l, e, _t in created_entries if m == "attached"
+            ],
+            "reapplied": [
+                e.id for m, _l, e, _t in created_entries if m == "reapplied"
+            ],
+        },
     )
 
     # Enqueue после commit'а — worker по job_id подбирает row из БД;
@@ -850,7 +873,7 @@ def batch_attach_relay(
     # запишет fail. При недоступности Redis enqueue падает, но task'и
     # остаются в pending — pending-rescue-tick подберёт через
     # PENDING_RESCUE_INTERVAL секунд.
-    for _link, _exit, task in created_pairs:
+    for _mode, _link, _exit, task in created_entries:
         try:
             orchestrator.run_task_async(task)
         except Exception:  # noqa: BLE001
@@ -868,8 +891,9 @@ def batch_attach_relay(
             task_id=task.id,
             wg_interface_name=link.wg_interface_name,
             wg_client_address_v4=link.wg_client_address_v4,
+            mode=mode,
         )
-        for link, exit_node, task in created_pairs
+        for mode, link, exit_node, task in created_entries
     ]
     return schemas.BatchAttachRelayResponse(
         batch_id=batch_id,
