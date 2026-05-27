@@ -127,6 +127,49 @@ def _ensure_ssh_control_path_dir() -> None:
     control_dir.mkdir(parents=True, exist_ok=True)
 
 
+def _apply_ansible_env_compat() -> None:
+    """Force connection-layer settings via env vars (ansible-core 2.19 compat).
+
+    Симптом: после rebuild mgmt (Dockerfile.worker подтянул ansible-core
+    2.19), per-task время на ансибл выросло x3-5. Диагностика показала
+    что cfg-файл сам **подхватывается** (config file = /app/infra/ansible/
+    ansible.cfg, видны DEFAULT_FORKS/DEFAULT_TIMEOUT/CACHE_PLUGIN_* из
+    cfg), но настройки из секции ``[ssh_connection]`` — pipelining,
+    ssh_args, retries — на дефолтах. То есть **именно эта секция** в
+    2.19 либо переименована, либо парсится строже и теряет ключи.
+
+    Env vars wins over cfg на всех версиях ansible (см. precedence в
+    ansible-core docs), поэтому форсим их здесь. ``setdefault`` — чтобы
+    оператор мог override'нуть через env.j2 без правки кода.
+
+    Без этого fix'а:
+      * pipelining=False → каждая task copy'ит python-модуль через scp →
+        +1-2s per task per host. На relay_tunnel_apply (~30 task'ов) =
+        +30-60s оверхеда **только на копирование модулей**.
+      * ssh_args отсутствуют → ControlMaster/ControlPersist не активны
+        → каждая task = свежий ssh-handshake (+1-2s) и
+        ServerAliveInterval/ConnectionAttempts не применяются → flaky-
+        канал дольше отваливается без retries.
+      * SSH_RETRIES=0 → одиночный network glitch = task fails вместо
+        retry.
+    """
+    defaults = {
+        "ANSIBLE_PIPELINING": "True",
+        "ANSIBLE_SSH_ARGS": (
+            "-o ControlMaster=auto"
+            " -o ControlPersist=10m"
+            " -o ControlPath=~/.ansible/cp/%h-%p-%r"
+            " -o ConnectTimeout=30"
+            " -o ConnectionAttempts=3"
+            " -o ServerAliveInterval=15"
+            " -o ServerAliveCountMax=3"
+        ),
+        "ANSIBLE_SSH_RETRIES": "3",
+    }
+    for key, val in defaults.items():
+        os.environ.setdefault(key, val)
+
+
 def build_inventory_for_node(node: models.VPNNode, ansible_user: str = "root") -> Path:
     """Generate a temporary inventory file for a single node.
 
@@ -312,6 +355,12 @@ def run_playbook(
     # to exist before it can create sockets. Fresh backend containers
     # don't have it → mkdir -p it here.
     _ensure_ssh_control_path_dir()
+    # Third catch (ansible-core 2.19 regression): pipelining + ssh_args
+    # from [ssh_connection] section в cfg перестали подхватываться. Без
+    # этих env vars каждая task делает свежий ssh + scp модуля — x3-5
+    # slowdown по сравнению с тем, что было на старом mgmt с 2.17.
+    # Подробности — в _apply_ansible_env_compat docstring.
+    _apply_ansible_env_compat()
     try:
         return subprocess.run(
             cmd,
