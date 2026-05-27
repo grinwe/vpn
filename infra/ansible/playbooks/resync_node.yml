@@ -30,6 +30,12 @@
 # running this twice is safe.
 - hosts: vpn_nodes
   become: yes
+  # gather_facts: false — resync_node не использует ни одного факта
+  # (ansible_*), только slurp/command/systemd. С gather_facts=true
+  # (default) каждый прогон ходит за full setup на ноду — это +5-10s
+  # к и без того короткому play. Worker дёргает resync сотни раз за
+  # день, экономия суммарно ощутима. См. discussion 2026-05-26.
+  gather_facts: false
   vars:
     clients_by_proto: {}
     clients: []

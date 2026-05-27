@@ -36,9 +36,16 @@
 # ── peer_on_jump ────────────────────────────────────────────────────────
 - name: "peer_on_jump :: filter dump lines matching exit pubkey"
   ansible.builtin.set_fact:
+    # `match` + `^<pubkey>\t` — peer-line ВСЕГДА начинается с peer_pubkey
+    # + tab. Header-line (4 поля: priv pub port fwmark) начинается с
+    # private_key — никогда не совпадёт. `regex_escape` обязателен:
+    # base64-pubkey содержит +, /, = — regex-meta'ы, без escape `search`
+    # может случайно зацепить header-line, и тогда дальнейший split[4]
+    # валится с "list has no attribute 4". Видели на link_id=61 (#exit_id=5).
     diag_peer_lines: >-
       {{ diag_wg_dump.stdout_lines | default([])
-         | select('search', diag_exit_pubkey) | list }}
+         | select('match', '^' ~ (diag_exit_pubkey | regex_escape) ~ '\t')
+         | list }}
   when: "'peer_on_jump' in diag_check_types"
   tags: peer_on_jump
 
@@ -72,20 +79,28 @@
   tags: peer_on_jump
 
 # ── handshake_age ───────────────────────────────────────────────────────
-# wg dump peer line: iface\tpeer_pub\tpreshared\tendpoint\tallowed_ips\thandshake\trx\ttx\tkeepalive
-# Field index 5 (0-based) = unix-epoch handshake (0 means never observed).
+# `wg show <iface> dump` (без 'all') выводит:
+#   line 1 (header): priv_key\tpub_key\tlisten_port\tfwmark            (4 поля)
+#   peer-lines:      peer_pub\tpsk\tendpoint\tallowed_ips\thandshake\trx\ttx\tkeepalive  (8)
+# Field index 4 (0-based) = unix-epoch handshake (0 means never observed).
+# Раньше тут стояло [5] — это формат `wg show all dump`, где первое поле
+# каждой строки = iface name. При `wg show <iface>` префикса нет, и [5]
+# даёт rx_bytes — handshake_age считал now - rx, что всегда > threshold.
 - name: "handshake_age :: filter peer lines"
   ansible.builtin.set_fact:
+    # Strict-match peer-line (см. peer_on_jump filter выше) — отсекаем
+    # header-line и любые ложные regex-совпадения.
     diag_hs_lines: >-
       {{ diag_wg_dump.stdout_lines | default([])
-         | select('search', diag_exit_pubkey) | list }}
+         | select('match', '^' ~ (diag_exit_pubkey | regex_escape) ~ '\t')
+         | list }}
   when: "'handshake_age' in diag_check_types"
   tags: handshake_age
 
 - name: "handshake_age :: extract epoch"
   ansible.builtin.set_fact:
     diag_hs_epoch: >-
-      {{ (diag_hs_lines[0].split('\t')[5] | int)
+      {{ (diag_hs_lines[0].split('\t')[4] | int)
          if (diag_hs_lines | length > 0) else 0 }}
   when: "'handshake_age' in diag_check_types"
   tags: handshake_age
