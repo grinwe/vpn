@@ -134,6 +134,13 @@ services:
       SKIP_MIGRATIONS: "1"
       ANSIBLE_ROOT: /app/infra/ansible
       ANSIBLE_PRIVATE_KEY_FILE: /run/secrets/provisioning_key
+      # ansible-core 2.19 compat — секция [ssh_connection] в ansible.cfg
+      # перестала подхватываться. Без env vars per-task время x3-5,
+      # потому что pipelining=False и ControlMaster не активирован.
+      # См. POSTMORTEM_2026-05-19 + scripts/diag_ansible_perf.sh.
+      ANSIBLE_PIPELINING: ${ANSIBLE_PIPELINING:-True}
+      ANSIBLE_SSH_RETRIES: ${ANSIBLE_SSH_RETRIES:-3}
+      ANSIBLE_SSH_ARGS: ${ANSIBLE_SSH_ARGS:--o ControlMaster=auto -o ControlPersist=10m -o ControlPath=~/.ansible/cp/%h-%p-%r -o ConnectTimeout=30 -o ConnectionAttempts=3 -o ServerAliveInterval=15 -o ServerAliveCountMax=3}
       AUTOSCALE_INTERVAL: ${AUTOSCALE_INTERVAL:-300}
       # Self-heal for stuck pending provisioning tasks.
       PENDING_RESCUE_INTERVAL: ${PENDING_RESCUE_INTERVAL:-60}
