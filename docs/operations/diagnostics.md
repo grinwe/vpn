@@ -62,6 +62,8 @@ ansible-роль `diagnose_relay_link`, результат каждого = сл
 | `ping_internet_through`| `curl --interface <iface> https://1.1.1.1` (HTTPS через WG)                                | Ping OK, но юзер не выходит в инет → NAT / forwarding на exit, MTU                                     |
 | `xray_port`            | `ss -tlnp \| grep :<diag_xray_port>` (default 9443)                                        | Xray Reality слушает? Юзер коннектится через xray на jump, потом xray уходит в WG-туннель              |
 | `listening_sockets`    | `ss -tulpn` — общий снапшот для контекста, всегда `status=info`                            | Никогда автоматом — только когда оператор хочет видеть полную картину listen-сокетов рядом              |
+| `peer_on_exit`         | `wg show wg0 dump` на EXIT, ищет `link.wg_client_public_key` среди peer'ов                  | Зеркало `peer_on_jump` с другой стороны. Fail = bootstrap_exit не накатил peer-line в /etc/wireguard/wg0.conf, либо ключи разошлись. |
+| `iptables_forward`     | `iptables -L FORWARD -nv` (fallback `nft list chain inet filter FORWARD`) на EXIT, считает ACCEPT-правила с упоминанием `wg0` | Peer есть с обеих сторон, handshake тоже, но трафик в инет не идёт. Часто — default policy `DROP` без явного ACCEPT для wg0. Status `warn` если правила нет, `fail` если iptables вообще не отвечает. |
 
 ## Auto-trigger (Phase 2)
 
@@ -89,14 +91,15 @@ ansible-роль `diagnose_relay_link`, результат каждого = сл
 
 Что вижу как оператор → какие check_types запросить.
 
-| Симптом                                              | Стартовый набор check_types                            |
-|------------------------------------------------------|--------------------------------------------------------|
-| «Только что прицепил exit, юзер не работает»         | `peer_on_jump, handshake_age, ping_endpoint`           |
-| «WG-индикатор в админке красный (handshake stale)»   | `handshake_age, ping_endpoint, ping_internet_through`  |
-| «Connect к VPN устанавливается, но интернет не идёт» | `ping_endpoint, ping_internet_through`                 |
-| «Юзер вообще не коннектится»                         | `xray_port, listening_sockets, peer_on_jump`           |
-| «Подозреваю что xray упал»                           | `xray_port, listening_sockets`                         |
-| «Не понимаю, проверь всё»                            | (пусто — backend возьмёт `DEFAULT_DIAGNOSE_CHECKS`)    |
+| Симптом                                              | Стартовый набор check_types                                            |
+|------------------------------------------------------|------------------------------------------------------------------------|
+| «Только что прицепил exit, юзер не работает»         | `peer_on_jump, peer_on_exit, handshake_age, ping_endpoint`              |
+| «WG-индикатор в админке красный (handshake stale)»   | `handshake_age, ping_endpoint, ping_internet_through`                  |
+| «Connect к VPN устанавливается, но интернет не идёт» | `ping_endpoint, ping_internet_through, iptables_forward`                |
+| «Юзер вообще не коннектится»                         | `xray_port, listening_sockets, peer_on_jump`                           |
+| «Подозреваю что xray упал»                           | `xray_port, listening_sockets`                                         |
+| «Handshake есть, но трафик не ходит»                 | `ping_endpoint, ping_internet_through, peer_on_exit, iptables_forward` |
+| «Не понимаю, проверь всё»                            | (пусто — backend возьмёт `DEFAULT_DIAGNOSE_CHECKS` = 8 проверок)        |
 
 ## Куда смотреть в коде
 
@@ -111,16 +114,38 @@ ansible-роль `diagnose_relay_link`, результат каждого = сл
 | UI badge    | `admin/src/pages/Nodes.tsx:AutoDiagnoseBadge`                                  |
 | UI render   | `admin/src/diagnoseResult.tsx:DiagnoseResult`                                  |
 
-## Что НЕ в Phase 1+2
+## Two-play архитектура (Phase 1.5)
 
-* **Exit-side checks** (`peer_on_exit`, `iptables_forward`) — требуют
-  второго play на exit-хосте в одном playbook'е (через `add_host` или
-  два plays). Отложено на Phase 1.5, потому что 6 jump-side проверок
-  покрывают большинство сценариев. Когда понадобятся — добавить tasks
-  с `delegate_to: "{{ diag_exit_host }}"` в той же role.
+Playbook `diagnose_relay_link.yml` теперь содержит два play'я:
+
+1. **Jump-side** (`hosts: vpn_nodes`) — role `diagnose_relay_link`,
+   6 проверок (peer_on_jump, handshake_age, ping_endpoint,
+   ping_internet_through, xray_port, listening_sockets). Записывает
+   JSON в `{diag_result_file}.jump`.
+2. **Exit-side** (`hosts: wg_exit_nodes`) — role
+   `diagnose_relay_link_exit_side`, 2 проверки (peer_on_exit,
+   iptables_forward). Запускается через `include_role` под условием
+   `'peer_on_exit' in diag_check_types or 'iptables_forward' in diag_check_types`
+   — если ни одной exit-side проверки не запрошено, второго SSH не
+   делаем. Записывает JSON в `{diag_result_file}.exit`.
+
+Backend (`provisioning.py:_run_relay_link_diagnose`):
+* Создаёт **combined inventory** через `build_inventory_for_relay_link_diagnose`
+  (relay в group `vpn_nodes`, exit в `wg_exit_nodes`).
+* `--limit` либо `relay.name` (jump only), либо `relay.name,exit.name`
+  (с exit-side).
+* После прогона читает оба JSON-файла, merge'ит `checks` в один
+  список, кладёт `sides: {jump: {...}, exit: {...}}` в `diagnose_meta`.
+
+## Что НЕ сделано
+
 * **Auto-recovery** — диагностика только наблюдает, не «чинит». Авто-
   reconnect (re-attach по симптому) сознательно вне scope, чтобы избежать
   flapping'а на сетевых дёргах. Если симптом сохраняется N тиков подряд
   — это уже сигнал оператору, не auto-action'а.
 * **Telegram-алёрты** — `symptom_detected` пишет только в audit_log.
   Если нужны пуши — расширить `notify_admins` на новый kind.
+* **Симптом «handshake свежий, но трафик не ходит»** — пока detector
+  ловит только stale-handshake. Логику auto-trigger'а exit-side
+  проверок (`peer_on_exit` + `iptables_forward`) можно добавить когда
+  накопится статистика, какие именно симптомы стоит за этим следить.

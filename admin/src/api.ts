@@ -209,6 +209,8 @@ export const RELAY_LINK_CHECKS = [
   "ping_internet_through",
   "xray_port",
   "listening_sockets",
+  "peer_on_exit",
+  "iptables_forward",
 ] as const;
 
 export type RelayLinkCheckName = (typeof RELAY_LINK_CHECKS)[number];

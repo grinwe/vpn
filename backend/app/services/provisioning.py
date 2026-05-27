@@ -27,6 +27,7 @@ from ..security import decrypt, encrypt
 from .ansible_runner import (
     build_inventory_for_exit_node,
     build_inventory_for_node,
+    build_inventory_for_relay_link_diagnose,
     run_playbook,
 )
 from .relay import (
@@ -1318,10 +1319,13 @@ class ProvisioningOrchestrator:
         )
 
     # ── relay_tunnel diagnose ─────────────────────────────────────────
-    # Default check_types when payload omits them. Mirrors the role's
-    # defaults so a manual `create_task("relay_tunnel", relay.id, "diagnose", {})`
-    # from a Python shell or the smart-trigger gets a sensible set.
-    DEFAULT_DIAGNOSE_CHECKS: list[str] = [
+    # Split jump-side vs exit-side checks. Playbook itself wraps each
+    # set in its own play (vpn_nodes vs wg_exit_nodes) — the second play
+    # is skipped entirely if no exit-side check is requested. Smart-
+    # trigger в worker.py явно подмножество jump-side (auto-diagnostics
+    # фокусируются на handshake-failure сценарий). DEFAULT_DIAGNOSE_CHECKS
+    # = всё подряд для ручного триггера без payload.
+    JUMP_SIDE_DIAGNOSE_CHECKS: list[str] = [
         "peer_on_jump",
         "handshake_age",
         "ping_endpoint",
@@ -1329,6 +1333,13 @@ class ProvisioningOrchestrator:
         "xray_port",
         "listening_sockets",
     ]
+    EXIT_SIDE_DIAGNOSE_CHECKS: list[str] = [
+        "peer_on_exit",
+        "iptables_forward",
+    ]
+    DEFAULT_DIAGNOSE_CHECKS: list[str] = (
+        JUMP_SIDE_DIAGNOSE_CHECKS + EXIT_SIDE_DIAGNOSE_CHECKS
+    )
 
     def _resolve_diagnose_link(
         self, relay: models.VPNNode, payload: dict[str, Any]
@@ -1405,6 +1416,11 @@ class ProvisioningOrchestrator:
         xray_port = int((payload or {}).get("xray_port", 9443))
         warn_min = int((payload or {}).get("handshake_warn_min", 5))
         fail_min = int((payload or {}).get("handshake_fail_min", 15))
+        # Iface name on the exit. WGExitNode у нас не хранит явное поле
+        # (wg_address_v4 фиксированное "10.77.0.1/24", iface всегда wg0
+        # из bootstrap_exit role), но если когда-нибудь выкатим разные
+        # имена per-exit — payload позволит override.
+        iface_on_exit = (payload or {}).get("wg_iface_on_exit", "wg0")
 
         # Strip CIDR suffix off exit's WG address — `ping` wants a bare IP.
         exit_wg_addr_raw = exit_node.wg_address_v4 or ""
@@ -1414,31 +1430,48 @@ class ProvisioningOrchestrator:
 
         # /tmp inside the backend/worker container — same FS where ansible
         # callbacks land. Per-task filename so concurrent diagnose runs
-        # don't trample each other.
-        result_file = f"/tmp/diagnose-result-{task.id}.json"
-        try:
-            os.unlink(result_file)
-        except OSError:
-            pass
+        # don't trample each other. Playbook делит на .jump и .exit
+        # суффиксы для merge'а в orchestrator'е.
+        result_file_base = f"/tmp/diagnose-result-{task.id}.json"
+        result_file_jump = f"{result_file_base}.jump"
+        result_file_exit = f"{result_file_base}.exit"
+        for path in (result_file_base, result_file_jump, result_file_exit):
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+
+        check_types_list = list(check_types)
+        needs_exit_play = any(
+            c in self.EXIT_SIDE_DIAGNOSE_CHECKS for c in check_types_list
+        )
 
         extra_vars: dict[str, Any] = {
             "diag_wg_iface": link.wg_interface_name,
+            "diag_wg_iface_on_exit": iface_on_exit,
             "diag_exit_pubkey": exit_node.wg_public_key or "",
+            "diag_client_pubkey": link.wg_client_public_key or "",
             "diag_exit_wg_addr": exit_wg_addr,
             "diag_client_wg_addr": client_wg_addr,
             "diag_xray_port": xray_port,
-            "diag_check_types": list(check_types),
-            "diag_result_file": result_file,
+            "diag_check_types": check_types_list,
+            "diag_result_file": result_file_base,
             "diag_handshake_warn_min": warn_min,
             "diag_handshake_fail_min": fail_min,
         }
 
-        inventory = build_inventory_for_node(relay)
+        # Combined inventory: relay (vpn_nodes group) + exit (wg_exit_nodes).
+        # Playbook hosts: vpn_nodes для первого play, wg_exit_nodes для
+        # второго; --limit ограничивает обе группы конкретными именами.
+        inventory = build_inventory_for_relay_link_diagnose(relay, exit_node)
+        limit_expr = (
+            f"{relay.name},{exit_node.name}" if needs_exit_play else relay.name
+        )
         try:
             ansible_result = run_playbook(
                 "playbooks/diagnose_relay_link.yml",
                 inventory,
-                limit=relay.name,
+                limit=limit_expr,
                 extra_vars=extra_vars,
                 timeout=300,
             )
@@ -1454,48 +1487,66 @@ class ProvisioningOrchestrator:
             "exit_id": exit_node.id,
             "relay_id": relay.id,
             "wg_interface": link.wg_interface_name,
-            "requested_checks": list(check_types),
+            "wg_interface_on_exit": iface_on_exit,
+            "requested_checks": check_types_list,
         }
-        # The role writes the structured JSON via copy:delegate_to:localhost.
-        # On a clean run it always exists; if ansible exited 0 but the file
-        # is missing we surface a synthetic "infrastructure" check failure
-        # so the admin sees something concrete instead of empty card list.
-        if os.path.exists(result_file):
+        result_meta: dict[str, dict[str, Any]] = {}
+
+        # Каждый play пишет свой JSON — orchestrator merge'ит checks из обоих.
+        # Если файла нет, синтетический `_*_missing` check появится в выводе.
+        for side, path, expected in (
+            ("jump", result_file_jump, True),  # jump play running always
+            ("exit", result_file_exit, needs_exit_play),
+        ):
+            if not expected:
+                continue
+            if not os.path.exists(path):
+                checks.append({
+                    "name": f"_{side}_result_file_missing",
+                    "status": "fail",
+                    "latency_ms": None,
+                    "message": (
+                        f"{side}-play не записал {path} — упал до финального "
+                        f"copy:, см. raw stdout/stderr"
+                    ),
+                    "details": {},
+                })
+                continue
             try:
-                with open(result_file, "r", encoding="utf-8") as f:
+                with open(path, "r", encoding="utf-8") as f:
                     parsed = json.load(f)
-                checks = parsed.get("checks") or []
-                for key in ("started_at", "finished_at", "exit_pubkey_prefix"):
-                    if key in parsed:
-                        diagnose_meta[key] = parsed[key]
+                side_checks = parsed.get("checks") or []
+                checks.extend(side_checks)
+                meta_keys = (
+                    "started_at",
+                    "finished_at",
+                    "exit_pubkey_prefix",
+                    "iface_on_exit",
+                    "client_pubkey_prefix",
+                )
+                result_meta[side] = {
+                    k: parsed[k] for k in meta_keys if k in parsed
+                }
             except (OSError, json.JSONDecodeError) as exc:
                 logger.warning(
                     "diagnose: failed to parse %s for task %s: %s",
-                    result_file, task.id, exc,
+                    path, task.id, exc,
                 )
-                checks = [{
-                    "name": "_result_file_unreadable",
+                checks.append({
+                    "name": f"_{side}_result_file_unreadable",
                     "status": "fail",
                     "latency_ms": None,
-                    "message": f"could not parse {result_file}: {exc}",
+                    "message": f"could not parse {path}: {exc}",
                     "details": {},
-                }]
+                })
             finally:
                 try:
-                    os.unlink(result_file)
+                    os.unlink(path)
                 except OSError:
                     pass
-        else:
-            checks = [{
-                "name": "_result_file_missing",
-                "status": "fail",
-                "latency_ms": None,
-                "message": (
-                    f"role finished без записи {result_file} — playbook упал "
-                    f"до финального copy:, см. stdout/stderr"
-                ),
-                "details": {},
-            }]
+
+        if result_meta:
+            diagnose_meta["sides"] = result_meta
 
         return SimpleNamespace(
             stdout=ansible_result.stdout,

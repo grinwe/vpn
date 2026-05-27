@@ -203,6 +203,59 @@ all:
     return Path(handle.name)
 
 
+def build_inventory_for_relay_link_diagnose(
+    relay: models.VPNNode,
+    exit_node: models.WGExitNode,
+    ansible_user: str = "root",
+) -> Path:
+    """Combined inventory: relay in ``vpn_nodes`` + exit in ``wg_exit_nodes``.
+
+    diagnose_relay_link.yml is a two-play playbook (jump-side then
+    exit-side), so both hosts must be reachable from the same inventory
+    file. Mirrors the two single-host builders above, just doubled up.
+    Identity validation runs for both nodes before any filesystem work —
+    a rejected pair leaves /tmp untouched.
+
+    Caller must unlink the returned temp file in a ``finally`` block.
+    """
+    _ensure_ansible_root()
+    _validate_node_for_inventory(relay)
+    validate_node_identity_fields(exit_node.name, exit_node.host, exit_node.ssh_port)
+    inventory_content = """
+all:
+  hosts:
+    {relay_name}:
+      ansible_host: {relay_host}
+      ansible_port: {relay_port}
+      ansible_user: {user}
+    {exit_name}:
+      ansible_host: {exit_host}
+      ansible_port: {exit_port}
+      ansible_user: {user}
+  children:
+    vpn_nodes:
+      hosts:
+        {relay_name}:
+    wg_exit_nodes:
+      hosts:
+        {exit_name}:
+    db_host:
+      hosts: {{}}
+""".format(
+        relay_name=relay.name,
+        relay_host=relay.host,
+        relay_port=relay.ssh_port,
+        exit_name=exit_node.name,
+        exit_host=exit_node.host,
+        exit_port=exit_node.ssh_port,
+        user=ansible_user,
+    )
+    handle = tempfile.NamedTemporaryFile("w", delete=False, suffix="-inventory.yml")
+    handle.write(inventory_content)
+    handle.flush()
+    return Path(handle.name)
+
+
 def run_playbook(
     playbook: str,
     inventory: Path,

@@ -28,6 +28,14 @@ const CHECK_LABELS: Record<string, string> = {
   ping_internet_through: "HTTPS через WG",
   xray_port: "Xray port",
   listening_sockets: "Listening sockets",
+  peer_on_exit: "Peer on exit",
+  iptables_forward: "iptables FORWARD",
+  _jump_result_file_missing: "Jump JSON отсутствует",
+  _jump_result_file_unreadable: "Jump JSON не парсится",
+  _exit_result_file_missing: "Exit JSON отсутствует",
+  _exit_result_file_unreadable: "Exit JSON не парсится",
+  // Legacy single-side fallback (pre Phase 1.5) — иногда всплывает на
+  // старых tasks из БД, держим mapping чтобы badge не показывал raw имя.
   _result_file_missing: "Result file отсутствует",
   _result_file_unreadable: "Result file не парсится",
 };
