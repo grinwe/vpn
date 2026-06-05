@@ -1,6 +1,11 @@
-import { useEffect, useState } from "react";
-import { Link } from "react-router-dom";
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { Fragment, useEffect, useState } from "react";
+import { Link, useSearchParams } from "react-router-dom";
+import {
+  keepPreviousData,
+  useMutation,
+  useQuery,
+  useQueryClient,
+} from "@tanstack/react-query";
 import {
   api,
   ApiError,
@@ -447,7 +452,24 @@ function statusColor(status: string) {
 
 export default function Nodes() {
   const [createOpen, setCreateOpen] = useState(false);
-  const [expandedNodeId, setExpandedNodeId] = useState<number | null>(null);
+  // Раскрытая нода живёт в URL (?node=<id>), а не в локальном state — тогда
+  // авто-refetch списка и F5/навигация не схлопывают открытую карточку
+  // (раньше каждый poll выглядел так, будто «вкладки прыгают»).
+  const [searchParams, setSearchParams] = useSearchParams();
+  const expandedNodeId = searchParams.has("node")
+    ? Number(searchParams.get("node"))
+    : null;
+  const setExpandedNodeId = (id: number | null) => {
+    setSearchParams(
+      (prev) => {
+        const next = new URLSearchParams(prev);
+        if (id == null) next.delete("node");
+        else next.set("node", String(id));
+        return next;
+      },
+      { replace: true },
+    );
+  };
   const [trackedOps, setTrackedOps] = useState<TrackedOp[]>(loadTrackedOps);
   const [migrateToModal, setMigrateToModal] = useState<
     { from_id: number; from_name: string } | null
@@ -883,12 +905,22 @@ export default function Nodes() {
   const { data, isLoading, error, refetch, isFetching } = useQuery<VPNNodeOut[]>({
     queryKey: ["nodes"],
     queryFn: () => api.get("/nodes"),
-    // Во время бутстрапа хочется, чтобы статус обновлялся быстро —
-    // раз в 5 секунд, а не раз в 20. После перехода в active это
-    // всё равно стабильный poll, нагрузка символическая.
+    // Во время бутстрапа хочется, чтобы статус обновлялся быстро — раз в
+    // 5 секунд. Но когда все ноды в устойчивом состоянии (active/disabled),
+    // частый poll только перерисовывает таблицу зря — тогда опрашиваем раз
+    // в 30с. Быстрый режим включаем только при наличии transient-нод.
     // При ошибке глушим авто-refetch, чтобы не долбить 500 раз в 5 сек —
     // пусть юзер явно нажмёт «Повторить».
-    refetchInterval: (q) => (q.state.error ? false : 5_000),
+    refetchInterval: (q) => {
+      if (q.state.error) return false;
+      const transient = q.state.data?.some(
+        (n) => n.status === "registering" || n.status === "draining",
+      );
+      return transient ? 5_000 : 30_000;
+    },
+    // Фоновые refetch'и не должны ронять таблицу в loading-ветку и
+    // ремоунтить строки — данные обновляются на месте, без мигания.
+    placeholderData: keepPreviousData,
     retry: false,
   });
 
@@ -1021,9 +1053,8 @@ export default function Nodes() {
           {data?.map((n) => {
             const expanded = expandedNodeId === n.id;
             return (
-              <>
+              <Fragment key={n.id}>
                 <tr
-                  key={n.id}
                   className="border-b border-slate-800 cursor-pointer hover:bg-slate-800/40"
                   onClick={() => setExpandedNodeId(expanded ? null : n.id)}
                 >
@@ -1246,7 +1277,7 @@ export default function Nodes() {
                     </td>
                   </tr>
                 )}
-              </>
+              </Fragment>
             );
           })}
           {data && data.length === 0 && (
@@ -1514,6 +1545,46 @@ function RefreshRealityDestModal({
 }
 
 // ── Create Node form ────────────────────────────────────────────────
+// Composite: node + N configs + ОДИН bootstrap. До: POST /nodes →
+// bootstrap → N × (POST /configs → bootstrap) = N+1 task. Сейчас:
+// POST /nodes/with-configs → один bootstrap, видящий сразу полный
+// набор протоколов в первом site.yml-проходе.
+
+type CreatableProto = "vless-reality" | "vless-ws-cdn" | "vless-xhttp";
+const CREATE_PROTOS: CreatableProto[] = [
+  "vless-reality",
+  "vless-ws-cdn",
+  "vless-xhttp",
+];
+
+interface ProtoDraft {
+  enabled: boolean;
+  port: number;
+  sni: string;
+  fallback: string;
+}
+
+const PROTO_DEFAULTS: Record<CreatableProto, ProtoDraft> = {
+  "vless-reality": {
+    enabled: false,
+    port: 9443,
+    sni: "www.asus.com",
+    fallback: "www.asus.com:443",
+  },
+  "vless-ws-cdn": { enabled: false, port: 443, sni: "", fallback: "" },
+  "vless-xhttp": { enabled: false, port: 443, sni: "", fallback: "" },
+};
+
+type NodeTemplate = "full" | "reality" | "custom";
+const TEMPLATE_ENABLED: Record<NodeTemplate, Set<CreatableProto>> = {
+  full: new Set<CreatableProto>([
+    "vless-reality",
+    "vless-ws-cdn",
+    "vless-xhttp",
+  ]),
+  reality: new Set<CreatableProto>(["vless-reality"]),
+  custom: new Set<CreatableProto>(),
+};
 
 function CreateNodeForm({ onDone }: { onDone: () => void }) {
   const qc = useQueryClient();
@@ -1525,11 +1596,40 @@ function CreateNodeForm({ onDone }: { onDone: () => void }) {
     pool_id: null,
     notes: null,
   });
+  const [template, setTemplate] = useState<NodeTemplate>("full");
+  const [protos, setProtos] = useState<Record<CreatableProto, ProtoDraft>>(
+    () => {
+      const init: Record<CreatableProto, ProtoDraft> = {
+        "vless-reality": { ...PROTO_DEFAULTS["vless-reality"] },
+        "vless-ws-cdn": { ...PROTO_DEFAULTS["vless-ws-cdn"] },
+        "vless-xhttp": { ...PROTO_DEFAULTS["vless-xhttp"] },
+      };
+      // дефолт = шаблон "full"
+      for (const p of TEMPLATE_ENABLED["full"]) init[p].enabled = true;
+      return init;
+    },
+  );
   const [err, setErr] = useState<string | null>(null);
 
+  function applyTemplate(t: NodeTemplate) {
+    setTemplate(t);
+    const en = TEMPLATE_ENABLED[t];
+    setProtos((prev) => {
+      const next = { ...prev };
+      for (const p of CREATE_PROTOS) next[p] = { ...next[p], enabled: en.has(p) };
+      return next;
+    });
+  }
+
+  function patchProto(p: CreatableProto, patch: Partial<ProtoDraft>) {
+    setProtos((prev) => ({ ...prev, [p]: { ...prev[p], ...patch } }));
+  }
+
   const mutation = useMutation({
-    mutationFn: (payload: VPNNodeCreateIn) =>
-      api.post<VPNNodeOut>("/nodes", payload),
+    mutationFn: (payload: {
+      node: VPNNodeCreateIn;
+      configs: VPNConfigCreateIn[];
+    }) => api.post<VPNNodeOut>("/nodes/with-configs", payload),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["nodes"] });
       onDone();
@@ -1546,75 +1646,203 @@ function CreateNodeForm({ onDone }: { onDone: () => void }) {
       setErr("name, region и host обязательны");
       return;
     }
-    mutation.mutate(form);
+    const configs: VPNConfigCreateIn[] = CREATE_PROTOS.filter(
+      (p) => protos[p].enabled,
+    ).map((p) => {
+      const d = protos[p];
+      const cfg: VPNConfigCreateIn = {
+        name: `${form.name}-${p}`,
+        protocol: p,
+        port: d.port,
+      };
+      if (d.sni) cfg.sni = d.sni;
+      // Fallback используется только REALITY; для остальных пустое
+      // поле = NULL, бэк не пишет fallback колонку.
+      if (p === "vless-reality" && d.fallback) cfg.fallback = d.fallback;
+      return cfg;
+    });
+    mutation.mutate({ node: form, configs });
   }
+
+  const enabledCount = CREATE_PROTOS.filter((p) => protos[p].enabled).length;
 
   return (
     <form
       onSubmit={submit}
-      className="mb-4 p-4 rounded border border-slate-700 bg-slate-900/60 grid grid-cols-2 gap-3 text-sm"
+      className="mb-4 p-4 rounded border border-slate-700 bg-slate-900/60 flex flex-col gap-4 text-sm"
     >
-      <label className="flex flex-col">
-        <span className="text-slate-400 text-xs mb-1">Имя (уникальное, kebab-case)</span>
-        <input
-          className="bg-slate-800 border border-slate-700 rounded px-2 py-1 font-mono"
-          placeholder="fr-pq-01"
-          value={form.name}
-          onChange={(e) => setForm({ ...form, name: e.target.value })}
-        />
-      </label>
-      <label className="flex flex-col">
-        <span className="text-slate-400 text-xs mb-1">Регион</span>
-        <input
-          className="bg-slate-800 border border-slate-700 rounded px-2 py-1"
-          placeholder="eu-west"
-          value={form.region}
-          onChange={(e) => setForm({ ...form, region: e.target.value })}
-        />
-      </label>
-      <label className="flex flex-col">
-        <span className="text-slate-400 text-xs mb-1">Host (IP или DNS)</span>
-        <input
-          className="bg-slate-800 border border-slate-700 rounded px-2 py-1 font-mono"
-          placeholder="185.234.64.186"
-          value={form.host}
-          onChange={(e) => setForm({ ...form, host: e.target.value })}
-        />
-      </label>
-      <label className="flex flex-col">
-        <span className="text-slate-400 text-xs mb-1">SSH port</span>
-        <input
-          type="number"
-          className="bg-slate-800 border border-slate-700 rounded px-2 py-1 font-mono"
-          value={form.ssh_port}
-          onChange={(e) => setForm({ ...form, ssh_port: Number(e.target.value) })}
-        />
-      </label>
-      <label className="flex flex-col">
-        <span className="text-slate-400 text-xs mb-1">Pool ID (опционально)</span>
-        <input
-          type="number"
-          className="bg-slate-800 border border-slate-700 rounded px-2 py-1 font-mono"
-          value={form.pool_id ?? ""}
-          onChange={(e) =>
-            setForm({
-              ...form,
-              pool_id: e.target.value ? Number(e.target.value) : null,
-            })
-          }
-        />
-      </label>
-      <label className="flex flex-col">
-        <span className="text-slate-400 text-xs mb-1">Заметка (опционально)</span>
-        <input
-          className="bg-slate-800 border border-slate-700 rounded px-2 py-1"
-          placeholder="PQ Hosting, Paris"
-          value={form.notes ?? ""}
-          onChange={(e) => setForm({ ...form, notes: e.target.value || null })}
-        />
-      </label>
-      {err && <div className="col-span-2 text-red-400 text-xs">{err}</div>}
-      <div className="col-span-2 flex gap-2 justify-end">
+      {/* Node fields */}
+      <div className="grid grid-cols-2 gap-3">
+        <label className="flex flex-col">
+          <span className="text-slate-400 text-xs mb-1">Имя (уникальное, kebab-case)</span>
+          <input
+            className="bg-slate-800 border border-slate-700 rounded px-2 py-1 font-mono"
+            placeholder="fr-pq-01"
+            value={form.name}
+            onChange={(e) => setForm({ ...form, name: e.target.value })}
+          />
+        </label>
+        <label className="flex flex-col">
+          <span className="text-slate-400 text-xs mb-1">Регион</span>
+          <input
+            className="bg-slate-800 border border-slate-700 rounded px-2 py-1"
+            placeholder="eu-west"
+            value={form.region}
+            onChange={(e) => setForm({ ...form, region: e.target.value })}
+          />
+        </label>
+        <label className="flex flex-col">
+          <span className="text-slate-400 text-xs mb-1">Host (IP или DNS)</span>
+          <input
+            className="bg-slate-800 border border-slate-700 rounded px-2 py-1 font-mono"
+            placeholder="185.234.64.186"
+            value={form.host}
+            onChange={(e) => setForm({ ...form, host: e.target.value })}
+          />
+        </label>
+        <label className="flex flex-col">
+          <span className="text-slate-400 text-xs mb-1">SSH port</span>
+          <input
+            type="number"
+            className="bg-slate-800 border border-slate-700 rounded px-2 py-1 font-mono"
+            value={form.ssh_port}
+            onChange={(e) => setForm({ ...form, ssh_port: Number(e.target.value) })}
+          />
+        </label>
+        <label className="flex flex-col">
+          <span className="text-slate-400 text-xs mb-1">Pool ID (опционально)</span>
+          <input
+            type="number"
+            className="bg-slate-800 border border-slate-700 rounded px-2 py-1 font-mono"
+            value={form.pool_id ?? ""}
+            onChange={(e) =>
+              setForm({
+                ...form,
+                pool_id: e.target.value ? Number(e.target.value) : null,
+              })
+            }
+          />
+        </label>
+        <label className="flex flex-col">
+          <span className="text-slate-400 text-xs mb-1">Заметка (опционально)</span>
+          <input
+            className="bg-slate-800 border border-slate-700 rounded px-2 py-1"
+            placeholder="PQ Hosting, Paris"
+            value={form.notes ?? ""}
+            onChange={(e) => setForm({ ...form, notes: e.target.value || null })}
+          />
+        </label>
+      </div>
+
+      {/* Protocols section */}
+      <div className="border-t border-slate-800 pt-3">
+        <div className="flex items-center justify-between mb-2">
+          <span className="text-slate-300 font-semibold text-xs">
+            Протоколы ({enabledCount} выбрано) — будут установлены первым же
+            bootstrap'ом
+          </span>
+          <label className="flex items-center gap-2 text-xs">
+            <span className="text-slate-400">Шаблон:</span>
+            <select
+              value={template}
+              onChange={(e) => applyTemplate(e.target.value as NodeTemplate)}
+              className="bg-slate-800 border border-slate-700 rounded px-2 py-1"
+            >
+              <option value="full">Full VLESS stack (reality+ws+xhttp)</option>
+              <option value="reality">Reality only</option>
+              <option value="custom">Custom (ничего по умолчанию)</option>
+            </select>
+          </label>
+        </div>
+
+        <div className="flex flex-col gap-2">
+          {CREATE_PROTOS.map((p) => {
+            const d = protos[p];
+            const isReality = p === "vless-reality";
+            return (
+              <div
+                key={p}
+                className={`p-2 rounded border ${d.enabled ? "border-slate-700 bg-slate-900" : "border-slate-800 bg-slate-950/60 opacity-60"}`}
+              >
+                <label className="flex items-center gap-2 mb-2 cursor-pointer">
+                  <input
+                    type="checkbox"
+                    checked={d.enabled}
+                    onChange={(e) =>
+                      patchProto(p, { enabled: e.target.checked })
+                    }
+                  />
+                  <span className="font-mono text-xs">{p}</span>
+                  {isReality && (
+                    <span
+                      className="text-[10px] text-slate-500"
+                      title="public_key + short_id бэкенд генерит сам, если оставить пустым"
+                    >
+                      (keypair: auto-gen)
+                    </span>
+                  )}
+                  {p === "vless-xhttp" && (
+                    <span
+                      className="text-[10px] text-slate-500"
+                      title="settings.domain бэкенд проставит = sni"
+                    >
+                      (settings.domain: auto = sni)
+                    </span>
+                  )}
+                </label>
+                {d.enabled && (
+                  <div className="grid grid-cols-3 gap-2 text-xs">
+                    <label className="flex flex-col">
+                      <span className="text-slate-500 mb-0.5">Порт</span>
+                      <input
+                        type="number"
+                        className="bg-slate-800 border border-slate-700 rounded px-2 py-1 font-mono"
+                        value={d.port}
+                        onChange={(e) =>
+                          patchProto(p, { port: Number(e.target.value) })
+                        }
+                      />
+                    </label>
+                    <label className="flex flex-col">
+                      <span className="text-slate-500 mb-0.5">
+                        SNI / fake domain
+                      </span>
+                      <input
+                        className="bg-slate-800 border border-slate-700 rounded px-2 py-1 font-mono"
+                        placeholder={
+                          isReality
+                            ? "www.asus.com"
+                            : "sNN.grinwer.online"
+                        }
+                        value={d.sni}
+                        onChange={(e) => patchProto(p, { sni: e.target.value })}
+                      />
+                    </label>
+                    {isReality && (
+                      <label className="flex flex-col">
+                        <span className="text-slate-500 mb-0.5">
+                          Fallback (REALITY dest)
+                        </span>
+                        <input
+                          className="bg-slate-800 border border-slate-700 rounded px-2 py-1 font-mono"
+                          placeholder="www.asus.com:443"
+                          value={d.fallback}
+                          onChange={(e) =>
+                            patchProto(p, { fallback: e.target.value })
+                          }
+                        />
+                      </label>
+                    )}
+                  </div>
+                )}
+              </div>
+            );
+          })}
+        </div>
+      </div>
+
+      {err && <div className="text-red-400 text-xs">{err}</div>}
+      <div className="flex gap-2 justify-end">
         <button
           type="button"
           onClick={onDone}
@@ -1627,7 +1855,9 @@ function CreateNodeForm({ onDone }: { onDone: () => void }) {
           disabled={mutation.isPending}
           className="px-3 py-1.5 rounded bg-emerald-600 hover:bg-emerald-500 text-sm font-semibold disabled:opacity-50"
         >
-          {mutation.isPending ? "Создаём…" : "Создать + bootstrap"}
+          {mutation.isPending
+            ? "Создаём…"
+            : `Создать + bootstrap (${enabledCount} протокол${enabledCount === 1 ? "" : "а"})`}
         </button>
       </div>
     </form>
@@ -1641,6 +1871,7 @@ function NodeConfigs({ nodeId, nodeHost }: { nodeId: number; nodeHost: string })
   const [addOpen, setAddOpen] = useState(false);
   const [editingId, setEditingId] = useState<number | null>(null);
   const [deleteErr, setDeleteErr] = useState<string | null>(null);
+  const [batchMode, setBatchMode] = useState(false);
 
   const { data, isLoading } = useQuery<VPNConfigOut[]>({
     queryKey: ["node-configs", nodeId],
@@ -1674,15 +1905,41 @@ function NodeConfigs({ nodeId, nodeHost }: { nodeId: number; nodeHost: string })
         <div className="text-xs uppercase tracking-wide text-slate-400">
           Конфиги протоколов
         </div>
-        <button
-          onClick={() => setAddOpen((v) => !v)}
-          className="px-2 py-1 rounded bg-slate-700 hover:bg-slate-600 text-xs"
-        >
-          {addOpen ? "Отмена" : "+ Добавить конфиг"}
-        </button>
+        <div className="flex gap-2">
+          {!batchMode && (
+            <>
+              <button
+                onClick={() => {
+                  setBatchMode(true);
+                  setAddOpen(false);
+                  setEditingId(null);
+                }}
+                disabled={!data || data.length === 0}
+                title="Открыть все configs на правку + добавить/удалить пачкой, потом один bootstrap"
+                className="px-2 py-1 rounded bg-blue-700 hover:bg-blue-600 text-xs disabled:opacity-50"
+              >
+                🛠 Batch правки
+              </button>
+              <button
+                onClick={() => setAddOpen((v) => !v)}
+                className="px-2 py-1 rounded bg-slate-700 hover:bg-slate-600 text-xs"
+              >
+                {addOpen ? "Отмена" : "+ Добавить конфиг"}
+              </button>
+            </>
+          )}
+        </div>
       </div>
 
-      {addOpen && (
+      {batchMode && data && (
+        <BatchEditConfigsForm
+          nodeId={nodeId}
+          configs={data}
+          onDone={() => setBatchMode(false)}
+        />
+      )}
+
+      {!batchMode && addOpen && (
         <AddConfigForm
           nodeId={nodeId}
           nodeHost={nodeHost}
@@ -1690,16 +1947,16 @@ function NodeConfigs({ nodeId, nodeHost }: { nodeId: number; nodeHost: string })
         />
       )}
 
-      {isLoading && <div className="text-slate-500 text-xs">Загрузка…</div>}
-      {data && data.length === 0 && !addOpen && (
+      {!batchMode && isLoading && <div className="text-slate-500 text-xs">Загрузка…</div>}
+      {!batchMode && data && data.length === 0 && !addOpen && (
         <div className="text-slate-500 text-xs">
           Нет конфигов — добавь хотя бы один, иначе нода не сможет выдавать подписки.
         </div>
       )}
-      {deleteErr && (
+      {!batchMode && deleteErr && (
         <div className="text-red-400 text-xs mb-2">{deleteErr}</div>
       )}
-      {data && data.length > 0 && (
+      {!batchMode && data && data.length > 0 && (
         <table className="w-full text-xs">
           <thead className="text-left text-slate-500">
             <tr>
@@ -1897,6 +2154,412 @@ function EditConfigForm({
           className="px-2 py-1 rounded bg-emerald-600 hover:bg-emerald-500 font-semibold disabled:opacity-50"
         >
           {mutation.isPending ? "Сохраняем…" : "Сохранить + bootstrap"}
+        </button>
+      </div>
+    </form>
+  );
+}
+
+// ── Batch edit configs ─────────────────────────────────────────────
+// Открыть все configs на правку сразу + позволить add/delete в одном
+// заходе → submit делает все API-вызовы с ?defer_bootstrap=true и в
+// конце один POST /nodes/{id}/bootstrap. Без этого редактирование 3
+// configs давало 3 bootstrap-таски (по одной на PUT).
+
+interface BatchEditRow {
+  // Существующий config (id != null) либо новый (id == null).
+  id: number | null;
+  protocol: string;
+  // Snapshot оригинала для diff'а (undefined для добавленных).
+  original: VPNConfigOut | null;
+  name: string;
+  port: number;
+  sni: string;
+  fallback: string | null;
+  public_key: string | null;
+  is_enabled: boolean;
+  toDelete: boolean;
+}
+
+function configToRow(c: VPNConfigOut): BatchEditRow {
+  return {
+    id: c.id,
+    protocol: c.protocol,
+    original: c,
+    name: c.name,
+    port: c.port,
+    sni: c.sni ?? "",
+    fallback: c.fallback ?? null,
+    public_key: c.public_key ?? null,
+    is_enabled: c.is_enabled,
+    toDelete: false,
+  };
+}
+
+function BatchEditConfigsForm({
+  nodeId,
+  configs,
+  onDone,
+}: {
+  nodeId: number;
+  configs: VPNConfigOut[];
+  onDone: () => void;
+}) {
+  const qc = useQueryClient();
+  const [rows, setRows] = useState<BatchEditRow[]>(() =>
+    configs.map(configToRow),
+  );
+  const [addProto, setAddProto] = useState<CreatableProto>("vless-reality");
+  const [err, setErr] = useState<string | null>(null);
+  const [progress, setProgress] = useState<{
+    done: number;
+    total: number;
+    current: string | null;
+    failures: { label: string; error: string }[];
+  } | null>(null);
+
+  // Какие protocols ещё можно добавить (т.е. не присутствуют в rows
+  // в not-deleted state'е).
+  const existingProtos = new Set(
+    rows.filter((r) => !r.toDelete).map((r) => r.protocol),
+  );
+  const addableProtos = (["vless-reality", "vless-ws-cdn", "vless-xhttp"] as CreatableProto[])
+    .filter((p) => !existingProtos.has(p));
+
+  function patchRow(idx: number, patch: Partial<BatchEditRow>) {
+    setRows((prev) => prev.map((r, i) => (i === idx ? { ...r, ...patch } : r)));
+  }
+
+  function addNew() {
+    const d = PROTO_DEFAULTS[addProto];
+    setRows((prev) => [
+      ...prev,
+      {
+        id: null,
+        protocol: addProto,
+        original: null,
+        name: `${addProto}-${Date.now() % 100000}`,
+        port: d.port,
+        sni: d.sni,
+        fallback: addProto === "vless-reality" ? d.fallback : null,
+        public_key: null,
+        is_enabled: true,
+        toDelete: false,
+      },
+    ]);
+    if (addableProtos.length > 1) {
+      const next = addableProtos.find((p) => p !== addProto);
+      if (next) setAddProto(next);
+    }
+  }
+
+  function diffRow(r: BatchEditRow): Partial<VPNConfigUpdateIn> | null {
+    if (!r.original) return null;
+    const o = r.original;
+    const patch: Partial<VPNConfigUpdateIn> = {};
+    if (r.name !== o.name) patch.name = r.name;
+    if (r.port !== o.port) patch.port = r.port;
+    if ((r.sni || null) !== (o.sni ?? null)) patch.sni = r.sni || null;
+    if ((r.fallback || null) !== (o.fallback ?? null))
+      patch.fallback = r.fallback || null;
+    if ((r.public_key || null) !== (o.public_key ?? null))
+      patch.public_key = r.public_key || null;
+    if (r.is_enabled !== o.is_enabled) patch.is_enabled = r.is_enabled;
+    return Object.keys(patch).length > 0 ? patch : null;
+  }
+
+  async function submit(e: React.FormEvent) {
+    e.preventDefault();
+    setErr(null);
+
+    const toDelete = rows.filter((r) => r.id != null && r.toDelete);
+    const toEdit = rows
+      .filter((r) => r.id != null && !r.toDelete)
+      .map((r) => ({ r, patch: diffRow(r) }))
+      .filter((x) => x.patch !== null) as { r: BatchEditRow; patch: Partial<VPNConfigUpdateIn> }[];
+    const toAdd = rows.filter((r) => r.id == null && !r.toDelete);
+
+    const totalOps = toDelete.length + toEdit.length + toAdd.length;
+    if (totalOps === 0) {
+      setErr("Никаких изменений — нечего сохранять");
+      return;
+    }
+
+    const failures: { label: string; error: string }[] = [];
+    setProgress({ done: 0, total: totalOps + 1, current: null, failures });
+    let done = 0;
+    const bump = (label: string) => {
+      done++;
+      setProgress({
+        done,
+        total: totalOps + 1,
+        current: label,
+        failures,
+      });
+    };
+    const recordError = (label: string, e: unknown) => {
+      const msg =
+        e instanceof ApiError
+          ? `${e.status}: ${e.message}`
+          : e instanceof Error
+            ? e.message
+            : String(e);
+      failures.push({ label, error: msg });
+    };
+
+    // Параллелим однотипные ops, между группами держим барьеры —
+    // меньше всего хочется чтобы PUT прошёл, а DELETE упал на FK
+    // и оставил inconsistent state. С defer=true это не приводит к
+    // лишним bootstrap'ам.
+    await Promise.all(
+      toDelete.map(async (r) => {
+        try {
+          await api.del(
+            `/nodes/${nodeId}/configs/${r.id}?defer_bootstrap=true`,
+          );
+        } catch (e) {
+          recordError(`delete ${r.protocol}`, e);
+        }
+        bump(`delete ${r.protocol}`);
+      }),
+    );
+    await Promise.all(
+      toEdit.map(async ({ r, patch }) => {
+        try {
+          await api.put(
+            `/nodes/${nodeId}/configs/${r.id}?defer_bootstrap=true`,
+            patch,
+          );
+        } catch (e) {
+          recordError(`edit ${r.protocol}`, e);
+        }
+        bump(`edit ${r.protocol}`);
+      }),
+    );
+    await Promise.all(
+      toAdd.map(async (r) => {
+        try {
+          const payload: VPNConfigCreateIn = {
+            name: r.name,
+            protocol: r.protocol as VPNConfigProtocol,
+            port: r.port,
+          };
+          if (r.sni) payload.sni = r.sni;
+          if (r.fallback) payload.fallback = r.fallback;
+          if (r.public_key) payload.public_key = r.public_key;
+          await api.post(
+            `/nodes/${nodeId}/configs?defer_bootstrap=true`,
+            payload,
+          );
+        } catch (e) {
+          recordError(`add ${r.protocol}`, e);
+        }
+        bump(`add ${r.protocol}`);
+      }),
+    );
+
+    // Если все ops провалились — не палим bootstrap (нечего применять).
+    if (failures.length === totalOps) {
+      setProgress({ done, total: totalOps + 1, current: null, failures });
+      setErr(
+        `Все ${totalOps} оп. провалились — bootstrap не запущен. Поправь и попробуй заново.`,
+      );
+      return;
+    }
+
+    try {
+      await api.post(`/nodes/${nodeId}/bootstrap`, {});
+      bump("bootstrap kicked");
+    } catch (e) {
+      recordError("bootstrap", e);
+      bump("bootstrap");
+    }
+
+    qc.invalidateQueries({ queryKey: ["node-configs", nodeId] });
+    qc.invalidateQueries({ queryKey: ["nodes"] });
+    qc.invalidateQueries({ queryKey: ["provisioning-tasks"] });
+
+    if (failures.length === 0) {
+      onDone();
+    } else {
+      setErr(
+        `Готово, но ${failures.length} оп. провалилось: ` +
+          failures.map((f) => `${f.label}: ${f.error}`).join("; "),
+      );
+    }
+  }
+
+  return (
+    <form
+      onSubmit={submit}
+      className="mb-3 p-3 rounded border border-blue-900/60 bg-blue-950/20"
+    >
+      <div className="text-xs text-blue-200 mb-2">
+        Batch-режим: правки накапливаются локально, отправляются одной
+        пачкой с <span className="font-mono">?defer_bootstrap=true</span>,
+        в конце — один общий <span className="font-mono">POST /bootstrap</span>.
+      </div>
+
+      <table className="w-full text-xs mb-3">
+        <thead className="text-left text-slate-500">
+          <tr>
+            <th className="py-1 w-28">Протокол</th>
+            <th className="w-32">Имя</th>
+            <th className="w-16">Порт</th>
+            <th>SNI</th>
+            <th>Fallback</th>
+            <th className="w-16">Enabled</th>
+            <th className="w-10"></th>
+          </tr>
+        </thead>
+        <tbody>
+          {rows.map((r, idx) => {
+            const isReality = r.protocol === "vless-reality";
+            return (
+              <tr
+                key={`${r.id ?? "new"}-${idx}`}
+                className={`border-t border-slate-800 ${r.toDelete ? "line-through opacity-50" : ""}`}
+              >
+                <td className="py-1 font-mono">
+                  {r.protocol}
+                  {r.id == null && (
+                    <span className="text-[10px] text-emerald-400 ml-1">NEW</span>
+                  )}
+                </td>
+                <td>
+                  <input
+                    className="bg-slate-800 border border-slate-700 rounded px-1 py-0.5 font-mono w-full"
+                    value={r.name}
+                    disabled={r.toDelete}
+                    onChange={(e) => patchRow(idx, { name: e.target.value })}
+                  />
+                </td>
+                <td>
+                  <input
+                    type="number"
+                    className="bg-slate-800 border border-slate-700 rounded px-1 py-0.5 font-mono w-full"
+                    value={r.port}
+                    disabled={r.toDelete}
+                    onChange={(e) =>
+                      patchRow(idx, { port: Number(e.target.value) })
+                    }
+                  />
+                </td>
+                <td>
+                  <input
+                    className="bg-slate-800 border border-slate-700 rounded px-1 py-0.5 font-mono w-full"
+                    value={r.sni}
+                    disabled={r.toDelete}
+                    onChange={(e) => patchRow(idx, { sni: e.target.value })}
+                  />
+                </td>
+                <td>
+                  <input
+                    className="bg-slate-800 border border-slate-700 rounded px-1 py-0.5 font-mono w-full disabled:opacity-40"
+                    value={r.fallback ?? ""}
+                    disabled={r.toDelete || !isReality}
+                    placeholder={isReality ? "domain:443" : "—"}
+                    onChange={(e) =>
+                      patchRow(idx, { fallback: e.target.value || null })
+                    }
+                  />
+                </td>
+                <td className="text-center">
+                  <input
+                    type="checkbox"
+                    checked={r.is_enabled}
+                    disabled={r.toDelete}
+                    onChange={(e) =>
+                      patchRow(idx, { is_enabled: e.target.checked })
+                    }
+                  />
+                </td>
+                <td className="text-right">
+                  {r.id != null ? (
+                    <button
+                      type="button"
+                      onClick={() => patchRow(idx, { toDelete: !r.toDelete })}
+                      title={r.toDelete ? "Восстановить" : "Удалить"}
+                      className={`px-1.5 py-0.5 rounded text-[11px] ${r.toDelete ? "bg-slate-700 hover:bg-slate-600" : "bg-red-900 hover:bg-red-800"}`}
+                    >
+                      {r.toDelete ? "↺" : "🗑"}
+                    </button>
+                  ) : (
+                    <button
+                      type="button"
+                      onClick={() =>
+                        setRows((prev) => prev.filter((_, i) => i !== idx))
+                      }
+                      title="Убрать из batch'а"
+                      className="px-1.5 py-0.5 rounded text-[11px] bg-slate-700 hover:bg-slate-600"
+                    >
+                      ✕
+                    </button>
+                  )}
+                </td>
+              </tr>
+            );
+          })}
+        </tbody>
+      </table>
+
+      {addableProtos.length > 0 && (
+        <div className="flex items-center gap-2 text-xs mb-2">
+          <select
+            value={addProto}
+            onChange={(e) => setAddProto(e.target.value as CreatableProto)}
+            className="bg-slate-800 border border-slate-700 rounded px-2 py-1"
+          >
+            {addableProtos.map((p) => (
+              <option key={p} value={p}>
+                {p}
+              </option>
+            ))}
+          </select>
+          <button
+            type="button"
+            onClick={addNew}
+            className="px-2 py-1 rounded bg-slate-700 hover:bg-slate-600"
+          >
+            + добавить в batch
+          </button>
+        </div>
+      )}
+
+      {progress && (
+        <div className="text-xs text-slate-400 mb-2">
+          Прогресс: {progress.done}/{progress.total}
+          {progress.current && ` — ${progress.current}`}
+          {progress.failures.length > 0 && (
+            <div className="text-red-400 mt-1">
+              Ошибок: {progress.failures.length}
+              {progress.failures.map((f, i) => (
+                <div key={i} className="font-mono text-[10px]">
+                  {f.label}: {f.error}
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
+
+      {err && <div className="text-red-400 text-xs mb-2">{err}</div>}
+
+      <div className="flex justify-end gap-2">
+        <button
+          type="button"
+          onClick={onDone}
+          disabled={progress != null && progress.done < progress.total}
+          className="px-3 py-1 rounded bg-slate-700 hover:bg-slate-600 text-xs"
+        >
+          Отмена
+        </button>
+        <button
+          type="submit"
+          disabled={progress != null}
+          className="px-3 py-1 rounded bg-emerald-600 hover:bg-emerald-500 text-xs font-semibold disabled:opacity-50"
+        >
+          Сохранить всё + 1 bootstrap
         </button>
       </div>
     </form>
