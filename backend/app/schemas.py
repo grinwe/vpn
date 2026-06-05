@@ -131,12 +131,15 @@ class VPNConfigOut(VPNConfigCreate):
 
 
 class VPNConfigUpdate(BaseModel):
-    # In-place edit of an existing VPNConfig. Protocol is intentionally
-    # absent — changing protocol turns the row into a different config
-    # entirely. All other fields are optional; omitted ones are left
-    # untouched. ``settings`` is merged into the existing JSONB so the UI
-    # can update one sub-key without having to re-send the encrypted
-    # secrets it never received in VPNConfigOut.
+    # In-place edit of an existing VPNConfig. ``protocol`` сюда приходит
+    # read-only echo'ом из UI — менять протокол нельзя (это другой конфиг),
+    # эндпоинт лишь отвергает запрос, если присланный protocol != текущего.
+    # Поле ОБЯЗАНО быть объявлено: update_config читает ``payload.protocol``,
+    # а в Pydantic v2 доступ к необъявленному (extra-ignored) полю кидает
+    # AttributeError → весь PUT падал в 500 ДО применения sni/прочих полей,
+    # т.е. редактирование конфига вообще не сохранялось. Все поля optional;
+    # пропущенные — не трогаются. ``settings`` мёржится в существующий JSONB,
+    # чтобы UI мог обновить один под-ключ, не пересылая зашифрованные секреты.
     name: str | None = None
     port: int | None = None
     sni: str | None = None
@@ -144,6 +147,7 @@ class VPNConfigUpdate(BaseModel):
     fallback: str | None = None
     settings: dict[str, Any] | None = None
     is_enabled: bool | None = None
+    protocol: str | None = None
     # Optional — if sent, backend verifies it matches the existing
     # protocol (defensive; the UI passes it for readability).
     protocol: str | None = None
@@ -192,6 +196,24 @@ class VPNNodeCreate(BaseModel):
     ssh_port: int = 22
     pool_id: int | None = None
     notes: str | None = None
+
+
+class VPNNodeWithConfigsCreate(BaseModel):
+    """Composite create-node-and-configs: за один запрос делаем INSERT
+    ноды + N INSERT'ов VPN-конфигов + один общий bootstrap.
+
+    Заменяет старый flow «создать ноду → bootstrap → добавить config →
+    bootstrap → …», который плодил N+1 таску на каждое добавление
+    протокола.
+
+    Best-effort атомарность: при exception во время создания configs
+    бэк rollback'ает уже-созданную ноду + успешные configs (см.
+    create_node_with_configs). Полностью atomic'ный flow требовал бы
+    рефакторинга ensure_reality_config/ensure_shadowtls_config'ов
+    (они сейчас сами commit'ят) — оставлено на потом.
+    """
+    node: VPNNodeCreate
+    configs: list[VPNConfigCreate] = []
 
 
 class NodeExitLinkHealthMini(BaseModel):
@@ -352,6 +374,27 @@ class SubscriptionMigrateOut(BaseModel):
     new_node_id: int
     new_node_name: str
     provisioning_task_id: int | None
+    # Заполняется только авто-миграцией (/migrate-auto): добавили ли
+    # старую ноду в бан-лист юзера. None для ручной /migrate.
+    banned_old_node: bool | None = None
+
+
+class NodeUserBanCreate(BaseModel):
+    node_id: int
+    reason: str | None = None
+
+
+class NodeUserBanOut(BaseModel):
+    id: int
+    user_id: int
+    node_id: int
+    node_name: str | None = None
+    reason: str | None = None
+    created_by: str | None = None
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
 
 
 class SubscriptionSwitchExitIn(BaseModel):
@@ -1067,6 +1110,46 @@ class BatchAttachRelayResponse(BaseModel):
     relay_node_id: int
     relay_node_name: str
     links: list[BatchAttachLinkOut]
+
+
+class BatchDetachRelayRequest(BaseModel):
+    """Отцепить несколько relay-нод от ОДНОГО exit'а одним POST'ом.
+
+    Обратная операция к batch-attach (там один relay → N exit'ов, тут
+    один exit → N relay'ев). relay_node_id, у которого нет линка к этому
+    exit'у, попадает в ``not_found`` ответа — батч best-effort и не падает
+    целиком из-за одной устаревшей строки в выборке UI.
+    """
+    relay_node_ids: list[int]
+
+
+class BatchDetachLinkOut(BaseModel):
+    """Один отцепленный relay + порождённая teardown-task внутри batch.
+
+    ``task_id`` = ``None`` только если relay-строка уже исчезла (редко —
+    FK cascade удалил link первым). ``credentials`` — summary миграции
+    осиротевших creds: ``{"migrated": N, "distribution": {...}}`` либо
+    ``{"cleared": N}`` (последний линк relay'я ушёл → exit_id обнулён).
+    """
+    relay_node_id: int
+    relay_node_name: str
+    link_id: int
+    task_id: int | None
+    credentials: dict[str, Any]
+
+
+class BatchDetachRelayResponse(BaseModel):
+    """Ответ batch-detach: общий batch_id + отцепленные + ненайденные.
+
+    Все task'и идут под одним ``batch_id`` — UI рендерит прогресс тем же
+    drawer'ом, что и batch-attach, retry отдельных через /tasks.
+    ``not_found`` — relay_node_id'ы без линка к этому exit'у (не ошибка).
+    """
+    batch_id: uuid.UUID
+    exit_id: int
+    exit_name: str
+    links: list[BatchDetachLinkOut]
+    not_found: list[int] = []
 
 
 class RelayExitLinkOut(BaseModel):

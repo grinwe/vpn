@@ -75,6 +75,178 @@ def create_node(
     return node
 
 
+def _build_config_from_payload(
+    db: Session, node: models.VPNNode, payload: schemas.VPNConfigCreate
+) -> models.VPNConfig:
+    """Создать VPNConfig из payload с auto-keygen для REALITY/shadowtls.
+
+    Reuse'ит логику ``create_config`` (см. ниже), но без bootstrap-task'и
+    в конце — caller сам решает когда планировать bootstrap (в composite
+    flow — один общий для всех configs).
+    """
+    try:
+        protocol = models.VPNConfigProtocol(payload.protocol)
+    except ValueError as exc:  # noqa: BLE001
+        raise HTTPException(
+            status_code=400, detail=f"Unknown protocol: {payload.protocol}"
+        ) from exc
+
+    existing_same = (
+        db.query(models.VPNConfig)
+        .filter(
+            models.VPNConfig.node_id == node.id,
+            models.VPNConfig.protocol == protocol,
+        )
+        .first()
+    )
+    if existing_same is not None:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"Config for {protocol.value} already exists on this node "
+                f"(id={existing_same.id})"
+            ),
+        )
+
+    if protocol == models.VPNConfigProtocol.vless_reality and not payload.public_key:
+        from ..services.node_spawner import ensure_reality_config
+        return ensure_reality_config(
+            db, node,
+            port=payload.port or None,
+            sni=payload.sni or None,
+            dest=payload.fallback or None,
+        )
+    if protocol == models.VPNConfigProtocol.shadowtls_ss and not (
+        payload.settings or {}
+    ).get("ss_password_enc"):
+        from ..services.node_spawner import ensure_shadowtls_config
+        return ensure_shadowtls_config(
+            db, node,
+            port=payload.port or None,
+            handshake_domain=payload.sni or None,
+            name=payload.name or None,
+        )
+
+    settings = dict(payload.settings or {})
+    # vless-xhttp: nginx-фронт matchит SNI с settings.domain — без
+    # дублирования у админа задача «sni vs settings.domain» расходилась
+    # после DR (sni был, domain пустой → fix_xhttp_sni.sh). Auto-fill
+    # сохраняет explicit значение, если админ его задал.
+    if (
+        protocol == models.VPNConfigProtocol.vless_xhttp
+        and payload.sni
+        and not settings.get("domain")
+    ):
+        settings["domain"] = payload.sni
+
+    config = models.VPNConfig(
+        node_id=node.id,
+        name=payload.name,
+        protocol=protocol,
+        port=payload.port,
+        sni=payload.sni,
+        public_key=payload.public_key,
+        fallback=payload.fallback,
+        settings=settings or None,
+        is_enabled=payload.is_enabled,
+    )
+    db.add(config)
+    db.commit()
+    db.refresh(config)
+    return config
+
+
+@router.post("/nodes/with-configs", response_model=schemas.VPNNodeOut)
+def create_node_with_configs(
+    payload: schemas.VPNNodeWithConfigsCreate,
+    db: Session = Depends(get_db),
+    admin_token: str = Depends(require_admin),
+    admin_actor: str | None = Header(default=None, alias=ADMIN_ACTOR_HEADER),
+):
+    """Создать ноду + N VPN-конфигов + один bootstrap одним запросом.
+
+    Заменяет последовательность «POST /nodes → POST /configs × N», где
+    каждый шаг плодил свой bootstrap-task. Здесь все INSERT'ы делаются
+    в логическом блоке + один bootstrap-task в конце c ``initial=True``
+    в payload — site.yml на ноде сразу видит финальный набор протоколов.
+
+    Best-effort atomicity: при exception в середине rollback'аем ноду
+    + успешно созданные configs ручным cleanup'ом (полностью atomic
+    require'ло бы non-committing варианты ensure_reality/shadowtls'ов).
+    Для админ-UX этого достаточно: при провале юзер видит чистое
+    состояние и пробует заново.
+    """
+    try:
+        validate_node_identity_fields(
+            payload.node.name, payload.node.host, payload.node.ssh_port
+        )
+    except InvalidNodeIdentity as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    protocols_seen: set[str] = set()
+    for cfg in payload.configs:
+        if cfg.protocol in protocols_seen:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Duplicate protocol in configs: {cfg.protocol}",
+            )
+        protocols_seen.add(cfg.protocol)
+        try:
+            models.VPNConfigProtocol(cfg.protocol)
+        except ValueError as exc:  # noqa: BLE001
+            raise HTTPException(
+                status_code=400, detail=f"Unknown protocol: {cfg.protocol}"
+            ) from exc
+
+    node = models.VPNNode(
+        name=payload.node.name,
+        region=payload.node.region,
+        host=payload.node.host,
+        ssh_port=payload.node.ssh_port,
+        pool_id=payload.node.pool_id,
+        notes=payload.node.notes,
+        status=models.VPNNodeStatus.registering,
+    )
+    db.add(node)
+    db.commit()
+    db.refresh(node)
+
+    actor, actor_type = _resolve_admin_actor(admin_actor)
+    _audit(db, actor, "node_created", "vpn_node", node.id, actor_type=actor_type)
+
+    created_configs: list[models.VPNConfig] = []
+    try:
+        for cfg_payload in payload.configs:
+            cfg = _build_config_from_payload(db, node, cfg_payload)
+            created_configs.append(cfg)
+            _audit(
+                db, actor, "config_created", "vpn_config", cfg.id,
+                actor_type=actor_type,
+            )
+    except HTTPException:
+        # Rollback: убираем уже созданные configs + ноду. Юзер видит
+        # чистое состояние и понимает что весь composite запрос
+        # провалился (без orphan'ной ноды без configs).
+        for cfg in created_configs:
+            db.delete(cfg)
+        db.delete(node)
+        db.commit()
+        raise
+
+    orchestrator = ProvisioningOrchestrator(db)
+    task = orchestrator.create_task(
+        "node", node.id, "bootstrap",
+        {
+            "pool_id": payload.node.pool_id,
+            "initial": True,
+            "config_change": len(created_configs) > 0,
+        },
+    )
+    db.commit()
+    orchestrator.run_task_async(task, node=node)
+    return node
+
+
 @router.get("/nodes", response_model=list[schemas.VPNNodeOut])
 def list_nodes(
     db: Session = Depends(get_db),
@@ -99,7 +271,11 @@ def list_nodes(
     if is_active is not None:
         query = query.filter(models.VPNNode.is_active.is_(is_active))
     nodes = (
-        query.order_by(models.VPNNode.created_at)
+        # id как вторичный ключ — детерминированный тайбрейкер. Без него
+        # ноды с равным (или NULL после DR-restore) created_at возвращались
+        # в физическом heap-порядке, который меняется на UPDATE строки
+        # (bootstrap/любое действие) → нода «перепрыгивала» в списке админки.
+        query.order_by(models.VPNNode.created_at, models.VPNNode.id)
         .offset(offset)
         .limit(limit)
         .all()
@@ -511,6 +687,13 @@ def set_node_status(
 def create_config(
     node_id: int,
     payload: schemas.VPNConfigCreate,
+    defer_bootstrap: bool = Query(
+        default=False,
+        description=(
+            "If true, не создаём bootstrap-task в конце — caller сам "
+            "вызовет POST /nodes/{id}/bootstrap после batch'а правок"
+        ),
+    ),
     db: Session = Depends(get_db),
     admin_token: str = Depends(require_admin),
     admin_actor: str | None = Header(default=None, alias=ADMIN_ACTOR_HEADER),
@@ -593,20 +776,20 @@ def create_config(
     from ..services import warm_pool
     warm_pool.invalidate_node_warm_pool(db, node.id, reason="config added")
     orchestrator = ProvisioningOrchestrator(db)
-    # Backfill credentials for existing devices on this node — without
-    # this, users provisioned before the new protocol existed get an
-    # updated node xray config but a stale per-user credential set, and
-    # the new protocol never appears in /sub/{token}. The node-level
-    # bootstrap's auto-resync (_handle_task_outcome → resync_node_clients)
-    # then pushes the newly-created vless-family rows onto the node.
+    # Backfill credentials for existing devices on this node — без этого
+    # юзеры провижененные до новой протоколы получат обновлённый xray
+    # config, но stale-credential без нового протокола. Backfill дёргаем
+    # ВСЕГДА (даже при defer_bootstrap), т.к. он только пишет в БД и не
+    # запускает ansible — реально дотолкает протокол на ноду только
+    # bootstrap (через _handle_task_outcome → resync_node_clients).
     orchestrator.backfill_credentials_for_new_config(node, config)
-    # Run site.yml so Ansible installs the new protocol on the node.
-    task = orchestrator.create_task(
-        "node", node.id, "bootstrap",
-        {"pool_id": node.pool_id, "config_change": True},
-    )
-    db.commit()
-    orchestrator.run_task_async(task, node=node)
+    if not defer_bootstrap:
+        task = orchestrator.create_task(
+            "node", node.id, "bootstrap",
+            {"pool_id": node.pool_id, "config_change": True},
+        )
+        db.commit()
+        orchestrator.run_task_async(task, node=node)
     return config
 
 
@@ -618,6 +801,13 @@ def update_config(
     node_id: int,
     config_id: int,
     payload: schemas.VPNConfigUpdate,
+    defer_bootstrap: bool = Query(
+        default=False,
+        description=(
+            "If true, не создаём bootstrap-task в конце — caller сам "
+            "вызовет POST /nodes/{id}/bootstrap после batch'а правок"
+        ),
+    ),
     db: Session = Depends(get_db),
     admin_token: str = Depends(require_admin),
     admin_actor: str | None = Header(default=None, alias=ADMIN_ACTOR_HEADER),
@@ -696,16 +886,16 @@ def update_config(
     # rebuilds with the updated config.
     from ..services import warm_pool
     warm_pool.invalidate_node_warm_pool(db, node_id, reason="config updated")
-    # Re-run site.yml so Ansible re-renders xray config with new values.
-    node = db.get(models.VPNNode, node_id)
-    if node:
-        orchestrator = ProvisioningOrchestrator(db)
-        task = orchestrator.create_task(
-            "node", node.id, "bootstrap",
-            {"pool_id": node.pool_id, "config_change": True},
-        )
-        db.commit()
-        orchestrator.run_task_async(task, node=node)
+    if not defer_bootstrap:
+        node = db.get(models.VPNNode, node_id)
+        if node:
+            orchestrator = ProvisioningOrchestrator(db)
+            task = orchestrator.create_task(
+                "node", node.id, "bootstrap",
+                {"pool_id": node.pool_id, "config_change": True},
+            )
+            db.commit()
+            orchestrator.run_task_async(task, node=node)
     return config
 
 
@@ -713,6 +903,13 @@ def update_config(
 def delete_config(
     node_id: int,
     config_id: int,
+    defer_bootstrap: bool = Query(
+        default=False,
+        description=(
+            "If true, не создаём bootstrap-task в конце — caller сам "
+            "вызовет POST /nodes/{id}/bootstrap после batch'а правок"
+        ),
+    ),
     db: Session = Depends(get_db),
     admin_token: str = Depends(require_admin),
     admin_actor: str | None = Header(default=None, alias=ADMIN_ACTOR_HEADER),
@@ -772,16 +969,16 @@ def delete_config(
     _audit(db, actor, "config_deleted", "vpn_config", config_id, actor_type=actor_type)
     from ..services import warm_pool
     warm_pool.invalidate_node_warm_pool(db, node_id, reason="config removed")
-    # Re-run site.yml so Ansible stops/removes the deleted protocol's service.
-    node = db.get(models.VPNNode, node_id)
-    if node:
-        orchestrator = ProvisioningOrchestrator(db)
-        task = orchestrator.create_task(
-            "node", node.id, "bootstrap",
-            {"pool_id": node.pool_id, "config_change": True},
-        )
-        db.commit()
-        orchestrator.run_task_async(task, node=node)
+    if not defer_bootstrap:
+        node = db.get(models.VPNNode, node_id)
+        if node:
+            orchestrator = ProvisioningOrchestrator(db)
+            task = orchestrator.create_task(
+                "node", node.id, "bootstrap",
+                {"pool_id": node.pool_id, "config_change": True},
+            )
+            db.commit()
+            orchestrator.run_task_async(task, node=node)
     return None
 
 
