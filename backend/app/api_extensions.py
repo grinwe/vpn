@@ -522,7 +522,7 @@ def get_pending_notifications(
     notif_actions = [
         "renewal_reminder", "expiry_reminder",
         "renewal_reminder_1d", "expiry_reminder_1d",
-        "config_ready", "migration_notice",
+        "config_ready", "migration_notice", "sublink_rotated",
         "low_balance_warning", "trial_expiry_warning", "health_ping_request",
         # Admin push-уведомления (см. services/admin_notify.py).
         # Текст полностью рендерится на backend-е и кладётся в
@@ -599,6 +599,19 @@ def get_pending_notifications(
                 "Подписка обновится в клиенте автоматически — "
                 "просто нажми 🔄 рядом с профилем в Hiddify / V2rayNG / Streisand.\n"
                 "Ничего переустанавливать и копировать не нужно."
+            )
+        elif log.action == "sublink_rotated":
+            # Перегенерация sub-link (admin bulk-regenerate, обычно хвосты
+            # аварии). В отличие от migration_notice здесь sub_token
+            # СМЕНИЛСЯ — авто-refresh в клиенте подтянет конфиг по старой
+            # ссылке через sibling-alias, но в ЛК уже лежит новая ссылка,
+            # и правильнее переподключиться по ней. Старый конфиг пока
+            # продолжает работать, так что без паники и без обрыва.
+            text = (
+                "🔁 Мы обновили твой VPN-конфиг.\n"
+                "Чтобы всё продолжило работать без перебоев — открой "
+                "личный кабинет и возьми оттуда новую ссылку.\n"
+                "Старый конфиг ещё работает, но лучше обновиться сейчас."
             )
         elif log.action == "low_balance_warning":
             days = extra.get("days_remaining", "?")

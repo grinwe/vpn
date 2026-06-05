@@ -351,6 +351,46 @@ class User(Base):
     )
 
 
+class NodeUserBan(Base):
+    """Per-node бан юзера — список нод, на которые авто-выбор НЕ должен
+    селить этого юзера.
+
+    Ортогонально глобальному ``User.banned_at`` (тот — бан на уровне
+    бота, дропает апдейты). Используется при «обновлении подписки»: при
+    миграции на свободный сервер старая нода заносится сюда, и
+    последующий auto-pick (``choose_node`` через ``exclude_node_ids``)
+    её пропускает. Бан per-USER, а не per-subscription — у юзера может
+    быть несколько подписок, бан ноды распространяется на все.
+    """
+
+    __tablename__ = "node_user_bans"
+    __table_args__ = (
+        UniqueConstraint("user_id", "node_id", name="uq_node_user_ban"),
+    )
+
+    id = Column(Integer, primary_key=True)
+    user_id = Column(
+        Integer,
+        ForeignKey("users.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    node_id = Column(
+        Integer,
+        ForeignKey("vpn_nodes.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    reason = Column(Text, nullable=True)
+    # Кто поставил бан: admin-actor / "auto" / telegram_id. Свободная
+    # строка, как actor в AuditLog.
+    created_by = Column(String, nullable=True)
+    created_at = Column(DateTime, default=utcnow, nullable=False)
+
+    user = relationship("User")
+    node = relationship("VPNNode")
+
+
 class Subscription(Base):
     __tablename__ = "subscriptions"
 

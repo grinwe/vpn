@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query
 from pydantic import BaseModel, Field
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from .. import models, schemas
@@ -391,6 +392,164 @@ def unban_user(
         "user_unbanned",
         "user",
         user_id,
+        actor_type=actor_type,
+    )
+    return {"status": "unbanned"}
+
+
+# ── Per-node user bans ───────────────────────────────────────────────
+# Список нод, на которые авто-выбор (choose_node через exclude_node_ids)
+# НЕ должен селить данного юзера. Ортогонально глобальному banned_at.
+# Заполняется авто-миграцией («обновить подписку» авто-банит старую
+# ноду) и этими ручными эндпоинтами.
+
+
+@router.get(
+    "/users/{user_id}/node-bans",
+    response_model=list[schemas.NodeUserBanOut],
+)
+def list_user_node_bans(
+    user_id: int,
+    db: Session = Depends(get_db),
+    admin_token: str = Depends(require_admin),
+):
+    """Per-node баны юзера (с именами нод для админки)."""
+    user = db.get(models.User, user_id)
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    rows = (
+        db.query(models.NodeUserBan, models.VPNNode.name)
+        .outerjoin(
+            models.VPNNode, models.VPNNode.id == models.NodeUserBan.node_id
+        )
+        .filter(models.NodeUserBan.user_id == user_id)
+        .order_by(models.NodeUserBan.created_at.desc())
+        .all()
+    )
+    return [
+        schemas.NodeUserBanOut(
+            id=ban.id,
+            user_id=ban.user_id,
+            node_id=ban.node_id,
+            node_name=node_name,
+            reason=ban.reason,
+            created_by=ban.created_by,
+            created_at=ban.created_at,
+        )
+        for ban, node_name in rows
+    ]
+
+
+@router.post(
+    "/users/{user_id}/node-bans",
+    response_model=schemas.NodeUserBanOut,
+)
+def add_user_node_ban(
+    user_id: int,
+    body: schemas.NodeUserBanCreate,
+    db: Session = Depends(get_db),
+    admin_token: str = Depends(require_admin),
+    admin_actor: str | None = Header(default=None, alias=ADMIN_ACTOR_HEADER),
+):
+    """Вручную забанить юзера на ноде — авто-выбор её пропустит.
+
+    Идемпотентно по (user_id, node_id): повторный бан возвращает
+    существующую запись. Не мигрирует юзера — только помечает ноду как
+    нежелательную для будущих авто-выборов.
+    """
+    user = db.get(models.User, user_id)
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    node = db.get(models.VPNNode, body.node_id)
+    if not node:
+        raise HTTPException(status_code=404, detail="Node not found")
+    actor, actor_type = _resolve_admin_actor(admin_actor)
+    ban = (
+        db.query(models.NodeUserBan)
+        .filter(
+            models.NodeUserBan.user_id == user_id,
+            models.NodeUserBan.node_id == body.node_id,
+        )
+        .first()
+    )
+    if ban is None:
+        try:
+            ban = models.NodeUserBan(
+                user_id=user_id,
+                node_id=body.node_id,
+                reason=body.reason,
+                created_by=actor,
+            )
+            db.add(ban)
+            db.commit()
+            db.refresh(ban)
+            _audit(
+                db,
+                actor,
+                "node_user_banned",
+                "user",
+                user_id,
+                metadata={"node_id": body.node_id, "reason": body.reason},
+                actor_type=actor_type,
+            )
+        except IntegrityError:
+            # Гонка: параллельный запрос уже создал бан (user_id, node_id).
+            # uq_node_user_ban → idempotent: откатываемся и перечитываем.
+            db.rollback()
+            ban = (
+                db.query(models.NodeUserBan)
+                .filter(
+                    models.NodeUserBan.user_id == user_id,
+                    models.NodeUserBan.node_id == body.node_id,
+                )
+                .first()
+            )
+            if ban is None:
+                raise HTTPException(
+                    status_code=409,
+                    detail="Конфликт при создании бана — повторите запрос",
+                )
+    return schemas.NodeUserBanOut(
+        id=ban.id,
+        user_id=ban.user_id,
+        node_id=ban.node_id,
+        node_name=node.name,
+        reason=ban.reason,
+        created_by=ban.created_by,
+        created_at=ban.created_at,
+    )
+
+
+@router.delete("/users/{user_id}/node-bans/{node_id}")
+def remove_user_node_ban(
+    user_id: int,
+    node_id: int,
+    db: Session = Depends(get_db),
+    admin_token: str = Depends(require_admin),
+    admin_actor: str | None = Header(default=None, alias=ADMIN_ACTOR_HEADER),
+):
+    """Снять per-node бан (разбан) — авто-выбор снова сможет селить юзера
+    на эту ноду. Идемпотентно."""
+    ban = (
+        db.query(models.NodeUserBan)
+        .filter(
+            models.NodeUserBan.user_id == user_id,
+            models.NodeUserBan.node_id == node_id,
+        )
+        .first()
+    )
+    if ban is None:
+        return {"status": "not_banned"}
+    db.delete(ban)
+    db.commit()
+    actor, actor_type = _resolve_admin_actor(admin_actor)
+    _audit(
+        db,
+        actor,
+        "node_user_unbanned",
+        "user",
+        user_id,
+        metadata={"node_id": node_id},
         actor_type=actor_type,
     )
     return {"status": "unbanned"}

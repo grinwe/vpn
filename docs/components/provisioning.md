@@ -320,6 +320,27 @@ else:
 
 Есть `background=False` опция (синхронный путь) — используется только в тестах и в ручных админских операциях, когда caller хочет видеть ansible stdout сразу.
 
+## `regenerate_subscription_sublink` — перевыпуск sub-link без обрыва
+
+Примитив для **хвостов аварии 2026-05** (часть sub-link поломалась при восстановлении, см. `POSTMORTEM_2026-05-19.md`) и массовой кнопки `🔁 регенерация sub-link` в ADMIN_UI (`POST /subscriptions/bulk-regenerate-sublink`). Это **НЕ переезд** — нода та же, меняется только ссылка.
+
+Для каждого живого устройства (`status NOT IN (revoked, disabled)`), **атомарной парой** (per-iteration commit, на ошибке — rollback только этой итерации + re-raise → подписка попадёт в `failed`):
+
+1. `_disable_device_keep_on_node(old)` — старый Device в `disabled`, creds `is_active=False`, **но БЕЗ ansible-revoke**: UUID остаётся в `xray.clients[]`, юзер продолжает подключаться по старому конфигу, пока не возьмёт новую ссылку. **Делается ПЕРВЫМ** — тогда внутренний commit `reprovision_subscription` фиксирует disable старого И новый Device одной транзакцией: нет окна, где новая строка уже durable, а старая ещё live (это окно иначе транзиентно задвоило бы live-счётчик). Падение fail-safe «в минус устройство», не в дубль.
+2. `reprovision_subscription(sub)` — **новый** Device на той же ноде с fresh `sub_token`+UUID+credentials+ansible-apply (старый токен **не** переиспользуем — в этом отличие от миграции, которая токен сохраняет).
+
+Подписка без живых устройств (incident tail: Device без `sub_token` или полностью revoked sub) получает один свежий Device.
+
+**Защита от resurrection.** Если у старого устройства был ещё не доехавший `apply`-таск (backlog серийного воркера), его поздний успех НЕ должен воскресить `disabled`-строку. Guard в `_handle_task_outcome` (apply-ветка): если устройство уже `disabled`/`revoked` — реактивация пропускается (`return` до `status=active` и до `_notify_bot_config_ready`). Это же чинит латентный баг во freeze/migrate-флоу.
+
+**Почему старый UUID реально живёт, а не «best-effort»** (ключевой факт, проверен по коду):
+
+- `resync_node.yml` **только `add`-ит** клиентов (идемпотентный re-add активного набора) — `del`/prune там нет, ресинк чужие UUID не трогает;
+- relay-`reconcile_xray.jq` переписывает только `outbounds`/`routing.rules`, не `inbounds[].settings.clients[]`;
+- единственное, что снимает UUID с ноды — явный `revoke`-таск, который здесь намеренно не запускается.
+
+Инвариант соблюдён: старую строку не удаляем/не мутируем, `dynamic_sub_link` алиасит старый токен на новый живой Device. **Стоимость не меняется**: `extra_device_slots` не трогаем, live-счётчик устройств сохраняется 1:1 (`balance.py::renew_subscription` считает цену от слотов, не от числа Device-строк). ЛК показывает новую ссылку, потому что `_build_subscription_extras` берёт первый live-device, а старый `disabled` из выдачи выпадает. Уведомление — system-AuditLog `sublink_rotated`, бот доставляет («возьми новую ссылку в ЛК»). Сводный bulk-эндпоинт капит на 25 юзеров/запрос (ansible-heavy через серийный воркер — тот же класс рисков, что инциденты 2026-04/05).
+
 ## Metrics
 
 ```

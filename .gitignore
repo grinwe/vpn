@@ -21,6 +21,9 @@ admin/tsconfig.tsbuildinfo
 infra/ansible/recovered/
 infra/ansible/recovered-runtime/
 infra/ansible/recovered-wg/
+# Локальные pg_dump'ы БД (scripts/db_dump.sh) — содержат telegram_id,
+# балансы, шифрованные креды. Никогда не коммитим.
+backups/
 # Diag-выводы scratch — для одноразовых сессий.
 diag.out
 runtime.out

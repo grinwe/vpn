@@ -10,6 +10,14 @@
     "services": ["StatsService"]
   },
   "stats": {},
+  "dns": {
+    "servers": [
+      "77.88.8.8",
+      "8.8.8.8",
+      "1.1.1.1"
+    ],
+    "queryStrategy": "UseIP"
+  },
   "policy": {
     "levels": {
       "0": {
@@ -23,11 +31,27 @@
     }
   },
   "routing": {
+    "domainStrategy": "IPIfNonMatch",
     "rules": [
       {
         "type": "field",
         "inboundTag": ["api-in"],
         "outboundTag": "api"
+      },
+      {
+        "type": "field",
+        "domain": [
+          "regexp:\\.ru$",
+          "regexp:\\.su$",
+          "regexp:\\.xn--p1ai$",
+          "regexp:^(yandex|mail|vk|ok|rutube|sberbank|gosuslugi|tinkoff|wildberries|ozon|avito|rambler|2gis|kinopoisk|dzen|hh|lenta|ria|tass|rbc|habr|dtf)\\..+$"
+        ],
+        "outboundTag": "direct-local"
+      },
+      {
+        "type": "field",
+        "ip": ["geoip:ru", "geoip:private"],
+        "outboundTag": "direct-local"
       }{% for _rule in _fan_out if _rule.emails %},
       {
         "type": "field",
@@ -58,6 +82,14 @@
       "streamSettings": {
         "network": "xhttp",
         "xhttpSettings": {
+          {#- host дублирует домен в САМ xray-конфиг — чтобы он пережил DR.
+              При потере БД восстановление читает xray-конфиги с нод
+              (aggregate_xray_inventory.py берёт xhttpSettings.host как sni);
+              иначе домен живёт ТОЛЬКО в nginx-vhost и терялся в restore.sql
+              (sni=NULL → билдер сабки падал на IP ноды). Рантайм-консистентно:
+              nginx форвардит Host=домен (proxy_set_header Host $host,
+              server_name=домен), клиент тоже шлёт host=домен. -#}
+          "host": "{{ vless_xhttp_domain }}",
           "path": "{{ vless_xhttp_path | default('/xh') }}",
           "mode": "{{ vless_xhttp_mode | default('auto') }}"
         }
@@ -78,6 +110,10 @@
           "tcpKeepAliveInterval": 30
         }
       }{% endif %}
+    },
+    {
+      "protocol": "freedom",
+      "tag": "direct-local"
     }{% for _ob in _fan_out %},
     {
       "protocol": "freedom",

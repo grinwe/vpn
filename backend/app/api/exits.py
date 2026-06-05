@@ -903,69 +903,33 @@ def batch_attach_relay(
     )
 
 
-@router.delete("/exits/{exit_id}/links/{relay_node_id}", status_code=200)
-def detach_relay(
-    exit_id: int,
-    relay_node_id: int,
-    db: Session = Depends(get_db),
-    admin_token: str = Depends(require_admin),
-    admin_actor: str | None = Header(default=None, alias=ADMIN_ACTOR_HEADER),
-):
-    """Detach a relay from this exit (G.5: multi-exit aware).
+def _detach_link_core(
+    db: Session,
+    link: models.RelayExitLink,
+) -> tuple[models.VPNNode | None, int, dict[str, Any]]:
+    """Ядро отцепления одного relay↔exit link'а — БЕЗ commit'а и task'а.
 
-    Drops the single matching link row. If the relay has other
-    remaining links, ``relay_config`` is re-snapshotted from one of
-    them so the admin schema still flags this node as a relay; if
-    this was the last link, ``relay_config`` is cleared. Either way
-    a ``relay_tunnel`` task is scheduled — ansible re-renders the
-    exit's peer list without this client (``bootstrap_exit.yml`` +
-    ``wg syncconf``) and re-applies the relay's WG tunnel set from
-    ``relay_wg_links``: the removed ``wgN`` gets torn down by the
-    drift-reconciliation step in the ``relay_jump_node`` role, any
-    remaining ``wgN`` stays up.
+    Перепинивает осиротевшие creds (live с ``node_id == relay`` и
+    ``exit_id == этот exit``): если у релея остаются другие линки —
+    раскладывает их least-loaded по оставшимся exit'ам (в памяти, чтобы
+    распределить пачку равномерно, а не свалить всех на наименее
+    загруженный); если линков больше нет — обнуляет ``exit_id`` в NULL
+    (релей становится direct-нодой), иначе ``build_xray_relay_outbounds``
+    видел бы stale exit_id и выкидывал email'ы из routing rules → юзер
+    ушёл бы на default outbound без sockopt (прямой egress из РФ). Затем
+    удаляет link и пересобирает ``relay_config``-флаг (NULL если это был
+    последний линк, иначе snapshot с любого оставшегося).
 
-    Перед удалением линка все live creds с ``exit_id == exit_id`` и
-    ``node_id == relay.id`` перепиниваются: если остаются другие
-    линки — распределяются least-loaded по ним; если линков больше
-    нет — ``exit_id`` обнуляется в NULL. Без этого шага
-    ``build_xray_relay_outbounds`` выкидывает emails со stale
-    ``exit_id`` из routing rules и юзер идёт по default outbound
-    (direct), а не через оставшийся туннель.
-
-    Returns ``task_id`` so the admin UI can surface progress in
-    /tasks, plus ``credentials`` summary (migrated count +
-    распределение по exit'ам). ``task_id`` is ``None`` only if the
-    relay row was already gone (rare — FK cascade order drops the
-    link first).
+    Возвращает ``(relay, link_id, migration_summary)``. Вынесено из
+    ``detach_relay``, чтобы ``batch_detach_relay`` повторял ту же логику
+    per-relay без дублирования. Commit, audit и создание ``relay_tunnel``
+    teardown-task'а — на стороне вызывающего.
     """
-    link = (
-        db.query(models.RelayExitLink)
-        .filter(
-            models.RelayExitLink.exit_id == exit_id,
-            models.RelayExitLink.relay_node_id == relay_node_id,
-        )
-        .first()
-    )
-    if not link:
-        raise HTTPException(status_code=404, detail="Link not found")
-
+    exit_id = link.exit_id
+    relay_node_id = link.relay_node_id
     link_id = link.id
     relay = db.get(models.VPNNode, relay_node_id)
 
-    # ── Авто-миграция осиротевших creds ──────────────────────────────
-    # До удаления линка фиксируем, кого надо переносить: каждый живой
-    # cred (``pool_state != revoked``) с ``node_id == relay.id`` и
-    # ``exit_id == exit_id`` указывает на уже отрезаемый exit.
-    # Если у релея остаются другие линки — раскладываем эти creds по
-    # оставшимся exit'ам least-loaded (в памяти, чтобы распределить
-    # пачку равномерно, а не свалить всех на один наименее
-    # загруженный). Если линков больше нет — релей де-факто становится
-    # direct-нодой, чистим ``exit_id`` в NULL, иначе
-    # ``build_xray_relay_outbounds`` будет видеть stale exit_id и
-    # исключать email'ы из routing rules → юзер попадёт на default
-    # outbound без sockopt (= прямой egress из РФ). Ранее этот шаг не
-    # делался вообще — creds жили с указателем на удалённый линк до
-    # следующего ручного switch-exit или миграции.
     migration_summary: dict[str, Any] = {"migrated": 0, "cleared": 0}
     orphans = (
         db.query(models.Credential)
@@ -1065,6 +1029,56 @@ def detach_relay(
                     ),
                     client_address_v4=remaining.wg_client_address_v4,
                 )
+    return relay, link_id, migration_summary
+
+
+@router.delete("/exits/{exit_id}/links/{relay_node_id}", status_code=200)
+def detach_relay(
+    exit_id: int,
+    relay_node_id: int,
+    db: Session = Depends(get_db),
+    admin_token: str = Depends(require_admin),
+    admin_actor: str | None = Header(default=None, alias=ADMIN_ACTOR_HEADER),
+):
+    """Detach a relay from this exit (G.5: multi-exit aware).
+
+    Drops the single matching link row. If the relay has other
+    remaining links, ``relay_config`` is re-snapshotted from one of
+    them so the admin schema still flags this node as a relay; if
+    this was the last link, ``relay_config`` is cleared. Either way
+    a ``relay_tunnel`` task is scheduled — ansible re-renders the
+    exit's peer list without this client (``bootstrap_exit.yml`` +
+    ``wg syncconf``) and re-applies the relay's WG tunnel set from
+    ``relay_wg_links``: the removed ``wgN`` gets torn down by the
+    drift-reconciliation step in the ``relay_jump_node`` role, any
+    remaining ``wgN`` stays up.
+
+    Перед удалением линка все live creds с ``exit_id == exit_id`` и
+    ``node_id == relay.id`` перепиниваются: если остаются другие
+    линки — распределяются least-loaded по ним; если линков больше
+    нет — ``exit_id`` обнуляется в NULL. Без этого шага
+    ``build_xray_relay_outbounds`` выкидывает emails со stale
+    ``exit_id`` из routing rules и юзер идёт по default outbound
+    (direct), а не через оставшийся туннель.
+
+    Returns ``task_id`` so the admin UI can surface progress in
+    /tasks, plus ``credentials`` summary (migrated count +
+    распределение по exit'ам). ``task_id`` is ``None`` only if the
+    relay row was already gone (rare — FK cascade order drops the
+    link first).
+    """
+    link = (
+        db.query(models.RelayExitLink)
+        .filter(
+            models.RelayExitLink.exit_id == exit_id,
+            models.RelayExitLink.relay_node_id == relay_node_id,
+        )
+        .first()
+    )
+    if not link:
+        raise HTTPException(status_code=404, detail="Link not found")
+
+    relay, link_id, migration_summary = _detach_link_core(db, link)
     db.commit()
     actor, actor_type = _resolve_admin_actor(admin_actor)
     _audit(
@@ -1106,6 +1120,160 @@ def detach_relay(
         # админка показывает это в alert'е после detach'а.
         "credentials": migration_summary,
     }
+
+
+@router.post(
+    "/exits/{exit_id}/batch-detach",
+    response_model=schemas.BatchDetachRelayResponse,
+)
+def batch_detach_relay(
+    exit_id: int,
+    payload: schemas.BatchDetachRelayRequest,
+    db: Session = Depends(get_db),
+    admin_token: str = Depends(require_admin),
+    admin_actor: str | None = Header(default=None, alias=ADMIN_ACTOR_HEADER),
+):
+    """Отцепить несколько relay-нод от одного exit'а одним запросом.
+
+    Обратная операция к batch-attach (там один relay → N exit'ов, тут
+    один exit → N relay'ев). Для каждого relay повторяет логику
+    ``detach_relay`` через общий хелпер ``_detach_link_core`` (перепин
+    осиротевших creds → удаление link'а → пересборка relay_config-флага)
+    и ставит ``relay_tunnel`` teardown-task. Все task'и идут под общим
+    ``batch_id`` — UI рендерит прогресс N/M тем же drawer'ом, что и
+    batch-attach, retry отдельных upal'нувших через /tasks.
+
+    Best-effort по составу: relay_node_id без линка к этому exit'у — не
+    ошибка, попадает в ``not_found`` ответа (UI мог показывать stale
+    строку). Каждый relay независим (его линки/creds scoped по
+    ``node_id``), поэтому порядок обработки на результат не влияет.
+    """
+    exit_node = db.get(models.WGExitNode, exit_id)
+    if not exit_node:
+        raise HTTPException(status_code=404, detail="Exit node not found")
+
+    if not payload.relay_node_ids:
+        raise HTTPException(
+            status_code=400, detail="relay_node_ids must be non-empty"
+        )
+    if len(set(payload.relay_node_ids)) != len(payload.relay_node_ids):
+        raise HTTPException(
+            status_code=400,
+            detail="relay_node_ids содержит дубликаты — почистите список",
+        )
+
+    links_by_relay: dict[int, models.RelayExitLink] = {
+        row.relay_node_id: row
+        for row in (
+            db.query(models.RelayExitLink)
+            .filter(
+                models.RelayExitLink.exit_id == exit_id,
+                models.RelayExitLink.relay_node_id.in_(payload.relay_node_ids),
+            )
+            .all()
+        )
+    }
+    not_found = [
+        rid for rid in payload.relay_node_ids if rid not in links_by_relay
+    ]
+    if not links_by_relay:
+        raise HTTPException(
+            status_code=404,
+            detail="Ни один из выбранных relay не прицеплен к этому exit'у",
+        )
+
+    batch_id = uuid.uuid4()
+    orchestrator = ProvisioningOrchestrator(db)
+    # (relay_id, relay_name, link_id, migration_summary, task|None).
+    # Сохраняем порядок payload.relay_node_ids для стабильного ответа.
+    created_entries: list[
+        tuple[int, str, int, dict[str, Any], models.ProvisioningTask | None]
+    ] = []
+
+    try:
+        for relay_id in payload.relay_node_ids:
+            link = links_by_relay.get(relay_id)
+            if link is None:
+                continue  # уже учтён в not_found
+            relay, link_id, migration_summary = _detach_link_core(db, link)
+            relay_name = relay.name if relay is not None else f"#{relay_id}"
+            task = None
+            if relay is not None:
+                task = orchestrator.create_task(
+                    "relay_tunnel",
+                    relay.id,
+                    "apply",
+                    {"exit_id": exit_id, "link_id": link_id, "detach": True},
+                    batch_id=batch_id,
+                )
+            created_entries.append(
+                (relay_id, relay_name, link_id, migration_summary, task)
+            )
+    except IntegrityError as exc:
+        db.rollback()
+        raise HTTPException(
+            status_code=409,
+            detail=f"Batch detach race на FK/уникальном индексе: {exc.orig}",
+        ) from exc
+
+    db.commit()
+
+    actor, actor_type = _resolve_admin_actor(admin_actor)
+    for relay_id, _name, link_id, summary, _task in created_entries:
+        _audit(
+            db, actor, "relay_exit_detached", "relay_exit_link", link_id,
+            actor_type=actor_type,
+            metadata={
+                "exit_id": exit_id,
+                "relay_node_id": relay_id,
+                # Паритет с одиночным detach: пишем summary перепина creds.
+                "credentials": summary,
+            },
+        )
+    _audit(
+        db, actor, "relay_batch_detach", "wg_exit_node", exit_id,
+        actor_type=actor_type,
+        metadata={
+            "batch_id": str(batch_id),
+            "relay_node_ids": payload.relay_node_ids,
+            "detached": [rid for rid, *_ in created_entries],
+            "not_found": not_found,
+        },
+    )
+
+    # Enqueue после commit'а — worker по job_id подбирает row из БД; см.
+    # развёрнутый комментарий в batch_attach_relay. Redis-fail → task'и
+    # в pending, pending-rescue-tick их подберёт.
+    for _rid, _name, _lid, _summary, task in created_entries:
+        if task is None:
+            continue
+        try:
+            orchestrator.run_task_async(task)
+        except Exception:  # noqa: BLE001
+            logger.exception(
+                "run_task_async failed for batch %s task %s — "
+                "pending-rescue-tick should pick it up",
+                batch_id, task.id,
+            )
+
+    out_links = [
+        schemas.BatchDetachLinkOut(
+            relay_node_id=relay_id,
+            relay_node_name=relay_name,
+            link_id=link_id,
+            task_id=task.id if task is not None else None,
+            credentials=migration_summary,
+        )
+        for relay_id, relay_name, link_id, migration_summary, task
+        in created_entries
+    ]
+    return schemas.BatchDetachRelayResponse(
+        batch_id=batch_id,
+        exit_id=exit_id,
+        exit_name=exit_node.name,
+        links=out_links,
+        not_found=not_found,
+    )
 
 
 @router.post("/exits/{exit_id}/links/{relay_node_id}/reconnect", status_code=200)

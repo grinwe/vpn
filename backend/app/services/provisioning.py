@@ -19,6 +19,7 @@ from typing import Any
 
 from prometheus_client import Counter
 from sqlalchemy import func
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from .. import models
@@ -987,6 +988,27 @@ class ProvisioningOrchestrator:
 
         if success:
             if task.action == "apply":
+                # A device can be intentionally retired (disabled/revoked)
+                # WHILE its apply task is still queued — e.g.
+                # regenerate_subscription_sublink swaps out a still-pending
+                # device, or a migrate/freeze revokes one. The retirement is
+                # terminal: do NOT resurrect it to active. Reactivating would
+                # make it reappear in the ЛК next to its replacement, double-
+                # count live devices, and — via change_plan's live-count
+                # recompute (balance.py) — overcharge the user. Leave it
+                # retired; its UUID lingering on the node is harmless.
+                if device.status in (
+                    models.DeviceStatus.disabled,
+                    models.DeviceStatus.revoked,
+                ):
+                    logger.info(
+                        "apply task %s finished but device %s is already %s "
+                        "(retired in-flight) — skipping reactivation",
+                        task.id,
+                        device.id,
+                        device.status.value,
+                    )
+                    return
                 device.status = models.DeviceStatus.active
                 for cred in device.credentials:
                     cred.is_active = True
@@ -2523,6 +2545,87 @@ class ProvisioningOrchestrator:
         assert first_device is not None and first_task is not None
         return target, first_device, first_task
 
+    def migrate_subscription_to_free_node(
+        self,
+        subscription: models.Subscription,
+        *,
+        auto_ban_old_node: bool = True,
+        ban_reason: str | None = None,
+        banned_by: str | None = None,
+    ) -> tuple[models.VPNNode, models.Device, models.ProvisioningTask, bool]:
+        """«Обновить подписку»: переселить на свободный сервер из пула,
+        исключив ноды, где юзер забанен, и (опц.) забанив старую ноду.
+
+        Поверх ``migrate_subscription_to_new_node`` (который сам выбирает
+        ноду через ``choose_node`` и сохраняет sub_token-инвариант):
+          1. Собираем ``NodeUserBan`` юзера → передаём их + текущую ноду
+             в ``exclude_node_ids`` (auto-pick их пропустит).
+          2. Если ``auto_ban_old_node`` — заносим старую ноду в
+             ``NodeUserBan`` (идемпотентно: SELECT + fallback на
+             IntegrityError при гонке двух подписок одного юзера), чтобы
+             последующее «обновление» не вернуло юзера обратно на неё.
+
+        Возвращает ``(new_node, device, task, banned_old_node)`` — флаг =
+        добавили ли новую запись бана (False если она уже была /
+        auto_ban выключен / у подписки нет юзера).
+
+        Поднимает ``RuntimeError`` если свободной ноды нет (например, все
+        ноды пула в бан-листе юзера) — вызывающий маппит в HTTP 503.
+        """
+        old_node = subscription.node
+        if old_node is None:
+            raise RuntimeError("subscription has no node — cannot migrate")
+        user = subscription.user
+
+        banned_node_ids: list[int] = []
+        if user is not None:
+            banned_node_ids = [
+                row[0]
+                for row in self.db.query(models.NodeUserBan.node_id)
+                .filter(models.NodeUserBan.user_id == user.id)
+                .all()
+            ]
+
+        exclude = list(banned_node_ids)
+        if old_node.id not in exclude:
+            exclude.append(old_node.id)
+
+        new_node, device, task = self.migrate_subscription_to_new_node(
+            subscription, exclude_node_ids=exclude
+        )
+
+        banned_old_node = False
+        if auto_ban_old_node and user is not None:
+            existing = (
+                self.db.query(models.NodeUserBan)
+                .filter(
+                    models.NodeUserBan.user_id == user.id,
+                    models.NodeUserBan.node_id == old_node.id,
+                )
+                .first()
+            )
+            if existing is None:
+                try:
+                    self.db.add(
+                        models.NodeUserBan(
+                            user_id=user.id,
+                            node_id=old_node.id,
+                            reason=ban_reason
+                            or "auto: обновление подписки (свободный сервер)",
+                            created_by=banned_by,
+                        )
+                    )
+                    self.db.commit()
+                    banned_old_node = True
+                except IntegrityError:
+                    # Гонка: параллельный migrate-auto для другой подписки
+                    # того же юзера уже создал бан (user_id, old_node.id).
+                    # uq_node_user_ban → idempotent, просто откатываемся.
+                    self.db.rollback()
+                    banned_old_node = False
+
+        return new_node, device, task, banned_old_node
+
     def migrate_device_to_node(
         self,
         device: models.Device,
@@ -2649,6 +2752,111 @@ class ProvisioningOrchestrator:
         subscription.status = models.SubscriptionStatus.blocked
         self.db.commit()
         return tasks
+
+    def _disable_device_keep_on_node(self, device: models.Device) -> None:
+        """Retire a device in the DB WITHOUT revoking it on the node.
+
+        Unlike :meth:`revoke_device` this enqueues **no** ansible task —
+        the user's UUID stays in xray.clients[] so an already-connected
+        client keeps working on the old config. The Device row is kept
+        (status=disabled) per the sub-link invariant, so its sub_token
+        keeps resolving via the sibling-alias in ``/api/sub/{token}``.
+
+        Used by :meth:`regenerate_subscription_sublink`: the old link must
+        keep flowing while the user picks up the freshly-minted one.
+        Nothing prunes the stale UUID off the node — ``resync_node.yml``
+        only ever ``add``s, and the relay reconcile touches routing, not
+        clients — so the old connection survives every resync until an
+        explicit revoke (which we deliberately never issue here).
+        """
+        device.status = models.DeviceStatus.disabled
+        device.updated_at = utcnow()
+        for cred in device.credentials:
+            cred.is_active = False
+            cred.revoked_at = cred.revoked_at or utcnow()
+            cred.pool_state = models.CredentialPoolState.revoked
+        self.db.flush()
+
+    def regenerate_subscription_sublink(
+        self, subscription: models.Subscription
+    ) -> list[tuple[models.Device, models.ProvisioningTask]]:
+        """Mint a fresh sub-link for every live device, old links stay alive.
+
+        Incident-recovery / "rotate my link" primitive (NOT a server
+        move — for that use :meth:`migrate_subscription_to_free_node`).
+        For each currently-live device it provisions a BRAND-NEW device
+        on the **same** node (fresh sub_token + UUID + credentials, fresh
+        ansible apply) and retires the old one via
+        :meth:`_disable_device_keep_on_node` — so:
+
+        * the new token shows in the ЛК (the old disabled row drops out
+          of the webapp's live-device list),
+        * the old token keeps resolving (sibling-alias → new device),
+        * the old UUID stays on the node, so the user keeps connecting on
+          the old config until they grab the new link.
+
+        Cost is unchanged: ``extra_device_slots`` is never touched and the
+        live device count is preserved (one new per retired old). A sub
+        with zero live devices (the incident tail — a Device with no
+        sub_token, or a fully-revoked sub) gets a single fresh device.
+
+        Returns ``[(new_device, apply_task), ...]``. Raises ``RuntimeError``
+        if the sub is not active or has no usable node (caller skips it).
+        """
+        if subscription.status != models.SubscriptionStatus.active:
+            raise RuntimeError(
+                f"subscription is {subscription.status.value}, must be active"
+            )
+        node = subscription.node
+        if node is None:
+            raise RuntimeError("subscription has no node — cannot regenerate")
+        if not node.is_active:
+            raise RuntimeError(f"node {node.id} is not active")
+
+        live_devices = [
+            d
+            for d in subscription.devices
+            if d.status
+            not in (models.DeviceStatus.revoked, models.DeviceStatus.disabled)
+        ]
+
+        results: list[tuple[models.Device, models.ProvisioningTask]] = []
+
+        # Incident tail: a sub with no live device at all → just create one.
+        if not live_devices:
+            device, task = self.reprovision_subscription(
+                subscription, device_name="primary"
+            )
+            results.append((device, task))
+            self.db.commit()
+            return results
+
+        # Replace each live device 1:1 so the visible & billable count is
+        # preserved. Keep the friendly name so the user sees the same
+        # device label after the swap.
+        #
+        # Per-pair atomicity matters: retire the old device FIRST (DB-only,
+        # its UUID stays on the node) so reprovision's own commit flushes
+        # the disable AND the new device together — there is never a window
+        # where the new row is durable without its retired counterpart.
+        # On any failure we roll back just this iteration — the pending
+        # disable is undone, leaving the old device live & unreplaced (prior
+        # pairs are already committed and survive) — and re-raise so the bulk
+        # endpoint records the sub under `failed`. Net: never a duplicate and
+        # never an over-count, so the cost invariant holds even on failure.
+        for idx, old in enumerate(live_devices, start=1):
+            try:
+                self._disable_device_keep_on_node(old)
+                device, task = self.reprovision_subscription(
+                    subscription, device_name=old.name or f"device-{idx}"
+                )
+                self.db.commit()
+            except Exception:
+                self.db.rollback()
+                raise
+            results.append((device, task))
+
+        return results
 
     def switch_subscription_exit(
         self,

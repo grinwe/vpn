@@ -65,6 +65,26 @@ interface RelayExitLinkOut {
   active_subs: number;
 }
 
+interface BatchDetachLinkOut {
+  relay_node_id: number;
+  relay_node_name: string;
+  link_id: number;
+  task_id: number | null;
+  credentials: {
+    migrated?: number;
+    cleared?: number;
+    distribution?: Record<string, number>;
+  };
+}
+
+interface BatchDetachRelayResponse {
+  batch_id: string;
+  exit_id: number;
+  exit_name: string;
+  links: BatchDetachLinkOut[];
+  not_found: number[];
+}
+
 interface ExitEvacuateOut {
   from_exit_id: number;
   to_exit_id: number;
@@ -414,7 +434,10 @@ export default function Exits() {
                   {isOpen && (
                     <tr className="bg-slate-900/50">
                       <td colSpan={15} className="p-4">
-                        <ExitLinksPanel exitNode={e} />
+                        <ExitLinksPanel
+                          exitNode={e}
+                          onBatchStarted={setBatchProgressId}
+                        />
                       </td>
                     </tr>
                   )}
@@ -576,9 +599,19 @@ function EvacuateExitModal({
   );
 }
 
-function ExitLinksPanel({ exitNode }: { exitNode: WGExitNodeOut }) {
+function ExitLinksPanel({
+  exitNode,
+  onBatchStarted,
+}: {
+  exitNode: WGExitNodeOut;
+  onBatchStarted?: (batchId: string) => void;
+}) {
   const qc = useQueryClient();
   const [showAttach, setShowAttach] = useState(false);
+  // Выбор relay'ев для массовой отвязки (обратное к batch-attach).
+  const [selectedForDetach, setSelectedForDetach] = useState<Set<number>>(
+    new Set(),
+  );
 
   const links = useQuery<RelayExitLinkOut[]>({
     queryKey: ["wg-exit-links", exitNode.id],
@@ -632,6 +665,34 @@ function ExitLinksPanel({ exitNode }: { exitNode: WGExitNodeOut }) {
             credMsg,
         );
       }
+    },
+    onError: (e: Error) => alert(`Ошибка: ${e.message}`),
+  });
+
+  // Массовая отвязка: отцепить выбранные relay'и от этого exit'а одним
+  // POST'ом. Все ansible-задачи идут под общим batch_id — прогресс
+  // показывает тот же BatchProgressDrawer, что и batch-attach (через
+  // onBatchStarted в родительском Exits).
+  const batchDetachMut = useMutation({
+    mutationFn: (relayIds: number[]) =>
+      api.post<BatchDetachRelayResponse>(
+        `/exits/${exitNode.id}/batch-detach`,
+        { relay_node_ids: relayIds },
+      ),
+    onSuccess: (res) => {
+      qc.invalidateQueries({ queryKey: ["wg-exit-links", exitNode.id] });
+      qc.invalidateQueries({ queryKey: ["wg-exits"] });
+      qc.invalidateQueries({ queryKey: ["provisioning-tasks"] });
+      qc.invalidateQueries({ queryKey: ["user-subs"] });
+      setSelectedForDetach(new Set());
+      if (res.batch_id) onBatchStarted?.(res.batch_id);
+      const nf = res.not_found.length
+        ? `\nПропущено (не было линка к этому exit): ${res.not_found.length}.`
+        : "";
+      alert(
+        `Отцеплено relay: ${res.links.length}. Ansible крутится в фоне ` +
+          `под общим batch — следи в drawer'е справа / вкладке Tasks.${nf}`,
+      );
     },
     onError: (e: Error) => alert(`Ошибка: ${e.message}`),
   });
@@ -690,11 +751,48 @@ function ExitLinksPanel({ exitNode }: { exitNode: WGExitNodeOut }) {
     (n) => n.is_active && !alreadyAttached.has(n.id),
   );
 
+  const allRelayIds = (links.data ?? []).map((l) => l.relay_node_id);
+  const allSelected =
+    allRelayIds.length > 0 &&
+    allRelayIds.every((id) => selectedForDetach.has(id));
+  const toggleSelectAll = () =>
+    setSelectedForDetach(allSelected ? new Set() : new Set(allRelayIds));
+  const toggleSelectOne = (id: number) =>
+    setSelectedForDetach((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  const runBatchDetach = () => {
+    if (selectedForDetach.size === 0) return;
+    if (
+      confirm(
+        `Отсоединить ${selectedForDetach.size} relay-нод от ${exitNode.name}?\n\n` +
+          "Для каждой запустится ansible (как в одиночном detach): peer уйдёт " +
+          "из wg0.conf exit'а, wgN на relay'е снимется, Xray rule/outbound " +
+          "удалятся. Осиротевшие creds перепинятся на оставшиеся линки релея " +
+          "либо обнулятся (если это был последний линк).",
+      )
+    )
+      batchDetachMut.mutate(Array.from(selectedForDetach));
+  };
+
   return (
     <div className="space-y-3">
       <div className="flex items-center justify-between">
         <h3 className="text-sm font-semibold text-slate-300">Attached relays</h3>
         <div className="flex gap-2">
+          <button
+            disabled={selectedForDetach.size === 0 || batchDetachMut.isPending}
+            onClick={runBatchDetach}
+            title="Массово отцепить выбранные relay-ноды от этого exit'а — одной транзакцией, прогресс в drawer'е справа"
+            className="text-xs px-3 py-1 rounded bg-red-700 hover:bg-red-600 disabled:opacity-50"
+          >
+            {batchDetachMut.isPending
+              ? "Отцепляю…"
+              : `⇆ Отцепить выбранные (${selectedForDetach.size})`}
+          </button>
           <button
             disabled={refreshHealthMut.isPending}
             onClick={() => refreshHealthMut.mutate()}
@@ -744,6 +842,15 @@ function ExitLinksPanel({ exitNode }: { exitNode: WGExitNodeOut }) {
         <table className="w-full text-xs">
           <thead className="text-slate-400">
             <tr>
+              <th className="py-1 px-2 w-6">
+                <input
+                  type="checkbox"
+                  checked={allSelected}
+                  onChange={toggleSelectAll}
+                  title="Выбрать все"
+                  aria-label="Выбрать все relay"
+                />
+              </th>
               <th className="text-left py-1 px-2">Relay</th>
               <th className="text-left py-1 px-2">Iface</th>
               <th className="text-left py-1 px-2">WG client addr</th>
@@ -759,6 +866,14 @@ function ExitLinksPanel({ exitNode }: { exitNode: WGExitNodeOut }) {
               const h = linkHealth(l);
               return (
               <tr key={l.id} className="border-t border-slate-800">
+                <td className="py-1 px-2">
+                  <input
+                    type="checkbox"
+                    checked={selectedForDetach.has(l.relay_node_id)}
+                    onChange={() => toggleSelectOne(l.relay_node_id)}
+                    aria-label={`Выбрать ${l.relay_node_name}`}
+                  />
+                </td>
                 <td className="py-1 px-2 font-mono">
                   #{l.relay_node_id} {l.relay_node_name}
                 </td>

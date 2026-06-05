@@ -8,6 +8,7 @@ those are webapp-JWT gated.
 from __future__ import annotations
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query
+from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
 from .. import models, schemas
@@ -54,6 +55,229 @@ def _subscription_provision_response(
             provisioning_task_id=task.id,
         ),
     )
+
+
+# ── Mass actions over a set of users ─────────────────────────────────
+#
+# Both bulk endpoints fire ansible per device (regenerate: 1 apply per
+# device; migrate: revoke+apply per device) and drain through the single
+# serial RQ worker. The 2026-04/05 incidents were exactly an ansible
+# backlog thrashing one xray node, so the per-request user cap is kept
+# deliberately LOW (batch_ban's 500 is fine for a pure-DB loop, NOT for
+# this). The admin UI chunks larger selections; bump worker replicas
+# (scripts/workers.sh) before big runs.
+_BULK_USERS_MAX = 25
+
+
+class BulkUserIdsRequest(BaseModel):
+    user_ids: list[int] = Field(min_length=1, max_length=_BULK_USERS_MAX)
+
+
+def _notify_sublink_rotated(db: Session, user: models.User) -> bool:
+    """Queue a "grab your new link from the ЛК" Telegram nudge.
+
+    The bot polls ``/api/notifications/pending`` for system AuditLog rows
+    with action ``sublink_rotated``; the row is silently dropped without
+    ``extra.telegram_id`` — so email-only users get nothing (reported as
+    "not notified" in the bulk summary). Honors the per-user
+    ``notify_migrations`` opt-out, same as health-driven migration notices.
+    """
+    if not (user.telegram_id and user.notify_migrations):
+        return False
+    db.add(
+        models.AuditLog(
+            actor="admin_regen",
+            actor_type=models.AuditActor.system,
+            action="sublink_rotated",
+            target_type="user",
+            target_id=user.id,
+            extra={"telegram_id": user.telegram_id},
+        )
+    )
+    # Commit the nudge immediately so a LATER user's failure (which rolls
+    # the session back) can never strand an already-completed user's
+    # notification while their new link is durably committed.
+    db.commit()
+    return True
+
+
+@router.post("/subscriptions/bulk-regenerate-sublink")
+def bulk_regenerate_sublink(
+    body: BulkUserIdsRequest,
+    db: Session = Depends(get_db),
+    admin_token: str = Depends(require_admin),
+    admin_actor: str | None = Header(default=None, alias=ADMIN_ACTOR_HEADER),
+):
+    """Mass «перегенерировать sub-link» over a set of users.
+
+    For every ACTIVE subscription of each user, regenerate the sub-link
+    (fresh token+UUID+creds on the SAME node, old link kept alive — see
+    ``ProvisioningOrchestrator.regenerate_subscription_sublink``) and send
+    the user a Telegram nudge to grab the new link from their ЛК.
+
+    This is NOT a server move — for that use ``/bulk-migrate-auto``. The
+    ``sub_token`` CHANGES (a new URL appears in the ЛК), but the monthly
+    cost is unchanged: ``extra_device_slots`` is never touched and the
+    live device count is preserved 1:1. Old devices stay on the node so
+    the user keeps connecting until they pick up the new link.
+    """
+    actor, actor_type = _resolve_admin_actor(admin_actor)
+    orchestrator = ProvisioningOrchestrator(db)
+
+    users = (
+        db.query(models.User).filter(models.User.id.in_(body.user_ids)).all()
+    )
+    found = {u.id for u in users}
+    not_found = [uid for uid in body.user_ids if uid not in found]
+
+    done: list[int] = []
+    skipped: list[int] = []
+    notified: list[int] = []
+    failed: list[dict] = []
+    subs_done = 0
+    devices_created = 0
+
+    for user in users:
+        active_subs = (
+            db.query(models.Subscription)
+            .filter(
+                models.Subscription.user_id == user.id,
+                models.Subscription.status == models.SubscriptionStatus.active,
+            )
+            .all()
+        )
+        if not active_subs:
+            skipped.append(user.id)
+            continue
+        any_ok = False
+        for sub in active_subs:
+            try:
+                created = orchestrator.regenerate_subscription_sublink(sub)
+            except Exception as exc:  # noqa: BLE001
+                # Batch resilience: one bad sub must never abort the whole
+                # run. Roll back its partial state so the session is clean
+                # for the next sub, and surface it for the operator.
+                db.rollback()
+                failed.append(
+                    {"user_id": user.id, "subscription_id": sub.id, "error": str(exc)}
+                )
+                continue
+            any_ok = True
+            subs_done += 1
+            devices_created += len(created)
+            _audit(
+                db,
+                actor,
+                "sublink_regenerated",
+                "subscription",
+                sub.id,
+                actor_type=actor_type,
+                metadata={"devices_created": len(created)},
+            )
+        if any_ok:
+            done.append(user.id)
+            if _notify_sublink_rotated(db, user):
+                notified.append(user.id)
+
+    db.commit()
+    return {
+        "done": done,
+        "skipped": skipped,
+        "not_found": not_found,
+        "failed": failed,
+        "notified": notified,
+        "subscriptions_regenerated": subs_done,
+        "devices_created": devices_created,
+    }
+
+
+@router.post("/subscriptions/bulk-migrate-auto")
+def bulk_migrate_auto(
+    body: BulkUserIdsRequest,
+    db: Session = Depends(get_db),
+    admin_token: str = Depends(require_admin),
+    admin_actor: str | None = Header(default=None, alias=ADMIN_ACTOR_HEADER),
+):
+    """Mass «переехать на другой сервер» over a set of users.
+
+    For every ACTIVE subscription of each user, auto-pick a free healthy
+    node (excluding the current one + the user's node ban-list), migrate,
+    and auto-ban the old node — the bulk version of the per-card
+    ``/migrate-auto``. The ``sub_token`` is PRESERVED (sub-link invariant):
+    the client's URL keeps working, only the server changes, so NO user
+    notification is sent (the profile auto-updates via the sibling-alias).
+    """
+    actor, actor_type = _resolve_admin_actor(admin_actor)
+    orchestrator = ProvisioningOrchestrator(db)
+
+    users = (
+        db.query(models.User).filter(models.User.id.in_(body.user_ids)).all()
+    )
+    found = {u.id for u in users}
+    not_found = [uid for uid in body.user_ids if uid not in found]
+
+    done: list[int] = []
+    skipped: list[int] = []
+    failed: list[dict] = []
+    subs_migrated = 0
+
+    for user in users:
+        active_subs = (
+            db.query(models.Subscription)
+            .filter(
+                models.Subscription.user_id == user.id,
+                models.Subscription.status == models.SubscriptionStatus.active,
+                models.Subscription.node_id.isnot(None),
+            )
+            .all()
+        )
+        if not active_subs:
+            skipped.append(user.id)
+            continue
+        any_ok = False
+        for sub in active_subs:
+            old_node = sub.node
+            try:
+                new_node, _dev, task, banned_old = (
+                    orchestrator.migrate_subscription_to_free_node(sub, banned_by=actor)
+                )
+            except Exception as exc:  # noqa: BLE001
+                # RuntimeError = no free node (pool empty / all unhealthy /
+                # all banned). Broadened to Exception for batch resilience:
+                # a DB/transient error on one sub must not abort the run.
+                # Roll back so the session is clean for the next sub.
+                db.rollback()
+                failed.append(
+                    {"user_id": user.id, "subscription_id": sub.id, "error": str(exc)}
+                )
+                continue
+            any_ok = True
+            subs_migrated += 1
+            _audit(
+                db,
+                actor,
+                "subscription_migrated",
+                "subscription",
+                sub.id,
+                actor_type=actor_type,
+                metadata={
+                    "old_node_id": old_node.id if old_node else None,
+                    "new_node_id": new_node.id,
+                    "banned_old_node": banned_old,
+                    "reason": "bulk auto free-server",
+                },
+            )
+        if any_ok:
+            done.append(user.id)
+
+    db.commit()
+    return {
+        "done": done,
+        "skipped": skipped,
+        "not_found": not_found,
+        "failed": failed,
+        "subscriptions_migrated": subs_migrated,
+    }
 
 
 @router.post("/subscriptions", response_model=schemas.SubscriptionProvisionResponse)
@@ -370,6 +594,77 @@ def migrate_subscription(
         new_node_id=new_node.id,
         new_node_name=new_node.name,
         provisioning_task_id=task.id if task else None,
+    )
+
+
+@router.post(
+    "/subscriptions/{subscription_id}/migrate-auto",
+    response_model=schemas.SubscriptionMigrateOut,
+)
+def migrate_subscription_auto(
+    subscription_id: int,
+    db: Session = Depends(get_db),
+    admin_token: str = Depends(require_admin),
+    admin_actor: str | None = Header(default=None, alias=ADMIN_ACTOR_HEADER),
+):
+    """«Обновить подписку»: авто-выбор свободного сервера + миграция.
+
+    В отличие от ``/migrate`` (админ задаёт target вручную), здесь
+    ``choose_node`` сам берёт наименее загруженную здоровую ноду пула,
+    исключая текущую И ноды из бан-листа юзера (``NodeUserBan``). Старая
+    нода авто-банится для этого юзера, чтобы повторное «обновление» не
+    вернуло его обратно. ``sub_token`` сохраняется (инвариант sub-link).
+
+    Бесплатно, без подтверждения target — кнопка «дай другой сервер».
+    Тот же путь в будущем дёргает ЛК юзера (``api_webapp``).
+    """
+    sub = db.get(models.Subscription, subscription_id)
+    if not sub:
+        raise HTTPException(status_code=404, detail="Subscription not found")
+    if sub.status != models.SubscriptionStatus.active:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Subscription is {sub.status.value}, must be active",
+        )
+    old_node = sub.node
+    if old_node is None:
+        raise HTTPException(status_code=400, detail="Subscription has no node")
+
+    actor, actor_type = _resolve_admin_actor(admin_actor)
+    orchestrator = ProvisioningOrchestrator(db)
+    try:
+        new_node, _device, task, banned_old = (
+            orchestrator.migrate_subscription_to_free_node(sub, banned_by=actor)
+        )
+    except RuntimeError as exc:
+        # Свободной ноды нет: пул пуст / все нездоровы / все в бан-листе.
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+    _audit(
+        db,
+        actor,
+        "subscription_migrated",
+        "subscription",
+        sub.id,
+        actor_type=actor_type,
+        metadata={
+            "old_node_id": old_node.id,
+            "old_node_name": old_node.name,
+            "new_node_id": new_node.id,
+            "new_node_name": new_node.name,
+            "banned_old_node": banned_old,
+            "reason": "auto free-server (обновление подписки)",
+        },
+    )
+    db.commit()
+    return schemas.SubscriptionMigrateOut(
+        subscription_id=sub.id,
+        old_node_id=old_node.id,
+        old_node_name=old_node.name,
+        new_node_id=new_node.id,
+        new_node_name=new_node.name,
+        provisioning_task_id=task.id if task else None,
+        banned_old_node=banned_old,
     )
 
 

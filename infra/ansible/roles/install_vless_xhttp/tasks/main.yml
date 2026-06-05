@@ -120,6 +120,55 @@
     group: nogroup
     mode: '0750'
 
+# geoip.dat нужен XHTTP так же, как Reality: routing-правило RU-обхода
+# `ip: ["geoip:ru", "geoip:private"]` без файла данных не резолвится и
+# xray падает с "failed to load geoip" на старте. На комбинированной
+# ноде каталог и сам geoip.dat могли уже встать от install_vless_reality —
+# state:directory и get_url force:no идемпотентны (повторно не качают).
+# force:no качает один раз на bootstrap; еженедельное обновление — общий
+# systemd timer ниже (он же рестартит и xray, и xray-xhttp).
+- name: Ensure xray data directory
+  file:
+    path: /usr/local/share/xray
+    state: directory
+    owner: root
+    group: root
+    mode: '0755'
+
+- name: Download geoip.dat (v2fly community, MIT)
+  get_url:
+    url: https://github.com/v2fly/geoip/releases/latest/download/geoip.dat
+    dest: /usr/local/share/xray/geoip.dat
+    mode: '0644'
+    force: no
+  # RU-ноды: РКН плавающе троттлит github/githubusercontent — TLS-handshake
+  # отваливается по таймауту. Ретраим, плавающий троттл обычно пропускает
+  # со 2-3 попытки. Стабильную блокировку это не лечит (тогда нужно зеркало).
+  register: geoip_download
+  until: geoip_download is succeeded
+  retries: 5
+  delay: 15
+  notify: restart xray xhttp
+
+- name: Install geoip-update systemd units
+  template:
+    src: "{{ item.src }}"
+    dest: "{{ item.dest }}"
+    owner: root
+    group: root
+    mode: '0644'
+  loop:
+    - { src: geoip-update.service.j2, dest: /etc/systemd/system/geoip-update.service }
+    - { src: geoip-update.timer.j2,   dest: /etc/systemd/system/geoip-update.timer }
+  notify: reload systemd
+
+- name: Enable weekly geoip refresh timer
+  systemd:
+    name: geoip-update.timer
+    enabled: yes
+    state: started
+    daemon_reload: yes
+
 - name: Obtain TLS certificate via certbot (if no cert path provided)
   when: (vless_xhttp_cert_path | default('')) == ''
   block:
@@ -286,6 +335,16 @@
     mode: '0640'
     backup: yes
   notify: restart xray xhttp
+
+# Ловим битый рендер (в т.ч. отсутствующий geoip.dat для RU-обхода) до
+# старта сервиса — иначе xray-xhttp молча падает в systemd 23/EXEC, а на
+# нодах с volatile journald причину потом не восстановить. -test печатает
+# реальный текст ошибки прямо в вывод ansible.
+- name: Validate xray XHTTP config before starting
+  command: /usr/local/bin/xray -test -config /usr/local/etc/xray/config_xhttp.json
+  register: xray_xhttp_config_test
+  changed_when: false
+  failed_when: xray_xhttp_config_test.rc != 0
 
 # ── Stage-4 TLS vhost ────────────────────────────────────────────────
 #

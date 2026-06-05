@@ -115,6 +115,56 @@ export function batchBanUsers(
   });
 }
 
+// Per-subscription failure entry shared by both bulk-subscription ops.
+export interface BulkUserFailure {
+  user_id: number;
+  subscription_id: number;
+  error: string;
+}
+
+// POST /subscriptions/bulk-regenerate-sublink — массовая ПЕРЕГЕНЕРАЦИЯ
+// sub-link: каждому активному устройству выбранных юзеров выдаётся новая
+// ссылка (в ЛК), старая остаётся живой, + Telegram-уведомление. sub_token
+// МЕНЯЕТСЯ. Стоимость прежняя (extra_device_slots не трогаем). Бэкенд
+// капит на 25 юзеров/запрос — UI чанкует.
+export interface BulkRegenerateResult {
+  done: number[];
+  skipped: number[];
+  not_found: number[];
+  failed: BulkUserFailure[];
+  notified: number[];
+  subscriptions_regenerated: number;
+  devices_created: number;
+}
+
+export function bulkRegenerateSublink(
+  userIds: number[],
+): Promise<BulkRegenerateResult> {
+  return api.post<BulkRegenerateResult>(
+    "/subscriptions/bulk-regenerate-sublink",
+    { user_ids: userIds },
+  );
+}
+
+// POST /subscriptions/bulk-migrate-auto — массовый ПЕРЕЕЗД выбранных
+// юзеров на свободные ноды (bulk-версия карточной migrate-auto). sub_token
+// СОХРАНЯЕТСЯ, уведомления нет (профиль обновляется сам через alias).
+export interface BulkMigrateResult {
+  done: number[];
+  skipped: number[];
+  not_found: number[];
+  failed: BulkUserFailure[];
+  subscriptions_migrated: number;
+}
+
+export function bulkMigrateAuto(
+  userIds: number[],
+): Promise<BulkMigrateResult> {
+  return api.post<BulkMigrateResult>("/subscriptions/bulk-migrate-auto", {
+    user_ids: userIds,
+  });
+}
+
 export function adminTopupByTelegram(
   telegramId: string,
   amountKopecks: number,
@@ -275,6 +325,9 @@ export interface SubscriptionMigrateOut {
   new_node_id: number;
   new_node_name: string;
   provisioning_task_id: number | null;
+  // Заполняется только авто-миграцией (/migrate-auto): забанили ли
+  // старую ноду для юзера. null/undefined для ручной /migrate.
+  banned_old_node?: boolean | null;
 }
 
 export interface SubscriptionSwitchExitIn {
@@ -581,6 +634,40 @@ export function adminReportFailureForSubscription(
     "/admin/client-control/report-for-subscription",
     body,
   );
+}
+
+// «Обновить подписку»: авто-выбор свободного сервера из пула (исключая
+// текущую ноду и ноды из бан-листа юзера) + миграция + авто-бан старой
+// ноды. sub_token сохраняется. В будущем тот же путь — в ЛК юзера.
+export function migrateSubscriptionAuto(
+  subId: number,
+): Promise<SubscriptionMigrateOut> {
+  return api.post<SubscriptionMigrateOut>(
+    `/subscriptions/${subId}/migrate-auto`,
+    {},
+  );
+}
+
+// Per-node баны юзера — ноды, на которые авто-выбор его не селит.
+export interface NodeUserBanOut {
+  id: number;
+  user_id: number;
+  node_id: number;
+  node_name: string | null;
+  reason: string | null;
+  created_by: string | null;
+  created_at: string;
+}
+
+export function listUserNodeBans(userId: number): Promise<NodeUserBanOut[]> {
+  return api.get<NodeUserBanOut[]>(`/users/${userId}/node-bans`);
+}
+
+export function removeUserNodeBan(
+  userId: number,
+  nodeId: number,
+): Promise<{ status: string }> {
+  return api.del<{ status: string }>(`/users/${userId}/node-bans/${nodeId}`);
 }
 
 export interface PlanOut {

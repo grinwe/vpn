@@ -75,6 +75,13 @@
     dest: /usr/local/share/xray/geoip.dat
     mode: '0644'
     force: no
+  # RU-ноды: РКН плавающе троттлит github/githubusercontent — TLS-handshake
+  # отваливается по таймауту. Ретраим, плавающий троттл обычно пропускает
+  # со 2-3 попытки. Стабильную блокировку это не лечит (тогда нужно зеркало).
+  register: geoip_download
+  until: geoip_download is succeeded
+  retries: 5
+  delay: 15
   notify: restart xray
 
 - name: Install geoip-update systemd units

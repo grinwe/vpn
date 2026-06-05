@@ -124,6 +124,26 @@ class VPNNode(Base):
 
 `suspect_since` — Phase D traffic-drop детектор (`services/traffic_stats.py::detect_traffic_drops`). Ставится моментом, когда `active_users` на ноде упал с ≥`TRAFFIC_DROP_MIN_USERS` до 0 между двумя traffic_stats тиками (пассивный ТСПУ-сигнал). На следующем тике — либо `status=error`/`cooldown_until=+3d`/`suspect_since=NULL` (подтверждение: трафик пошёл на мигрированных подписках на ноде другого региона), либо `suspect_since=NULL` (false-alarm). Не часть `VPNNodeStatus` enum'а — это промежуточное подозрение внутри детектора, не часть жизненного цикла.
 
+### `node_user_bans`
+
+Per-node бан юзера: ноды, на которые авто-выбор НЕ должен селить данного юзера. **Ортогонально** `users.banned_at` (тот — глобальный бан на уровне бота).
+
+```python
+# backend/app/models.py — class NodeUserBan
+class NodeUserBan(Base):
+    id,
+    user_id → users (ON DELETE CASCADE, index),
+    node_id → vpn_nodes (ON DELETE CASCADE, index),
+    reason: Text NULL,
+    created_by: String NULL,   # admin-actor / "auto" / telegram_id
+    created_at
+    # UniqueConstraint(user_id, node_id) = uq_node_user_ban
+```
+
+- Заполняется авто-миграцией: «Обновить подписку» (`POST /api/subscriptions/{id}/migrate-auto` → `ProvisioningOrchestrator.migrate_subscription_to_free_node`) выбирает свободный сервер пула, исключая текущую ноду **и** ноды из бан-листа юзера (через `choose_node(exclude_node_ids=...)`), мигрирует с сохранением `sub_token`, и **банит старую ноду** (`created_by=actor`, `reason="auto: …"`), чтобы повторное «обновление» не вернуло юзера обратно.
+- Ручное управление: `GET /api/users/{id}/node-bans`, `POST /api/users/{id}/node-bans` (`{node_id, reason}`, идемпотентно по паре), `DELETE /api/users/{id}/node-bans/{node_id}` (разбан). В admin SPA (Users.tsx) — панель «Бан-лист нод» с разбаном + кнопка «🔄 обновить подписку» в строке активной подписки. Аудит: `node_user_banned` / `node_user_unbanned` / `subscription_migrated`.
+- Бан per-**USER**, а не per-subscription: у юзера может быть несколько подписок, бан ноды распространяется на все. Миграция 0038.
+
 ### `vpn_configs`
 
 Конфигурация одного протокола на одной ноде. Одна нода обычно имеет несколько `VPNConfig` — по одной на активный протокол (ShadowTLS, Reality, WS CDN, xHTTP, Hysteria2).

@@ -187,6 +187,35 @@ client ──TLS (Reality, RU :443)──▶ jump node (RU) ──WireGuard tunn
 - **Не** ставит xray, shadow-tls, hysteria. **Не** живёт в `vpn_nodes` таблице (обычно) — это «inventory-only» машина, про которую БД ничего не знает. Её `ansible_host` прописан в group `wg_exit_nodes` статического inventory.
 - На момент написания группа `wg_exit_nodes` в `inventories/prod/hosts.yml` **пустая** — relay-cхема описана в коде, но в проде не работает. См. ⚠️ ниже.
 
+### RU-обход (split-tunnel на geoip:ru)
+
+Поверх обеих схем работает **разделение трафика по назначению**: запросы к РУ-зоне выходят с собственного IP ноды (direct), всё остальное идёт в туннель/exit. Это держит клиенту доступ к РУ-банкам/госуслугам (которые геоблочат зарубежные IP) и снижает внимание ТСПУ к подключению.
+
+Реализовано **server-side в xray** на двух протоколах — `vless_reality` ([install_vless_reality/templates/config.json.j2](../../infra/ansible/roles/install_vless_reality/templates/config.json.j2)) и `vless_xhttp` ([install_vless_xhttp/templates/config_xhttp.json.j2](../../infra/ansible/roles/install_vless_xhttp/templates/config_xhttp.json.j2)). В обоих `routing` (`domainStrategy: IPIfNonMatch`) два правила, стоящие **перед** per-user relay-fan-out (first-match-wins):
+
+```jsonc
+{ "domain": ["regexp:\\.ru$", "regexp:\\.su$", "regexp:\\.xn--p1ai$", "regexp:^(yandex|...|dtf)\\..+$"], "outboundTag": "direct-local" },
+{ "ip": ["geoip:ru", "geoip:private"], "outboundTag": "direct-local" }
+```
+
+`direct-local` — freedom-outbound **без** `sockopt.interface`, поэтому даже на relay-ноде РУ-трафик выходит с её родного (РУ) IP, а не уходит в WireGuard к exit'у. Список доменов — **намеренно самописный regexp** (курированный список РУ-хостов), а не `geosite:category-ru`; geoip:ru покрывает резолвящиеся в РУ-IP домены через `IPIfNonMatch`.
+
+`geoip.dat` (v2fly community, MIT) ставится обеими ролями в `/usr/local/share/xray/geoip.dat` (`get_url force:no` — один раз на bootstrap, идемпотентно на комбинированной ноде) и обновляется еженедельным `geoip-update.timer`; refresh-сервис делает `try-restart` обоих флаворов (`xray` и `xray-xhttp`) best-effort (`-` префикс — трогает только активные юниты). Без файла xray падает с `failed to load geoip` — поэтому обе роли валидируют рендер через `xray -test` до старта.
+
+**Почему именно так — 5 выстраданных правок** (рационал жил в сообщениях коммитов, не было отдельной доки — этот раздел её заменяет). Каждый пункт — отдельный fix после реального бага, проверенного по access-логам xray:
+
+1. **`direct-local` без `sockopt` отдельным outbound'ом** (`678fb3b`). На relay-ноде дефолтный `direct` outbound патчится `sockopt.interface = wgN` → весь «direct» трафик уходит в WG к exit'у. Первая версия правила слала `geoip:ru → direct` — и РУ-трафик послушно утекал на exit (2ip.ru с клиента показывал IP exit-ноды). Нужен **отдельный** freedom-outbound без sockopt = чистый egress через main-iface ноды.
+2. **`domainStrategy: IPIfNonMatch`** (`9353a76`). Дефолтный `AsIs` не резолвит domain-назначения в IP → правило `ip:[geoip:ru]` по domain-коннектам **никогда не матчит**. `IPIfNonMatch` резолвит domain в IP, только если ни одно domain-правило не попало (минимальный overhead).
+3. **Секция `dns` (Yandex первым)** (`a6d7c58`). Без `dns` xray не резолвит domain→IP для routing'а, и `IPIfNonMatch` молча не срабатывает. Лог подтверждал: `accepted tcp:2ip.ru:443 [vless-reality -> direct-wg2]` (назначение — domain, geoip-правило не применилось). Порядок DNS: **Yandex `77.88.8.8` первым** — отдаёт РУ-IP для РУ-сайтов даже за CDN (foreign DNS часто возвращает Cloudflare). Сам DNS-трафик к 77.88.8.8 попадает под `geoip:ru → direct-local`.
+4. **Domain-правило ДО geoip-правила** (`48ae3bd`). Даже со всем выше geoip-путь оказался ненадёжен (в той Reality-сборке geoip.dat либо не грузился, либо `IPIfNonMatch` не резолвил sniffed-SNI до routing'а — в логах старта не было строк про geoip). Domain-правило матчит **прямо по sniffed SNI, без резолва** — покрывает `.ru/.su/.рф` + явный список `.com`-доменов РУ-гигантов. Geoip-правило остаётся **ниже как safety-net** для прямых IP-коннектов (когда клиент обходит sniffing).
+5. **Требует `sniffing.enabled: true` + `destOverride: [http, tls]`** на inbound — иначе пункт 4 (matching по SNI) не работает. Оба конфига (Reality и XHTTP) это имеют.
+
+> **XHTTP-специфика:** XHTTP-inbound слушает loopback за nginx (Stage-4 camo), но sniffing работает по **внутреннему** TLS-stream'у проксируемого коннекта, не по внешнему транспорту — поэтому RU-обход на XHTTP идентичен Reality. Reconcile relay-линков (`xray_reconcile.jq`/`xray_unpatch.jq`) патчит **только** `config.json` (Reality) и трогает только `direct-wg*` — правила `direct-local` и сам `config_xhttp.json` не затрагиваются, обход переживает attach/detach.
+>
+> **Где это вообще работает:** RU-обход осмыслен только на **relay/РУ-нодах**, где `direct` уходит в WG (≠ `direct-local`). На standalone-зарубежной ноде `_primary` пуст → `direct` и `direct-local` оба egress'ят локально → правило безвредный no-op (РУ-сайты всё равно видят зарубежный IP, выгоды нет).
+
+> `vless_ws_cdn` и `hysteria2` RU-обхода **не несут** (на данный момент неактуальны). У `hysteria2` вообще нет per-destination routing — добавление потребовало бы секции `acl`+`outbounds`.
+
 ## Роли, запускаемые на ноде
 
 Полная цепочка из `site.yml` для группы `vpn_nodes`:

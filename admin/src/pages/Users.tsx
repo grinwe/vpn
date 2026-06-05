@@ -9,11 +9,17 @@ import {
   adminReportFailureForSubscription,
   api,
   batchBanUsers,
+  bulkMigrateAuto,
+  bulkRegenerateSublink,
   claimOrphanSubscription,
   DeviceMigrateOut,
   DeviceOut,
   DeviceSwitchExitOut,
+  listUserNodeBans,
+  migrateSubscriptionAuto,
   NodeRelayLinkOut,
+  NodeUserBanOut,
+  removeUserNodeBan,
   SubscriptionMigrateOut,
   SubscriptionOut,
   SubscriptionSwitchExitOut,
@@ -234,6 +240,27 @@ export default function Users() {
       qc.invalidateQueries({ queryKey: ["provisioning-tasks"] });
     },
     onError: (e: Error) => alert(`Не удалось перевести: ${e.message}`),
+  });
+
+  // «Обновить подписку»: авто-выбор свободного сервера из пула (исключая
+  // ноды из бан-листа юзера) + миграция + авто-бан старой ноды. В отличие
+  // от ручного MigrateSubControl админ НЕ выбирает target — backend сам
+  // берёт наименее загруженный healthy сервер.
+  const migrateAuto = useMutation({
+    mutationFn: (subId: number) => migrateSubscriptionAuto(subId),
+    onSuccess: (res) => {
+      const banMsg = res.banned_old_node
+        ? " Старая нода добавлена в бан-лист юзера (авто-выбор туда больше не вернёт)."
+        : "";
+      alert(
+        `Подписка #${res.subscription_id} переведена на свободный сервер: ` +
+          `${res.old_node_name} → ${res.new_node_name}. Таск #${res.provisioning_task_id ?? "—"} — следи в Tasks.${banMsg}`,
+      );
+      qc.invalidateQueries({ queryKey: ["user-subs"] });
+      qc.invalidateQueries({ queryKey: ["provisioning-tasks"] });
+      qc.invalidateQueries({ queryKey: ["user-node-bans"] });
+    },
+    onError: (e: Error) => alert(`Не удалось обновить подписку: ${e.message}`),
   });
 
   const switchExit = useMutation({
@@ -458,6 +485,102 @@ export default function Users() {
     qc.invalidateQueries({ queryKey: ["users"] });
   };
 
+  // Both bulk-subscription ops fire ansible per device and the backend
+  // caps user_ids at 25/request (ansible backlog safety — see the 2026
+  // incidents). Chunk the selection the same way runBatchBan does. One
+  // shared `bulkBusy` flag disables both buttons while either runs so the
+  // operator can't double-fire a heavy provisioning wave.
+  const BULK_SUBS_CHUNK = 25;
+  const [bulkBusy, setBulkBusy] = useState(false);
+
+  const runBulkRegenerate = async (ids: number[]) => {
+    setBulkBusy(true);
+    let done = 0,
+      skipped = 0,
+      notFound = 0,
+      failed = 0,
+      notified = 0,
+      subs = 0,
+      devices = 0;
+    try {
+      for (let i = 0; i < ids.length; i += BULK_SUBS_CHUNK) {
+        const res = await bulkRegenerateSublink(ids.slice(i, i + BULK_SUBS_CHUNK));
+        done += res.done.length;
+        skipped += res.skipped.length;
+        notFound += res.not_found.length;
+        failed += res.failed.length;
+        notified += res.notified.length;
+        subs += res.subscriptions_regenerated;
+        devices += res.devices_created;
+      }
+    } catch (e) {
+      alert(
+        `Перегенерация упала на чанке: ${e instanceof Error ? e.message : String(e)}.\n\n` +
+          `Успешно до падения: юзеров ${done}, подписок ${subs}.`,
+      );
+      setBulkBusy(false);
+      qc.invalidateQueries({ queryKey: ["user-subs"] });
+      qc.invalidateQueries({ queryKey: ["provisioning-tasks"] });
+      return;
+    }
+    alert(
+      `Перегенерация sub-link готова.\n` +
+        `Юзеров обновлено: ${done}` +
+        (skipped ? `, без активных подписок: ${skipped}` : "") +
+        (notFound ? `, не найдено: ${notFound}` : "") +
+        (failed ? `, ошибок по подпискам: ${failed}` : "") +
+        `.\nПодписок: ${subs}, новых устройств: ${devices}, уведомлено в Telegram: ${notified}.\n\n` +
+        `Провижининг идёт в фоне — следи в Tasks. Старые ссылки остаются живыми до перехода.`,
+    );
+    setSelectedIds(new Set());
+    setBulkBusy(false);
+    qc.invalidateQueries({ queryKey: ["users"] });
+    qc.invalidateQueries({ queryKey: ["user-subs"] });
+    qc.invalidateQueries({ queryKey: ["provisioning-tasks"] });
+  };
+
+  const runBulkMigrate = async (ids: number[]) => {
+    setBulkBusy(true);
+    let done = 0,
+      skipped = 0,
+      notFound = 0,
+      failed = 0,
+      subs = 0;
+    try {
+      for (let i = 0; i < ids.length; i += BULK_SUBS_CHUNK) {
+        const res = await bulkMigrateAuto(ids.slice(i, i + BULK_SUBS_CHUNK));
+        done += res.done.length;
+        skipped += res.skipped.length;
+        notFound += res.not_found.length;
+        failed += res.failed.length;
+        subs += res.subscriptions_migrated;
+      }
+    } catch (e) {
+      alert(
+        `Переезд упал на чанке: ${e instanceof Error ? e.message : String(e)}.\n\n` +
+          `Успешно до падения: юзеров ${done}, подписок ${subs}.`,
+      );
+      setBulkBusy(false);
+      qc.invalidateQueries({ queryKey: ["provisioning-tasks"] });
+      return;
+    }
+    alert(
+      `Массовый переезд запущен.\n` +
+        `Юзеров: ${done}` +
+        (skipped ? `, без активных подписок: ${skipped}` : "") +
+        (notFound ? `, не найдено: ${notFound}` : "") +
+        (failed ? `, ошибок (нет свободной ноды и т.п.): ${failed}` : "") +
+        `.\nПодписок переезжает: ${subs}. Старые ноды забанены для этих юзеров.\n\n` +
+        `Провижининг в фоне — следи в Tasks.`,
+    );
+    setSelectedIds(new Set());
+    setBulkBusy(false);
+    qc.invalidateQueries({ queryKey: ["users"] });
+    qc.invalidateQueries({ queryKey: ["user-subs"] });
+    qc.invalidateQueries({ queryKey: ["provisioning-tasks"] });
+    qc.invalidateQueries({ queryKey: ["user-node-bans"] });
+  };
+
   return (
     <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
       <div className="lg:col-span-2">
@@ -498,6 +621,45 @@ export default function Users() {
                 className="text-xs px-2 py-1 rounded bg-emerald-700 hover:bg-emerald-600 disabled:opacity-50"
               >
                 unban all
+              </button>
+              <span className="w-px h-4 bg-slate-600" />
+              <button
+                disabled={bulkBusy}
+                onClick={() => {
+                  if (
+                    confirm(
+                      `Перегенерировать sub-link для ${selArr.length} юзер(ов)?\n\n` +
+                        `Каждому активному устройству выдаётся НОВАЯ ссылка (появится в ЛК), ` +
+                        `старая остаётся рабочей до перехода. Юзерам уйдёт Telegram: «возьми новую ссылку в ЛК».\n\n` +
+                        `Это НЕ переезд на другой сервер. sub_token сменится, стоимость НЕ изменится.\n` +
+                        `Идёт ansible-провижининг — для больших пачек подними воркеры (scripts/workers.sh).`,
+                    )
+                  )
+                    runBulkRegenerate(selArr);
+                }}
+                title="Новая ссылка в ЛК + Telegram-уведомление, старая ссылка остаётся живой. sub_token меняется, сервер тот же, цена та же."
+                className="text-xs px-2 py-1 rounded bg-indigo-700 hover:bg-indigo-600 disabled:opacity-50"
+              >
+                {bulkBusy ? "…" : "🔁 регенерация sub-link"}
+              </button>
+              <button
+                disabled={bulkBusy}
+                onClick={() => {
+                  if (
+                    confirm(
+                      `Переселить ${selArr.length} юзер(ов) на свободные серверы?\n\n` +
+                        `Каждая активная подписка авто-переезжает на свободную здоровую ноду, ` +
+                        `старая нода банится для юзера. sub_token СОХРАНЯЕТСЯ — ссылка та же, меняется только сервер.\n\n` +
+                        `Это НЕ регенерация ссылки. Тяжёлый ansible (revoke+apply на каждое устройство) — ` +
+                        `подними воркеры (scripts/workers.sh) перед большой пачкой.`,
+                    )
+                  )
+                    runBulkMigrate(selArr);
+                }}
+                title="bulk-версия карточной «обновить подписку»: авто-выбор свободной ноды + бан старой. sub_token сохраняется, уведомления нет."
+                className="text-xs px-2 py-1 rounded bg-sky-700 hover:bg-sky-600 disabled:opacity-50"
+              >
+                {bulkBusy ? "…" : "🚚 переезд на сервер"}
               </button>
             </div>
           )}
@@ -908,6 +1070,23 @@ export default function Users() {
                               : "🚨 report failure"}
                           </button>
                         )}
+                        {s.status === "active" && (
+                          <button
+                            disabled={migrateAuto.isPending}
+                            onClick={() => {
+                              if (
+                                confirm(
+                                  `Обновить подписку #${s.id}?\n\nBackend выберет свободный сервер из пула (исключая текущий и ноды из бан-листа юзера), мигрирует подписку (sub_token сохранится) и забанит старую ноду для этого юзера.`
+                                )
+                              )
+                                migrateAuto.mutate(s.id);
+                            }}
+                            title="Авто-выбор свободного сервера из пула + миграция + авто-бан старой ноды. В будущем — кнопка в ЛК юзера."
+                            className="text-xs px-2 py-1 rounded bg-sky-700 hover:bg-sky-600 disabled:opacity-50"
+                          >
+                            {migrateAuto.isPending ? "…" : "🔄 обновить подписку"}
+                          </button>
+                        )}
                         {s.status !== "active" && (
                           <button
                             disabled={enableSub.isPending}
@@ -959,6 +1138,8 @@ export default function Users() {
                 </ul>
               )}
             </div>
+
+            <UserNodeBans userId={selected.id} />
           </div>
         )}
       </aside>
@@ -1273,6 +1454,71 @@ function DeviceList({
 // migrate_subscription_to_new_node) — админ осознанно берёт
 // ответственность. Мы всё равно прячем ноды с is_active=false из
 // дропдауна, чтобы не собирать 400 на пустом месте.
+// Бан-лист нод юзера: ноды, на которые авто-выбор («обновить подписку»)
+// его не селит. Заполняется авто-баном при миграции + ручным баном.
+// Здесь — просмотр + разбан (снять, чтобы авто-выбор снова мог вернуть).
+function UserNodeBans({ userId }: { userId: number }) {
+  const qc = useQueryClient();
+  const bans = useQuery<NodeUserBanOut[]>({
+    queryKey: ["user-node-bans", userId],
+    queryFn: () => listUserNodeBans(userId),
+  });
+  const unban = useMutation({
+    mutationFn: (nodeId: number) => removeUserNodeBan(userId, nodeId),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["user-node-bans", userId] });
+    },
+    onError: (e: Error) => alert(`Не удалось снять бан: ${e.message}`),
+  });
+  return (
+    <div className="pt-2 border-t border-slate-700">
+      <div className="font-semibold mb-1">
+        Бан-лист нод{" "}
+        <span className="text-slate-500 text-xs font-normal">
+          (авто-выбор сюда не селит)
+        </span>
+      </div>
+      {bans.isLoading && (
+        <div className="text-slate-400 text-xs">Загрузка…</div>
+      )}
+      {bans.data && bans.data.length === 0 && (
+        <div className="text-slate-500 text-xs">Пусто.</div>
+      )}
+      {bans.data && bans.data.length > 0 && (
+        <ul className="space-y-1">
+          {bans.data.map((b) => (
+            <li
+              key={b.id}
+              className="flex items-center justify-between gap-2 text-xs bg-slate-900 rounded px-2 py-1"
+            >
+              <div className="min-w-0">
+                <span className="font-mono">
+                  #{b.node_id} {b.node_name ?? ""}
+                </span>
+                {b.reason && (
+                  <span
+                    className="text-slate-500 block truncate"
+                    title={b.reason}
+                  >
+                    {b.reason}
+                  </span>
+                )}
+              </div>
+              <button
+                disabled={unban.isPending}
+                onClick={() => unban.mutate(b.node_id)}
+                className="text-xs px-2 py-0.5 rounded bg-slate-700 hover:bg-slate-600 disabled:opacity-50 shrink-0"
+              >
+                разбан
+              </button>
+            </li>
+          ))}
+        </ul>
+      )}
+    </div>
+  );
+}
+
 function MigrateSubControl({
   sub,
   nodes,
