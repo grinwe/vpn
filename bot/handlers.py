@@ -872,6 +872,142 @@ def health_ping_keyboard(sub_id: int | None) -> types.InlineKeyboardMarkup:
     return types.InlineKeyboardMarkup(inline_keyboard=rows)
 
 
+def node_diagnosis_keyboard(
+    kind: str | None, target_id: int | None
+) -> types.InlineKeyboardMarkup | None:
+    """Inline keyboard for the «нода диагностирована» admin push.
+
+    Mirrors the diagnose-control endpoints (POST /api/diagnostics/{kind}/{id}/...):
+    ack ("вижу, работаю"), mute на 1/4/24ч или совсем, follow (экспонента).
+    Все callback_data парсятся одним хендлером diag_control() ниже.
+
+    target_id None → пуш собрался криво (бэкенд не проставил target_id);
+    возвращаем None, чтобы send_message ушёл без клавиатуры, а не падал.
+    """
+    if target_id is None or not kind:
+        return None
+    rows = [
+        [
+            types.InlineKeyboardButton(
+                text="👀 Вижу, работаю",
+                callback_data=f"diag:ack:{kind}:{target_id}",
+            ),
+        ],
+        [
+            types.InlineKeyboardButton(
+                text="🔕 1ч", callback_data=f"diag:mute:{kind}:{target_id}:1"
+            ),
+            types.InlineKeyboardButton(
+                text="🔕 4ч", callback_data=f"diag:mute:{kind}:{target_id}:4"
+            ),
+            types.InlineKeyboardButton(
+                text="🔕 24ч", callback_data=f"diag:mute:{kind}:{target_id}:24"
+            ),
+        ],
+        [
+            types.InlineKeyboardButton(
+                text="🔕 совсем",
+                callback_data=f"diag:mute:{kind}:{target_id}:-1",
+            ),
+        ],
+        [
+            types.InlineKeyboardButton(
+                text="📈 Следить (экспонента)",
+                callback_data=f"diag:follow:{kind}:{target_id}",
+            ),
+        ],
+    ]
+    return types.InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+# ── Node-diagnosis admin push: inline control callbacks ──
+#
+# Все кнопки из node_diagnosis_keyboard() дёргают diagnose-control
+# эндпоинты бэкенда. callback_data:
+#   diag:ack:{kind}:{id}            → POST .../ack            (тело: нет)
+#   diag:mute:{kind}:{id}:{hours}   → POST .../mute  {"hours": int}
+#   diag:follow:{kind}:{id}         → POST .../follow {"mode":"exponential"}
+# kind ∈ {"node","exit"}. Только для админов — mirror mark_invoice_paid.
+
+@router.callback_query(F.data.startswith("diag:"))
+async def diag_control(callback_query: types.CallbackQuery):
+    if not _is_admin(callback_query.from_user.id):
+        await callback_query.answer("Недостаточно прав", show_alert=True)
+        return
+
+    parts = callback_query.data.split(":")
+    # diag:<action>:<kind>:<id>[:<hours>]
+    if len(parts) < 4:
+        await callback_query.answer()
+        return
+    action, kind, target_id = parts[1], parts[2], parts[3]
+
+    body: dict | None = None
+    if action == "mute":
+        hours = parts[4] if len(parts) > 4 else "0"
+        try:
+            body = {"hours": int(hours)}
+        except ValueError:
+            await callback_query.answer()
+            return
+    elif action == "follow":
+        body = {"mode": "exponential"}
+    elif action != "ack":
+        await callback_query.answer()
+        return
+
+    try:
+        status_code, _ = await _fetch_json(
+            "POST",
+            f"{BACKEND_URL}/api/diagnostics/{kind}/{target_id}/{action}",
+            json=body,
+            headers=_admin_headers(callback_query.from_user.id),
+        )
+    except aiohttp.ClientError:
+        await callback_query.answer("Бэкенд недоступен", show_alert=True)
+        return
+
+    if status_code != 200:
+        await callback_query.answer("Не удалось применить", show_alert=True)
+        return
+
+    # Человекочитаемый toast + строка в сообщение, какое действие применено.
+    if action == "ack":
+        toast = "Принято: вижу, работаю 👀"
+        applied = "✅ Вижу, работаю"
+    elif action == "follow":
+        toast = "Слежу по экспоненте 📈"
+        applied = "✅ Слежу (экспонента)"
+    else:  # mute
+        h = body["hours"]
+        if h < 0:
+            toast = "Заглушено совсем 🔕"
+            applied = "✅ Заглушено совсем"
+        elif h == 0:
+            toast = "Звук включён 🔔"
+            applied = "✅ Звук включён"
+        else:
+            toast = f"Заглушено на {h}ч 🔕"
+            applied = f"✅ Заглушено на {h}ч"
+
+    await callback_query.answer(toast)
+    # Дроп клавиатуры + добавляем строку «что сделали», чтобы было видно
+    # в истории чата. edit_text best-effort — текст пуша приходит из
+    # бэкенда уже как HTML; если редактирование упало (сообщение слишком
+    # старое и т.п.), хотя бы убираем кнопки.
+    try:
+        original = callback_query.message.html_text or callback_query.message.text or ""
+        await callback_query.message.edit_text(
+            f"{original}\n\n{applied}",
+            disable_web_page_preview=True,
+        )
+    except Exception:
+        try:
+            await callback_query.message.edit_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+
+
 # ── /settings — notification preferences ──
 
 def _notif_prefs_keyboard(prefs: dict) -> types.InlineKeyboardMarkup:

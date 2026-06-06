@@ -258,9 +258,18 @@ class VPNNodeOut(VPNNodeCreate):
     # остальные call-сайты VPNNodeOut его не проставляют — им неактуально).
     last_ssh_at: UTCDateTime | None = None
     # NULL = auto-trigger и Telegram-алерты на эту ноду работают.
-    # Timestamp = оператор замьютил (см. POST /nodes/{id}/auto-diagnose/
-    # {disable|enable}). UI рендерит badge «🔕 muted» в строке.
+    # Timestamp = оператор замьютил (legacy combined-флаг, до migration 0039).
     auto_diagnose_disabled_at: UTCDateTime | None = None
+    # Diagnostics overhaul (migration 0039) — два независимых тумблера +
+    # per-incident state для admin UI (две разные кнопки в строке ноды).
+    diagnostics_disabled_at: UTCDateTime | None = None
+    alerts_muted_until: UTCDateTime | None = None
+    diagnose_incident_open_at: UTCDateTime | None = None
+    diagnose_follow_mode: str | None = None
+    diagnose_acked_at: UTCDateTime | None = None
+    last_diagnosed_at: UTCDateTime | None = None
+    last_probe_at: UTCDateTime | None = None
+    last_probe_status: str | None = None
     created_at: datetime
     updated_at: datetime
 
@@ -1050,6 +1059,16 @@ class WGExitNodeOut(BaseModel):
     # этому exit'у. «Сколько юзеров реально ходит через этот exit».
     # Дефолт 0 — одно-нодовые ответы (create/patch) не считают.
     active_subs_total: int = 0
+    # Diagnostics overhaul (migration 0039) — exits get their own probe +
+    # the same toggles/incident state as nodes.
+    last_probe_at: UTCDateTime | None = None
+    last_probe_status: str | None = None
+    diagnostics_disabled_at: UTCDateTime | None = None
+    alerts_muted_until: UTCDateTime | None = None
+    diagnose_incident_open_at: UTCDateTime | None = None
+    diagnose_follow_mode: str | None = None
+    diagnose_acked_at: UTCDateTime | None = None
+    last_diagnosed_at: UTCDateTime | None = None
     created_at: datetime
     updated_at: datetime
 

@@ -235,6 +235,29 @@ class VPNNode(Base):
     # Покрывает оба уровня — relay→exit linkи у этой ноды + сам ноду.
     auto_diagnose_disabled_at = Column(DateTime, nullable=True)
 
+    # ── Diagnostics overhaul (migration 0039) ──────────────────────────
+    # ДВА независимых тумблера (оператор попросил разделить):
+    #   diagnostics_disabled_at — hard-стоп ВСЕХ диаг-тасок (авто+ручные),
+    #     гейт в worker-триггерах, ручных эндпоинтах И оркестраторе;
+    #   alerts_muted_until      — молчание admin-Telegram до TTL
+    #     («замутить N часов» из пуша). NULL или прошлое = не muted.
+    # ``auto_diagnose_disabled_at`` выше — legacy combined-флаг, выводится из
+    # обихода; новый код читает две колонки ниже.
+    diagnostics_disabled_at = Column(DateTime, nullable=True)
+    alerts_muted_until = Column(DateTime, nullable=True)
+    # Per-outage инцидент-стейт: упавшую ноду диагностируем ОДИН раз, а не
+    # каждый тик. incident_open_at NULL = нет открытого инцидента (чистится
+    # на recovery). follow_mode: NULL/'once' = one-and-done; 'exponential' =
+    # оператор включил backoff 30m→2h→6h из пуша. acked_at = «вижу, работаю».
+    diagnose_incident_open_at = Column(DateTime, nullable=True)
+    last_diagnosed_at = Column(DateTime, nullable=True)
+    diagnose_backoff_until = Column(DateTime, nullable=True)
+    diagnose_follow_mode = Column(String, nullable=True)
+    diagnose_acked_at = Column(DateTime, nullable=True)
+    # Reachability-tick telemetry (ping/ssh from controller).
+    last_probe_at = Column(DateTime, nullable=True)
+    last_probe_status = Column(String, nullable=True)  # ok | unreachable
+
     pool = relationship("ServerPool", back_populates="nodes")
     configs = relationship("VPNConfig", back_populates="node", cascade="all, delete-orphan")
     subscriptions = relationship("Subscription", back_populates="node")
@@ -673,6 +696,20 @@ class WGExitNode(Base):
     notes = Column(Text, nullable=True)
     created_at = Column(DateTime, default=utcnow, nullable=False)
     updated_at = Column(DateTime, default=utcnow, onupdate=utcnow, nullable=False)
+
+    # ── Diagnostics overhaul (migration 0039) ──────────────────────────
+    # Exits раньше не имели health-телеметрии вообще; теперь у них свой
+    # reachability-пробинг (ping/port/ssh с контроллера). Те же два тумблера
+    # и инцидент-стейт, что у VPNNode.
+    last_probe_at = Column(DateTime, nullable=True)
+    last_probe_status = Column(String, nullable=True)  # ok | unreachable | degraded
+    diagnostics_disabled_at = Column(DateTime, nullable=True)
+    alerts_muted_until = Column(DateTime, nullable=True)
+    diagnose_incident_open_at = Column(DateTime, nullable=True)
+    last_diagnosed_at = Column(DateTime, nullable=True)
+    diagnose_backoff_until = Column(DateTime, nullable=True)
+    diagnose_follow_mode = Column(String, nullable=True)
+    diagnose_acked_at = Column(DateTime, nullable=True)
 
     provider = relationship("CloudProvider")
 

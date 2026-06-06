@@ -9,12 +9,20 @@ FROM python:3.11-slim
 # ansible needs openssh-client to talk to the nodes; rsync is handy for a
 # number of roles; gcc/libffi are kept out because ansible-core wheels ship
 # pure-python.
+#
+# iputils-ping + traceroute: the staged local probe in
+# app/services/diagnostics.py shells out to `ping`/`traceroute` from THIS
+# container (worker-side, before any SSH hop). Without them the probe
+# degrades to status=skip ("ping не установлен в контейнере") instead of
+# giving a real ICMP/path signal.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         openssh-client \
         sshpass \
         rsync \
         ca-certificates \
+        iputils-ping \
+        traceroute \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app

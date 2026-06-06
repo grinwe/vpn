@@ -1810,5 +1810,25 @@ def webapp_health_ping_report(
             },
         )
     )
+
+    # «Не работает» → сразу делаем юзеру то же, что админская «обновить
+    # подписку»: переселяем на свободную ноду + БАНИМ проблемную для него +
+    # краудсорс-эскалация «плохости» ноды. _do_failover сам throttle'ит
+    # (5 мин/sub). Best-effort — не ломаем user-facing ответ.
+    if sub is not None:
+        from .api.client_control import _do_failover
+
+        try:
+            _do_failover(db, sub, kind="user_reported", actor=f"user:{user.id}")
+        except Exception:  # noqa: BLE001
+            # Roll back a mid-migration failure so the trailing db.commit()
+            # can't flush a half-migrated sub (inner commits already persisted
+            # the audit/migration rows we care about).
+            if db.is_active:
+                db.rollback()
+            logger.exception(
+                "webapp health-ping-report: failover for sub %s failed", sub.id
+            )
+
     db.commit()
     return HealthPingReportResponse(ok=True, subscription_id=sub_id, node_id=node_id)

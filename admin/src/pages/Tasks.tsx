@@ -1,6 +1,12 @@
 import { Fragment, useEffect, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { api, ProvisioningTaskOut } from "../api";
+import {
+  api,
+  DiagnoseCheckEntry,
+  DiagnoseMeta,
+  ProvisioningTaskOut,
+} from "../api";
+import { DiagnoseResult } from "../diagnoseResult";
 
 const STATUSES = ["", "pending", "running", "success", "failed"] as const;
 const TARGETS = ["", "node", "device", "subscription"] as const;
@@ -222,6 +228,17 @@ function fmtDuration(start: string | null, end: string | null): string {
 }
 
 function TaskDetails({ task }: { task: ProvisioningTaskOut }) {
+  // Structured diagnose-результат лежит в task.result.checks (массив
+  // DiagnoseCheckEntry, дописанный ansible-ролью + orchestrator'ом). Для
+  // обычных (non-diagnose) тасок поля нет — рендерим только raw result.
+  const diagnoseChecks = task.result?.checks;
+  const checks: DiagnoseCheckEntry[] | null = Array.isArray(diagnoseChecks)
+    ? (diagnoseChecks as DiagnoseCheckEntry[])
+    : null;
+  const diagnoseMeta = (task.result?.diagnose_meta ?? undefined) as
+    | DiagnoseMeta
+    | undefined;
+
   return (
     <div className="bg-slate-950 border border-slate-800 rounded p-3 space-y-3 text-xs">
       <div className="grid grid-cols-2 gap-4">
@@ -257,8 +274,19 @@ function TaskDetails({ task }: { task: ProvisioningTaskOut }) {
         </details>
       )}
 
+      {checks && (
+        <div>
+          <div className="text-slate-500 uppercase text-[10px] mb-1">
+            диагностика
+          </div>
+          <DiagnoseResult checks={checks} meta={diagnoseMeta} />
+        </div>
+      )}
+
       {task.result && (
-        <details open>
+        // Когда есть structured checks — raw result схлопнут (детали выше),
+        // иначе открыт по умолчанию, как раньше.
+        <details open={!checks}>
           <summary className="cursor-pointer text-slate-400 uppercase text-[10px]">
             result (stdout/stderr/ansible exit)
           </summary>

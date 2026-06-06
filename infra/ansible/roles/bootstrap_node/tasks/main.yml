@@ -63,6 +63,43 @@
     update_cache: yes
     lock_timeout: 600
 
+# ── Открыть 22/80/443 на iptables-уровне ────────────────────────────
+# У части RU-VPS-провайдеров cloud-init из коробки ставит restrictive
+# INPUT policy / нативные iptables-правила (мы видели это на
+# ru-cloud-web-02: nginx слушает локально, но certbot HTTP-01
+# challenge таймаутит — LE не может достучаться до :80 извне).
+#
+# Идемпотентно: ansible iptables module матчит правило по точному
+# совпадению параметров. Если ACCEPT уже стоит — не дублирует.
+# `action: insert` ставит правило в начало INPUT chain — даже если
+# где-то ниже есть -j DROP, наш ACCEPT срабатывает первым.
+#
+# `failed_when: false` — на минимальных образах (alpine-like) iptables
+# может быть не установлен или kernel module отсутствовать. Не валим
+# play, шаг становится best-effort.
+- name: Ensure iptables ACCEPT for SSH/HTTP/HTTPS at top of INPUT
+  ansible.builtin.iptables:
+    chain: INPUT
+    protocol: tcp
+    destination_port: "{{ item }}"
+    jump: ACCEPT
+    action: insert
+    state: present
+  loop: ["22", "80", "443"]
+  failed_when: false
+
+# Параллельно — ufw allow. На inactive ufw (наш текущий дефолт, см.
+# закомменченный блок ниже) команда без эффекта; но если когда-нибудь
+# ufw enable'нётся (вручную или из group_vars), эти правила уже стоят
+# и ssh/http/https не отваливается.
+- name: Ensure ufw allows SSH/HTTP/HTTPS (idempotent, no-op on inactive ufw)
+  community.general.ufw:
+    rule: allow
+    port: "{{ item }}"
+    proto: tcp
+  loop: ["22", "80", "443"]
+  failed_when: false
+
 # ВРЕМЕННО ЗАКОММЕНТИРОВАНО — ufw rate-limit на 22/tcp блокировал сам
 # ansible-раннер (6+ коннектов/30с с одного egress-IP → drop), из-за
 # чего бутстрап падал на UNREACHABLE после этого шага. Вернуть после

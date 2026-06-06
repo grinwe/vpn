@@ -31,6 +31,9 @@ import {
   diagnoseRelayLink,
   disableNodeAutoDiagnose,
   enableNodeAutoDiagnose,
+  diagnosticsDisable,
+  diagnosticsEnable,
+  diagnosticsMute,
   DiagnoseCheckEntry,
   DiagnoseMeta,
 } from "../api";
@@ -200,6 +203,94 @@ function NodeMuteToggle({
       }
     >
       {mutation.isPending ? "…" : isDisabled ? "🔔 unmute" : "🔕 mute"}
+    </button>
+  );
+}
+
+// Hard-stop ВСЕХ diagnose-тасок ноды (api/diagnostics.py disable/enable).
+// Отдельно от NodeMuteToggle: тот глушит smart-триггер+Telegram, этот —
+// полностью запрещает любую диагностику (ручную и авто) до явного enable.
+function NodeDiagnosticsToggle({
+  nodeId,
+  disabledAt,
+}: {
+  nodeId: number;
+  disabledAt: string | null | undefined;
+}) {
+  const qc = useQueryClient();
+  const isDisabled = !!disabledAt;
+  const mutation = useMutation({
+    mutationFn: () =>
+      isDisabled
+        ? diagnosticsEnable("node", nodeId)
+        : diagnosticsDisable("node", nodeId),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ["nodes"] }),
+    onError: (e: Error) =>
+      alert(`Не удалось переключить диагностику: ${e.message}`),
+  });
+  return (
+    <button
+      onClick={() => mutation.mutate()}
+      disabled={mutation.isPending}
+      title={
+        isDisabled
+          ? "Диагностика ноды выключена (hard-stop всех diagnose-тасок) — клик включит"
+          : "Hard-stop: полностью запретить любую диагностику ноды (ручную и авто) до явного включения"
+      }
+      className={
+        "text-xs px-2 py-1 rounded disabled:opacity-50 " +
+        (isDisabled
+          ? "bg-emerald-700 hover:bg-emerald-600 text-white"
+          : "bg-slate-700 hover:bg-slate-600 text-slate-200")
+      }
+    >
+      {mutation.isPending
+        ? "…"
+        : isDisabled
+          ? "🛠 диагностика on"
+          : "🛠 диагностика off"}
+    </button>
+  );
+}
+
+// Глушит Telegram-алёрты ноды на 24ч (api/diagnostics.py mute, hours>0)
+// или снимает mute (hours=0). Состояние — n.alerts_muted_until.
+function NodeAlertsMuteToggle({
+  nodeId,
+  mutedUntil,
+}: {
+  nodeId: number;
+  mutedUntil: string | null | undefined;
+}) {
+  const qc = useQueryClient();
+  // mute активен только если until ещё в будущем.
+  const isMuted = !!mutedUntil && Date.parse(mutedUntil) > Date.now();
+  const mutation = useMutation({
+    mutationFn: () => diagnosticsMute("node", nodeId, isMuted ? 0 : 24),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ["nodes"] }),
+    onError: (e: Error) => alert(`Не удалось переключить mute алёртов: ${e.message}`),
+  });
+  return (
+    <button
+      onClick={() => mutation.mutate()}
+      disabled={mutation.isPending}
+      title={
+        isMuted
+          ? `Telegram-алёрты заглушены до ${new Date(mutedUntil as string).toLocaleString()} — клик снимет mute`
+          : "Заглушить Telegram-алёрты ноды на 24 часа"
+      }
+      className={
+        "text-xs px-2 py-1 rounded disabled:opacity-50 " +
+        (isMuted
+          ? "bg-amber-700 hover:bg-amber-600 text-white"
+          : "bg-slate-700 hover:bg-slate-600 text-slate-200")
+      }
+    >
+      {mutation.isPending
+        ? "…"
+        : isMuted
+          ? "🔔 unmute алёрты"
+          : "🔕 alerts mute 24ч"}
     </button>
   );
 }
@@ -1096,7 +1187,32 @@ export default function Nodes() {
                     </select>
                   </td>
                   <td>
-                    <HealthBadge score={n.health_score} blocked={n.blocked_regions} />
+                    <div className="flex flex-col gap-0.5">
+                      <HealthBadge
+                        score={n.health_score}
+                        blocked={n.blocked_regions}
+                      />
+                      {n.diagnose_incident_open_at && (
+                        <span
+                          className="text-[10px] px-1 py-0.5 rounded bg-red-900 text-red-300"
+                          title={`Открыт diagnose-инцидент с ${new Date(n.diagnose_incident_open_at).toLocaleString()}`}
+                        >
+                          🔴 инцидент
+                        </span>
+                      )}
+                      {n.last_probe_status && (
+                        <span
+                          className="text-[10px] px-1 py-0.5 rounded bg-slate-800 text-slate-400 font-mono"
+                          title={
+                            n.last_probe_at
+                              ? `Последний probe: ${new Date(n.last_probe_at).toLocaleString()}`
+                              : undefined
+                          }
+                        >
+                          probe: {n.last_probe_status}
+                        </span>
+                      )}
+                    </div>
                   </td>
                   <td>
                     <HealthDots
@@ -1223,6 +1339,14 @@ export default function Nodes() {
                       <NodeMuteToggle
                         nodeId={n.id}
                         disabledAt={n.auto_diagnose_disabled_at}
+                      />
+                      <NodeDiagnosticsToggle
+                        nodeId={n.id}
+                        disabledAt={n.diagnostics_disabled_at}
+                      />
+                      <NodeAlertsMuteToggle
+                        nodeId={n.id}
+                        mutedUntil={n.alerts_muted_until}
                       />
                       <button
                         disabled={refreshRealityDest.isPending}

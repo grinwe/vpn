@@ -53,11 +53,19 @@ def select_target_node(
         .filter(models.VPNNode.is_active.is_(True))
         .filter(models.VPNNode.id != current_node_id)
     )
-    # auto_diagnose_disabled_at добавлен миграцией 0036 — getattr-guard
-    # на случай pre-миграционного deploy'а.
-    disabled_col = getattr(models.VPNNode, "auto_diagnose_disabled_at", None)
-    if disabled_col is not None:
-        q = q.filter(disabled_col.is_(None))
+    # Исключаем ноду из failover-таргета, если оператор пометил её «руки
+    # прочь»: legacy combined-mute (auto_diagnose_disabled_at, миграция
+    # 0036) ИЛИ новый hard-тумблер diagnostics_disabled_at (миграция 0039).
+    # Раньше читался только legacy-столбец — нода, выключенная новым 🛠
+    # toggle, ошибочно оставалась валидным таргетом, и report-failure мог
+    # мигрировать падающих юзеров на неё. getattr-guard — на pre-миграционный
+    # deploy. Семантика согласована с is_diagnostics_disabled.
+    for _col in (
+        getattr(models.VPNNode, "auto_diagnose_disabled_at", None),
+        getattr(models.VPNNode, "diagnostics_disabled_at", None),
+    ):
+        if _col is not None:
+            q = q.filter(_col.is_(None))
 
     excluded = list(exclude_node_ids or [])
     if excluded:

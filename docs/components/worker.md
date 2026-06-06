@@ -131,6 +131,10 @@ return summary
 | `run_balance_charge_tick`    | `tick-balance-charge`  |
 | `run_traffic_stats_tick`     | `tick-traffic-stats`   |
 | `run_user_health_ping_tick`  | `tick-health-ping`     |
+| `run_relay_link_health_tick` | `tick-relay-link-health` |
+| `run_node_reachability_tick` | `tick-node-reachability` |
+
+`run_node_reachability_tick` (diagnostics overhaul, env `NODE_REACHABILITY_INTERVAL=300`) — единственный владелец node/exit down-детекта: пробит ВСЕ active ноды + exit'ы staged-пробой (ping/ssh), на падении открывает инцидент (`services/diagnostics_state.should_diagnose` = одна диагностика на инцидент), шлёт говорящий пуш и enqueue'ит on-host диагноз; на recovery закрывает инцидент. Подробнее — `docs/operations/diagnostics.md` § Overhaul.
 
 Все `tick-*` места (self-reschedule + bootstrap в `main()`) используют `schedule_tick`. После фикса параллельных цепочек быть не может: даже 10 рестартов подряд оставят ровно по одному scheduled job на тик.
 

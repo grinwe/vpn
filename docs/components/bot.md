@@ -135,7 +135,9 @@ async def notification_poller(bot: Bot):
         # → POST /api/notifications/{id}/ack
 ```
 
-Это и есть «очередь уведомлений»: воркер пишет строки в `audit_logs` со специальными `action` (`renewal_reminder`, `config_ready`, `migration_notice`, `sublink_rotated`, `low_balance_warning`, `trial_expiry_warning`), бэкенд их рендерит в человекочитаемый текст (`backend/app/api_extensions.py:359-439`), бот опрашивает и доставляет.
+Это и есть «очередь уведомлений»: воркер пишет строки в `audit_logs` со специальными `action` (`renewal_reminder`, `config_ready`, `migration_notice`, `sublink_rotated`, `low_balance_warning`, `trial_expiry_warning`, `admin_alert_node_diagnosis`), бэкенд их рендерит в человекочитаемый текст (`backend/app/api_extensions.py:359-439`), бот опрашивает и доставляет.
+
+**Admin-диагностический пуш с кнопками.** `admin_alert_node_diagnosis` (diagnostics overhaul) — говорящий пуш «нода/exit недоступна» с резюме чек-листа (рендерит `services/admin_notify.notify_node_diagnosis`). В отличие от прочих `admin_alert_*`, несёт `target_kind`/`target_id` в `NotificationOut`, по которым `notification_poller` строит `node_diagnosis_keyboard` (`bot/handlers.py`): `👀 Вижу, работаю` / `🔕 1ч·4ч·24ч·совсем` / `📈 Следить (экспонента)`. Callback `diag:<action>:<kind>:<id>[:<hours>]` ловит admin-only `diag_control` и POST'ит в `/api/diagnostics/{kind}/{id}/{action}`. Это первый admin-пуш с интерактивом — раньше все `admin_alert_*` шли без клавиатуры.
 
 Тонкости:
 

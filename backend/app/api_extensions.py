@@ -499,6 +499,11 @@ class NotificationOut(BaseModel):
     # the subscription ID — leave NULL for notification types that don't
     # need it (renewal_reminder, expiry_reminder, ...).
     subscription_id: int | None = None
+    # Diagnose-incident push (admin_alert_node_diagnosis): carries the
+    # target so the bot can build the ack / mute / follow keyboard
+    # (callback ``diag:<action>:<kind>:<id>``).
+    target_kind: str | None = None
+    target_id: int | None = None
 
 
 @ext_router.get("/notifications/pending", response_model=list[NotificationOut])
@@ -531,6 +536,10 @@ def get_pending_notifications(
         "admin_alert_user_report",
         "admin_alert_infra_ssh",
         "admin_alert_infra_dlq",
+        # Speaking node/exit diagnosis push (diagnostics overhaul) — text is
+        # rendered in services/admin_notify.notify_node_diagnosis; the bot
+        # attaches the ack/mute/follow keyboard from target_kind/target_id.
+        "admin_alert_node_diagnosis",
         # Admin broadcast — кастомная рассылка юзерам через /admin/broadcasts.
         # Текст готовится на backend-е при create и режется батчами в
         # run_broadcast_dispatch_tick (см. worker.py). Bot-поллер доставляет
@@ -683,12 +692,25 @@ def get_pending_notifications(
             if isinstance(raw, int):
                 sub_id_extra = raw
 
+        # Diagnose-incident push: forward target so the bot can build the
+        # ack / mute / follow inline keyboard.
+        target_kind_extra: str | None = None
+        target_id_extra: int | None = None
+        if log.action == "admin_alert_node_diagnosis":
+            tk = extra.get("target_kind")
+            ti = extra.get("target_id")
+            if isinstance(tk, str) and isinstance(ti, int):
+                target_kind_extra = tk
+                target_id_extra = ti
+
         results.append(NotificationOut(
             id=log.id,
             telegram_id=telegram_id,
             text=text,
             type=log.action,
             subscription_id=sub_id_extra,
+            target_kind=target_kind_extra,
+            target_id=target_id_extra,
         ))
 
     return results
@@ -730,6 +752,7 @@ def submit_health_ping_response(
         raise HTTPException(status_code=404, detail="User not found")
 
     node_id: int | None = None
+    sub: models.Subscription | None = None
     if body.subscription_id is not None:
         sub = db.get(models.Subscription, body.subscription_id)
         # Cross-check ownership so a leaked sub_id from one user can't
@@ -785,6 +808,32 @@ def submit_health_ping_response(
             logger.exception(
                 "notify_admins не отработал для health-ping-response"
             )
+
+        # «Не работает» от юзера → сразу делаем ему то же, что админская
+        # кнопка «обновить подписку»: переселяем на свободную ноду +
+        # БАНИМ проблемную для него (NodeUserBan), плюс краудсорс-эскалация
+        # «плохости» ноды. Только если sub валидна, принадлежит юзеру и
+        # active. 5-мин throttle внутри _do_failover не даёт спамить
+        # миграциями. Best-effort — не ломаем user-facing ответ.
+        if (
+            sub is not None
+            and sub.user_id == user.id
+            and sub.status == models.SubscriptionStatus.active
+        ):
+            from .api.client_control import _do_failover
+
+            try:
+                _do_failover(db, sub, kind="user_reported", actor=f"user:{user.id}")
+            except Exception:  # noqa: BLE001
+                # Roll back so a mid-migration failure can't be flushed by the
+                # trailing db.commit() as a half-migrated sub (inner commits
+                # already persisted the audit/migration rows we care about).
+                if db.is_active:
+                    db.rollback()
+                logger.exception(
+                    "health-ping-response: failover for sub %s failed",
+                    body.subscription_id,
+                )
 
     db.commit()
     return {"ok": True}

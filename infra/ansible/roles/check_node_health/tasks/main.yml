@@ -70,3 +70,121 @@
       See the "Show listening sockets" and "Show service diagnostics"
       output above for the reason — usually a crashed systemd unit,
       a config.json the service refused to load, or a port conflict.
+  # Diagnose mode collects the structured result below regardless of port
+  # state, so don't abort here when an admin explicitly requested a probe.
+  when: diag_result_file is not defined
+
+# ── Structured diagnose capture ─────────────────────────────────────────
+# Only the orchestrator's diagnose_node.yml passes `diag_result_file`.
+# A normal site.yml run (which also includes check_node_health) leaves it
+# undefined, so the whole block below is skipped and behaviour is unchanged.
+# Each probe is `failed_when: false` + register, then appended to
+# `diag_collected_checks`; the final task serializes the batch to a
+# controller-side JSON file the backend parser merges into the task result.
+# Mirrors roles/diagnose_relay_link/tasks/main.yml.
+- name: "diagnose :: structured node checks"
+  when: diag_result_file is defined
+  block:
+    - name: "diagnose :: init result accumulator"
+      ansible.builtin.set_fact:
+        diag_collected_checks: []
+
+    # ── xray_service (systemctl is-active xray → ok/fail) ───────────────
+    - name: "diagnose :: xray_service — systemctl is-active"
+      ansible.builtin.command: "systemctl is-active xray"
+      register: diag_xray_active
+      changed_when: false
+      failed_when: false
+
+    - name: "diagnose :: xray_service — append result"
+      ansible.builtin.set_fact:
+        diag_collected_checks: "{{ diag_collected_checks + [diag_xray_entry] }}"
+      vars:
+        diag_xray_state: "{{ diag_xray_active.stdout | default('') | trim }}"
+        diag_xray_entry:
+          name: xray_service
+          status: "{{ 'ok' if (diag_xray_state == 'active') else 'fail' }}"
+          latency_ms: null
+          message: >-
+            {%- if diag_xray_state == 'active' -%}
+            xray.service active
+            {%- else -%}
+            xray.service {{ diag_xray_state | default('unknown') }} — сервис не запущен (rc={{ diag_xray_active.rc | default(-1) }})
+            {%- endif -%}
+          details:
+            systemctl_state: "{{ diag_xray_state }}"
+            rc: "{{ diag_xray_active.rc | default(-1) }}"
+
+    # ── ports_listening (ss -tulpn has 443/8443/9443 → ok/warn) ─────────
+    - name: "diagnose :: ports_listening — ss -tulpn"
+      ansible.builtin.shell: "ss -tulpn 2>/dev/null || true"
+      args:
+        executable: /bin/bash
+      register: diag_ss_ports
+      changed_when: false
+      failed_when: false
+
+    - name: "diagnose :: ports_listening — append result"
+      ansible.builtin.set_fact:
+        diag_collected_checks: "{{ diag_collected_checks + [diag_ports_entry] }}"
+      vars:
+        # Ports considered "the node is serving traffic" — any one present is ok.
+        # Cast to str: the `in` test compares against ss stdout (a string), and
+        # `int in str` raises a templating type error (ports default to ints).
+        diag_expected_ports: >-
+          {{ (vpn_health_ports | default([443, 8443, 9443])) | map('string') | list }}
+        diag_present_ports: >-
+          {{ diag_expected_ports
+             | select('in', (diag_ss_ports.stdout | default('')))
+             | list }}
+        diag_ports_entry:
+          name: ports_listening
+          status: "{{ 'ok' if (diag_present_ports | length > 0) else 'warn' }}"
+          latency_ms: null
+          message: >-
+            {%- if (diag_present_ports | length > 0) -%}
+            слушают порты: {{ diag_present_ports | join(', ') }} (из {{ diag_expected_ports | join(', ') }})
+            {%- else -%}
+            никто не слушает ожидаемые порты {{ diag_expected_ports | join(', ') }} — сервисы могли упасть
+            {%- endif -%}
+          details:
+            expected_ports: "{{ diag_expected_ports }}"
+            present_ports: "{{ diag_present_ports }}"
+            rc: "{{ diag_ss_ports.rc | default(-1) }}"
+
+    # ── geoip_loaded (test -f geoip.dat → ok/fail) ──────────────────────
+    - name: "diagnose :: geoip_loaded — stat geoip.dat"
+      ansible.builtin.stat:
+        path: /usr/local/share/xray/geoip.dat
+      register: diag_geoip_stat
+
+    - name: "diagnose :: geoip_loaded — append result"
+      ansible.builtin.set_fact:
+        diag_collected_checks: "{{ diag_collected_checks + [diag_geoip_entry] }}"
+      vars:
+        diag_geoip_entry:
+          name: geoip_loaded
+          status: "{{ 'ok' if diag_geoip_stat.stat.exists else 'fail' }}"
+          latency_ms: null
+          message: >-
+            {%- if diag_geoip_stat.stat.exists -%}
+            geoip.dat присутствует ({{ diag_geoip_stat.stat.size | default(0) }} байт)
+            {%- else -%}
+            /usr/local/share/xray/geoip.dat отсутствует — split-tunnel/routing не загрузится
+            {%- endif -%}
+          details:
+            path: /usr/local/share/xray/geoip.dat
+            exists: "{{ diag_geoip_stat.stat.exists }}"
+            size: "{{ diag_geoip_stat.stat.size | default(0) }}"
+
+    # ── Финал: пишем структурированный JSON на контроллер ───────────────
+    # Backend orchestrator (_parse_diagnose_result_file) прочитает файл и
+    # подмержит checks в ProvisioningTask.result. delegate_to localhost —
+    # пишем на стороне контроллера, не на ноде.
+    - name: "diagnose :: write structured result to controller"
+      ansible.builtin.copy:
+        content: "{{ {'checks': diag_collected_checks} | to_nice_json }}"
+        dest: "{{ diag_result_file }}"
+        mode: "0644"
+      delegate_to: localhost
+      become: false

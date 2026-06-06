@@ -82,14 +82,12 @@
       "streamSettings": {
         "network": "xhttp",
         "xhttpSettings": {
-          {#- host дублирует домен в САМ xray-конфиг — чтобы он пережил DR.
-              При потере БД восстановление читает xray-конфиги с нод
-              (aggregate_xray_inventory.py берёт xhttpSettings.host как sni);
-              иначе домен живёт ТОЛЬКО в nginx-vhost и терялся в restore.sql
-              (sni=NULL → билдер сабки падал на IP ноды). Рантайм-консистентно:
-              nginx форвардит Host=домен (proxy_set_header Host $host,
-              server_name=домен), клиент тоже шлёт host=домен. -#}
-          "host": "{{ vless_xhttp_domain }}",
+          {#- host НЕ рендерим. xray-xhttp ЭНФОРСИТ Host (xhttp/hub.go:
+              host != "" && request.Host != host → HTTP 404). Любой клиент,
+              у кого в сохранённом config_text вшит старый/иной host= (а после
+              DR это весь флот), ловит 404 → xhttp ложится целиком. Домен для
+              DR-восстановления берём из nginx server_name
+              (scripts/grab_xhttp_domains.sh), отсюда он НЕ нужен. -#}
           "path": "{{ vless_xhttp_path | default('/xh') }}",
           "mode": "{{ vless_xhttp_mode | default('auto') }}"
         }

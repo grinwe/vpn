@@ -25,6 +25,7 @@ from . import (
     broadcasts,
     client_control,
     cloud,
+    diagnostics,
     exits,
     health,
     health_pings,
@@ -65,6 +66,7 @@ router.include_router(payments.router)
 router.include_router(cloud.router)
 router.include_router(autoscale.router)
 router.include_router(exits.router)
+router.include_router(diagnostics.router)
 router.include_router(ops.router)
 router.include_router(broadcasts.router)
 router.include_router(admin_claim.router)

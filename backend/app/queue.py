@@ -163,6 +163,7 @@ TICK_IDS = {
     "app.worker.run_traffic_stats_tick": "tick-traffic-stats",
     "app.worker.run_user_health_ping_tick": "tick-health-ping",
     "app.worker.run_relay_link_health_tick": "tick-relay-link-health",
+    "app.worker.run_node_reachability_tick": "tick-node-reachability",
     "app.worker.run_broadcast_dispatch_tick": "tick-broadcast-dispatch",
 }
 
@@ -175,6 +176,10 @@ TICK_IDS = {
 TICK_TIMEOUTS = {
     "tick-traffic-stats": 120,
     "tick-relay-link-health": 120,
+    # Probes ping/ssh across ALL active nodes + exits — serial SSH can be
+    # slow when several are down (each waits the ssh timeout), so a roomier
+    # cap than the wg-only relay tick.
+    "tick-node-reachability": 240,
     "tick-pending-rescue": 60,
     "tick-warm-pool": 180,
     "tick-autoscale": 90,

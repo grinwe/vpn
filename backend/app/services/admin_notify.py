@@ -146,3 +146,51 @@ def notify_admins(
     else:
         db.flush()
     return [r.id for r in rows if r.id is not None]
+
+
+def notify_node_diagnosis(
+    db: Session,
+    *,
+    target_kind: str,
+    target,
+    checks: list[dict[str, Any]],
+    autocommit: bool = True,
+) -> list[int]:
+    """Speaking node/exit-down push WITH a diagnosis summary + button context.
+
+    Unlike the old static ``infra_ssh`` "Проверь /admin/nodes" alert, this
+    renders the staged-probe checklist into the text and stashes
+    ``target_kind``/``target_id`` in ``extra`` so the bot poller can attach
+    the ack / mute / follow inline keyboard (``diag:<action>:<kind>:<id>``).
+
+    De-dups per target per ``ADMIN_ALERT_DIAGNOSIS_WINDOW_SEC`` (default 30
+    min) so a flapping node yields one push per window, complementing the
+    once-per-incident gate in ``diagnostics_state.should_diagnose``.
+    """
+    from .diagnostics import summarize_checks  # local import avoids cycle
+
+    name = getattr(target, "name", str(getattr(target, "id", "?")))
+    host = getattr(target, "host", "") or ""
+    brief = summarize_checks(checks)
+    text = (
+        f"🔴 Диагностика: {target_kind} <b>{name}</b>"
+        + (f" ({host})" if host else "")
+        + " недоступна.\n\n"
+        + brief
+        + "\n\nЧто делаем — кнопки ниже."
+    )
+    window = int(os.getenv("ADMIN_ALERT_DIAGNOSIS_WINDOW_SEC", "1800"))
+    return notify_admins(
+        db,
+        kind="node_diagnosis",
+        text=text,
+        dedup_key={"target_kind": target_kind, "target_id": target.id},
+        extra={
+            "target_kind": target_kind,
+            "target_id": target.id,
+            "node_id": target.id,  # bot keyboard convenience
+            "checks_brief": brief,
+        },
+        window_sec=window,
+        autocommit=autocommit,
+    )

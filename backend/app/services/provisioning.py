@@ -86,6 +86,17 @@ def choose_node(
         (models.VPNNode.cooldown_until.is_(None))
         | (models.VPNNode.cooldown_until < now)
     )
+    # Exclude nodes the operator marked "руки прочь": legacy combined mute
+    # (auto_diagnose_disabled_at) or the new hard diagnostics toggle
+    # (diagnostics_disabled_at, migration 0039). Mirrors
+    # failover.select_target_node + is_diagnostics_disabled so a disabled /
+    # crowd-cooled node never receives new users. getattr-guard for pre-0039.
+    for _disabled_col in (
+        getattr(models.VPNNode, "auto_diagnose_disabled_at", None),
+        getattr(models.VPNNode, "diagnostics_disabled_at", None),
+    ):
+        if _disabled_col is not None:
+            query = query.filter(_disabled_col.is_(None))
     query = query.filter(
         models.VPNNode.status.in_(
             [models.VPNNodeStatus.active, models.VPNNodeStatus.registering]
@@ -906,6 +917,17 @@ class ProvisioningOrchestrator:
             # visible via the task row.
             if task.action == "resync_vless":
                 return
+            # Diagnose is READ-ONLY (staged probe + read-only on-host play).
+            # A FAILED probe of a temporarily-unreachable node must NOT zero
+            # health_score / flip registering→error (that pulls a live node
+            # out of selection), and a SUCCESSFUL one must NOT promote +
+            # fire a full resync_node_clients. The reachability tick auto-
+            # enqueues node diagnose on every outage, so without this guard a
+            # routine probe would demote healthy nodes. Mirrors the exit
+            # branch below + the diagnose_node endpoint's "without touching
+            # configs" contract.
+            if task.action == "diagnose":
+                return
             if success:
                 node.status = models.VPNNodeStatus.active
                 node.last_health_check_at = utcnow()
@@ -1116,12 +1138,11 @@ class ProvisioningOrchestrator:
                         extra_vars=payload,
                     )
                 elif task.action == "diagnose":
-                    result = run_playbook(
-                        "playbooks/diagnose_node.yml",
-                        inventory,
-                        limit=node.name,
-                        extra_vars=payload,
-                    )
+                    # Staged: controller→host probe (ping/tcp/ssh) first; the
+                    # on-host play runs only if ssh is reachable, else we
+                    # short-circuit to a skip-checklist instead of burning an
+                    # ansible UNREACHABLE. The helper owns its own inventory.
+                    result = self._run_node_diagnose(task, node, payload)
                 else:
                     site_vars = _collect_site_extra_vars(self.db, node)
                     # 900s (15мин) потому что site.yml на свежей relay/jump-ноде
@@ -1150,18 +1171,12 @@ class ProvisioningOrchestrator:
                 inventory = build_inventory_for_exit_node(exit_node)
                 exit_vars = _collect_exit_extra_vars(self.db, exit_node)
                 if task.action == "diagnose":
-                    # Read-only probe — wg show + systemd state + listen
-                    # port assertion. Does not touch configs, so the
-                    # same extra_vars shape is reused (we only need
-                    # wg_exit_port). Status callback skips this action
-                    # so the diagnose run can't flip the exit status.
-                    result = run_playbook(
-                        "playbooks/diagnose_exit.yml",
-                        inventory,
-                        limit=exit_node.name,
-                        extra_vars=exit_vars,
-                        timeout=300,
-                    )
+                    # Read-only probe — staged controller→host reachability
+                    # (ping/tcp/ssh) first, then on-host wg show + systemd +
+                    # listen-port assertion ONLY if ssh is reachable. The
+                    # helper owns its own inventory + extra_vars. Status
+                    # callback skips diagnose so it can't flip exit status.
+                    result = self._run_exit_diagnose(task, exit_node, payload)
                 else:
                     result = run_playbook(
                         "playbooks/bootstrap_exit.yml",
@@ -1398,6 +1413,217 @@ class ProvisioningOrchestrator:
                 f"No link between relay #{relay.id} and exit #{exit_id}"
             )
         raise RuntimeError("diagnose payload must include link_id or exit_id")
+
+    def _parse_diagnose_result_file(
+        self, path: str, task: models.ProvisioningTask
+    ) -> list[dict[str, Any]] | None:
+        """Parse a single ``/tmp`` diagnose JSON (check_node_health/exit).
+
+        Returns the parsed ``checks`` list, or ``None`` if the role didn't
+        write the file (pre-structured role version) so the caller can fall
+        back to an rc-derived check. Always cleans up the file.
+        """
+        if not os.path.exists(path):
+            return None
+        checks: list[dict[str, Any]]
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                checks = json.load(f).get("checks") or []
+        except (OSError, json.JSONDecodeError) as exc:
+            logger.warning(
+                "diagnose: failed to parse %s for task %s: %s", path, task.id, exc
+            )
+            checks = [{
+                "name": "_result_file_unreadable",
+                "status": "fail",
+                "latency_ms": None,
+                "message": f"could not parse {path}: {exc}",
+                "details": {},
+            }]
+        finally:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+        return checks
+
+    def _run_node_diagnose(
+        self,
+        task: models.ProvisioningTask,
+        node: models.VPNNode,
+        payload: dict[str, Any],
+    ) -> SimpleNamespace:
+        """Staged node diagnose: local path probe → on-host play (if ssh up).
+
+        ASK-1/ASK-2: prepends controller-side ping/tcp/ssh checks, SKIPS the
+        ansible play entirely when ssh is unreachable (no wasted UNREACHABLE),
+        and merges the on-host role's structured checks when present (falls
+        back to an rc-derived check until ``check_node_health`` emits JSON).
+        """
+        from . import diagnostics, diagnostics_state
+
+        # ASK-4 hard toggle: refuse ALL diagnose work (covers manual reruns +
+        # any auto path) when the operator disabled diagnostics for this node.
+        if diagnostics_state.is_diagnostics_disabled(node):
+            return SimpleNamespace(
+                stdout="[diagnostics disabled — оператор выключил диагностику этой ноды]",
+                stderr="",
+                returncode=0,
+                checks=diagnostics.skip_checks(
+                    ["diagnostics_disabled"],
+                    reason="диагностика этой ноды выключена оператором",
+                ),
+                diagnose_meta={"target": "node", "node_id": node.id, "disabled": True},
+            )
+
+        probe = diagnostics.run_local_path_probe(
+            node.host, ssh_port=node.ssh_port or 22, extra_tcp_ports=[443]
+        )
+        checks: list[dict[str, Any]] = list(probe.checks)
+        meta = {
+            "target": "node",
+            "node_id": node.id,
+            "node_name": node.name,
+            "host": node.host,
+            "ssh_ok": probe.ssh_ok,
+            "summary": probe.summary,
+        }
+
+        if not probe.ssh_ok:
+            checks.extend(diagnostics.skip_checks(
+                ["xray_service", "ports_listening", "geoip_loaded"],
+                reason="пропущено — host недоступен по ssh",
+            ))
+            return SimpleNamespace(
+                stdout=f"[staged-probe] {probe.summary}; on-host diagnose_node.yml пропущен (ssh down)",
+                stderr="",
+                returncode=1,
+                checks=checks,
+                diagnose_meta=meta,
+            )
+
+        result_file = f"/tmp/diagnose-result-{task.id}.json"
+        try:
+            os.unlink(result_file)
+        except OSError:
+            pass
+        inventory = build_inventory_for_node(node)
+        extra = dict(payload or {})
+        extra["diag_result_file"] = result_file
+        try:
+            ar = run_playbook(
+                "playbooks/diagnose_node.yml",
+                inventory, limit=node.name, extra_vars=extra, timeout=300,
+            )
+        finally:
+            try:
+                inventory.unlink()
+            except OSError:
+                pass
+
+        file_checks = self._parse_diagnose_result_file(result_file, task)
+        if file_checks is None:
+            checks.append({
+                "name": "onhost_diagnose",
+                "status": "ok" if ar.returncode == 0 else "fail",
+                "latency_ms": None,
+                "message": (
+                    f"diagnose_node.yml rc={ar.returncode} "
+                    "(структурные чеки — после обновления роли check_node_health)"
+                ),
+                "details": {},
+            })
+        else:
+            checks.extend(file_checks)
+        return SimpleNamespace(
+            stdout=ar.stdout, stderr=ar.stderr, returncode=ar.returncode,
+            checks=checks, diagnose_meta=meta,
+        )
+
+    def _run_exit_diagnose(
+        self,
+        task: models.ProvisioningTask,
+        exit_node: models.WGExitNode,
+        payload: dict[str, Any],
+    ) -> SimpleNamespace:
+        """Staged exit diagnose: local path probe → on-host play (if ssh up)."""
+        from . import diagnostics, diagnostics_state
+
+        if diagnostics_state.is_diagnostics_disabled(exit_node):
+            return SimpleNamespace(
+                stdout="[diagnostics disabled — оператор выключил диагностику этого exit'а]",
+                stderr="",
+                returncode=0,
+                checks=diagnostics.skip_checks(
+                    ["diagnostics_disabled"],
+                    reason="диагностика этого exit'а выключена оператором",
+                ),
+                diagnose_meta={"target": "exit", "exit_id": exit_node.id, "disabled": True},
+            )
+
+        probe = diagnostics.run_local_path_probe(
+            exit_node.host, ssh_port=exit_node.ssh_port or 22
+        )
+        checks: list[dict[str, Any]] = list(probe.checks)
+        meta = {
+            "target": "exit",
+            "exit_id": exit_node.id,
+            "exit_name": exit_node.name,
+            "host": exit_node.host,
+            "ssh_ok": probe.ssh_ok,
+            "summary": probe.summary,
+        }
+
+        if not probe.ssh_ok:
+            checks.extend(diagnostics.skip_checks(
+                ["wg_interface", "wg_peers", "ip_forward"],
+                reason="пропущено — host недоступен по ssh",
+            ))
+            return SimpleNamespace(
+                stdout=f"[staged-probe] {probe.summary}; on-host diagnose_exit.yml пропущен (ssh down)",
+                stderr="",
+                returncode=1,
+                checks=checks,
+                diagnose_meta=meta,
+            )
+
+        result_file = f"/tmp/diagnose-result-{task.id}.json"
+        try:
+            os.unlink(result_file)
+        except OSError:
+            pass
+        inventory = build_inventory_for_exit_node(exit_node)
+        extra = _collect_exit_extra_vars(self.db, exit_node)
+        extra["diag_result_file"] = result_file
+        try:
+            ar = run_playbook(
+                "playbooks/diagnose_exit.yml",
+                inventory, limit=exit_node.name, extra_vars=extra, timeout=300,
+            )
+        finally:
+            try:
+                inventory.unlink()
+            except OSError:
+                pass
+
+        file_checks = self._parse_diagnose_result_file(result_file, task)
+        if file_checks is None:
+            checks.append({
+                "name": "onhost_diagnose",
+                "status": "ok" if ar.returncode == 0 else "fail",
+                "latency_ms": None,
+                "message": (
+                    f"diagnose_exit.yml rc={ar.returncode} "
+                    "(структурные чеки — после обновления роли check_exit_health)"
+                ),
+                "details": {},
+            })
+        else:
+            checks.extend(file_checks)
+        return SimpleNamespace(
+            stdout=ar.stdout, stderr=ar.stderr, returncode=ar.returncode,
+            checks=checks, diagnose_meta=meta,
+        )
 
     def _run_relay_link_diagnose(
         self,

@@ -1049,14 +1049,12 @@ def _auto_diagnose_stale_links(session) -> dict:
     # один SSH ни разу не прошёл, диагностика всё равно не сможет
     # сделать `wg show` со стороны jump.
     #
-    # JOIN с VPNNode + filter VPNNode.auto_diagnose_disabled_at IS NULL —
-    # оператор замьютил ноду через /nodes/{id}/auto-diagnose/disable
-    # (миграция 0036 перенесла mute-флаг с link-level на node-level,
-    # чтобы один клик глушил все link'и этой ноды и Telegram-алёрты).
-    # getattr-guard на новой колонке для backward-compat — если миграция
-    # 0036 ещё не накатилась, фильтр пропускаем (worst case: лишние
-    # diagnose тики, но не падение).
-    node_disabled_col = getattr(models.VPNNode, "auto_diagnose_disabled_at", None)
+    # JOIN с VPNNode + filter VPNNode.diagnostics_disabled_at IS NULL —
+    # оператор выключил диагностику ноды (новый hard-тумблер, migration
+    # 0039; старый auto_diagnose_disabled_at в неё забэкфилен). getattr-
+    # guard для backward-compat: если 0039 ещё не накатилась, фильтр
+    # пропускаем (worst case: лишние diagnose тики, но не падение).
+    node_disabled_col = getattr(models.VPNNode, "diagnostics_disabled_at", None)
 
     # ORDER BY (handshake_at IS NULL DESC, handshake_at ASC) — NULL первыми
     # (never observed = worst), потом самые stale → за один tick покрываем
@@ -1344,96 +1342,188 @@ def run_relay_link_health_tick() -> dict:
         except Exception:  # noqa: BLE001
             logger.exception("relay_link_health: auto_diagnose failed")
 
-        # Node-level smart-diagnose: ноды на которые SSH не дошёл вообще
-        # (relay_link_health.collect_all_relay_links вернул их в
-        # failed_relay_names) — это симптом «нода не отвечает», link-
-        # level diagnose тут не поможет (он тоже SSH-зависим). Enqueue
-        # `playbooks/diagnose_node.yml` который через ансибл умеет
-        # ретраить SSH с другими таймаутами + соберёт systemd state.
-        try:
-            node_summary = _auto_diagnose_unreachable_nodes(
-                session, list(summary.get("failed_relay_names") or [])
-            )
-            if node_summary.get("enqueued"):
-                summary["auto_diagnose_node"] = node_summary
-        except Exception:  # noqa: BLE001
-            logger.exception(
-                "relay_link_health: auto_diagnose_node failed"
-            )
-
-        # Admin push-алерт при серийных SSH/WG-фейлах. Перед отправкой
-        # фильтруем failed_relay_names против muted nodes (VPNNode.
-        # auto_diagnose_disabled_at) — если оператор уже знает, что
-        # нода проблемная, и явно замьютил её, не шлём по ней повторные
-        # пинг'и в Telegram. Если ВСЕ упавшие ноды замьючены — alert не
-        # уходит вообще.
-        failed = int(summary.get("relays_ssh_failed", 0) or 0)
-        threshold = int(os.getenv("ADMIN_ALERT_SSH_FAILED_THRESHOLD", "1"))
-        if failed >= threshold:
-            try:
-                from . import models as _m
-                from .services.admin_notify import notify_admins
-
-                all_names = list(summary.get("failed_relay_names") or [])
-                # Подтягиваем muted имена одним запросом — обычно их 0-3.
-                muted_names: set[str] = set()
-                disabled_col = getattr(_m.VPNNode, "auto_diagnose_disabled_at", None)
-                if disabled_col is not None and all_names:
-                    rows = (
-                        session.query(_m.VPNNode.name)
-                        .filter(_m.VPNNode.name.in_(all_names))
-                        .filter(disabled_col.isnot(None))
-                        .all()
-                    )
-                    muted_names = {n for (n,) in rows}
-                unmuted_names = [n for n in all_names if n not in muted_names]
-                unmuted_failed = len(unmuted_names)
-
-                if unmuted_failed >= threshold:
-                    names_line = (
-                        f"Ноды: {', '.join(unmuted_names)}\n"
-                        if unmuted_names
-                        else ""
-                    )
-                    no_match = int(summary.get("links_no_match", 0) or 0)
-                    muted_suffix = (
-                        f" (ещё {len(muted_names)} muted: "
-                        f"{', '.join(sorted(muted_names))})"
-                        if muted_names
-                        else ""
-                    )
-                    alert_text = (
-                        f"⚠️ WireGuard/SSH проблемы на {unmuted_failed} "
-                        f"relay-нодах{muted_suffix}.\n"
-                        f"{names_line}"
-                        f"links_no_match={no_match}.\n"
-                        f"Проверь /admin/nodes."
-                    )
-                    notify_admins(
-                        session,
-                        kind="infra_ssh",
-                        text=alert_text,
-                        dedup_key={},
-                        extra={
-                            "relays_ssh_failed": unmuted_failed,
-                            "failed_relay_names": unmuted_names,
-                            "muted_relay_names": sorted(muted_names),
-                            "links_no_match": no_match,
-                        },
-                        autocommit=True,
-                    )
-                else:
-                    # Все ноды замьючены — alert не идёт, но логнуть стоит.
-                    logger.info(
-                        "relay_link_health: %s nodes failed, all muted (%s) — alert skipped",
-                        failed, sorted(muted_names),
-                    )
-            except Exception:  # noqa: BLE001
-                logger.exception(
-                    "relay_link_health: notify_admins failed"
-                )
+        # Node/exit down-detection + the admin push moved to
+        # ``run_node_reachability_tick``: it probes ALL active nodes + exits
+        # (not just relays with exit-links) and emits a SPEAKING diagnosis
+        # push with ack/mute/follow inline buttons instead of the old static
+        # "Проверь /admin/nodes" alert, with the once-per-incident anti-spam
+        # gate in ``diagnostics_state``. The relay tick now only polls WG
+        # handshakes and auto-diagnoses stale LINKS (a signal reachability
+        # can't see — a relay can be ssh-up while its tunnel to an exit is
+        # dead). ``failed_relay_names`` stays in ``summary`` for telemetry.
     except Exception:  # noqa: BLE001
         logger.exception("relay_link_health: tick failed")
+        if session.is_active:
+            session.rollback()
+    finally:
+        session.close()
+
+    return summary
+
+
+def run_node_reachability_tick() -> dict:
+    """Controller→host reachability for ALL active VPN nodes + WG exits.
+
+    The single owner of node/exit down-detection (the old relay tick only
+    saw relay nodes with exit-links). Per target runs a staged local probe
+    (ping → tcp:ssh → ssh-pong); on DOWN it consults
+    ``diagnostics_state.should_diagnose`` (the once-per-incident anti-spam
+    gate), and when that fires: opens the incident, sends a SPEAKING admin
+    push built from the probe checks (unless alerts muted), and enqueues the
+    full on-host diagnose task for the detailed /tasks checklist. On RECOVERY
+    it closes the incident so the next outage is fresh.
+
+    Self-reschedules every NODE_REACHABILITY_INTERVAL sec (default 300).
+    Disabled at 0. NODE_REACHABILITY_MAX_DIAGNOSE_PER_TICK (default 4) caps
+    how many full diagnoses we kick off per tick so a multi-node outage
+    can't dogpile ansible.
+    """
+    from .db import SessionLocal
+    from .queue import schedule_tick
+    from . import models
+    from .services import diagnostics, diagnostics_state
+    from .services.admin_notify import notify_node_diagnosis
+    from .services.provisioning import ProvisioningOrchestrator
+    from .time_utils import utcnow
+
+    # Reschedule first (SSH can hang) — same pattern as the other ticks.
+    interval = int(os.getenv("NODE_REACHABILITY_INTERVAL", "300"))
+    if interval > 0:
+        try:
+            schedule_tick(
+                "app.worker.run_node_reachability_tick",
+                interval,
+                tick_id="tick-node-reachability",
+                replace=True,
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("node_reachability: failed to re-enqueue tick (at start)")
+
+    if os.getenv("NODE_REACHABILITY_ENABLED", "true").lower() not in {"1", "true", "yes"}:
+        return {"enabled": False}
+
+    max_diag = int(os.getenv("NODE_REACHABILITY_MAX_DIAGNOSE_PER_TICK", "4"))
+    summary: dict = {
+        "enabled": True,
+        "checked": 0,
+        "down": [],
+        "recovered": [],
+        "diagnosed": [],
+        "pushed": [],
+    }
+    session = SessionLocal()
+    try:
+        targets: list[tuple[str, object]] = []
+        for n in (
+            session.query(models.VPNNode)
+            .filter(models.VPNNode.is_active.is_(True))
+            .all()
+        ):
+            targets.append(("node", n))
+        for e in (
+            session.query(models.WGExitNode)
+            .filter(models.WGExitNode.is_active.is_(True))
+            .all()
+        ):
+            targets.append(("exit", e))
+
+        import time as _time
+
+        # Per-tick wall-clock budget. Serial ping/ssh per DOWN target costs
+        # seconds (each blackholed probe waits its timeout) and the RQ job
+        # timeout is tick-node-reachability=240s. Stop probing once we near
+        # it — the tick already self-rescheduled at the top, so the unprobed
+        # tail is picked up next cycle instead of the whole tick getting
+        # killed mid-loop by the RQ kill-horse (which would also rotate which
+        # targets get starved). Default 200s leaves headroom under 240s.
+        budget_s = int(os.getenv("NODE_REACHABILITY_BUDGET_SEC", "200"))
+        started = _time.monotonic()
+        diagnosed = 0
+        for kind, target in targets:
+            if _time.monotonic() - started > budget_s:
+                summary["budget_exceeded_after"] = summary["checked"]
+                logger.warning(
+                    "node_reachability: wall-clock budget %ss hit after %s targets — "
+                    "deferring rest to next tick",
+                    budget_s, summary["checked"],
+                )
+                break
+            host = getattr(target, "host", None)
+            if not host:
+                continue
+            summary["checked"] += 1
+            try:
+                probe = diagnostics.run_local_path_probe(
+                    host,
+                    ssh_port=getattr(target, "ssh_port", 22) or 22,
+                    # No traceroute in the sweep — it adds ~29s per DOWN
+                    # target. The detailed on-host diagnose task enqueued
+                    # below runs the full probe WITH traceroute for /tasks.
+                    traceroute_on_fail=False,
+                )
+            except Exception:  # noqa: BLE001
+                logger.exception(
+                    "node_reachability: probe crashed for %s:%s", kind, target.id
+                )
+                continue
+            now = utcnow()
+            ref = f"{kind}:{target.id}"
+
+            if probe.ssh_ok:
+                target.last_probe_at = now
+                target.last_probe_status = "ok"
+                if diagnostics_state.close_incident(target):
+                    summary["recovered"].append(ref)
+                session.commit()
+                continue
+
+            # ── DOWN ────────────────────────────────────────────────────
+            target.last_probe_at = now
+            target.last_probe_status = "unreachable"
+            summary["down"].append(ref)
+
+            do_diag, reason = diagnostics_state.should_diagnose(target, now)
+            if not do_diag or diagnosed >= max_diag:
+                # Either gated (disabled / acked / once-done / backoff) or we
+                # already kicked off enough diagnoses this tick.
+                session.commit()
+                continue
+
+            diagnosed += 1
+            diagnostics_state.mark_diagnosed(target, now)
+            summary["diagnosed"].append(ref)
+
+            # Speaking push from the probe checks (immediate), unless muted.
+            if not diagnostics_state.is_alerts_muted(target, now):
+                try:
+                    notify_node_diagnosis(
+                        session, target_kind=kind, target=target,
+                        checks=probe.checks, autocommit=False,
+                    )
+                    summary["pushed"].append(ref)
+                except Exception:  # noqa: BLE001
+                    logger.exception("node_reachability: push failed for %s", ref)
+
+            # Enqueue the full on-host diagnose for the detailed /tasks
+            # checklist (should_diagnose already cleared the hard toggle).
+            try:
+                orchestrator = ProvisioningOrchestrator(session)
+                task = orchestrator.create_task(
+                    "node" if kind == "node" else "exit",
+                    target.id,
+                    "diagnose",
+                    {"auto_triggered": True, "symptom": "unreachable"},
+                )
+                session.commit()
+                orchestrator.run_task_async(
+                    task, node=target if kind == "node" else None
+                )
+            except Exception:  # noqa: BLE001
+                logger.exception("node_reachability: diagnose enqueue failed for %s", ref)
+                if session.is_active:
+                    session.rollback()
+    except Exception:  # noqa: BLE001
+        logger.exception("node_reachability: tick failed")
         if session.is_active:
             session.rollback()
     finally:
@@ -2032,6 +2122,27 @@ def main() -> None:
             )
         except Exception:  # noqa: BLE001
             logger.exception("Failed to schedule relay-link health tick")
+
+    # Diagnostics overhaul — controller→host reachability probe across ALL
+    # active VPN nodes + WG exits (ping/tcp/ssh). Owns node/exit down-
+    # detection, the once-per-incident anti-spam gate, the speaking admin
+    # push and the on-host diagnose enqueue. Interval
+    # NODE_REACHABILITY_INTERVAL (default 300s), disabled at 0.
+    node_reach_interval = int(os.getenv("NODE_REACHABILITY_INTERVAL", "300"))
+    if do_bootstrap and node_reach_interval > 0:
+        try:
+            schedule_tick(
+                "app.worker.run_node_reachability_tick",
+                min(node_reach_interval, 60),
+                tick_id="tick-node-reachability",
+                replace=True,
+            )
+            logger.info(
+                "Node-reachability tick bootstrapped: first run in 60s (interval=%ss)",
+                node_reach_interval,
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("Failed to schedule node-reachability tick")
 
     # Phase C — bot health-ping with consent. Queues a friendly
     # "помогите нам улучшить сервис" prompt to active users at most

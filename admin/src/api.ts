@@ -422,6 +422,23 @@ export interface VPNNodeOut {
   last_ssh_at: string | null;
   // NULL = auto-trigger и Telegram-алёрты включены. Timestamp = mute.
   auto_diagnose_disabled_at?: string | null;
+  // ── Diagnose-control state (см. api/diagnostics.py) ──
+  // Все timestamp'ы — ISO-8601 или null. Заполняются бэком в VPNNodeOut.
+  // disabled_at — hard-stop ВСЕХ diagnose-тасок ноды (отдельно от
+  // auto_diagnose_disabled_at, который глушит только smart-триггер+алёрты).
+  diagnostics_disabled_at?: string | null;
+  // alerts_muted_until — Telegram-алёрты заглушены до этого момента
+  // (forever = далёкое будущее). null = не заглушены.
+  alerts_muted_until?: string | null;
+  // diagnose_incident_open_at — открытый инцидент: пока стоит, бэк
+  // авто-передиагностит по follow_mode. ack снимает авто-передиагностику.
+  diagnose_incident_open_at?: string | null;
+  diagnose_follow_mode?: string | null;
+  diagnose_acked_at?: string | null;
+  last_diagnosed_at?: string | null;
+  // last_probe_* — лёгкий probe (ping/ssh), отдельно от полной диагностики.
+  last_probe_at?: string | null;
+  last_probe_status?: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -599,6 +616,39 @@ export function enableNodeAutoDiagnose(nodeId: number) {
   return api.post<{ node_id: number; auto_diagnose_disabled_at: string | null }>(
     `/nodes/${nodeId}/auto-diagnose/enable`,
     {},
+  );
+}
+
+// ── Diagnose-control (api/diagnostics.py) ──────────────────────────────
+// Унифицированный control-channel для нод и exit'ов. kind ∈ node|exit.
+// disable/enable — hard-stop ВСЕХ diagnose-тасок цели; mute — глушит
+// Telegram-алёрты на N часов (>0 N часов, <0 навсегда, 0 — снять mute).
+// Возвращают обновлённое diagnose-состояние цели (поля как в VPNNodeOut).
+
+export type DiagnosticsTargetKind = "node" | "exit";
+
+export function diagnosticsDisable(kind: DiagnosticsTargetKind, id: number) {
+  return api.post<Record<string, unknown>>(
+    `/diagnostics/${kind}/${id}/disable`,
+    {},
+  );
+}
+
+export function diagnosticsEnable(kind: DiagnosticsTargetKind, id: number) {
+  return api.post<Record<string, unknown>>(
+    `/diagnostics/${kind}/${id}/enable`,
+    {},
+  );
+}
+
+export function diagnosticsMute(
+  kind: DiagnosticsTargetKind,
+  id: number,
+  hours: number,
+) {
+  return api.post<Record<string, unknown>>(
+    `/diagnostics/${kind}/${id}/mute`,
+    { hours },
   );
 }
 

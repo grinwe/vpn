@@ -39,7 +39,6 @@ from sqlalchemy.orm import Session
 
 from .. import models
 from ..rate_limit import limiter
-from ..services.failover import select_target_node
 from ..services.provisioning import ProvisioningOrchestrator
 from ..time_utils import utcnow
 from ._common import _audit, get_db
@@ -216,6 +215,109 @@ class AdminReportFailureResponse(ReportFailureResponse):
     subscription_id: int
 
 
+def _escalate_node_failure_reports(db: Session, node_id: int) -> None:
+    """Crowdsourced node health: many user "не работает" → cool the node out.
+
+    Counts DISTINCT subscriptions that reported failure on ``node_id`` within
+    ``NODE_FAILURE_REPORT_WINDOW_MIN`` (default 60). At
+    ``NODE_FAILURE_BAN_THRESHOLD`` (default 4) the node is pulled from the pool
+    via ``cooldown_until`` (``choose_node`` skips it) for
+    ``NODE_FAILURE_COOLDOWN_HOURS`` (default 2), a diagnose is enqueued, and a
+    speaking admin push goes out. Idempotent: a node already in cooldown is
+    not re-cooled / re-pushed (so the threshold fires once per outage, not per
+    report). The per-sub 5-min failover throttle + DISTINCT counting keep one
+    impatient user from tripping it alone.
+    """
+    from datetime import timedelta
+
+    from sqlalchemy import func as sa_func
+
+    from ..services import diagnostics_state
+    from ..services.admin_notify import notify_node_diagnosis
+
+    window_min = int(os.getenv("NODE_FAILURE_REPORT_WINDOW_MIN", "60"))
+    threshold = int(os.getenv("NODE_FAILURE_BAN_THRESHOLD", "4"))
+    cooldown_h = int(os.getenv("NODE_FAILURE_COOLDOWN_HOURS", "2"))
+
+    node = db.get(models.VPNNode, node_id)
+    if node is None:
+        return
+    now = utcnow()
+
+    # Already cooled down for this outage → don't re-cool / re-spam.
+    if node.cooldown_until is not None and node.cooldown_until > now:
+        return
+
+    cutoff = now - timedelta(minutes=window_min)
+    reports = (
+        db.query(sa_func.count(sa_func.distinct(models.AuditLog.target_id)))
+        .filter(models.AuditLog.action == "client_reported_failure")
+        .filter(models.AuditLog.target_type == "subscription")
+        .filter(models.AuditLog.created_at >= cutoff)
+        .filter(models.AuditLog.extra.contains({"current_node_id": node_id}))
+        .scalar()
+    ) or 0
+    if reports < threshold:
+        return
+
+    # Pull from the pool + open a diagnose incident (so the reachability tick
+    # doesn't double-diagnose) + record the action.
+    node.cooldown_until = now + timedelta(hours=cooldown_h)
+    diagnostics_state.mark_diagnosed(node, now)
+    _audit(
+        db,
+        actor="crowd-health",
+        action="node_user_reports_threshold",
+        target_type="vpn_node",
+        target_id=node.id,
+        metadata={
+            "reports": reports,
+            "window_min": window_min,
+            "threshold": threshold,
+            "cooldown_until": node.cooldown_until.isoformat(),
+        },
+        actor_type=models.AuditActor.system,
+    )
+
+    # Enqueue the staged diagnose (the orchestrator gate skips it if the
+    # operator hard-disabled diagnostics for this node).
+    try:
+        orchestrator = ProvisioningOrchestrator(db)
+        task = orchestrator.create_task(
+            "node", node.id, "diagnose",
+            {"auto_triggered": True, "symptom": "user_reports", "reports": reports},
+        )
+        db.commit()
+        orchestrator.run_task_async(task, node=node)
+    except Exception:  # noqa: BLE001
+        logger.exception("crowd-health: diagnose enqueue failed for node %s", node.id)
+        if db.is_active:
+            db.rollback()
+
+    # Speaking admin push (synthetic check) unless alerts muted.
+    if not diagnostics_state.is_alerts_muted(node, now):
+        try:
+            notify_node_diagnosis(
+                db,
+                target_kind="node",
+                target=node,
+                checks=[{
+                    "name": "user_reports",
+                    "status": "fail",
+                    "latency_ms": None,
+                    "message": (
+                        f"{reports} юзеров сообщили «не работает» за {window_min}мин → "
+                        f"нода выведена из пула на {cooldown_h}ч, запущена диагностика"
+                    ),
+                    "details": {"reports": reports},
+                }],
+                autocommit=False,
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("crowd-health: push failed for node %s", node.id)
+    db.commit()
+
+
 def _do_failover(
     db: Session,
     sub: models.Subscription,
@@ -256,16 +358,21 @@ def _do_failover(
             action="throttled",
         )
 
-    target = select_target_node(
-        db,
-        current_node_id=sub.node_id or 0,
-        plan_pool_id=(
-            sub.plan.server_pools[0].id
-            if (sub.plan and sub.plan.server_pools)
-            else None
-        ),
-    )
-    if target is None:
+    old_node_id = sub.node_id
+    orchestrator = ProvisioningOrchestrator(db)
+    try:
+        # Тот же путь, что админская «обновить подписку» (migrate-auto):
+        # choose_node сам подберёт свободную healthy-ноду (честя cooldown,
+        # disable-флаги и NodeUserBan этого юзера), мигрирует с сохранением
+        # sub_token и АВТО-БАНИТ старую ноду для юзера (NodeUserBan) — чтобы
+        # auto-pick больше не вернул его на проблемную ноду.
+        new_node, _new_device, task, banned_old = (
+            orchestrator.migrate_subscription_to_free_node(sub, banned_by=actor)
+        )
+        task_id = task.id if task else None
+    except RuntimeError:
+        # Свободной ноды нет: пул пуст / все unhealthy / все в cooldown /
+        # все в бан-листе юзера. Юзер остаётся на текущей — алертим.
         _audit(
             db,
             actor=actor,
@@ -274,7 +381,7 @@ def _do_failover(
             target_id=sub.id,
             metadata={
                 "kind": kind,
-                "current_node_id": sub.node_id,
+                "current_node_id": old_node_id,
                 "fail_count": fail_count,
                 "device_id": device_id,
             },
@@ -285,20 +392,10 @@ def _do_failover(
             retry_after_sec=900,
             action="no_target_available",
         )
-
-    orchestrator = ProvisioningOrchestrator(db)
-    try:
-        # migrate_subscription_to_new_node preserve'ит sub_token + sам
-        # выбирает target если не передать target_node_id — мы уже
-        # подобрали через select_target_node, передаём явно.
-        _new_node, _new_device, task = orchestrator.migrate_subscription_to_new_node(
-            sub, target_node_id=target.id,
-        )
-        task_id = task.id if task else None
     except Exception as exc:  # noqa: BLE001
         logger.exception(
-            "client_control: migrate_subscription_to_new_node failed for sub %s → node %s",
-            sub.id, target.id,
+            "client_control: migrate_subscription_to_free_node failed for sub %s",
+            sub.id,
         )
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -314,20 +411,34 @@ def _do_failover(
         metadata={
             "kind": kind,
             "fail_count": fail_count,
-            "current_node_id": sub.node_id,
-            "target_node_id": target.id,
-            "target_node_name": target.name,
+            "current_node_id": old_node_id,
+            "target_node_id": new_node.id,
+            "target_node_name": new_node.name,
+            "banned_old_node": banned_old,
             "task_id": task_id,
             "device_id": device_id,
             "client_ts": client_ts,
         },
         actor_type=models.AuditActor.system,
     )
+
+    # Краудсорс здоровья ноды: каждый user-report «не работает» на старой
+    # ноде голосует за её «плохость». По порогу — выводим из пула (cooldown)
+    # + диагностика + admin-push. Best-effort — не ломаем основной flow.
+    if old_node_id:
+        try:
+            _escalate_node_failure_reports(db, old_node_id)
+        except Exception:  # noqa: BLE001
+            logger.exception(
+                "client_control: crowd-health escalation failed for node %s",
+                old_node_id,
+            )
+
     return ReportFailureResponse(
         ok=True,
         retry_after_sec=300,
-        target_node_id=target.id,
-        target_node_name=target.name,
+        target_node_id=new_node.id,
+        target_node_name=new_node.name,
         task_id=task_id,
         action="migrated",
     )

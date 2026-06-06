@@ -137,15 +137,122 @@ Backend (`provisioning.py:_run_relay_link_diagnose`):
 * После прогона читает оба JSON-файла, merge'ит `checks` в один
   список, кладёт `sides: {jump: {...}, exit: {...}}` в `diagnose_meta`.
 
+## Overhaul: staged probe + node/exit reachability + говорящий пуш (2026-06)
+
+Расширение поверх relay-link диагностики выше. Закрывает три боли:
+спам диагностиками, отсутствие per-node «выключить», сырой stdout.
+
+### 1. Staged path-to-host probe (`services/diagnostics.py`)
+
+`run_local_path_probe(host, ssh_port, extra_tcp_ports)` гоняется **с
+контроллера** (worker-контейнер) ПЕРЕД любым on-host плейбуком:
+`ping → tcp:port → ssh-pong` (+ `traceroute`, если ssh не дошёл).
+Каждый этап — чек в стандартном контракте `{name,status,latency_ms,
+message,details}`. `.ssh_ok` — гейт: **если ssh не дошёл, on-host
+плейбук НЕ запускается** (конец бессмысленных ansible UNREACHABLE на
+упавшей ноде), on-host этапы помечаются `skip`. Вклинено в
+`_execute_task` через `_run_node_diagnose` / `_run_exit_diagnose`.
+Worker-образу нужны `iputils-ping` + `traceroute` (см.
+`backend/Dockerfile.worker`), иначе эти этапы деградируют в `skip`.
+
+### 2. Структурный чек-лист для node/exit
+
+Роли `check_node_health` (node: `xray_service`, `ports_listening`,
+`geoip_loaded`) и `check_exit_health` (exit: `wg_interface`, `wg_peers`,
+`ip_forward`) пишут тот же `{diag_result_file}` JSON, что и relay-роль
+(под `when: diag_result_file is defined` — обычный `site.yml` не
+затронут). Парсер — `provisioning.py:_parse_diagnose_result_file`.
+Probe-этапы префиксуются. Рендер — тот же `<DiagnoseResult>` в Tasks
+**и** Nodes (раньше Tasks показывал голый `JSON.stringify`).
+
+### 3. Reachability-tick + анти-спам инцидентом (`worker.py`)
+
+`run_node_reachability_tick` (env `NODE_REACHABILITY_INTERVAL`,
+default 300s) пробит **ВСЕ active VPNNode + WGExitNode** (не только
+relay'и). Анти-спам — через **инцидент-стейт** (`services/
+diagnostics_state.py::should_diagnose`):
+
+* нода упала → диагностика **ОДИН раз** → говорящий пуш → тишина;
+* recovery (`ssh_ok`) → `close_incident` сбрасывает стейт → следующее
+  падение = новый инцидент;
+* экспонента (30m→2h→6h) и мьют — **по кнопке из пуша**, не дефолт;
+* `should_diagnose` — единый гейт для всех триггеров (заменил три
+  раздельные 30-мин AuditLog-дебаунс зоны). Relay-тик больше НЕ делает
+  node-down детект и infra_ssh-пуш — это всё ушло сюда.
+
+### 4. Два независимых тумблера (per-node/exit)
+
+* `diagnostics_disabled_at` — **hard-стоп ВСЕХ** диаг-тасок (авто +
+  ручные: гейт в `_run_node_diagnose`/`_run_exit_diagnose` + worker);
+* `alerts_muted_until` — молчание admin-пушей до TTL («замутить N
+  часов / совсем»).
+
+Старый `auto_diagnose_disabled_at` — legacy combined-флаг, забэкфилен в
+`diagnostics_disabled_at` миграцией `0039`; `is_diagnostics_disabled`
+читает обе колонки.
+
+### 5. Говорящий пуш + inline ack/mute/follow
+
+`admin_notify.notify_node_diagnosis` рендерит резюме чек-листа в текст
+(kind `node_diagnosis`, dedup per-target за `ADMIN_ALERT_DIAGNOSIS_
+WINDOW_SEC`, default 30m) и кладёт `target_kind`/`target_id` в `extra`.
+Бот строит клавиатуру `node_diagnosis_keyboard` и роутит callback
+`diag:<action>:<kind>:<id>[:<hours>]` → `POST /api/diagnostics/{kind}/
+{id}/{action}` (`api/diagnostics.py`, generic node|exit, `require_admin`):
+`ack` (вижу-работаю → стоп до recovery), `mute` (1/4/24ч/совсем),
+`follow` (включить экспоненту).
+
+### 6. Краудсорс здоровья нод (user-report-driven)
+
+Юзер жмёт «🆘 VPN не работает» (бот `hping:bad` → `/users/health-ping-
+response`, или webapp Help → `/webapp/health-ping-report`) — и backend
+сразу делает ему **то же, что админская «обновить подписку»**: через
+`_do_failover` → `migrate_subscription_to_free_node` переселяет на
+свободную healthy-ноду (sub_token сохраняется) И **банит проблемную ноду
+для этого юзера** (`NodeUserBan`), чтобы auto-pick не вернул его назад.
+5-мин per-sub throttle (по `client_reported_failure` в AuditLog) не даёт
+спамить миграциями.
+
+Плюс **краудсорс «плохости»** (`_escalate_node_failure_reports`): считаем
+DISTINCT подписки, пожаловавшиеся на ноду за окно; по порогу — нода
+выводится из пула через `cooldown_until` (`choose_node` её пропускает),
+открывается diagnose-инцидент + enqueue диагностики + говорящий
+admin-push. Идемпотентно: уже cooled-нода повторно не охлаждается. Так
+ноды само-ранжируются по реальным юзер-сигналам, а не только по нашему ssh.
+
+`choose_node` теперь исключает и disable-флагнутые ноды
+(`auto_diagnose_disabled_at` / `diagnostics_disabled_at`) — централизованно
+для всех путей выбора (new subs, admin migrate-auto, failover).
+
+### Env (все с дефолтами в коде)
+
+`NODE_REACHABILITY_INTERVAL=300`, `NODE_REACHABILITY_ENABLED=true`,
+`NODE_REACHABILITY_MAX_DIAGNOSE_PER_TICK=4`, `NODE_REACHABILITY_BUDGET_SEC=200`,
+`DIAGNOSE_SAFETY_RECAP_HOURS=12`, `ADMIN_ALERT_DIAGNOSIS_WINDOW_SEC=1800`.
+Краудсорс: `NODE_FAILURE_REPORT_WINDOW_MIN=60`, `NODE_FAILURE_BAN_THRESHOLD=4`,
+`NODE_FAILURE_COOLDOWN_HOURS=2`.
+
+### Код overhaul'а
+
+| Слой | Файл |
+|------|------|
+| Staged probe | `backend/app/services/diagnostics.py` |
+| Инцидент + тумблеры | `backend/app/services/diagnostics_state.py` |
+| Tick | `backend/app/worker.py:run_node_reachability_tick` |
+| Пуш | `backend/app/services/admin_notify.py:notify_node_diagnosis` |
+| Эндпоинты | `backend/app/api/diagnostics.py` |
+| On-host роли | `infra/ansible/roles/check_node_health`, `check_exit_health` |
+| Bot | `bot/handlers.py:node_diagnosis_keyboard`/`diag_control`, `bot/bot.py` |
+| Migration | `backend/app/alembic/versions/0039_node_diagnostics_state.py` |
+
 ## Что НЕ сделано
 
 * **Auto-recovery** — диагностика только наблюдает, не «чинит». Авто-
   reconnect (re-attach по симптому) сознательно вне scope, чтобы избежать
-  flapping'а на сетевых дёргах. Если симптом сохраняется N тиков подряд
-  — это уже сигнал оператору, не auto-action'а.
-* **Telegram-алёрты** — `symptom_detected` пишет только в audit_log.
-  Если нужны пуши — расширить `notify_admins` на новый kind.
-* **Симптом «handshake свежий, но трафик не ходит»** — пока detector
-  ловит только stale-handshake. Логику auto-trigger'а exit-side
-  проверок (`peer_on_exit` + `iptables_forward`) можно добавить когда
-  накопится статистика, какие именно симптомы стоит за этим следить.
+  flapping'а на сетевых дёргах.
+* **Параллельный пробинг** — `run_node_reachability_tick` пробит ноды
+  серийно; при многих упавших (каждая ждёт ssh-таймаут) тик медленный.
+  При росте флота — thread-pool. Пока серийно + cap на диагнозы/тик.
+* **Симптом «handshake свежий, но трафик не ходит»** — relay-detector
+  ловит только stale-handshake. Exit-side auto-trigger можно добавить
+  когда накопится статистика.

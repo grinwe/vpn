@@ -5,7 +5,7 @@ from aiogram.client.default import DefaultBotProperties
 from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
 from aiogram.fsm.storage.memory import MemoryStorage
 from .config import BOT_TOKEN, BACKEND_URL, ADMIN_API_TOKEN, NOTIFICATION_POLL_INTERVAL, BOT_WEBHOOK_PORT
-from .handlers import close_session, router, get_session, onboarding_keyboard, health_ping_keyboard
+from .handlers import close_session, router, get_session, onboarding_keyboard, health_ping_keyboard, node_diagnosis_keyboard
 from .keyboards import DEFAULT_COMMANDS
 from .middleware import BanGuard
 from .support import support_router
@@ -68,6 +68,10 @@ async def notification_poller(bot: Bot):
                         keyboard = onboarding_keyboard()
                     elif notif_type == "health_ping_request":
                         keyboard = health_ping_keyboard(notif.get("subscription_id"))
+                    elif notif_type == "admin_alert_node_diagnosis":
+                        keyboard = node_diagnosis_keyboard(
+                            notif.get("target_kind"), notif.get("target_id")
+                        )
                     await bot.send_message(
                         chat_id=int(telegram_id),
                         text=text,

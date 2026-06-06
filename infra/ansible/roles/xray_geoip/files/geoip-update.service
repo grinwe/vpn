@@ -1,0 +1,21 @@
+[Unit]
+Description=Refresh xray geoip.dat via fallback CDN chain
+After=network-online.target
+Wants=network-online.target
+ConditionPathExists=/usr/local/bin/xray-geoip-fetch.sh
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/xray-geoip-fetch.sh
+# Оба try-restart с best-effort префиксом `-`. try-restart трогает
+# только АКТИВНЫЕ юниты: на чисто-xhttp ноде xray.service отключён,
+# не воскрешаем его с stale config.json; на чисто-Reality нет
+# xray-xhttp. `-` гасит non-zero от inactive/not-loaded юнита — иначе
+# падение одного флавора пометило бы oneshot failed И оборвало бы
+# следующую строку ExecStart, живой xray так и не получил бы свежий
+# geoip.
+ExecStart=-/bin/systemctl try-restart xray
+ExecStart=-/bin/systemctl try-restart xray-xhttp
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7

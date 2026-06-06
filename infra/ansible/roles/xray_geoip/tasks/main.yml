@@ -1,0 +1,60 @@
+---
+# Установка fetcher'а geoip.dat + еженедельного таймера. Используется
+# install_vless_reality и install_vless_xhttp через include_role. Файлы
+# статичные (не зависят от node-specific vars), поэтому files/ а не
+# templates/. Имена unit'ов сохранены прежние (`geoip-update.service`,
+# `geoip-update.timer`) — на нодах, забутстрапленных до этой роли,
+# старые unit'ы перезапишутся новой версией.
+
+- name: Ensure xray data directory
+  file:
+    path: /usr/local/share/xray
+    state: directory
+    owner: root
+    group: root
+    mode: '0755'
+
+- name: Stage geoip fetcher with CDN fallback chain
+  copy:
+    src: xray-geoip-fetch.sh
+    dest: /usr/local/bin/xray-geoip-fetch.sh
+    owner: root
+    group: root
+    mode: '0755'
+
+- name: Install geoip-update systemd units
+  copy:
+    src: "{{ item.src }}"
+    dest: "{{ item.dest }}"
+    owner: root
+    group: root
+    mode: '0644'
+  loop:
+    - { src: geoip-update.service, dest: /etc/systemd/system/geoip-update.service }
+    - { src: geoip-update.timer, dest: /etc/systemd/system/geoip-update.timer }
+  notify: reload systemd
+
+# Force-flush handlers — daemon-reload должен пройти ДО первого
+# `systemctl try-restart`/`start`, иначе systemd выкатит unit из старой
+# inline-curl-версии (если эта роль гонится на уже-забутстрапленной ноде).
+- name: Force handlers (apply daemon-reload before first run)
+  meta: flush_handlers
+
+# Initial fetch — блокируем play до получения файла. На fresh-нодах
+# geoip.dat ещё нет, xray упадёт со "failed to load geoip" если поднять
+# его до этой задачи. `creates:` делает таску идемпотентной — повторные
+# прогоны роли (resync, добавление протокола) не качают повторно.
+# Для принудительного refresh — `rm /usr/local/share/xray/geoip.dat`
+# перед прогоном ИЛИ `systemctl start geoip-update.service`.
+- name: Initial geoip.dat fetch (blocks play until file present)
+  command: /usr/local/bin/xray-geoip-fetch.sh
+  args:
+    creates: /usr/local/share/xray/geoip.dat
+  changed_when: true
+
+- name: Enable weekly geoip refresh timer
+  systemd:
+    name: geoip-update.timer
+    enabled: yes
+    state: started
+    daemon_reload: yes
