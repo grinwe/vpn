@@ -71,6 +71,12 @@ _BULK_USERS_MAX = 25
 
 class BulkUserIdsRequest(BaseModel):
     user_ids: list[int] = Field(min_length=1, max_length=_BULK_USERS_MAX)
+    # Honored ONLY by bulk-regenerate-sublink: when False, the "grab your
+    # new link" Telegram nudge is suppressed — for operator-driven mass
+    # runs where the old link auto-heals and users shouldn't be spammed.
+    # The other bulk ops (migrate-auto, rebuild-config) never notify and
+    # ignore this field.
+    notify: bool = True
 
 
 def _notify_sublink_rotated(db: Session, user: models.User) -> bool:
@@ -176,7 +182,7 @@ def bulk_regenerate_sublink(
             )
         if any_ok:
             done.append(user.id)
-            if _notify_sublink_rotated(db, user):
+            if body.notify and _notify_sublink_rotated(db, user):
                 notified.append(user.id)
 
     db.commit()
@@ -188,6 +194,117 @@ def bulk_regenerate_sublink(
         "notified": notified,
         "subscriptions_regenerated": subs_done,
         "devices_created": devices_created,
+    }
+
+
+@router.post("/subscriptions/{subscription_id}/rebuild-config")
+def rebuild_subscription_config(
+    subscription_id: int,
+    db: Session = Depends(get_db),
+    admin_token: str = Depends(require_admin),
+    admin_actor: str | None = Header(default=None, alias=ADMIN_ACTOR_HEADER),
+):
+    """Пересобрать config_text подписки из ТЕКУЩЕГО VPNConfig — тихо.
+
+    Без ротации sub_token, без нового устройства, без ansible, без пуша.
+    Лечит расхождение «исправили VPNConfig в БД (напр. xhttp sni/port
+    после DR), а сабка отдаёт старый config_text»: URI пересобирается из
+    актуального cfg тем же UUID, старая ссылка юзера сама подтянет
+    исправленный конфиг на следующем рефреше.
+    """
+    sub = db.get(models.Subscription, subscription_id)
+    if not sub:
+        raise HTTPException(status_code=404, detail="Subscription not found")
+    actor, actor_type = _resolve_admin_actor(admin_actor)
+    orchestrator = ProvisioningOrchestrator(db)
+    try:
+        rebuilt = orchestrator.rebuild_subscription_config_text(sub)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    _audit(
+        db,
+        actor,
+        "sublink_config_rebuilt",
+        "subscription",
+        sub.id,
+        actor_type=actor_type,
+        metadata={"credentials_rebuilt": rebuilt},
+    )
+    db.commit()
+    return {"subscription_id": sub.id, "credentials_rebuilt": rebuilt}
+
+
+@router.post("/subscriptions/bulk-rebuild-config")
+def bulk_rebuild_config(
+    body: BulkUserIdsRequest,
+    db: Session = Depends(get_db),
+    admin_token: str = Depends(require_admin),
+    admin_actor: str | None = Header(default=None, alias=ADMIN_ACTOR_HEADER),
+):
+    """Массовый ТИХИЙ rebuild config_text по набору юзеров.
+
+    Для каждой активной подписки пересобирает config_text из текущего
+    VPNConfig (см. ``rebuild_subscription_config_text``). Никаких пушей,
+    ротаций токена, новых устройств, ansible — чистая починка вшитых URI
+    после правки конфигов. ``notify`` в боди игнорируется.
+    """
+    actor, actor_type = _resolve_admin_actor(admin_actor)
+    orchestrator = ProvisioningOrchestrator(db)
+
+    users = (
+        db.query(models.User).filter(models.User.id.in_(body.user_ids)).all()
+    )
+    found = {u.id for u in users}
+    not_found = [uid for uid in body.user_ids if uid not in found]
+
+    done: list[int] = []
+    skipped: list[int] = []
+    failed: list[dict] = []
+    creds_rebuilt = 0
+
+    for user in users:
+        active_subs = (
+            db.query(models.Subscription)
+            .filter(
+                models.Subscription.user_id == user.id,
+                models.Subscription.status == models.SubscriptionStatus.active,
+            )
+            .all()
+        )
+        if not active_subs:
+            skipped.append(user.id)
+            continue
+        any_ok = False
+        for sub in active_subs:
+            try:
+                n = orchestrator.rebuild_subscription_config_text(sub)
+            except Exception as exc:  # noqa: BLE001
+                db.rollback()
+                failed.append(
+                    {"user_id": user.id, "subscription_id": sub.id, "error": str(exc)}
+                )
+                continue
+            any_ok = True
+            creds_rebuilt += n
+            _audit(
+                db,
+                actor,
+                "sublink_config_rebuilt",
+                "subscription",
+                sub.id,
+                actor_type=actor_type,
+                metadata={"credentials_rebuilt": n},
+            )
+        if any_ok:
+            done.append(user.id)
+
+    db.commit()
+    return {
+        "done": done,
+        "skipped": skipped,
+        "not_found": not_found,
+        "failed": failed,
+        "credentials_rebuilt": creds_rebuilt,
     }
 
 

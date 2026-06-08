@@ -251,8 +251,9 @@ def execute_task(
     if not task:
         raise HTTPException(status_code=404, detail="Task not found")
     orchestrator = ProvisioningOrchestrator(db)
-    node = db.get(models.VPNNode, task.target_id) if task.target_type == "node" else None
-    orchestrator.run_task_async(task, node=node)
+    # requeue_task маршрутизирует node-bootstrap через coalesce (иначе можно
+    # дважды задиспатчить или воскресить терминальную строку → IntegrityError).
+    task = orchestrator.requeue_task(task)
     db.refresh(task)
     return schemas.ProvisioningTaskOut.from_orm(task)
 
@@ -281,8 +282,49 @@ def rerun_task(
             detail="Task is currently running; wait for it to finish",
         )
     orchestrator = ProvisioningOrchestrator(db)
-    orchestrator.reset_failed_task(task)
-    orchestrator.run_task_async(task, node=None)
+    # node-bootstrap reruns идут через coalesce (resurrect терминальной строки
+    # в pending → коллизия с uq_active_node_bootstrap → 500). Возвращаемая
+    # таска может быть свежей coalesced-таской.
+    task = orchestrator.requeue_task(task)
+    db.refresh(task)
+    return schemas.ProvisioningTaskOut.from_orm(task)
+
+
+@router.post(
+    "/provisioning/tasks/{task_id}/cancel",
+    response_model=schemas.ProvisioningTaskOut,
+)
+def cancel_task(
+    task_id: int,
+    db: Session = Depends(get_db),
+    admin_token: str = Depends(require_admin),
+):
+    """Phase 1: отмена таски. pending → помечаем cancelled сразу + снимаем
+    RQ-джобу. running → ставим cancel_requested_at; раннер на ближайшем poll'е
+    SIGTERM'нет ansible, и worker пометит cancelled. Терминальные — no-op."""
+    from ..queue import cancel_task_job
+    from ..time_utils import utcnow
+
+    task = db.get(models.ProvisioningTask, task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+    if task.status in (
+        models.ProvisioningTaskStatus.success,
+        models.ProvisioningTaskStatus.failed,
+        models.ProvisioningTaskStatus.cancelled,
+    ):
+        return schemas.ProvisioningTaskOut.from_orm(task)  # idempotent
+
+    task.cancel_requested_at = utcnow()
+    if task.status == models.ProvisioningTaskStatus.pending:
+        # Ещё не стартовала — снимаем сразу + дропаем RQ-джобу (worker'у
+        # пре-старт проверка тоже бы помогла, но так чище и быстрее).
+        cancel_task_job(task_id)
+        task.status = models.ProvisioningTaskStatus.cancelled
+        task.finished_at = utcnow()
+        task.error_message = "cancelled before start"
+    db.add(task)
+    db.commit()
     db.refresh(task)
     return schemas.ProvisioningTaskOut.from_orm(task)
 
@@ -327,9 +369,15 @@ def batch_tasks(
             if task.status == models.ProvisioningTaskStatus.running:
                 results["skipped"].append(tid)
                 continue
-            orchestrator.reset_failed_task(task)
-            orchestrator.run_task_async(task, node=None)
-            results["ok"].append(tid)
+            try:
+                orchestrator.requeue_task(task)
+                results["ok"].append(tid)
+            except Exception:  # noqa: BLE001
+                # Одна коллизия не должна отравлять весь батч (poisoned txn):
+                # откатываем и продолжаем со следующим id.
+                db.rollback()
+                logger.exception("batch rerun: task %s failed", tid)
+                results["skipped"].append(tid)
 
     db.commit()
     _audit(

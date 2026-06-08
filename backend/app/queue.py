@@ -149,6 +149,36 @@ def enqueue_task(task_id: int, node_id: int | None) -> str | None:
         return None
 
 
+def cancel_task_job(task_id: int) -> bool:
+    """Best-effort снять ещё НЕ стартовавшую provisioning RQ-джобу, чтобы
+    worker её не подхватил. True если джоба найдена в очереди и снята. No-op
+    если RQ не настроен или джоба уже started/finished (там отмена идёт через
+    cancel_requested_at + poll → SIGTERM в раннере)."""
+    queue = get_queue()
+    if queue is None:
+        return False
+    try:
+        from rq.job import Job
+        from rq.exceptions import NoSuchJobError
+
+        job_id = f"provision-{task_id}"
+        try:
+            job = Job.fetch(job_id, connection=queue.connection)
+        except NoSuchJobError:
+            return False
+        if job.get_status(refresh=True) in {"queued", "deferred", "scheduled"}:
+            job.cancel()
+            try:
+                job.delete()
+            except Exception:  # noqa: BLE001
+                pass
+            return True
+        return False
+    except Exception:  # noqa: BLE001
+        logger.exception("cancel_task_job failed for task %s", task_id)
+        return False
+
+
 # Stable job_ids for the self-rescheduling worker ticks. Each tick's
 # bootstrap call (in worker.main) and its self-reschedule call (at the
 # end of the tick body) MUST pass the same tick_id — that's what makes
@@ -165,6 +195,8 @@ TICK_IDS = {
     "app.worker.run_relay_link_health_tick": "tick-relay-link-health",
     "app.worker.run_node_reachability_tick": "tick-node-reachability",
     "app.worker.run_broadcast_dispatch_tick": "tick-broadcast-dispatch",
+    "app.worker.run_operator_report_watch_tick": "tick-operator-report-watch",
+    "app.worker.run_reconcile_tick": "tick-reconcile",
 }
 
 # Per-tick hard timeouts. Без них зависшая SSH (traffic-stats,
@@ -187,6 +219,11 @@ TICK_TIMEOUTS = {
     "tick-balance-charge": 300,
     "tick-health-ping": 180,
     "tick-broadcast-dispatch": 60,
+    # DB-only (no SSH) — резолвит pending operator-репорты по NodeTrafficSample.
+    "tick-operator-report-watch": 60,
+    # DB-only — находит due-ноды и диспатчит coalesced bootstrap'ы (сам ansible
+    # не гоняет). Быстрый, но cap на всякий.
+    "tick-reconcile": 60,
 }
 
 

@@ -69,10 +69,99 @@ def create_node(
     actor, actor_type = _resolve_admin_actor(admin_actor)
     _audit(db, actor, "node_created", "vpn_node", node.id, actor_type=actor_type)
     orchestrator = ProvisioningOrchestrator(db)
-    task = orchestrator.create_task("node", node.id, "bootstrap", {"pool_id": payload.pool_id})
+    task, _created = orchestrator.create_or_coalesce_node_bootstrap(
+        node, {"pool_id": payload.pool_id}
+    )
     db.commit()
-    orchestrator.run_task_async(task, node=node)
+    if _created:
+        orchestrator.run_task_async(task, node=node)
     return node
+
+
+def _ws_cdn_resolve_ip(host: str) -> str:
+    """node.host may be an IP or a hostname; CF A-records need an IPv4."""
+    import ipaddress
+    import socket
+
+    try:
+        ipaddress.ip_address(host)
+        return host
+    except ValueError:
+        return socket.gethostbyname(host)
+
+
+def _provision_cf_subdomain(
+    db: Session, node: models.VPNNode, config: models.VPNConfig
+) -> None:
+    """Mint a CF-proxied subdomain → node IP and pin it onto a CF-fronted
+    config (``sni`` + ``settings.cf_record_id/cf_subdomain``).
+
+    Applies to: ws-cdn (always — its sni is always the CF subdomain) and
+    xhttp when the operator left ``sni`` empty (auto CF-fronted mode; a
+    non-empty sni = classic direct+LE xhttp, left untouched). Clients then
+    hit the CF edge, CF proxies to the node origin (origin IP hidden,
+    user↔CF leg on un-blockable shared CF edge). Fails loud (HTTPException)
+    if CF isn't configured or the API errors.
+    """
+    from ..services import cloudflare_dns
+
+    proto = config.protocol
+    if proto == models.VPNConfigProtocol.vless_ws_cdn:
+        # ws-cdn sni is always the CF subdomain — default front zone.
+        domain = cloudflare_dns.front_domain()
+    elif proto == models.VPNConfigProtocol.vless_xhttp and not config.sni:
+        # empty sni → auto CF-fronted xhttp — its OWN front zone (grwr.ink),
+        # falls back to the ws-cdn front when not split.
+        domain = cloudflare_dns.xhttp_front_domain()
+    else:
+        return  # other protocols, or xhttp with an explicit (direct) domain
+
+    if not cloudflare_dns.is_configured(domain):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "CF front requires CLOUDFLARE_DNS_TOKEN + a front domain "
+                "(WSCDN_FRONT_DOMAIN / XHTTP_FRONT_DOMAIN) on the backend"
+            ),
+        )
+    try:
+        ip = _ws_cdn_resolve_ip(node.host)
+        rec = cloudflare_dns.create_node_record(ip, domain=domain)
+    except cloudflare_dns.CloudflareError as exc:
+        raise HTTPException(
+            status_code=502, detail=f"Cloudflare DNS failed: {exc}"
+        ) from exc
+    except OSError as exc:
+        raise HTTPException(
+            status_code=400, detail=f"Cannot resolve node host {node.host!r}: {exc}"
+        ) from exc
+
+    config.sni = rec["subdomain"]
+    settings = dict(config.settings or {})
+    settings["cf_record_id"] = rec["record_id"]
+    settings["cf_subdomain"] = rec["subdomain"]
+    settings["cf_front_domain"] = rec["front_domain"]  # zone for teardown
+    config.settings = settings
+    db.add(config)
+    db.commit()
+    db.refresh(config)
+
+
+def _teardown_cf_subdomain(config: models.VPNConfig) -> None:
+    """Best-effort delete the CF record bound to a CF-fronted config (ws-cdn
+    or auto xhttp) — idempotent. Keyed on cf_record_id, so it's
+    protocol-agnostic: a config without a record is a no-op."""
+    settings = config.settings or {}
+    record_id = settings.get("cf_record_id")
+    if not record_id:
+        return
+    from ..services import cloudflare_dns
+
+    # Delete in the zone the record was minted in (ws→wgse, xhttp→grwr).
+    # Older configs predate cf_front_domain → fall back to the default front.
+    cloudflare_dns.delete_record(
+        record_id, domain=settings.get("cf_front_domain")
+    )
 
 
 def _build_config_from_payload(
@@ -153,6 +242,12 @@ def _build_config_from_payload(
     db.add(config)
     db.commit()
     db.refresh(config)
+    try:
+        _provision_cf_subdomain(db, node, config)
+    except HTTPException:
+        db.delete(config)
+        db.commit()
+        raise
     return config
 
 
@@ -228,14 +323,15 @@ def create_node_with_configs(
         # чистое состояние и понимает что весь composite запрос
         # провалился (без orphan'ной ноды без configs).
         for cfg in created_configs:
+            _teardown_cf_subdomain(cfg)  # release CF record before dropping the row
             db.delete(cfg)
         db.delete(node)
         db.commit()
         raise
 
     orchestrator = ProvisioningOrchestrator(db)
-    task = orchestrator.create_task(
-        "node", node.id, "bootstrap",
+    task, _created = orchestrator.create_or_coalesce_node_bootstrap(
+        node,
         {
             "pool_id": payload.node.pool_id,
             "initial": True,
@@ -243,7 +339,8 @@ def create_node_with_configs(
         },
     )
     db.commit()
-    orchestrator.run_task_async(task, node=node)
+    if _created:
+        orchestrator.run_task_async(task, node=node)
     return node
 
 
@@ -456,11 +553,15 @@ def rebootstrap_node(
     if not node:
         raise HTTPException(status_code=404, detail="Node not found")
     orchestrator = ProvisioningOrchestrator(db)
-    task = orchestrator.create_task(
-        "node", node.id, "bootstrap", {"pool_id": node.pool_id, "rerun": True}
+    task, _created = orchestrator.create_or_coalesce_node_bootstrap(
+        node, {"pool_id": node.pool_id, "rerun": True}
     )
     db.commit()
-    orchestrator.run_task_async(task, node=node)
+    if _created:
+        orchestrator.run_task_async(task, node=node)
+    # RECONCILER_ENABLED on → coalesce ушёл в defer (mark_node_dirty) и вернул
+    # (None, False); правка зачтена, таски нет. task.id дёргаем None-safe.
+    task_id = task.id if task else None
     actor, actor_type = _resolve_admin_actor(admin_actor)
     _audit(
         db,
@@ -469,9 +570,9 @@ def rebootstrap_node(
         "vpn_node",
         node.id,
         actor_type=actor_type,
-        metadata={"task_id": task.id},
+        metadata={"task_id": task_id},
     )
-    return {"node_id": node.id, "task_id": task.id}
+    return {"node_id": node.id, "task_id": task_id}
 
 
 @router.post("/nodes/{node_id}/diagnose")
@@ -769,6 +870,17 @@ def create_config(
         db.add(config)
         db.commit()
         db.refresh(config)
+    # WS+CDN: provision the CF-proxied subdomain (sets config.sni) BEFORE
+    # backfill so credentials are built against the CDN domain. On CF
+    # failure drop the just-created row, else the 409 "already exists"
+    # guard blocks the retry and the operator is stuck with a dangling
+    # sni-less config.
+    try:
+        _provision_cf_subdomain(db, node, config)
+    except HTTPException:
+        db.delete(config)
+        db.commit()
+        raise
     actor, actor_type = _resolve_admin_actor(admin_actor)
     _audit(db, actor, "config_created", "vpn_config", config.id, actor_type=actor_type)
     # Existing warm bundles were built against the previous protocol set;
@@ -784,12 +896,12 @@ def create_config(
     # bootstrap (через _handle_task_outcome → resync_node_clients).
     orchestrator.backfill_credentials_for_new_config(node, config)
     if not defer_bootstrap:
-        task = orchestrator.create_task(
-            "node", node.id, "bootstrap",
-            {"pool_id": node.pool_id, "config_change": True},
+        task, _created = orchestrator.create_or_coalesce_node_bootstrap(
+            node, {"pool_id": node.pool_id, "config_change": True}
         )
         db.commit()
-        orchestrator.run_task_async(task, node=node)
+        if _created:
+            orchestrator.run_task_async(task, node=node)
     return config
 
 
@@ -834,7 +946,41 @@ def update_config(
             ),
         )
 
+    # CF-fronted configs (ws-cdn, and xhttp in auto mode): sni is the
+    # CF-managed subdomain (= settings.cf_subdomain) and port is pinned to
+    # the CF edge (443). A manual edit would desync from the live CF
+    # A-record / nginx server_name and break the chain silently — neutralize
+    # those two fields. Direct xhttp (no cf_subdomain) stays editable.
+    _cf_fronted = config.protocol == models.VPNConfigProtocol.vless_ws_cdn or (
+        config.protocol == models.VPNConfigProtocol.vless_xhttp
+        and (config.settings or {}).get("cf_subdomain")
+    )
+    if _cf_fronted:
+        payload.sni = None
+        payload.port = None
+
     changed: list[str] = []
+
+    # xhttp: явный пустой sni ("") = «переведи в CF-fronted» — чистим stale
+    # direct-домен/серт и минтим wgse.info-сабдомен (как при create с пустым
+    # sni). null = поле не трогали (PATCH-семантика); ТОЛЬКО "" — явный сброс
+    # из формы. Для прочих протоколов "" трактуем как «не трогать», чтобы
+    # случайно не обнулить, например, reality-SNI.
+    if payload.sni == "":
+        if (
+            config.protocol == models.VPNConfigProtocol.vless_xhttp
+            and not (config.settings or {}).get("cf_subdomain")
+        ):
+            _s = dict(config.settings or {})
+            for _k in ("domain", "cert_path", "key_path"):
+                _s.pop(_k, None)
+            config.sni = None
+            config.settings = _s
+            db.flush()
+            _provision_cf_subdomain(db, config.node, config)  # sni ← wgse.info
+            changed.append("sni")
+        payload.sni = None  # обработали (или игнор для non-xhttp) — не применять ниже
+
     if payload.name is not None and payload.name != config.name:
         config.name = payload.name
         changed.append("name")
@@ -890,12 +1036,12 @@ def update_config(
         node = db.get(models.VPNNode, node_id)
         if node:
             orchestrator = ProvisioningOrchestrator(db)
-            task = orchestrator.create_task(
-                "node", node.id, "bootstrap",
-                {"pool_id": node.pool_id, "config_change": True},
+            task, _created = orchestrator.create_or_coalesce_node_bootstrap(
+                node, {"pool_id": node.pool_id, "config_change": True}
             )
             db.commit()
-            orchestrator.run_task_async(task, node=node)
+            if _created:
+                orchestrator.run_task_async(task, node=node)
     return config
 
 
@@ -963,6 +1109,8 @@ def delete_config(
     ).update({models.Credential.config_id: None}, synchronize_session=False)
     db.flush()
 
+    # Tear down the CF DNS record for ws-cdn configs before dropping the row.
+    _teardown_cf_subdomain(config)
     db.delete(config)
     db.commit()
     actor, actor_type = _resolve_admin_actor(admin_actor)
@@ -973,12 +1121,12 @@ def delete_config(
         node = db.get(models.VPNNode, node_id)
         if node:
             orchestrator = ProvisioningOrchestrator(db)
-            task = orchestrator.create_task(
-                "node", node.id, "bootstrap",
-                {"pool_id": node.pool_id, "config_change": True},
+            task, _created = orchestrator.create_or_coalesce_node_bootstrap(
+                node, {"pool_id": node.pool_id, "config_change": True}
             )
             db.commit()
-            orchestrator.run_task_async(task, node=node)
+            if _created:
+                orchestrator.run_task_async(task, node=node)
     return None
 
 
@@ -1458,6 +1606,11 @@ def delete_node(
             "devices_detached": devices_detached,
         },
     )
+    # WS+CDN: release each ws-cdn config's CF DNS record before the ORM
+    # cascade drops the rows — else the proxied A-record (origin IP in the
+    # public CF zone) leaks forever (resource leak + deanon of a burned IP).
+    for _cfg in list(node.configs):
+        _teardown_cf_subdomain(_cfg)
     db.delete(node)
     try:
         db.commit()
@@ -1791,14 +1944,16 @@ def refresh_reality_dest(
     # cfg.sni/cfg.settings.dest). Device-apply таски встанут в очередь
     # ПОСЛЕ bootstrap'а ноды — xray к тому моменту уже рестартнёт с
     # новым конфигом, новые UUID'ы добавятся штатно через API.
-    bootstrap_task = orchestrator.create_task(
-        "node",
-        node.id,
-        "bootstrap",
+    bootstrap_task, _created = orchestrator.create_or_coalesce_node_bootstrap(
+        node,
         {"pool_id": node.pool_id, "rerun": True, "reason": "reality-dest refresh"},
     )
     db.commit()
-    orchestrator.run_task_async(bootstrap_task, node=node)
+    if _created:
+        orchestrator.run_task_async(bootstrap_task, node=node)
+    # RECONCILER_ENABLED on → coalesce ушёл в defer и вернул (None, False):
+    # bootstrap зачтён через mark_node_dirty, отдельной таски нет. id None-safe.
+    bootstrap_task_id = bootstrap_task.id if bootstrap_task else None
 
     subs = (
         db.query(models.Subscription)
@@ -1809,7 +1964,9 @@ def refresh_reality_dest(
         .all()
     )
     failed: list[int] = []
-    task_ids: list[int] = [bootstrap_task.id]
+    task_ids: list[int] = []
+    if bootstrap_task_id is not None:
+        task_ids.append(bootstrap_task_id)
     for sub in subs:
         try:
             # Снимок имён активных девайсов ДО revoke — чтобы не
@@ -1858,7 +2015,7 @@ def refresh_reality_dest(
             "from_pool": new_sni in REALITY_DEST_POOL,
             "sub_count": len(subs),
             "failed_subs": failed,
-            "bootstrap_task_id": bootstrap_task.id,
+            "bootstrap_task_id": bootstrap_task_id,
             "task_ids": task_ids,
         },
     )

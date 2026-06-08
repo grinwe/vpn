@@ -93,6 +93,7 @@ class ProvisioningTaskStatus(str, enum.Enum):
     running = "running"
     success = "success"
     failed = "failed"
+    cancelled = "cancelled"  # Phase 1: оператор отменил (до старта или SIGTERM)
 
 
 class AuditActor(str, enum.Enum):
@@ -210,6 +211,18 @@ class VPNNode(Base):
     max_bandwidth_mbps = Column(Integer, nullable=True)
     health_score = Column(Integer, nullable=True)
     last_health_check_at = Column(DateTime, nullable=True)
+    # Phase 2+3 reconciler (RECONCILER_ENABLED, миграция 0043): правка бампает
+    # desired_generation + ставит reconcile_due_at (debounce); reconcile-тик
+    # сходит ноды, где due наступил и desired > reconciled, ОДНИМ bootstrap'ом;
+    # на успехе reconciled = desired@start. desired бампнулся во время прогона
+    # → supersession (тик прогонит снова). См. reconciler_epic.md.
+    desired_generation = Column(
+        Integer, nullable=False, server_default="0", default=0
+    )
+    reconciled_generation = Column(
+        Integer, nullable=False, server_default="0", default=0
+    )
+    reconcile_due_at = Column(DateTime, nullable=True)
     blocked_regions = Column(JSONB, nullable=True)
     cooldown_until = Column(DateTime, nullable=True)
     # Phase D traffic-drop detector: set when active_users drops from
@@ -412,6 +425,77 @@ class NodeUserBan(Base):
 
     user = relationship("User")
     node = relationship("VPNNode")
+
+
+class OperatorNodeReport(Base):
+    """Краудсорс-сигнал «нода блочит оператора» из юзерского флоу
+    «VPN не работает» (Phase 1 — operator-aware routing).
+
+    Юзер тапает «не работает» → бэк авто-мигрирует (migrate-auto + бан
+    старой ноды) и создаёт этот репорт (``outcome="pending"``). Сам тап —
+    сильный **fail** для ``(failed_node, operator)``. Затем бот спрашивает
+    оператора одним тапом → ``operator`` проставляется. Воркер через
+    T_RECONNECT (15 мин) смотрит ``NodeTrafficSample.details["users"]``
+    целевой ноды на ``target_access_username`` → ``outcome`` ok/
+    inconclusive. Матрица node×operator агрегируется из этих репортов с
+    recency-decay (24ч) и порогом K=5 разных device. **Advisory** —
+    ``choose_node`` пока НЕ трогаем (см. operations roadmap).
+    """
+
+    __tablename__ = "operator_node_reports"
+
+    id = Column(Integer, primary_key=True)
+    user_id = Column(
+        Integer,
+        ForeignKey("users.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    subscription_id = Column(
+        Integer,
+        ForeignKey("subscriptions.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    device_id = Column(
+        Integer,
+        ForeignKey("devices.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    # Оператор/сеть из инлайн-выбора: mts/beeline/megafon/tele2/home_wifi/
+    # other/unknown. NULL пока юзер не ответил (тап-репорт создаётся ДО
+    # выбора оператора).
+    operator = Column(String, nullable=True, index=True)
+    # Нода, которую юзер пометил «не работает» — сильный fail-сигнал.
+    failed_node_id = Column(
+        Integer,
+        ForeignKey("vpn_nodes.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    # Нода, на которую авто-мигрировали — исход меряем по ней.
+    target_node_id = Column(
+        Integer,
+        ForeignKey("vpn_nodes.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    # access_username нового девайса на target-ноде. Watcher ищет именно
+    # его в NodeTrafficSample.details["users"] (после migrate имя другое —
+    # суффикс против TTL-коллизий).
+    target_access_username = Column(String, nullable=True)
+    # pending → ok / fail / inconclusive (проставляет watcher; «всё равно
+    # не работает» из бота → fail сразу).
+    outcome = Column(
+        String, nullable=False, server_default="pending", default="pending"
+    )
+    reported_at = Column(DateTime, default=utcnow, nullable=False, index=True)
+    resolved_at = Column(DateTime, nullable=True)
+
+    user = relationship("User")
+    subscription = relationship("Subscription")
+    device = relationship("Device")
+    failed_node = relationship("VPNNode", foreign_keys=[failed_node_id])
+    target_node = relationship("VPNNode", foreign_keys=[target_node_id])
 
 
 class Subscription(Base):
@@ -645,6 +729,19 @@ class ProvisioningTask(Base):
     # batch-attach (POST /admin/exits/batch-attach). UI группирует по
     # этому полю и считает прогресс N/M; orchestrator его не читает.
     batch_id = Column(UUID(as_uuid=True), nullable=True, index=True)
+    # Phase-0 coalescing (см. docs/operations/provisioning_reconciler_epic.md):
+    # инвариант — ≤1 активный (pending|running) node-bootstrap на ноду
+    # (partial unique index uq_active_node_bootstrap, миграция 0041). Если
+    # во время активного прогона прилетают правки, мы не плодим вторую
+    # таску, а ставим этот флаг на активной — worker на финише создаёт
+    # ровно ОДИН свежий bootstrap.
+    rerun_requested = Column(
+        Boolean, nullable=False, server_default="false", default=False
+    )
+    # Phase 1 (cancel): оператор попросил отмену. Worker проверяет ПЕРЕД
+    # стартом (skip → status=cancelled) и поллит во время ansible-прогона
+    # (→ SIGTERM процессу ansible-playbook). Миграция 0042.
+    cancel_requested_at = Column(DateTime, nullable=True)
 
 
 class CloudProvider(Base):

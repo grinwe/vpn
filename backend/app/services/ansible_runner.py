@@ -6,10 +6,34 @@ import os
 import re
 import subprocess
 import tempfile
+import threading
+import time
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
 from .. import models
+
+# Per-thread активный cancel_check: run_task ставит его вокруг _execute_task,
+# а run_playbook (которых в одном task'е до 9 штук) подхватывает как fallback,
+# если cancel_check не передан явно. Thread-local изолирует параллельные таски
+# (in-process-thread fallback) и forked RQ-джобы (отдельный процесс) — никакой
+# глобальный флаг не утечёт между задачами.
+_cancel_tls = threading.local()
+
+
+def set_active_cancel_check(fn: "Callable[[], bool] | None") -> None:
+    _cancel_tls.fn = fn
+
+
+class AnsibleCancelled(RuntimeError):
+    """Raised when run_playbook is SIGTERM'd mid-run via cancel_check.
+    Carries partial stdout/stderr so the Tasks UI shows the last progress."""
+
+    def __init__(self, msg: str, *, stdout: str = "", stderr: str = "") -> None:
+        super().__init__(msg)
+        self.stdout = stdout
+        self.stderr = stderr
 
 # Strict whitelists for values that get interpolated into the dynamically
 # rendered inventory YAML (see ``build_inventory_for_node``). Because that
@@ -306,6 +330,7 @@ def run_playbook(
     limit: str | None = None,
     extra_vars: dict[str, Any] | None = None,
     timeout: int | None = None,
+    cancel_check: Callable[[], bool] | None = None,
 ) -> subprocess.CompletedProcess:
     """Execute an Ansible playbook and return the completed process.
 
@@ -316,6 +341,8 @@ def run_playbook(
     """
     if timeout is None:
         timeout = int(os.getenv("ANSIBLE_PLAYBOOK_TIMEOUT", "300"))
+    if cancel_check is None:
+        cancel_check = getattr(_cancel_tls, "fn", None)
     _ensure_ansible_root()
     playbook_path = ANSIBLE_ROOT / playbook
     if not playbook_path.exists():
@@ -361,33 +388,58 @@ def run_playbook(
     # slowdown по сравнению с тем, что было на старом mgmt с 2.17.
     # Подробности — в _apply_ansible_env_compat docstring.
     _apply_ansible_env_compat()
-    try:
-        return subprocess.run(
-            cmd,
-            check=False,
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-            cwd=str(ANSIBLE_ROOT),
-        )
-    except subprocess.TimeoutExpired as exc:
-        # subprocess.TimeoutExpired несёт частичный stdout/stderr до
-        # момента kill — без этого в UI /admin/tasks видно только
-        # голое "timed out" и непонятно какой play/task завис.
-        # Пишем tail в сообщение, чтобы _mark_task->error_message
-        # показывало последний прогресс Ansible.
-        def _tail(buf: bytes | str | None, n: int = 40) -> str:
-            if not buf:
-                return ""
-            s = buf.decode(errors="replace") if isinstance(buf, bytes) else buf
-            lines = [ln for ln in s.splitlines() if ln.strip()]
-            return "\n".join(lines[-n:])
 
-        tail_stdout = _tail(exc.stdout)
-        tail_stderr = _tail(exc.stderr)
-        parts = [f"Ansible playbook timed out after {timeout}s"]
-        if tail_stderr:
-            parts.append(f"--- stderr tail ---\n{tail_stderr}")
-        if tail_stdout:
-            parts.append(f"--- stdout tail ---\n{tail_stdout}")
-        raise RuntimeError("\n".join(parts)) from exc
+    def _tail(buf: str | None, n: int = 40) -> str:
+        if not buf:
+            return ""
+        lines = [ln for ln in buf.splitlines() if ln.strip()]
+        return "\n".join(lines[-n:])
+
+    # Popen + poll-цикл вместо блокирующего subprocess.run: даёт (а) отмену
+    # на запрос оператора (cancel_check → SIGTERM процессу ansible-playbook),
+    # (б) сохраняет timeout-поведение. communicate(timeout=N) в цикле НЕ
+    # теряет вывод (см. python docs: "retrying communication will not lose
+    # any output"). poll каждые ANSIBLE_CANCEL_POLL_S сек.
+    poll_s = float(os.getenv("ANSIBLE_CANCEL_POLL_S", "3"))
+    proc = subprocess.Popen(  # noqa: S603
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        cwd=str(ANSIBLE_ROOT),
+    )
+    start = time.monotonic()
+    while True:
+        try:
+            stdout, stderr = proc.communicate(timeout=poll_s)
+            return subprocess.CompletedProcess(
+                cmd, proc.returncode, stdout, stderr
+            )
+        except subprocess.TimeoutExpired:
+            # Запрошена отмена → SIGTERM, добиваем kill'ом если не реагирует.
+            if cancel_check is not None and cancel_check():
+                proc.terminate()
+                try:
+                    stdout, stderr = proc.communicate(timeout=15)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    stdout, stderr = proc.communicate()
+                raise AnsibleCancelled(
+                    "Ansible playbook cancelled by operator",
+                    stdout=stdout or "",
+                    stderr=stderr or "",
+                )
+            # Общий timeout — kill + tail в сообщение (как раньше).
+            if time.monotonic() - start > timeout:
+                proc.kill()
+                try:
+                    stdout, stderr = proc.communicate(timeout=15)
+                except subprocess.TimeoutExpired:
+                    stdout, stderr = "", ""
+                parts = [f"Ansible playbook timed out after {timeout}s"]
+                if _tail(stderr):
+                    parts.append(f"--- stderr tail ---\n{_tail(stderr)}")
+                if _tail(stdout):
+                    parts.append(f"--- stdout tail ---\n{_tail(stdout)}")
+                raise RuntimeError("\n".join(parts))
+            # иначе — продолжаем поллить

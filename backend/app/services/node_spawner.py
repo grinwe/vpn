@@ -270,11 +270,12 @@ def spawn_node(
     ensure_reality_config(db, node, sni=reality_sni, dest=reality_dest)
 
     orchestrator = ProvisioningOrchestrator(db)
-    task = orchestrator.create_task(
-        "node", node.id, "bootstrap", {"pool_id": pool_id, "auto_spawn": True}
+    task, _created = orchestrator.create_or_coalesce_node_bootstrap(
+        node, {"pool_id": pool_id, "auto_spawn": True}
     )
     db.commit()
-    orchestrator.run_task_async(task, node=node)
+    if _created:
+        orchestrator.run_task_async(task, node=node)
     return node, task
 
 

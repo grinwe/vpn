@@ -298,9 +298,12 @@ def create_node(
     actor, actor_type = _resolve_admin_actor(admin_actor)
     _audit(db, actor, "node_created", "vpn_node", node.id, actor_type=actor_type)
     orchestrator = ProvisioningOrchestrator(db)
-    task = orchestrator.create_task("node", node.id, "bootstrap", {"pool_id": payload.pool_id})
+    task, _created = orchestrator.create_or_coalesce_node_bootstrap(
+        node, {"pool_id": payload.pool_id}
+    )
     db.commit()
-    orchestrator.run_task_async(task, node=node)
+    if _created:
+        orchestrator.run_task_async(task, node=node)
     return node
 
 
@@ -412,11 +415,15 @@ def rebootstrap_node(
     if not node:
         raise HTTPException(status_code=404, detail="Node not found")
     orchestrator = ProvisioningOrchestrator(db)
-    task = orchestrator.create_task(
-        "node", node.id, "bootstrap", {"pool_id": node.pool_id, "rerun": True}
+    task, _created = orchestrator.create_or_coalesce_node_bootstrap(
+        node, {"pool_id": node.pool_id, "rerun": True}
     )
     db.commit()
-    orchestrator.run_task_async(task, node=node)
+    if _created:
+        orchestrator.run_task_async(task, node=node)
+    # RECONCILER_ENABLED on → coalesce ушёл в defer (mark_node_dirty) и вернул
+    # (None, False); правка зачтена, таски нет. task.id дёргаем None-safe.
+    task_id = task.id if task else None
     actor, actor_type = _resolve_admin_actor(admin_actor)
     _audit(
         db,
@@ -425,9 +432,9 @@ def rebootstrap_node(
         "vpn_node",
         node.id,
         actor_type=actor_type,
-        metadata={"task_id": task.id},
+        metadata={"task_id": task_id},
     )
-    return {"node_id": node.id, "task_id": task.id}
+    return {"node_id": node.id, "task_id": task_id}
 
 
 @router.post("/nodes/{node_id}/diagnose")
@@ -580,12 +587,12 @@ def create_config(
     warm_pool.invalidate_node_warm_pool(db, node.id, reason="config added")
     # Run site.yml so Ansible installs the new protocol on the node.
     orchestrator = ProvisioningOrchestrator(db)
-    task = orchestrator.create_task(
-        "node", node.id, "bootstrap",
-        {"pool_id": node.pool_id, "config_change": True},
+    task, _created = orchestrator.create_or_coalesce_node_bootstrap(
+        node, {"pool_id": node.pool_id, "config_change": True}
     )
     db.commit()
-    orchestrator.run_task_async(task, node=node)
+    if _created:
+        orchestrator.run_task_async(task, node=node)
     return config
 
 
@@ -657,12 +664,12 @@ def delete_config(
     node = db.get(models.VPNNode, node_id)
     if node:
         orchestrator = ProvisioningOrchestrator(db)
-        task = orchestrator.create_task(
-            "node", node.id, "bootstrap",
-            {"pool_id": node.pool_id, "config_change": True},
+        task, _created = orchestrator.create_or_coalesce_node_bootstrap(
+            node, {"pool_id": node.pool_id, "config_change": True}
         )
         db.commit()
-        orchestrator.run_task_async(task, node=node)
+        if _created:
+            orchestrator.run_task_async(task, node=node)
     return None
 
 

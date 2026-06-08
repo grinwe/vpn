@@ -122,6 +122,153 @@ def run_pending_rescue_tick() -> dict:
     return {"scanned": scanned, "rescued": rescued}
 
 
+def run_operator_report_watch_tick() -> dict:
+    """Periodic — resolve operator-routing reports by observed reconnect.
+
+    Phase 1: flips ``OperatorNodeReport`` rows from ``pending`` to
+    ``ok``/``inconclusive`` once ``T_RECONNECT`` (default 15 min) has
+    elapsed, by checking whether the user reconnected on the target node
+    (``NodeTrafficSample``). See services.operator_reports +
+    docs/operations/operator_routing_roadmap.md.
+    """
+    from .db import SessionLocal
+    from .queue import schedule_tick
+    from .services.operator_reports import resolve_pending_reports
+
+    # Reschedule в начале — см. run_pending_rescue_tick.
+    interval = int(os.getenv("OPERATOR_REPORT_WATCH_INTERVAL", "300"))
+    if interval > 0:
+        try:
+            schedule_tick(
+                "app.worker.run_operator_report_watch_tick",
+                interval,
+                tick_id="tick-operator-report-watch",
+                replace=True,
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception(
+                "operator_report_watch: failed to re-enqueue tick (at start)"
+            )
+
+    session = SessionLocal()
+    try:
+        return resolve_pending_reports(session)
+    finally:
+        session.close()
+
+
+def run_reconcile_tick() -> dict:
+    """Phase 3 reconcile-тик: сходит ноды по desired-state generations (одним
+    coalesced bootstrap'ом на ноду, у которой due наступил и desired >
+    reconciled). No-op если RECONCILER_ENABLED выключен (provision идёт по
+    Phase-0 immediate-модели). Self-reschedules. См. reconciler_epic.md."""
+    from .db import SessionLocal
+    from .queue import schedule_tick
+    from .services.provisioning import ProvisioningOrchestrator
+
+    interval = int(os.getenv("RECONCILE_INTERVAL", "10"))
+    if interval > 0:
+        try:
+            schedule_tick(
+                "app.worker.run_reconcile_tick",
+                interval,
+                tick_id="tick-reconcile",
+                replace=True,
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("reconcile: failed to re-enqueue tick (at start)")
+
+    session = SessionLocal()
+    try:
+        return ProvisioningOrchestrator(session).reconcile_due_nodes()
+    finally:
+        session.close()
+
+
+def _resolve_mgmt_host() -> str:
+    """Pull the mgmt host from the ansible inventory (db_host → mgmt-1).
+
+    Mirrors ``scripts/workers.sh``. ``MGMT_HOST`` env overrides this.
+    """
+    import yaml
+
+    root = os.getenv("ANSIBLE_ROOT", "/app/infra/ansible")
+    path = os.path.join(root, "inventories", "prod", "hosts.yml")
+    with open(path) as fh:
+        inv = yaml.safe_load(fh)
+    return inv["all"]["children"]["db_host"]["hosts"]["mgmt-1"]["ansible_host"]
+
+
+def run_scale_workers(replicas: int) -> dict:
+    """Scale the worker container replicas on the mgmt host via SSH.
+
+    Runs on a worker (the API image carries no ssh/key) — mirrors
+    ``scripts/workers.sh``: ssh to the mgmt host, persist
+    ``WORKER_REPLICAS`` in ``.env`` (so it survives a plain
+    ``docker compose up``), then ``docker compose up -d --scale
+    worker=N worker``. The docker command runs ON the host, so even a
+    scale-DOWN that kills this very worker mid-run still completes.
+
+    Returns ``{replicas, ok, rc, stdout, stderr}`` (output tails). Raises
+    ``ValueError`` on an out-of-range count (the API also validates).
+    """
+    import subprocess
+
+    n = int(replicas)
+    if not (1 <= n <= 20):
+        raise ValueError(f"replicas {n} out of range 1..20")
+
+    mgmt_host = os.getenv("MGMT_HOST") or _resolve_mgmt_host()
+    mgmt_user = os.getenv("MGMT_USER", "root")
+    stack_dir = os.getenv("MGMT_STACK_DIR", "/opt/vpn")
+    key = os.getenv("ANSIBLE_PRIVATE_KEY_FILE", "/run/secrets/provisioning_key")
+
+    remote = (
+        f"set -e; cd {stack_dir}; "
+        f"if grep -q '^WORKER_REPLICAS=' .env 2>/dev/null; then "
+        f"sed -i 's/^WORKER_REPLICAS=.*/WORKER_REPLICAS={n}/' .env; "
+        f"else echo 'WORKER_REPLICAS={n}' >> .env; fi; "
+        f"docker compose up -d --scale worker={n} worker; "
+        f"docker compose ps worker --format '{{{{.Name}}}} {{{{.State}}}}'"
+    )
+    cmd = [
+        "ssh",
+        "-i", key,
+        "-o", "StrictHostKeyChecking=no",
+        "-o", "UserKnownHostsFile=/dev/null",
+        "-o", "ConnectTimeout=20",
+        "-o", "BatchMode=yes",
+        f"{mgmt_user}@{mgmt_host}",
+        remote,
+    ]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=150)
+    except subprocess.TimeoutExpired:
+        logger.error("scale_workers: ssh to %s timed out", mgmt_host)
+        return {
+            "replicas": n,
+            "ok": False,
+            "rc": -1,
+            "stdout": "",
+            "stderr": "ssh timeout (150s)",
+        }
+
+    ok = proc.returncode == 0
+    if not ok:
+        logger.error(
+            "scale_workers rc=%s stderr=%s", proc.returncode, proc.stderr[-500:]
+        )
+    else:
+        logger.info("scale_workers: set worker replicas = %s on %s", n, mgmt_host)
+    return {
+        "replicas": n,
+        "ok": ok,
+        "rc": proc.returncode,
+        "stdout": proc.stdout[-1500:],
+        "stderr": proc.stderr[-1500:],
+    }
+
+
 def run_autoscale_tick() -> list[dict]:
     """Periodic job — walk pools and scale up where needed."""
     from dataclasses import asdict
@@ -2016,6 +2163,43 @@ def main() -> None:
             )
         except Exception:  # noqa: BLE001
             logger.exception("Failed to schedule pending-rescue tick")
+
+    # Schedule operator-report watcher (Phase 1 operator-aware routing) —
+    # resolves «VPN не работает» reports by observed reconnect. Default 5 min.
+    operator_watch_interval = int(os.getenv("OPERATOR_REPORT_WATCH_INTERVAL", "300"))
+    if do_bootstrap and operator_watch_interval > 0:
+        try:
+            schedule_tick(
+                "app.worker.run_operator_report_watch_tick",
+                min(operator_watch_interval, 60),
+                tick_id="tick-operator-report-watch",
+                replace=True,
+            )
+            logger.info(
+                "Operator-report watcher bootstrapped: first run in 60s "
+                "(interval=%ss)", operator_watch_interval,
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("Failed to schedule operator-report watcher tick")
+
+    # Phase 3 reconcile tick — сходит ноды по desired-state generations.
+    # No-op пока RECONCILER_ENABLED выключен (сам тик short-circuit'ит).
+    # Дефолт 10s; debounce RECONCILE_DEBOUNCE_S коллапсит burst правок.
+    reconcile_interval = int(os.getenv("RECONCILE_INTERVAL", "10"))
+    if do_bootstrap and reconcile_interval > 0:
+        try:
+            schedule_tick(
+                "app.worker.run_reconcile_tick",
+                reconcile_interval,
+                tick_id="tick-reconcile",
+                replace=True,
+            )
+            logger.info(
+                "Reconcile tick bootstrapped: interval=%ss (RECONCILER_ENABLED=%r)",
+                reconcile_interval, os.getenv("RECONCILER_ENABLED", ""),
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("Failed to schedule reconcile tick")
 
     # Schedule autoscale tick
     autoscale_interval = int(os.getenv("AUTOSCALE_INTERVAL", "0"))

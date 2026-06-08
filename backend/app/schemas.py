@@ -521,6 +521,24 @@ class WorkerRestartOut(BaseModel):
     failed: list[str] = Field(default_factory=list)
 
 
+class WorkerScaleRequest(BaseModel):
+    """Желаемое число worker-реплик (1..20, как в scripts/workers.sh)."""
+    replicas: int = Field(ge=1, le=20)
+
+
+class WorkerScaleOut(BaseModel):
+    """Результат скейла. ``status``: applied | failed | enqueued.
+
+    Скейл реально делает worker по SSH на mgmt (у API-образа нет ssh/ключа),
+    поэтому API энкьюит job и коротко ждёт результат. ``enqueued`` — job
+    взяли, но за окно ожидания он не успел; счётчик воркеров подтянется
+    в виджете сам.
+    """
+    replicas: int
+    status: str
+    detail: str | None = None
+
+
 class ExitEvacuateOut(BaseModel):
     """Результат массового переезда подписок с exit A на exit B.
 
@@ -827,6 +845,9 @@ class ProvisioningTaskOut(BaseModel):
     created_at: UTCDateTime
     started_at: UTCDateTime | None
     finished_at: UTCDateTime | None
+    # Phase 1: выставлен → оператор запросил отмену. Если status ещё running —
+    # UI показывает «отменяется…» (раннер SIGTERM'нет на ближайшем poll'е).
+    cancel_requested_at: UTCDateTime | None = None
     # Best-effort lookup: for device/subscription tasks we resolve the
     # owning user's telegram_id so the admin Tasks table can show who
     # the job belongs to without a second round-trip. None for node

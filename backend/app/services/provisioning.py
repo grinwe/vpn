@@ -18,7 +18,7 @@ from ..time_utils import utcnow
 from typing import Any
 
 from prometheus_client import Counter
-from sqlalchemy import func
+from sqlalchemy import case, func
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -26,10 +26,12 @@ from .. import models
 from ..db import SessionLocal
 from ..security import compute_client_id_hmac, decrypt, encrypt
 from .ansible_runner import (
+    AnsibleCancelled,
     build_inventory_for_exit_node,
     build_inventory_for_node,
     build_inventory_for_relay_link_diagnose,
     run_playbook,
+    set_active_cancel_check,
 )
 from .relay import (
     build_xray_relay_outbounds,
@@ -212,6 +214,17 @@ def _build_shadowtls_credential(
     )
 
 
+# uTLS ClientHello fingerprint для vless-кредов. RKN-DPI (июнь-2026) флагует
+# chrome/safari/ios; firefox/edge/android — проходят. НЕ ставить randomized:
+# смена fp во время блока = +600с штрафа по алгоритму РКН. Меняется тут одним
+# местом, раскатывается тихо через bulk-rebuild-config (без ротации токена).
+_VLESS_UTLS_FP = "firefox"
+
+# xray-ws (ws-cdn) sits on this loopback port; nginx :443 fronts it and
+# proxies the WS path here. Internal only — never client-facing.
+_WS_CDN_LOOPBACK_PORT = 10444
+
+
 def _build_vless_reality_credential(
     node: models.VPNNode, config: models.VPNConfig, user_id: str
 ) -> str:
@@ -224,7 +237,7 @@ def _build_vless_reality_credential(
         "pbk": config.public_key or settings.get("public_key", ""),
         "sid": settings.get("short_id", ""),
         "flow": "xtls-rprx-vision",
-        "fp": "chrome",
+        "fp": _VLESS_UTLS_FP,
         "type": "tcp",
     }
     query = "&".join([f"{k}={v}" for k, v in params.items() if v])
@@ -244,9 +257,10 @@ def _build_vless_ws_cdn_credential(
     cdn_domain = config.sni or settings.get("cdn_domain", "")
     path = settings.get("ws_path", "/ws")
     params = {
+        "encryption": "none",  # mandatory in the VLESS URI — clients reject without it
         "security": "tls",
         "sni": cdn_domain,
-        "fp": "chrome",
+        "fp": _VLESS_UTLS_FP,
         "type": "ws",
         "host": cdn_domain,
         "path": urlquote(path),
@@ -290,7 +304,7 @@ def _build_vless_xhttp_credential(
         "encryption": "none",
         "security": "tls",
         "sni": domain,
-        "fp": "chrome",
+        "fp": _VLESS_UTLS_FP,
         "type": "xhttp",
         "host": domain,
         "path": urlquote(path),
@@ -380,6 +394,47 @@ def _validate_extra_vars(extra: dict[str, Any], *, node_hint: str) -> None:
                 )
 
 
+def _resolve_xray_mirror_url() -> str | None:
+    """Mgmt-mirror base URL for ``xray-{geoip,core}-fetch.sh``.
+
+    Provisioning runs against a single-node temp inventory
+    (:func:`build_inventory_for_node`), so neither ``group_vars/all.yml``
+    (which defines ``xray_mirror_url``) nor ``mgmt-1``'s hostvars are
+    loaded — the group_vars value ``http://{{ hostvars['mgmt-1']... }}``
+    would render undefined → empty ``MIRROR_URL``. We resolve the URL here
+    and pass it as an ``--extra-var`` so the node's ``/etc/default/xray-mirror``
+    gets a real value and the fetch wrappers try the mirror first (xray-core
+    has NO jsdelivr fallback — without the mirror it dies on github timeout
+    from blocked RU DCs).
+
+    Order: ``XRAY_MIRROR_URL`` env (explicit) → ``http://<mgmt-1
+    ansible_host>:<XRAY_MIRROR_PORT|8090>`` parsed from the prod inventory →
+    ``None`` (wrappers fall back to ghproxy/github).
+    """
+    explicit = os.getenv("XRAY_MIRROR_URL")
+    if explicit:
+        return explicit.rstrip("/")
+
+    mgmt = os.getenv("MGMT_HOST")
+    if not mgmt:
+        try:
+            import yaml
+
+            root = os.getenv("ANSIBLE_ROOT", "/app/infra/ansible")
+            path = os.path.join(root, "inventories", "prod", "hosts.yml")
+            with open(path) as fh:
+                inv = yaml.safe_load(fh)
+            mgmt = inv["all"]["children"]["db_host"]["hosts"]["mgmt-1"][
+                "ansible_host"
+            ]
+        except Exception:  # noqa: BLE001
+            return None
+    if not mgmt:
+        return None
+    port = os.getenv("XRAY_MIRROR_PORT", "8090")
+    return f"http://{mgmt}:{port}"
+
+
 def _collect_site_extra_vars(
     db: Session, node: models.VPNNode
 ) -> dict[str, Any]:
@@ -389,6 +444,13 @@ def _collect_site_extra_vars(
     backend-authoritative secrets for each protocol to the installer roles.
     """
     extra: dict[str, Any] = {}
+
+    # Mgmt-mirror URL for the xray geoip/core fetchers. The temp inventory
+    # drops group_vars, so we inject it here — without it xray-core can't
+    # install from a github-blocked RU DC. See _resolve_xray_mirror_url.
+    mirror_url = _resolve_xray_mirror_url()
+    if mirror_url:
+        extra["xray_mirror_url"] = mirror_url
     # Ports the health-check role must see listening after site.yml
     # finishes. Built from the set of enabled VPNConfig rows so adding
     # or removing a protocol on the node automatically adjusts which
@@ -431,27 +493,65 @@ def _collect_site_extra_vars(
             })
             health_ports.append(cfg.port)
 
-        # ── VLESS+WS+CDN ──
+        # ── VLESS+WS+CDN (CF-fronted: nginx :443 → xray-ws loopback) ──
         elif cfg.protocol == models.VPNConfigProtocol.vless_ws_cdn:
             extra.update({
                 "vless_ws_cdn_port": cfg.port,
-                "vless_ws_cdn_domain": cfg.sni or "",
+                "vless_ws_cdn_domain": cfg.sni or "",  # cf_subdomain (set by DNS hook)
                 "vless_ws_cdn_path": settings.get("ws_path", "/ws"),
-                "vless_ws_cdn_cert_path": settings.get("cert_path", ""),
-                "vless_ws_cdn_key_path": settings.get("key_path", ""),
+                "vless_ws_cdn_loopback_port": settings.get(
+                    "loopback_port", _WS_CDN_LOOPBACK_PORT
+                ),
             })
+            # Origin CA cert (*.wgse.info) for the nginx WS front — shared
+            # secret, passed base64 (single-line → passes the newline check
+            # in _validate_extra_vars). Only when both are set in backend env.
+            _cert_b64 = os.getenv("WSCDN_ORIGIN_CERT_B64", "")
+            _key_b64 = os.getenv("WSCDN_ORIGIN_KEY_B64", "")
+            if _cert_b64 and _key_b64:
+                extra["vless_ws_cdn_origin_cert_b64"] = _cert_b64
+                extra["vless_ws_cdn_origin_key_b64"] = _key_b64
             health_ports.append(cfg.port)
 
-        # ── VLESS+XHTTP ──
+        # ── VLESS+XHTTP (direct+LE, or CF-fronted like ws-cdn) ──
         elif cfg.protocol == models.VPNConfigProtocol.vless_xhttp:
             extra.update({
                 "vless_xhttp_port": cfg.port,
                 "vless_xhttp_domain": cfg.sni or "",
                 "vless_xhttp_path": settings.get("xhttp_path", "/xh"),
                 "vless_xhttp_mode": settings.get("xhttp_mode", "auto"),
-                "vless_xhttp_cert_path": settings.get("cert_path", ""),
-                "vless_xhttp_key_path": settings.get("key_path", ""),
             })
+            # CF-fronted xhttp (auto mode — settings.cf_subdomain set by the
+            # DNS hook): pick the Origin CA cert that MATCHES this config's
+            # front zone. xhttp can live on its own zone (grwr.ink) while
+            # legacy/ws configs stay on wgse.info — serving the wrong cert for
+            # the SNI fails CF Full(strict). Dedicated cert_path → no clobber
+            # with the ws-cdn cert on a combo node → role's "cert_path provided
+            # → skip certbot" logic kicks in (no per-domain LE / HTTP-01).
+            # Direct xhttp (explicit sni) keeps its LE/cert paths.
+            if settings.get("cf_subdomain"):
+                _xhttp_front = os.getenv("XHTTP_FRONT_DOMAIN", "").strip().rstrip(".")
+                _cf_front = (settings.get("cf_front_domain") or "").strip().rstrip(".")
+                # On the dedicated xhttp zone? (explicit cf_front_domain, or —
+                # for configs minted before that field existed — sni suffix.)
+                _on_xhttp_zone = bool(_xhttp_front) and (
+                    _cf_front == _xhttp_front
+                    or (not _cf_front and str(cfg.sni or "").endswith("." + _xhttp_front))
+                )
+                if _on_xhttp_zone:
+                    _cert_b64 = os.getenv("XHTTP_ORIGIN_CERT_B64", "") or os.getenv("WSCDN_ORIGIN_CERT_B64", "")
+                    _key_b64 = os.getenv("XHTTP_ORIGIN_KEY_B64", "") or os.getenv("WSCDN_ORIGIN_KEY_B64", "")
+                else:
+                    _cert_b64 = os.getenv("WSCDN_ORIGIN_CERT_B64", "")
+                    _key_b64 = os.getenv("WSCDN_ORIGIN_KEY_B64", "")
+                if _cert_b64 and _key_b64:
+                    extra["vless_xhttp_origin_cert_b64"] = _cert_b64
+                    extra["vless_xhttp_origin_key_b64"] = _key_b64
+                    extra["vless_xhttp_cert_path"] = "/etc/nginx/ssl/xhttp-origin.crt"
+                    extra["vless_xhttp_key_path"] = "/etc/nginx/ssl/xhttp-origin.key"
+            else:
+                extra["vless_xhttp_cert_path"] = settings.get("cert_path", "")
+                extra["vless_xhttp_key_path"] = settings.get("key_path", "")
             health_ports.append(cfg.port)
 
         # ── Hysteria2 ──
@@ -765,6 +865,246 @@ class ProvisioningOrchestrator:
         self.db.flush()
         return task
 
+    @staticmethod
+    def _reconciler_enabled() -> bool:
+        return os.getenv("RECONCILER_ENABLED", "").lower() in {"1", "true", "yes"}
+
+    def mark_node_dirty(
+        self, node: models.VPNNode, *, delay_s: float | None = None
+    ) -> None:
+        """Phase 3: «ноде нужен reconcile» — атомарно бампаем
+        desired_generation и ставим reconcile_due_at = now + debounce. Правка
+        НЕ диспатчит bootstrap сразу; reconcile-тик сойдёт ноду ОДНИМ прогоном
+        после того, как burst правок осядет. UPDATE статeless (выражение
+        desired_generation+1 в SQL) — без гонок read-modify-write."""
+        if delay_s is None:
+            delay_s = float(os.getenv("RECONCILE_DEBOUNCE_S", "5"))
+        self.db.query(models.VPNNode).filter(
+            models.VPNNode.id == node.id
+        ).update(
+            {
+                models.VPNNode.desired_generation:
+                    models.VPNNode.desired_generation + 1,
+                models.VPNNode.reconcile_due_at:
+                    utcnow() + timedelta(seconds=delay_s),
+            },
+            synchronize_session=False,
+        )
+        self.db.flush()
+
+    def create_or_coalesce_node_bootstrap(
+        self,
+        node: models.VPNNode,
+        payload: dict[str, Any] | None,
+        *,
+        batch_id: uuid.UUID | None = None,
+        defer_to_reconciler: bool = True,
+    ) -> tuple[models.ProvisioningTask | None, bool]:
+        """Phase-0 coalescing: ≤1 активный (pending|running) bootstrap на ноду.
+
+        Активный bootstrap уже есть → ставим ``rerun_requested`` на нём (worker
+        создаст один свежий на финише) и возвращаем (existing, False). Иначе
+        создаём новый → (task, True). Вызывающий делает ``run_task_async``
+        ТОЛЬКО при created=True.
+
+        DB-инвариант держит partial unique index uq_active_node_bootstrap
+        (миграция 0041); гонку конкурентных insert'ов ловим savepoint'ом.
+
+        Phase 3: при defer_to_reconciler=True (дефолт — все edit-сайты) и
+        включённом RECONCILER_ENABLED правка НЕ создаёт таску сразу — бампаем
+        desired_generation, reconcile-тик сойдёт ноду. Сам тик / rerun-хук /
+        явный requeue зовут с defer_to_reconciler=False (им надо реально
+        создать+задиспатчить). См. reconciler_epic.md.
+        """
+        if defer_to_reconciler and self._reconciler_enabled():
+            self.mark_node_dirty(node)
+            return None, False
+
+        def _find_active() -> models.ProvisioningTask | None:
+            return (
+                self.db.query(models.ProvisioningTask)
+                .filter(
+                    models.ProvisioningTask.target_type == "node",
+                    models.ProvisioningTask.target_id == node.id,
+                    models.ProvisioningTask.action == "bootstrap",
+                    models.ProvisioningTask.status.in_(
+                        (
+                            models.ProvisioningTaskStatus.pending,
+                            models.ProvisioningTaskStatus.running,
+                        )
+                    ),
+                )
+                .order_by(models.ProvisioningTask.id.desc())
+                .first()
+            )
+
+        def _flag(active_task: models.ProvisioningTask) -> bool:
+            # Status-checked атомарный set: True ТОЛЬКО если таска всё ещё
+            # активна. Если она финишировала между _find_active и этим UPDATE
+            # (0 строк) — НЕ ставим флаг на терминальную строку (иначе worker
+            # его не подхватит и правка потеряется — review TOCTOU lost-rerun),
+            # а проваливаемся в INSERT свежего bootstrap'а.
+            return bool(
+                self.db.query(models.ProvisioningTask)
+                .filter(
+                    models.ProvisioningTask.id == active_task.id,
+                    models.ProvisioningTask.status.in_(
+                        (
+                            models.ProvisioningTaskStatus.pending,
+                            models.ProvisioningTaskStatus.running,
+                        )
+                    ),
+                )
+                .update(
+                    {models.ProvisioningTask.rerun_requested: True},
+                    synchronize_session=False,
+                )
+            )
+
+        active = _find_active()
+        if active is not None and _flag(active):
+            self.db.flush()
+            return active, False
+
+        try:
+            with self.db.begin_nested():
+                task = models.ProvisioningTask(
+                    target_type="node",
+                    target_id=node.id,
+                    action="bootstrap",
+                    payload=payload or {},
+                    status=models.ProvisioningTaskStatus.pending,
+                    batch_id=batch_id,
+                )
+                self.db.add(task)
+                self.db.flush()  # тут триггерится uq_active_node_bootstrap при гонке
+            return task, True
+        except IntegrityError:
+            # Проиграли гонку — активный bootstrap создал другой запрос.
+            active = _find_active()
+            if active is not None and _flag(active):
+                self.db.flush()
+                return active, False
+            # Крайне редкий зазор: индекс сработал, но активного уже нет
+            # (успел финишировать между insert и re-query) — создаём обычно.
+            return (
+                self.create_task(
+                    "node", node.id, "bootstrap", payload, batch_id=batch_id
+                ),
+                True,
+            )
+
+    def _enqueue_bootstrap_rerun(
+        self, node: models.VPNNode, finished_task: models.ProvisioningTask
+    ) -> None:
+        """Phase-0: на финише bootstrap'а с ``rerun_requested`` создаём РОВНО
+        один свежий bootstrap (правки, прилетевшие во время прогона). Старая
+        таска уже терминальна → unique index свободен. Свежая стартует с
+        rerun_requested=False, так что бесконечного цикла нет."""
+        payload = dict(finished_task.payload or {})
+        payload["rerun"] = True
+        fresh, created = self.create_or_coalesce_node_bootstrap(
+            node, payload, defer_to_reconciler=False
+        )
+        self.db.commit()
+        if created:
+            logger.info(
+                "Coalesce rerun: node %s → свежий bootstrap task %s",
+                node.id, fresh.id,
+            )
+            self.run_task_async(fresh, node=node)
+
+    def reconcile_due_nodes(self) -> dict[str, Any]:
+        """Phase 3 reconcile-тик: сходит ноды, у которых reconcile_due_at
+        наступил И desired_generation > reconciled_generation — ОДНИМ coalesced
+        bootstrap'ом, помеченным целевым generation (reconcile_gen). На успехе
+        reconciled = gen; на фейле due_at re-arm'ится с backoff (см.
+        _handle_task_outcome). No-op если RECONCILER_ENABLED выключен.
+
+        Ноды с уже активным (pending|running) bootstrap'ом ИСКЛЮЧАЕМ из выборки
+        (NOT EXISTS): иначе они — с самым ранним due_at — занимали бы окно капа
+        на каждом тике (created=False, dispatched=0) и морили бы голодом ждущие
+        ноды (review: cap-starvation), а тик ещё и коалесился бы на свой же
+        in-flight bootstrap, плодя лишний прогон (review: spurious-rerun). due_at
+        в тике НЕ чистим — им управляет outcome-хэндлер: успех → None (сошлись)
+        либо оставлен (supersession, desired обогнал), фейл → now+backoff. Пока
+        bootstrap бежит, нода невидима тику; на терминале outcome перевыставит
+        due_at, и СЛЕДУЮЩИЙ тик (active-bootstrap'а уже нет) задиспатчит свежий
+        прогон с актуальным gen.
+
+        Phase 4: за один тик диспатчим максимум RECONCILE_MAX_PER_TICK нод
+        (default 5), отсортированных по reconcile_due_at ASC (дольше всех
+        ждавшие — первыми, FIFO-справедливость). Остальные созревшие подождут
+        следующего тика (RECONCILE_INTERVAL=10s). Это back-pressure против
+        thundering herd при bulk-правке (50 нод сразу): семафор всё равно
+        пускает MAX_CONCURRENT_ANSIBLE параллельно, но кап не плодит лишние
+        pending-строки впереди ёмкости. Берём limit+1, чтобы честно
+        репортить ``capped`` (есть ли ещё созревшие сверх капа), не считая
+        второй COUNT."""
+        if not self._reconciler_enabled():
+            return {"reconciler": "disabled"}
+        now = utcnow()
+        max_per_tick = max(1, int(os.getenv("RECONCILE_MAX_PER_TICK", "5")))
+        # Коррелированный NOT EXISTS: нода уже имеет активный bootstrap (его
+        # держит Phase-0 unique index uq_active_node_bootstrap, ≤1 на ноду) →
+        # новый прогон сейчас не нужен/не возможен, исключаем из окна капа.
+        active_bootstrap = (
+            self.db.query(models.ProvisioningTask.id)
+            .filter(
+                models.ProvisioningTask.target_type == "node",
+                models.ProvisioningTask.target_id == models.VPNNode.id,
+                models.ProvisioningTask.action == "bootstrap",
+                models.ProvisioningTask.status.in_(
+                    (
+                        models.ProvisioningTaskStatus.pending,
+                        models.ProvisioningTaskStatus.running,
+                    )
+                ),
+            )
+            .exists()
+        )
+        rows = (
+            self.db.query(models.VPNNode)
+            .filter(
+                models.VPNNode.reconcile_due_at.isnot(None),
+                models.VPNNode.reconcile_due_at <= now,
+                models.VPNNode.desired_generation
+                > models.VPNNode.reconciled_generation,
+                ~active_bootstrap,
+            )
+            .order_by(models.VPNNode.reconcile_due_at.asc())
+            .limit(max_per_tick + 1)
+            .all()
+        )
+        capped = len(rows) > max_per_tick
+        due = rows[:max_per_tick]
+        dispatched = 0
+        for node in due:
+            gen = node.desired_generation  # фиксируем целевой generation
+            try:
+                task, created = self.create_or_coalesce_node_bootstrap(
+                    node,
+                    {
+                        "pool_id": node.pool_id,
+                        "reconcile_gen": gen,
+                        "reconcile": True,
+                    },
+                    defer_to_reconciler=False,
+                )
+                self.db.commit()
+                if created and task is not None:
+                    self.run_task_async(task, node=node)
+                    dispatched += 1
+            except Exception:  # noqa: BLE001
+                logger.exception("reconcile: node %s dispatch failed", node.id)
+                self.db.rollback()
+        if capped:
+            logger.info(
+                "reconcile: capped at %s node(s)/tick — ещё созревшие ждут "
+                "следующего тика", max_per_tick,
+            )
+        return {"due": len(due), "dispatched": dispatched, "capped": capped}
+
     def _mark_task(
         self,
         task: models.ProvisioningTask,
@@ -781,16 +1121,54 @@ class ProvisioningOrchestrator:
         self.db.commit()
         TASK_STATUS_COUNTER.labels(status=status.value).inc()
 
+    def _is_cancel_requested(self, task_id: int) -> bool:
+        """Свежая короткая сессия — видеть cancel_requested_at, выставленный
+        API в ДРУГОЙ сессии, не трогая транзакцию идущего таска. На ошибке БД
+        возвращаем False (лучше доделать прогон, чем оборвать на мигании БД)."""
+        try:
+            with SessionLocal() as s:
+                return (
+                    s.query(models.ProvisioningTask.cancel_requested_at)
+                    .filter(models.ProvisioningTask.id == task_id)
+                    .scalar()
+                ) is not None
+        except Exception:  # noqa: BLE001
+            return False
+
     def run_task(
         self, task: models.ProvisioningTask, node: models.VPNNode | None = None
     ) -> models.ProvisioningTask:
+        # Phase 1: оператор мог отменить таску, пока она ждала в очереди —
+        # не запускаем ansible, помечаем cancelled и выходим.
+        if task.cancel_requested_at is not None:
+            # Отмена ≠ поломка: НЕ зовём _handle_task_outcome (он бы демотил
+            # ноду в error / обнулял health_score). Просто помечаем cancelled.
+            self._mark_task(
+                task, models.ProvisioningTaskStatus.cancelled,
+                error="cancelled before start",
+            )
+            return task
+
         task.started_at = utcnow()
         task.status = models.ProvisioningTaskStatus.running
         self.db.commit()
 
+        # Активный cancel_check для run_playbook'ов этого таска (poll→SIGTERM).
+        # Ставится thread-local'но, перезаписывается на старте каждого run_task,
+        # так что между тасками не утекает.
+        set_active_cancel_check(lambda: self._is_cancel_requested(task.id))
+
         result_payload: dict[str, Any] | None = None
         try:
             result_payload = self._execute_task(task, node=node)
+        except AnsibleCancelled as exc:
+            # Отмена ≠ поломка — ноду не демотим (см. pre-start ветку выше).
+            self._mark_task(
+                task, models.ProvisioningTaskStatus.cancelled,
+                error="cancelled by operator (SIGTERM)",
+                result={"stdout": exc.stdout, "stderr": exc.stderr},
+            )
+            return task
         except Exception as exc:  # noqa: BLE001
             # Unexpected error BEFORE or AFTER ansible (setup/teardown,
             # inventory build, semaphore, etc). Ansible non-zero exit is
@@ -899,6 +1277,61 @@ class ProvisioningOrchestrator:
         self.db.add(task)
         self.db.commit()
 
+    def requeue_task(
+        self, task: models.ProvisioningTask
+    ) -> models.ProvisioningTask:
+        """Safely (re)dispatch a task. Возвращает таску, которая реально
+        побежит (для node-bootstrap может быть СВЕЖАЯ coalesced-таска).
+
+        Для node-bootstrap НЕЛЬЗЯ воскрешать терминальную строку в pending —
+        она снова войдёт в uq_active_node_bootstrap и, если рядом уже есть
+        активный bootstrap, commit упадёт IntegrityError (review: rerun_task
+        resurrect → 500 + batch poison). Поэтому:
+          * активную (pending|running) — просто (ре)диспатчим (RQ дедупит по
+            job_id, second-run не будет);
+          * терминальную — гоним через coalesce → свежий bootstrap либо флаг
+            на живом.
+        Прочие типы тасок — прежнее resurrect-in-place.
+        """
+        node = (
+            self.db.get(models.VPNNode, task.target_id)
+            if task.target_type == "node"
+            else None
+        )
+        if task.target_type == "node" and task.action == "bootstrap":
+            if task.status in (
+                models.ProvisioningTaskStatus.pending,
+                models.ProvisioningTaskStatus.running,
+            ):
+                self.run_task_async(task, node=node)
+                return task
+            if node is None:
+                return task  # ноды нет — бутстрапить нечего
+            rerun_payload = dict(task.payload or {}, rerun=True)
+            # review: stale-gen — терминальный reconcile-bootstrap несёт gen
+            # СВОЕГО прогона; при ручном requeue пере-штампуем актуальным desired,
+            # иначе success не продвинет reconciled до текущего desired и тик
+            # будет гонять повторы, пока supersession не сойдётся.
+            if "reconcile_gen" in rerun_payload:
+                self.db.refresh(node, ["desired_generation"])
+                rerun_payload["reconcile_gen"] = node.desired_generation
+            fresh, created = self.create_or_coalesce_node_bootstrap(
+                node, rerun_payload,
+                defer_to_reconciler=False,
+            )
+            self.db.commit()
+            if created:
+                self.run_task_async(fresh, node=node)
+            return fresh
+        # non-bootstrap: resurrect-in-place (на них unique-index не действует)
+        if task.status in (
+            models.ProvisioningTaskStatus.failed,
+            models.ProvisioningTaskStatus.success,
+        ):
+            self.reset_failed_task(task)
+        self.run_task_async(task, node=node)
+        return task
+
     def _handle_task_outcome(self, task: models.ProvisioningTask, *, success: bool) -> None:
         # ── Node-level outcome: flip registering → active on success ──
         #
@@ -965,6 +1398,85 @@ class ProvisioningOrchestrator:
                     node.health_score = 0
             self.db.add(node)
             self.db.commit()
+            # Phase 3: продвигаем reconciled_generation / reconcile_due_at для
+            # reconcile-bootstrap'ов ОДНИМ conditional SQL UPDATE по ЖИВОЙ строке
+            # (НЕ read-modify-write по ORM-снимку). Иначе правка из другой сессии
+            # (mark_node_dirty: desired+1 И due_at=now+debounce одним UPDATE)
+            # могла прилететь между нашим re-SELECT и commit'ом, и мы затёрли бы
+            # её due_at в NULL по устаревшему desired==reconciled → нода навсегда
+            # выпадает из выборки тика (review: lost-update, CRITICAL). CASE на
+            # ЖИВОМ desired_generation гарантирует: due_at чистим в NULL ТОЛЬКО
+            # если desired не обогнал новый reconciled; иначе оставляем due_at как
+            # есть — re-arm правки (или supersession) цел. В Postgres все ссылки
+            # на колонки в SET/CASE = OLD-значения строки, поэтому GREATEST(...) и
+            # сравнение согласованы и идемпотентны под RQ-retry.
+            _rgen = (task.payload or {}).get("reconcile_gen")
+            if _rgen is not None and task.action == "bootstrap":
+                if success:
+                    new_reconciled = func.greatest(
+                        models.VPNNode.reconciled_generation, int(_rgen)
+                    )
+                    self.db.query(models.VPNNode).filter(
+                        models.VPNNode.id == node.id
+                    ).update(
+                        {
+                            models.VPNNode.reconciled_generation: new_reconciled,
+                            models.VPNNode.reconcile_due_at: case(
+                                (
+                                    models.VPNNode.desired_generation
+                                    > new_reconciled,
+                                    models.VPNNode.reconcile_due_at,
+                                ),
+                                else_=None,
+                            ),
+                        },
+                        synchronize_session=False,
+                    )
+                else:
+                    self.db.query(models.VPNNode).filter(
+                        models.VPNNode.id == node.id
+                    ).update(
+                        {
+                            models.VPNNode.reconcile_due_at: utcnow()
+                            + timedelta(
+                                seconds=float(os.getenv("RECONCILE_RETRY_S", "60"))
+                            )
+                        },
+                        synchronize_session=False,
+                    )
+                self.db.commit()
+            # Phase-0 coalescing: атомарно claim+clear rerun_requested одним
+            # UPDATE ... WHERE rerun_requested=true. claimed=1 ТОЛЬКО если флаг
+            # реально стоял на момент UPDATE (правка прилетела во время прогона,
+            # через ДРУГУЮ сессию, и поставила его status-checked'ом). Это:
+            #   * закрывает TOCTOU с флаг-сетом (парно с _flag выше — row-lock
+            #     сериализует наш _mark_task terminal и их status-checked set);
+            #   * делает outcome идемпотентным под RQ-retry/crash-recovery
+            #     (повторный проход увидит флаг уже false → claimed=0 → no-op).
+            # Свежий bootstrap создаём на успехе И фейле — desired-изменения
+            # обязаны примениться.
+            #
+            # NB (review: spurious-rerun): reconcile-bootstrap'ы (reconcile_gen в
+            # payload) в rerun_requested НЕ участвуют — их повтор делает
+            # supersession-ветка тика (due_at остаётся вооружённым, пока
+            # desired>reconciled). Иначе тик, повторно коалесясь на СВОЙ же
+            # in-flight bootstrap (или при overlap двух тиков), выставил бы флаг,
+            # и outcome уже-сошедшейся ноды запустил бы лишний полный site.yml.
+            if task.action == "bootstrap" and _rgen is None:
+                claimed = (
+                    self.db.query(models.ProvisioningTask)
+                    .filter(
+                        models.ProvisioningTask.id == task.id,
+                        models.ProvisioningTask.rerun_requested.is_(True),
+                    )
+                    .update(
+                        {models.ProvisioningTask.rerun_requested: False},
+                        synchronize_session=False,
+                    )
+                )
+                self.db.commit()
+                if claimed:
+                    self._enqueue_bootstrap_rerun(node, task)
             return
 
         # ── Exit-level outcome: same shape as node, with recovery. ──
@@ -3083,6 +3595,65 @@ class ProvisioningOrchestrator:
             results.append((device, task))
 
         return results
+
+    def rebuild_subscription_config_text(
+        self, subscription: models.Subscription
+    ) -> int:
+        """Re-mint each live device's stored ``config_text`` from the
+        CURRENT VPNConfig — in place. NO new device, NO ``sub_token``
+        rotation, NO ansible, NO Telegram nudge.
+
+        The sub-link serves the stored ``config_text`` (it is not rebuilt
+        live), so a plain DB fix to a ``VPNConfig`` field (e.g. xhttp
+        ``sni``/``port`` restored after DR) never reaches installed
+        clients until the baked URI is rebuilt. This walks the sub's live
+        devices and rewrites every vless-family credential URI (reality /
+        xhttp / ws-cdn) using the SAME UUID (pulled back out of the
+        existing blob) against the now-corrected ``cred.config`` on the
+        subscription's node — so the user's existing link silently starts
+        returning the fixed URI on the next client refresh. Password-based
+        protocols (shadowtls / hysteria2) carry no sni/port-derived URI
+        and are left untouched.
+
+        Returns the number of credentials whose ``config_text`` changed.
+        Raises ``RuntimeError`` if the sub is not active or has no node.
+        """
+        if subscription.status != models.SubscriptionStatus.active:
+            raise RuntimeError(
+                f"subscription is {subscription.status.value}, must be active"
+            )
+        node = subscription.node
+        if node is None:
+            raise RuntimeError("subscription has no node — cannot rebuild")
+
+        builders = {
+            models.VPNConfigProtocol.vless_reality: _build_vless_reality_credential,
+            models.VPNConfigProtocol.vless_xhttp: _build_vless_xhttp_credential,
+            models.VPNConfigProtocol.vless_ws_cdn: _build_vless_ws_cdn_credential,
+        }
+        rebuilt = 0
+        for device in subscription.devices:
+            if device.status in (
+                models.DeviceStatus.revoked,
+                models.DeviceStatus.disabled,
+            ):
+                continue
+            for cred in device.credentials:
+                if cred.pool_state == models.CredentialPoolState.revoked:
+                    continue
+                cfg = cred.config
+                if cfg is None:
+                    continue
+                builder = builders.get(cfg.protocol)
+                if builder is None:
+                    continue  # shadowtls / hysteria2 — nothing sni/port-derived
+                user_uuid = _extract_vless_uuid(cred.config_text)
+                if not user_uuid:
+                    continue  # can't rebuild without the existing UUID
+                cred.config_text = encrypt(builder(node, cfg, user_uuid))
+                rebuilt += 1
+        self.db.commit()
+        return rebuilt
 
     def switch_subscription_exit(
         self,

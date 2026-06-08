@@ -487,3 +487,352 @@ def admin_report_failure(
         subscription_id=sub.id,
         **base.model_dump(),
     )
+
+
+# ── Operator-aware routing (Phase 1) — bot-driven «VPN не работает» ──────
+#
+# Бот зовёт report-broken по telegram_id (admin-auth) → мигрируем на
+# свободную ноду (auto-ban старой) + создаём OperatorNodeReport(pending).
+# Бот спрашивает оператора → report-operator. «Всё равно не работает» →
+# report-still-broken (target=fail) + чат с админом. Watcher через 15м
+# проставит ok по факту переподключения.
+# См. docs/operations/operator_routing_roadmap.md.
+
+_OPERATORS = {
+    "mts",
+    "beeline",
+    "megafon",
+    "tele2",
+    "home_wifi",
+    "other",
+    "unknown",
+}
+
+# Анти-абьюз: один report-broken на юзера в это окно — иначе тапами
+# юзер вычерпает себе пул нод через авто-баны.
+_REPORT_BROKEN_THROTTLE_MIN = 5
+
+
+class ReportBrokenRequest(BaseModel):
+    telegram_id: str
+    # Оператора можно прислать сразу; обычно ставится отдельно (report-operator).
+    operator: str | None = None
+
+
+class ReportBrokenResponse(BaseModel):
+    action: Literal[
+        "migrated", "throttled", "no_subscription", "no_target", "user_not_found"
+    ]
+    report_id: int | None = None
+    new_node_name: str | None = None
+    new_node_region: str | None = None
+    task_id: int | None = None
+    retry_after_sec: int | None = None
+
+
+@router.post(
+    "/admin/client-control/report-broken",
+    response_model=ReportBrokenResponse,
+)
+def report_broken_by_telegram(
+    body: ReportBrokenRequest,
+    db: Session = Depends(get_db),
+    admin_token: str = Depends(require_admin),  # noqa: ARG001 — bot shared token
+) -> ReportBrokenResponse:
+    """Юзер тапнул «VPN не работает» в боте → мигрируем + заводим репорт.
+
+    Resolve user по telegram_id, берём первую активную подписку, гоним
+    ``migrate_subscription_to_free_node`` (свободная нода + бан старой) и
+    пишем ``OperatorNodeReport(outcome=pending)`` со снапшотом
+    access_username новой ноды — watcher по нему проставит исход. Оператор
+    приходит отдельным тапом (report-operator).
+    """
+    from datetime import timedelta
+
+    user = (
+        db.query(models.User)
+        .filter(models.User.telegram_id == str(body.telegram_id))
+        .first()
+    )
+    if user is None:
+        return ReportBrokenResponse(action="user_not_found")
+
+    cutoff = utcnow() - timedelta(minutes=_REPORT_BROKEN_THROTTLE_MIN)
+    recent = (
+        db.query(models.OperatorNodeReport)
+        .filter(models.OperatorNodeReport.user_id == user.id)
+        .filter(models.OperatorNodeReport.reported_at >= cutoff)
+        .first()
+    )
+    if recent is not None:
+        return ReportBrokenResponse(
+            action="throttled",
+            retry_after_sec=_REPORT_BROKEN_THROTTLE_MIN * 60,
+        )
+
+    sub = (
+        db.query(models.Subscription)
+        .filter(
+            models.Subscription.user_id == user.id,
+            models.Subscription.status == models.SubscriptionStatus.active,
+        )
+        .order_by(models.Subscription.id)
+        .first()
+    )
+    if sub is None or sub.node is None or sub.plan is None:
+        return ReportBrokenResponse(action="no_subscription")
+
+    old_node = sub.node
+    orchestrator = ProvisioningOrchestrator(db)
+    try:
+        new_node, device, task, _banned = (
+            orchestrator.migrate_subscription_to_free_node(
+                sub,
+                ban_reason="user reported VPN broken (operator-routing)",
+                banned_by=f"user:{user.telegram_id}",
+            )
+        )
+    except RuntimeError:
+        # Нет свободной ноды (пул пуст / нездоровы / все в бан-листе) → бот
+        # отправит в чат с админом.
+        return ReportBrokenResponse(action="no_target")
+
+    operator = body.operator if body.operator in _OPERATORS else None
+    report = models.OperatorNodeReport(
+        user_id=user.id,
+        subscription_id=sub.id,
+        device_id=device.id,
+        operator=operator,
+        failed_node_id=old_node.id,
+        target_node_id=new_node.id,
+        target_access_username=device.access_username,
+        outcome="pending",
+    )
+    db.add(report)
+    db.commit()
+    db.refresh(report)
+    _audit(
+        db,
+        f"user:{user.telegram_id}",
+        "client_reported_failure",
+        "subscription",
+        sub.id,
+        metadata={
+            "report_id": report.id,
+            "failed_node_id": old_node.id,
+            "target_node_id": new_node.id,
+            "source": "bot_vpn_broken",
+        },
+        actor_type=models.AuditActor.user,
+    )
+    return ReportBrokenResponse(
+        action="migrated",
+        report_id=report.id,
+        new_node_name=new_node.name,
+        new_node_region=new_node.region,
+        task_id=task.id if task else None,
+    )
+
+
+class SetOperatorRequest(BaseModel):
+    report_id: int
+    operator: str
+
+
+@router.post("/admin/client-control/report-operator")
+def report_set_operator(
+    body: SetOperatorRequest,
+    db: Session = Depends(get_db),
+    admin_token: str = Depends(require_admin),  # noqa: ARG001
+):
+    """Проставить оператора на репорте (юзер тапнул выбор в боте)."""
+    report = db.get(models.OperatorNodeReport, body.report_id)
+    if report is None:
+        raise HTTPException(status_code=404, detail="Report not found")
+    report.operator = (
+        body.operator if body.operator in _OPERATORS else "unknown"
+    )
+    db.commit()
+    return {"report_id": report.id, "operator": report.operator}
+
+
+class ReportIdRequest(BaseModel):
+    report_id: int
+
+
+@router.post("/admin/client-control/report-still-broken")
+def report_still_broken(
+    body: ReportIdRequest,
+    db: Session = Depends(get_db),
+    admin_token: str = Depends(require_admin),  # noqa: ARG001
+):
+    """«Всё равно не работает» после миграции → target-нода тоже fail.
+
+    Самый весомый негативный сигнал: юзер реально попробовал target-ноду,
+    не помогло. Бот после этого ведёт в чат с админом.
+    """
+    report = db.get(models.OperatorNodeReport, body.report_id)
+    if report is None:
+        raise HTTPException(status_code=404, detail="Report not found")
+    report.outcome = "fail"
+    report.resolved_at = utcnow()
+    db.commit()
+    return {"report_id": report.id, "outcome": report.outcome}
+
+
+@router.get("/admin/client-control/report-status/{report_id}")
+def report_status(
+    report_id: int,
+    db: Session = Depends(get_db),
+    admin_token: str = Depends(require_admin),  # noqa: ARG001
+):
+    """On-demand статус репорта для условного пуша бота.
+
+    ``reconnected`` — переподключился ли юзер на новую ноду с момента
+    репорта (по NodeTrafficSample), считается на лету (не ждём watcher).
+    Бот шлёт «всё ещё не работает» только если reconnected=False.
+    """
+    from ..services.operator_reports import report_reconnected
+
+    report = db.get(models.OperatorNodeReport, report_id)
+    if report is None:
+        raise HTTPException(status_code=404, detail="Report not found")
+    return {
+        "report_id": report.id,
+        "outcome": report.outcome,
+        "reconnected": report_reconnected(db, report),
+    }
+
+
+# ── Operator × node матрица (advisory, Phase 1) ──────────────────────────
+
+
+@router.get("/admin/operator-routing/matrix")
+def operator_routing_matrix(
+    db: Session = Depends(get_db),
+    admin_token: str = Depends(require_admin),  # noqa: ARG001
+):
+    """Агрегат `(нода × оператор) → ok/fail` из репортов с recency-decay.
+
+    fail для (node, op): репорт где failed_node=node (юзер сам пометил)
+    ИЛИ target_node=node & outcome∈{fail,inconclusive}. ok: target_node=
+    node & outcome=ok. Считаем РАЗНЫЕ device (fallback на user). `confident`
+    при total≥K. Окно/K — env `OPERATOR_MATRIX_WINDOW_HOURS`/`_MIN_DEVICES`.
+    Advisory — choose_node это пока не использует.
+    """
+    from datetime import timedelta
+
+    window_h = int(os.getenv("OPERATOR_MATRIX_WINDOW_HOURS", "24"))
+    min_devices = int(os.getenv("OPERATOR_MATRIX_MIN_DEVICES", "5"))
+    cutoff = utcnow() - timedelta(hours=window_h)
+
+    reports = (
+        db.query(models.OperatorNodeReport)
+        .filter(models.OperatorNodeReport.reported_at >= cutoff)
+        .all()
+    )
+
+    # (node_id, operator) -> {"ok": set(device-keys), "fail": set(device-keys)}
+    cells: dict[tuple[int, str], dict[str, set]] = {}
+    node_ids: set[int] = set()
+
+    def _dev_key(r: models.OperatorNodeReport) -> str:
+        return f"d{r.device_id}" if r.device_id is not None else f"u{r.user_id}"
+
+    for r in reports:
+        op = r.operator or "unknown"
+        key = _dev_key(r)
+        if r.failed_node_id is not None:
+            cells.setdefault((r.failed_node_id, op), {"ok": set(), "fail": set()})[
+                "fail"
+            ].add(key)
+            node_ids.add(r.failed_node_id)
+        if r.target_node_id is not None:
+            cell = cells.setdefault(
+                (r.target_node_id, op), {"ok": set(), "fail": set()}
+            )
+            if r.outcome == "ok":
+                cell["ok"].add(key)
+            elif r.outcome in ("fail", "inconclusive"):
+                cell["fail"].add(key)
+            node_ids.add(r.target_node_id)
+
+    names: dict[int, str] = {}
+    if node_ids:
+        names = {
+            n.id: n.name
+            for n in db.query(models.VPNNode)
+            .filter(models.VPNNode.id.in_(node_ids))
+            .all()
+        }
+
+    out_cells = []
+    for (node_id, op), sig in cells.items():
+        ok = len(sig["ok"])
+        fail = len(sig["fail"])
+        total = ok + fail
+        out_cells.append(
+            {
+                "node_id": node_id,
+                "node_name": names.get(node_id),
+                "operator": op,
+                "ok": ok,
+                "fail": fail,
+                "total": total,
+                "score": round(ok / total, 3) if total else None,
+                "confident": total >= min_devices,
+            }
+        )
+    out_cells.sort(key=lambda c: (c["node_name"] or "", c["operator"]))
+
+    return {
+        "window_hours": window_h,
+        "min_devices": min_devices,
+        "cells": out_cells,
+    }
+
+
+@router.get("/admin/operator-routing/reports")
+def operator_routing_reports(
+    limit: int = 200,
+    db: Session = Depends(get_db),
+    admin_token: str = Depends(require_admin),  # noqa: ARG001
+):
+    """Сырые репорты (последние N) для админ-таблицы под матрицей."""
+    limit = max(1, min(limit, 1000))
+    reports = (
+        db.query(models.OperatorNodeReport)
+        .order_by(models.OperatorNodeReport.reported_at.desc())
+        .limit(limit)
+        .all()
+    )
+    node_ids = {
+        nid
+        for r in reports
+        for nid in (r.failed_node_id, r.target_node_id)
+        if nid is not None
+    }
+    names: dict[int, str] = {}
+    if node_ids:
+        names = {
+            n.id: n.name
+            for n in db.query(models.VPNNode)
+            .filter(models.VPNNode.id.in_(node_ids))
+            .all()
+        }
+    return [
+        {
+            "id": r.id,
+            "user_id": r.user_id,
+            "subscription_id": r.subscription_id,
+            "operator": r.operator,
+            "failed_node_id": r.failed_node_id,
+            "failed_node_name": names.get(r.failed_node_id),
+            "target_node_id": r.target_node_id,
+            "target_node_name": names.get(r.target_node_id),
+            "outcome": r.outcome,
+            "reported_at": r.reported_at.isoformat() if r.reported_at else None,
+            "resolved_at": r.resolved_at.isoformat() if r.resolved_at else None,
+        }
+        for r in reports
+    ]
