@@ -32,7 +32,7 @@ deploy_app_stack_webapp_init_data_ttl_seconds: 300
 # правленные после включения. Откат: "0" + redeploy (или RECONCILER_ENABLED=
 # на хосте). Тунаблы interval/debounce/cap/retry — дефолты из defaults/main.yml.
 # См. docs/operations/provisioning_reconciler_epic.md.
-deploy_app_stack_reconciler_enabled: "1"
+deploy_app_stack_reconciler_enabled: "0"  # ВРЕМЕННО OFF (CDN-debug): ручной bootstrap дебаунсился. Вернуть "1" после фикса manual-bootstrap-эндпоинтов на defer_to_reconciler=False.
 
 # Controller-side path to the SSH private key used for provisioning
 # VPN nodes. Leave empty during initial bootstrap; set it once you
