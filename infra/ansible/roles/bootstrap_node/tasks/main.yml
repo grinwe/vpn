@@ -271,3 +271,20 @@
     owner: root
     group: root
     mode: '0644'
+
+# Mgmt-mirror URL для xray-{geoip,core}-fetch.sh wrapper'ов. Если
+# xray_mirror_url задан в group_vars/inventory — wrapper'ы пробуют
+# mgmt-mirror первым (он стабильно достижим из любой RU-ноды по
+# private/public сети), и только при его падении уходят в ghproxy
+# /jsdelivr/github fallback. Когда переменная пустая (или не задана)
+# — env-файл всё равно создаётся, но MIRROR_URL пустой → wrapper'ы
+# работают как раньше (без mirror first stage'а).
+- name: Configure xray mirror URL on node
+  copy:
+    dest: /etc/default/xray-mirror
+    content: |
+      # Managed by ansible bootstrap_node. См. infra/mgmt-mirror.
+      MIRROR_URL={{ xray_mirror_url | default('') }}
+    owner: root
+    group: root
+    mode: '0644'

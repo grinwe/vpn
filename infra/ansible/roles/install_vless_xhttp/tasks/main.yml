@@ -35,22 +35,21 @@
     state: present
     update_cache: yes
 
-# ── Stage-4 anti-probing front: nginx + headers-more ────────────────
+# ── Stage-4 anti-probing front: nginx ───────────────────────────────
 #
 # До Stage-4 xray сам слушал :443 с TLS. Активный пробер ловил голый
 # 404 от Go-stack на любой не-xhttp путь — очевидный VPN-маркер.
 # Теперь поверх встаёт nginx, xray переезжает на 127.0.0.1, неизвестные
 # пути уходят на camo-landing (см. xhttp-vhost.conf.j2).
 #
-# headers-more нужен для more_clear_headers — `proxy_hide_header`
-# не умеет чистить Server response-header из самого nginx (только
-# upstream-заголовки). Без модуля Server: nginx всё равно виден;
-# с ним — чистый пустой ответ без идентификации.
-- name: Install nginx + headers-more module
+# NB: НЕ ставим headers-more / more_clear_headers — связка
+# headers-more 0.37 + nginx 1.24 сегфолтит воркер на каждом :443-запросе
+# (подтверждено на ноде). server_tokens off даёт ванильный Server: nginx
+# (без версии) — этого достаточно для камуфляжа, маркером он не является.
+- name: Install nginx
   apt:
     name:
       - nginx
-      - libnginx-mod-http-headers-more-filter
     state: present
 
 - name: Ensure webroot for ACME challenge
@@ -84,18 +83,13 @@
     state: absent
   notify: reload nginx xhttp
 
-- name: Install xray-core (idempotent)
-  shell: |
-    set -euo pipefail
-    if command -v xray >/dev/null 2>&1; then
-      echo "xray already installed"
-      exit 0
-    fi
-    bash -c "$(curl -fsSL https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install
-  args:
-    executable: /bin/bash
-  register: xray_xhttp_install
-  changed_when: "'already installed' not in xray_xhttp_install.stdout"
+# xray-core install: pinned version через ghproxy с fallback'ом на
+# github (см. xray_core role). На комбо-ноде с install_vless_reality
+# роль идемпотентна — повторный include skip'нет если та же версия
+# уже стоит.
+- name: Install xray-core (CDN-fallback)
+  include_role:
+    name: xray_core
 
 # Also in bootstrap_node (the authoritative one). Kept here as a
 # safety net in case bootstrap order changes.
@@ -129,6 +123,43 @@
 - name: Provision geoip.dat fetcher + weekly refresh timer
   include_role:
     name: xray_geoip
+
+# CF-fronted xhttp (auto mode): кладём Origin CA cert в ОТДЕЛЬНЫЙ файл
+# (vless_xhttp_cert_path, дефолт /etc/nginx/ssl/xhttp-origin.crt) — НЕ в
+# общий wgse-origin.crt. Иначе на combo-ноде (ws_cdn + xhttp) две роли
+# затирают cert друг друга в одном файле, и если домены/зоны xhttp и ws
+# разные (xhttp→grwr.ink, ws→wgse.info) — один из протоколов отдаёт чужой
+# cert → CF Full(strict) его отвергает. Бэкенд проставляет
+# vless_xhttp_cert_path → certbot-блок ниже скипается. Никакого HTTP-01 ада.
+- name: Install Origin CA cert for CF-fronted xhttp
+  when: (vless_xhttp_origin_cert_b64 | default('')) | length > 0
+  block:
+    - name: Ensure nginx ssl directory (xhttp CF front)
+      file:
+        path: /etc/nginx/ssl
+        state: directory
+        owner: root
+        group: root
+        mode: '0750'
+
+    - name: Install Origin CA certificate (xhttp)
+      copy:
+        content: "{{ vless_xhttp_origin_cert_b64 | b64decode }}"
+        dest: "{{ vless_xhttp_cert_path | default('/etc/nginx/ssl/xhttp-origin.crt') }}"
+        owner: root
+        group: root
+        mode: '0644'
+      notify: reload nginx xhttp
+
+    - name: Install Origin CA private key (xhttp)
+      copy:
+        content: "{{ vless_xhttp_origin_key_b64 | b64decode }}"
+        dest: "{{ vless_xhttp_key_path | default('/etc/nginx/ssl/xhttp-origin.key') }}"
+        owner: root
+        group: root
+        mode: '0600'
+      no_log: true
+      notify: reload nginx xhttp
 
 - name: Obtain TLS certificate via certbot (if no cert path provided)
   when: (vless_xhttp_cert_path | default('')) == ''
@@ -207,6 +238,9 @@
 # тот делает reload nginx + restart xray-xhttp. Без hook'а свежий
 # fullchain.pem окажется на диске, но nginx продолжит отдавать старый
 # (in-memory) — через 90 дней клиенты начнут ловить CERT_DATE_INVALID.
+# Renewal — только в direct+LE режиме. Для CF-fronted (cert_path задан =
+# Origin CA) certbot не ставится и /etc/letsencrypt нет → эти таски надо
+# скипать, иначе deploy-hook copy падает на отсутствующем каталоге.
 - name: Install certbot deploy-hook for nginx + xray reload
   copy:
     src: xhttp-cert-reload.sh
@@ -214,6 +248,7 @@
     owner: root
     group: root
     mode: '0755'
+  when: (vless_xhttp_cert_path | default('')) == ''
 
 - name: Enable certbot renewal timer
   systemd:
@@ -221,6 +256,7 @@
     state: started
     enabled: yes
   failed_when: false
+  when: (vless_xhttp_cert_path | default('')) == ''
 
 # Preserve clients added dynamically by manage_vless_xhttp_user.sh across
 # re-runs of this role. Without the slurp+re-inject the template's
@@ -313,6 +349,31 @@
 # redirect HTTP→HTTPS, ACME webroot, TLS terminus, xhttp location
 # и camo-landing как fallback. reload nginx xhttp flush'ится вместе
 # с restart xray xhttp в самом конце роли.
+# Домен xhttp может меняться (direct→CF-fronted, ротация CF-сабдомена) —
+# тогда старый xhttp-<old>.conf остаётся висеть на :443 рядом с новым
+# (так на ноде и появились xhttp-ka1.grinwer.online + xhttp-<cf>.wgse.info).
+# Сносим все xhttp-*.conf, кроме текущего домена, на каждом прогоне.
+- name: Find existing xhttp vhosts
+  find:
+    paths:
+      - /etc/nginx/sites-enabled
+      - /etc/nginx/sites-available
+    patterns: 'xhttp-*.conf'
+    # file_type=any — иначе find по дефолту матчит только обычные файлы и
+    # ПРОПУСКАЕТ симлинки в sites-enabled. Тогда remove сносит лишь файл из
+    # sites-available, а битый симлинк остаётся → nginx -t → reload падает
+    # с open() ... No such file or directory.
+    file_type: any
+  register: _xhttp_existing_vhosts
+
+- name: Remove stale xhttp vhosts (keep only current domain)
+  file:
+    path: "{{ item.path }}"
+    state: absent
+  loop: "{{ _xhttp_existing_vhosts.files }}"
+  when: item.path | basename != ('xhttp-' ~ vless_xhttp_domain ~ '.conf')
+  notify: reload nginx xhttp
+
 - name: Render nginx TLS vhost for xhttp
   template:
     src: xhttp-vhost.conf.j2

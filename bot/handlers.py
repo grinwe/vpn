@@ -799,46 +799,199 @@ async def health_ping_response(callback_query: types.CallbackQuery):
 # жалобы красным как более сильный сигнал, чем ответ на плановый пинг.
 @router.message(F.text == BTN_VPN_BROKEN)
 async def self_report_vpn_broken(message: types.Message) -> None:
+    # Operator-aware routing P1: тап → бэкенд авто-мигрирует на свободную
+    # ноду (+бан старой) и заводит OperatorNodeReport → спрашиваем оператора
+    # одним тапом. «Всё равно не работает» → поддержка. Watcher через 15м
+    # проставит исход по факту переподключения.
     tg_id = message.from_user.id
     now_mono = asyncio.get_event_loop().time()
     last = _self_report_last.get(tg_id)
     if last is not None and (now_mono - last) < _SELF_REPORT_COOLDOWN_S:
         await message.answer(
-            "👍 Мы уже получили вашу жалобу, не волнуйтесь — админы смотрят.\n"
-            "Если проблема не уйдёт за 10 минут, напишите в /help."
+            "👍 Мы уже перекинули тебя на другой сервер недавно. Дай минуту "
+            "переподключиться. Если через 10 минут не работает — /help."
         )
         return
 
-    payload = {
-        "telegram_id": str(tg_id),
-        "answer": "bad",
-        "source": "self_reported",
-    }
     try:
-        status_code, _ = await _fetch_json(
+        status_code, data = await _fetch_json(
             "POST",
-            f"{BACKEND_URL}/api/users/health-ping-response",
-            json=payload,
+            f"{BACKEND_URL}/api/admin/client-control/report-broken",
+            json={"telegram_id": str(tg_id)},
             headers=_admin_headers(tg_id),
         )
     except aiohttp.ClientError:
         await message.answer(
-            "Не получилось отправить жалобу — попробуйте ещё раз через минуту."
+            "Не получилось обработать — попробуй ещё раз через минуту."
         )
         return
-    if status_code != 200:
+    if status_code != 200 or not isinstance(data, dict):
         await message.answer(
-            "Не получилось отправить жалобу — попробуйте ещё раз через минуту."
+            "Не получилось обработать — попробуй ещё раз через минуту."
         )
         return
 
-    _self_report_last[tg_id] = now_mono
-    await message.answer(
-        "🛠 Спасибо! Мы получили сигнал и проверяем ваш сервер прямо сейчас.\n"
-        "Если проблема не уйдёт за 10 минут — напишите в /help, "
-        "приложите модель устройства.",
-        reply_markup=help_keyboard(),
+    action = data.get("action")
+    if action == "migrated":
+        _self_report_last[tg_id] = now_mono
+        report_id = data.get("report_id")
+        await message.answer(
+            "🔄 Поменяли тебе сервер. Подписка обновится в приложении сама — "
+            "нажми 🔄 рядом с профилем и попробуй подключиться через пару минут.\n\n"
+            "Чтобы мы быстрее ловили блокировки — подскажи, какой у тебя интернет?",
+            reply_markup=(
+                operator_keyboard(int(report_id)) if report_id else help_keyboard()
+            ),
+        )
+        # «Всё равно не работает» отдаём НЕ сразу, а через делей — даём юзеру
+        # время переподключиться, чтобы он не ломился в поддержку с порога.
+        if report_id:
+            asyncio.create_task(
+                _delayed_still_broken_prompt(
+                    message.bot, message.chat.id, int(report_id)
+                )
+            )
+    elif action == "throttled":
+        _self_report_last[tg_id] = now_mono
+        await message.answer(
+            "👍 Уже перекидывали недавно — дай минуту переподключиться. "
+            "Если не помогло за 10 минут — /help."
+        )
+    elif action == "no_subscription":
+        await message.answer("У тебя нет активной подписки. Оформить — /buy.")
+    else:  # no_target / user_not_found / прочее
+        await message.answer(
+            "Не смогли автоматически подобрать другой сервер. Напиши в "
+            "поддержку — разберёмся вручную.",
+            reply_markup=help_keyboard(),
+        )
+
+
+# «Всё равно не работает» показываем не сразу, а через этот делей — даём
+# юзеру время переподключиться. Через делей дёргаем бэк: если он ВИДИТ
+# переподключение — молчим; если нет — присылаем пуш с этой кнопкой.
+_STILL_BROKEN_DELAY_S = 300
+
+
+def _still_broken_keyboard(report_id: int) -> types.InlineKeyboardMarkup:
+    return types.InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                types.InlineKeyboardButton(
+                    text="❌ Всё равно не работает",
+                    callback_data=f"op:still:{report_id}",
+                )
+            ]
+        ]
     )
+
+
+async def _delayed_still_broken_prompt(bot, chat_id: int, report_id: int) -> None:
+    """Через делей: если юзер НЕ переподключился — предложить «всё равно не
+    работает» → поддержка. Если бэк видит переподключение — молчим."""
+    await asyncio.sleep(_STILL_BROKEN_DELAY_S)
+    # Пушим только если бэкенд НЕ видит переподключения за это время.
+    try:
+        status_code, data = await _fetch_json(
+            "GET",
+            f"{BACKEND_URL}/api/admin/client-control/report-status/{report_id}",
+            headers=_admin_headers(chat_id),
+        )
+        if (
+            status_code == 200
+            and isinstance(data, dict)
+            and data.get("reconnected")
+        ):
+            return  # переподключился — не дёргаем
+    except aiohttp.ClientError:
+        pass  # бэк недоступен — лучше предложить помощь, чем промолчать
+    try:
+        await bot.send_message(
+            chat_id,
+            "Похоже, подключиться так и не вышло 🤔 Всё ещё не работает?",
+            reply_markup=_still_broken_keyboard(report_id),
+        )
+    except Exception:  # noqa: BLE001
+        logger.exception(
+            "delayed still-broken prompt failed for chat %s", chat_id
+        )
+
+
+def operator_keyboard(report_id: int) -> types.InlineKeyboardMarkup:
+    """Выбор оператора после авто-миграции (operator-aware routing P1).
+
+    Без «всё равно не работает» — она приходит отдельным сообщением через
+    делей (см. _delayed_still_broken_prompt).
+    """
+
+    def _b(text: str, op: str) -> types.InlineKeyboardButton:
+        return types.InlineKeyboardButton(
+            text=text, callback_data=f"op:{report_id}:{op}"
+        )
+
+    return types.InlineKeyboardMarkup(
+        inline_keyboard=[
+            [_b("МТС", "mts"), _b("Билайн", "beeline")],
+            [_b("МегаФон", "megafon"), _b("Tele2", "tele2")],
+            [_b("🏠 Домашний/WiFi", "home_wifi"), _b("Другое", "other")],
+        ]
+    )
+
+
+@router.callback_query(F.data.startswith("op:"))
+async def operator_choice(callback_query: types.CallbackQuery) -> None:
+    parts = callback_query.data.split(":")
+    tg_id = callback_query.from_user.id
+    if len(parts) < 3:
+        await callback_query.answer()
+        return
+
+    # op:still:<report_id> — «всё равно не работает» → поддержка + target=fail.
+    if parts[1] == "still":
+        try:
+            await _fetch_json(
+                "POST",
+                f"{BACKEND_URL}/api/admin/client-control/report-still-broken",
+                json={"report_id": int(parts[2])},
+                headers=_admin_headers(tg_id),
+            )
+        except (aiohttp.ClientError, ValueError):
+            pass
+        await callback_query.answer()
+        try:
+            await callback_query.message.edit_reply_markup(reply_markup=None)
+        except Exception:  # noqa: BLE001
+            pass
+        await callback_query.message.answer(
+            "Жаль, что не помогло 😕 Передаём в поддержку — опиши проблему и "
+            "приложи модель устройства.",
+            reply_markup=help_keyboard(),
+        )
+        return
+
+    # op:<report_id>:<operator> — записываем оператора.
+    try:
+        report_id = int(parts[1])
+    except ValueError:
+        await callback_query.answer()
+        return
+    operator = parts[2]
+    try:
+        await _fetch_json(
+            "POST",
+            f"{BACKEND_URL}/api/admin/client-control/report-operator",
+            json={"report_id": report_id, "operator": operator},
+            headers=_admin_headers(tg_id),
+        )
+    except aiohttp.ClientError:
+        pass
+    await callback_query.answer("Спасибо! 🙏")
+    # Операторскую клавиатуру убираем. «Всё равно не работает» придёт
+    # отдельным сообщением через делей (_delayed_still_broken_prompt).
+    try:
+        await callback_query.message.edit_reply_markup(reply_markup=None)
+    except Exception:  # noqa: BLE001
+        pass
 
 
 def health_ping_keyboard(sub_id: int | None) -> types.InlineKeyboardMarkup:

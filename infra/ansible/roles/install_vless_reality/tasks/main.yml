@@ -66,20 +66,13 @@
   include_role:
     name: xray_geoip
 
-- name: Install xray-core from upstream (idempotent)
-  shell: |
-    set -euo pipefail
-    if command -v xray >/dev/null 2>&1; then
-      echo "xray already installed: $(xray version | head -n1)"
-      exit 0
-    fi
-    # Pinned upstream installer. Runs non-interactive; writes to
-    # /usr/local/bin/xray and installs a systemd unit.
-    bash -c "$(curl -fsSL https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install
-  args:
-    executable: /bin/bash
-  register: xray_install_result
-  changed_when: "'already installed' not in xray_install_result.stdout"
+# xray-core install: pinned version через ghproxy с fallback'ом на
+# github. Раньше тут был inline-вызов upstream's install-release.sh,
+# но он 5-минутно SSL-timeout'ил с RU-провайдеров (см. xray_core
+# role rationale + ru-cloud-web-02 ticket).
+- name: Install xray-core (CDN-fallback)
+  include_role:
+    name: xray_core
 
 # Preserve clients added dynamically by manage_vless_user.sh across
 # re-runs of this role. The template ships `clients: []` by design

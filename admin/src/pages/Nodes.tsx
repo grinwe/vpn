@@ -1907,10 +1907,18 @@ function CreateNodeForm({ onDone }: { onDone: () => void }) {
                   )}
                   {p === "vless-xhttp" && (
                     <span
-                      className="text-[10px] text-slate-500"
-                      title="settings.domain бэкенд проставит = sni"
+                      className="text-[10px] text-emerald-500/80"
+                      title="Пусто sni → бэкенд авто-создаёт CF-поддомен <rand>.wgse.info (CF-fronted, общий Origin CA, без LE/HTTP-01). Впишешь домен → классический direct+LE."
                     >
-                      (settings.domain: auto = sni)
+                      (sni пусто = авто CF)
+                    </span>
+                  )}
+                  {p === "vless-ws-cdn" && (
+                    <span
+                      className="text-[10px] text-emerald-500/80"
+                      title="бэкенд авто-создаёт CF-поддомен <rand>.wgse.info и проставляет sni — заполнять не нужно. Делит :443 с xhttp, разводятся по SNI."
+                    >
+                      (sni: auto = CF поддомен)
                     </span>
                   )}
                 </label>
@@ -1931,16 +1939,22 @@ function CreateNodeForm({ onDone }: { onDone: () => void }) {
                       <span className="text-slate-500 mb-0.5">
                         SNI / fake domain
                       </span>
-                      <input
-                        className="bg-slate-800 border border-slate-700 rounded px-2 py-1 font-mono"
-                        placeholder={
-                          isReality
-                            ? "www.asus.com"
-                            : "sNN.grinwer.online"
-                        }
-                        value={d.sni}
-                        onChange={(e) => patchProto(p, { sni: e.target.value })}
-                      />
+                      {p === "vless-ws-cdn" ? (
+                        <span className="px-2 py-1 rounded bg-slate-800/60 border border-slate-700 text-slate-500 italic">
+                          авто (CF поддомен)
+                        </span>
+                      ) : (
+                        <input
+                          className="bg-slate-800 border border-slate-700 rounded px-2 py-1 font-mono"
+                          placeholder={
+                            isReality
+                              ? "www.asus.com"
+                              : "пусто → авто CF-поддомен"
+                          }
+                          value={d.sni}
+                          onChange={(e) => patchProto(p, { sni: e.target.value })}
+                        />
+                      )}
                     </label>
                     {isReality && (
                       <label className="flex flex-col">
@@ -2226,9 +2240,13 @@ function EditConfigForm({
         <span className="text-slate-400 mb-1">SNI / fake domain</span>
         <input
           className="bg-slate-800 border border-slate-700 rounded px-2 py-1 font-mono"
+          placeholder="xhttp: пусто = авто CF-поддомен"
           value={form.sni ?? ""}
-          onChange={(e) => setForm({ ...form, sni: e.target.value || null })}
+          onChange={(e) => setForm({ ...form, sni: e.target.value })}
         />
+        <span className="text-[10px] text-slate-500 mt-0.5">
+          xhttp: очисти поле и сохрани → перейдёт в CF-fronted (wgse.info).
+        </span>
       </label>
       <label className="flex flex-col">
         <span className="text-slate-400 mb-1">Fallback (REALITY dest)</span>
@@ -2383,7 +2401,9 @@ function BatchEditConfigsForm({
     const patch: Partial<VPNConfigUpdateIn> = {};
     if (r.name !== o.name) patch.name = r.name;
     if (r.port !== o.port) patch.port = r.port;
-    if ((r.sni || null) !== (o.sni ?? null)) patch.sni = r.sni || null;
+    // Очистка sni шлём как "" (явный сброс), НЕ null — бэк трактует null как
+    // «не трогать» (PATCH), а "" у xhttp = «переведи в CF-fronted».
+    if ((r.sni || "") !== (o.sni ?? "")) patch.sni = r.sni || "";
     if ((r.fallback || null) !== (o.fallback ?? null))
       patch.fallback = r.fallback || null;
     if ((r.public_key || null) !== (o.public_key ?? null))
@@ -3097,12 +3117,18 @@ function AddConfigForm({
       </label>
       <label className="flex flex-col">
         <span className="text-slate-400 mb-1">SNI / fake domain</span>
-        <input
-          className="bg-slate-800 border border-slate-700 rounded px-2 py-1 font-mono"
-          placeholder="www.cloudflare.com"
-          value={form.sni ?? ""}
-          onChange={(e) => setForm({ ...form, sni: e.target.value || null })}
-        />
+        {protocol === "vless-ws-cdn" ? (
+          <span className="px-2 py-1 rounded bg-slate-800/60 border border-slate-700 text-slate-500 italic">
+            авто (CF поддомен wgse.info) — не заполнять
+          </span>
+        ) : (
+          <input
+            className="bg-slate-800 border border-slate-700 rounded px-2 py-1 font-mono"
+            placeholder="www.cloudflare.com"
+            value={form.sni ?? ""}
+            onChange={(e) => setForm({ ...form, sni: e.target.value || null })}
+          />
+        )}
       </label>
       <div className="col-span-2 text-slate-500 text-[11px]">
         Host ноды: <span className="font-mono">{nodeHost}</span>. Для

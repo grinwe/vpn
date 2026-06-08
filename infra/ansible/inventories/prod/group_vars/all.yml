@@ -1,0 +1,18 @@
+---
+# Mgmt-mirror URL для xray-{geoip,core}-fetch.sh wrapper'ов на нодах.
+# Хардкод IP'а вместо `hostvars['mgmt-1'].ansible_host` — потому что
+# при targeted-прогоне (`ansible-playbook -l ru-cloud-web-02`) mgmt-1
+# не входит в run-set, hostvars['mgmt-1'] резолвится в пустое значение
+# → MIRROR_URL прилетал на ноду пустым → wrapper не использовал mirror,
+# хотя сам зеркало работало.
+#
+# Если mgmt переедет на другой IP — поменяй здесь И в
+# `inventories/prod/hosts.yml` (db_host.mgmt-1.ansible_host).
+#
+# Wrapper'ы пробуют этот URL первым; если ноды теряют связность с
+# mgmt'ом (бывает у RU-провайдеров с ограниченным intra-AS routing)
+# — уходят в ghproxy/jsdelivr/github fallback.
+#
+# Чтобы отключить mirror на отдельной ноде — задать
+# `xray_mirror_url: ""` в host_vars/<имя>.yml.
+xray_mirror_url: "http://185.242.87.250:8090"

@@ -48,8 +48,8 @@
     },
     {
       "tag": "vless-ws-cdn",
-      "listen": "0.0.0.0",
-      "port": {{ vless_ws_cdn_port | int }},
+      "listen": "127.0.0.1",
+      "port": {{ vless_ws_cdn_loopback_port | default(10444) | int }},
       "protocol": "vless",
       "settings": {
         "clients": {{ vless_ws_cdn_existing_clients | default([]) | to_json }},
@@ -58,7 +58,12 @@
       "streamSettings": {
         "network": "ws",
         "wsSettings": {
-          "path": "{{ vless_ws_cdn_path }}"
+          "path": "{{ vless_ws_cdn_path }}",
+          {#- heartbeatPeriod: xray шлёт WS ping-фреймы каждые N секунд.
+              Cloudflare молча рвёт idle-WebSocket на 100с (Free/Pro) → клиент
+              ловит close 1006 unexpected EOF. Пинги < 100с держат коннект
+              живым. См. developers.cloudflare.com/network/websockets. -#}
+          "heartbeatPeriod": {{ vless_ws_cdn_ws_heartbeat | default(30) | int }}
         }
       },
       "sniffing": {

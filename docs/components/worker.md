@@ -266,6 +266,31 @@ return summary
 - Не читает env на горячую — все тики читают `os.getenv(...)` в своём теле при каждом запуске, поэтому смена env требует рестарта процесса (чтобы перевыбрать запланированный интервал в bootstrap-блоке).
 - Не имеет отдельной auth-поверхности. Всё внутри воркера — trusted, потому что контейнер с тем же admin-токеном и тем же провижининг-ключом, что и бэкенд.
 
+## Скейл воркеров из админки
+
+Виджет **Workers** (`admin/src/workerHealth.tsx`, открывается в Nodes) умеет
+менять число реплик: степпер `реплик [−][N][+] OK` → `POST /ops/worker/scale {replicas}`.
+
+Механика (зеркало `scripts/workers.sh`, но из UI):
+- API-образ (`backend/Dockerfile`) **без ssh/ключа** → сам скейлить не может.
+  Поэтому эндпоинт **энкьюит RQ-job** `app.worker.run_scale_workers(N)`, и его
+  подхватывает **worker** (`Dockerfile.worker` несёт `openssh-client` +
+  `/run/secrets/provisioning_key`).
+- Worker SSH-ит на mgmt-хост и гонит `docker compose up -d --scale worker=N worker`
+  + пишет `WORKER_REPLICAS=N` в `.env` (чтобы пережило plain `docker compose up`).
+  Docker-команда исполняется **на хосте**, так что даже scale-DOWN, убивающий
+  этот же worker, доходит до конца.
+- API коротко (≤30с) ждёт результат job'а → отдаёт `applied/failed/enqueued`.
+
+Параметры (env воркера; дефолты под текущий prod): `MGMT_HOST` (иначе резолв
+из inventory `db_host→mgmt-1`), `MGMT_USER` (root), `MGMT_STACK_DIR`
+(`/opt/vpn`), ключ — `ANSIBLE_PRIVATE_KEY_FILE`.
+
+**Предусловия:** (1) нужен ≥1 живой worker, который подхватит job (для бампа
+вверх — всегда; при 0 воркеров сперва «↻ Рестарт»); (2) provisioning-ключ
+должен пускать `MGMT_USER` на mgmt с правом `docker compose`. Если нет — job
+вернёт SSH-ошибку, она прилетит в UI как `failed` + stderr. Аудит — `worker_scale`.
+
 ## ⚠️ Неясные места
 
 - Структура обработки ошибок между тиками неконсистентна (см. выше). Не ясно, намеренно ли `run_autoscale_tick` падает молча при ошибке `evaluate_all_pools`, или это пропущено.

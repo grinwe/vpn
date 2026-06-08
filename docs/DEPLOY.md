@@ -86,6 +86,18 @@ ansible-playbook -i inventories/prod/hosts.yml site.yml --tags web
 
 **DNS-режим backend-домена:** `grinwer.online` (или аналог) — **Proxied** в Cloudflare (оранжевое облачко). Это HTTP(S)-трафик, CF даёт DDoS-защиту и кеширует статику admin/webapp.
 
+### 4a. Mgmt-mirror (upstream-зеркало для vpn-нод)
+
+На том же web-host'е поднимается отдельный compose-стек `mgmt-mirror` — nginx, который раздаёт ноды `geoip.dat`, `geosite.dat` и pinned-`Xray-linux-64-*.zip`. Это spasает bootstrap'ы на RU-провайдерах, где outbound к `github.com` (и зеркалам типа ghproxy/jsdelivr) троттлится до неюзабельного состояния. См. подробности в [docs/infrastructure/ansible.md § mgmt-mirror](infrastructure/ansible.md#mgmt-mirror--собственное-зеркало-upstream).
+
+Раскат — частью того же `--tags web`:
+
+```bash
+ansible-playbook -i inventories/prod/hosts.yml site.yml --tags web
+```
+
+После — `bootstrap_node` на любой новой ноде сам прописывает `MIRROR_URL` в `/etc/default/xray-mirror`, и wrapper'ы качают upstream через зеркало в первую очередь.
+
 ## 5. Create initial plans
 
 Через Admin UI: открой `https://<your-domain>/admin/`, залогинься по `ADMIN_API_TOKEN`, перейди в **Plans** → кнопка «+ Добавить тариф».

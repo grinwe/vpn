@@ -51,9 +51,11 @@ server {
     ssl_session_tickets off;
 
     # Убираем версию nginx из Server-header — активный пробер не должен
-    # отличить наш xhttp-фронт от web-фронта по build-строке.
+    # отличить наш xhttp-фронт от web-фронта по build-строке. НЕ ставим
+    # more_clear_headers: headers-more 0.37 + nginx 1.24 сегфолтят воркер на
+    # каждом :443-запросе (подтверждено на ноде). Server: nginx (без версии)
+    # — ванильный, не маркер; upstream-заголовки чистит proxy_hide_header.
     server_tokens off;
-    more_clear_headers 'X-Powered-By';
 
     add_header Strict-Transport-Security "max-age=31536000" always;
 
@@ -78,8 +80,10 @@ server {
         # бэкенда убила бы low-latency flow.
         proxy_buffering off;
         proxy_request_buffering off;
-        proxy_read_timeout 300s;
-        proxy_send_timeout 300s;
+        # Длинные таймауты под долгоживущий xhttp stream/long-poll —
+        # 300s рвало download-канал раньше CF idle-таймаута.
+        proxy_read_timeout 3600s;
+        proxy_send_timeout 3600s;
         proxy_set_header Upgrade $http_upgrade;
         proxy_set_header Connection $connection_upgrade;
         # Скрываем upstream-заголовки, чтобы xray-specific маркеры не

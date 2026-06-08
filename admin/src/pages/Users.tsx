@@ -10,6 +10,7 @@ import {
   api,
   batchBanUsers,
   bulkMigrateAuto,
+  bulkRebuildConfig,
   bulkRegenerateSublink,
   claimOrphanSubscription,
   DeviceMigrateOut,
@@ -492,8 +493,13 @@ export default function Users() {
   // operator can't double-fire a heavy provisioning wave.
   const BULK_SUBS_CHUNK = 25;
   const [bulkBusy, setBulkBusy] = useState(false);
+  // Слать ли Telegram-нудж «возьми новую ссылку» при bulk-регенерации.
+  // Дефолт OFF — массовая регенерация почти всегда операционная (старая
+  // ссылка живёт), спамить юзеров не надо. Галкой включаешь для честного
+  // «выдать новый линк».
+  const [notifyOnRegen, setNotifyOnRegen] = useState(false);
 
-  const runBulkRegenerate = async (ids: number[]) => {
+  const runBulkRegenerate = async (ids: number[], notify: boolean) => {
     setBulkBusy(true);
     let done = 0,
       skipped = 0,
@@ -504,7 +510,10 @@ export default function Users() {
       devices = 0;
     try {
       for (let i = 0; i < ids.length; i += BULK_SUBS_CHUNK) {
-        const res = await bulkRegenerateSublink(ids.slice(i, i + BULK_SUBS_CHUNK));
+        const res = await bulkRegenerateSublink(
+          ids.slice(i, i + BULK_SUBS_CHUNK),
+          notify,
+        );
         done += res.done.length;
         skipped += res.skipped.length;
         notFound += res.not_found.length;
@@ -581,6 +590,48 @@ export default function Users() {
     qc.invalidateQueries({ queryKey: ["user-node-bans"] });
   };
 
+  // Тихая пересборка config_text из текущего VPNConfig: без ротации
+  // токена, нового устройства, ansible и пуша. Под починку вшитых URI
+  // после правки конфигов (xhttp sni/port и т.п.).
+  const runBulkRebuild = async (ids: number[]) => {
+    setBulkBusy(true);
+    let done = 0,
+      skipped = 0,
+      notFound = 0,
+      failed = 0,
+      creds = 0;
+    try {
+      for (let i = 0; i < ids.length; i += BULK_SUBS_CHUNK) {
+        const res = await bulkRebuildConfig(ids.slice(i, i + BULK_SUBS_CHUNK));
+        done += res.done.length;
+        skipped += res.skipped.length;
+        notFound += res.not_found.length;
+        failed += res.failed.length;
+        creds += res.credentials_rebuilt;
+      }
+    } catch (e) {
+      alert(
+        `Пересборка упала на чанке: ${e instanceof Error ? e.message : String(e)}.\n\n` +
+          `Успешно до падения: юзеров ${done}.`,
+      );
+      setBulkBusy(false);
+      qc.invalidateQueries({ queryKey: ["user-subs"] });
+      return;
+    }
+    alert(
+      `Пересборка config_text готова (тихо, без пуша).\n` +
+        `Юзеров: ${done}` +
+        (skipped ? `, без активных подписок: ${skipped}` : "") +
+        (notFound ? `, не найдено: ${notFound}` : "") +
+        (failed ? `, ошибок по подпискам: ${failed}` : "") +
+        `.\nПересобрано кредов: ${creds}. Клиенты подтянут исправленный URI на следующем рефреше сабки (sub_token не менялся).`,
+    );
+    setSelectedIds(new Set());
+    setBulkBusy(false);
+    qc.invalidateQueries({ queryKey: ["users"] });
+    qc.invalidateQueries({ queryKey: ["user-subs"] });
+  };
+
   return (
     <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
       <div className="lg:col-span-2">
@@ -623,6 +674,18 @@ export default function Users() {
                 unban all
               </button>
               <span className="w-px h-4 bg-slate-600" />
+              <label
+                className="flex items-center gap-1 text-[11px] text-slate-400 select-none"
+                title="Слать ли юзерам Telegram «возьми новую ссылку» при регенерации"
+              >
+                <input
+                  type="checkbox"
+                  checked={notifyOnRegen}
+                  onChange={(e) => setNotifyOnRegen(e.target.checked)}
+                  disabled={bulkBusy}
+                />
+                уведомить
+              </label>
               <button
                 disabled={bulkBusy}
                 onClick={() => {
@@ -630,14 +693,17 @@ export default function Users() {
                     confirm(
                       `Перегенерировать sub-link для ${selArr.length} юзер(ов)?\n\n` +
                         `Каждому активному устройству выдаётся НОВАЯ ссылка (появится в ЛК), ` +
-                        `старая остаётся рабочей до перехода. Юзерам уйдёт Telegram: «возьми новую ссылку в ЛК».\n\n` +
-                        `Это НЕ переезд на другой сервер. sub_token сменится, стоимость НЕ изменится.\n` +
+                        `старая остаётся рабочей до перехода.\n` +
+                        (notifyOnRegen
+                          ? `Юзерам УЙДЁТ Telegram: «возьми новую ссылку в ЛК».\n`
+                          : `Telegram-уведомление НЕ шлётся (галка «уведомить» снята).\n`) +
+                        `\nЭто НЕ переезд на другой сервер. sub_token сменится, стоимость НЕ изменится.\n` +
                         `Идёт ansible-провижининг — для больших пачек подними воркеры (scripts/workers.sh).`,
                     )
                   )
-                    runBulkRegenerate(selArr);
+                    runBulkRegenerate(selArr, notifyOnRegen);
                 }}
-                title="Новая ссылка в ЛК + Telegram-уведомление, старая ссылка остаётся живой. sub_token меняется, сервер тот же, цена та же."
+                title="Новая ссылка в ЛК (+ Telegram по галке «уведомить»), старая ссылка остаётся живой. sub_token меняется, сервер тот же, цена та же."
                 className="text-xs px-2 py-1 rounded bg-indigo-700 hover:bg-indigo-600 disabled:opacity-50"
               >
                 {bulkBusy ? "…" : "🔁 регенерация sub-link"}
@@ -660,6 +726,25 @@ export default function Users() {
                 className="text-xs px-2 py-1 rounded bg-sky-700 hover:bg-sky-600 disabled:opacity-50"
               >
                 {bulkBusy ? "…" : "🚚 переезд на сервер"}
+              </button>
+              <button
+                disabled={bulkBusy}
+                onClick={() => {
+                  if (
+                    confirm(
+                      `Пересобрать config_text для ${selArr.length} юзер(ов)?\n\n` +
+                        `ТИХО пересобирает вшитые ссылки из ТЕКУЩЕГО VPNConfig — ` +
+                        `без смены sub_token, нового устройства, ansible и пуша. ` +
+                        `Клиент сам подтянет исправленный URI на рефреше сабки.\n\n` +
+                        `Под починку конфигов (напр. xhttp sni/port после правок в БД). Безопасно.`,
+                    )
+                  )
+                    runBulkRebuild(selArr);
+                }}
+                title="Тихо пересобрать config_text из текущего VPNConfig: без токена/ansible/пуша. Под починку вшитых URI."
+                className="text-xs px-2 py-1 rounded bg-teal-700 hover:bg-teal-600 disabled:opacity-50"
+              >
+                {bulkBusy ? "…" : "🧩 пересобрать конфиг"}
               </button>
             </div>
           )}

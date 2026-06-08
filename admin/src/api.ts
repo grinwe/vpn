@@ -139,10 +139,79 @@ export interface BulkRegenerateResult {
 
 export function bulkRegenerateSublink(
   userIds: number[],
+  notify: boolean = false,
 ): Promise<BulkRegenerateResult> {
   return api.post<BulkRegenerateResult>(
     "/subscriptions/bulk-regenerate-sublink",
-    { user_ids: userIds },
+    { user_ids: userIds, notify },
+  );
+}
+
+// POST /subscriptions/bulk-rebuild-config — ТИХАЯ пересборка config_text
+// из текущего VPNConfig: без ротации sub_token, нового устройства,
+// ansible и пуша. Чинит вшитые URI после правки конфигов (напр. xhttp
+// sni/port после DR) — клиент подтянет исправленный URI сам на рефреше.
+export interface BulkRebuildResult {
+  done: number[];
+  skipped: number[];
+  not_found: number[];
+  failed: BulkUserFailure[];
+  credentials_rebuilt: number;
+}
+
+export function bulkRebuildConfig(
+  userIds: number[],
+): Promise<BulkRebuildResult> {
+  return api.post<BulkRebuildResult>("/subscriptions/bulk-rebuild-config", {
+    user_ids: userIds,
+  });
+}
+
+// ── Operator-aware routing (Phase 1, advisory) ───────────────────────
+// Матрица «нода × оператор → ok/fail» из краудсорса юзерских «VPN не
+// работает». choose_node это пока НЕ использует. См.
+// docs/operations/operator_routing_roadmap.md.
+
+export interface OperatorMatrixCell {
+  node_id: number;
+  node_name: string | null;
+  operator: string;
+  ok: number;
+  fail: number;
+  total: number;
+  score: number | null;
+  confident: boolean;
+}
+
+export interface OperatorMatrixOut {
+  window_hours: number;
+  min_devices: number;
+  cells: OperatorMatrixCell[];
+}
+
+export function operatorRoutingMatrix(): Promise<OperatorMatrixOut> {
+  return api.get<OperatorMatrixOut>("/admin/operator-routing/matrix");
+}
+
+export interface OperatorReportOut {
+  id: number;
+  user_id: number;
+  subscription_id: number | null;
+  operator: string | null;
+  failed_node_id: number | null;
+  failed_node_name: string | null;
+  target_node_id: number | null;
+  target_node_name: string | null;
+  outcome: string;
+  reported_at: string | null;
+  resolved_at: string | null;
+}
+
+export function operatorRoutingReports(
+  limit = 200,
+): Promise<OperatorReportOut[]> {
+  return api.get<OperatorReportOut[]>(
+    `/admin/operator-routing/reports?limit=${limit}`,
   );
 }
 
@@ -757,13 +826,14 @@ export interface ProvisioningTaskOut {
   target_type: string;
   target_id: number;
   action: string;
-  status: "pending" | "running" | "success" | "failed" | string;
+  status: "pending" | "running" | "success" | "failed" | "cancelled" | string;
   payload: Record<string, unknown> | null;
   result: Record<string, unknown> | null;
   error_message: string | null;
   created_at: string;
   started_at: string | null;
   finished_at: string | null;
+  cancel_requested_at: string | null;
   telegram_id: string | null;
 }
 

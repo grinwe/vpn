@@ -26,7 +26,8 @@ infra/ansible/
 │   ├── diagnose_node.yml         ← диагностика, read-only
 │   ├── deploy_app_stack.yml      ← deploy на web-host (docker-compose + nginx)
 │   ├── deploy_web_frontend.yml   ← SPA build + nginx site conf
-│   └── deploy_monitoring.yml     ← Grafana/Prometheus на monitoring-host
+│   ├── deploy_monitoring.yml     ← Grafana/Prometheus на monitoring-host
+│   └── mgmt_mirror.yml           ← standalone-раскат mgmt-зеркала upstream (см. ниже)
 └── roles/
     ├── base_node                 ← общие системные настройки (не vpn-спец.)
     ├── bootstrap_node            ← pre-install: user, ufw (+ rate-limit 22/tcp), sshd-hardening, fail2ban, unattended-upgrades, apt
@@ -40,12 +41,73 @@ infra/ansible/
     ├── relay_jump_node           ← WG tunnel client → чужая exit-нода
     ├── wg_exit_node              ← non-RU exit нода для relay'ев
     ├── check_node_health         ← post-install assertion: порты LISTEN
+    ├── xray_geoip                ← geoip.dat fetcher с CDN-fallback (mirror→jsdelivr→ghproxy→github) + weekly timer
+    ├── xray_core                 ← xray-core install через CDN-fallback (mirror→ghproxy→github), pinned version
+    ├── mgmt_mirror               ← nginx-зеркало upstream-ресурсов на web-host'е (см. ниже)
     ├── db_host                   ← PostgreSQL + volume на mgmt-хосте
     ├── deploy_app_stack          ← backend, bot, redis, db compose-stack на web
     ├── deploy_web_frontend       ← nginx site для SPA и sub-ссылок
     ├── monitoring_stack          ← Grafana/Prometheus compose на nl-monitoring
     └── node_exporter             ← prom node_exporter (запускается поверх vpn_nodes)
 ```
+
+## mgmt-mirror — собственное зеркало upstream
+
+Часть RU-провайдеров троттлит outbound к `github.com` и его зеркалам
+настолько, что `curl` стоит 5+ минут SSL-handshake и фейлится: видели на
+`ru-cloud-web-02` при попытке скачать `Xray-linux-64.zip` (даже через
+`ghproxy.com`). Чтобы ноды не зависели от capricious-доступности
+upstream'а, у нас есть свой mini-mirror на web-host'е (`nl-web` /
+`mgmt-1` — один IP).
+
+### Что лежит в зеркале
+
+`/srv/assets/` на nginx-контейнере отдаёт по `http://<web-host>:8090/`:
+
+| URL | Что |
+|---|---|
+| `/geoip.dat` | v2fly geoip database (latest, qweekly refresh) |
+| `/geosite.dat` | v2fly geosite list |
+| `/xray/Xray-linux-64-<version>.zip` | pinned-версии xray-core |
+| `/healthz` | docker healthcheck endpoint |
+
+Источник правды pinned-версий — `XRAY_VERSIONS` массив в
+[refresh-assets.sh](../../infra/ansible/roles/mgmt_mirror/files/refresh-assets.sh).
+Bump xray — два места: тут + `xray_core_version` в
+[roles/xray_core/defaults/main.yml](../../infra/ansible/roles/xray_core/defaults/main.yml).
+
+### Как ноды его находят
+
+[group_vars/all.yml](../../infra/ansible/inventories/prod/group_vars/all.yml)
+задаёт `xray_mirror_url: "http://{{ hostvars['mgmt-1']['ansible_host'] }}:8090"`.
+`bootstrap_node` рендерит `/etc/default/xray-mirror` на каждой ноде, оттуда
+wrapper'ы `xray-geoip-fetch.sh` и `xray-core-fetch.sh` подхватывают `MIRROR_URL`
+и пробуют его **первым** в цепочке. При недоступности — fallback на
+ghproxy/jsdelivr/github как раньше.
+
+### Раскатка
+
+В составе общего `site.yml`:
+
+```bash
+ansible-playbook -i inventories/prod/hosts.yml site.yml --tags web,mirror
+```
+
+Точечно, только mirror без перетряхивания backend/admin:
+
+```bash
+ansible-playbook -i inventories/prod/hosts.yml playbooks/mgmt_mirror.yml
+```
+
+Принудительный refresh upstream'а (после bump'а xray-version, например):
+
+```bash
+ansible-playbook -i inventories/prod/hosts.yml playbooks/mgmt_mirror.yml \
+    -e mgmt_mirror_force_refresh=true
+```
+
+Cron на mgmt'е сам обновляет geoip раз в неделю (понедельник 04:00,
+лог `/var/log/mgmt-mirror-refresh.log`).
 
 ## `ansible.cfg` — важные дефолты
 

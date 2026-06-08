@@ -13,8 +13,11 @@
     # - install_shadowtls_stack
     # - install_hysteria2
     - install_vless_reality
-    - install_vless_ws_cdn
     - install_vless_xhttp
+    # ws_cdn ПОСЛЕ xhttp: оба делят nginx :443, и ws_cdn гоняет `nginx -t`
+    # по всему дереву — пусть xhttp сначала выпустит/устаканит свой серт+vhost,
+    # иначе транзиентно-битый xhttp-vhost уронит nginx -t у ws_cdn.
+    - install_vless_ws_cdn
     # Relay: WG tunnel to foreign exit node. Patches Xray outbound with
     # sockopt.interface: wg0 so user traffic exits via the tunnel while
     # management traffic stays on the main interface. Role runs
@@ -74,3 +77,15 @@
   tags: [web, frontend]
   roles:
     - deploy_web_frontend
+
+# Mgmt-mirror — статичный nginx с upstream-ресурсами (geoip.dat,
+# Xray-linux-64-*.zip) для vpn-нод. Живёт на том же физическом сервере
+# что web/app, но в отдельном compose-стеке (отдельная роль с отдельным
+# жизненным циклом). При `site.yml --tags web` прокатается вместе с
+# остальной web-инфой. Точечный refresh — `--tags mirror`. См.
+# roles/mgmt_mirror и playbooks/mgmt_mirror.yml.
+- hosts: web
+  become: yes
+  tags: [web, mirror]
+  roles:
+    - mgmt_mirror

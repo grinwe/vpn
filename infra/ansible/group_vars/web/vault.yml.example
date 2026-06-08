@@ -45,9 +45,10 @@ vault_telegram_stars_webhook_secret: ""
 # Rotating invalidates all active webapp sessions.
 vault_webapp_jwt_secret: ""
 
-# Cloudflare API token used by certbot-dns-cloudflare for the DNS-01
-# ACME challenge. Scope it to Zone → DNS → Edit on the target zone
-# only (do NOT use a Global API Key). Create at
+# Cloudflare API token, Zone → DNS → Edit (NOT a Global API Key). Used by
+# certbot-dns-cloudflare for the DNS-01 ACME challenge AND by the backend
+# to mint ws-cdn front records — so scope it to BOTH the grinwer.online
+# zone and the wgse.info (ws-cdn front) zone. Create at
 # https://dash.cloudflare.com/profile/api-tokens.
 vault_cloudflare_api_token: "replace-me-cf-dns-edit-token"
 
@@ -62,3 +63,44 @@ vault_probe_agent_token: ""
 # clients from an RKN block on grinwer.online. Leave empty to fall
 # back to the backend's own domain. See Worker code in the ops notes.
 vault_sub_link_base_url: ""
+
+# ── WS+CDN (Cloudflare-fronted ws-cdn) ────────────────────────────────
+# Front zone for ws-cdn SNI — a clean, dedicated domain (NOT grinwer.online).
+# Default wgse.info; override only if the front domain moves.
+vault_wscdn_front_domain: "wgse.info"
+
+# ── XHTTP front zone (optional split) ─────────────────────────────────
+# Separate Cloudflare front zone for xhttp SNI, so xhttp and ws-cdn live
+# on different domains (xhttp→grwr.ink, ws→wgse.info). Empty → xhttp reuses
+# the ws-cdn front zone (single-zone setup). When set, also provide the
+# matching Origin cert in vault_grwr_origin_cert/key below, AND ensure
+# vault_cloudflare_api_token has Zone.DNS:Edit on grwr.ink too.
+vault_xhttp_front_domain: "grwr.ink"
+
+# Cloudflare Origin CA cert (+ key) for *.wgse.info — installed on the nginx
+# WS front of every ws-cdn node (CF SSL mode = Full strict). Generate in
+# CF Dashboard → SSL/TLS → Origin Server → Create Certificate (hostnames
+# wgse.info + *.wgse.info, 15 years). Paste as YAML block scalars (`|`) so
+# the multi-line PEM stays intact — do NOT collapse onto one line.
+vault_wgse_origin_cert: |
+  -----BEGIN CERTIFICATE-----
+  ...paste Origin Certificate here...
+  -----END CERTIFICATE-----
+vault_wgse_origin_key: |
+  -----BEGIN PRIVATE KEY-----
+  ...paste Private Key here (CF shows it once)...
+  -----END PRIVATE KEY-----
+
+# Origin CA cert for the xhttp CF front, when xhttp lives on a SEPARATE
+# zone/domain from ws-cdn (xhttp→grwr.ink, ws→wgse.info). Generate in the
+# grwr.ink zone → SSL/TLS → Origin Server → Create Certificate (hostnames
+# grwr.ink + *.grwr.ink). Leave empty → backend falls back to the shared
+# wgse cert (single-zone setup). Same block-scalar (`|`) rules apply.
+vault_grwr_origin_cert: |
+  -----BEGIN CERTIFICATE-----
+  ...paste grwr.ink Origin Certificate here...
+  -----END CERTIFICATE-----
+vault_grwr_origin_key: |
+  -----BEGIN PRIVATE KEY-----
+  ...paste grwr.ink Private Key here (CF shows it once)...
+  -----END PRIVATE KEY-----

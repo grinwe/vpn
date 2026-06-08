@@ -28,7 +28,16 @@ MIN_BYTES=5000000  # 5MB — настоящий ~22MB, эффективно ло
 CONNECT_TIMEOUT=30
 MAX_TIME=180
 
-URLS=(
+# Mgmt-mirror как первый кандидат (если ansible прописал MIRROR_URL в
+# env-файл). Идея: у части RU-провайдеров github троттлится даже через
+# ghproxy/jsdelivr, а до нашего mgmt-host'а ноды дотягиваются стабильно.
+# Mgmt сам качает upstream и раздаёт нодам по локальному маршруту.
+MIRROR_URL=""
+[ -r /etc/default/xray-mirror ] && . /etc/default/xray-mirror
+
+URLS=()
+[ -n "$MIRROR_URL" ] && URLS+=("$MIRROR_URL/geoip.dat")
+URLS+=(
     "https://cdn.jsdelivr.net/gh/v2fly/geoip@release/geoip.dat"
     "https://ghproxy.com/https://github.com/v2fly/geoip/releases/latest/download/geoip.dat"
     "https://github.com/v2fly/geoip/releases/latest/download/geoip.dat"

@@ -83,6 +83,17 @@ services:
       # CDN-fronted domain (Cloudflare Worker proxy etc.) so an RKN
       # block on grinwer.online does not kill installed clients.
       SUB_LINK_BASE_URL: ${SUB_LINK_BASE_URL:-}
+      # WS+CDN (Cloudflare-fronted ws-cdn). Backend mints proxied DNS
+      # records on config-create; the Origin CA cert (base64) is passed to
+      # the ws_cdn role. See services/cloudflare_dns.py.
+      CLOUDFLARE_DNS_TOKEN: ${CLOUDFLARE_DNS_TOKEN:-}
+      WSCDN_FRONT_DOMAIN: ${WSCDN_FRONT_DOMAIN:-}
+      WSCDN_ORIGIN_CERT_B64: ${WSCDN_ORIGIN_CERT_B64:-}
+      WSCDN_ORIGIN_KEY_B64: ${WSCDN_ORIGIN_KEY_B64:-}
+      # xhttp on its own CF front zone/cert (optional split; empty → reuse ws-cdn)
+      XHTTP_FRONT_DOMAIN: ${XHTTP_FRONT_DOMAIN:-}
+      XHTTP_ORIGIN_CERT_B64: ${XHTTP_ORIGIN_CERT_B64:-}
+      XHTTP_ORIGIN_KEY_B64: ${XHTTP_ORIGIN_KEY_B64:-}
       ANSIBLE_PLAYBOOK_TIMEOUT: ${ANSIBLE_PLAYBOOK_TIMEOUT:-300}
       # Admin push-уведомления: backend шлёт в телегу по тем же
       # telegram_id'шникам, что бот считает админами. Одна переменная
@@ -176,6 +187,16 @@ services:
       # provisioning.py also bake the sub URL into Device.connection_uri
       # when running off the queue.
       SUB_LINK_BASE_URL: ${SUB_LINK_BASE_URL:-}
+      # WS+CDN: worker passes the Origin CA cert (base64) to the ws_cdn
+      # role via extra_vars; token/domain harmless here.
+      CLOUDFLARE_DNS_TOKEN: ${CLOUDFLARE_DNS_TOKEN:-}
+      WSCDN_FRONT_DOMAIN: ${WSCDN_FRONT_DOMAIN:-}
+      WSCDN_ORIGIN_CERT_B64: ${WSCDN_ORIGIN_CERT_B64:-}
+      WSCDN_ORIGIN_KEY_B64: ${WSCDN_ORIGIN_KEY_B64:-}
+      # xhttp on its own CF front zone/cert (optional split; empty → reuse ws-cdn)
+      XHTTP_FRONT_DOMAIN: ${XHTTP_FRONT_DOMAIN:-}
+      XHTTP_ORIGIN_CERT_B64: ${XHTTP_ORIGIN_CERT_B64:-}
+      XHTTP_ORIGIN_KEY_B64: ${XHTTP_ORIGIN_KEY_B64:-}
       LOW_BALANCE_WARN_DAYS: ${LOW_BALANCE_WARN_DAYS:-3}
       # Phase B — passive xray traffic stats collector. Worker SSHs
       # into each active node every TRAFFIC_STATS_INTERVAL seconds and

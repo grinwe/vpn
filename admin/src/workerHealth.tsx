@@ -95,6 +95,8 @@ function fmtAge(iso: string | null): string {
 
 export function WorkerHealthBadge() {
   const [open, setOpen] = useState(false);
+  // Желаемое число реплик; null = "следовать текущему счётчику воркеров".
+  const [desired, setDesired] = useState<number | null>(null);
   const qc = useQueryClient();
   const { data } = useQuery<TicksStatusOut>({
     queryKey: ["ops-ticks-status"],
@@ -127,6 +129,35 @@ export function WorkerHealthBadge() {
     onError: (e: Error) => alert(`Не удалось: ${e.message}`),
   });
 
+  const scale = useMutation({
+    mutationFn: (replicas: number) =>
+      api.post<{ replicas: number; status: string; detail: string | null }>(
+        "/ops/worker/scale",
+        { replicas },
+      ),
+    onSuccess: (res) => {
+      if (res.status === "applied") {
+        alert(
+          `Воркеры: установлено ${res.replicas} реплик.\n${res.detail ?? ""}`,
+        );
+      } else if (res.status === "enqueued") {
+        alert(
+          `Скейл до ${res.replicas} запущен — счётчик обновится через ~20 сек.`,
+        );
+      } else {
+        alert(
+          `Не удалось отскейлить до ${res.replicas}:\n${res.detail ?? "ошибка"}`,
+        );
+      }
+      setDesired(null);
+      setTimeout(
+        () => qc.invalidateQueries({ queryKey: ["ops-ticks-status"] }),
+        20_000,
+      );
+    },
+    onError: (e: Error) => alert(`Не удалось: ${e.message}`),
+  });
+
   const { s, label } = severity(data);
   const colorClass =
     s === "ok"
@@ -151,6 +182,61 @@ export function WorkerHealthBadge() {
           <div className="flex justify-between items-center">
             <span className="font-semibold text-slate-200">Workers ({data.workers.length})</span>
             <div className="flex gap-2 items-center">
+              <div
+                className="flex items-center gap-0.5"
+                title="Число worker-контейнеров. OK гонит docker compose --scale на mgmt-хосте (через SSH воркера)."
+              >
+                <span className="text-[11px] text-slate-400 mr-1">реплик</span>
+                <button
+                  onClick={() =>
+                    setDesired(Math.max(1, (desired ?? data.workers.length) - 1))
+                  }
+                  disabled={
+                    scale.isPending || (desired ?? data.workers.length) <= 1
+                  }
+                  className="text-[11px] px-1.5 py-0.5 rounded bg-slate-700 hover:bg-slate-600 text-white disabled:opacity-40"
+                >
+                  −
+                </button>
+                <span className="text-[11px] w-5 text-center font-mono text-slate-200">
+                  {desired ?? data.workers.length}
+                </span>
+                <button
+                  onClick={() =>
+                    setDesired(
+                      Math.min(20, (desired ?? data.workers.length) + 1),
+                    )
+                  }
+                  disabled={
+                    scale.isPending || (desired ?? data.workers.length) >= 20
+                  }
+                  className="text-[11px] px-1.5 py-0.5 rounded bg-slate-700 hover:bg-slate-600 text-white disabled:opacity-40"
+                >
+                  +
+                </button>
+                <button
+                  onClick={() => {
+                    const target = desired ?? data.workers.length;
+                    if (
+                      target !== data.workers.length &&
+                      confirm(
+                        `Отскейлить воркеры ${data.workers.length} → ${target}? ` +
+                          `Выполнит docker compose --scale worker=${target} на mgmt-хосте.`,
+                      )
+                    ) {
+                      scale.mutate(target);
+                    }
+                  }}
+                  disabled={
+                    scale.isPending ||
+                    (desired ?? data.workers.length) === data.workers.length
+                  }
+                  className="text-[11px] px-2 py-0.5 rounded bg-sky-700 hover:bg-sky-600 text-white disabled:opacity-40 disabled:cursor-not-allowed ml-0.5"
+                  title="Применить число реплик (SSH воркера → docker compose --scale на mgmt)"
+                >
+                  {scale.isPending ? "…" : "OK"}
+                </button>
+              </div>
               <button
                 onClick={() => {
                   if (

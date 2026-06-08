@@ -13,6 +13,7 @@ import CloudProviders from "./pages/CloudProviders";
 import Exits from "./pages/Exits";
 import HealthPings from "./pages/HealthPings";
 import Broadcasts from "./pages/Broadcasts";
+import OperatorMatrix from "./pages/OperatorMatrix";
 
 function Layout({ children }: { children: React.ReactNode }) {
   const { logout } = useAuth();
@@ -31,6 +32,7 @@ function Layout({ children }: { children: React.ReactNode }) {
           <NavLink to="/exits" className={linkCls}>Exits</NavLink>
           <NavLink to="/tasks" className={linkCls}>Tasks</NavLink>
           <NavLink to="/health-pings" className={linkCls}>Health</NavLink>
+          <NavLink to="/operators" className={linkCls}>Operators</NavLink>
           <NavLink to="/broadcasts" className={linkCls}>Broadcasts</NavLink>
           <NavLink to="/tokens" className={linkCls}>API tokens</NavLink>
           <NavLink to="/cloud" className={linkCls}>Cloud</NavLink>
@@ -79,6 +81,10 @@ export default function App() {
       <Route
         path="/broadcasts"
         element={<Protected><Broadcasts /></Protected>}
+      />
+      <Route
+        path="/operators"
+        element={<Protected><OperatorMatrix /></Protected>}
       />
       <Route path="*" element={<Navigate to="/" replace />} />
     </Routes>

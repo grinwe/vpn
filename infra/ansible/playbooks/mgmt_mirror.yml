@@ -1,0 +1,25 @@
+---
+# Standalone-раскат mgmt-mirror: nginx-зеркало upstream-ресурсов
+# (geoip.dat, Xray-linux-64-*.zip) для vpn-нод. См. roles/mgmt_mirror.
+#
+# То же самое прокатывается из site.yml (тэги [web, mirror]) вместе с
+# остальной web-инфой. Этот playbook — shortcut для точечного раската
+# без deploy_app_stack/frontend.
+#
+# Цель — группа web (там же где deploy_app_stack). Физически совпадает
+# с mgmt-1 (один IP в inventory), но семантически mirror живёт рядом с
+# app/static stack'ом.
+#
+# Запуск:
+#   cd infra/ansible
+#   ansible-playbook -i inventories/prod/hosts.yml playbooks/mgmt_mirror.yml
+#
+# Принудительный refresh upstream'а (без ожидания cron'а):
+#   ansible-playbook -i inventories/prod/hosts.yml playbooks/mgmt_mirror.yml \
+#     -e mgmt_mirror_force_refresh=true
+
+- hosts: web
+  become: yes
+  gather_facts: no
+  roles:
+    - mgmt_mirror

@@ -8,7 +8,7 @@ import {
 } from "../api";
 import { DiagnoseResult } from "../diagnoseResult";
 
-const STATUSES = ["", "pending", "running", "success", "failed"] as const;
+const STATUSES = ["", "pending", "running", "success", "failed", "cancelled"] as const;
 const TARGETS = ["", "node", "device", "subscription"] as const;
 const EXPECTED_TICKS = 8;
 
@@ -213,6 +213,8 @@ function statusColor(s: string): string {
       return "text-blue-400";
     case "pending":
       return "text-yellow-400";
+    case "cancelled":
+      return "text-orange-400";
     default:
       return "text-slate-400";
   }
@@ -343,6 +345,14 @@ export default function Tasks() {
     onSuccess: () =>
       qc.invalidateQueries({ queryKey: ["provisioning-tasks"] }),
     onError: (e: Error) => alert(`Не удалось удалить: ${e.message}`),
+  });
+
+  const cancel = useMutation({
+    mutationFn: (id: number) =>
+      api.post<ProvisioningTaskOut>(`/provisioning/tasks/${id}/cancel`, {}),
+    onSuccess: () =>
+      qc.invalidateQueries({ queryKey: ["provisioning-tasks"] }),
+    onError: (e: Error) => alert(`Не удалось отменить: ${e.message}`),
   });
 
   const batch = useMutation({
@@ -598,6 +608,25 @@ export default function Tasks() {
                     </td>
                     <td onClick={(e) => e.stopPropagation()}>
                       <div className="flex gap-1">
+                        {(t.status === "pending" || t.status === "running") && (
+                          <button
+                            disabled={cancel.isPending || !!t.cancel_requested_at}
+                            onClick={() => {
+                              if (
+                                confirm(
+                                  `Отменить задачу #${t.id} (${t.action} на ${t.target_type}:${t.target_id})?` +
+                                    (t.status === "running"
+                                      ? " Идущий ansible получит SIGTERM."
+                                      : "")
+                                )
+                              )
+                                cancel.mutate(t.id);
+                            }}
+                            className="text-xs px-2 py-1 rounded bg-orange-700 hover:bg-orange-600 disabled:opacity-50"
+                          >
+                            {t.cancel_requested_at ? "отменяется…" : "cancel"}
+                          </button>
+                        )}
                         {t.status !== "running" && (
                           <button
                             disabled={rerun.isPending}

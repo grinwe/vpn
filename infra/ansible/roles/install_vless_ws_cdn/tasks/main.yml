@@ -1,13 +1,13 @@
 ---
 # install_vless_ws_cdn
 #
-# Installs xray-core configured for VLESS+WebSocket inbound, designed
-# to sit behind Cloudflare CDN. TLS termination is handled either by
-# Cloudflare (Full Strict mode with origin cert) or locally with
-# certbot. The WebSocket transport allows Cloudflare to proxy traffic,
-# making the origin IP invisible to TSPU.
-#
-# The role is a no-op unless ``vless_ws_cdn_domain`` is defined.
+# Installs the CF-fronted VLESS+WebSocket stack:
+#   client (WSS → <cf_subdomain>.wgse.info) → Cloudflare Full(strict)
+#   → nginx :443 (Origin CA cert, routed by SNI) → xray-ws (loopback, WS).
+# Origin IP hidden behind CF; coexists with reality (:9443) + xhttp (nginx
+# :443, different SNI). The *.wgse.info Origin CA cert arrives base64 via
+# extra_vars (vless_ws_cdn_origin_cert_b64). No-op unless
+# ``vless_ws_cdn_domain`` is set (the backend's CF DNS hook sets it).
 
 - name: Stop xray-ws-cdn when VLESS WS+CDN is removed
   systemd:
@@ -16,6 +16,29 @@
     enabled: no
   when: vless_ws_cdn_domain is not defined or vless_ws_cdn_domain | length == 0
   failed_when: false
+
+# Teardown: убираем ВСЕ wscdn-*.conf (иначе :443 server-block с мёртвым
+# server_name снесённого CF-субдомена остаётся висеть рядом с xhttp).
+- name: Find ws-cdn nginx vhosts (teardown)
+  find:
+    paths:
+      - /etc/nginx/sites-enabled
+      - /etc/nginx/sites-available
+    patterns: 'wscdn-*.conf'
+    # file_type=any — без него find пропускает симлинки в sites-enabled,
+    # remove сносит лишь файл из sites-available, а битый симлинк остаётся
+    # → nginx -t → reload падает с open() ... No such file or directory.
+    file_type: any
+  register: _wscdn_teardown_vhosts
+  when: vless_ws_cdn_domain is not defined or vless_ws_cdn_domain | length == 0
+
+- name: Drop ws-cdn vhost files (teardown)
+  file:
+    path: "{{ item.path }}"
+    state: absent
+  loop: "{{ _wscdn_teardown_vhosts.files | default([]) }}"
+  when: vless_ws_cdn_domain is not defined or vless_ws_cdn_domain | length == 0
+  notify: reload nginx ws cdn
 
 - name: Skip role when VLESS WS+CDN is not configured
   meta: end_role
@@ -27,28 +50,33 @@
       - vless_ws_cdn_domain is defined and vless_ws_cdn_domain | length > 0
       - vless_ws_cdn_port is defined
       - vless_ws_cdn_path is defined and vless_ws_cdn_path | length > 0
+      - vless_ws_cdn_origin_cert_b64 is defined and vless_ws_cdn_origin_cert_b64 | length > 0
+      - vless_ws_cdn_origin_key_b64 is defined and vless_ws_cdn_origin_key_b64 | length > 0
+      - (vless_ws_cdn_origin_cert_b64 | b64decode).startswith('-----BEGIN CERTIFICATE')
     fail_msg: >-
-      install_vless_ws_cdn requires vless_ws_cdn_domain, vless_ws_cdn_port,
-      and vless_ws_cdn_path.
+      install_vless_ws_cdn requires vless_ws_cdn_domain/port/path AND the
+      *.wgse.info Origin CA cert (vless_ws_cdn_origin_cert_b64 + _key_b64 —
+      set WSCDN_ORIGIN_CERT_B64/KEY_B64 in the backend env via vault).
 
-- name: Ensure dependencies
+- name: Ensure dependencies (incl. nginx WS front)
   apt:
-    name: [curl, unzip, jq, ca-certificates]
+    name:
+      - curl
+      - unzip
+      - jq
+      - ca-certificates
+      - nginx
     state: present
     update_cache: yes
 
-- name: Install xray-core (idempotent)
-  shell: |
-    set -euo pipefail
-    if command -v xray >/dev/null 2>&1; then
-      echo "xray already installed"
-      exit 0
-    fi
-    bash -c "$(curl -fsSL https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install
-  args:
-    executable: /bin/bash
-  register: xray_ws_install
-  changed_when: "'already installed' not in xray_ws_install.stdout"
+# xray-core: self-install через mirror-backed роль xray_core (идемпотентно;
+# на combo-нодах xray_core скипнется при той же версии). Раньше был
+# github-install (SSL-timeout на заблокированных RU-DC); на ws-cdn-ONLY
+# ноде НИКТО иначе xray не ставит — reality/xhttp end_role'ятся без своего
+# конфига, а xhttp в site.yml идёт ПОСЛЕ нас. Поэтому ставим сами.
+- name: Install xray-core (CDN-fallback via mirror)
+  include_role:
+    name: xray_core
 
 # Also in bootstrap_node (the authoritative one). Kept here as a
 # safety net in case bootstrap order changes.
@@ -122,6 +150,14 @@
     backup: yes
   notify: restart xray ws cdn
 
+# Ловим битый рендер ДО старта — иначе xray-ws молча падает в systemd, а на
+# volatile-journald RU-нодах причину потом не восстановить (как в reality/xhttp).
+- name: Validate xray WS+CDN config before starting
+  command: /usr/local/bin/xray -test -config /usr/local/etc/xray/config_ws_cdn.json
+  register: xray_ws_cdn_config_test
+  changed_when: false
+  failed_when: xray_ws_cdn_config_test.rc != 0
+
 - name: Install VLESS WS user management helper
   copy:
     src: manage_vless_ws_user.sh
@@ -167,3 +203,89 @@
     state: restarted
     daemon_reload: yes
   when: _xray_ws_cdn_active.stdout != 'active'
+
+# ── CF-fronted nginx :443 front (Origin CA cert) → xray-ws loopback ─────
+- name: Ensure nginx ssl directory
+  file:
+    path: /etc/nginx/ssl
+    state: directory
+    owner: root
+    group: root
+    mode: '0750'
+
+- name: Install wgse Origin CA certificate
+  copy:
+    content: "{{ vless_ws_cdn_origin_cert_b64 | b64decode }}"
+    dest: /etc/nginx/ssl/wgse-origin.crt
+    owner: root
+    group: root
+    mode: '0644'
+  notify: reload nginx ws cdn
+
+- name: Install wgse Origin CA private key
+  copy:
+    content: "{{ vless_ws_cdn_origin_key_b64 | b64decode }}"
+    dest: /etc/nginx/ssl/wgse-origin.key
+    owner: root
+    group: root
+    mode: '0600'
+  no_log: true
+  notify: reload nginx ws cdn
+
+- name: Remove default nginx site
+  file:
+    path: /etc/nginx/sites-enabled/default
+    state: absent
+  notify: reload nginx ws cdn
+
+# Субдомен рандомизируется per-config (token_hex), так что delete+recreate
+# оставляет старый wscdn-*.conf с мёртвым server_name на :443. Сносим все,
+# кроме текущего, на каждом прогоне.
+- name: Find existing ws-cdn vhosts
+  find:
+    paths:
+      - /etc/nginx/sites-enabled
+      - /etc/nginx/sites-available
+    patterns: 'wscdn-*.conf'
+    # file_type=any — без него find пропускает симлинки в sites-enabled,
+    # remove сносит лишь файл из sites-available, а битый симлинк остаётся
+    # → nginx -t → reload падает с open() ... No such file or directory.
+    file_type: any
+  register: _wscdn_existing_vhosts
+
+- name: Remove stale ws-cdn vhosts (keep only current subdomain)
+  file:
+    path: "{{ item.path }}"
+    state: absent
+  loop: "{{ _wscdn_existing_vhosts.files }}"
+  when: item.path | basename != ('wscdn-' ~ vless_ws_cdn_domain ~ '.conf')
+  notify: reload nginx ws cdn
+
+- name: Render ws-cdn nginx vhost
+  template:
+    src: wscdn-nginx.conf.j2
+    dest: "/etc/nginx/sites-available/wscdn-{{ vless_ws_cdn_domain }}.conf"
+    owner: root
+    group: root
+    mode: '0644'
+  notify: reload nginx ws cdn
+
+- name: Enable ws-cdn nginx vhost
+  file:
+    src: "/etc/nginx/sites-available/wscdn-{{ vless_ws_cdn_domain }}.conf"
+    dest: "/etc/nginx/sites-enabled/wscdn-{{ vless_ws_cdn_domain }}.conf"
+    state: link
+  notify: reload nginx ws cdn
+
+- name: Validate nginx config (ws-cdn front)
+  command: nginx -t
+  changed_when: false
+
+- name: Ensure nginx is enabled and running
+  systemd:
+    name: nginx
+    enabled: yes
+    state: started
+
+- name: Flush ws-cdn nginx handlers
+  meta: flush_handlers

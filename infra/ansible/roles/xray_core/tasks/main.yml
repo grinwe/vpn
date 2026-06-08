@@ -1,0 +1,43 @@
+---
+# Install xray-core with CDN-fallback chain. Заменяет inline-вызов
+# upstream's install-release.sh из install_vless_reality (тот висел
+# 5 минут SSL timeout'ом на RU-провайдерах, где curl к github не
+# проходит). Делает то же что upstream installer, но fetch — через
+# ghproxy.com с fallback'ом на direct github.
+
+- name: Ensure unzip + curl installed (xray-core install deps)
+  ansible.builtin.apt:
+    name: [unzip, curl]
+    state: present
+    update_cache: yes
+
+- name: Ensure xray data directory
+  ansible.builtin.file:
+    path: /usr/local/share/xray
+    state: directory
+    owner: root
+    group: root
+    mode: '0755'
+
+- name: Stage xray-core fetcher
+  ansible.builtin.copy:
+    src: xray-core-fetch.sh
+    dest: /usr/local/bin/xray-core-fetch.sh
+    owner: root
+    group: root
+    mode: '0755'
+
+- name: Install / refresh xray-core ({{ xray_core_version }})
+  ansible.builtin.command: /usr/local/bin/xray-core-fetch.sh {{ xray_core_version }}
+  register: xray_core_fetch
+  changed_when: "'установлен:' in xray_core_fetch.stdout"
+  failed_when: xray_core_fetch.rc != 0
+
+- name: Install xray.service systemd unit
+  ansible.builtin.copy:
+    src: xray.service
+    dest: /etc/systemd/system/xray.service
+    owner: root
+    group: root
+    mode: '0644'
+  notify: reload systemd
