@@ -59,9 +59,10 @@ server {
 
     add_header Strict-Transport-Security "max-age=31536000" always;
 
-    # XHTTP традиционно гоняет большие POST/long-poll'ы, но клиенту
-    # незачем слать > пары мегабайт за раз — cap на всякий случай.
-    client_max_body_size 4m;
+    # xhttp stream-up заливает аплинк ОДНИМ длинным POST-телом — любой cap
+    # его обрежет (413 / обрыв up-канала). Референс XTLS xhttp+nginx ставит
+    # 0 (без лимита). См. cdn_front_nodata_investigation.md.
+    client_max_body_size 0;
 
     # XHTTP location — проксируем на loopback-xray.
     # ВНИМАНИЕ: xhttp mode=auto комбинирует GET long-poll + POST stream-up.
@@ -84,8 +85,15 @@ server {
         # 300s рвало download-канал раньше CF idle-таймаута.
         proxy_read_timeout 3600s;
         proxy_send_timeout 3600s;
-        proxy_set_header Upgrade $http_upgrade;
-        proxy_set_header Connection $connection_upgrade;
+        # xhttp — ПЛЕЙН HTTP (GET long-poll + POST stream-up), НЕ websocket.
+        # websocket-style Upgrade/Connection здесь ЯД: без Upgrade-заголовка
+        # map отдаёт Connection: close → nginx рвёт длинный GET-download
+        # стрим к xray = "upstream prematurely closed connection" (тот самый
+        # "коннект есть — данных нет"). Пустой Connection + proxy_http_version
+        # 1.1 = keep-alive к upstream, стрим живёт. Официальный XTLS
+        # xhttp+nginx пример Upgrade/Connection НЕ ставит вовсе.
+        # См. cdn_front_nodata_investigation.md.
+        proxy_set_header Connection "";
         # Скрываем upstream-заголовки, чтобы xray-specific маркеры не
         # протекали наружу (на всякий случай — xray обычно не шлёт
         # Server, но защищаемся от будущих правок).
@@ -101,11 +109,7 @@ server {
     }
 }
 
-# map нужен для корректной работы proxy_set_header Connection
-# в xhttp-location'е выше. Должен быть в http{} scope — Debian-nginx
-# подтягивает этот файл через include /etc/nginx/sites-enabled/*,
-# поэтому map на верхнем уровне файла работает (context: http).
-map $http_upgrade $connection_upgrade {
-    default upgrade;
-    ''      close;
-}
+# NB: map $http_upgrade $connection_upgrade УДАЛЁН намеренно — xhttp не
+# websocket, Connection задаётся статически "" в location выше. Это также
+# снимает риск конфликта одноимённого $connection_upgrade map с ws-cdn
+# vhost'ом на combo-ноде (ws-cdn использует свой $ws_cdn_connection_upgrade).

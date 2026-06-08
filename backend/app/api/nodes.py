@@ -977,7 +977,7 @@ def update_config(
             config.sni = None
             config.settings = _s
             db.flush()
-            _provision_cf_subdomain(db, config.node, config)  # sni ← wgse.info
+            _provision_cf_subdomain(db, config.node, config)  # sni ← xhttp_front_domain() (grwr.ink, fallback wgse)
             changed.append("sni")
         payload.sni = None  # обработали (или игнор для non-xhttp) — не применять ниже
 
