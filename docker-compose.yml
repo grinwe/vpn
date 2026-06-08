@@ -105,6 +105,14 @@ services:
       ADMIN_ALERT_DEDUP_WINDOW_SEC: ${ADMIN_ALERT_DEDUP_WINDOW_SEC:-600}
       ADMIN_ALERT_SSH_FAILED_THRESHOLD: ${ADMIN_ALERT_SSH_FAILED_THRESHOLD:-1}
       ADMIN_ALERT_DLQ_WINDOW_SEC: ${ADMIN_ALERT_DLQ_WINDOW_SEC:-300}
+      # ── Provisioning reconciler (desired-state convergence) ──────────
+      # Backend-сторона: правка ноды бампает desired_generation + ставит
+      # debounce-таймер (mark_node_dirty) ВМЕСТО немедленного bootstrap'а.
+      # Сам прогон сходит reconcile-тик на worker-scheduler. Пусто/0 →
+      # старое immediate-поведение (Phase-0 coalescing). См.
+      # docs/operations/provisioning_reconciler_epic.md.
+      RECONCILER_ENABLED: ${RECONCILER_ENABLED:-}
+      RECONCILE_DEBOUNCE_S: ${RECONCILE_DEBOUNCE_S:-5}
     ports:
       - "127.0.0.1:8000:8000"
     depends_on:
@@ -220,6 +228,18 @@ services:
       ADMIN_ALERT_DEDUP_WINDOW_SEC: ${ADMIN_ALERT_DEDUP_WINDOW_SEC:-600}
       ADMIN_ALERT_SSH_FAILED_THRESHOLD: ${ADMIN_ALERT_SSH_FAILED_THRESHOLD:-1}
       ADMIN_ALERT_DLQ_WINDOW_SEC: ${ADMIN_ALERT_DLQ_WINDOW_SEC:-300}
+      # ── Provisioning reconciler (desired-state convergence) ──────────
+      # worker-scheduler (WORKER_ROLE=ticks) гоняет reconcile-тик: берёт
+      # ноды с desired>reconciled и созревшим due_at, диспатчит ОДИН
+      # coalesced bootstrap (cap MAX_PER_TICK, FIFO по due_at). worker
+      # (provisioning) исполняет bootstrap и стэмпит reconciled / backoff
+      # на фейле. Пусто/0 в RECONCILER_ENABLED → фича выключена (Phase-0).
+      # См. docs/operations/provisioning_reconciler_epic.md.
+      RECONCILER_ENABLED: ${RECONCILER_ENABLED:-}
+      RECONCILE_INTERVAL: ${RECONCILE_INTERVAL:-10}
+      RECONCILE_DEBOUNCE_S: ${RECONCILE_DEBOUNCE_S:-5}
+      RECONCILE_MAX_PER_TICK: ${RECONCILE_MAX_PER_TICK:-5}
+      RECONCILE_RETRY_S: ${RECONCILE_RETRY_S:-60}
     volumes:
       - ${PROVISIONING_SSH_KEY:?Set PROVISIONING_SSH_KEY to the host path of the SSH private key}:/run/secrets/provisioning_key:ro
     depends_on:

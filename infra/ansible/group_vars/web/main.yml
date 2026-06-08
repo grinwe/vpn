@@ -25,6 +25,15 @@ deploy_app_stack_sub_link_base_url: "{{ vault_sub_link_base_url | default('') }}
 # bound the replay window. NOT a secret — just a tunable.
 deploy_app_stack_webapp_init_data_ttl_seconds: 300
 
+# Provisioning reconciler — ВКЛючён в проде: правки нод сходятся через
+# desired-state reconcile-тик (debounce + coalesce) вместо немедленного
+# bootstrap'а на каждое действие. Миграция 0043 бэкфилит desired=reconciled=0,
+# поэтому включение НЕ триггерит mass-rebuild — реконсайлятся только ноды,
+# правленные после включения. Откат: "0" + redeploy (или RECONCILER_ENABLED=
+# на хосте). Тунаблы interval/debounce/cap/retry — дефолты из defaults/main.yml.
+# См. docs/operations/provisioning_reconciler_epic.md.
+deploy_app_stack_reconciler_enabled: "1"
+
 # Controller-side path to the SSH private key used for provisioning
 # VPN nodes. Leave empty during initial bootstrap; set it once you
 # have the key on disk and re-run the playbook.

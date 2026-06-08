@@ -90,3 +90,13 @@ deploy_app_stack_wscdn_origin_key_b64: "{{ (vault_wgse_origin_key | default(''))
 # Пусто → бэкенд фолбэчится на wscdn-cert (общий *.wgse.info), как раньше.
 deploy_app_stack_xhttp_origin_cert_b64: "{{ (vault_grwr_origin_cert | default('')) | b64encode }}"
 deploy_app_stack_xhttp_origin_key_b64: "{{ (vault_grwr_origin_key | default('')) | b64encode }}"
+
+# ── Provisioning reconciler (desired-state convergence) ────────────────
+# Master-тумблер + тунаблы reconcile-модели. Безопасный role-дефолт OFF;
+# прод включает через group_vars/web/main.yml (deploy_app_stack_reconciler_enabled: "1").
+# См. docs/operations/provisioning_reconciler_epic.md.
+deploy_app_stack_reconciler_enabled: "0"
+deploy_app_stack_reconcile_interval: 10
+deploy_app_stack_reconcile_debounce_s: 5
+deploy_app_stack_reconcile_max_per_tick: 5
+deploy_app_stack_reconcile_retry_s: 60

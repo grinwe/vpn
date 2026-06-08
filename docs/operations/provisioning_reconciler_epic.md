@@ -1,10 +1,12 @@
 # EPIC: Provisioning reconciler — от «задача-на-действие» к desired-state convergence
 
-**Статус:** Phase 0 ✅ (отревьюен, 5 багов закрыты) · Phase 1 ✅ · Phase 2+3 ✅
-собраны и flag-gated OFF (`RECONCILER_ENABLED`, по умолчанию выключено — без
-флага поведение = Phase 0) · Phase 4 ⏳ частично (cap+ordering, backoff на
-фейлах — есть; diff-skip, стриминг ansible, reconciler'ы exit/relay — deferred,
-см. ниже) · **Создан:** 2026-06-08 · **Обновлён:** 2026-06-08
+**Статус:** Phase 0 ✅ · Phase 1 ✅ · Phase 2+3 ✅ собраны, отревьюены
+(адверс-ревью: 1 CRIT + 6 HIGH закрыты) и **проброшены через ansible** —
+`RECONCILER_ENABLED` включён в `group_vars/web/main.yml`, раскатывается
+ближайшим деплоем (role-default остаётся OFF) · Phase 4 ⏳ частично
+(cap+ordering, backoff — есть; diff-skip, стриминг ansible, reconciler'ы
+exit/relay — deferred, см. ниже) · **Создан:** 2026-06-08 · **Обновлён:**
+2026-06-08
 
 ## Зачем
 Сейчас каждое действие (правка/добавление/удаление конфига, ручной bootstrap)
@@ -109,10 +111,11 @@ generation сошёлся) — UI истории/прогресса живёт.
 
 ## Состояние реализации и как включить (Phase 2+3)
 
-Код Phase 2+3 собран и **flag-gated OFF**. Без `RECONCILER_ENABLED` система
-работает по Phase-0 immediate-модели — правка сразу коалесится в bootstrap.
-Включение — один env var (`RECONCILER_ENABLED=1`), переключает точку входа
-оркестрации с «правка → bootstrap» на «правка → bump desired → reconcile-тик».
+Код Phase 2+3 собран, отревьюен и **проброшен через ansible**. Флаг
+`RECONCILER_ENABLED` переключает точку входа оркестрации с «правка →
+bootstrap» на «правка → bump desired → reconcile-тик». Role-default OFF
+(`deploy_app_stack/defaults/main.yml`), в проде ВКЛючён через
+`group_vars/web/main.yml` (`deploy_app_stack_reconciler_enabled: "1"`).
 
 | Файл | Что лежит |
 |------|-----------|
@@ -122,19 +125,33 @@ generation сошёлся) — UI истории/прогресса живёт.
 | `worker.py` | `run_reconcile_tick()` + bootstrap тика в `main()` |
 | `queue.py` | `tick-reconcile` в `TICK_IDS` + `TICK_TIMEOUTS` (60s) |
 
-### Env vars
+### Env vars (проброс: `docker-compose.yml` backend+worker-env, `env.j2`, `defaults/main.yml`)
 
-| Var | Default | Назначение |
-|-----|---------|-----------|
-| `RECONCILER_ENABLED` | `` (off) | мастер-тумблер. `1/true/yes` → reconcile-модель |
-| `RECONCILE_INTERVAL` | `10` | период reconcile-тика, сек (0 = тик не bootstrap'ится) |
-| `RECONCILE_DEBOUNCE_S` | `5` | debounce: правка ставит `due_at = now + N` |
-| `RECONCILE_MAX_PER_TICK` | `5` | сколько нод диспатчим за один тик (back-pressure) |
-| `RECONCILE_RETRY_S` | `60` | backoff: re-arm `due_at` после фейла reconcile-bootstrap'а |
+| Env var | Ansible var (`deploy_app_stack_*`) | Default | Назначение |
+|---------|-----------------------------------|---------|-----------|
+| `RECONCILER_ENABLED` | `…reconciler_enabled` | `0` (role) / `1` (web) | мастер-тумблер. `1/true/yes` → reconcile-модель |
+| `RECONCILE_INTERVAL` | `…reconcile_interval` | `10` | период reconcile-тика, сек (только worker-scheduler) |
+| `RECONCILE_DEBOUNCE_S` | `…reconcile_debounce_s` | `5` | debounce: правка ставит `due_at = now + N` |
+| `RECONCILE_MAX_PER_TICK` | `…reconcile_max_per_tick` | `5` | нод за тик (back-pressure, FIFO по due_at) |
+| `RECONCILE_RETRY_S` | `…reconcile_retry_s` | `60` | backoff: re-arm `due_at` после фейла reconcile-bootstrap'а |
+
+Кто читает: `RECONCILER_ENABLED`/`RECONCILE_DEBOUNCE_S` — backend (mark_node_dirty)
++ worker. `RECONCILE_INTERVAL`/`MAX_PER_TICK` — worker-scheduler (тик).
+`RECONCILE_RETRY_S` — worker (outcome). Поэтому флаг проброшен и в backend, и в
+`&worker-env` (worker + worker-scheduler).
 
 ### Rollout
-Деплой через ansible (`site.yml --tags web`) с `RECONCILER_ENABLED` пустым
-выкатывает весь код **без смены поведения** (миграция накатывается, тик
-крутится, но short-circuit'ит на `disabled`). Включать флагом отдельным шагом
-после прогона миграции 0043, наблюдая `due` / `dispatched` / `capped` в
-результате тика (RQ result backend).
+Один деплой через ansible (`site.yml --tags web`) выкатывает код И включает
+флаг (`group_vars/web`). Что происходит:
+1. **Миграция авто** — backend на старте гонит `alembic upgrade head`
+   (`main.py:23`; воркеры `SKIP_MIGRATIONS=1`). 0040–0043 накатываются сами.
+2. **Бэкфилл безопасен** — 0043 ставит `desired=reconciled=0` всем нодам →
+   включение НЕ триггерит mass-rebuild; реконсайлятся только ноды, правленные
+   ПОСЛЕ деплоя. Светофор спокойный.
+3. **Наблюдать** `due`/`dispatched`/`capped` в результате `tick-reconcile`
+   (RQ result backend) + логи worker-scheduler `Reconcile tick bootstrapped`.
+
+**Откат:** `deploy_app_stack_reconciler_enabled: "0"` + redeploy (или
+`RECONCILER_ENABLED=` в `.env` на хосте + `docker compose up -d backend worker
+worker-scheduler`). Worst case вырождается в Phase-0 immediate, не в тихую
+несходимость.
