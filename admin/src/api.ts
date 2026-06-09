@@ -483,6 +483,7 @@ export interface VPNNodeOut {
   status: string;
   is_active: boolean;
   health_score: number;
+  active_users: number;
   blocked_regions: string[];
   cooldown_until: string | null;
   suspect_since: string | null;
