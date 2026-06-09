@@ -1,12 +1,15 @@
 """Cloudflare DNS client for the WS+CDN front zone (operator-aware routing).
 
-When a ``vless-ws-cdn`` VPNConfig is created on a node, the backend mints a
-random proxied A-record ``<rand>.<WSCDN_FRONT_DOMAIN>`` → node IP in
-Cloudflare (orange cloud ON). Clients then connect to the CF edge (WSS),
-CF proxies the WebSocket to the node origin — so the origin IP is hidden
-and the user↔CF leg rides un-blockable shared CF edge IPs (survives the
-RKN subnet-flagging that kills Reality; see operator_routing_roadmap /
-project_ru_nodes_burnable).
+When a ``vless-ws-cdn`` / ``vless-xhttp`` VPNConfig is created on a node, the
+backend mints a random **DNS-only** A-record ``<rand>.<WSCDN_FRONT_DOMAIN>``
+→ node IP in Cloudflare (grey cloud, proxied=False). The node serves TLS
+itself (Let's Encrypt per subdomain); CF is used ONLY as a DNS host, not as
+a proxy/CDN. Random hex labels (not node names) keep records
+un-fingerprintable.
+
+NB: CF *proxying* (orange cloud) for WS/xhttp transport is DEAD — RKN DPI
+kills the Cloudflare leg on 4G (origin proven alive, client gets no data;
+see project_cf_ws_cdn_dead). Never set proxied=True for node transport.
 
 Config (env, wired via deploy_app_stack):
 - ``CLOUDFLARE_DNS_TOKEN``  — API token with Zone.DNS:Edit on the front zone
@@ -45,15 +48,10 @@ def front_domain() -> str:
     return os.getenv("WSCDN_FRONT_DOMAIN", "").strip().rstrip(".")
 
 
-def xhttp_front_domain() -> str:
-    """xhttp front zone — falls back to the ws-cdn front when not split."""
-    return (os.getenv("XHTTP_FRONT_DOMAIN", "").strip().rstrip(".")
-            or front_domain())
-
-
 def _token() -> str:
-    # Single token; must hold Zone.DNS:Edit on EVERY front zone in use
-    # (wgse.info AND grwr.ink when split). CF tokens scope to multiple zones.
+    # Single token; must hold Zone.DNS:Edit on the front zone (wgse.info).
+    # Keep grwr.ink access too UNTIL old CF-proxied xhttp records are torn
+    # down — delete_record() resolves the zone from the stored cf_front_domain.
     return os.getenv("CLOUDFLARE_DNS_TOKEN", "").strip()
 
 
@@ -94,7 +92,7 @@ def _request(method: str, path: str, **kwargs) -> dict:
 def _get_zone_id(domain: str | None = None) -> str:
     domain = (domain or front_domain()).strip().rstrip(".")
     if not domain:
-        raise CloudflareError("CF front domain not set (WSCDN_FRONT_DOMAIN / XHTTP_FRONT_DOMAIN)")
+        raise CloudflareError("CF front domain not set (WSCDN_FRONT_DOMAIN)")
     if domain in _zone_id_cache:
         return _zone_id_cache[domain]
     body = _request("GET", "/zones", params={"name": domain})
@@ -109,12 +107,19 @@ def _get_zone_id(domain: str | None = None) -> str:
 
 
 def create_node_record(
-    node_ip: str, *, label: str | None = None, domain: str | None = None
+    node_ip: str,
+    *,
+    label: str | None = None,
+    domain: str | None = None,
+    proxied: bool = False,
 ) -> dict:
-    """Create a random proxied A-record for a node in ``domain``'s zone
-    (default ws-cdn front). Returns ``{"subdomain": "<rand>.<front>",
+    """Create a random A-record for a node in ``domain``'s zone (default
+    ws-cdn front). Returns ``{"subdomain": "<rand>.<front>",
     "record_id": "...", "front_domain": "<front>"}``.
 
+    ``proxied`` defaults to **False** (DNS-only / grey cloud → record points
+    straight at the node IP; node serves TLS itself). CF *proxying* for
+    WS/xhttp transport is dead (RKN kills the CF leg) — do not pass True.
     ``label`` lets the caller pin a name (e.g. for a retry); default is a
     fresh random hex label — less fingerprintable than node names.
     """
@@ -128,13 +133,18 @@ def create_node_record(
             "type": "A",
             "name": fqdn,
             "content": node_ip,
-            "proxied": True,
-            "ttl": 1,  # 1 = auto; ignored when proxied
-            "comment": "vless-cdn-front (managed by backend)",
+            "proxied": proxied,
+            # proxied=True → CF ignores ttl (forces "auto"=1). DNS-only honors
+            # it: keep low so a recycled label can't serve a stale IP.
+            "ttl": 1 if proxied else 120,
+            "comment": "vless-node-front (managed by backend)",
         },
     )
     record_id = body["result"]["id"]
-    logger.info("cf_dns: created proxied A %s → %s (id=%s)", fqdn, node_ip, record_id)
+    logger.info(
+        "cf_dns: created %s A %s → %s (id=%s)",
+        "proxied" if proxied else "dns-only", fqdn, node_ip, record_id,
+    )
     return {"subdomain": fqdn, "record_id": record_id, "front_domain": domain}
 
 

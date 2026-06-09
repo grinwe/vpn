@@ -1,13 +1,15 @@
 ---
 # install_vless_ws_cdn
 #
-# Installs the CF-fronted VLESS+WebSocket stack:
-#   client (WSS → <cf_subdomain>.wgse.info) → Cloudflare Full(strict)
-#   → nginx :443 (Origin CA cert, routed by SNI) → xray-ws (loopback, WS).
-# Origin IP hidden behind CF; coexists with reality (:9443) + xhttp (nginx
-# :443, different SNI). The *.wgse.info Origin CA cert arrives base64 via
-# extra_vars (vless_ws_cdn_origin_cert_b64). No-op unless
-# ``vless_ws_cdn_domain`` is set (the backend's CF DNS hook sets it).
+# Installs the DIRECT (no-CF) VLESS+WebSocket stack:
+#   client (WSS → <rand>.wgse.info, DNS-only A → THIS node)
+#   → nginx :443 (Let's Encrypt cert, routed by SNI) → xray-ws (loopback, WS).
+# Coexists with reality (:9443) + xhttp (nginx :443, different SNI). The node
+# obtains its OWN Let's Encrypt cert per random subdomain (HTTP-01 webroot,
+# same proven path as install_vless_xhttp); CF is DNS-only — proxying WS is
+# dead (RKN kills the CF leg; see project_cf_ws_cdn_dead). No-op unless
+# ``vless_ws_cdn_domain`` is set (the backend's DNS hook sets it to the
+# minted subdomain).
 
 - name: Stop xray-ws-cdn when VLESS WS+CDN is removed
   systemd:
@@ -50,13 +52,10 @@
       - vless_ws_cdn_domain is defined and vless_ws_cdn_domain | length > 0
       - vless_ws_cdn_port is defined
       - vless_ws_cdn_path is defined and vless_ws_cdn_path | length > 0
-      - vless_ws_cdn_origin_cert_b64 is defined and vless_ws_cdn_origin_cert_b64 | length > 0
-      - vless_ws_cdn_origin_key_b64 is defined and vless_ws_cdn_origin_key_b64 | length > 0
-      - (vless_ws_cdn_origin_cert_b64 | b64decode).startswith('-----BEGIN CERTIFICATE')
     fail_msg: >-
-      install_vless_ws_cdn requires vless_ws_cdn_domain/port/path AND the
-      *.wgse.info Origin CA cert (vless_ws_cdn_origin_cert_b64 + _key_b64 —
-      set WSCDN_ORIGIN_CERT_B64/KEY_B64 in the backend env via vault).
+      install_vless_ws_cdn requires vless_ws_cdn_domain/port/path. The node
+      serves TLS directly via Let's Encrypt (HTTP-01) for the minted
+      subdomain — no Origin CA needed (CF is DNS-only).
 
 - name: Ensure dependencies (incl. nginx WS front)
   apt:
@@ -204,33 +203,94 @@
     daemon_reload: yes
   when: _xray_ws_cdn_active.stdout != 'active'
 
-# ── CF-fronted nginx :443 front (Origin CA cert) → xray-ws loopback ─────
-- name: Ensure nginx ssl directory
+# ── Direct TLS via Let's Encrypt (HTTP-01 webroot) → xray-ws loopback ───
+# No CF Origin CA anymore: the DNS-only subdomain points straight at this
+# node, so nginx terminates TLS with its OWN LE cert. Mirrors the proven
+# install_vless_xhttp certbot path. :80 is opened by bootstrap_node.
+- name: Install certbot (ws-cdn LE)
+  apt:
+    name: [certbot]
+    state: present
+
+- name: Ensure ACME webroot (shared with xhttp on combo nodes)
   file:
-    path: /etc/nginx/ssl
+    path: /var/www/acme-challenge
     state: directory
     owner: root
     group: root
-    mode: '0750'
+    mode: '0755'
 
-- name: Install wgse Origin CA certificate
-  copy:
-    content: "{{ vless_ws_cdn_origin_cert_b64 | b64decode }}"
-    dest: /etc/nginx/ssl/wgse-origin.crt
+- name: Check for existing Let's Encrypt certificate (ws-cdn)
+  stat:
+    path: /etc/letsencrypt/live/{{ vless_ws_cdn_domain }}/fullchain.pem
+  register: _ws_cdn_le_cert
+
+# Первичная выдача: рендерим минимальный :80 acme-vhost, через который
+# certbot --webroot кладёт токен. Полноценный TLS-vhost ниже требует уже
+# существующий серт → двухфазный bootstrap неизбежен. На повторных
+# (идемпотентных) прогонах блок скипается (_ws_cdn_le_cert.stat.exists).
+- name: Render pre-cert ws-cdn vhost (HTTP-only acme-challenge)
+  template:
+    src: wscdn-nginx-precert.conf.j2
+    dest: /etc/nginx/sites-available/wscdn-{{ vless_ws_cdn_domain }}.conf
     owner: root
     group: root
     mode: '0644'
-  notify: reload nginx ws cdn
+  when: not _ws_cdn_le_cert.stat.exists
 
-- name: Install wgse Origin CA private key
+- name: Enable pre-cert ws-cdn vhost
+  file:
+    src: /etc/nginx/sites-available/wscdn-{{ vless_ws_cdn_domain }}.conf
+    dest: /etc/nginx/sites-enabled/wscdn-{{ vless_ws_cdn_domain }}.conf
+    state: link
+  when: not _ws_cdn_le_cert.stat.exists
+
+- name: Ensure nginx is up for pre-cert issuance (ws-cdn)
+  systemd:
+    name: nginx
+    state: started
+    enabled: yes
+  when: not _ws_cdn_le_cert.stat.exists
+
+- name: Reload nginx to pick up pre-cert ws-cdn vhost
+  systemd:
+    name: nginx
+    state: reloaded
+  when: not _ws_cdn_le_cert.stat.exists
+
+- name: Issue ws-cdn certificate via webroot challenge
+  command: >-
+    certbot certonly --webroot
+    -w /var/www/acme-challenge
+    --non-interactive --agree-tos
+    --email {{ vless_ws_cdn_acme_email | default('admin@' + vless_ws_cdn_domain) }}
+    -d {{ vless_ws_cdn_domain }}
+  args:
+    creates: /etc/letsencrypt/live/{{ vless_ws_cdn_domain }}/fullchain.pem
+
+- name: Set ws-cdn cert paths from certbot
+  set_fact:
+    _ws_cdn_cert_path: /etc/letsencrypt/live/{{ vless_ws_cdn_domain }}/fullchain.pem
+    _ws_cdn_key_path: /etc/letsencrypt/live/{{ vless_ws_cdn_domain }}/privkey.pem
+
+# Renewal: certbot.timer дёргает deploy-hook → reload nginx (+ restart
+# xray-ws-cdn на случай ручного отката на direct-TLS). Без hook'а свежий
+# fullchain.pem окажется на диске, но nginx продолжит отдавать старый
+# (in-memory) → через 90 дней клиенты ловят CERT_DATE_INVALID.
+- name: Install certbot deploy-hook for ws-cdn (nginx + xray reload)
   copy:
-    content: "{{ vless_ws_cdn_origin_key_b64 | b64decode }}"
-    dest: /etc/nginx/ssl/wgse-origin.key
+    src: wscdn-cert-reload.sh
+    dest: /etc/letsencrypt/renewal-hooks/deploy/wscdn-reload.sh
     owner: root
     group: root
-    mode: '0600'
-  no_log: true
-  notify: reload nginx ws cdn
+    mode: '0755'
+
+- name: Enable certbot renewal timer (ws-cdn)
+  systemd:
+    name: certbot.timer
+    state: started
+    enabled: yes
+  failed_when: false
 
 - name: Remove default nginx site
   file:

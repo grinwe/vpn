@@ -73,23 +73,16 @@ deploy_app_stack_admin_base_path: "{{ vault_admin_secret_path | default('admin')
 deploy_app_stack_webapp_base_url: "https://{{ deploy_web_frontend_domain | default('grinwer.online') }}/app"
 deploy_app_stack_webapp_jwt_ttl_seconds: 1800
 
-# ── WS+CDN (Cloudflare-fronted ws-cdn) ────────────────────────────────
-# Reuses the existing DNS-edit token (vault_cloudflare_api_token, now
-# scoped to the wgse.info zone too). The *.wgse.info Origin CA cert/key
-# are base64'd here for env transit; the ws_cdn role b64decodes them
-# onto nginx. Leave the vault vars empty to keep ws-cdn disabled.
+# ── WS+CDN / xhttp DNS front (Cloudflare DNS-only, no proxy) ───────────
+# CF is used ONLY as a DNS host: the backend mints a random DNS-only
+# (grey-cloud) A-record <rand>.wgse.info → node IP; the node serves TLS
+# itself via Let's Encrypt. CF-proxying ws/xhttp is dead (RKN; see
+# project_cf_ws_cdn_dead) — the Origin-CA vars are gone, no CF cert anymore.
+# Leave vault_cloudflare_api_token empty to disable DNS fronting. NB: the
+# token must still cover grwr.ink until the old CF-proxied xhttp records
+# are torn down (teardown resolves the zone from the stored cf_front_domain).
 deploy_app_stack_cloudflare_dns_token: "{{ vault_cloudflare_api_token | default('') }}"
 deploy_app_stack_wscdn_front_domain: "{{ vault_wscdn_front_domain | default('wgse.info') }}"
-# Отдельная front-зона для xhttp (xhttp→grwr.ink). Пусто → бэкенд
-# фолбэчится на ws-cdn зону (single-zone, как раньше). Токен
-# CLOUDFLARE_DNS_TOKEN должен иметь Zone.DNS:Edit на ОБЕ зоны.
-deploy_app_stack_xhttp_front_domain: "{{ vault_xhttp_front_domain | default('') }}"
-deploy_app_stack_wscdn_origin_cert_b64: "{{ (vault_wgse_origin_cert | default('')) | b64encode }}"
-deploy_app_stack_wscdn_origin_key_b64: "{{ (vault_wgse_origin_key | default('')) | b64encode }}"
-# xhttp Origin CA cert — отдельная зона/домен от ws-cdn (xhttp→grwr.ink).
-# Пусто → бэкенд фолбэчится на wscdn-cert (общий *.wgse.info), как раньше.
-deploy_app_stack_xhttp_origin_cert_b64: "{{ (vault_grwr_origin_cert | default('')) | b64encode }}"
-deploy_app_stack_xhttp_origin_key_b64: "{{ (vault_grwr_origin_key | default('')) | b64encode }}"
 
 # ── Provisioning reconciler (desired-state convergence) ────────────────
 # Master-тумблер + тунаблы reconcile-модели. Безопасный role-дефолт OFF;

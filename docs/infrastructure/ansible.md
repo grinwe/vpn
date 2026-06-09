@@ -33,7 +33,7 @@ infra/ansible/
     ├── bootstrap_node            ← pre-install: user, ufw (+ rate-limit 22/tcp), sshd-hardening, fail2ban, unattended-upgrades, apt
     ├── install_shadowtls_stack   ← ShadowTLS v3 + shadowsocks-rust
     ├── install_vless_reality     ← xray + VLESS Reality (xtls-rprx-vision)
-    ├── install_vless_ws_cdn      ← xray + VLESS/WS за Cloudflare
+    ├── install_vless_ws_cdn      ← xray + VLESS/WS, прямой TLS (LE), DNS-only (без CF-прокси)
     ├── install_vless_xhttp       ← xray + VLESS/xHTTP
     ├── install_hysteria2         ← hysteria2 (UDP)
     ├── install_probe_agent       ← опциональный node-to-node health probe

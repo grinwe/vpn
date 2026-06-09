@@ -1,12 +1,14 @@
 # {{ ansible_managed }}
 #
-# CF-fronted WS+CDN front.
-#   Clients → CF edge (WSS, SNI {{ vless_ws_cdn_domain }})
-#           → CF Full(strict) → this nginx :443 (Origin CA cert)
+# DIRECT (no-CF) WS front.
+#   Clients → :{{ vless_ws_cdn_port | default(443) }} (nginx, TLS termination,
+#             SNI {{ vless_ws_cdn_domain }}, Let's Encrypt cert)
 #           → xray-ws @ 127.0.0.1:{{ vless_ws_cdn_loopback_port | default(10444) }}
 #
-# Origin IP is hidden behind CF; the user↔CF leg rides shared CF edge IPs
-# (un-blockable by RKN subnet-flagging — survives where Reality dies).
+# DNS-only A-record points the random subdomain straight at THIS node — no CF
+# proxy (RKN kills the CF leg; see project_cf_ws_cdn_dead). nginx terminates
+# TLS with its own LE cert (renewed via certbot deploy-hook →
+# /etc/letsencrypt/renewal-hooks/deploy/wscdn-reload.sh).
 #
 # Own $ws_cdn_connection_upgrade map var so this coexists with the xhttp
 # vhost on the same :443 — a duplicate map OUTPUT variable (both naming
@@ -19,17 +21,37 @@ map $http_upgrade $ws_cdn_connection_upgrade {
 }
 
 server {
-    # Порт = client-URI port (cfg.port, дефолт 443 = CF edge). origin
-    # слушает ровно его, чтобы CF Full(strict) тянул на совпадающий порт.
-    listen {{ vless_ws_cdn_port | default(443) }} ssl http2;
-    listen [::]:{{ vless_ws_cdn_port | default(443) }} ssl http2;
+    listen 80;
+    listen [::]:80;
     server_name {{ vless_ws_cdn_domain }};
 
-    ssl_certificate     /etc/nginx/ssl/wgse-origin.crt;
-    ssl_certificate_key /etc/nginx/ssl/wgse-origin.key;
+    # Webroot для ACME — certbot renewal пользуется тем же каталогом, что и
+    # первичный issuance (без этого location авто-renew ломается).
+    location /.well-known/acme-challenge/ {
+        root /var/www/acme-challenge;
+    }
 
-    # Same TLS profile as the xhttp/web fronts so JA3/JA4 don't diverge
-    # across our domains.
+    location / {
+        return 301 https://$host$request_uri;
+    }
+}
+
+server {
+    # Порт = client-URI port (cfg.port, дефолт 443). origin слушает ровно
+    # его — клиент идёт на субдомен:порт НАПРЯМУЮ (DNS-only, без CF).
+    # NB: БЕЗ http2. WS — это HTTP/1.1 Upgrade, h2 туннелю не нужен, а
+    # лишний h2-ALPN на origin'е — повод для RKN-DPI (h2 на CF-плече и убивал
+    # ws; см. project_cf_ws_cdn_dead). xhttp свой http2 оставляет — там
+    # stream-up может требовать h2 end-to-end.
+    listen {{ vless_ws_cdn_port | default(443) }} ssl;
+    listen [::]:{{ vless_ws_cdn_port | default(443) }} ssl;
+    server_name {{ vless_ws_cdn_domain }};
+
+    ssl_certificate     {{ _ws_cdn_cert_path }};
+    ssl_certificate_key {{ _ws_cdn_key_path }};
+
+    # Mozilla intermediate profile — тот же набор, что и на xhttp/web фронтах,
+    # чтобы JA3/JA4 наших доменов не расходились.
     ssl_protocols TLSv1.2 TLSv1.3;
     ssl_prefer_server_ciphers off;
     ssl_ciphers ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305:DHE-RSA-AES128-GCM-SHA256:DHE-RSA-AES256-GCM-SHA384;
@@ -55,8 +77,7 @@ server {
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto $scheme;
         proxy_buffering off;
-        # Длинные таймауты: WS-туннель долгоживущий, а xray держит его
-        # heartbeat-пингами. 300s рвало idle-сессии раньше CF-таймаута.
+        # Длинные таймауты: WS-туннель долгоживущий, xray держит heartbeat.
         proxy_read_timeout 3600s;
         proxy_send_timeout 3600s;
         proxy_hide_header Server;

@@ -1,7 +1,6 @@
 """Provisioning orchestration and helpers."""
 from __future__ import annotations
 
-import base64
 import ipaddress
 import json
 import logging
@@ -503,14 +502,10 @@ def _collect_site_extra_vars(
                     "loopback_port", _WS_CDN_LOOPBACK_PORT
                 ),
             })
-            # Origin CA cert (*.wgse.info) for the nginx WS front — shared
-            # secret, passed base64 (single-line → passes the newline check
-            # in _validate_extra_vars). Only when both are set in backend env.
-            _cert_b64 = os.getenv("WSCDN_ORIGIN_CERT_B64", "")
-            _key_b64 = os.getenv("WSCDN_ORIGIN_KEY_B64", "")
-            if _cert_b64 and _key_b64:
-                extra["vless_ws_cdn_origin_cert_b64"] = _cert_b64
-                extra["vless_ws_cdn_origin_key_b64"] = _key_b64
+            # No Origin CA: ws-cdn is served DIRECTLY (DNS-only, no CF proxy),
+            # so the node obtains its own Let's Encrypt cert for the minted
+            # *.wgse subdomain (role's certbot path runs when no cert given).
+            # CF-proxying WS is dead — RKN kills the CF leg.
             health_ports.append(cfg.port)
 
         # ── VLESS+XHTTP (direct+LE, or CF-fronted like ws-cdn) ──
@@ -521,37 +516,13 @@ def _collect_site_extra_vars(
                 "vless_xhttp_path": settings.get("xhttp_path", "/xh"),
                 "vless_xhttp_mode": settings.get("xhttp_mode", "auto"),
             })
-            # CF-fronted xhttp (auto mode — settings.cf_subdomain set by the
-            # DNS hook): pick the Origin CA cert that MATCHES this config's
-            # front zone. xhttp can live on its own zone (grwr.ink) while
-            # legacy/ws configs stay on wgse.info — serving the wrong cert for
-            # the SNI fails CF Full(strict). Dedicated cert_path → no clobber
-            # with the ws-cdn cert on a combo node → role's "cert_path provided
-            # → skip certbot" logic kicks in (no per-domain LE / HTTP-01).
-            # Direct xhttp (explicit sni) keeps its LE/cert paths.
-            if settings.get("cf_subdomain"):
-                _xhttp_front = os.getenv("XHTTP_FRONT_DOMAIN", "").strip().rstrip(".")
-                _cf_front = (settings.get("cf_front_domain") or "").strip().rstrip(".")
-                # On the dedicated xhttp zone? (explicit cf_front_domain, or —
-                # for configs minted before that field existed — sni suffix.)
-                _on_xhttp_zone = bool(_xhttp_front) and (
-                    _cf_front == _xhttp_front
-                    or (not _cf_front and str(cfg.sni or "").endswith("." + _xhttp_front))
-                )
-                if _on_xhttp_zone:
-                    _cert_b64 = os.getenv("XHTTP_ORIGIN_CERT_B64", "") or os.getenv("WSCDN_ORIGIN_CERT_B64", "")
-                    _key_b64 = os.getenv("XHTTP_ORIGIN_KEY_B64", "") or os.getenv("WSCDN_ORIGIN_KEY_B64", "")
-                else:
-                    _cert_b64 = os.getenv("WSCDN_ORIGIN_CERT_B64", "")
-                    _key_b64 = os.getenv("WSCDN_ORIGIN_KEY_B64", "")
-                if _cert_b64 and _key_b64:
-                    extra["vless_xhttp_origin_cert_b64"] = _cert_b64
-                    extra["vless_xhttp_origin_key_b64"] = _key_b64
-                    extra["vless_xhttp_cert_path"] = "/etc/nginx/ssl/xhttp-origin.crt"
-                    extra["vless_xhttp_key_path"] = "/etc/nginx/ssl/xhttp-origin.key"
-            else:
-                extra["vless_xhttp_cert_path"] = settings.get("cert_path", "")
-                extra["vless_xhttp_key_path"] = settings.get("key_path", "")
+            # No Origin CA: every xhttp front (auto DNS-only on *.wgse OR an
+            # explicit direct sni) is served DIRECTLY. Pass through pre-set
+            # cert paths (legacy direct configs); else empty → the role's
+            # certbot/LE path issues a cert for the subdomain. CF-proxying is
+            # dead; the grwr.ink Origin-CA split is retired.
+            extra["vless_xhttp_cert_path"] = settings.get("cert_path", "")
+            extra["vless_xhttp_key_path"] = settings.get("key_path", "")
             health_ports.append(cfg.port)
 
         # ── Hysteria2 ──

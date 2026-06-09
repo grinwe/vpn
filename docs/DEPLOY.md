@@ -118,7 +118,7 @@ ansible-playbook -i inventories/prod/hosts.yml site.yml --tags web
 ### Pre-flight на ноде
 
 1. Чистая Ubuntu 22.04/24.04, root SSH, **публичный ключ из `/opt/vpn/secrets/provisioning_key.pub` уже в `/root/.ssh/authorized_keys`**.
-2. DNS для этой ноды (например `n1.grinwer.online`) указывает A-записью на IP. **Для VPN-нод это должно быть DNS-only (серое облачко в Cloudflare), не Proxied.** Cloudflare проксирует только HTTP(S), а ShadowTLS/VLESS Reality/Hysteria2 он либо заблокирует, либо MITM'нет TLS. Единственное исключение — протокол **VLESS+WS+CDN**, который специально живёт через CF proxy; но и тогда на этой ноде должен быть отдельный DNS-ресурс в Proxied режиме, а SSH/основной хост — DNS-only.
+2. DNS для этой ноды (например `n1.grinwer.online`) указывает A-записью на IP. **Для VPN-нод это должно быть DNS-only (серое облачко в Cloudflare), не Proxied.** Cloudflare проксирует только HTTP(S), а ShadowTLS/VLESS Reality/Hysteria2 он либо заблокирует, либо MITM'нет TLS. **Это касается и `vless-ws-cdn`/`vless-xhttp`:** CF-проксирование для них мёртвое (RKN режет CF-плечо на 4G — см. `operations/cdn_front_nodata_investigation.md` и память `project_cf_ws_cdn_dead`). Теперь они тоже **DNS-only** — backend сам минтит случайную DNS-only запись `<rand>.wgse.info` → IP ноды, а нода терминирует TLS своим Let's Encrypt сертом. CF используется ТОЛЬКО как DNS-хостинг.
 3. Порты, которые нужно открыть на файрволле провайдера: `22` (SSH), `443`, `8443`, `9443` (см. [group_vars/vpn_nodes.yml](../infra/ansible/group_vars/vpn_nodes.yml) `firewall_allowed_ports`). Роль `bootstrap_node` также ставит ufw на самой ноде.
 
 ### Регистрация ноды
@@ -139,7 +139,7 @@ ansible-playbook -i inventories/prod/hosts.yml site.yml --tags web
 
 - **vless-reality** — основной протокол, порт `9443`, SNI `www.asus.com` (по дефолту). Ключи генерятся бэкендом автоматически, если оставить `public_key` пустым. Per-user isolation + sharing enforcer.
 - **vless-xhttp** — основной TCP-протокол, обход 16KB curtain ТСПУ.
-- **vless-ws-cdn** — порт `443`, требует отдельного Cloudflare-сетапа (см. ниже). Подходит для случаев, когда DPI режет всё остальное.
+- **vless-ws-cdn** — порт `443`, прямой WS+TLS на случайный `*.wgse.info` сабдомен (DNS-only, LE-серт, БЕЗ CF-прокси — backend создаёт DNS-запись на провиженинге сам). Подходит, когда DPI режет Reality.
 - **hysteria2** — UDP/QUIC, порт `8443`. На мобильных бывает нестабилен.
 - **shadowtls+shadowsocks** — legacy-протокол, порт `8443`. Нет per-user isolation (общий пароль на ноду), sharing enforcer не покрывает.
 
@@ -147,17 +147,16 @@ ansible-playbook -i inventories/prod/hosts.yml site.yml --tags web
 
 После добавления конфига warm-pool инвалидируется для этой ноды, и warmer'у нужно несколько тиков, чтобы пересобрать предсгенерированные credential-бандлы под новый набор протоколов ([см. warm pool](../README.md#key-features)).
 
-## 7. Cloudflare setup для VLESS+WS+CDN (опционально)
+## 7. Cloudflare setup для VLESS+WS+CDN / XHTTP (DNS-only)
 
-Только если хочешь поднять `vless-ws-cdn` конфиг — т.е. трафик через CF-прокси:
+⚠️ **CF-проксирование (orange cloud) для ws-cdn/xhttp — МЁРТВОЕ** (RKN режет CF-плечо на 4G; см. `operations/cdn_front_nodata_investigation.md`, память `project_cf_ws_cdn_dead`). Раньше тут был CF-proxy + Origin CA — **больше нет**. Теперь ws-cdn и xhttp раздаются **напрямую**, CF — только DNS.
 
-1. Добавь домен в Cloudflare (если ещё нет).
-2. Создай отдельную A-запись для этой ноды (например `cdn-n1.grinwer.online`) → IP ноды, **Proxied (оранжевое облачко)**.
-3. SSL/TLS → **Full (Strict)**.
-4. Сгенерируй Origin certificate в Cloudflare (Origin Server → Create Certificate) и установи на ноду — роль `install_vless_ws_cdn` умеет это, если прокинуть сертификат через vault.
-5. Network → WebSockets → **Enabled**.
+Сетап минимальный (один раз на зону, не на ноду):
 
-**Важно:** основной SSH/admin-хост ноды (`n1.grinwer.online`) всё равно должен быть DNS-only. Proxied режим — только для отдельной CDN-записи.
+1. Зона `wgse.info` добавлена в Cloudflare и активна (NS делегированы).
+2. API-токен `vault_cloudflare_api_token` с `Zone.DNS:Edit` на `wgse.info` (прокинут в backend как `CLOUDFLARE_DNS_TOKEN`). Держи доступ и к `grwr.ink`, пока не снесены старые CF-ноды (teardown резолвит зону по сохранённому `cf_front_domain`).
+
+Дальше — **всё автоматически**: при создании `vless-ws-cdn`/`vless-xhttp` конфига backend минтит случайную **DNS-only** запись `<rand>.wgse.info` → IP ноды, а роль на ноде сама выпускает Let's Encrypt серт (HTTP-01, `:80` уже открыт `bootstrap_node`). Никаких Proxied-записей, Origin CA, Full(strict) — больше не нужно.
 
 ## 8. Auto-renewal и balance billing
 

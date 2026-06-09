@@ -93,26 +93,28 @@ def _ws_cdn_resolve_ip(host: str) -> str:
 def _provision_cf_subdomain(
     db: Session, node: models.VPNNode, config: models.VPNConfig
 ) -> None:
-    """Mint a CF-proxied subdomain → node IP and pin it onto a CF-fronted
-    config (``sni`` + ``settings.cf_record_id/cf_subdomain``).
+    """Mint a **DNS-only** subdomain → node IP and pin it onto the config
+    (``sni`` + ``settings.cf_record_id/cf_subdomain``).
 
-    Applies to: ws-cdn (always — its sni is always the CF subdomain) and
-    xhttp when the operator left ``sni`` empty (auto CF-fronted mode; a
-    non-empty sni = classic direct+LE xhttp, left untouched). Clients then
-    hit the CF edge, CF proxies to the node origin (origin IP hidden,
-    user↔CF leg on un-blockable shared CF edge). Fails loud (HTTPException)
-    if CF isn't configured or the API errors.
+    Applies to: ws-cdn (always — its sni is always the minted subdomain) and
+    xhttp when the operator left ``sni`` empty (auto-front mode; a non-empty
+    sni = classic direct+LE xhttp, left untouched). The record is grey-cloud
+    (proxied=False) → resolves straight to the node, which serves TLS itself
+    (LE per subdomain). CF is DNS only — proxying WS/xhttp is dead (RKN; see
+    project_cf_ws_cdn_dead). Fails loud (HTTPException) if CF isn't configured
+    or the API errors.
     """
     from ..services import cloudflare_dns
 
     proto = config.protocol
     if proto == models.VPNConfigProtocol.vless_ws_cdn:
-        # ws-cdn sni is always the CF subdomain — default front zone.
+        # ws-cdn sni is always the minted subdomain.
         domain = cloudflare_dns.front_domain()
     elif proto == models.VPNConfigProtocol.vless_xhttp and not config.sni:
-        # empty sni → auto CF-fronted xhttp — its OWN front zone (grwr.ink),
-        # falls back to the ws-cdn front when not split.
-        domain = cloudflare_dns.xhttp_front_domain()
+        # empty sni → auto-front xhttp. Single zone now (wgse.info): xhttp
+        # shares the ws-cdn front; grwr.ink is retired (DNS-only removed the
+        # cert-clobber that forced the per-protocol zone split).
+        domain = cloudflare_dns.front_domain()
     else:
         return  # other protocols, or xhttp with an explicit (direct) domain
 
@@ -120,13 +122,14 @@ def _provision_cf_subdomain(
         raise HTTPException(
             status_code=400,
             detail=(
-                "CF front requires CLOUDFLARE_DNS_TOKEN + a front domain "
-                "(WSCDN_FRONT_DOMAIN / XHTTP_FRONT_DOMAIN) on the backend"
+                "DNS front requires CLOUDFLARE_DNS_TOKEN + WSCDN_FRONT_DOMAIN "
+                "on the backend"
             ),
         )
     try:
         ip = _ws_cdn_resolve_ip(node.host)
-        rec = cloudflare_dns.create_node_record(ip, domain=domain)
+        # proxied=False → DNS-only A → node IP directly; node serves TLS (LE).
+        rec = cloudflare_dns.create_node_record(ip, domain=domain, proxied=False)
     except cloudflare_dns.CloudflareError as exc:
         raise HTTPException(
             status_code=502, detail=f"Cloudflare DNS failed: {exc}"
@@ -999,7 +1002,7 @@ def update_config(
             config.sni = None
             config.settings = _s
             db.flush()
-            _provision_cf_subdomain(db, config.node, config)  # sni ← xhttp_front_domain() (grwr.ink, fallback wgse)
+            _provision_cf_subdomain(db, config.node, config)  # sni ← DNS-only *.wgse subdomain (node serves LE)
             changed.append("sni")
         payload.sni = None  # обработали (или игнор для non-xhttp) — не применять ниже
 
