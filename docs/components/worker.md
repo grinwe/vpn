@@ -76,6 +76,29 @@ schedule_tick(
 
 Затем `worker.work(with_scheduler=True)` — блокирующий вызов, запускает worker main loop + scheduler loop для отложенных задач.
 
+#### Stale scheduler-lock после деплоя (фикс 2026-06-09)
+
+`with_scheduler=True` форкает `RQScheduler`, который захватывает лок
+`SET rq:scheduler-lock:<queue> <pid> NX EX (interval+60)` и стартует
+**только если лок захвачен**. Граница: `acquire_locks` зовётся на старте
+**один раз**; reacquire-петля живёт *внутри* форкнутого scheduler-процесса,
+так что при незахвате ретрая нет.
+
+Деплой (`docker compose up -d` recreate) убивает старый worker-scheduler
+SIGKILL'ом после `stop_grace` → graceful `stop()→release_locks()` не
+вызывается → лок мёртвого инстанса висит ~`interval+60`с. Свежий контейнер
+на старте упирается в `NX` → scheduler не форкается → **все тики стоят**,
+пока следующий рестарт случайно не попадёт в окно после истечения TTL
+(наблюдали ~9 мин полного простоя периодики; симптом — `rq` показывает
+N jobs в `scheduled`, очередь пустая, `Job OK` в логах нет).
+
+Фикс (`worker.py`, перед `work()`): т.к. `worker-scheduler` это
+`replicas: 1` и recreate последовательный (стоп старого → старт нового),
+легитимного держателя лока в момент старта нет — поэтому чистим
+`RQScheduler.get_locking_key(q.name)` в Redis до `work()`, гарантируя
+чистый `acquire`. Это убирает костыль «передёрнуть worker-scheduler руками
+после деплоя».
+
 ### Паттерн «самопланирования» — как это работает и где ломается
 
 Каждая тика в конце своего тела делает примерно так:

@@ -2380,6 +2380,35 @@ def main() -> None:
         [q.name for q in queues_to_listen],
         with_scheduler,
     )
+    if with_scheduler:
+        # ── Fix: "RQ-scheduler залипает после деплоя" ──
+        # RQScheduler.acquire_locks() (rq/scheduler.py) делает
+        #   SET rq:scheduler-lock:<queue> <pid> NX EX (interval+60)
+        # и форкает scheduler ТОЛЬКО если захватил хоть один лок
+        # (auto_start: `if self._acquired_locks and auto_start: self.start()`).
+        # При деплое `docker compose up -d` пересоздаёт контейнер — старый
+        # worker-scheduler получает SIGKILL после stop_grace и НЕ доходит до
+        # graceful stop()→release_locks(), поэтому его лок остаётся висеть
+        # (TTL ~interval+60). Свежий контейнер на старте делает acquire_locks
+        # ОДИН раз → NX фейлится (лок мёртвого инстанса жив) → scheduler не
+        # форкается, а reacquire-петля (`work()`: should_reacquire_locks)
+        # крутится только ВНУТРИ форкнутого процесса, которого нет → ретрая
+        # нет. Итог: ВСЕ тики стоят, пока следующий рестарт случайно не
+        # попадёт в окно после истечения TTL (наблюдали ~9 мин простоя).
+        # Очередь наша эксклюзивно (worker-scheduler replicas=1, recreate
+        # последовательный: стоп старого → старт нового), легитимного
+        # держателя в этот момент нет — чистим stale-лок до work().
+        from rq.scheduler import RQScheduler
+
+        for q in queues_to_listen:
+            lock_key = RQScheduler.get_locking_key(q.name)
+            if connection.delete(lock_key):
+                logger.warning(
+                    "Cleared stale RQ scheduler lock %s (предыдущий "
+                    "worker-scheduler умер без release_locks) — иначе тики "
+                    "залипли бы до истечения TTL",
+                    lock_key,
+                )
     worker.work(with_scheduler=with_scheduler)
 
 
