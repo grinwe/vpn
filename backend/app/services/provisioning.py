@@ -246,11 +246,12 @@ def _build_vless_reality_credential(
 def _build_vless_ws_cdn_credential(
     node: models.VPNNode, config: models.VPNConfig, user_id: str
 ) -> str:
-    """Build a VLESS+WebSocket+TLS connection URI routed through Cloudflare CDN.
+    """Build a VLESS+WebSocket+TLS connection URI served DIRECTLY by the node.
 
-    The ``host`` header is set to the CDN domain (from config.sni) so
-    Cloudflare routes the WebSocket to the origin. The actual IP in the
-    URI is the CDN edge — clients never see the real server IP.
+    ``host``/``sni`` are the minted ``*.wgse.info`` subdomain (config.sni),
+    which is a DNS-only record pointing straight at the node — the client
+    connects to the node directly on :443 and the node terminates TLS with
+    its own Let's Encrypt cert. CF-proxying WS is dead (see project_cf_ws_cdn_dead).
     """
     settings = config.settings or {}
     cdn_domain = config.sni or settings.get("cdn_domain", "")
@@ -492,11 +493,11 @@ def _collect_site_extra_vars(
             })
             health_ports.append(cfg.port)
 
-        # ── VLESS+WS+CDN (CF-fronted: nginx :443 → xray-ws loopback) ──
+        # ── VLESS+WS+CDN (DIRECT, no CF: nginx :443 LE → xray-ws loopback) ──
         elif cfg.protocol == models.VPNConfigProtocol.vless_ws_cdn:
             extra.update({
                 "vless_ws_cdn_port": cfg.port,
-                "vless_ws_cdn_domain": cfg.sni or "",  # cf_subdomain (set by DNS hook)
+                "vless_ws_cdn_domain": cfg.sni or "",  # minted *.wgse subdomain (DNS hook)
                 "vless_ws_cdn_path": settings.get("ws_path", "/ws"),
                 "vless_ws_cdn_loopback_port": settings.get(
                     "loopback_port", _WS_CDN_LOOPBACK_PORT
@@ -508,7 +509,7 @@ def _collect_site_extra_vars(
             # CF-proxying WS is dead — RKN kills the CF leg.
             health_ports.append(cfg.port)
 
-        # ── VLESS+XHTTP (direct+LE, or CF-fronted like ws-cdn) ──
+        # ── VLESS+XHTTP (DIRECT+LE: auto *.wgse subdomain or explicit sni) ──
         elif cfg.protocol == models.VPNConfigProtocol.vless_xhttp:
             extra.update({
                 "vless_xhttp_port": cfg.port,

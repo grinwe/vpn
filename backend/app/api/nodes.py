@@ -151,9 +151,10 @@ def _provision_cf_subdomain(
 
 
 def _teardown_cf_subdomain(config: models.VPNConfig) -> None:
-    """Best-effort delete the CF record bound to a CF-fronted config (ws-cdn
-    or auto xhttp) — idempotent. Keyed on cf_record_id, so it's
-    protocol-agnostic: a config without a record is a no-op."""
+    """Best-effort delete the DNS-only CF record bound to a config (ws-cdn or
+    auto xhttp) — idempotent. Keyed on cf_record_id (+ stored cf_front_domain
+    for the zone), so it's protocol-agnostic and still tears down legacy
+    proxied/grwr.ink records: a config without a record is a no-op."""
     settings = config.settings or {}
     record_id = settings.get("cf_record_id")
     if not record_id:
@@ -971,11 +972,11 @@ def update_config(
             ),
         )
 
-    # CF-fronted configs (ws-cdn, and xhttp in auto mode): sni is the
-    # CF-managed subdomain (= settings.cf_subdomain) and port is pinned to
-    # the CF edge (443). A manual edit would desync from the live CF
-    # A-record / nginx server_name and break the chain silently — neutralize
-    # those two fields. Direct xhttp (no cf_subdomain) stays editable.
+    # Auto-front configs (ws-cdn, and xhttp in auto mode): sni is the minted
+    # DNS-only *.wgse subdomain (= settings.cf_subdomain) and port is pinned
+    # to 443. A manual edit would desync from the live A-record / nginx
+    # server_name / LE cert and break the chain silently — neutralize those
+    # two fields. Direct xhttp (no cf_subdomain) stays editable.
     _cf_fronted = config.protocol == models.VPNConfigProtocol.vless_ws_cdn or (
         config.protocol == models.VPNConfigProtocol.vless_xhttp
         and (config.settings or {}).get("cf_subdomain")
@@ -986,8 +987,8 @@ def update_config(
 
     changed: list[str] = []
 
-    # xhttp: явный пустой sni ("") = «переведи в CF-fronted» — чистим stale
-    # direct-домен/серт и минтим wgse.info-сабдомен (как при create с пустым
+    # xhttp: явный пустой sni ("") = «переведи в auto-front (DNS-only)» —
+    # чистим stale direct-домен/серт и минтим wgse.info-сабдомен (как при create с пустым
     # sni). null = поле не трогали (PATCH-семантика); ТОЛЬКО "" — явный сброс
     # из формы. Для прочих протоколов "" трактуем как «не трогать», чтобы
     # случайно не обнулить, например, reality-SNI.
