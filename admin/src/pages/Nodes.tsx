@@ -1219,6 +1219,7 @@ export default function Nodes() {
                       links={n.exit_links}
                       peerLabel={(l) => `${l.exit_name} · ${l.wg_interface_name}`}
                       peerKey={(l) => `${l.exit_id}-${l.wg_interface_name}`}
+                      activeUsers={n.active_users}
                     />
                   </td>
                   <td>

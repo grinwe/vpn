@@ -132,6 +132,18 @@ def enqueue_task(task_id: int, node_id: int | None) -> str | None:
             existing.delete()
         except NoSuchJobError:
             pass
+        except Exception:  # noqa: BLE001
+            # Битый job-hash (см. schedule_tick — KeyError('created_at') и т.п.)
+            # не должен вешать таску: чистим сырой ключ и enqueue'им свежий job
+            # под тем же job_id.
+            logger.warning(
+                "enqueue_task: corrupted job %s — purging + re-enqueuing",
+                job_id, exc_info=True,
+            )
+            try:
+                queue.connection.delete(f"rq:job:{job_id}")
+            except Exception:  # noqa: BLE001
+                logger.debug("enqueue_task: raw key purge failed", exc_info=True)
 
         job = queue.enqueue(
             "app.worker.run_provisioning_task",
@@ -300,6 +312,22 @@ def schedule_tick(
             existing.delete()
         except NoSuchJobError:
             pass
+        except Exception:  # noqa: BLE001
+            # Битый/частичный job-hash (наблюдали KeyError('created_at'): хэш
+            # потерял поля, но registry на него ещё ссылается) роняет
+            # Job.fetch/get_status/delete. Раньше это всплывало в внешний
+            # handler и тик оставался НЕ запланированным НАВСЕГДА (dead-tick:
+            # node-reachability висел 12ч, recovery нод не детектился, инциденты
+            # на ожившие ноды замерзали). Чистим сырой ключ и проваливаемся в
+            # свежий enqueue — один битый job не должен вечно вешать тик.
+            logger.warning(
+                "schedule_tick: corrupted job %s — purging + re-enqueuing",
+                tick_id, exc_info=True,
+            )
+            try:
+                queue.connection.delete(f"rq:job:{tick_id}")
+            except Exception:  # noqa: BLE001
+                logger.debug("schedule_tick: raw key purge failed", exc_info=True)
 
         # job_timeout нужен чтобы зависшая SSH-сессия в traffic-stats /
         # relay-link-health не держала воркер вечно — RQ kill horse через

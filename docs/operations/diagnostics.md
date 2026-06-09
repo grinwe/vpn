@@ -158,8 +158,9 @@ Worker-образу нужны `iputils-ping` + `traceroute` (см.
 ### 2. Структурный чек-лист для node/exit
 
 Роли `check_node_health` (node: `xray_service`, `ports_listening`,
-`geoip_loaded`) и `check_exit_health` (exit: `wg_interface`, `wg_peers`,
-`ip_forward`) пишут тот же `{diag_result_file}` JSON, что и relay-роль
+`geoip_loaded`) и `check_exit_health` (exit, 8 чеков: `wg_interface`,
+`wg_peers`, `ip_forward`, `wg_listen_port`, `nat_masquerade`,
+`internet_egress`, `dns_resolve`, `conntrack`) пишут тот же `{diag_result_file}` JSON, что и relay-роль
 (под `when: diag_result_file is defined` — обычный `site.yml` не
 затронут). Парсер — `provisioning.py:_parse_diagnose_result_file`.
 Probe-этапы префиксуются. Рендер — тот же `<DiagnoseResult>` в Tasks
@@ -255,4 +256,41 @@ admin-push. Идемпотентно: уже cooled-нода повторно н
   При росте флота — thread-pool. Пока серийно + cap на диагнозы/тик.
 * **Симптом «handshake свежий, но трафик не ходит»** — relay-detector
   ловит только stale-handshake. Exit-side auto-trigger можно добавить
-  когда накопится статистика.
+  когда накопится статистика. *(частично закрыто: `internet_egress`/
+  `nat_masquerade`/`dns_resolve` чеки ниже дают видимость, но авто-триггер
+  по ним ещё не подключён.)*
+
+## Паритет exit-диагностики + idle-туннели + self-heal тиков (2026-06-09)
+
+### Exit-чеки до уровня relay-link (пункт 1)
+`check_exit_health` теперь 8 чеков (было 3) — exit это терминус egress,
+нужна видимость «реально ли уходит трафик». Добавлены:
+`wg_listen_port` (UDP wg-порт слушает), `nat_masquerade` (MASQUERADE/SNAT
+на egress — без него трафик из туннеля не наатится наружу, юзеры без инета),
+`internet_egress` (`curl https://1.1.1.1` с самого exit'а — настоящий
+выход в сеть), `dns_resolve` (DNS с exit'а), `conntrack` (заполнение
+таблицы). Контракт тот же `{name,status,latency_ms,message,details}`,
+рендер — `<DiagnoseResult>`.
+
+### Idle-aware туннели (admin/src/linkHealth.tsx)
+`linkHealth()` красил relay↔exit в красный по stale-handshake. Но WG без
+трафика handshake не делает → **пустая нода (0 active_users) показывала все
+туннели красными, будучи здоровой** (кейс 4vds-ru-kmr: жива, SSH/observed
+свежий, юзеров нет → «горело»). Теперь при `activeUsers === 0`
+stale/нет-handshake = **`idle` (серый)**; красный остаётся только когда
+юзеры ЕСТЬ, а handshake протух (реальный обрыв). `active_users` уже в
+`NodeOut`, прокидывается `Nodes.tsx → HealthDots → linkHealth`. SSH-stale
+(`observed_at` старый) по-прежнему красный — это реальная недоступность
+relay, не idle.
+
+### Self-heal тиков от битого RQ-джоба (queue.py)
+`schedule_tick`/`enqueue_task` ловили только `NoSuchJobError`. Битый
+job-hash (`KeyError('created_at')` — хэш потерял поля, но registry на него
+ссылается) пробивал наружу → тик **не планировался НАВСЕГДА**. Наблюдали:
+`tick-node-reachability` висел 12ч → recovery нод не детектился →
+инциденты на ожившие ноды замерзали (тот же 4vds-ru-kmr: SSH ожил, а
+«probe: unreachable / инцидент» висели намертво). Теперь оба ловят и битый
+job → чистят сырой ключ `rq:job:<id>` → свежий enqueue. Один битый запис
+больше не вешает тик. Расклинить уже-битый прод-джоб: **deploy** (новый код
+вычистит на рестарте воркера) либо вручную `redis del
+rq:job:tick-node-reachability` + рестарт `worker-scheduler`.

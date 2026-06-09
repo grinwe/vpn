@@ -14,7 +14,10 @@ export interface LinkHealthVerdict {
   title: string;
 }
 
-export function linkHealth(l: LinkHealthInput): LinkHealthVerdict {
+export function linkHealth(
+  l: LinkHealthInput,
+  activeUsers?: number,
+): LinkHealthVerdict {
   // Светофор для relay↔exit туннеля. Цвет считаем от возраста
   // последнего handshake'а (WG keepalive = 25s, значит healthy peer
   // handshook в последние 3 минуты). SSH-фейл (observed_at stale)
@@ -37,6 +40,17 @@ export function linkHealth(l: LinkHealthInput): LinkHealthVerdict {
     };
   }
   if (!l.last_handshake_at) {
+    // Idle: на ноде 0 юзеров → нет трафика → WG не делает handshake.
+    // Это простой, а не обрыв — не красим в красный (см. node 4vds-ru-kmr:
+    // нода жива, SSH/observed свежий, но юзеров нет → туннели «горели»).
+    if (activeUsers === 0) {
+      return {
+        color: "bg-slate-500",
+        label: "idle",
+        title:
+          "0 юзеров на ноде — WG без трафика не делает handshake; туннель простаивает, не порван",
+      };
+    }
     return {
       color: "bg-red-500",
       label: "no hs",
@@ -58,6 +72,15 @@ export function linkHealth(l: LinkHealthInput): LinkHealthVerdict {
       title: `Последний handshake ${Math.round(handshakeAgeMin)} минут назад — туннель простаивает`,
     };
   }
+  // Stale handshake, НО 0 юзеров → idle, не обрыв. Красный оставляем
+  // только когда юзеры есть, а handshake протух (вот это реальная поломка).
+  if (activeUsers === 0) {
+    return {
+      color: "bg-slate-500",
+      label: `idle ${Math.round(handshakeAgeMin)}m`,
+      title: `handshake ${Math.round(handshakeAgeMin)} мин назад, но 0 юзеров на ноде — туннель простаивает (нет трафика → нет keepalive), не порван`,
+    };
+  }
   return {
     color: "bg-red-500",
     label: `${Math.round(handshakeAgeMin)}m`,
@@ -71,12 +94,17 @@ interface HealthDotsProps<L extends LinkHealthInput> {
   // на Nodes — "exit-foreign-01 · wg0". Ключ — стабильный id для React.
   peerLabel: (l: L) => string;
   peerKey: (l: L) => string | number;
+  // Активные юзеры на relay-ноде. 0 → stale/нет-handshake трактуем как
+  // idle (серый), а не обрыв (красный). Не передан (Exits) → старое
+  // поведение. Передаётся из Nodes.tsx (n.active_users).
+  activeUsers?: number;
 }
 
 export function HealthDots<L extends LinkHealthInput>({
   links,
   peerLabel,
   peerKey,
+  activeUsers,
 }: HealthDotsProps<L>) {
   // Ряд цветных точек — по одной на relay↔exit линк. Пустой массив →
   // серый дефис (линков нет).
@@ -86,7 +114,7 @@ export function HealthDots<L extends LinkHealthInput>({
   return (
     <div className="flex gap-1 items-center">
       {links.map((l) => {
-        const h = linkHealth(l);
+        const h = linkHealth(l, activeUsers);
         return (
           <span
             key={peerKey(l)}
