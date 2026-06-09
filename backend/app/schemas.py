@@ -257,6 +257,12 @@ class VPNNodeOut(VPNNodeCreate):
     # stats. Без клика по diagnose. Дефолт None (``list_nodes`` bulk-load,
     # остальные call-сайты VPNNodeOut его не проставляют — им неактуально).
     last_ssh_at: UTCDateTime | None = None
+    # Текущее число активных юзеров — active_users из ПОСЛЕДНЕГО
+    # NodeTrafficSample (тем же per-node lookup, что и last_ssh_at). Нужно
+    # админке, чтобы отличать idle-туннель (0 юзеров → WG без трафика не делает
+    # handshake → серый) от реального обрыва (юзеры есть, а handshake протух →
+    # красный). Дефолт 0; кроме list_nodes другие call-сайты не проставляют.
+    active_users: int = 0
     # NULL = auto-trigger и Telegram-алерты на эту ноду работают.
     # Timestamp = оператор замьютил (legacy combined-флаг, до migration 0039).
     auto_diagnose_disabled_at: UTCDateTime | None = None

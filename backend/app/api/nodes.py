@@ -411,6 +411,27 @@ def list_nodes(
         )
         last_ssh_by_node = {node_id: latest for node_id, latest in rows}
 
+    # active_users из ПОСЛЕДНЕГО сэмпла per-node (DISTINCT ON node_id ORDER BY
+    # observed_at DESC). Нужно для idle-aware health-dots: 0 юзеров + протухший
+    # WG-handshake = простой, не обрыв (см. linkHealth.tsx). Колонки
+    # active_users на vpn_nodes НЕТ — она живёт только в node_traffic_samples.
+    active_users_by_node: dict[int, int] = {}
+    if node_ids:
+        au_rows = (
+            db.query(
+                models.NodeTrafficSample.node_id,
+                models.NodeTrafficSample.active_users,
+            )
+            .filter(models.NodeTrafficSample.node_id.in_(node_ids))
+            .order_by(
+                models.NodeTrafficSample.node_id,
+                models.NodeTrafficSample.observed_at.desc(),
+            )
+            .distinct(models.NodeTrafficSample.node_id)
+            .all()
+        )
+        active_users_by_node = {nid: au for nid, au in au_rows}
+
     def _to_out(n: models.VPNNode) -> schemas.VPNNodeOut:
         out = schemas.VPNNodeOut.from_orm(n)
         out.exit_links = [
@@ -424,6 +445,7 @@ def list_nodes(
             for link in links_by_relay.get(n.id, [])
         ]
         out.last_ssh_at = last_ssh_by_node.get(n.id)
+        out.active_users = active_users_by_node.get(n.id, 0)
         return out
 
     return [_to_out(n) for n in nodes]
