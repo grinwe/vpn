@@ -450,6 +450,9 @@ def list_nodes(
         ]
         out.last_ssh_at = last_ssh_by_node.get(n.id)
         out.active_users = active_users_by_node.get(n.id, 0)
+        # Reconciler-видимость: нода помечена dirty (desired бампнут правкой),
+        # но прогон ещё отложен на тик. reconcile_due_at уже подтянут from_orm.
+        out.reconcile_pending = n.desired_generation > n.reconciled_generation
         return out
 
     return [_to_out(n) for n in nodes]

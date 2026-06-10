@@ -34,9 +34,27 @@
     relay_wanted_ifaces: >-
       {{ (relay_wg_links | default([])) | map(attribute='interface') | list }}
 
+# CRITICAL: только backend-driven прогоны (relay_tunnel_apply / site.yml через
+# _collect_*_extra_vars) передают relay_wg_links — ВСЕГДА, даже пустой список
+# (= «у ноды ноль туннелей, снести»). Ручной `ansible-playbook site.yml
+# -l <relay>` НЕ передаёт её вовсе → undefined. Раньше `default([])` схлопывал
+# undefined в [] и disable-ветка молча рвала ЖИВОЙ туннель (подтверждено на
+# 4kmr: wg0 прожил 2м50с, снесён следующим прогоном без переменной). Поэтому:
+# undefined → роль no-op (туннели не трогаем); defined-[] → авторитетный
+# teardown; defined-непустой → enable. Бэкенд всегда defined (см.
+# provisioning.py _collect_site_extra_vars / _collect_relay_tunnel_extra_vars).
+- name: Skip relay role — relay_wg_links not provided (manual/partial run)
+  debug:
+    msg: >-
+      relay_jump_node: relay_wg_links undefined — пропуск, туннели не трогаем
+      (вероятно ручной site.yml без backend extra_vars).
+  when: relay_wg_links is not defined
+
 # ── ENABLE branch ────────────────────────────────────────────────
 - name: Relay enable — set up WG clients + patch Xray
-  when: relay_enabled | bool
+  when:
+    - relay_wg_links is defined
+    - relay_enabled | bool
   block:
     - name: Install WireGuard
       apt:
@@ -84,17 +102,24 @@
     # в бэкенде раз в 5 минут фиксирует latest-handshake по каждому
     # peer и красит индикатор в админке, так что «жив ли туннель»
     # видно без этого синхронного теста.
+    # Advisory, single-shot и ЖЁСТКО ограниченный по времени. Раньше тут были
+    # retries:3/delay:5 + curl без --max-time, а у command-модуля нет своего
+    # таймаута — на мёртвом туннеле curl залипал (connect/DNS через blackhole
+    # маршрут), и «advisory» проверка ВЕШАЛА весь play до 600s (подтверждено на
+    # 4kmr). failed_when:false спасал от падения, но не от зависания. Теперь
+    # `timeout 8` (внешний хард-стоп) + curl --max-time 8 баундят каждую пробу,
+    # retries убраны: авторитетный сигнал «жив ли туннель» даёт out-of-band
+    # health-тик (services/relay_link_health.py), а не этот синхронный curl.
     - name: Test tunnel connectivity per link (advisory)
-      command: curl -s --interface {{ item.interface }} --connect-timeout 5 https://ifconfig.me
+      command: >-
+        timeout 8 curl -s --interface {{ item.interface }}
+        --connect-timeout 5 --max-time 8 https://ifconfig.me
       loop: "{{ relay_wg_links }}"
       loop_control:
         label: "{{ item.interface }}"
       register: tunnel_test
       changed_when: false
       failed_when: false
-      retries: 3
-      delay: 5
-      until: tunnel_test.rc == 0
 
     - name: Report tunnel status per link
       debug:
@@ -212,8 +237,13 @@
       when: hy2_config.stat.exists
 
 # ── DISABLE branch ───────────────────────────────────────────────
+# ТОЛЬКО при defined-but-empty relay_wg_links (бэкенд авторитетно говорит «у
+# этой ноды туннелей нет» — детач последнего линка / прямая нода). undefined
+# (ручной прогон) сюда НЕ попадает — туннели остаются нетронутыми.
 - name: Relay disable — tear every tunnel down + unpatch Xray
-  when: not (relay_enabled | bool)
+  when:
+    - relay_wg_links is defined
+    - not (relay_enabled | bool)
   block:
     - name: Enumerate WG configs for teardown
       find:

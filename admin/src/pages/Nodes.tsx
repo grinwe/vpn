@@ -164,6 +164,38 @@ function CooldownBadge({ until }: { until: string | null }) {
   );
 }
 
+// Reconciler-видимость: нода помечена dirty (desired > reconciled), но прогон
+// отложен на reconcile-тик. Без этого бейджа операторское действие при
+// включённом RECONCILER_ENABLED выглядит как «ничего не произошло» — таска
+// появляется только когда тик сойдёт ноду. due — когда тик её подхватит.
+function ReconcilePendingBadge({
+  pending,
+  due,
+}: {
+  pending: boolean;
+  due: string | null;
+}) {
+  if (!pending) return null;
+  const ms = due ? new Date(due).getTime() - Date.now() : 0;
+  const label = !due
+    ? "queued"
+    : ms > 0
+      ? `через ${Math.max(1, Math.round(ms / 1000))}s`
+      : "now";
+  return (
+    <span
+      className="text-xs px-1 py-0.5 rounded bg-amber-900 text-amber-300"
+      title={
+        due
+          ? `reconcile подхватит ноду ~${new Date(due).toLocaleString()}`
+          : "ноде нужен reconcile (поставлена в очередь тика)"
+      }
+    >
+      ⏳ reconcile {label}
+    </span>
+  );
+}
+
 function NodeMuteToggle({
   nodeId,
   disabledAt,
@@ -1226,6 +1258,10 @@ export default function Nodes() {
                     <span className="inline-flex items-center gap-1">
                       <span>{n.is_active ? "✓" : "✕"}</span>
                       <CooldownBadge until={n.cooldown_until} />
+                      <ReconcilePendingBadge
+                        pending={n.reconcile_pending}
+                        due={n.reconcile_due_at}
+                      />
                     </span>
                   </td>
                   <td>

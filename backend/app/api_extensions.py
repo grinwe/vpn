@@ -440,7 +440,9 @@ def regenerate_user_config(
     db: Session = Depends(get_db),
     admin_token: str = Depends(require_admin),
 ):
-    """Revoke current devices and re-provision on a different node."""
+    """Move the user's active subscription to a freshly chosen node,
+    preserving every device and its sub-link (device-preserving self-service
+    migration)."""
     from .services.provisioning import ProvisioningOrchestrator
 
     user = db.query(models.User).filter_by(telegram_id=telegram_id).first()
@@ -461,28 +463,29 @@ def regenerate_user_config(
 
     orchestrator = ProvisioningOrchestrator(db)
 
-    # Revoke old devices
-    for device in active_sub.devices:
-        try:
-            orchestrator.revoke_device(device, reason="self-service regeneration")
-        except Exception:
-            logger.exception("Failed to revoke device %s", device.id)
-
-    # Re-provision (potentially on a different node)
-    new_sub, task = orchestrator.provision_subscription(
-        user, active_sub.plan,
-        expires_at_override=active_sub.expires_at,
-    )
-
-    # Mark old subscription
-    active_sub.status = models.SubscriptionStatus.blocked
-    active_sub.notes = "replaced by self-service regeneration"
-    db.add(active_sub)
-    db.commit()
+    # Device-preserving self-service node move. The old body revoked EVERY
+    # device, provisioned a brand-new single-device subscription and blocked
+    # the old one — collapsing an N-device sub to one "primary", rerolling the
+    # sub-link, and dropping device rows. That breaks the sub-link invariant
+    # (revoked rows must survive as aliases) and was the source of the
+    # "all devices deleted, one primary" report. migrate_subscription_to_new_node
+    # relocates the SAME subscription to a freshly chosen node, mirroring every
+    # live device N:N and preserving sub_token + connection_uri — installed
+    # links keep working and no device is lost.
+    try:
+        target, _device, task = orchestrator.migrate_subscription_to_new_node(
+            active_sub
+        )
+    except RuntimeError as exc:
+        # No eligible target node (single-node pool, all excluded, no healthy
+        # node in the plan's pools, …). Surface as 409 so the bot shows
+        # "couldn't regenerate, try later" instead of a 500.
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
 
     return {
         "ok": True,
-        "new_subscription_id": new_sub.id,
+        "subscription_id": active_sub.id,
+        "node_id": target.id,
         "task_id": task.id,
     }
 

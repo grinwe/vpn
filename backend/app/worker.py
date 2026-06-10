@@ -47,6 +47,19 @@ PENDING_RESCUE = Counter(
     "Pending provisioning tasks re-enqueued by the self-heal tick",
 )
 
+# Reconciler watchdog gauges — set each reconcile tick (no-op while
+# RECONCILER_ENABLED is off). A wedged scheduler stops updating these, so an
+# external staleness alert on the metric catches the "stuck tick strands a
+# fresh node" failure that no in-tick check can see.
+RECONCILE_PENDING_NODES = Gauge(
+    "vpn_reconcile_pending_nodes",
+    "Nodes with desired_generation > reconciled_generation awaiting reconcile",
+)
+RECONCILE_OLDEST_OVERDUE = Gauge(
+    "vpn_reconcile_oldest_overdue_seconds",
+    "Age (s) of the oldest overdue (due_at<=now) pending-reconcile node",
+)
+
 
 def run_pending_rescue_tick() -> dict:
     """Periodic self-heal — re-enqueue provisioning tasks that are stuck.
@@ -166,7 +179,7 @@ def run_reconcile_tick() -> dict:
     from .queue import schedule_tick
     from .services.provisioning import ProvisioningOrchestrator
 
-    interval = int(os.getenv("RECONCILE_INTERVAL", "10"))
+    interval = int(os.getenv("RECONCILE_INTERVAL", "3"))
     if interval > 0:
         try:
             schedule_tick(
@@ -180,7 +193,14 @@ def run_reconcile_tick() -> dict:
 
     session = SessionLocal()
     try:
-        return ProvisioningOrchestrator(session).reconcile_due_nodes()
+        result = ProvisioningOrchestrator(session).reconcile_due_nodes()
+        # Watchdog-гейджи: пока reconciler включён, reconcile_due_nodes
+        # возвращает pending_total/oldest_overdue_s. Если scheduler завис и
+        # тик перестал бежать, гейджи протухают → external staleness-alert.
+        if "pending_total" in result:
+            RECONCILE_PENDING_NODES.set(result["pending_total"])
+            RECONCILE_OLDEST_OVERDUE.set(result["oldest_overdue_s"])
+        return result
     finally:
         session.close()
 
@@ -2184,8 +2204,8 @@ def main() -> None:
 
     # Phase 3 reconcile tick — сходит ноды по desired-state generations.
     # No-op пока RECONCILER_ENABLED выключен (сам тик short-circuit'ит).
-    # Дефолт 10s; debounce RECONCILE_DEBOUNCE_S коллапсит burst правок.
-    reconcile_interval = int(os.getenv("RECONCILE_INTERVAL", "10"))
+    # Дефолт 3s; debounce RECONCILE_DEBOUNCE_S коллапсит burst правок.
+    reconcile_interval = int(os.getenv("RECONCILE_INTERVAL", "3"))
     if do_bootstrap and reconcile_interval > 0:
         try:
             schedule_tick(

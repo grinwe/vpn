@@ -89,7 +89,10 @@ deploy_app_stack_wscdn_front_domain: "{{ vault_wscdn_front_domain | default('wgs
 # прод включает через group_vars/web/main.yml (deploy_app_stack_reconciler_enabled: "1").
 # См. docs/operations/provisioning_reconciler_epic.md.
 deploy_app_stack_reconciler_enabled: "0"
-deploy_app_stack_reconcile_interval: 10
+deploy_app_stack_reconcile_interval: 3
 deploy_app_stack_reconcile_debounce_s: 5
-deploy_app_stack_reconcile_max_per_tick: 5
+deploy_app_stack_reconcile_max_per_tick: 15
 deploy_app_stack_reconcile_retry_s: 60
+# Watchdog: WARNING в логах, если самая старая dirty-нода просрочена дольше
+# (run_reconcile_tick также экспортит pending/overdue гейджи для алертов).
+deploy_app_stack_reconcile_overdue_warn_s: 120

@@ -490,6 +490,10 @@ export interface VPNNodeOut {
   has_relay_config: boolean;
   exit_links: NodeExitLinkHealthMini[];
   last_ssh_at: string | null;
+  // Reconciler: нода помечена dirty (desired > reconciled), прогон отложен на
+  // тик. reconcile_due_at — когда тик её подхватит. Дефолты false/null.
+  reconcile_pending: boolean;
+  reconcile_due_at: string | null;
   // NULL = auto-trigger и Telegram-алёрты включены. Timestamp = mute.
   auto_diagnose_disabled_at?: string | null;
   // ── Diagnose-control state (см. api/diagnostics.py) ──

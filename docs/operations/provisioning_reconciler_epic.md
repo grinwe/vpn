@@ -86,7 +86,7 @@ generation сошёлся) — UI истории/прогресса живёт.
 
 ### Phase 4 — Extend + polish ⏳ (частично)
 - ✅ **Cap + ordering** в `reconcile_due_nodes`: `RECONCILE_MAX_PER_TICK`
-  (default 5) нод за тик, ORDER BY `reconcile_due_at` ASC (FIFO,
+  (default 15) нод за тик, ORDER BY `reconcile_due_at` ASC (FIFO,
   дольше-ждавшие первыми), back-pressure против thundering herd при bulk-правке.
 - ✅ **Backoff на фейлах**: `_handle_task_outcome` re-arm'ит `due_at = now +
   RECONCILE_RETRY_S` (default 60s) при неуспешном reconcile-bootstrap'е.
@@ -114,8 +114,27 @@ generation сошёлся) — UI истории/прогресса живёт.
 Код Phase 2+3 собран, отревьюен и **проброшен через ansible**. Флаг
 `RECONCILER_ENABLED` переключает точку входа оркестрации с «правка →
 bootstrap» на «правка → bump desired → reconcile-тик». Role-default OFF
-(`deploy_app_stack/defaults/main.yml`), в проде ВКЛючён через
-`group_vars/web/main.yml` (`deploy_app_stack_reconciler_enabled: "1"`).
+(`deploy_app_stack/defaults/main.yml`); **в проде сейчас тоже OFF**
+(`group_vars/web/main.yml` (`deploy_app_stack_reconciler_enabled: "0"`),
+откат в `4acddab` на время CDN-дебага). Возврат в `"1"` — после того как
+ручные/операторские bootstrap-эндпоинты перестанут дефолтить на defer (см.
+«Видимость и скорость» ниже).
+
+### Видимость и скорость (вариант C — оставить reconcile-модель, убрать «тишину»)
+Чтобы операторское действие при включённом флаге не выглядело как «ничего не
+произошло», dirty-состояние ноды **видно в API/админке**, а тик — быстрее:
+- `VPNNodeOut.reconcile_pending` (= `desired_generation > reconciled_generation`)
+  + `reconcile_due_at` — отдаются в `GET /nodes`; админка рисует бейдж
+  «⏳ reconcile через Ns» (`Nodes.tsx:ReconcilePendingBadge`). Фантомную
+  `pending`-таску при `mark_node_dirty` НЕ создаём: она попала бы под
+  `NOT EXISTS(active bootstrap)` в тике и зависла бы навсегда — поэтому видимость
+  это **состояние ноды**, а не строка таски.
+- Тик ускорен: `RECONCILE_INTERVAL` 10→**3s**, `RECONCILE_MAX_PER_TICK` 5→**15**.
+- **Watchdog**: `run_reconcile_tick` экспортит гейджи `vpn_reconcile_pending_nodes`
+  и `vpn_reconcile_oldest_overdue_seconds`; при `oldest_overdue > RECONCILE_OVERDUE_WARN_S`
+  (default 120s) — WARNING в лог. Завис scheduler → гейджи протухают →
+  external staleness-alert ловит то, что изнутри тика не видно (страховка сверху
+  к self-heal stale-лока на старте воркера, `7bf697a`).
 
 | Файл | Что лежит |
 |------|-----------|
@@ -130,15 +149,16 @@ bootstrap» на «правка → bump desired → reconcile-тик». Role-de
 | Env var | Ansible var (`deploy_app_stack_*`) | Default | Назначение |
 |---------|-----------------------------------|---------|-----------|
 | `RECONCILER_ENABLED` | `…reconciler_enabled` | `0` (role) / `1` (web) | мастер-тумблер. `1/true/yes` → reconcile-модель |
-| `RECONCILE_INTERVAL` | `…reconcile_interval` | `10` | период reconcile-тика, сек (только worker-scheduler) |
+| `RECONCILE_INTERVAL` | `…reconcile_interval` | `3` | период reconcile-тика, сек (только worker-scheduler) |
 | `RECONCILE_DEBOUNCE_S` | `…reconcile_debounce_s` | `5` | debounce: правка ставит `due_at = now + N` |
-| `RECONCILE_MAX_PER_TICK` | `…reconcile_max_per_tick` | `5` | нод за тик (back-pressure, FIFO по due_at) |
+| `RECONCILE_MAX_PER_TICK` | `…reconcile_max_per_tick` | `15` | нод за тик (back-pressure, FIFO по due_at) |
 | `RECONCILE_RETRY_S` | `…reconcile_retry_s` | `60` | backoff: re-arm `due_at` после фейла reconcile-bootstrap'а |
+| `RECONCILE_OVERDUE_WARN_S` | `…reconcile_overdue_warn_s` | `120` | watchdog: WARNING если самая старая dirty-нода просрочена дольше |
 
 Кто читает: `RECONCILER_ENABLED`/`RECONCILE_DEBOUNCE_S` — backend (mark_node_dirty)
-+ worker. `RECONCILE_INTERVAL`/`MAX_PER_TICK` — worker-scheduler (тик).
-`RECONCILE_RETRY_S` — worker (outcome). Поэтому флаг проброшен и в backend, и в
-`&worker-env` (worker + worker-scheduler).
++ worker. `RECONCILE_INTERVAL`/`MAX_PER_TICK`/`RECONCILE_OVERDUE_WARN_S` —
+worker-scheduler (тик). `RECONCILE_RETRY_S` — worker (outcome). Поэтому флаг
+проброшен и в backend, и в `&worker-env` (worker + worker-scheduler).
 
 ### Rollout
 Один деплой через ansible (`site.yml --tags web`) выкатывает код И включает

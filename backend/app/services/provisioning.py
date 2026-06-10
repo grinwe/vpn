@@ -555,6 +555,31 @@ def _collect_site_extra_vars(
         # module but still string-typed). Same rules as top-level keys.
         _validate_relay_link_strings(relay_links, node_hint=f"{node.id}/{node.name}")
         extra["relay_wg_links"] = relay_links
+    else:
+        # Empty result needs disambiguation before we hand the role an
+        # authoritative "[] → tear down every tunnel". _build_relay_wg_links
+        # returns [] for TWO very different states:
+        #   1) genuinely zero RelayExitLink rows → this node has no tunnels →
+        #      send [] so the role's DISABLE branch reconciles (real detach).
+        #   2) link rows EXIST but every exit was skipped (missing
+        #      wg_public_key — a transient/config error) → the live wg0 is
+        #      still up. Sending [] here would rip down a working tunnel over
+        #      a DB hiccup. Instead OMIT the key (undefined) so the role
+        #      no-ops and leaves the tunnel intact, and log loudly.
+        link_count = (
+            db.query(func.count(models.RelayExitLink.id))
+            .filter(models.RelayExitLink.relay_node_id == node.id)
+            .scalar()
+        ) or 0
+        if link_count == 0:
+            extra["relay_wg_links"] = []  # authoritative: node has no tunnels
+        else:
+            logger.warning(
+                "node %s has %d relay link(s) but none yielded a usable WG "
+                "config (exit missing wg_public_key?) — omitting relay_wg_links "
+                "so a live tunnel is left intact instead of torn down",
+                node.id, link_count,
+            )
 
     # ── G.6: xray fan-out (multi-link only) ──
     # Emit every run so site.yml renders (or re-renders) both xray
@@ -1005,9 +1030,9 @@ class ProvisioningOrchestrator:
         прогон с актуальным gen.
 
         Phase 4: за один тик диспатчим максимум RECONCILE_MAX_PER_TICK нод
-        (default 5), отсортированных по reconcile_due_at ASC (дольше всех
+        (default 15), отсортированных по reconcile_due_at ASC (дольше всех
         ждавшие — первыми, FIFO-справедливость). Остальные созревшие подождут
-        следующего тика (RECONCILE_INTERVAL=10s). Это back-pressure против
+        следующего тика (RECONCILE_INTERVAL=3s). Это back-pressure против
         thundering herd при bulk-правке (50 нод сразу): семафор всё равно
         пускает MAX_CONCURRENT_ANSIBLE параллельно, но кап не плодит лишние
         pending-строки впереди ёмкости. Берём limit+1, чтобы честно
@@ -1016,7 +1041,7 @@ class ProvisioningOrchestrator:
         if not self._reconciler_enabled():
             return {"reconciler": "disabled"}
         now = utcnow()
-        max_per_tick = max(1, int(os.getenv("RECONCILE_MAX_PER_TICK", "5")))
+        max_per_tick = max(1, int(os.getenv("RECONCILE_MAX_PER_TICK", "15")))
         # Коррелированный NOT EXISTS: нода уже имеет активный bootstrap (его
         # держит Phase-0 unique index uq_active_node_bootstrap, ≤1 на ноду) →
         # новый прогон сейчас не нужен/не возможен, исключаем из окна капа.
@@ -1075,7 +1100,48 @@ class ProvisioningOrchestrator:
                 "reconcile: capped at %s node(s)/tick — ещё созревшие ждут "
                 "следующего тика", max_per_tick,
             )
-        return {"due": len(due), "dispatched": dispatched, "capped": capped}
+        # Watchdog: сколько нод ждут reconcile и насколько просрочена самая
+        # старая. run_reconcile_tick экспортит это гейджами — если scheduler
+        # завис, гейдж перестаёт обновляться (staleness-alert ловит wedge,
+        # который не виден изнутри тика), а растущий oldest_overdue ловит
+        # cap-starvation или повторно падающий bootstrap. Пользователь принял
+        # зависимость свежей ноды от здоровья тика (вариант C) — это страховка
+        # сверху к self-heal stale-лока на старте воркера (commit 7bf697a).
+        pending_total = (
+            self.db.query(func.count(models.VPNNode.id))
+            .filter(
+                models.VPNNode.desired_generation
+                > models.VPNNode.reconciled_generation
+            )
+            .scalar()
+        ) or 0
+        oldest_due = (
+            self.db.query(func.min(models.VPNNode.reconcile_due_at))
+            .filter(
+                models.VPNNode.desired_generation
+                > models.VPNNode.reconciled_generation,
+                models.VPNNode.reconcile_due_at.isnot(None),
+                models.VPNNode.reconcile_due_at <= now,
+            )
+            .scalar()
+        )
+        oldest_overdue_s = (
+            (now - oldest_due).total_seconds() if oldest_due else 0.0
+        )
+        warn_s = float(os.getenv("RECONCILE_OVERDUE_WARN_S", "120"))
+        if oldest_overdue_s > warn_s:
+            logger.warning(
+                "reconcile: %s node(s) pending, oldest overdue by %.0fs "
+                "(>%.0fs warn) — тик не успевает сходить ноды или bootstrap "
+                "повторно падает", pending_total, oldest_overdue_s, warn_s,
+            )
+        return {
+            "due": len(due),
+            "dispatched": dispatched,
+            "capped": capped,
+            "pending_total": pending_total,
+            "oldest_overdue_s": oldest_overdue_s,
+        }
 
     def _mark_task(
         self,
@@ -3532,12 +3598,29 @@ class ProvisioningOrchestrator:
 
         results: list[tuple[models.Device, models.ProvisioningTask]] = []
 
-        # Incident tail: a sub with no live device at all → just create one.
+        # Incident tail: a sub with no live device at all (e.g. all got
+        # disabled/revoked by a prior half-applied op, or a migrate to a node
+        # that failed to provision). DON'T collapse to a single "primary" —
+        # that silently drops every extra device the user paid for (the exact
+        # "all devices gone, one primary" regression). Rebuild one device per
+        # DISTINCT name the sub ever had (latest row per name wins), mirroring
+        # migrate_subscription_to_new_node's name snapshot. Fall back to a lone
+        # "primary" only for a sub that genuinely never had a named device.
         if not live_devices:
-            device, task = self.reprovision_subscription(
-                subscription, device_name="primary"
-            )
-            results.append((device, task))
+            seen_names: list[str] = []
+            for d in sorted(
+                subscription.devices,
+                key=lambda x: x.updated_at or x.created_at,
+                reverse=True,
+            ):
+                nm = d.name or "primary"
+                if nm not in seen_names:
+                    seen_names.append(nm)
+            for name in seen_names or ["primary"]:
+                device, task = self.reprovision_subscription(
+                    subscription, device_name=name
+                )
+                results.append((device, task))
             self.db.commit()
             return results
 

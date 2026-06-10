@@ -263,6 +263,14 @@ class VPNNodeOut(VPNNodeCreate):
     # handshake → серый) от реального обрыва (юзеры есть, а handshake протух →
     # красный). Дефолт 0; кроме list_nodes другие call-сайты не проставляют.
     active_users: int = 0
+    # Reconciler-видимость: desired_generation > reconciled_generation, т.е.
+    # ноде нужен прогон, но он отложен на reconcile-тик (defer-модель). Без
+    # этого флага операторское действие при включённом RECONCILER_ENABLED
+    # выглядит как «ничего не произошло» — таска материализуется только когда
+    # тик сойдёт ноду. reconcile_pending derived (ставится в list_nodes, как
+    # active_users); reconcile_due_at маппится из ORM-колонки автоматически.
+    reconcile_pending: bool = False
+    reconcile_due_at: UTCDateTime | None = None
     # NULL = auto-trigger и Telegram-алерты на эту ноду работают.
     # Timestamp = оператор замьютил (legacy combined-флаг, до migration 0039).
     auto_diagnose_disabled_at: UTCDateTime | None = None

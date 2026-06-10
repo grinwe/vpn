@@ -224,10 +224,11 @@ services:
       # на фейле. Пусто/0 в RECONCILER_ENABLED → фича выключена (Phase-0).
       # См. docs/operations/provisioning_reconciler_epic.md.
       RECONCILER_ENABLED: ${RECONCILER_ENABLED:-}
-      RECONCILE_INTERVAL: ${RECONCILE_INTERVAL:-10}
+      RECONCILE_INTERVAL: ${RECONCILE_INTERVAL:-3}
       RECONCILE_DEBOUNCE_S: ${RECONCILE_DEBOUNCE_S:-5}
-      RECONCILE_MAX_PER_TICK: ${RECONCILE_MAX_PER_TICK:-5}
+      RECONCILE_MAX_PER_TICK: ${RECONCILE_MAX_PER_TICK:-15}
       RECONCILE_RETRY_S: ${RECONCILE_RETRY_S:-60}
+      RECONCILE_OVERDUE_WARN_S: ${RECONCILE_OVERDUE_WARN_S:-120}
     volumes:
       - ${PROVISIONING_SSH_KEY:?Set PROVISIONING_SSH_KEY to the host path of the SSH private key}:/run/secrets/provisioning_key:ro
     depends_on:
