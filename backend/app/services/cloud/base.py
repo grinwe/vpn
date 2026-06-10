@@ -22,6 +22,10 @@ class CloudServer:
     region: str | None = None
     plan: str | None = None
     monthly_cost: float | None = None
+    # Рут-пароль, выданный хостером при заказе (для провайдеров без инъекции
+    # SSH-ключа, напр. 4vps — нужен для first-connect SSH перед установкой
+    # нашего ключа). Не логировать. None если хостер инжектит ключ.
+    root_password: str | None = field(default=None, repr=False)
     raw: dict | None = field(default=None, repr=False)
 
 

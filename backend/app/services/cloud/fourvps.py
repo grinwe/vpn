@@ -1,19 +1,21 @@
 """4vps.su (он же 4vds) cloud driver.
 
 Mirrors the structure of :mod:`aeza` / :mod:`hetzner`. Talks raw HTTP to the
-4vps.su API. 4vps использует «конверт» ответа ``{"error": bool, "data": ...,
-"errorMessage": str}`` и требует в КАЖДОМ запросе ключ (``apikey``) и
-``panel_id`` — мы храним их в одном ``CloudProvider.api_token_enc`` как
-``panel_id:apikey`` (Fernet), см. :func:`_split_token`.
+4vps.su API (https://4vps.su/page/api). Спека сверена по официальной доке.
 
-API: https://4vps.su/page/api
-
-NB: фетчер не достаёт доку 4vps (SPA/блок), поэтому ТОЧНЫЕ пути info-методов и
-имена параметров ``order`` вынесены в единый блок ``_API`` ниже и помечены
-``# VERIFY`` — их надо сверить с живой докой (см.
-docs/operations/hoster_api_epic.md, «Чек-лист спека»). Достоверно известен
-только ``reinstall``. Структура драйвера (session/конверт/поллинг/маппинг в
-CloudServer) от этих деталей не зависит и корректна.
+Особенности 4vps:
+* Auth: ``Authorization: Bearer <apikey>`` ХЕДЕР + ``panel_id`` параметром в
+  запросах, где есть взаимодействие с панелью (locations/tariffs/order). Мы
+  храним оба значения в одном ``CloudProvider.api_token_enc`` как
+  ``panel_id:apikey`` (Fernet), см. :func:`_split_token`.
+* Конверт ответа: ``{"error": bool, "data": ..., "errorMessage": str|dict}``.
+* ``buyServer`` возвращает только ``{serverid, password}`` — БЕЗ IP. IP и статус
+  берём поллингом ``/myservers`` (``serverlist[].ipv4`` / ``.status``).
+* ``buyServer`` НЕ принимает SSH-ключ — свежий сервер поднимается с root +
+  сгенерённым паролем (его возвращает API). Пароль прокидывается в
+  ``CloudServer.root_password`` и сохраняется на ноде (provider_root_password_enc)
+  для SSH-bootstrap'а (ansible ходит по ключу — нужен first-connect по паролю
+  + установка ключа; см. docs/operations/hoster_api_epic.md, Фаза 1.5).
 """
 from __future__ import annotations
 
@@ -27,44 +29,17 @@ from .base import CloudServer, DriverError
 
 logger = logging.getLogger(__name__)
 
-# ── Блок _API: ЕДИНСТВЕННОЕ место с wire-деталями 4vps ───────────────────────
 _BASE = "https://4vps.su/api"
 _TIMEOUT = 30
-_POLL_TIMEOUT = 300
-_POLL_INTERVAL = 6
-
-# Имена auth-параметров (шлём в КАЖДОМ запросе). VERIFY: точные имена по доке.
-_AUTH_KEY_PARAM = "apikey"
-_AUTH_PANEL_PARAM = "panel_id"
-
-# Логический метод -> (HTTP, path). VERIFY: префикс info-методов (info/ vs
-# action/ vs корень) и имена методов. `reinstall` известен точно.
-_METHODS: dict[str, tuple[str, str]] = {
-    "balance": ("GET", "/info/getBalance"),       # VERIFY
-    "datacenters": ("GET", "/info/getDatacenters"),  # VERIFY
-    "tariffs": ("GET", "/info/getTariffs"),        # VERIFY
-    "images": ("GET", "/info/getImages"),          # VERIFY
-    "servers": ("GET", "/info/getServers"),        # VERIFY
-    "order": ("POST", "/action/order"),            # VERIFY
-    "reinstall": ("POST", "/action/reinstall"),    # известно точно
-    "delete": ("POST", "/action/delete"),          # VERIFY
-}
-
-# Имена параметров заказа. VERIFY по доке (нужен ли SSH-ключ / домен?).
-_ORDER_PARAM = {
-    "tariff": "tariff",        # VERIFY
-    "datacenter": "datacenter",  # VERIFY
-    "ostempl": "ostempl",      # из #getImages
-    "password": "password",    # min 6
-    "period": "period",        # [720,2160,4320,8640] = 1/3/6/12 мес
-}
-_DEFAULT_PERIOD = 720  # 1 месяц
-# ─────────────────────────────────────────────────────────────────────────────
+_POLL_TIMEOUT = 600
+_POLL_INTERVAL = 8
+# period аренды: [720, 2160, 4320, 8640] = 1/3/6/12 мес.
+_DEFAULT_PERIOD = 720
 
 
 def _split_token(token: str) -> tuple[str, str]:
-    """``"panel_id:apikey"`` → ``(panel_id, apikey)``. Без ``:`` → весь токен
-    трактуется как apikey (panel_id пуст)."""
+    """``"panel_id:apikey"`` → ``(panel_id, apikey)``. Без ``:`` → весь токен =
+    apikey (panel_id пуст)."""
     token = (token or "").strip()
     if ":" in token:
         panel_id, apikey = token.split(":", 1)
@@ -73,11 +48,11 @@ def _split_token(token: str) -> tuple[str, str]:
 
 
 def _gen_password() -> str:
-    """Сильный рут-пароль для order/reinstall (4vps требует пароль). Мы ходим на
-    ноду по SSH-КЛЮЧУ (provisioning_key), пароль здесь — для панели/требования
-    API. VERIFY: инжектит ли 4vps наш SSH-ключ при заказе, или нужен
-    password-auth/cloud-init для первого коннекта ansible."""
-    return secrets.token_urlsafe(16)
+    """Рут-пароль для buyServer/reinstall (4vps требует/возвращает пароль).
+    Берём только буквы+цифры — 4vps валидирует пароль и спецсимволы иногда
+    отклоняет; длина с запасом > минимума (6)."""
+    alphabet = "abcdefghijkmnopqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+    return "".join(secrets.choice(alphabet) for _ in range(20))
 
 
 class FourVpsDriver:
@@ -88,7 +63,12 @@ class FourVpsDriver:
         if not self._apikey:
             raise DriverError("4vps provider token missing apikey")
         self._session = requests.Session()
-        self._session.headers.update({"Accept": "application/json"})
+        self._session.headers.update(
+            {
+                "Authorization": f"Bearer {self._apikey}",
+                "Accept": "application/json",
+            }
+        )
 
     # ---------- public API ----------
 
@@ -99,59 +79,54 @@ class FourVpsDriver:
         region: str,
         plan: str,
         image: str,
-        ssh_key_ids: list[str] | None = None,
-        user_data: str | None = None,
+        ssh_key_ids: list[str] | None = None,  # 4vps не принимает SSH-ключ
+        user_data: str | None = None,          # 4vps не поддерживает user_data
     ) -> CloudServer:
         password = _gen_password()
-        params = {
-            _ORDER_PARAM["tariff"]: plan,
-            _ORDER_PARAM["datacenter"]: region,
-            _ORDER_PARAM["ostempl"]: image,
-            _ORDER_PARAM["password"]: password,
-            _ORDER_PARAM["period"]: _DEFAULT_PERIOD,
-        }
-        data = self._call("order", params)
-        # VERIFY: где serverid и IP в ответе. По поиску ответ содержит
-        # serverInfo / dcInfo / ipPrice / ipList. Берём максимально терпимо.
-        info = data if isinstance(data, dict) else {}
-        server_info = info.get("serverInfo") or info
-        server_id = str(
-            server_info.get("serverid")
-            or server_info.get("id")
-            or info.get("serverid")
-            or ""
+        # POST /api/action/buyServer — tarif/datacenter/ostempl/name + period.
+        data = self._call(
+            "POST",
+            "/action/buyServer",
+            {
+                "tarif": plan,
+                "datacenter": region,
+                "ostempl": image,
+                "name": name,
+                "password": password,
+                "period": _DEFAULT_PERIOD,
+            },
         )
+        server_id = str((data or {}).get("serverid") or "")
         if not server_id:
-            raise DriverError(f"4vps order did not return serverid: {data}")
+            raise DriverError(f"4vps buyServer did not return serverid: {data}")
+        # 4vps сам генерит/возвращает пароль — берём его, иначе наш.
+        root_password = str((data or {}).get("password") or password)
 
-        ipv4 = self._extract_ip(info) or self._wait_ip(server_id)
+        # buyServer не отдаёт IP — поллим /myservers, пока сервер не active с IP.
+        ipv4, status, srv = self._wait_active(server_id)
         if not ipv4:
             raise DriverError(
-                f"4vps server {server_id} has no IPv4 after {_POLL_TIMEOUT}s"
+                f"4vps server {server_id} got no IPv4 within {_POLL_TIMEOUT}s "
+                f"(last status={status})"
             )
-        price = _to_float(
-            server_info.get("price")
-            or server_info.get("cost")
-            or info.get("ipPrice")
-        )
         return CloudServer(
             external_id=server_id,
             ipv4=ipv4,
             ipv6=None,
             region=region,
             plan=plan,
-            monthly_cost=price,
-            raw=info,
+            monthly_cost=_to_float((srv or {}).get("price")),
+            root_password=root_password,
+            raw=srv or data,
         )
 
     def reinstall_server(
         self, external_id: str, image: str, *, password: str | None = None
     ) -> None:
-        """Переустановка ОС. Известно точно:
-        ``POST /api/action/reinstall {serverid, ostempl, password(≥6)}`` →
-        ``{"error":false,"data":"ok"}``."""
+        """POST /api/action/reinstall {serverid, ostempl, password(≥6)}."""
         self._call(
-            "reinstall",
+            "POST",
+            "/action/reinstall",
             {
                 "serverid": external_id,
                 "ostempl": image,
@@ -160,62 +135,118 @@ class FourVpsDriver:
         )
 
     def destroy_server(self, external_id: str) -> None:
-        # VERIFY: путь/параметры delete.
-        self._call("delete", {"serverid": external_id})
+        """POST /api/action/deleteServer {serverid}."""
+        self._call("POST", "/action/deleteServer", {"serverid": external_id})
+
+    def reboot_server(self, external_id: str) -> None:
+        self._call("POST", "/action/reboot", {"serverid": external_id})
+
+    def renew_server(self, external_id: str) -> None:
+        """POST /api/action/continueServer — продлить на месяц."""
+        self._call("POST", "/action/continueServer", {"serverid": external_id})
 
     def list_regions(self) -> list[str]:
         """Protocol-метод: id датацентров строками."""
-        return [str(d.get("id") or d.get("datacenter") or "") for d in self.list_datacenters() if d]
+        return [str(d["id"]) for d in self.list_datacenters() if d.get("id")]
 
     # ---- offerings (для admin-формы заказа) ----
 
     def list_datacenters(self) -> list[dict]:
-        return _as_items(self._call("datacenters", {}))
+        """GET /api/getDcList → data.dcList {id: {dc_name, cpu_name, flag, ...}}."""
+        data = self._call("GET", "/getDcList", {})
+        dc_list = (data or {}).get("dcList") or {}
+        out: list[dict] = []
+        for key, dc in dc_list.items() if isinstance(dc_list, dict) else []:
+            if not isinstance(dc, dict):
+                continue
+            out.append(
+                {
+                    "id": dc.get("id") or _to_int(key),
+                    "name": dc.get("dc_name") or dc.get("t_name") or str(key),
+                    "flag": dc.get("flag"),
+                    "cpu_name": dc.get("cpu_name"),
+                }
+            )
+        return out
 
     def list_plans(self) -> list[dict]:
-        return _as_items(self._call("tariffs", {}))
+        """GET /api/getTarifList → data.tarifList. Каждый тариф несёт osList +
+        osNames, поэтому образы для UI берутся прямо отсюда (см. list_images —
+        у 4vps образы зависят от тарифа+ДЦ)."""
+        data = self._call("GET", "/getTarifList", {})
+        tarif_list = (data or {}).get("tarifList") or {}
+        out: list[dict] = []
+        for key, t in tarif_list.items() if isinstance(tarif_list, dict) else []:
+            if not isinstance(t, dict):
+                continue
+            os_names = t.get("osNames") or {}
+            out.append(
+                {
+                    "id": t.get("id") or _to_int(key),
+                    "name": t.get("nameFull") or t.get("name") or str(key),
+                    "price": _to_float(t.get("price")),
+                    "cpu": t.get("cpu_number"),
+                    "ram_mib": t.get("ram_mib"),
+                    "rom": t.get("rom"),
+                    # образы этого тарифа: [{id, name}] из osNames
+                    "images": [
+                        {"id": _to_int(oid), "name": oname}
+                        for oid, oname in os_names.items()
+                    ]
+                    if isinstance(os_names, dict)
+                    else [],
+                }
+            )
+        return out
 
-    def list_images(self) -> list[dict]:
-        return _as_items(self._call("images", {}))
+    def list_images(self, tarif: str | int | None = None, dc: str | int | None = None) -> list[dict]:
+        """GET /api/getImages/{TARIF_ID}/{DC_ID} → data.images {id: name}.
+        У 4vps образы зависят от тарифа+ДЦ. Без них вернём []: образы для UI
+        берутся из list_plans()[].images (osNames). offerings зовёт без
+        аргументов — отдаём [], плюс осведомляем в эпике."""
+        if tarif is None or dc is None:
+            return []
+        data = self._call("GET", f"/getImages/{tarif}/{dc}", {})
+        images = (data or {}).get("images") or {}
+        if isinstance(images, dict):
+            return [{"id": _to_int(k), "name": v} for k, v in images.items()]
+        return []
 
     # ---------- helpers ----------
 
-    def _extract_ip(self, info: dict) -> str:
-        ip_list = info.get("ipList") or info.get("iplist") or []
-        if isinstance(ip_list, list) and ip_list:
-            first = ip_list[0]
-            if isinstance(first, dict):
-                return str(first.get("ip") or first.get("address") or "") or ""
-            return str(first or "")
-        si = info.get("serverInfo") or {}
-        return str(si.get("ip") or si.get("ipv4") or info.get("ip") or "") or ""
-
-    def _wait_ip(self, server_id: str) -> str:
-        """Поллим #getServers, пока у сервера не появится IP. VERIFY: форма
-        ответа getServers и поле IP."""
+    def _wait_active(self, server_id: str) -> tuple[str, str, dict]:
+        """Поллим /myservers, пока сервер не получит IP и status=active.
+        Возвращаем (ipv4, last_status, server_dict)."""
         deadline = time.time() + _POLL_TIMEOUT
+        last_status = ""
+        last_srv: dict = {}
         while time.time() < deadline:
             try:
-                data = self._call("servers", {})
+                data = self._call("GET", "/myservers", {})
             except DriverError:
                 time.sleep(_POLL_INTERVAL)
                 continue
-            for srv in _as_items(data):
-                if str(srv.get("serverid") or srv.get("id") or "") == server_id:
-                    ip = str(srv.get("ip") or srv.get("ipv4") or "")
-                    if ip:
-                        return ip
+            for srv in (data or {}).get("serverlist") or []:
+                if str(srv.get("id") or "") == server_id:
+                    last_srv = srv
+                    last_status = str(srv.get("status") or "")
+                    ipv4 = str(srv.get("ipv4") or "")
+                    if ipv4 and last_status.lower() == "active":
+                        return ipv4, last_status, srv
+                    # IP уже есть, но статус ещё не active — подождём ещё.
+                    break
             time.sleep(_POLL_INTERVAL)
-        return ""
+        # таймаут — отдадим что есть (IP мог появиться без active)
+        return str(last_srv.get("ipv4") or ""), last_status, last_srv
 
-    def _call(self, method_key: str, params: dict) -> dict | list:
-        http, path = _METHODS[method_key]
-        auth = {_AUTH_KEY_PARAM: self._apikey}
-        if self._panel_id:
-            auth[_AUTH_PANEL_PARAM] = self._panel_id
-        merged = {**auth, **params}
+    def _call(self, method: str, path: str, params: dict) -> dict | list:
+        # panel_id шлём всегда (где взаимодействие с панелью — он нужен; где не
+        # нужен — безвреден). apikey — в Authorization-хедере (см. __init__).
+        merged = dict(params)
+        if self._panel_id and "panel_id" not in merged:
+            merged["panel_id"] = self._panel_id
         try:
-            if http == "GET":
+            if method == "GET":
                 resp = self._session.get(
                     f"{_BASE}{path}", params=merged, timeout=_TIMEOUT
                 )
@@ -224,41 +255,33 @@ class FourVpsDriver:
                     f"{_BASE}{path}", data=merged, timeout=_TIMEOUT
                 )
         except requests.RequestException as exc:
-            raise DriverError(f"4vps {method_key} request failed: {exc}") from exc
+            raise DriverError(f"4vps {method} {path} failed: {exc}") from exc
         try:
             payload = resp.json()
         except ValueError:
             payload = {"raw": resp.text}
         if resp.status_code >= 400:
-            raise DriverError(
-                f"4vps {method_key} -> {resp.status_code}: {payload}"
-            )
-        # 4vps-конверт: {"error": bool, "data": ..., "errorMessage": str}
+            raise DriverError(f"4vps {method} {path} -> {resp.status_code}: {payload}")
+        # Конверт {"error": bool, "data": ..., "errorMessage": str|dict}
         if isinstance(payload, dict) and payload.get("error"):
-            raise DriverError(
-                f"4vps {method_key} error: {payload.get('errorMessage') or payload}"
-            )
+            msg = payload.get("errorMessage")
+            if isinstance(msg, dict):  # напр. {redirect, message}
+                msg = msg.get("message") or msg
+            raise DriverError(f"4vps {path} error: {msg or payload}")
         if isinstance(payload, dict) and "data" in payload:
             return payload["data"]
         return payload
 
 
-def _as_items(data) -> list[dict]:
-    """Нормализует разнородный ответ (list / {items:[...]} / dict) в list[dict]."""
-    if isinstance(data, list):
-        return [d for d in data if isinstance(d, dict)]
-    if isinstance(data, dict):
-        if isinstance(data.get("items"), list):
-            return [d for d in data["items"] if isinstance(d, dict)]
-        # dict вида {id: {...}} → значения
-        vals = [v for v in data.values() if isinstance(v, dict)]
-        if vals:
-            return vals
-    return []
-
-
 def _to_float(v) -> float | None:
     try:
         return float(v) or None
+    except (TypeError, ValueError):
+        return None
+
+
+def _to_int(v) -> int | None:
+    try:
+        return int(v)
     except (TypeError, ValueError):
         return None

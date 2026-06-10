@@ -242,6 +242,10 @@ class VPNNode(Base):
     provider_region = Column(String, nullable=True)
     provider_plan = Column(String, nullable=True)
     monthly_cost = Column(Numeric(10, 2), nullable=True)
+    # Рут-пароль, выданный хостером при заказе (Fernet). Только для провайдеров
+    # без инъекции SSH-ключа (4vps): нужен для first-connect SSH перед
+    # установкой нашего ключа. NULL у key-based провайдеров. См. node_spawner.
+    provider_root_password_enc = Column(Text, nullable=True)
 
     # Mute-флаг для smart-диагностики и Telegram-алертов на эту ноду.
     # NULL = всё работает (default). Timestamp = оператор выключил

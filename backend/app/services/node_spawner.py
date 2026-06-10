@@ -257,6 +257,11 @@ def spawn_node(
         provider_region=server.region,
         provider_plan=server.plan,
         monthly_cost=server.monthly_cost,
+        # Хостеры без инъекции SSH-ключа (4vps) отдают рут-пароль при заказе —
+        # храним зашифрованным для SSH-bootstrap'а (см. эпик, Фаза 1.5).
+        provider_root_password_enc=(
+            encrypt(server.root_password) if server.root_password else None
+        ),
         notes=notes,
         health_score=100,
         last_health_check_at=utcnow(),

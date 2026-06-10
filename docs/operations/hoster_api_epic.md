@@ -42,15 +42,27 @@
 
 ## Фазы
 
-### Фаза 1 — API-клиент + заказ/переустановка из админ-API ⏳ (в работе)
+### Фаза 1 — API-клиент + заказ/переустановка из админ-API ✅ (spec подтверждён по доке)
 - [x] `CloudProviderKind.fourvps`, миграция `0044` (`ALTER TYPE … ADD VALUE '4vps'`).
-- [x] `FourVpsDriver` — каркас: session, `_request` (4vps-конверт `{error,data,errorMessage}`), poll-IP, маппинг в `CloudServer`. Точные пути/имена параметров вынесены в **один блок `_API`** (см. «Чек-лист спека» — нужно подтвердить по доке).
-- [x] `reinstall_server` (известен точно: `POST /api/action/reinstall` `{serverid, ostempl, password}`).
-- [x] `get_driver()` → `FourVpsDriver`.
-- [x] `reinstall_node()` в `node_spawner` + `POST /nodes/{id}/reinstall`.
-- [x] `list_plans/list_images` + `GET /cloud/providers/{id}/offerings`.
-- [ ] **Подтвердить wire-спек по доке** (см. чек-лист) и довести `order`/`getTariffs`/`getDatacenters`/`getImages`/`delete`.
-- [ ] Боевой smoke: завести `CloudProvider(kind=4vps)`, дёрнуть offerings, заказать тест-ноду, дождаться `active`, снести.
+- [x] `FourVpsDriver` финализирован по официальной доке (PDF): Bearer-хедер + `panel_id`, конверт `{error,data,errorMessage}`, реальные пути (`/getDcList`, `/getTarifList`, `/getImages/{tarif}/{dc}`, `/action/buyServer`, `/myservers`, `/action/deleteServer`, `/action/reinstall`, `/action/reboot`, `/action/continueServer`).
+- [x] `create_server`: `buyServer` отдаёт только `{serverid, password}` (БЕЗ IP) → поллим `/myservers` до `status=active`+`ipv4`. Пароль (4vps не инжектит SSH-ключ) → `CloudServer.root_password` → `VPNNode.provider_root_password_enc` (Fernet, миграция `0045`).
+- [x] `reinstall_server` (`POST /api/action/reinstall {serverid, ostempl, password}`).
+- [x] `get_driver()` → `FourVpsDriver`; `reinstall_node()` + `POST /nodes/{id}/reinstall`.
+- [x] `list_datacenters/list_plans/list_images` + `GET /cloud/providers/{id}/offerings`. NB: у 4vps образы зависят от тарифа+ДЦ → отдаются внутри `list_plans()[].images` (из `osNames`); `list_images()` без аргументов = `[]`.
+- [ ] Боевой smoke: завести `CloudProvider(kind=4vps, api_token="panel_id:apikey")`, дёрнуть offerings, заказать тест-ноду, дождаться `active`, снести. (Нужен реальный ключ + баланс; заказ списывает деньги.)
+
+### Фаза 1.5 — SSH-bootstrap для key-less провайдеров (4vps) ⏳ КРИТИЧНО для «разворачивать инфру»
+4vps `buyServer` НЕ принимает SSH-ключ — свежий сервер поднимается только с
+root + паролем (его отдаёт API, мы храним в `provider_root_password_enc`).
+Ansible же ходит на ноды по КЛЮЧУ (`provisioning_key`) — значит bootstrap не
+подключится, пока ключ не установлен. Нужно:
+- `ansible_runner`/inventory: для нод с `provider_root_password_enc` (и пока ключ
+  не подтверждён рабочим) — first-connect по паролю (`ansible_password` + sshpass
+  в worker-образе), затем `bootstrap_node` кладёт наш pubkey в `authorized_keys`.
+- После успешной установки ключа — последующие прогоны по ключу (как сейчас);
+  пароль можно занулить или оставить для аварийного доступа.
+- Альтернатива: ставить ключ через VM-панель/`getVmLink` — менее автоматизируемо.
+Без этой фазы «заказ» работает, а авто-bootstrap 4vps-ноды — нет.
 
 ### Фаза 2 — Admin UI «Заказать ноду» (UI-часть, явно одобрена)
 - Форма в `admin/src/pages/Nodes.tsx`: провайдер → (offerings) локация/тариф/ОС → pool/SNI → «Заказать». Прогресс через существующий tasks-поллинг; нода появляется в списке как `registering` → `active`.
@@ -67,20 +79,33 @@
 
 ---
 
-## Чек-лист спека (нужно подтвердить по доке — фетчер 4vps.su заблокирован)
+## Спек 4vps (подтверждён по официальной доке, PDF)
 
-Достоверно известно из публичного поиска:
-- Переустановка: `POST https://4vps.su/api/action/reinstall` `{serverid:int, ostempl:int, password:str(≥6)}` → `{"error":false,"data":"ok"}`; ошибка → `{"error":true,"errorMessage":"…","data":false}`.
-- Заказ: параметр `period ∈ [720,2160,4320,8640]` (1/3/6/12 мес), опц. домен. Ответ содержит `serverInfo`, `dcInfo`, `ipPrice`, `ipList`.
-- Auth: `apikey` + `panel_id` в каждом запросе (GET/POST-параметр или JSON-тело).
-- Методы: `getBalance`, `getDatacenters`, `getTariffs`, `getImages`, `order`, заказ IP, `enable/disable/reboot`, `renewal`, `delete`, `reinstall`, смена тарифа.
+База: `https://4vps.su/api`. Auth: `Authorization: Bearer <apikey>` (хедер) +
+`panel_id` параметром (где взаимодействие с панелью). Конверт ответа:
+`{"error": bool, "data": ..., "errorMessage": str|dict}`.
 
-**Нужно подтвердить (иначе `order`/list-методы — на допущениях):**
-1. Точное имя auth-параметра ключа (`apikey`? `api_key`?) и нужен ли `panel_id` всегда.
-2. Базовый префикс info-методов: `/api/info/getTariffs` vs `/api/getTariffs` vs `/api/action/getTariffs`.
-3. `order` — полный список параметров (имена `tariff`/`datacenter`/`ostempl`/`password`/`period`/SSH-ключ/домен?) и **где в ответе `serverid` и IP** (в `serverInfo`? `ipList`?), приходит ли IP сразу или нужен поллинг `getServers`.
-4. `getTariffs`/`getDatacenters`/`getImages` — форма ответа (имена полей id/name/price/cpu/ram).
-5. `delete` — путь и параметры (`POST /api/action/delete {serverid}`?).
-6. `getServers`/детали сервера — как получить IP/статус по `serverid` после заказа.
+| Метод | HTTP | URL | Параметры | Ответ (data) |
+|-------|------|-----|-----------|--------------|
+| Баланс | GET | `/userBalance` | — | `{userBalance}` |
+| Дата-центры | GET | `/getDcList` | — | `{dcList:{id:{dc_name,cpu_name,flag,…,id}}}` |
+| Тарифы | GET | `/getTarifList` | — | `{tarifList:{id:{…,osList,osNames}}}` |
+| Образы | GET | `/getImages/{TARIF}/{DC}` | path | `{images:{id:name}}` |
+| **Заказ** | POST | `/action/buyServer` | `tarif,datacenter,ostempl,name,domain?,period?` | `{serverid,password}` (БЕЗ IP) |
+| Мои серверы | GET | `/myservers` | — | `{serverlist:[{id,name,ipv4,status,tid,dc,price,…}]}` |
+| Инфо о сервере | GET | `/getServerInfo/{ID}` | path | `{serverInfo,dcInfo,ipPrice,ipList}` |
+| Переустановка | POST | `/action/reinstall` | `serverid,ostempl,password` | `"ok"` |
+| Удаление | POST | `/action/deleteServer` | `serverid` | `"ok"` |
+| Перезагрузка | POST | `/action/reboot` | `serverid` | `"ok"` |
+| Продление | POST | `/action/continueServer` | `serverid` | `"ok"` |
+| Смена тарифа | POST | `/action/changeTarif` | `serverid,preset` | `"ok"` |
+| Панели (публ.) | GET | `/public/getPanelIds` / `/public/getPanels` | — | список ID/панелей |
 
-Всё перечисленное локализовано в `fourvps.py` в блоке `_API` и помечено `# VERIFY`.
+Заказ может вернуть ошибку-объект: верификация профиля (`/Api/verif`) или
+нехватка средств (`/Api/deposit/...`) — драйвер разворачивает `errorMessage.message`.
+
+Реализовано в `fourvps.py` (без `# VERIFY` — спек закрыт). Период аренды:
+`[720,2160,4320,8640]` = 1/3/6/12 мес (дефолт 720). Образы зависят от тарифа+ДЦ
+(`getImages/{tarif}/{dc}`), для UI отдаются внутри `list_plans()[].images`.
+
+**Остаток:** SSH-bootstrap (Фаза 1.5) — `buyServer` не инжектит ключ.
