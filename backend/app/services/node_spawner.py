@@ -296,3 +296,48 @@ def destroy_node(db: Session, node: models.VPNNode) -> None:
     node.updated_at = utcnow()
     db.add(node)
     db.commit()
+
+
+def reinstall_node(
+    db: Session, node: models.VPNNode, *, image: str | None = None,
+    password: str | None = None,
+) -> tuple[models.VPNNode, models.ProvisioningTask]:
+    """Переустановить ОС на ноде через API провайдера, затем заново
+    прокатить site.yml (reinstall стирает диск — клиентов на ноде не остаётся,
+    бэк их пере-провижинит через bootstrap). IP сохраняется, поэтому VPNConfig
+    (reality-ключи, sub-токены) и так валидны — нода вернётся той же.
+
+    Провайдер обязан уметь ``reinstall_server`` (capability-проверка через
+    hasattr; напр. 4vps умеет, manual — нет)."""
+    if not node.provider_id or not node.provider_external_id:
+        raise NodeSpawnError("Node has no attached cloud provider; cannot reinstall")
+    provider = db.get(models.CloudProvider, node.provider_id)
+    if not provider:
+        raise NodeSpawnError("CloudProvider record missing")
+    driver = get_driver(provider)
+    if not hasattr(driver, "reinstall_server"):
+        raise NodeSpawnError(
+            f"Provider {provider.kind} driver does not support OS reinstall"
+        )
+    img = image or provider.default_image or "ubuntu-22.04"
+    try:
+        driver.reinstall_server(node.provider_external_id, img, password=password)
+    except DriverError as exc:
+        raise NodeSpawnError(str(exc)) from exc
+
+    # Свежая ОС → нода ещё не настроена. Возвращаем в registering и заново
+    # катим bootstrap (site.yml) — ansible-ретраи дождутся, пока SSH поднимется.
+    node.status = models.VPNNodeStatus.registering
+    node.updated_at = utcnow()
+    db.add(node)
+    db.commit()
+    db.refresh(node)
+
+    orchestrator = ProvisioningOrchestrator(db)
+    task, _created = orchestrator.create_or_coalesce_node_bootstrap(
+        node, {"reinstall": True, "image": img}, defer_to_reconciler=False
+    )
+    db.commit()
+    if _created:
+        orchestrator.run_task_async(task, node=node)
+    return node, task

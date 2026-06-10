@@ -847,6 +847,19 @@ class NodeSpawnRequest(BaseModel):
     notes: str | None = None
 
 
+class NodeReinstallRequest(BaseModel):
+    # OS template/image id для провайдера (4vps: ostempl). None → default_image.
+    image: str | None = None
+
+
+class ProviderOfferingsOut(BaseModel):
+    # Наполнение admin-формы заказа. Списки сырые-нормализованные (id+name+…)
+    # из driver.list_datacenters/list_plans/list_images.
+    datacenters: list[dict] = []
+    plans: list[dict] = []
+    images: list[dict] = []
+
+
 class ProvisioningTaskOut(BaseModel):
     id: int
     target_type: str

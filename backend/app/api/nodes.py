@@ -25,7 +25,12 @@ from ..services.ansible_runner import (
     validate_node_name,
 )
 from ..services.health import recompute_node_health
-from ..services.node_spawner import NodeSpawnError, destroy_node, spawn_node
+from ..services.node_spawner import (
+    NodeSpawnError,
+    destroy_node,
+    reinstall_node,
+    spawn_node,
+)
 from ..services.provisioning import ProvisioningOrchestrator
 from ._common import (
     ADMIN_ACTOR_HEADER,
@@ -1527,6 +1532,36 @@ def destroy_node_route(
     actor, actor_type = _resolve_admin_actor(admin_actor)
     _audit(db, actor, "node_destroyed", "vpn_node", node.id, actor_type=actor_type)
     return {"node_id": node.id, "status": node.status.value}
+
+
+@router.post("/nodes/{node_id}/reinstall", response_model=schemas.VPNNodeOut)
+def reinstall_node_route(
+    node_id: int,
+    payload: schemas.NodeReinstallRequest,
+    db: Session = Depends(get_db),
+    admin_token: str = Depends(require_admin),
+    admin_actor: str | None = Header(default=None, alias=ADMIN_ACTOR_HEADER),
+):
+    """Переустановить ОС на cloud-ноде через API провайдера и заново прокатить
+    site.yml. IP сохраняется → reality-ключи и sub-токены остаются валидными."""
+    node = db.get(models.VPNNode, node_id)
+    if not node:
+        raise HTTPException(status_code=404, detail="Node not found")
+    try:
+        node, _task = reinstall_node(db, node, image=payload.image)
+    except NodeSpawnError as exc:
+        raise HTTPException(status_code=502, detail=f"reinstall failed: {exc}") from exc
+    actor, actor_type = _resolve_admin_actor(admin_actor)
+    _audit(
+        db,
+        actor,
+        "node_reinstalled",
+        "vpn_node",
+        node.id,
+        actor_type=actor_type,
+        metadata={"image": payload.image},
+    )
+    return schemas.VPNNodeOut.from_orm(node)
 
 
 @router.delete("/nodes/{node_id}", status_code=200)

@@ -115,6 +115,9 @@ class CloudProviderKind(str, enum.Enum):
     vultr = "vultr"
     digitalocean = "digitalocean"
     aeza = "aeza"
+    # 4vps.su (он же 4vds) — RU-хостер. Python-имя fourvps (нельзя начинать с
+    # цифры), wire-значение "4vps". Кредсы: api_token_enc хранит "panel_id:apikey".
+    fourvps = "4vps"
     manual = "manual"
 
 
