@@ -67,6 +67,18 @@ class CloudDriver(Protocol):
         """OS-образы провайдера: ``[{id, name, ...}]``."""
         ...
 
+    def get_balance(self) -> float | None:
+        """Текущий баланс аккаунта у провайдера (единицы — как у провайдера)."""
+        ...
+
+    def renew_server(self, external_id: str) -> None:
+        """Продлить аренду сервера (списывает с баланса)."""
+        ...
+
+    def set_autoprolong(self, external_id: str, enabled: bool = True) -> bool:
+        """Вкл/выкл авто-продление на стороне провайдера. Возвращает состояние."""
+        ...
+
 
 def get_driver(provider: models.CloudProvider) -> CloudDriver:
     """Instantiate a driver for the given provider record."""

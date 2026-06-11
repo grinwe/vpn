@@ -142,8 +142,27 @@ class FourVpsDriver:
         self._call("POST", "/action/reboot", {"serverid": external_id})
 
     def renew_server(self, external_id: str) -> None:
-        """POST /api/action/continueServer — продлить на месяц."""
+        """POST /api/action/continueServer — продлить на месяц (списывает с баланса)."""
         self._call("POST", "/action/continueServer", {"serverid": external_id})
+
+    def get_balance(self) -> float | None:
+        """GET /api/userBalance → data.userBalance. Единицы — как у 4vps
+        (в копейках; price тарифов — в рублях). Возвращаем сырое число."""
+        data = self._call("GET", "/userBalance", {})
+        return _to_float((data or {}).get("userBalance"))
+
+    def set_autoprolong(self, external_id: str, enabled: bool = True) -> bool:
+        """Включить/выключить авто-продление. 4vps `/action/autoprolong` —
+        ТОГГЛ: возвращает НОВОЕ состояние (data: true/false). Дёргаем и, если
+        состояние не совпало с желаемым, дёргаем второй раз. Возвращает
+        итоговое состояние."""
+        state = False
+        for _ in range(2):
+            data = self._call("POST", "/action/autoprolong", {"serverid": external_id})
+            state = bool(data)
+            if state == enabled:
+                return state
+        return state
 
     def list_regions(self) -> list[str]:
         """Protocol-метод: id датацентров строками."""

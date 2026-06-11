@@ -96,3 +96,7 @@ deploy_app_stack_reconcile_retry_s: 60
 # Watchdog: WARNING в логах, если самая старая dirty-нода просрочена дольше
 # (run_reconcile_tick также экспортит pending/overdue гейджи для алертов).
 deploy_app_stack_reconcile_overdue_warn_s: 120
+# Cloud-billing guard: интервал тика (сек) + порог алерта по балансу
+# провайдера (единицы как у провайдера; 0 = алерты выкл, только gauge).
+deploy_app_stack_cloud_billing_interval: 3600
+deploy_app_stack_cloud_balance_alert_threshold: 0

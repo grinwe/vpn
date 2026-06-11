@@ -209,6 +209,7 @@ TICK_IDS = {
     "app.worker.run_broadcast_dispatch_tick": "tick-broadcast-dispatch",
     "app.worker.run_operator_report_watch_tick": "tick-operator-report-watch",
     "app.worker.run_reconcile_tick": "tick-reconcile",
+    "app.worker.run_cloud_billing_tick": "tick-cloud-billing",
 }
 
 # Per-tick hard timeouts. Без них зависшая SSH (traffic-stats,
@@ -236,6 +237,8 @@ TICK_TIMEOUTS = {
     # DB-only — находит due-ноды и диспатчит coalesced bootstrap'ы (сам ansible
     # не гоняет). Быстрый, но cap на всякий.
     "tick-reconcile": 60,
+    # HTTP к API провайдеров (balance) — несколько провайдеров последовательно.
+    "tick-cloud-billing": 120,
 }
 
 

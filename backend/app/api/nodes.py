@@ -29,6 +29,7 @@ from ..services.node_spawner import (
     NodeSpawnError,
     destroy_node,
     reinstall_node,
+    renew_node,
     spawn_node,
 )
 from ..services.provisioning import ProvisioningOrchestrator
@@ -1562,6 +1563,28 @@ def reinstall_node_route(
         metadata={"image": payload.image},
     )
     return schemas.VPNNodeOut.from_orm(node)
+
+
+@router.post("/nodes/{node_id}/renew")
+def renew_node_route(
+    node_id: int,
+    db: Session = Depends(get_db),
+    admin_token: str = Depends(require_admin),
+    admin_actor: str | None = Header(default=None, alias=ADMIN_ACTOR_HEADER),
+):
+    """Принудительно продлить аренду cloud-ноды у провайдера (списывает с
+    баланса). Обычно продление автоматическое (autoprolong, включается при
+    заказе) — это ручной путь на случай выключенного autoprolong."""
+    node = db.get(models.VPNNode, node_id)
+    if not node:
+        raise HTTPException(status_code=404, detail="Node not found")
+    try:
+        renew_node(db, node)
+    except NodeSpawnError as exc:
+        raise HTTPException(status_code=502, detail=f"renew failed: {exc}") from exc
+    actor, actor_type = _resolve_admin_actor(admin_actor)
+    _audit(db, actor, "node_renewed", "vpn_node", node.id, actor_type=actor_type)
+    return {"node_id": node.id, "renewed": True}
 
 
 @router.delete("/nodes/{node_id}", status_code=200)

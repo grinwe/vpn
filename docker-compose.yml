@@ -161,6 +161,11 @@ services:
       ANSIBLE_PLAYBOOK_TIMEOUT: ${ANSIBLE_PLAYBOOK_TIMEOUT:-300}
       RENEWAL_CHECK_INTERVAL: ${RENEWAL_CHECK_INTERVAL:-300}
       RENEWAL_GRACE_HOURS: ${RENEWAL_GRACE_HOURS:-24}
+      # Cloud-billing guard: баланс провайдеров + стоимость флота. Порог
+      # алерта 0 = алерты выкл (только gauge). Единицы баланса — как у
+      # провайдера (4vps: копейки). CLOUD_BILLING_INTERVAL=0 → тик выкл.
+      CLOUD_BILLING_INTERVAL: ${CLOUD_BILLING_INTERVAL:-3600}
+      CLOUD_BALANCE_ALERT_THRESHOLD: ${CLOUD_BALANCE_ALERT_THRESHOLD:-0}
       # Stage 2.5 — warm credential pool. Worker tops up each active
       # node to WARM_POOL_TARGET bundles every WARM_POOL_CHECK_INTERVAL
       # seconds, capped to WARM_POOL_BATCH_PER_TICK provisions per node

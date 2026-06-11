@@ -60,6 +60,104 @@ RECONCILE_OLDEST_OVERDUE = Gauge(
     "Age (s) of the oldest overdue (due_at<=now) pending-reconcile node",
 )
 
+# Cloud billing gauges — set each cloud-billing tick.
+PROVIDER_BALANCE = Gauge(
+    "vpn_cloud_provider_balance",
+    "Account balance at a cloud provider (units per provider)",
+    ["provider"],
+)
+FLEET_MONTHLY_COST = Gauge(
+    "vpn_fleet_monthly_cost",
+    "Sum of monthly_cost over active VPN nodes",
+)
+
+
+def run_cloud_billing_tick() -> dict:
+    """Periodic billing guard for cloud-provisioned fleet:
+    * per active CloudProvider — pull balance → gauge + low-balance admin alert;
+    * export fleet monthly-cost gauge.
+
+    Авто-продление само живёт на стороне провайдера (4vps autoprolong,
+    включается при spawn) — этот тик СТРАЖ, чтобы баланс не иссяк молча и ноды
+    не удалились в конце периода. Self-reschedules. No-op без cloud-провайдеров.
+    """
+    from sqlalchemy import func as sa_func
+
+    from . import models
+    from .db import SessionLocal
+    from .queue import schedule_tick
+    from .services.admin_notify import notify_admins
+    from .services.cloud.base import DriverError, get_driver
+
+    interval = int(os.getenv("CLOUD_BILLING_INTERVAL", "3600"))
+    if interval > 0:
+        try:
+            schedule_tick(
+                "app.worker.run_cloud_billing_tick",
+                interval,
+                tick_id="tick-cloud-billing",
+                replace=True,
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("cloud-billing: failed to re-enqueue tick")
+
+    threshold = float(os.getenv("CLOUD_BALANCE_ALERT_THRESHOLD", "0"))
+    session = SessionLocal()
+    checked = 0
+    alerts = 0
+    try:
+        providers = (
+            session.query(models.CloudProvider)
+            .filter(models.CloudProvider.is_active.is_(True))
+            .all()
+        )
+        for p in providers:
+            try:
+                driver = get_driver(p)
+            except DriverError:
+                continue
+            if not hasattr(driver, "get_balance"):
+                continue
+            try:
+                bal = driver.get_balance()
+            except DriverError as exc:
+                logger.warning(
+                    "cloud-billing: balance fetch failed for %s: %s", p.name, exc
+                )
+                continue
+            checked += 1
+            if bal is None:
+                continue
+            PROVIDER_BALANCE.labels(provider=p.name).set(bal)
+            if threshold > 0 and bal < threshold:
+                alerts += 1
+                notify_admins(
+                    session,
+                    kind="cloud_balance_low",
+                    text=(
+                        f"⚠️ Низкий баланс у облачного провайдера {p.name}: "
+                        f"{bal}. Ноды могут не продлиться (autoprolong) — "
+                        f"пополни баланс."
+                    ),
+                    dedup_key={"provider_id": p.id},
+                    autocommit=True,
+                )
+        total = (
+            session.query(
+                sa_func.coalesce(sa_func.sum(models.VPNNode.monthly_cost), 0)
+            )
+            .filter(models.VPNNode.is_active.is_(True))
+            .scalar()
+        ) or 0
+        FLEET_MONTHLY_COST.set(float(total))
+        return {
+            "providers_checked": checked,
+            "alerts": alerts,
+            "fleet_monthly_cost": float(total),
+        }
+    finally:
+        session.close()
+
 
 def run_pending_rescue_tick() -> dict:
     """Periodic self-heal — re-enqueue provisioning tasks that are stuck.
@@ -2248,6 +2346,25 @@ def main() -> None:
             logger.info("Renewal check bootstrapped: first run in 60s (interval=%ss)", renewal_interval)
         except Exception:  # noqa: BLE001
             logger.exception("Failed to schedule renewal check")
+
+    # Schedule cloud-billing guard (default: every hour). Pulls provider
+    # balance (gauge + low-balance alert) + fleet monthly-cost gauge. No-op
+    # без cloud-провайдеров. CLOUD_BILLING_INTERVAL=0 → выключить.
+    cloud_billing_interval = int(os.getenv("CLOUD_BILLING_INTERVAL", "3600"))
+    if do_bootstrap and cloud_billing_interval > 0:
+        try:
+            schedule_tick(
+                "app.worker.run_cloud_billing_tick",
+                min(cloud_billing_interval, 120),
+                tick_id="tick-cloud-billing",
+                replace=True,
+            )
+            logger.info(
+                "Cloud-billing guard bootstrapped: first run in 120s (interval=%ss)",
+                cloud_billing_interval,
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("Failed to schedule cloud-billing tick")
 
     # Schedule warm-pool check (default: every 2 min). Stage 2.5 of the
     # WebApp roadmap — keeps each active node's pool topped up so user

@@ -31,6 +31,7 @@ import {
   getProviderOfferings,
   spawnNode,
   reinstallNode,
+  renewNode,
 } from "../api";
 import { HealthDots } from "../linkHealth";
 import { DiagnoseResult } from "../diagnoseResult";
@@ -853,6 +854,14 @@ export default function Nodes() {
     onError: (e: Error) => alert(`Не удалось переустановить ОС: ${e.message}`),
   });
 
+  // Ручное продление аренды cloud-ноды (autoprolong делает это автоматически;
+  // кнопка — на случай выключенного autoprolong / форс-продления).
+  const renew = useMutation({
+    mutationFn: (id: number) => renewNode(id),
+    onSuccess: () => alert("Нода продлена у провайдера."),
+    onError: (e: Error) => alert(`Не удалось продлить: ${e.message}`),
+  });
+
   // Smart delete: walk the 409 → migrate → delete path so admins can
   // remove a node without poking migrate first. Cloud-provisioned nodes
   // still go through /destroy (teardown playbook + VPS deprovision);
@@ -1383,6 +1392,24 @@ export default function Nodes() {
                           title="Переустановить ОС через API провайдера (только cloud-ноды)"
                         >
                           reinstall OS
+                        </button>
+                      )}
+                      {n.provider_id && (
+                        <button
+                          disabled={renew.isPending}
+                          onClick={() => {
+                            if (
+                              confirm(
+                                `Продлить аренду ноды #${n.id} (${n.name}) у провайдера?\n\n` +
+                                  `Спишет с баланса. Обычно продление автоматическое (autoprolong) — нужно лишь если оно выключено.`,
+                              )
+                            )
+                              renew.mutate(n.id);
+                          }}
+                          className="text-xs px-2 py-1 rounded bg-slate-700 hover:bg-slate-600 disabled:opacity-50"
+                          title="Продлить аренду через API провайдера (списывает с баланса)"
+                        >
+                          renew
                         </button>
                       )}
                       <button

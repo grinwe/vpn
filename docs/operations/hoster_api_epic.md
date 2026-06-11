@@ -70,10 +70,21 @@ SSH-ключ** (кладётся в биллинге/панели) — он ав
 - «Уничтожить» — уже был (`deleteNode` → `/destroy` для provider-нод).
 - `api.ts`: `listCloudProviders / getProviderOfferings / spawnNode / reinstallNode` + типы.
 
-### Фаза 3 — Жизненный цикл и автоскейл
-- Подключить 4vps как `autoscale_provider_id`/fallback в пулах (autoscale уже умеет провайдер-цепочку).
-- Биллинг: `monthly_cost` с заказа в `VPNNode.monthly_cost` (уже пишется), агрегаты по флоту.
-- Продление (4vps `renewal`) — тик, который продлевает VPS до истечения, если нода живая.
+### Фаза 3 — Жизненный цикл, продление и биллинг ✅
+- **Автоскейл на 4vps — без кода (конфигурация пула).** Autoscale-тик уже ходит по
+  `[autoscale_provider_id] + autoscale_fallback_provider_ids` → `spawn_node`, а 4vps
+  теперь валидный провайдер. Оператор задаёт у пула `autoscale_provider_id`=4vps,
+  `autoscale_region`=DC-id, `autoscale_plan`=tarif-id, `autoscale_image`=ostempl-id
+  (через существующий `PoolAutoscaleConfig`). Спавн пойдёт на 4vps автоматически.
+- **Авто-продление.** `spawn_node` включает 4vps `autoprolong` при заказе (best-effort)
+  — хостер сам продлевает VPS с баланса, флот не умирает в конце периода. Ручной путь:
+  `renew_node()` + `POST /nodes/{id}/renew` + кнопка «renew» в админке (4vps `continueServer`).
+- **Страж баланса + стоимость флота.** Тик `run_cloud_billing_tick` (`CLOUD_BILLING_INTERVAL`,
+  default 1ч): по каждому активному cloud-провайдеру тянет `get_balance` → gauge
+  `vpn_cloud_provider_balance{provider}` + admin-алерт при балансе ниже
+  `CLOUD_BALANCE_ALERT_THRESHOLD` (0=выкл); суммирует `monthly_cost` активных нод →
+  gauge `vpn_fleet_monthly_cost`. Так баланс не иссякнет молча.
+- Driver += `get_balance`, `set_autoprolong` (тоггл), `renew_server`.
 
 ### Фаза 4 — Два агента (видение, отдельный эпик)
 - **Support-agent**: отвечает юзерам в поддержке (read-only к биллингу/подпискам).

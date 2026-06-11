@@ -270,6 +270,18 @@ def spawn_node(
     db.commit()
     db.refresh(node)
 
+    # Авто-продление на стороне провайдера: чтобы заказанный VPS не удалился в
+    # конце оплаченного периода (флот живёт без ручного continueServer).
+    # Best-effort — не все провайдеры умеют, сбой не должен валить спавн.
+    if hasattr(driver, "set_autoprolong"):
+        try:
+            driver.set_autoprolong(server.external_id, True)
+            logger.info("autoprolong enabled for node %s (%s)", node.id, node.name)
+        except Exception:  # noqa: BLE001
+            logger.warning(
+                "autoprolong enable failed for node %s (ignored)", node.id
+            )
+
     # Auto-provision a VLESS+Reality VPNConfig for this node via the shared
     # helper so manual and automated registration go through the same path.
     ensure_reality_config(db, node, sni=reality_sni, dest=reality_dest)
@@ -346,3 +358,23 @@ def reinstall_node(
     if _created:
         orchestrator.run_task_async(task, node=node)
     return node, task
+
+
+def renew_node(db: Session, node: models.VPNNode) -> None:
+    """Продлить аренду cloud-ноды через API провайдера (continueServer у 4vps).
+    Списывает с баланса. Авто-продление обычно включается при заказе
+    (set_autoprolong), это — ручной/принудительный путь."""
+    if not node.provider_id or not node.provider_external_id:
+        raise NodeSpawnError("Node has no attached cloud provider; cannot renew")
+    provider = db.get(models.CloudProvider, node.provider_id)
+    if not provider:
+        raise NodeSpawnError("CloudProvider record missing")
+    driver = get_driver(provider)
+    if not hasattr(driver, "renew_server"):
+        raise NodeSpawnError(
+            f"Provider {provider.kind} driver does not support renewal"
+        )
+    try:
+        driver.renew_server(node.provider_external_id)
+    except DriverError as exc:
+        raise NodeSpawnError(str(exc)) from exc

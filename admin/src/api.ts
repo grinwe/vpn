@@ -648,6 +648,15 @@ export function reinstallNode(
   return api.post<VPNNodeOut>(`/nodes/${nodeId}/reinstall`, { image });
 }
 
+export function renewNode(
+  nodeId: number,
+): Promise<{ node_id: number; renewed: boolean }> {
+  return api.post<{ node_id: number; renewed: boolean }>(
+    `/nodes/${nodeId}/renew`,
+    {},
+  );
+}
+
 // Протоколы должны быть в синке с VPNConfigProtocol enum в
 // backend/app/models.py — backend ругнётся 400 на неизвестный.
 // shadowtls+shadowsocks и hysteria2 оставлены в типе, так как их всё
