@@ -14,7 +14,7 @@ interface CloudProviderOut {
   created_at: string;
 }
 
-const KINDS = ["hetzner", "vultr", "digitalocean", "aeza", "manual"] as const;
+const KINDS = ["hetzner", "vultr", "digitalocean", "aeza", "4vps", "manual"] as const;
 
 export default function CloudProviders() {
   const qc = useQueryClient();
@@ -186,9 +186,18 @@ function ProviderForm({
           type="password"
           value={apiToken}
           onChange={(e) => setApiToken(e.target.value)}
-          placeholder={isEdit ? "••••••••" : ""}
+          placeholder={
+            kind === "4vps" ? "panel_id:apikey" : isEdit ? "••••••••" : ""
+          }
           className="bg-slate-800 border border-slate-700 rounded px-2 py-1"
         />
+        {kind === "4vps" && (
+          <span className="text-[10px] text-amber-400 mt-1">
+            4vps: формат <code>panel_id:apikey</code> (panel_id из
+            /api/public/getPanelIds, apikey — из ЛК). Регион/тариф/ОС задаются
+            при заказе ноды, тут можно не заполнять.
+          </span>
+        )}
       </label>
       <label className="flex flex-col">
         <span className="text-slate-400 mb-1">Default Region</span>
