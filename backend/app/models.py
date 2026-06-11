@@ -799,6 +799,11 @@ class WGExitNode(Base):
     provider_id = Column(Integer, ForeignKey("cloud_providers.id"), nullable=True)
     provider_external_id = Column(String, nullable=True)
     provider_region = Column(String, nullable=True)
+    # Рут-пароль от облачного провайдера без инъекции SSH-ключа (4vps) — для
+    # bootstrap по паролю (worker кладёт provisioning-ключ перед bootstrap_exit).
+    # Fernet. None если exit заведён вручную / провайдер инжектит ключ. Зеркалит
+    # VPNNode.provider_root_password_enc.
+    provider_root_password_enc = Column(Text, nullable=True)
 
     status = Column(Enum(WGExitNodeStatus), default=WGExitNodeStatus.registering, nullable=False)
     is_active = Column(Boolean, default=True, nullable=False)

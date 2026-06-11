@@ -1,6 +1,13 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { Fragment, useState } from "react";
-import { api, ApiError } from "../api";
+import { Fragment, useEffect, useState, type FormEvent } from "react";
+import {
+  api,
+  ApiError,
+  getProviderOfferings,
+  spawnExit,
+  type OfferingImage,
+  type ProviderOfferings,
+} from "../api";
 import { HealthDots, linkHealth } from "../linkHealth";
 import { WorkerHealthBadge } from "../workerHealth";
 
@@ -36,6 +43,7 @@ interface CloudProviderOut {
   id: number;
   name: string;
   kind: string;
+  is_active: boolean;
 }
 
 interface VPNNodeMini {
@@ -116,6 +124,7 @@ const STATUSES = ["registering", "active", "error", "disabled"] as const;
 export default function Exits() {
   const qc = useQueryClient();
   const [showForm, setShowForm] = useState(false);
+  const [orderCloudOpen, setOrderCloudOpen] = useState(false);
   const [editId, setEditId] = useState<number | null>(null);
   const [expanded, setExpanded] = useState<Set<number>>(new Set());
   const [evacuateFromId, setEvacuateFromId] = useState<number | null>(null);
@@ -238,6 +247,12 @@ export default function Exits() {
             ⇆ Batch attach relay
           </button>
           <button
+            onClick={() => { setOrderCloudOpen((v) => !v); setShowForm(false); }}
+            className="text-sm px-3 py-1 rounded bg-sky-700 hover:bg-sky-600"
+          >
+            {orderCloudOpen ? "Отмена" : "☁ Заказать в облаке"}
+          </button>
+          <button
             onClick={() => { setShowForm(true); setEditId(null); }}
             className="text-sm px-3 py-1 rounded bg-green-700 hover:bg-green-600"
           >
@@ -253,6 +268,10 @@ export default function Exits() {
 
       {isLoading && <div className="text-slate-400">Загрузка…</div>}
       {error && <div className="text-red-400">{(error as Error).message}</div>}
+
+      {orderCloudOpen && (
+        <OrderCloudExitForm onDone={() => setOrderCloudOpen(false)} />
+      )}
 
       {showForm && (
         <ExitForm
@@ -1848,5 +1867,244 @@ function BatchProgressDrawer({
         </div>
       </div>
     </>
+  );
+}
+
+// ☁ Заказать exit-ноду у облачного провайдера — зеркало OrderCloudNodeForm
+// (Nodes.tsx) без pool_id. Зарубежный сервер заводится как WG-exit за РУ-relay
+// (см. диагноз: прямой зарубежный endpoint душит DPI). По умолчанию провайдер —
+// «зарубежный» (4vps, не -ru); тариф/ОС тянутся из live offerings, ОС авто-
+// выбирается Ubuntu 22.04. Нода появляется registering → active, relay цепляешь
+// отдельно.
+function OrderCloudExitForm({ onDone }: { onDone: () => void }) {
+  const qc = useQueryClient();
+  const providersQ = useQuery<CloudProviderOut[]>({
+    queryKey: ["cloud-providers"],
+    queryFn: () => api.get("/cloud/providers"),
+  });
+  const [providerId, setProviderId] = useState<number | null>(null);
+  const [name, setName] = useState("");
+  const [dc, setDc] = useState("");
+  const [plan, setPlan] = useState("");
+  const [image, setImage] = useState("");
+  const [err, setErr] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (providerId == null && providersQ.data?.length) {
+      const actives = providersQ.data.filter((p) => p.is_active);
+      // exit'ы — на «зарубежном» провайдере (4vps, НЕ -ru): exit за РУ-relay,
+      // его IP клиент не видит.
+      const pick =
+        actives.find((p) => !p.name.toLowerCase().includes("ru")) ??
+        actives[0] ??
+        providersQ.data[0];
+      setProviderId(pick.id);
+    }
+  }, [providersQ.data, providerId]);
+
+  const offeringsQ = useQuery<ProviderOfferings>({
+    queryKey: ["provider-offerings", providerId],
+    queryFn: () => getProviderOfferings(providerId as number),
+    enabled: providerId != null,
+  });
+
+  const datacenters = offeringsQ.data?.datacenters ?? [];
+  const plans = offeringsQ.data?.plans ?? [];
+  const selectedPlan = plans.find((p) => String(p.id) === plan);
+  const images: OfferingImage[] =
+    selectedPlan?.images?.length ? selectedPlan.images : offeringsQ.data?.images ?? [];
+
+  useEffect(() => {
+    if (!image && images.length) {
+      const pick =
+        images.find((im) => /ubuntu\s*22\.04/i.test(im.name)) ??
+        images.find((im) => /ubuntu/i.test(im.name)) ??
+        images[0];
+      if (pick?.id != null) setImage(String(pick.id));
+    }
+  }, [images.length, image]);
+
+  const mutation = useMutation({
+    mutationFn: () =>
+      spawnExit({
+        provider_id: providerId as number,
+        name: name.trim(),
+        region: dc.trim(),
+        plan: plan.trim(),
+        image: image.trim() || null,
+      }),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["wg-exits"] });
+      qc.invalidateQueries({ queryKey: ["provisioning-tasks"] });
+      onDone();
+    },
+    onError: (e: Error) =>
+      setErr(e instanceof ApiError ? `${e.status}: ${e.message}` : e.message),
+  });
+
+  function submit(e: FormEvent) {
+    e.preventDefault();
+    setErr(null);
+    if (providerId == null) return setErr("выбери провайдера");
+    if (!name.trim()) return setErr("имя обязательно (kebab-case)");
+    if (!dc.trim()) return setErr("укажи дата-центр");
+    if (!plan.trim()) return setErr("укажи тариф");
+    mutation.mutate();
+  }
+
+  const inputCls = "bg-slate-800 border border-slate-700 rounded px-2 py-1";
+
+  return (
+    <form
+      onSubmit={submit}
+      className="mb-4 p-4 rounded border border-sky-800 bg-slate-900/60 flex flex-col gap-4 text-sm"
+    >
+      <div className="text-sky-300 text-xs font-semibold">
+        ☁ Заказать exit-ноду у облачного провайдера
+      </div>
+      <div className="grid grid-cols-2 gap-3">
+        <label className="flex flex-col">
+          <span className="text-slate-400 text-xs mb-1">Провайдер</span>
+          <select
+            className={inputCls}
+            value={providerId ?? ""}
+            onChange={(e) => {
+              setProviderId(e.target.value ? Number(e.target.value) : null);
+              setDc("");
+              setPlan("");
+              setImage("");
+            }}
+          >
+            <option value="">— выбери —</option>
+            {(providersQ.data ?? []).map((p) => (
+              <option key={p.id} value={p.id} disabled={!p.is_active}>
+                {p.name} ({p.kind}){p.is_active ? "" : " — выкл"}
+              </option>
+            ))}
+          </select>
+        </label>
+        <label className="flex flex-col">
+          <span className="text-slate-400 text-xs mb-1">
+            Имя (уникальное, kebab-case)
+          </span>
+          <input
+            className={`${inputCls} font-mono`}
+            placeholder="fi-exit-01"
+            value={name}
+            onChange={(e) => setName(e.target.value)}
+          />
+        </label>
+
+        <label className="flex flex-col">
+          <span className="text-slate-400 text-xs mb-1">
+            Дата-центр {offeringsQ.isFetching ? "(загрузка…)" : ""}
+          </span>
+          {datacenters.length ? (
+            <select
+              className={inputCls}
+              value={dc}
+              onChange={(e) => setDc(e.target.value)}
+            >
+              <option value="">— выбери —</option>
+              {datacenters.map((d) => (
+                <option key={String(d.id)} value={String(d.id)}>
+                  {d.name} {d.flag ? `[${d.flag}]` : ""} (id {d.id})
+                </option>
+              ))}
+            </select>
+          ) : (
+            <input
+              className={`${inputCls} font-mono`}
+              placeholder="id датацентра"
+              value={dc}
+              onChange={(e) => setDc(e.target.value)}
+            />
+          )}
+        </label>
+
+        <label className="flex flex-col">
+          <span className="text-slate-400 text-xs mb-1">Тариф</span>
+          {plans.length ? (
+            <select
+              className={inputCls}
+              value={plan}
+              onChange={(e) => {
+                setPlan(e.target.value);
+                setImage("");
+              }}
+            >
+              <option value="">— выбери —</option>
+              {plans.map((p) => (
+                <option key={String(p.id)} value={String(p.id)}>
+                  {p.name}
+                  {p.price != null ? ` — ${p.price}₽` : ""}
+                  {p.cpu ? ` · ${p.cpu}vCPU` : ""}
+                  {p.ram_mib ? ` · ${Math.round(p.ram_mib / 1024)}G` : ""}
+                </option>
+              ))}
+            </select>
+          ) : (
+            <input
+              className={`${inputCls} font-mono`}
+              placeholder="id тарифа"
+              value={plan}
+              onChange={(e) => setPlan(e.target.value)}
+            />
+          )}
+        </label>
+
+        <label className="flex flex-col">
+          <span className="text-slate-400 text-xs mb-1">
+            ОС {selectedPlan && !images.length ? "(нет образов у тарифа)" : ""}
+          </span>
+          {images.length ? (
+            <select
+              className={inputCls}
+              value={image}
+              onChange={(e) => setImage(e.target.value)}
+            >
+              <option value="">— дефолт провайдера —</option>
+              {images.map((im) => (
+                <option key={String(im.id)} value={String(im.id)}>
+                  {im.name} (id {im.id})
+                </option>
+              ))}
+            </select>
+          ) : (
+            <input
+              className={`${inputCls} font-mono`}
+              placeholder="ostempl id (необязательно)"
+              value={image}
+              onChange={(e) => setImage(e.target.value)}
+            />
+          )}
+        </label>
+      </div>
+
+      {offeringsQ.error && (
+        <div className="text-amber-400 text-xs">
+          Не удалось загрузить offerings провайдера (
+          {offeringsQ.error instanceof ApiError
+            ? offeringsQ.error.message
+            : String(offeringsQ.error)}
+          ). Можно ввести id вручную.
+        </div>
+      )}
+      {err && <div className="text-red-400 text-xs">{err}</div>}
+
+      <div className="flex items-center gap-3">
+        <button
+          type="submit"
+          disabled={mutation.isPending}
+          className="px-4 py-1.5 rounded bg-sky-600 hover:bg-sky-500 text-sm font-semibold disabled:opacity-50"
+        >
+          {mutation.isPending ? "Заказываем…" : "Заказать и развернуть"}
+        </button>
+        <span className="text-slate-500 text-xs">
+          заказ спишет средства; exit появится как registering → active, relay
+          привяжешь отдельно
+        </span>
+      </div>
+    </form>
   );
 }

@@ -42,7 +42,11 @@ from .shadowtls import (
     generate_shadowtls_password,
     generate_ss_password,
 )
-from .vless import generate_reality_keypair, generate_short_id
+from .vless import (
+    generate_reality_keypair,
+    generate_short_id,
+    generate_wireguard_keypair,
+)
 
 # Reality's "borrowed" SNI. Must be real TLS 1.3 host, НЕ заблокированный
 # в целевом рынке — иначе Reality handshake перестаёт выглядеть легитимным.
@@ -704,3 +708,207 @@ def renew_node(db: Session, node: models.VPNNode) -> None:
         driver.renew_server(node.provider_external_id)
     except DriverError as exc:
         raise NodeSpawnError(str(exc)) from exc
+
+
+# ---------------------------------------------------------------------------
+# Cloud-spawned WG EXIT nodes (зеркало spawn_node_async для зарубежных exit'ов)
+# ---------------------------------------------------------------------------
+
+
+def spawn_exit_async(
+    db: Session,
+    *,
+    provider_id: int,
+    name: str,
+    region: str,
+    plan: str,
+    image: str | None = None,
+    ssh_key_ids: list[str] | None = None,
+    user_data: str | None = None,
+    notes: str | None = None,
+) -> models.WGExitNode:
+    """Неблокирующий заказ облачной EXIT-ноды — зеркало :func:`spawn_node_async`.
+
+    Зарубежный VPS заводится как WG-exit ЗА РУ-relay: клиент его IP не видит,
+    обходя DPI-троттлинг прямого зарубежного endpoint'а (см. диагноз в эпике).
+    Синхронно — быстрый ``order_server`` + сразу фиксируем ``WGExitNode``
+    (is_active=False, placeholder host, external_id, root-пароль, сгенерённый
+    WG-keypair); поллинг IP + ``bootstrap_exit`` уходят в фоновый поток
+    (:func:`_finalize_exit_spawn`). Драйверы без ``order_server`` — заказ
+    целиком в фоне.
+    """
+    provider = db.get(models.CloudProvider, provider_id)
+    if not provider or not provider.is_active:
+        raise NodeSpawnError(f"CloudProvider {provider_id} not found or inactive")
+    try:
+        validate_node_name(name)
+    except InvalidNodeIdentity as exc:
+        raise NodeSpawnError(str(exc)) from exc
+    if db.query(models.WGExitNode).filter(models.WGExitNode.name == name).first():
+        raise NodeSpawnError(f"Exit node {name!r} already exists")
+
+    driver = get_driver(provider)
+    image = image or provider.default_image or "ubuntu-22.04"
+    ssh_key_ids = ssh_key_ids if ssh_key_ids is not None else (provider.ssh_key_ids or [])
+
+    external_id: str | None = None
+    root_password: str | None = None
+    if hasattr(driver, "order_server"):
+        logger.info("Ordering exit %s via %s in %s", name, provider.name, region)
+        try:
+            external_id, root_password = driver.order_server(
+                name=name,
+                region=region,
+                plan=plan,
+                image=image,
+                ssh_key_ids=[str(x) for x in ssh_key_ids] or None,
+                user_data=user_data,
+            )
+        except DriverError as exc:
+            logger.exception("Failed to order exit via %s", provider.name)
+            raise NodeSpawnError(str(exc)) from exc
+
+    public_key, private_key = generate_wireguard_keypair()
+    exit_node = models.WGExitNode(
+        name=name,
+        region=region,
+        host=SPAWN_PLACEHOLDER_HOST,  # реальный IP проставит _finalize_exit_spawn
+        status=models.WGExitNodeStatus.registering,
+        is_active=False,  # вне привязки, пока нет реального IP
+        provider_id=provider.id,
+        provider_external_id=external_id,
+        provider_region=region,
+        provider_root_password_enc=(
+            encrypt(root_password) if root_password else None
+        ),
+        wg_public_key=public_key,
+        wg_private_key_enc=encrypt(private_key),
+        notes=notes,
+    )
+    db.add(exit_node)
+    db.commit()
+    db.refresh(exit_node)
+
+    threading.Thread(
+        target=_finalize_exit_spawn,
+        args=(exit_node.id,),
+        kwargs={
+            "name": name,
+            "region": region,
+            "plan": plan,
+            "image": image,
+            "ssh_key_ids": list(ssh_key_ids) if ssh_key_ids else None,
+            "user_data": user_data,
+        },
+        daemon=True,
+    ).start()
+    return exit_node
+
+
+def _mark_exit_error(session: Session, exit_node: models.WGExitNode) -> None:
+    """Пометить exit error+inactive (заказ не достроился). external_id уже в
+    строке → оператор может снести/переустановить, сирот нет."""
+    exit_node.status = models.WGExitNodeStatus.error
+    exit_node.is_active = False
+    exit_node.updated_at = utcnow()
+    session.add(exit_node)
+    session.commit()
+
+
+def _finalize_exit_spawn(
+    exit_id: int,
+    *,
+    name: str,
+    region: str,
+    plan: str,
+    image: str,
+    ssh_key_ids: list[str] | None,
+    user_data: str | None,
+) -> None:
+    """Фоновая достройка облачной exit-ноды: дождаться IP, проставить host +
+    is_active, дождаться SSH и запустить ``bootstrap_exit.yml``. Зеркало
+    :func:`_finalize_spawn`."""
+    session = SessionLocal()
+    try:
+        exit_node = session.get(models.WGExitNode, exit_id)
+        if not exit_node:
+            logger.error("exit spawn finalize: exit %s vanished", exit_id)
+            return
+        provider = session.get(models.CloudProvider, exit_node.provider_id)
+        if not provider:
+            logger.error("exit spawn finalize: provider for exit %s missing", exit_id)
+            _mark_exit_error(session, exit_node)
+            return
+        driver = get_driver(provider)
+
+        try:
+            if exit_node.provider_external_id and hasattr(driver, "wait_for_ipv4"):
+                ipv4, _cost, _raw = driver.wait_for_ipv4(exit_node.provider_external_id)
+            else:
+                server = driver.create_server(
+                    name=name,
+                    region=region,
+                    plan=plan,
+                    image=image,
+                    ssh_key_ids=[str(x) for x in (ssh_key_ids or [])] or None,
+                    user_data=user_data,
+                )
+                ipv4 = server.ipv4
+                exit_node.provider_external_id = server.external_id
+                if server.root_password:
+                    exit_node.provider_root_password_enc = encrypt(server.root_password)
+        except DriverError:
+            logger.exception("exit spawn finalize: driver failed for exit %s", exit_id)
+            _mark_exit_error(session, exit_node)
+            return
+
+        try:
+            validate_node_identity_fields(exit_node.name, ipv4, 22)
+        except InvalidNodeIdentity:
+            logger.exception(
+                "exit spawn finalize: invalid IPv4 %r for exit %s", ipv4, exit_id
+            )
+            _mark_exit_error(session, exit_node)
+            return
+
+        exit_node.host = ipv4
+        exit_node.is_active = True
+        exit_node.updated_at = utcnow()
+        session.add(exit_node)
+        session.commit()
+        session.refresh(exit_node)
+
+        if exit_node.provider_external_id and hasattr(driver, "set_autoprolong"):
+            try:
+                driver.set_autoprolong(exit_node.provider_external_id, True)
+                logger.info("autoprolong enabled for exit %s (%s)", exit_node.id, name)
+            except Exception:  # noqa: BLE001
+                logger.warning("autoprolong enable failed for exit %s (ignored)", exit_id)
+
+        if _wait_for_ssh(exit_node.host, exit_node.ssh_port or 22):
+            logger.info("exit spawn finalize: SSH up on %s", exit_node.host)
+        else:
+            logger.warning(
+                "exit spawn finalize: SSH on %s not up within wait window — "
+                "enqueuing bootstrap anyway", exit_node.host,
+            )
+
+        orchestrator = ProvisioningOrchestrator(session)
+        task = orchestrator.create_task("exit", exit_node.id, "bootstrap", {})
+        session.commit()
+        orchestrator.run_task_async(task)
+        logger.info(
+            "exit spawn finalize: exit %s got IP %s, bootstrap enqueued", exit_id, ipv4
+        )
+    except Exception:  # noqa: BLE001
+        logger.exception("exit spawn finalize crashed for exit %s", exit_id)
+        if session.is_active:
+            session.rollback()
+        try:
+            exit_node = session.get(models.WGExitNode, exit_id)
+            if exit_node and exit_node.status == models.WGExitNodeStatus.registering:
+                _mark_exit_error(session, exit_node)
+        except Exception:  # noqa: BLE001
+            session.rollback()
+    finally:
+        session.close()

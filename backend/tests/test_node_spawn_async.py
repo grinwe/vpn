@@ -346,3 +346,52 @@ def test_ensure_provisioning_key_no_key_is_falsey(
     monkeypatch.delenv("ANSIBLE_PRIVATE_KEY_FILE", raising=False)
     # нет ключа → не бросает, возвращает False (bootstrap не должен падать)
     assert ssh_bootstrap.ensure_provisioning_key("1.2.3.4", "pw") is False
+
+
+# ── cloud-spawn for WG EXIT nodes (spawn_exit_async) ─────────────────
+
+
+def test_spawn_exit_async_tracks_server_and_generates_wg_keys(
+    db_session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    provider = _make_4vps_provider(db_session)
+    fake_driver = SimpleNamespace(
+        order_server=lambda **kw: ("srv-e1", "exit-root-pw"),
+        wait_for_ipv4=lambda sid: ("5.6.7.8", 6.0, {}),
+        set_autoprolong=lambda sid, enabled=True: enabled,
+    )
+    monkeypatch.setattr(node_spawner, "get_driver", lambda _p: fake_driver)
+
+    started: list[tuple] = []
+
+    class _DummyThread:
+        def __init__(self, *, target, args=(), kwargs=None, daemon=False):
+            self.target = target
+            self.args = args
+
+        def start(self) -> None:
+            started.append((self.target, self.args))
+
+    monkeypatch.setattr(node_spawner.threading, "Thread", _DummyThread)
+
+    exit_node = node_spawner.spawn_exit_async(
+        db_session,
+        provider_id=provider.id,
+        name="fi-exit-1",
+        region="10",
+        plan="13",
+        image="14",
+    )
+
+    # сервер привязан с момента заказа (сирот нет), плейсхолдер до IP
+    assert exit_node.provider_external_id == "srv-e1"
+    assert exit_node.provider_root_password_enc is not None
+    assert exit_node.host == node_spawner.SPAWN_PLACEHOLDER_HOST
+    assert exit_node.is_active is False
+    assert exit_node.status == models.WGExitNodeStatus.registering
+    # WG-keypair сгенерён сразу (нужен для bootstrap_exit)
+    assert exit_node.wg_public_key
+    assert exit_node.wg_private_key_enc
+    # достройка (poll IP → SSH → bootstrap_exit) отложена в фон
+    assert len(started) == 1
+    assert started[0][0] is node_spawner._finalize_exit_spawn

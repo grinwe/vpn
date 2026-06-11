@@ -1847,9 +1847,14 @@ function OrderCloudNodeForm({ onDone }: { onDone: () => void }) {
 
   useEffect(() => {
     if (providerId == null && providersQ.data?.length) {
-      const active =
-        providersQ.data.find((p) => p.is_active) ?? providersQ.data[0];
-      setProviderId(active.id);
+      const actives = providersQ.data.filter((p) => p.is_active);
+      // Ноды по умолчанию — на РУ-провайдере (4vps-ru): сами ноды РУ-расходники,
+      // зарубежные серверы идут в exit'ы (см. Exits → заказ в облаке).
+      const pick =
+        actives.find((p) => p.name.toLowerCase().includes("ru")) ??
+        actives[0] ??
+        providersQ.data[0];
+      setProviderId(pick.id);
     }
   }, [providersQ.data, providerId]);
 

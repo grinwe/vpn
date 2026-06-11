@@ -852,6 +852,19 @@ class NodeReinstallRequest(BaseModel):
     image: str | None = None
 
 
+class ExitSpawnRequest(BaseModel):
+    # Заказ облачной WG-exit-ноды (зеркало NodeSpawnRequest без pool_id —
+    # exit'ы не входят в choose_node-пул).
+    provider_id: int
+    name: str
+    region: str
+    plan: str
+    image: str | None = None
+    ssh_key_ids: list[str] | None = None
+    user_data: str | None = None
+    notes: str | None = None
+
+
 class ProviderOfferingsOut(BaseModel):
     # Наполнение admin-формы заказа. Списки сырые-нормализованные (id+name+…)
     # из driver.list_datacenters/list_plans/list_images.

@@ -92,6 +92,8 @@ denied (publickey,password)`). Поэтому используем то, что 
 - Кнопка «reinstall OS» в строке cloud-ноды (`prompt` ostempl → `POST /nodes/{id}/reinstall`).
 - «Уничтожить» — уже был (`deleteNode` → `/destroy` для provider-нод).
 - `api.ts`: `listCloudProviders / getProviderOfferings / spawnNode / reinstallNode` + типы.
+- **Заказ EXIT-ноды в облаке** ✅ (`OrderCloudExitForm`, `admin/src/pages/Exits.tsx`, тоггл «☁ Заказать в облаке»): то же offerings-меню → `POST /exits/spawn` → `node_spawner.spawn_exit_async` (заводит `WGExitNode` registering + WG-keypair, фоновая достройка `_finalize_exit_spawn`: poll IP → SSH → `bootstrap_exit`). Требует `wg_exit_nodes.provider_root_password_enc` (миграция `0047`) — worker кладёт ключ по паролю перед `bootstrap_exit` (как у нод). Зарубежные серверы заводят ИМЕННО так — exit за РУ-relay, не прямой нодой (прямой зарубежный endpoint душит DPI; см. диагностику).
+- **Дефолтный провайдер в формах заказа:** ноды → провайдер с «ru» в имени (`4vps-ru`, РУ-расходники); exit'ы → провайдер БЕЗ «ru» (`4vps`, зарубежный). Фолбэк — первый активный.
 
 ### Фаза 3 — Жизненный цикл, продление и биллинг ✅
 - **Автоскейл на 4vps — без кода (конфигурация пула).** Autoscale-тик уже ходит по

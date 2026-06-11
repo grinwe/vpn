@@ -641,6 +641,22 @@ export function spawnNode(payload: NodeSpawnIn): Promise<VPNNodeOut> {
   return api.post<VPNNodeOut>("/nodes/spawn", payload);
 }
 
+// Заказ облачной WG-exit-ноды — зеркало NodeSpawnIn без pool_id (exit'ы не
+// входят в choose_node-пул). Возврат не используется формой (она инвалидирует
+// список), поэтому unknown.
+export interface ExitSpawnIn {
+  provider_id: number;
+  name: string;
+  region: string; // datacenter (локация) id строкой
+  plan: string; // tariff (preset) id строкой
+  image?: string | null; // ostempl id строкой
+  notes?: string | null;
+}
+
+export function spawnExit(payload: ExitSpawnIn): Promise<unknown> {
+  return api.post("/exits/spawn", payload);
+}
+
 export function reinstallNode(
   nodeId: number,
   image?: string | null,

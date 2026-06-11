@@ -1748,6 +1748,24 @@ class ProvisioningOrchestrator:
                     # callback skips diagnose so it can't flip exit status.
                     result = self._run_exit_diagnose(task, exit_node, payload)
                 else:
+                    # Cloud exit без инъекции ключа (4vps): кладём provisioning-
+                    # ключ по root-паролю ПЕРЕД bootstrap_exit (как у нод).
+                    # Best-effort + идемпотентно. SSH-готовность уже дождал
+                    # _finalize_exit_spawn в backend'е, так что коннект быстрый.
+                    if exit_node.provider_root_password_enc:
+                        from ..security import decrypt
+                        from .ssh_bootstrap import ensure_provisioning_key
+                        try:
+                            ensure_provisioning_key(
+                                exit_node.host,
+                                decrypt(exit_node.provider_root_password_enc) or "",
+                                port=exit_node.ssh_port or 22,
+                            )
+                        except Exception:  # noqa: BLE001
+                            logger.exception(
+                                "provisioning-key bootstrap failed for exit %s "
+                                "(continuing — ansible will retry)", exit_node.id,
+                            )
                     result = run_playbook(
                         "playbooks/bootstrap_exit.yml",
                         inventory,

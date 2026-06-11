@@ -21,8 +21,6 @@ from sqlalchemy import func
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-logger = logging.getLogger(__name__)
-
 from .. import models, schemas
 from ..auth import require_admin
 from ..security import decrypt, encrypt as _encrypt
@@ -34,8 +32,12 @@ from ..services.relay import (
     next_wg_interface_name,
     validate_requested_address,
 )
+from ..services.ansible_runner import InvalidNodeIdentity, validate_node_name
+from ..services.node_spawner import NodeSpawnError, spawn_exit_async
 from ..services.vless import generate_wireguard_keypair
 from ._common import ADMIN_ACTOR_HEADER, _audit, _resolve_admin_actor, get_db
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
@@ -330,6 +332,58 @@ def create_exit(
     db.commit()
     orchestrator.run_task_async(task)
 
+    return _to_out(exit_node, peers_count=0)
+
+
+@router.post("/exits/spawn", response_model=schemas.WGExitNodeOut)
+def spawn_exit_route(
+    payload: schemas.ExitSpawnRequest,
+    db: Session = Depends(get_db),
+    admin_token: str = Depends(require_admin),
+    admin_actor: str | None = Header(default=None, alias=ADMIN_ACTOR_HEADER),
+):
+    """Заказать облачную WG-exit-ноду у провайдера и развернуть.
+
+    Зеркало ``POST /nodes/spawn``: быстрый заказ синхронно + фиксация
+    ``WGExitNode`` (registering, placeholder host), долгий поллинг IP +
+    ``bootstrap_exit`` — в фоне (см. ``node_spawner.spawn_exit_async``).
+    Зарубежные серверы заводят так — как exit за РУ-relay, а не прямой нодой.
+    """
+    try:
+        validate_node_name(payload.name)
+    except InvalidNodeIdentity as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    # 400 (не 502): ошибка заказа у провайдера; CF прячет 5xx — на 4xx detail
+    # доходит до админки (как в /nodes/spawn).
+    try:
+        exit_node = spawn_exit_async(
+            db,
+            provider_id=payload.provider_id,
+            name=payload.name,
+            region=payload.region,
+            plan=payload.plan,
+            image=payload.image,
+            ssh_key_ids=payload.ssh_key_ids,
+            user_data=payload.user_data,
+            notes=payload.notes,
+        )
+    except NodeSpawnError as exc:
+        raise HTTPException(status_code=400, detail=f"spawn failed: {exc}") from exc
+
+    actor, actor_type = _resolve_admin_actor(admin_actor)
+    _audit(
+        db,
+        actor,
+        "wg_exit_spawned",
+        "wg_exit_node",
+        exit_node.id,
+        actor_type=actor_type,
+        metadata={
+            "provider_id": payload.provider_id,
+            "region": payload.region,
+            "plan": payload.plan,
+        },
+    )
     return _to_out(exit_node, peers_count=0)
 
 
