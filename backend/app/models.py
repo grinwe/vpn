@@ -116,7 +116,12 @@ class CloudProviderKind(str, enum.Enum):
     digitalocean = "digitalocean"
     aeza = "aeza"
     # 4vps.su (он же 4vds) — RU-хостер. Python-имя fourvps (нельзя начинать с
-    # цифры), wire-значение "4vps". Кредсы: api_token_enc хранит "panel_id:apikey".
+    # цифры), wire-значение "4vps" (get_driver/frontend/CloudProviderOut). Кредсы:
+    # api_token_enc хранит "panel_id:apikey".
+    # NB: SQLAlchemy Enum хранит в PG ИМЯ члена ("fourvps"), а не value — так же
+    # как vless_reality/vless_ws_cdn хранятся именами, не "vless-reality". Поэтому
+    # PG-enum cloudproviderkind должен содержать 'fourvps' (см. миграция 0046),
+    # а не '4vps'.
     fourvps = "4vps"
     manual = "manual"
 

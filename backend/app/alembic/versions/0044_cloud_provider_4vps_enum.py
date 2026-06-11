@@ -25,7 +25,11 @@ depends_on = None
 
 
 def upgrade() -> None:
-    op.execute("ALTER TYPE cloudproviderkind ADD VALUE IF NOT EXISTS '4vps'")
+    # NB: SQLAlchemy Enum хранит ИМЯ Python-члена ('fourvps'), не value ('4vps')
+    # — как vless_reality хранится именем, а не 'vless-reality'. Поэтому в PG-enum
+    # нужно 'fourvps'. (Изначально тут было '4vps' — баг; прод дочинен миграцией
+    # 0046, этот ADD оставлен для свежих БД корректным.)
+    op.execute("ALTER TYPE cloudproviderkind ADD VALUE IF NOT EXISTS 'fourvps'")
 
 
 def downgrade() -> None:
