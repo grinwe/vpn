@@ -464,6 +464,21 @@ def list_nodes(
     return [_to_out(n) for n in nodes]
 
 
+@router.get("/nodes/carrying-fractions")
+def list_carrying_fractions(
+    db: Session = Depends(get_db),
+    admin_token: str = Depends(require_admin),
+):
+    """Phase C — per-node ``carrying_fraction`` (детект блокировок по поведению
+    клиентов). Read-only. = (девайсов сейчас на ноде) / (девайсов, у кого нода в
+    наборе). Осмыслен при ``DIVERSE_SUB_NODES``>1; устойчивый тренд вниз = нода
+    широко заблокирована (клиенты ушли на 2nd-best). См.
+    docs/operations/diverse_subscription_epic.md."""
+    from ..services.carrying import compute_carrying_fractions
+
+    return {"nodes": compute_carrying_fractions(db)}
+
+
 @router.post("/nodes/{node_id}/resync")
 def resync_node_clients(
     node_id: int,
