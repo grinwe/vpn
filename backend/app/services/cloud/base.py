@@ -79,6 +79,28 @@ class CloudDriver(Protocol):
         """Вкл/выкл авто-продление на стороне провайдера. Возвращает состояние."""
         ...
 
+    # ── Async-spawn split (только драйверы, чей create_server БЛОКИРУЕТ до
+    # выдачи IP). HTTP-роут /nodes/spawn использует эту пару вместо create_server,
+    # чтобы быстро (за секунды) зафиксировать заказанный сервер в БД и не убивать
+    # воркер долгим поллингом. См. node_spawner.spawn_node_async. ──
+
+    def order_server(
+        self,
+        *,
+        name: str,
+        region: str,
+        plan: str,
+        image: str,
+        ssh_key_ids: list[str] | None = None,
+        user_data: str | None = None,
+    ) -> tuple[str, str]:
+        """Быстрый заказ БЕЗ ожидания IP → ``(external_id, root_password)``."""
+        ...
+
+    def wait_for_ipv4(self, external_id: str) -> tuple[str, float | None, dict]:
+        """Дождаться IP+active для заказанного сервера → ``(ipv4, monthly_cost, raw)``."""
+        ...
+
 
 def get_driver(provider: models.CloudProvider) -> CloudDriver:
     """Instantiate a driver for the given provider record."""

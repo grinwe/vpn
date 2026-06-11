@@ -17,11 +17,16 @@ from __future__ import annotations
 
 import logging
 import os
+import secrets
+import socket
+import threading
+import time
 
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from .. import models
+from ..db import SessionLocal
 from ..security import encrypt
 from ..time_utils import utcnow
 from .ansible_runner import (
@@ -64,6 +69,50 @@ logger = logging.getLogger(__name__)
 
 class NodeSpawnError(RuntimeError):
     pass
+
+
+# Заглушка host для ноды, заказанной через spawn_node_async, пока реальный IP
+# не выдан хостером. Валидный IPv4 (проходит inventory-regex), SSH к нему падает
+# мгновенно. Нода держится is_active=False (вне choose_node) до проставления
+# настоящего IP — placeholder в credentials не попадает.
+SPAWN_PLACEHOLDER_HOST = "0.0.0.0"
+
+# Алфавит без спецсимволов — некоторые хостеры (4vps) валидируют рут-пароль и
+# отклоняют спецсимволы; длина с запасом.
+_PW_ALPHABET = "abcdefghijkmnopqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+
+
+def _gen_root_password(length: int = 20) -> str:
+    """Рут-пароль для reinstall (провайдер сбрасывает его; нам нужно знать
+    новый, чтобы зайти по паролю и переустановить provisioning-ключ)."""
+    return "".join(secrets.choice(_PW_ALPHABET) for _ in range(length))
+
+
+def _wait_for_ssh(
+    host: str, port: int = 22, *, timeout_s: int | None = None, interval: int = 10
+) -> bool:
+    """Поллим TCP-доступность ``host:port``, пока не поднимется sshd.
+
+    Свежий VPS (после заказа) и нода после reinstall грузятся несколько минут —
+    bootstrap, стартовавший раньше, падает на ``No route to host`` /
+    ``Connection refused``. Ждём ЗДЕСЬ, в фоновом daemon-потоке backend'а (нет
+    RQ-таймаута), ПЕРЕД постановкой bootstrap-таски — тогда воркер запускает
+    site.yml уже по доступной ноде и укладывается в RQ job_timeout (900s).
+
+    Возвращает True, если порт открылся; False по таймауту (bootstrap всё равно
+    ставим — key-inject/ansible-ретраи получат последний шанс).
+    Окно настраивается через ``NODE_SSH_WAIT_TIMEOUT`` (сек, дефолт 480 = 8 мин).
+    """
+    if timeout_s is None:
+        timeout_s = int(os.getenv("NODE_SSH_WAIT_TIMEOUT", "480"))
+    deadline = time.time() + timeout_s
+    while time.time() < deadline:
+        try:
+            with socket.create_connection((host, port), timeout=5):
+                return True
+        except OSError:
+            time.sleep(interval)
+    return False
 
 
 def pick_reality_sni(db: Session) -> str:
@@ -296,6 +345,247 @@ def spawn_node(
     return node, task
 
 
+def spawn_node_async(
+    db: Session,
+    *,
+    provider_id: int,
+    name: str,
+    region: str,
+    plan: str,
+    image: str | None = None,
+    ssh_key_ids: list[str] | None = None,
+    pool_id: int | None = None,
+    user_data: str | None = None,
+    notes: str | None = None,
+    reality_sni: str | None = None,
+    reality_dest: str | None = None,
+) -> models.VPNNode:
+    """Неблокирующий спавн для HTTP-роута ``POST /nodes/spawn``.
+
+    ``create_server`` у всех драйверов БЛОКИРУЕТ до выдачи IP (4vps — поллинг
+    /myservers до 600s). Прямой вызов в запросе убивал uvicorn-воркер по nginx
+    ``proxy_read_timeout`` (60s) → CF 502; хуже того, ``buyServer`` оплачивал
+    VPS ДО создания строки ``VPNNode``, и убитый запрос оставлял осиротевший,
+    неотслеживаемый сервер (каждый ретрай — ещё один заказ).
+
+    Здесь СИНХРОННО выполняем только быстрый ``order_server`` (buyServer,
+    ~секунды) и сразу фиксируем ``VPNNode`` (placeholder host,
+    ``is_active=False``, ``provider_external_id``) — сервер привязан к строке с
+    момента заказа, сирот нет. Долгий поллинг IP + bootstrap уходят в фоновый
+    daemon-поток (:func:`_finalize_spawn`). Нода становится ``is_active=True``
+    (видимой для ``choose_node``) только когда проставлен реальный IP — до этого
+    юзеры на неё не назначаются (placeholder не попадает в credentials).
+
+    Драйверы без ``order_server`` (hetzner/vultr/…): здесь строка создаётся без
+    ``external_id``, а полный (блокирующий) ``create_server`` уходит целиком в
+    тот же фоновый поток. (Их основной путь — autoscale-тик в RQ-воркере, без
+    HTTP-таймаута, через :func:`spawn_node`.)
+    """
+    provider = db.get(models.CloudProvider, provider_id)
+    if not provider or not provider.is_active:
+        raise NodeSpawnError(f"CloudProvider {provider_id} not found or inactive")
+
+    try:
+        validate_node_name(name)
+    except InvalidNodeIdentity as exc:
+        raise NodeSpawnError(str(exc)) from exc
+
+    driver = get_driver(provider)
+    image = image or provider.default_image or "ubuntu-22.04"
+    ssh_key_ids = ssh_key_ids if ssh_key_ids is not None else (provider.ssh_key_ids or [])
+
+    external_id: str | None = None
+    root_password: str | None = None
+    # Быстрый заказ — фиксируем external_id ДО создания строки, чтобы оплаченный
+    # сервер сразу был привязан. Capability-проверка: 4vps умеет order_server.
+    if hasattr(driver, "order_server"):
+        logger.info("Ordering node %s via %s in %s", name, provider.name, region)
+        try:
+            external_id, root_password = driver.order_server(
+                name=name,
+                region=region,
+                plan=plan,
+                image=image,
+                ssh_key_ids=[str(x) for x in ssh_key_ids] or None,
+                user_data=user_data,
+            )
+        except DriverError as exc:
+            logger.exception("Failed to order node via %s", provider.name)
+            raise NodeSpawnError(str(exc)) from exc
+
+    node = models.VPNNode(
+        name=name,
+        region=region,
+        host=SPAWN_PLACEHOLDER_HOST,  # реальный IP проставит _finalize_spawn
+        status=models.VPNNodeStatus.registering,
+        is_active=False,  # вне choose_node, пока нет настоящего IP
+        pool_id=pool_id,
+        provider_id=provider.id,
+        provider_external_id=external_id,
+        provider_region=region,
+        provider_plan=plan,
+        provider_root_password_enc=(
+            encrypt(root_password) if root_password else None
+        ),
+        notes=notes,
+        health_score=100,
+        last_health_check_at=utcnow(),
+    )
+    db.add(node)
+    db.commit()
+    db.refresh(node)
+
+    # Reality-config можно создать сразу — он node-scoped и не требует host
+    # (host вшивается в credentials позже, при выдаче). Нода уже несёт целевой
+    # протокол в админ-UI.
+    ensure_reality_config(db, node, sni=reality_sni, dest=reality_dest)
+
+    threading.Thread(
+        target=_finalize_spawn,
+        args=(node.id,),
+        kwargs={
+            "name": name,
+            "region": region,
+            "plan": plan,
+            "image": image,
+            "ssh_key_ids": list(ssh_key_ids) if ssh_key_ids else None,
+            "user_data": user_data,
+            "reality_sni": reality_sni,
+            "reality_dest": reality_dest,
+        },
+        daemon=True,
+    ).start()
+    return node
+
+
+def _mark_spawn_error(session: Session, node: models.VPNNode) -> None:
+    """Пометить ноду error+inactive (заказ не достроился). external_id уже в
+    строке → оператор может снести/переустановить, сирот не остаётся."""
+    node.status = models.VPNNodeStatus.error
+    node.is_active = False
+    node.updated_at = utcnow()
+    session.add(node)
+    session.commit()
+
+
+def _finalize_spawn(
+    node_id: int,
+    *,
+    name: str,
+    region: str,
+    plan: str,
+    image: str,
+    ssh_key_ids: list[str] | None,
+    user_data: str | None,
+    reality_sni: str | None,
+    reality_dest: str | None,
+) -> None:
+    """Фоновая достройка ноды, заказанной через :func:`spawn_node_async`.
+
+    Дожидается IP (``wait_for_ipv4`` — драйверы с ``order_server``) либо
+    выполняет полный блокирующий ``create_server`` (драйверы без него),
+    проставляет host + ``is_active=True`` и запускает bootstrap (site.yml).
+    Крутится в daemon-потоке backend'а со своей сессией. При провале помечает
+    ноду error (см. :func:`_mark_spawn_error`)."""
+    session = SessionLocal()
+    try:
+        node = session.get(models.VPNNode, node_id)
+        if not node:
+            logger.error("spawn finalize: node %s vanished", node_id)
+            return
+        provider = session.get(models.CloudProvider, node.provider_id)
+        if not provider:
+            logger.error("spawn finalize: provider for node %s missing", node_id)
+            _mark_spawn_error(session, node)
+            return
+        driver = get_driver(provider)
+
+        try:
+            if node.provider_external_id and hasattr(driver, "wait_for_ipv4"):
+                ipv4, monthly_cost, _raw = driver.wait_for_ipv4(node.provider_external_id)
+            else:
+                # Драйвер без order_server — полный (блокирующий) заказ тут, в фоне.
+                server = driver.create_server(
+                    name=name,
+                    region=region,
+                    plan=plan,
+                    image=image,
+                    ssh_key_ids=[str(x) for x in (ssh_key_ids or [])] or None,
+                    user_data=user_data,
+                )
+                ipv4 = server.ipv4
+                monthly_cost = server.monthly_cost
+                node.provider_external_id = server.external_id
+                if server.root_password:
+                    node.provider_root_password_enc = encrypt(server.root_password)
+        except DriverError:
+            logger.exception("spawn finalize: driver failed for node %s", node_id)
+            _mark_spawn_error(session, node)
+            return
+
+        try:
+            validate_node_identity_fields(node.name, ipv4, 22)
+        except InvalidNodeIdentity:
+            logger.exception("spawn finalize: invalid IPv4 %r for node %s", ipv4, node_id)
+            _mark_spawn_error(session, node)
+            return
+
+        node.host = ipv4
+        node.is_active = True  # реальный IP есть → нода доступна для choose_node
+        if monthly_cost is not None:
+            node.monthly_cost = monthly_cost
+        node.updated_at = utcnow()
+        session.add(node)
+        session.commit()
+        session.refresh(node)
+
+        # Авто-продление на стороне провайдера (best-effort) — теперь точно есть
+        # external_id. Сбой не должен валить достройку.
+        if node.provider_external_id and hasattr(driver, "set_autoprolong"):
+            try:
+                driver.set_autoprolong(node.provider_external_id, True)
+                logger.info("autoprolong enabled for node %s (%s)", node.id, node.name)
+            except Exception:  # noqa: BLE001
+                logger.warning("autoprolong enable failed for node %s (ignored)", node.id)
+
+        # Ждём, пока на свежем VPS поднимется SSH, ПЕРЕД bootstrap'ом — иначе
+        # site.yml стартует слишком рано и падает на 'No route to host'. Ждём
+        # тут (фоновый поток, без RQ-таймаута), не в воркере.
+        if _wait_for_ssh(node.host, node.ssh_port or 22):
+            logger.info("spawn finalize: SSH up on %s", node.host)
+        else:
+            logger.warning(
+                "spawn finalize: SSH on %s not up within wait window — enqueuing "
+                "bootstrap anyway (key-inject/ansible will retry)", node.host,
+            )
+
+        orchestrator = ProvisioningOrchestrator(session)
+        # defer_to_reconciler=False — нода только что поднялась, bootstrap нужен
+        # сразу (как в reinstall_node), не ждём reconcile-тик.
+        task, created = orchestrator.create_or_coalesce_node_bootstrap(
+            node, {"pool_id": node.pool_id, "auto_spawn": True},
+            defer_to_reconciler=False,
+        )
+        session.commit()
+        if created:
+            orchestrator.run_task_async(task, node=node)
+        logger.info(
+            "spawn finalize: node %s got IP %s, bootstrap enqueued", node_id, ipv4
+        )
+    except Exception:  # noqa: BLE001
+        logger.exception("spawn finalize crashed for node %s", node_id)
+        if session.is_active:
+            session.rollback()
+        try:
+            node = session.get(models.VPNNode, node_id)
+            if node and node.status == models.VPNNodeStatus.registering:
+                _mark_spawn_error(session, node)
+        except Exception:  # noqa: BLE001
+            session.rollback()
+    finally:
+        session.close()
+
+
 def destroy_node(db: Session, node: models.VPNNode) -> None:
     if not node.provider_id or not node.provider_external_id:
         raise NodeSpawnError("Node has no attached cloud provider; cannot destroy automatically")
@@ -318,7 +608,7 @@ def destroy_node(db: Session, node: models.VPNNode) -> None:
 def reinstall_node(
     db: Session, node: models.VPNNode, *, image: str | None = None,
     password: str | None = None,
-) -> tuple[models.VPNNode, models.ProvisioningTask]:
+) -> tuple[models.VPNNode, models.ProvisioningTask | None]:
     """Переустановить ОС на ноде через API провайдера, затем заново
     прокатить site.yml (reinstall стирает диск — клиентов на ноде не остаётся,
     бэк их пере-провижинит через bootstrap). IP сохраняется, поэтому VPNConfig
@@ -337,27 +627,63 @@ def reinstall_node(
             f"Provider {provider.kind} driver does not support OS reinstall"
         )
     img = image or provider.default_image or "ubuntu-22.04"
+    # Reinstall СБРАСЫВАЕТ root-пароль. Генерим его сами (а не отдаём драйверу
+    # на самогенерацию) и СОХРАНЯЕМ — иначе после переустановки мы не сможем
+    # зайти по паролю и переустановить provisioning-ключ (4vps ключ не
+    # инжектит), и bootstrap снова упадёт на Permission denied.
+    if password is None:
+        password = _gen_root_password()
     try:
         driver.reinstall_server(node.provider_external_id, img, password=password)
     except DriverError as exc:
         raise NodeSpawnError(str(exc)) from exc
 
-    # Свежая ОС → нода ещё не настроена. Возвращаем в registering и заново
-    # катим bootstrap (site.yml) — ansible-ретраи дождутся, пока SSH поднимется.
+    # Свежая ОС → нода ещё не настроена. Сохраняем новый пароль и возвращаем в
+    # registering. Bootstrap НЕ пинаем сразу — нода уходит в ребут на несколько
+    # минут, и ранний site.yml падает на 'No route to host'. Ждём SSH в фоне
+    # (_reinstall_finalize), потом ставим bootstrap (по паролю положит ключ).
+    node.provider_root_password_enc = encrypt(password)
     node.status = models.VPNNodeStatus.registering
     node.updated_at = utcnow()
     db.add(node)
     db.commit()
     db.refresh(node)
 
-    orchestrator = ProvisioningOrchestrator(db)
-    task, _created = orchestrator.create_or_coalesce_node_bootstrap(
-        node, {"reinstall": True, "image": img}, defer_to_reconciler=False
-    )
-    db.commit()
-    if _created:
-        orchestrator.run_task_async(task, node=node)
-    return node, task
+    threading.Thread(
+        target=_reinstall_finalize, args=(node.id, img), daemon=True
+    ).start()
+    return node, None
+
+
+def _reinstall_finalize(node_id: int, img: str) -> None:
+    """Фоновая достройка после reinstall: дождаться, пока нода переедет в ребут
+    и поднимет SSH, затем поставить bootstrap. Своя сессия (daemon-поток)."""
+    session = SessionLocal()
+    try:
+        node = session.get(models.VPNNode, node_id)
+        if not node:
+            logger.error("reinstall finalize: node %s vanished", node_id)
+            return
+        if _wait_for_ssh(node.host, node.ssh_port or 22):
+            logger.info("reinstall finalize: SSH up on %s", node.host)
+        else:
+            logger.warning(
+                "reinstall finalize: SSH on %s not up within wait window — "
+                "enqueuing bootstrap anyway", node.host,
+            )
+        orchestrator = ProvisioningOrchestrator(session)
+        task, created = orchestrator.create_or_coalesce_node_bootstrap(
+            node, {"reinstall": True, "image": img}, defer_to_reconciler=False
+        )
+        session.commit()
+        if created:
+            orchestrator.run_task_async(task, node=node)
+    except Exception:  # noqa: BLE001
+        logger.exception("reinstall finalize crashed for node %s", node_id)
+        if session.is_active:
+            session.rollback()
+    finally:
+        session.close()
 
 
 def renew_node(db: Session, node: models.VPNNode) -> None:

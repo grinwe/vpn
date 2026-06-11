@@ -1867,6 +1867,19 @@ function OrderCloudNodeForm({ onDone }: { onDone: () => void }) {
       ? selectedPlan.images
       : offeringsQ.data?.images ?? [];
 
+  // Когда список ОС подгрузился — авто-выбираем Ubuntu 22.04 (иначе ostempl
+  // уезжает пустым → бэкенд подставляет строку "ubuntu-22.04", которую 4vps
+  // не понимает: ему нужен числовой id образа, см. list_images).
+  useEffect(() => {
+    if (!image && images.length) {
+      const pick =
+        images.find((im) => /ubuntu\s*22\.04/i.test(im.name)) ??
+        images.find((im) => /ubuntu/i.test(im.name)) ??
+        images[0];
+      if (pick?.id != null) setImage(String(pick.id));
+    }
+  }, [images.length, image]);
+
   const mutation = useMutation({
     mutationFn: () =>
       spawnNode({

@@ -187,6 +187,14 @@ def _apply_ansible_env_compat() -> None:
             " -o ConnectionAttempts=3"
             " -o ServerAliveInterval=15"
             " -o ServerAliveCountMax=3"
+            # Cloud-ноды переустанавливаются / переиспользуют IP → host-key
+            # меняется. host_key_checking=False (ansible.cfg) даёт
+            # StrictHostKeyChecking=no, но OpenSSH ВСЁ РАВНО отказывает при
+            # СМЕНЕ ключа ("REMOTE HOST IDENTIFICATION HAS CHANGED"). С
+            # UserKnownHostsFile=/dev/null хранилища нет → конфликта нет, и
+            # свежая/переехавшая нода не вешает bootstrap.
+            " -o UserKnownHostsFile=/dev/null"
+            " -o StrictHostKeyChecking=accept-new"
         ),
         "ANSIBLE_SSH_RETRIES": "3",
     }

@@ -72,7 +72,7 @@ class FourVpsDriver:
 
     # ---------- public API ----------
 
-    def create_server(
+    def order_server(
         self,
         *,
         name: str,
@@ -81,7 +81,17 @@ class FourVpsDriver:
         image: str,
         ssh_key_ids: list[str] | None = None,  # 4vps не принимает SSH-ключ
         user_data: str | None = None,          # 4vps не поддерживает user_data
-    ) -> CloudServer:
+    ) -> tuple[str, str]:
+        """Быстрый шаг заказа (POST /action/buyServer) БЕЗ ожидания IP.
+
+        Возвращает ``(external_id, root_password)`` за ~секунды. IP появляется
+        позже — его берёт :meth:`wait_for_ipv4` (поллинг /myservers до 600s).
+
+        Вынесено из :meth:`create_server`, чтобы HTTP-роут /nodes/spawn мог
+        зафиксировать заказанный сервер в БД СРАЗУ (без блокировки запроса на
+        долгом поллинге → nginx proxy_read_timeout 60s → CF 502) и не плодить
+        осиротевшие оплаченные VPS. См. ``node_spawner.spawn_node_async``.
+        """
         password = _gen_password()
         # POST /api/action/buyServer — tarif/datacenter/ostempl/name + period.
         data = self._call(
@@ -101,23 +111,51 @@ class FourVpsDriver:
             raise DriverError(f"4vps buyServer did not return serverid: {data}")
         # 4vps сам генерит/возвращает пароль — берём его, иначе наш.
         root_password = str((data or {}).get("password") or password)
+        return server_id, root_password
 
-        # buyServer не отдаёт IP — поллим /myservers, пока сервер не active с IP.
-        ipv4, status, srv = self._wait_active(server_id)
+    def wait_for_ipv4(self, external_id: str) -> tuple[str, float | None, dict]:
+        """Дождаться, пока заказанный сервер получит IP и станет active.
+
+        Возвращает ``(ipv4, monthly_cost, raw)``. Бросает :class:`DriverError`,
+        если IP не появился за ``_POLL_TIMEOUT`` (600s). Блокирует — вызывается
+        в фоне (``node_spawner._finalize_spawn``), не в HTTP-запросе.
+        """
+        ipv4, status, srv = self._wait_active(external_id)
         if not ipv4:
             raise DriverError(
-                f"4vps server {server_id} got no IPv4 within {_POLL_TIMEOUT}s "
+                f"4vps server {external_id} got no IPv4 within {_POLL_TIMEOUT}s "
                 f"(last status={status})"
             )
+        return ipv4, _to_float((srv or {}).get("price")), (srv or {})
+
+    def create_server(
+        self,
+        *,
+        name: str,
+        region: str,
+        plan: str,
+        image: str,
+        ssh_key_ids: list[str] | None = None,  # 4vps не принимает SSH-ключ
+        user_data: str | None = None,          # 4vps не поддерживает user_data
+    ) -> CloudServer:
+        """Блокирующий заказ (order + ожидание IP). Используется autoscale-тиком
+        (RQ-воркер, без HTTP-таймаута). HTTP-роут идёт через ``order_server`` +
+        ``wait_for_ipv4`` (см. ``node_spawner.spawn_node_async``)."""
+        server_id, root_password = self.order_server(
+            name=name, region=region, plan=plan, image=image,
+            ssh_key_ids=ssh_key_ids, user_data=user_data,
+        )
+        # buyServer не отдаёт IP — поллим /myservers, пока сервер не active с IP.
+        ipv4, monthly_cost, srv = self.wait_for_ipv4(server_id)
         return CloudServer(
             external_id=server_id,
             ipv4=ipv4,
             ipv6=None,
             region=region,
             plan=plan,
-            monthly_cost=_to_float((srv or {}).get("price")),
+            monthly_cost=monthly_cost,
             root_password=root_password,
-            raw=srv or data,
+            raw=srv,
         )
 
     def reinstall_server(
@@ -189,46 +227,88 @@ class FourVpsDriver:
         return out
 
     def list_plans(self) -> list[dict]:
-        """GET /api/getTarifList → data.tarifList. Каждый тариф несёт osList +
-        osNames, поэтому образы для UI берутся прямо отсюда (см. list_images —
-        у 4vps образы зависят от тарифа+ДЦ)."""
+        """Тарифы 4vps = ПРЕСЕТЫ (cx01/cx11/…), и они лежат НЕ на верхнем уровне.
+
+        Реальная структура ``getTarifList``::
+
+            tarifList = {
+              "<locId>": {
+                 "clusterInfo": {"id": locId, "dc_name", "flag", "presets": [13,14,…]},
+                 "presets": {"13": {"id":13,"name":"cx01","cpu_number":1,
+                                    "ram_mib":1024,"rom":10240,
+                                    "commentParsed":{"price":590}}, …}
+              }, …
+            }
+
+        Ключи ``tarifList`` — это ЛОКАЦИИ (= id из ``getDcList`` = параметр
+        ``datacenter`` для buyServer), а тарифы — это ``presets`` внутри. Раньше
+        мы ошибочно отдавали ключи локаций как тарифы → форма слала
+        ``tarif=<locId>`` (невалидно), 4vps резал заказ. Возвращаем
+        объединённый каталог пресетов (dedupe по id) — это валидные значения
+        ``tarif``. Каталог общий по всем локациям; если конкретный пресет в
+        выбранной локации недоступен (напр. у ОАЭ нет cx01/cx11), buyServer
+        вернёт понятную ошибку — её теперь видно в форме (роут отдаёт 400)."""
         data = self._call("GET", "/getTarifList", {})
         tarif_list = (data or {}).get("tarifList") or {}
-        out: list[dict] = []
-        for key, t in tarif_list.items() if isinstance(tarif_list, dict) else []:
-            if not isinstance(t, dict):
+        by_id: dict[int, dict] = {}
+        for loc in tarif_list.values() if isinstance(tarif_list, dict) else []:
+            presets = (loc or {}).get("presets") if isinstance(loc, dict) else None
+            if not isinstance(presets, dict):
                 continue
-            os_names = t.get("osNames") or {}
-            out.append(
-                {
-                    "id": t.get("id") or _to_int(key),
-                    "name": t.get("nameFull") or t.get("name") or str(key),
-                    "price": _to_float(t.get("price")),
-                    "cpu": t.get("cpu_number"),
-                    "ram_mib": t.get("ram_mib"),
-                    "rom": t.get("rom"),
-                    # образы этого тарифа: [{id, name}] из osNames
-                    "images": [
-                        {"id": _to_int(oid), "name": oname}
-                        for oid, oname in os_names.items()
-                    ]
-                    if isinstance(os_names, dict)
-                    else [],
+            for pid, pr in presets.items():
+                if not isinstance(pr, dict):
+                    continue
+                _id = pr.get("id") or _to_int(pid)
+                if _id is None or _id in by_id:
+                    continue
+                cp = pr.get("commentParsed") or {}
+                by_id[_id] = {
+                    "id": _id,
+                    "name": pr.get("name") or str(_id),
+                    "price": _to_float(pr.get("price") or cp.get("price")),
+                    "cpu": pr.get("cpu_number"),
+                    "ram_mib": pr.get("ram_mib"),
+                    "rom": pr.get("rom"),
+                    # образы зависят от пары (пресет, локация) → list_images;
+                    # форма берёт общий каталог из offerings.images.
+                    "images": [],
                 }
-            )
-        return out
+        return [by_id[k] for k in sorted(by_id)]
 
-    def list_images(self, tarif: str | int | None = None, dc: str | int | None = None) -> list[dict]:
-        """GET /api/getImages/{TARIF_ID}/{DC_ID} → data.images {id: name}.
-        У 4vps образы зависят от тарифа+ДЦ. Без них вернём []: образы для UI
-        берутся из list_plans()[].images (osNames). offerings зовёт без
-        аргументов — отдаём [], плюс осведомляем в эпике."""
-        if tarif is None or dc is None:
+    def list_images(
+        self, tarif: str | int | None = None, dc: str | int | None = None
+    ) -> list[dict]:
+        """GET /api/getImages/{PRESET_ID}/{LOCATION_ID} → data.images {id: name}.
+
+        У 4vps образы зависят от пары (пресет, локация); ``PRESET_ID`` — это
+        ``tarif`` (id пресета, напр. 13=cx01), ``LOCATION_ID`` — ``datacenter``
+        (id локации, напр. 10=Финляндия). Без аргументов (offerings) каталог ОС
+        у 4vps фактически общий — дёргаем getImages для ПЕРВОЙ валидной пары
+        (пресет, локация) из getTarifList и отдаём её. Так заполняется
+        ``offerings.images`` и форма показывает список ОС."""
+        if tarif is not None and dc is not None:
+            data = self._call("GET", f"/getImages/{tarif}/{dc}", {})
+            images = (data or {}).get("images") or {}
+            if isinstance(images, dict):
+                return [{"id": _to_int(k), "name": v} for k, v in images.items()]
             return []
-        data = self._call("GET", f"/getImages/{tarif}/{dc}", {})
-        images = (data or {}).get("images") or {}
-        if isinstance(images, dict):
-            return [{"id": _to_int(k), "name": v} for k, v in images.items()]
+        # no-arg (offerings): репрезентативный каталог из первой валидной пары.
+        try:
+            tl = (self._call("GET", "/getTarifList", {}) or {}).get("tarifList") or {}
+        except DriverError:
+            return []
+        for loc_id, loc in tl.items() if isinstance(tl, dict) else []:
+            ci = (loc or {}).get("clusterInfo") if isinstance(loc, dict) else None
+            presets = (ci or {}).get("presets") or []
+            if not presets:
+                continue
+            try:
+                data = self._call("GET", f"/getImages/{presets[0]}/{loc_id}", {})
+            except DriverError:
+                continue
+            images = (data or {}).get("images") or {}
+            if isinstance(images, dict) and images:
+                return [{"id": _to_int(k), "name": v} for k, v in images.items()]
         return []
 
     # ---------- helpers ----------

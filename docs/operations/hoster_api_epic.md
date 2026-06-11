@@ -22,7 +22,8 @@
 | Провайдеры | `backend/app/services/cloud/{hetzner,vultr,digitalocean,aeza,manual}.py` | каждый реализует Protocol (duck-typed) |
 | **Новый** | `backend/app/services/cloud/fourvps.py` | `FourVpsDriver` |
 | Enum | `backend/app/models.py` `CloudProviderKind` | + `fourvps = "4vps"` |
-| Спавн end-to-end | `backend/app/services/node_spawner.py` `spawn_node()` | order → wait IP → VPNNode(registering) → ensure_reality_config → bootstrap site.yml |
+| Спавн end-to-end (autoscale-тик) | `backend/app/services/node_spawner.py` `spawn_node()` | блокирующий: order → wait IP → VPNNode(registering) → ensure_reality_config → bootstrap site.yml (RQ-воркер, без HTTP-таймаута) |
+| Спавн из админ-панели | `backend/app/services/node_spawner.py` `spawn_node_async()` | неблокирующий: `order_server` (sync, быстро) → VPNNode(registering, **is_active=False**, host=`0.0.0.0`, external_id) → ensure_reality_config → **фон** `_finalize_spawn`: `wait_for_ipv4` → host + is_active=True → bootstrap |
 | Кредсы провайдера | `backend/app/models.py` `CloudProvider` | `api_token_enc` (Fernet) |
 | Admin API | `backend/app/api/cloud.py`, `backend/app/api/nodes.py` | CRUD провайдеров, `/nodes/spawn`, `/nodes/{id}/destroy` |
 
@@ -46,26 +47,48 @@
 - [x] `CloudProviderKind.fourvps`, миграция `0044` (`ALTER TYPE … ADD VALUE '4vps'`).
 - [x] `FourVpsDriver` финализирован по официальной доке (PDF): Bearer-хедер + `panel_id`, конверт `{error,data,errorMessage}`, реальные пути (`/getDcList`, `/getTarifList`, `/getImages/{tarif}/{dc}`, `/action/buyServer`, `/myservers`, `/action/deleteServer`, `/action/reinstall`, `/action/reboot`, `/action/continueServer`).
 - [x] `create_server`: `buyServer` отдаёт только `{serverid, password}` (БЕЗ IP) → поллим `/myservers` до `status=active`+`ipv4`. Пароль (4vps не инжектит SSH-ключ) → `CloudServer.root_password` → `VPNNode.provider_root_password_enc` (Fernet, миграция `0045`).
+- [x] **Async-spawn (фикс 502 + сирот):** `create_server` блокирует до 600s (поллинг IP). Прямой вызов в HTTP-роуте `POST /nodes/spawn` убивал uvicorn-воркер по nginx `proxy_read_timeout` 60s → CF 502; хуже — `buyServer` оплачивал VPS ДО создания `VPNNode`, и убитый запрос оставлял осиротевший сервер. Разбили `create_server` на `order_server` (быстрый `buyServer`) + `wait_for_ipv4` (поллинг). Роут идёт через `spawn_node_async`: sync-заказ + фиксация `VPNNode(is_active=False, host=0.0.0.0, external_id)` сразу (сервер привязан → сирот нет), поллинг IP + bootstrap — в фоновом daemon-потоке. `is_active=False` ⇒ `choose_node` не отдаёт placeholder-ноду юзерам. Autoscale-тик (RQ, без HTTP-таймаута) остался на блокирующем `spawn_node`.
 - [x] `reinstall_server` (`POST /api/action/reinstall {serverid, ostempl, password}`).
 - [x] `get_driver()` → `FourVpsDriver`; `reinstall_node()` + `POST /nodes/{id}/reinstall`.
-- [x] `list_datacenters/list_plans/list_images` + `GET /cloud/providers/{id}/offerings`. NB: у 4vps образы зависят от тарифа+ДЦ → отдаются внутри `list_plans()[].images` (из `osNames`); `list_images()` без аргументов = `[]`.
+- [x] `list_datacenters/list_plans/list_images` + `GET /cloud/providers/{id}/offerings`.
+- [x] **Парсинг offerings исправлен (заказ не проходил, 4vps резал buyServer).** Реальная структура `getTarifList`: `tarifList[<locId>] = {clusterInfo:{id,dc_name,flag,presets:[13..25],need_verification}, presets:{13:{id,name:"cx01",cpu_number,ram_mib,rom,commentParsed.price}}}`. Ключи `tarifList` — это **локации** (= id из `getDcList` = `datacenter` для buyServer), а тарифы — это **пресеты** (cx01/cx11/…, id 13–25) внутри. Образы: `getImages/{PRESET}/{LOCATION}` → `{imgId:name}` (напр. `/getImages/13/10` для Финляндии → `{14:"Ubuntu 22.04",1098:"Ubuntu 24.04",…}`). Итого валидный заказ = `tarif=<пресет id>`, `datacenter=<локация id>`, `ostempl=<img id>`. Раньше `list_plans` отдавал id локаций как тарифы, а `osNames`/`list_images()` без аргументов были пустыми → форма слала `tarif=<локация>` + `ostempl="ubuntu-22.04"` (строка) → buyServer падал. Теперь `list_plans` = каталог пресетов, `list_images()` без аргументов дёргает репрезентативный `getImages` (каталог ОС общий) → заполняет `offerings.images`, форма авто-выбирает Ubuntu 22.04.
 - [ ] Боевой smoke: завести `CloudProvider(kind=4vps, api_token="panel_id:apikey")`, дёрнуть offerings, заказать тест-ноду, дождаться `active`, снести. (Нужен реальный ключ + баланс; заказ списывает деньги.)
 
-### Фаза 1.5 — SSH-bootstrap ✅ РЕШЕНО account-level ключом (не требует кода)
-`buyServer` не принимает SSH-ключ в параметрах, НО у 4vps есть **аккаунтный
-SSH-ключ** (кладётся в биллинге/панели) — он авто-инжектится на ВСЕ новые
-серверы. Подтверждено вручную: ключ положен, на свежих нодах работает.
-Значит API-заказанная нода получит тот же ключ → ansible цепляется по ключу,
-как у key-based провайдеров; существующий `spawn_node → bootstrap site.yml`
-работает без изменений.
+### Фаза 1.5 — SSH-bootstrap ✅ РЕШЕНО password-инъекцией ключа (код)
+`buyServer` не принимает SSH-ключ, аккаунтный ключ 4vps **на практике не
+инжектится** (проверено боем — нода поднялась без ключа → ansible `Permission
+denied (publickey,password)`). Поэтому используем то, что API ОТДАЁТ —
+**root-пароль** (`provider_root_password_enc`):
 
-⚠️ **Условие:** ключ в панели 4vps должен быть **публичной половиной нашего
-`provisioning_key`** (им ходит worker/ansible), не личным ключом оператора.
-Проверить при первом боевом заказе (см. smoke в Фазе 1). `provider_root_password_enc`
-остаётся как аварийный доступ.
+- `services/ssh_bootstrap.py::ensure_provisioning_key(host, password)` — заходит
+  по root-паролю (paramiko) и дописывает наш **provisioning-pubkey** (деривится
+  из `ANSIBLE_PRIVATE_KEY_FILE` или `<key>.pub`) в `~/.ssh/authorized_keys`.
+  Идемпотентно, ретраит подключение (свежая нода/после reinstall поднимает SSH
+  не сразу), терпит провал (если password-auth уже отключён `bootstrap_node` —
+  ключ и так стоит).
+- Вызывается в worker'е из `provisioning._execute_task` **перед `site.yml`** для
+  любой ноды с `provider_root_password_enc` (worker'у примонтирован приватный
+  ключ; backend — нет, поэтому инъекция именно тут, не в `_finalize_spawn`).
+- `reinstall_node` теперь **генерит и СОХРАНЯЕТ** новый root-пароль (reinstall
+  его сбрасывает) — иначе после переустановки зайти было бы нечем.
+- Host-key: `ANSIBLE_SSH_ARGS` += `UserKnownHostsFile=/dev/null
+  StrictHostKeyChecking=accept-new` — переустановка/реюз IP больше не вешает
+  bootstrap на «REMOTE HOST IDENTIFICATION HAS CHANGED».
+- **Ждём SSH перед bootstrap'ом** (`node_spawner._wait_for_ssh`, TCP-поллинг
+  порта, окно `NODE_SSH_WAIT_TIMEOUT`, дефолт 480с). Свежий VPS / нода после
+  reinstall грузятся минутами — ранний `site.yml` падал на `No route to host`.
+  Ждём в фоновом daemon-потоке backend'а (нет RQ-таймаута; RQ job_timeout=900с
+  уже равен timeout site.yml, так что внутри bootstrap-джобы ждать нельзя):
+  `_finalize_spawn` (заказ) и `_reinstall_finalize` (reinstall) дожидаются SSH
+  и только потом ставят bootstrap-таску. Уже-живые ноды проходят проверку
+  мгновенно. reinstall теперь возвращает ноду сразу, bootstrap уходит в фон.
+
+После первого `bootstrap_node` нода отключает password-auth и хардится; ключ
+уже стоит, дальше ansible ходит по ключу. `provider_root_password_enc` остаётся
+аварийным доступом.
 
 ### Фаза 2 — Admin UI «Заказать ноду» ✅
-- `OrderCloudNodeForm` (`admin/src/pages/Nodes.tsx`, тоггл «☁ Заказать в облаке»): провайдер → live offerings (`GET /cloud/providers/{id}/offerings`) → ДЦ/тариф/ОС (образы из `plan.images`/osNames) → pool → `POST /nodes/spawn`. Дегрейд в текст-инпуты, если offerings пусты (не-4vps/без токена). Нода появляется как `registering` → `active` (существующий tasks-поллинг).
+- `OrderCloudNodeForm` (`admin/src/pages/Nodes.tsx`, тоггл «☁ Заказать в облаке»): провайдер → live offerings (`GET /cloud/providers/{id}/offerings`) → ДЦ (локация) / тариф (пресет) / ОС (из `offerings.images`, авто-выбор Ubuntu 22.04) → pool → `POST /nodes/spawn`. Дегрейд в текст-инпуты, если offerings пусты (не-4vps/без токена). Нода появляется как `registering` → `active` (существующий tasks-поллинг).
 - Кнопка «reinstall OS» в строке cloud-ноды (`prompt` ostempl → `POST /nodes/{id}/reinstall`).
 - «Уничтожить» — уже был (`deleteNode` → `/destroy` для provider-нод).
 - `api.ts`: `listCloudProviders / getProviderOfferings / spawnNode / reinstallNode` + типы.
@@ -105,8 +128,8 @@ SSH-ключ** (кладётся в биллинге/панели) — он ав
 |-------|------|-----|-----------|--------------|
 | Баланс | GET | `/userBalance` | — | `{userBalance}` |
 | Дата-центры | GET | `/getDcList` | — | `{dcList:{id:{dc_name,cpu_name,flag,…,id}}}` |
-| Тарифы | GET | `/getTarifList` | — | `{tarifList:{id:{…,osList,osNames}}}` |
-| Образы | GET | `/getImages/{TARIF}/{DC}` | path | `{images:{id:name}}` |
+| Тарифы | GET | `/getTarifList` | — | `{tarifList:{<locId>:{clusterInfo:{id,dc_name,flag,presets:[…],need_verification}, presets:{<presetId>:{id,name,cpu_number,ram_mib,rom,commentParsed:{price}}}}}}` — ключи = ЛОКАЦИИ, тарифы = пресеты внутри |
+| Образы | GET | `/getImages/{PRESET}/{LOCATION}` | path | `{images:{imgId:name}}` (PRESET=tarif id, LOCATION=datacenter id; пара, не tarif+dc-в-нашем-старом-смысле) |
 | **Заказ** | POST | `/action/buyServer` | `tarif,datacenter,ostempl,name,domain?,period?` | `{serverid,password}` (БЕЗ IP) |
 | Мои серверы | GET | `/myservers` | — | `{serverlist:[{id,name,ipv4,status,tid,dc,price,…}]}` |
 | Инфо о сервере | GET | `/getServerInfo/{ID}` | path | `{serverInfo,dcInfo,ipPrice,ipList}` |
@@ -121,7 +144,8 @@ SSH-ключ** (кладётся в биллинге/панели) — он ав
 нехватка средств (`/Api/deposit/...`) — драйвер разворачивает `errorMessage.message`.
 
 Реализовано в `fourvps.py` (без `# VERIFY` — спек закрыт). Период аренды:
-`[720,2160,4320,8640]` = 1/3/6/12 мес (дефолт 720). Образы зависят от тарифа+ДЦ
-(`getImages/{tarif}/{dc}`), для UI отдаются внутри `list_plans()[].images`.
+`[720,2160,4320,8640]` = 1/3/6/12 мес (дефолт 720). Образы зависят от пары
+(пресет, локация) — `getImages/{PRESET}/{LOCATION}`; для UI общий каталог
+отдаётся в `offerings.images` (`list_images()` без аргументов).
 
 **Остаток:** SSH-bootstrap (Фаза 1.5) — `buyServer` не инжектит ключ.

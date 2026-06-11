@@ -75,11 +75,12 @@ enum VPNNodeStatus (models.py:50-61):
 Начальное состояние, когда строка только-только создана:
 
 - **ручная регистрация**: `POST /api/nodes` — админ заводит запись в БД. Статус `registering`, `is_active=True`, `health_score=NULL` (нет проб → `choose_node` всё равно берёт, т.к. `IS NULL` проходит фильтр).
-- **автоспавн**: `node_spawner.spawn_node` (`backend/app/services/node_spawner.py:154-221`). Порядок:
-  1. `driver.create_server(...)` — вызов у Hetzner/Vultr/DO/Aeza/manual. Блокирующий (30–90с).
-  2. `VPNNode(status=registering, provider_id=..., provider_external_id=...)` в БД.
-  3. `ensure_reality_config(node)` — сгенерировать Reality ключи и сохранить `VPNConfig`.
-  4. `ProvisioningOrchestrator.create_task("node", node.id, "bootstrap")` + `run_task_async` — в воркер.
+- **автоспавн (autoscale-тик)**: `node_spawner.spawn_node` — вызывается из `autoscale.evaluate_pool` в RQ-воркере (без HTTP-таймаута). Блокирующий: `driver.create_server(...)` (30–600с, ждёт IP) → `VPNNode(registering, is_active=True, provider_external_id=...)` → `ensure_reality_config` → bootstrap-task. Порядок: VPNNode пишется **после** выдачи IP.
+- **спавн из админ-панели**: `POST /api/nodes/spawn` → `node_spawner.spawn_node_async`. **Неблокирующий** (нельзя держать HTTP-запрос на 600s-поллинге — nginx `proxy_read_timeout` 60s убьёт воркер → CF 502, а оплаченный VPS осиротеет). Порядок:
+  1. `driver.order_server(...)` — синхронно, БЫСТРО (только `buyServer`, ~секунды) → `(external_id, root_password)`. Драйверы без `order_server` (hetzner/…) — заказ целиком уходит в фон на шаге 4.
+  2. `VPNNode(status=registering, is_active=False, host="0.0.0.0", provider_external_id=...)` сразу в БД — сервер привязан к строке с момента заказа (**сирот нет**). `is_active=False` ⇒ `choose_node` не назначает на неё юзеров, пока нет реального IP.
+  3. `ensure_reality_config(node)` (синхронно — host не нужен) → ответ админу с готовой нодой.
+  4. фоновый daemon-поток `_finalize_spawn`: `driver.wait_for_ipv4(external_id)` (поллинг до 600s) → проставить `host` + `is_active=True` → `set_autoprolong` (best-effort) → **`_wait_for_ssh`** (ждём, пока свежий VPS поднимет SSH, окно `NODE_SSH_WAIT_TIMEOUT`=480s — иначе bootstrap падает на `No route to host`) → bootstrap-task (`defer_to_reconciler=False`). При провале поллинга IP — нода `error`+`is_active=False` (external_id уже в строке → оператор сносит/переустанавливает). Перед `site.yml` воркер кладёт `provisioning`-ключ по root-паролю (`ssh_bootstrap.ensure_provisioning_key`, см. эпик Фаза 1.5). Reinstall идёт тем же путём через `_reinstall_finalize` (ждёт SSH после ребута).
 
 После этого воркер запускает `playbooks/site.yml` против этой ноды и ждёт успеха + health pass. Промоут `registering → active` делается в `ProvisioningOrchestrator._handle_task_outcome` (см. `components/provisioning.md`).
 

@@ -30,7 +30,7 @@ from ..services.node_spawner import (
     destroy_node,
     reinstall_node,
     renew_node,
-    spawn_node,
+    spawn_node_async,
 )
 from ..services.provisioning import ProvisioningOrchestrator
 from ._common import (
@@ -1476,15 +1476,19 @@ def spawn_node_route(
     admin_actor: str | None = Header(default=None, alias=ADMIN_ACTOR_HEADER),
 ):
     # #55 — same DNS-safe whitelist as /nodes POST. Only ``name`` can be
-    # checked at this point; the host is resolved later by the cloud
-    # driver and re-validated inside spawn_node() itself before the
-    # VPNNode row is written.
+    # checked at this point; the host is resolved later by the cloud driver
+    # and re-validated inside ``_finalize_spawn`` before the real host is
+    # written onto the row.
     try:
         validate_node_name(payload.name)
     except InvalidNodeIdentity as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    # Неблокирующий спавн: синхронно делаем только быстрый заказ (order_server)
+    # + фиксируем VPNNode-строку, долгий поллинг IP + bootstrap — в фоне. Иначе
+    # 600s-поллинг create_server упирался в nginx proxy_read_timeout (60s) → CF
+    # 502, а оплаченный VPS оставался осиротевшим. См. spawn_node_async.
     try:
-        node, _task = spawn_node(
+        node = spawn_node_async(
             db,
             provider_id=payload.provider_id,
             name=payload.name,
@@ -1496,8 +1500,12 @@ def spawn_node_route(
             user_data=payload.user_data,
             notes=payload.notes,
         )
+    # 400, не 502: заказ падает на этапе обращения к провайдеру (неверный
+    # tarif/ostempl, нет баланса, верификация). Cloudflare подменяет 5xx своей
+    # HTML-страницей и прячет detail — на 4xx он проходит, и админ видит
+    # реальную причину от 4vps в форме. Реальные gateway-сбои тут не при чём.
     except NodeSpawnError as exc:
-        raise HTTPException(status_code=502, detail=f"spawn failed: {exc}") from exc
+        raise HTTPException(status_code=400, detail=f"spawn failed: {exc}") from exc
 
     actor, actor_type = _resolve_admin_actor(admin_actor)
     _audit(

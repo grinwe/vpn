@@ -1694,6 +1694,26 @@ class ProvisioningOrchestrator:
                     # ansible UNREACHABLE. The helper owns its own inventory.
                     result = self._run_node_diagnose(task, node, payload)
                 else:
+                    # Cloud-ноды без инъекции SSH-ключа (4vps): кладём наш
+                    # provisioning-ключ по root-паролю ПЕРЕД site.yml, иначе
+                    # ansible не зайдёт (Permission denied (publickey,password)).
+                    # Best-effort + идемпотентно; после первого bootstrap'а
+                    # password-auth отключается → повторная попытка просто
+                    # отвалится (ключ уже стоит). Никогда не валит bootstrap.
+                    if node.provider_root_password_enc:
+                        from ..security import decrypt
+                        from .ssh_bootstrap import ensure_provisioning_key
+                        try:
+                            ensure_provisioning_key(
+                                node.host,
+                                decrypt(node.provider_root_password_enc) or "",
+                                port=node.ssh_port or 22,
+                            )
+                        except Exception:  # noqa: BLE001
+                            logger.exception(
+                                "provisioning-key bootstrap failed for node %s "
+                                "(continuing — ansible will retry)", node.id,
+                            )
                     site_vars = _collect_site_extra_vars(self.db, node)
                     # 900s (15мин) потому что site.yml на свежей relay/jump-ноде
                     # гонит подряд bootstrap_node + install_vless_reality +
