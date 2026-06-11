@@ -56,6 +56,19 @@ tool-use'ом и выдаёт человекочитаемый **root-cause + р
 - Env (vault): `vault_anthropic_api_key` → `deploy_app_stack_anthropic_api_key`.
 
 ### Phase 2 — Draft-саппорт + propose-remediation
+- **Ops-планировщик (dry-run) ✅ реализовано (за флагом).** NL-команда оператора
+  («закажи 2 ноды в Германии, подними туннель, перевези юзеров с ноды X») →
+  агент через READ-ONLY fleet-тулы (`services/agent/ops_tools.py`: list_providers /
+  provider_balance / provider_offerings / list_nodes / list_exits / node_load /
+  list_pools) собирает состояние флота и ОБЯЗАН вызвать терминальный `submit_plan` →
+  структурированный план: пошагово, с оценкой стоимости (₽), влияния (сколько
+  юзеров затронем) и tier'ом (read/reversible/costly/destructive).
+  `services/agent/ops.py::plan_ops`, `POST /api/agent/ops/plan {command}`
+  (`api/agent.py`), audit `agent_ops_planned`. **Ничего не выполняет** — чистый
+  dry-run; за флагом `AGENT_ENABLED` + `ANTHROPIC_API_KEY`, кап итераций.
+  Решено с оператором: модель автономии = «план → одно подтверждение»; старт = dry-run.
+  - TODO: точка входа (TG admin-команда / админка) + выполнение плана за одним
+    подтверждением (costly/destructive шаги — order/destroy/migrate — за гейтом).
 - **Support-агент:** RAG по `docs/` с цитатами → черновик ответа юзеру. На старте — **human-approve** перед отправкой; потом автоответ на FAQ-класс. Анти-галлюцинации: только из доков, с источником.
 - **Ops-агент (reversible):** предлагает действие (`migrate sub X`, `mute node Y`, `ban-node`) с обоснованием → кнопка «применить». После обкатки — часть reversible переводим в автономный режим с rate-limit.
 

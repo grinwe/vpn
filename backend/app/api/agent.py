@@ -7,6 +7,7 @@ AGENT_ENABLED; требует ANTHROPIC_API_KEY. Мутаций инфры не�
 from __future__ import annotations
 
 from fastapi import APIRouter, Depends, Header, HTTPException
+from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
 from .. import models
@@ -14,6 +15,10 @@ from ..auth import require_admin
 from ._common import ADMIN_ACTOR_HEADER, _audit, _resolve_admin_actor, get_db
 
 router = APIRouter()
+
+
+class OpsPlanRequest(BaseModel):
+    command: str
 
 
 @router.post("/agent/triage/{node_id}")
@@ -49,6 +54,47 @@ def agent_triage_node(
             "model": result.get("model"),
             "tool_calls": result.get("tool_calls"),
             "iterations": result.get("iterations"),
+        },
+    )
+    db.commit()
+    return result
+
+
+@router.post("/agent/ops/plan")
+def agent_ops_plan(
+    payload: OpsPlanRequest,
+    db: Session = Depends(get_db),
+    admin_token: str = Depends(require_admin),
+    admin_actor: str | None = Header(default=None, alias=ADMIN_ACTOR_HEADER),
+):
+    """Ops-планировщик (dry-run): NL-команда → структурированный план с оценкой
+    стоимости/влияния. НИЧЕГО НЕ ВЫПОЛНЯЕТ — только читает состояние флота и
+    предлагает шаги. За флагом AGENT_ENABLED + ANTHROPIC_API_KEY. Выполнение
+    плана — отдельная фаза (за одним подтверждением)."""
+    from ..services.agent.ops import AgentError, plan_ops
+
+    try:
+        result = plan_ops(db, payload.command)
+    except AgentError as exc:
+        raise HTTPException(status_code=503, detail=f"agent ops plan: {exc}") from exc
+
+    plan = result.get("plan") or {}
+    actor, actor_type = _resolve_admin_actor(admin_actor)
+    _audit(
+        db,
+        actor,
+        "agent_ops_planned",
+        "ops_plan",
+        0,
+        actor_type=actor_type,
+        metadata={
+            "command": payload.command[:500],
+            "model": result.get("model"),
+            "tool_calls": result.get("tool_calls"),
+            "iterations": result.get("iterations"),
+            "feasible": plan.get("feasible"),
+            "needs_confirmation": plan.get("needs_confirmation"),
+            "steps": len(plan.get("steps") or []),
         },
     )
     db.commit()
