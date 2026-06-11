@@ -71,6 +71,8 @@ services:
       # pool entirely when set to "0". Worker has its own copy because
       # it also reads the var to gate the periodic warmer.
       WARM_POOL_ENABLED: ${WARM_POOL_ENABLED:-1}
+      # Diverse N×M subscription (Phase A): N nodes per sub (1 = current single-node).
+      DIVERSE_SUB_NODES: ${DIVERSE_SUB_NODES:-1}
       # Stage 4 — balance billing. Backend reads these for the
       # WebApp endpoints (freeze caps, min topup, referral bonus).
       FREEZE_DAYS: ${FREEZE_DAYS:-14}
@@ -181,6 +183,9 @@ services:
       WARM_POOL_BATCH_PER_TICK: ${WARM_POOL_BATCH_PER_TICK:-3}
       WARM_POOL_CHECK_INTERVAL: ${WARM_POOL_CHECK_INTERVAL:-120}
       WARM_POOL_MAX_CONCURRENT: ${WARM_POOL_MAX_CONCURRENT:-2}
+      # Diverse N×M subscription (Phase A): N nodes per sub (1 = current single-node).
+      # Worker copy — reprovision/migration paths also read it.
+      DIVERSE_SUB_NODES: ${DIVERSE_SUB_NODES:-1}
       # Cold-path throttle — sliding-window cap on warm-pool-miss
       # activations (migrations/reprovision bypass). Prevents a bot
       # burst from chaining ansible runs faster than xray tolerates.

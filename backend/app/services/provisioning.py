@@ -2558,6 +2558,7 @@ class ProvisioningOrchestrator:
                     user, subscription, warm_bundle, device_name
                 )
                 self.db.refresh(subscription)
+                self._maybe_attach_diverse(subscription, device, plan, node)
                 return subscription, task
             except Exception:
                 # If wiring blew up after we marked the bundle assigned,
@@ -2688,7 +2689,78 @@ class ProvisioningOrchestrator:
         self.db.commit()
         self.run_task_async(task, node=node)
         self.db.refresh(subscription)
+        self._maybe_attach_diverse(subscription, device, plan, node)
         return subscription, task
+
+    def _maybe_attach_diverse(
+        self,
+        subscription: models.Subscription,
+        device: models.Device,
+        plan: models.Plan,
+        primary_node: models.VPNNode,
+    ) -> None:
+        """Phase A — диверсная N×M подписка (за флагом ``DIVERSE_SUB_NODES``).
+
+        Если флаг > 1, дотягивает к УЖЕ созданному device бандлы с (N-1)
+        дополнительных РАЗНООБРАЗНЫХ нод (разные регионы), чтобы саб-линк отдал
+        эндпоинты нескольких нод и клиент (Auto/url-test) мог прыгать между
+        НОДАМИ, не только протоколами. Берёт ТОЛЬКО тёплые бандлы (warm-pool уже
+        провижинит юзера на ноде) — без лишних ansible-прогонов на каждый сайнап;
+        ноды без тёплого бандла просто пропускает (best-effort, degrade).
+
+        Полностью аддитивно и за флагом: ``DIVERSE_SUB_NODES`` по умолчанию ``1``
+        ⇒ метод — no-op, поведение байт-в-байт как сейчас. Никогда не валит
+        основной провижининг: primary-нода уже выдана, тут только бонус.
+        """
+        try:
+            n_total = int(os.getenv("DIVERSE_SUB_NODES", "1") or "1")
+        except ValueError:
+            n_total = 1
+        if n_total <= 1:
+            return  # флаг выключен → текущее однонодовое поведение
+
+        from . import warm_pool
+
+        picked_ids: list[int] = [primary_node.id]
+        picked_regions: list[str] = [primary_node.region] if primary_node.region else []
+        attached = 0
+        try:
+            for _ in range(n_total - 1):
+                try:
+                    node = choose_node(
+                        self.db,
+                        plan,
+                        exclude_node_ids=list(picked_ids),
+                        exclude_regions=list(picked_regions),
+                    )
+                except Exception:  # noqa: BLE001 — больше диверсных нод нет
+                    break
+                picked_ids.append(node.id)
+                if node.region:
+                    picked_regions.append(node.region)
+                bundle = warm_pool.try_assign_bundle(self.db, node.id, subscription.id)
+                if not bundle:
+                    # нет тёплого бандла на этой ноде — пропускаем (не гоним
+                    # cold-ansible на вторичные ноды в MVP).
+                    continue
+                for cred in bundle:
+                    cred.device_id = device.id
+                    self.db.add(cred)
+                attached += 1
+            if attached:
+                self.db.commit()
+                logger.info(
+                    "diverse-sub: attached %d extra node(s) to device %s (sub %s)",
+                    attached, device.id, subscription.id,
+                )
+        except Exception:  # noqa: BLE001 — бонус, не должен ронять provisioning
+            logger.exception(
+                "diverse-sub attach failed for sub %s (primary intact)", subscription.id
+            )
+            try:
+                self.db.rollback()
+            except Exception:  # noqa: BLE001
+                pass
 
     def backfill_credentials_for_new_config(
         self, node: models.VPNNode, new_config: models.VPNConfig
