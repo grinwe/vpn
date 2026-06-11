@@ -24,6 +24,13 @@ import {
   VPNNodeCreateIn,
   VPNNodeOut,
   refreshNodeRealityDest,
+  CloudProviderOut,
+  ProviderOfferings,
+  OfferingImage,
+  listCloudProviders,
+  getProviderOfferings,
+  spawnNode,
+  reinstallNode,
 } from "../api";
 import { HealthDots } from "../linkHealth";
 import { DiagnoseResult } from "../diagnoseResult";
@@ -575,6 +582,7 @@ function statusColor(status: string) {
 
 export default function Nodes() {
   const [createOpen, setCreateOpen] = useState(false);
+  const [orderOpen, setOrderOpen] = useState(false);
   // Раскрытая нода живёт в URL (?node=<id>), а не в локальном state — тогда
   // авто-refetch списка и F5/навигация не схлопывают открытую карточку
   // (раньше каждый poll выглядел так, будто «вкладки прыгают»).
@@ -830,6 +838,19 @@ export default function Nodes() {
       });
     },
     onError: (e: Error) => alert(`Не удалось запустить bootstrap: ${e.message}`),
+  });
+
+  // Переустановка ОС через API провайдера (только cloud-ноды). IP сохраняется,
+  // поэтому reality-ключи и sub-токены остаются валидны; после reinstall бэк
+  // сам перекатывает site.yml.
+  const reinstall = useMutation({
+    mutationFn: (args: { id: number; image: string | null }) =>
+      reinstallNode(args.id, args.image),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["nodes"] });
+      qc.invalidateQueries({ queryKey: ["provisioning-tasks"] });
+    },
+    onError: (e: Error) => alert(`Не удалось переустановить ОС: ${e.message}`),
   });
 
   // Smart delete: walk the 409 → migrate → delete path so admins can
@@ -1104,6 +1125,13 @@ export default function Nodes() {
           >
             {createOpen ? "Отмена" : "+ Добавить ноду"}
           </button>
+          <button
+            className="px-3 py-1.5 rounded bg-sky-600 hover:bg-sky-500 text-sm font-semibold"
+            onClick={() => setOrderOpen((v) => !v)}
+            title="Заказать VPS у облачного провайдера (4vps) и сразу раскатать инфру"
+          >
+            {orderOpen ? "Отмена" : "☁ Заказать в облаке"}
+          </button>
         </div>
       </div>
 
@@ -1112,6 +1140,8 @@ export default function Nodes() {
           onDone={() => setCreateOpen(false)}
         />
       )}
+
+      {orderOpen && <OrderCloudNodeForm onDone={() => setOrderOpen(false)} />}
 
       {migrateToModal && data && (
         <MigrateToModal
@@ -1333,6 +1363,28 @@ export default function Nodes() {
                       >
                         bootstrap
                       </button>
+                      {n.provider_id && (
+                        <button
+                          disabled={reinstall.isPending}
+                          onClick={() => {
+                            const img = prompt(
+                              `Переустановить ОС на cloud-ноде #${n.id} (${n.name})?\n\n` +
+                                `Хостер сотрёт диск и поставит ОС заново; IP сохраняется (reality-ключи и sub-токены остаются валидны), после чего бэк перекатит site.yml.\n\n` +
+                                `ID образа (ostempl) — пусто = дефолт провайдера:`,
+                              "",
+                            );
+                            if (img === null) return; // отмена
+                            reinstall.mutate({
+                              id: n.id,
+                              image: img.trim() || null,
+                            });
+                          }}
+                          className="text-xs px-2 py-1 rounded bg-rose-800 hover:bg-rose-700 disabled:opacity-50"
+                          title="Переустановить ОС через API провайдера (только cloud-ноды)"
+                        >
+                          reinstall OS
+                        </button>
+                      )}
                       <button
                         disabled={resync.isPending}
                         onClick={() => {
@@ -1746,6 +1798,246 @@ const TEMPLATE_ENABLED: Record<NodeTemplate, Set<CreatableProto>> = {
   reality: new Set<CreatableProto>(["vless-reality"]),
   custom: new Set<CreatableProto>(),
 };
+
+// Заказ ноды у облачного провайдера (4vps): провайдер → live offerings
+// (ДЦ/тарифы/образы) → spawn. Дегрейд: если offerings пустые (провайдер без
+// list-методов или без токена) — поля становятся текст-инпутами, форма всё
+// равно рабочая. spawn_node заказывает VPS, ждёт IP, заводит VPNNode и катит
+// site.yml (SSH-ключ инжектит аккаунтный ключ 4vps — см. hoster_api_epic.md).
+function OrderCloudNodeForm({ onDone }: { onDone: () => void }) {
+  const qc = useQueryClient();
+  const providersQ = useQuery<CloudProviderOut[]>({
+    queryKey: ["cloud-providers"],
+    queryFn: listCloudProviders,
+  });
+  const [providerId, setProviderId] = useState<number | null>(null);
+  const [name, setName] = useState("");
+  const [dc, setDc] = useState("");
+  const [plan, setPlan] = useState("");
+  const [image, setImage] = useState("");
+  const [poolId, setPoolId] = useState("");
+  const [err, setErr] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (providerId == null && providersQ.data?.length) {
+      const active =
+        providersQ.data.find((p) => p.is_active) ?? providersQ.data[0];
+      setProviderId(active.id);
+    }
+  }, [providersQ.data, providerId]);
+
+  const offeringsQ = useQuery<ProviderOfferings>({
+    queryKey: ["provider-offerings", providerId],
+    queryFn: () => getProviderOfferings(providerId as number),
+    enabled: providerId != null,
+  });
+
+  const datacenters = offeringsQ.data?.datacenters ?? [];
+  const plans = offeringsQ.data?.plans ?? [];
+  const selectedPlan = plans.find((p) => String(p.id) === plan);
+  const images: OfferingImage[] =
+    selectedPlan?.images?.length
+      ? selectedPlan.images
+      : offeringsQ.data?.images ?? [];
+
+  const mutation = useMutation({
+    mutationFn: () =>
+      spawnNode({
+        provider_id: providerId as number,
+        name: name.trim(),
+        region: dc.trim(),
+        plan: plan.trim(),
+        image: image.trim() || null,
+        pool_id: poolId ? Number(poolId) : null,
+      }),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["nodes"] });
+      qc.invalidateQueries({ queryKey: ["provisioning-tasks"] });
+      onDone();
+    },
+    onError: (e: Error) =>
+      setErr(e instanceof ApiError ? `${e.status}: ${e.message}` : e.message),
+  });
+
+  function submit(e: React.FormEvent) {
+    e.preventDefault();
+    setErr(null);
+    if (providerId == null) return setErr("выбери провайдера");
+    if (!name.trim()) return setErr("имя обязательно (kebab-case)");
+    if (!dc.trim()) return setErr("укажи дата-центр");
+    if (!plan.trim()) return setErr("укажи тариф");
+    mutation.mutate();
+  }
+
+  const inputCls =
+    "bg-slate-800 border border-slate-700 rounded px-2 py-1";
+
+  return (
+    <form
+      onSubmit={submit}
+      className="mb-4 p-4 rounded border border-sky-800 bg-slate-900/60 flex flex-col gap-4 text-sm"
+    >
+      <div className="text-sky-300 text-xs font-semibold">
+        ☁ Заказать ноду у облачного провайдера
+      </div>
+      <div className="grid grid-cols-2 gap-3">
+        <label className="flex flex-col">
+          <span className="text-slate-400 text-xs mb-1">Провайдер</span>
+          <select
+            className={inputCls}
+            value={providerId ?? ""}
+            onChange={(e) => {
+              setProviderId(e.target.value ? Number(e.target.value) : null);
+              setDc("");
+              setPlan("");
+              setImage("");
+            }}
+          >
+            <option value="">— выбери —</option>
+            {(providersQ.data ?? []).map((p) => (
+              <option key={p.id} value={p.id} disabled={!p.is_active}>
+                {p.name} ({p.kind}){p.is_active ? "" : " — выкл"}
+              </option>
+            ))}
+          </select>
+        </label>
+        <label className="flex flex-col">
+          <span className="text-slate-400 text-xs mb-1">
+            Имя (уникальное, kebab-case)
+          </span>
+          <input
+            className={`${inputCls} font-mono`}
+            placeholder="ru-4vps-01"
+            value={name}
+            onChange={(e) => setName(e.target.value)}
+          />
+        </label>
+
+        <label className="flex flex-col">
+          <span className="text-slate-400 text-xs mb-1">
+            Дата-центр {offeringsQ.isFetching ? "(загрузка…)" : ""}
+          </span>
+          {datacenters.length ? (
+            <select
+              className={inputCls}
+              value={dc}
+              onChange={(e) => setDc(e.target.value)}
+            >
+              <option value="">— выбери —</option>
+              {datacenters.map((d) => (
+                <option key={String(d.id)} value={String(d.id)}>
+                  {d.name} {d.flag ? `[${d.flag}]` : ""} (id {d.id})
+                </option>
+              ))}
+            </select>
+          ) : (
+            <input
+              className={`${inputCls} font-mono`}
+              placeholder="id датацентра"
+              value={dc}
+              onChange={(e) => setDc(e.target.value)}
+            />
+          )}
+        </label>
+
+        <label className="flex flex-col">
+          <span className="text-slate-400 text-xs mb-1">Тариф</span>
+          {plans.length ? (
+            <select
+              className={inputCls}
+              value={plan}
+              onChange={(e) => {
+                setPlan(e.target.value);
+                setImage("");
+              }}
+            >
+              <option value="">— выбери —</option>
+              {plans.map((p) => (
+                <option key={String(p.id)} value={String(p.id)}>
+                  {p.name}
+                  {p.price != null ? ` — ${p.price}₽` : ""}
+                  {p.cpu ? ` · ${p.cpu}vCPU` : ""}
+                  {p.ram_mib ? ` · ${Math.round(p.ram_mib / 1024)}G` : ""}
+                </option>
+              ))}
+            </select>
+          ) : (
+            <input
+              className={`${inputCls} font-mono`}
+              placeholder="id тарифа"
+              value={plan}
+              onChange={(e) => setPlan(e.target.value)}
+            />
+          )}
+        </label>
+
+        <label className="flex flex-col">
+          <span className="text-slate-400 text-xs mb-1">
+            ОС {selectedPlan && !images.length ? "(нет образов у тарифа)" : ""}
+          </span>
+          {images.length ? (
+            <select
+              className={inputCls}
+              value={image}
+              onChange={(e) => setImage(e.target.value)}
+            >
+              <option value="">— дефолт провайдера —</option>
+              {images.map((im) => (
+                <option key={String(im.id)} value={String(im.id)}>
+                  {im.name} (id {im.id})
+                </option>
+              ))}
+            </select>
+          ) : (
+            <input
+              className={`${inputCls} font-mono`}
+              placeholder="ostempl id (необязательно)"
+              value={image}
+              onChange={(e) => setImage(e.target.value)}
+            />
+          )}
+        </label>
+
+        <label className="flex flex-col">
+          <span className="text-slate-400 text-xs mb-1">
+            Pool id (необязательно)
+          </span>
+          <input
+            className={`${inputCls} font-mono`}
+            placeholder="напр. 1"
+            value={poolId}
+            onChange={(e) => setPoolId(e.target.value)}
+          />
+        </label>
+      </div>
+
+      {offeringsQ.error && (
+        <div className="text-amber-400 text-xs">
+          Не удалось загрузить offerings провайдера (
+          {offeringsQ.error instanceof ApiError
+            ? offeringsQ.error.message
+            : String(offeringsQ.error)}
+          ). Можно ввести id вручную.
+        </div>
+      )}
+      {err && <div className="text-red-400 text-xs">{err}</div>}
+
+      <div className="flex items-center gap-3">
+        <button
+          type="submit"
+          disabled={mutation.isPending}
+          className="px-4 py-1.5 rounded bg-sky-600 hover:bg-sky-500 text-sm font-semibold disabled:opacity-50"
+        >
+          {mutation.isPending ? "Заказываем…" : "Заказать и развернуть"}
+        </button>
+        <span className="text-slate-500 text-xs">
+          заказ спишет средства у провайдера; нода появится как
+          registering → active
+        </span>
+      </div>
+    </form>
+  );
+}
 
 function CreateNodeForm({ onDone }: { onDone: () => void }) {
   const qc = useQueryClient();

@@ -51,22 +51,24 @@
 - [x] `list_datacenters/list_plans/list_images` + `GET /cloud/providers/{id}/offerings`. NB: у 4vps образы зависят от тарифа+ДЦ → отдаются внутри `list_plans()[].images` (из `osNames`); `list_images()` без аргументов = `[]`.
 - [ ] Боевой smoke: завести `CloudProvider(kind=4vps, api_token="panel_id:apikey")`, дёрнуть offerings, заказать тест-ноду, дождаться `active`, снести. (Нужен реальный ключ + баланс; заказ списывает деньги.)
 
-### Фаза 1.5 — SSH-bootstrap для key-less провайдеров (4vps) ⏳ КРИТИЧНО для «разворачивать инфру»
-4vps `buyServer` НЕ принимает SSH-ключ — свежий сервер поднимается только с
-root + паролем (его отдаёт API, мы храним в `provider_root_password_enc`).
-Ansible же ходит на ноды по КЛЮЧУ (`provisioning_key`) — значит bootstrap не
-подключится, пока ключ не установлен. Нужно:
-- `ansible_runner`/inventory: для нод с `provider_root_password_enc` (и пока ключ
-  не подтверждён рабочим) — first-connect по паролю (`ansible_password` + sshpass
-  в worker-образе), затем `bootstrap_node` кладёт наш pubkey в `authorized_keys`.
-- После успешной установки ключа — последующие прогоны по ключу (как сейчас);
-  пароль можно занулить или оставить для аварийного доступа.
-- Альтернатива: ставить ключ через VM-панель/`getVmLink` — менее автоматизируемо.
-Без этой фазы «заказ» работает, а авто-bootstrap 4vps-ноды — нет.
+### Фаза 1.5 — SSH-bootstrap ✅ РЕШЕНО account-level ключом (не требует кода)
+`buyServer` не принимает SSH-ключ в параметрах, НО у 4vps есть **аккаунтный
+SSH-ключ** (кладётся в биллинге/панели) — он авто-инжектится на ВСЕ новые
+серверы. Подтверждено вручную: ключ положен, на свежих нодах работает.
+Значит API-заказанная нода получит тот же ключ → ansible цепляется по ключу,
+как у key-based провайдеров; существующий `spawn_node → bootstrap site.yml`
+работает без изменений.
 
-### Фаза 2 — Admin UI «Заказать ноду» (UI-часть, явно одобрена)
-- Форма в `admin/src/pages/Nodes.tsx`: провайдер → (offerings) локация/тариф/ОС → pool/SNI → «Заказать». Прогресс через существующий tasks-поллинг; нода появляется в списке как `registering` → `active`.
-- Кнопки в строке ноды: «Переустановить ОС» (выбор образа), «Уничтожить» (destroy).
+⚠️ **Условие:** ключ в панели 4vps должен быть **публичной половиной нашего
+`provisioning_key`** (им ходит worker/ansible), не личным ключом оператора.
+Проверить при первом боевом заказе (см. smoke в Фазе 1). `provider_root_password_enc`
+остаётся как аварийный доступ.
+
+### Фаза 2 — Admin UI «Заказать ноду» ✅
+- `OrderCloudNodeForm` (`admin/src/pages/Nodes.tsx`, тоггл «☁ Заказать в облаке»): провайдер → live offerings (`GET /cloud/providers/{id}/offerings`) → ДЦ/тариф/ОС (образы из `plan.images`/osNames) → pool → `POST /nodes/spawn`. Дегрейд в текст-инпуты, если offerings пусты (не-4vps/без токена). Нода появляется как `registering` → `active` (существующий tasks-поллинг).
+- Кнопка «reinstall OS» в строке cloud-ноды (`prompt` ostempl → `POST /nodes/{id}/reinstall`).
+- «Уничтожить» — уже был (`deleteNode` → `/destroy` для provider-нод).
+- `api.ts`: `listCloudProviders / getProviderOfferings / spawnNode / reinstallNode` + типы.
 
 ### Фаза 3 — Жизненный цикл и автоскейл
 - Подключить 4vps как `autoscale_provider_id`/fallback в пулах (autoscale уже умеет провайдер-цепочку).

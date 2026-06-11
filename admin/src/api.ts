@@ -572,6 +572,82 @@ export function refreshNodeRealityDest(
   );
 }
 
+// ── Cloud providers / order node (hoster API, напр. 4vps) ──
+
+export interface CloudProviderOut {
+  id: number;
+  name: string;
+  kind: string;
+  default_image: string | null;
+  default_region: string | null;
+  default_plan: string | null;
+  ssh_key_ids: string[] | null;
+  is_active: boolean;
+  created_at: string;
+}
+
+// Образ ОС внутри тарифа (у 4vps образы зависят от тарифа+ДЦ).
+export interface OfferingImage {
+  id: number | null;
+  name: string;
+}
+
+export interface OfferingPlan {
+  id: number | null;
+  name: string;
+  price?: number | null;
+  cpu?: number | null;
+  ram_mib?: number | null;
+  rom?: number | null;
+  images?: OfferingImage[];
+}
+
+export interface OfferingDatacenter {
+  id: number | null;
+  name: string;
+  flag?: string | null;
+  cpu_name?: string | null;
+}
+
+export interface ProviderOfferings {
+  datacenters: OfferingDatacenter[];
+  plans: OfferingPlan[];
+  images: OfferingImage[];
+}
+
+export interface NodeSpawnIn {
+  provider_id: number;
+  name: string;
+  region: string; // datacenter id (строкой)
+  plan: string; // tariff id (строкой)
+  image?: string | null; // ostempl id (строкой)
+  pool_id?: number | null;
+  notes?: string | null;
+}
+
+export function listCloudProviders(): Promise<CloudProviderOut[]> {
+  return api.get<CloudProviderOut[]>("/cloud/providers");
+}
+
+export function getProviderOfferings(
+  providerId: number,
+): Promise<ProviderOfferings> {
+  return api.get<ProviderOfferings>(
+    `/cloud/providers/${providerId}/offerings`,
+  );
+}
+
+export function spawnNode(payload: NodeSpawnIn): Promise<VPNNodeOut> {
+  return api.post<VPNNodeOut>("/nodes/spawn", payload);
+}
+
+export function reinstallNode(
+  nodeId: number,
+  image?: string | null,
+): Promise<VPNNodeOut> {
+  return api.post<VPNNodeOut>(`/nodes/${nodeId}/reinstall`, { image });
+}
+
 // Протоколы должны быть в синке с VPNConfigProtocol enum в
 // backend/app/models.py — backend ругнётся 400 на неизвестный.
 // shadowtls+shadowsocks и hysteria2 оставлены в типе, так как их всё
