@@ -39,7 +39,16 @@ COPY infra /app/infra
 # authorized_key/sysctl, community.general for misc modules). ansible-core
 # ships with nothing bundled, so without this every bootstrap playbook fails
 # with "couldn't resolve module/action 'authorized_key'".
-RUN ansible-galaxy collection install -r /app/infra/ansible/requirements.yml
+# Retry: build is --no-cache, so this re-fetches from galaxy.ansible.com every
+# deploy → любой их 502/timeout (а они бывают) ронял всю прокатку. 5 попыток с
+# нарастающим бэкоффом переживают транзиентный сбой Galaxy.
+RUN for i in 1 2 3 4 5; do \
+      ansible-galaxy collection install -r /app/infra/ansible/requirements.yml && break; \
+      echo "ansible-galaxy install failed (attempt $i/5), retrying in $((i*15))s…"; \
+      sleep $((i*15)); \
+    done; \
+    ansible-galaxy collection list 2>/dev/null | grep -qi ansible.posix \
+      || { echo "FATAL: ansible.posix not installed after retries"; exit 1; }
 
 # The backend expects ANSIBLE_ROOT to resolve to `<backend>/../infra/ansible`
 # relative to the package location. We set it explicitly here so the worker
