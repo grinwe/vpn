@@ -86,9 +86,12 @@ SSH-ключ** (кладётся в биллинге/панели) — он ав
   gauge `vpn_fleet_monthly_cost`. Так баланс не иссякнет молча.
 - Driver += `get_balance`, `set_autoprolong` (тоггл), `renew_server`.
 
-### Фаза 4 — Два агента (видение, отдельный эпик)
+### Фаза 4 — Два агента (см. docs/AI_AGENT_ROADMAP.md)
 - **Support-agent**: отвечает юзерам в поддержке (read-only к биллингу/подпискам).
 - **Ops-agent**: управляет флотом через этот API + диагностику (добавить/снести/переустановить/мигрировать), за гейтом подтверждений. Независимые сущности, общая БД-правда.
+- **Сделано (P1 роадмапа агента):** read-only диагностический триаж ноды —
+  `POST /api/agent/triage/{node_id}`, `services/agent/*`, за флагом `AGENT_ENABLED`,
+  Claude `claude-sonnet-4-6`. Дальше — support-draft + ops-reversible по тирам.
 
 ---
 

@@ -100,3 +100,8 @@ deploy_app_stack_reconcile_overdue_warn_s: 120
 # провайдера (единицы как у провайдера; 0 = алерты выкл, только gauge).
 deploy_app_stack_cloud_billing_interval: 3600
 deploy_app_stack_cloud_balance_alert_threshold: 0
+# AI-агент (read-only триаж). Выключен по умолчанию; ключ — из vault
+# (vault_anthropic_api_key → deploy_app_stack_anthropic_api_key в group_vars).
+deploy_app_stack_agent_enabled: ""
+deploy_app_stack_anthropic_api_key: "{{ vault_anthropic_api_key | default('') }}"
+deploy_app_stack_agent_model: "claude-sonnet-4-6"

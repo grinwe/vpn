@@ -89,6 +89,11 @@ services:
       CLOUDFLARE_DNS_TOKEN: ${CLOUDFLARE_DNS_TOKEN:-}
       WSCDN_FRONT_DOMAIN: ${WSCDN_FRONT_DOMAIN:-}
       ANSIBLE_PLAYBOOK_TIMEOUT: ${ANSIBLE_PLAYBOOK_TIMEOUT:-300}
+      # AI-агент (read-only диагностический триаж, AI_AGENT_ROADMAP Phase 1).
+      # Kill switch + LLM-ключ + модель. Выключен по умолчанию.
+      AGENT_ENABLED: ${AGENT_ENABLED:-}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      AGENT_MODEL: ${AGENT_MODEL:-claude-sonnet-4-6}
       # Admin push-уведомления: backend шлёт в телегу по тем же
       # telegram_id'шникам, что бот считает админами. Одна переменная
       # в .env (ADMIN_IDS), два контейнерных алиаса — бот читает

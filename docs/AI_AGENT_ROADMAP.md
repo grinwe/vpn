@@ -38,10 +38,22 @@
 
 ## Фазы
 
-### Phase 1 — Диагностический триаж (read-only) ★ старт
-**Риск нулевой, польза мгновенная, юзеров не трогает.** Агент берёт smart-diagnose + health_probes + traffic_stats + свежий `audit_logs`, коррелирует и выдаёт человекочитаемый **root-cause + рекомендованное действие** (без выполнения). Здесь отлаживаем tool-слой, scoped-токен, аудит, dry-run — до того как подпускать к мутациям/юзерам.
-- Tools (read): `get_node_health`, `get_node_diagnose`, `get_traffic`, `list_recent_audit`, `get_subscription`.
-- Выход: отчёт в ops-чат/бот по запросу или по триггеру (нода → `error`).
+### Phase 1 — Диагностический триаж (read-only) ✅ реализовано (по запросу; за флагом)
+**Риск нулевой, польза мгновенная, юзеров не трогает.** Агент берёт overview +
+health_probes + traffic_stats + configs + provisioning-таски, коррелирует Claude
+tool-use'ом и выдаёт человекочитаемый **root-cause + рекомендованное действие**
+(без выполнения).
+- Реализация: `backend/app/services/agent/tools.py` (read-only tool-слой:
+  `get_node_overview`, `get_node_configs`, `get_node_health_probes`,
+  `get_node_traffic`, `get_node_provisioning_tasks`), `services/agent/triage.py`
+  (manual tool-use loop, `claude-sonnet-4-6` по умолчанию, adaptive thinking),
+  `POST /api/agent/triage/{node_id}` (`api/agent.py`).
+- Гардрейлы: kill switch `AGENT_ENABLED` (по умолчанию OFF), отдельный
+  `ANTHROPIC_API_KEY` (не мастер-ключ системы), `AGENT_MAX_ITERATIONS` кап,
+  все тулы read-only, действие в `audit_logs` (`agent_node_triaged`).
+- Выход: отчёт по запросу (`POST .../triage/{id}`). TODO: авто-триггер при
+  node→error + кнопка в админке + RAG по `docs/`.
+- Env (vault): `vault_anthropic_api_key` → `deploy_app_stack_anthropic_api_key`.
 
 ### Phase 2 — Draft-саппорт + propose-remediation
 - **Support-агент:** RAG по `docs/` с цитатами → черновик ответа юзеру. На старте — **human-approve** перед отправкой; потом автоответ на FAQ-класс. Анти-галлюцинации: только из доков, с источником.
