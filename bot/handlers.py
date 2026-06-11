@@ -1,11 +1,12 @@
 import asyncio
+import html
 import logging
 import os
 from urllib.parse import urlparse
 
 import aiohttp
 from aiogram import F, Router, types
-from aiogram.filters import Command, CommandStart
+from aiogram.filters import Command, CommandObject, CommandStart
 from aiogram.fsm.context import FSMContext
 
 from .config import (
@@ -1646,4 +1647,128 @@ async def go_referral(callback_query: types.CallbackQuery):
         f"Приглашённый получает <b>+50 ₽ на баланс</b>, ты — <b>+50 ₽</b>.\n"
         f"Приглашено: {uses} чел.",
         parse_mode="HTML",
+    )
+
+
+# ── Ops-агент: /ops <команда> → dry-run план (Phase 2, ничего не выполняет) ──
+
+_OPS_TIER_ICON = {"read": "👀", "reversible": "♻️", "costly": "💸", "destructive": "⚠️"}
+
+
+def _render_ops_plan(result: dict) -> str:
+    """Plan dict из POST /api/agent/ops/plan → HTML-сообщение Telegram.
+    Все динамические строки экранируем (план приходит от LLM, может содержать <>&)."""
+    plan = (result or {}).get("plan") or {}
+    esc = html.escape
+    lines: list[str] = ["🧭 <b>Ops-план</b> <i>(dry-run — ничего не выполнено)</i>"]
+
+    summary = plan.get("summary")
+    if summary:
+        lines.append(esc(str(summary)))
+
+    if plan.get("feasible") is False:
+        reason = plan.get("blocked_reason") or "не уточнено"
+        lines.append(f"\n⛔ <b>Невыполнимо:</b> {esc(str(reason))}")
+        if plan.get("notes"):
+            lines.append(f"ℹ️ {esc(str(plan['notes']))}")
+        return "\n".join(lines)
+
+    steps = plan.get("steps") or []
+    if steps:
+        lines.append("")
+        for i, st in enumerate(steps, 1):
+            icon = _OPS_TIER_ICON.get(str(st.get("tier")), "•")
+            desc = esc(str(st.get("description") or st.get("kind") or "шаг"))
+            block = [f"{i}. {icon} {desc}"]
+            extra = []
+            if st.get("est_cost_rub") not in (None, 0):
+                extra.append(f"~{st['est_cost_rub']}₽")
+            if st.get("est_users_affected") not in (None, 0):
+                extra.append(f"юзеров: {st['est_users_affected']}")
+            if st.get("reversible") is False:
+                extra.append("необратимо")
+            if extra:
+                block.append(f"   <i>{esc(' · '.join(str(x) for x in extra))}</i>")
+            for w in st.get("warnings") or []:
+                block.append(f"   ⚠️ {esc(str(w))}")
+            lines.append("\n".join(block))
+    else:
+        lines.append("\n(шагов нет)")
+
+    totals = []
+    if plan.get("total_est_cost_rub") not in (None, 0):
+        totals.append(f"итого ~{plan['total_est_cost_rub']}₽")
+    if plan.get("total_users_affected") not in (None, 0):
+        totals.append(f"юзеров затронем: {plan['total_users_affected']}")
+    if totals:
+        lines.append(f"\n<b>{esc(' · '.join(str(x) for x in totals))}</b>")
+
+    if plan.get("needs_confirmation"):
+        lines.append("\n⚠️ <b>Есть платные/необратимые шаги — нужно подтверждение.</b>")
+    if plan.get("notes"):
+        lines.append(f"ℹ️ {esc(str(plan['notes']))}")
+    lines.append(
+        f"\n<i>модель: {esc(str(result.get('model') or '?'))}, "
+        f"итераций: {result.get('iterations')}</i>"
+    )
+
+    text = "\n".join(lines)
+    return text[:4000] + ("…" if len(text) > 4000 else "")
+
+
+@router.message(Command("ops"))
+async def ops_plan(message: types.Message, command: CommandObject):
+    """Admin: NL ops-команда → dry-run план от агента. НИЧЕГО НЕ ВЫПОЛНЯЕТ —
+    только показывает шаги/оценку. Выполнение (за подтверждением) — отдельно."""
+    if not _is_admin(message.from_user.id):
+        await message.answer("Эта команда только для админов.")
+        return
+    text = (command.args or "").strip()
+    if not text:
+        await message.answer(
+            "Напиши команду после <code>/ops</code>, напр.:\n"
+            "<code>/ops закажи 2 ноды в Германии, подними туннель, "
+            "перевези юзеров с ноды 19</code>",
+            parse_mode="HTML",
+        )
+        return
+
+    wait = await message.answer("⏳ Собираю план… (агент опрашивает флот, до ~минуты)")
+    # Прямой single-shot вызов (НЕ _fetch_json): у него ретрай на 5xx, а 503 от
+    # агента — это полный прогон Claude, повторять дорого. Таймаут щедрый —
+    # bot→backend идёт напрямую (http://backend:8000), без nginx-кэпа 60с.
+    session = await get_session()
+    try:
+        async with session.request(
+            "POST",
+            f"{BACKEND_URL}/api/agent/ops/plan",
+            json={"command": text},
+            headers=_admin_headers(message.from_user.id),
+            timeout=aiohttp.ClientTimeout(total=120),
+        ) as resp:
+            status = resp.status
+            try:
+                payload = await resp.json()
+            except Exception:  # noqa: BLE001
+                payload = {"message": await resp.text()}
+    except asyncio.TimeoutError:
+        await wait.edit_text("Агент думал слишком долго (>120с). Упрости команду и повтори.")
+        return
+    except aiohttp.ClientError as exc:
+        await wait.edit_text(f"Бэкенд недоступен: {exc}")
+        return
+
+    if status == 503:
+        detail = (payload or {}).get("detail") or "агент недоступен"
+        await wait.edit_text(f"Агент недоступен: {html.escape(str(detail))}")
+        return
+    if status != 200:
+        detail = (payload or {}).get("detail") or (payload or {}).get("message") or status
+        await wait.edit_text(f"Не удалось построить план: {html.escape(str(detail))}")
+        return
+
+    await wait.edit_text(
+        _render_ops_plan(payload),
+        parse_mode="HTML",
+        disable_web_page_preview=True,
     )

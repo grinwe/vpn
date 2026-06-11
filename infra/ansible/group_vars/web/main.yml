@@ -65,3 +65,11 @@ deploy_app_stack_bot_webhook_port: 8081
 # ~50 nodes from this single vantage point.
 deploy_app_stack_probe_agent_token: "{{ vault_probe_agent_token | default('') }}"
 deploy_app_stack_probe_agent_region: "eu-nl"
+
+# AI-агент (триаж + ops-планировщик). Ключ Claude лежит в vault как
+# vault_anthropic_api_key; без этой проводки env.j2 рендерил ANTHROPIC_API_KEY
+# пустым и агент молча отдавал 503. Флаг включает агента (read-only триаж +
+# dry-run планировщик; мутаций нет).
+deploy_app_stack_anthropic_api_key: "{{ vault_anthropic_api_key | default('') }}"
+deploy_app_stack_agent_enabled: 1
+deploy_app_stack_agent_model: "claude-sonnet-4-6"
