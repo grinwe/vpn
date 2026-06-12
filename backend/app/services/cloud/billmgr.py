@@ -41,6 +41,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import secrets
 import time
 from typing import Any
@@ -194,19 +195,62 @@ class BillmgrDriver:
         ]
 
     # ---- offerings (admin-форма заказа) ----
-    # billmgr НЕ отдаёт отдельных списков клиенту — они в select-list'ах (slist)
-    # ВНУТРИ order-формы (vds.order.param без sok). Имена/форма slist панель-зависимы
-    # (UNCONFIRMED) → парсим защитно, дегрейдим в []. До боевого smoke админ берёт
-    # id руками из ответа no-sok формы (логируем сырой slist в debug).
+    # Wizard ДВУХШАГОВЫЙ (сверено по живому UFO): шаг 1 ``func=vds.order.pricelist``
+    # отдаёт тарифы (в блоке ``list[$name=tariflist].elem[]``, НЕ в slist!) +
+    # datacenter/period в ``slist``; шаг 2 ``func=vds.order.param&pricelist=…&
+    # datacenter=…&period=1`` отдаёт ОС (``slist[ostempl]``). Голый vds.order.param
+    # без pricelist → ``wizard_unavailable``. Всё защитно, дегрейд в [].
 
     def list_datacenters(self) -> list[dict]:
-        return self._slist_options("datacenter")
+        return _slist_from(self._order_form("vds.order.pricelist"), "datacenter")
 
     def list_plans(self) -> list[dict]:
-        return self._slist_options("pricelist")
+        """Тарифы из шага 1 — блок ``list[$name=tariflist].elem[]`` (pricelist/desc/
+        price), НЕ slist."""
+        doc = self._order_form("vds.order.pricelist")
+        blocks = doc.get("list")
+        if isinstance(blocks, dict):
+            blocks = [blocks]
+        elems: list = []
+        for b in blocks if isinstance(blocks, list) else []:
+            if isinstance(b, dict) and b.get("$name") == "tariflist":
+                elems = b.get("elem") or []
+                break
+        if isinstance(elems, dict):
+            elems = [elems]
+        out: list[dict] = []
+        for e in elems if isinstance(elems, list) else []:
+            if not isinstance(e, dict):
+                continue
+            pid = _scalar(e.get("pricelist"))
+            if pid is None:
+                continue
+            out.append({
+                "id": pid,
+                "name": _strip_html(_scalar(e.get("desc")) or str(pid)),
+                "price": _last_rub(_scalar(e.get("price"))),
+            })
+        return out
 
     def list_images(self) -> list[dict]:
-        return self._slist_options("ostempl")
+        """ОС — шаг 2: vds.order.param с выбранным pricelist+datacenter (иначе
+        wizard_unavailable). Берём первый тариф+ДЦ как репрезентативные."""
+        plans = self.list_plans()
+        dcs = self.list_datacenters()
+        if not plans or not dcs:
+            return []
+        doc = self._order_form(
+            "vds.order.param",
+            pricelist=plans[0]["id"], datacenter=dcs[0]["id"], period="1",
+        )
+        return _slist_from(doc, "ostempl")
+
+    def _order_form(self, func: str, **params: Any) -> dict:
+        """Шаг order-wizard'а (без sok — ничего не заказывает). Дегрейд в {}."""
+        try:
+            return self._call(func, **params)
+        except DriverError:
+            return {}
 
     # ---------- helpers ----------
 
@@ -235,34 +279,6 @@ class BillmgrDriver:
             except DriverError:
                 time.sleep(_PW_INTERVAL)
         return ""
-
-    def _slist_options(self, field: str) -> list[dict]:
-        """Опции select-list'а ``field`` из order-формы (vds.order.param без sok).
-        Защитно: разные версии billmgr кладут slist по-разному."""
-        try:
-            doc = self._call("vds.order.param")
-        except DriverError:
-            return []
-        slists = doc.get("slist")
-        entries: list = []
-        if isinstance(slists, list):
-            for s in slists:
-                if isinstance(s, dict) and (s.get("$name") == field or s.get("name") == field):
-                    entries = s.get("val") or s.get("value") or []
-                    break
-        elif isinstance(slists, dict):
-            entries = slists.get(field) or []
-        if not entries:
-            logger.debug("billmgr slist[%s] пуст/неизвестной формы: %r", field, slists)
-        out: list[dict] = []
-        for opt in entries if isinstance(entries, list) else []:
-            if not isinstance(opt, dict):
-                continue
-            key = opt.get("$key") or opt.get("key") or opt.get("id")
-            label = opt.get("$") or opt.get("label") or opt.get("name") or str(key)
-            if key is not None:
-                out.append({"id": key, "name": label})
-        return out
 
     def _wait_active(self, name: str) -> tuple[str, str, float | None, dict]:
         """Поллим func=vds, пока услуга с ``domain==name`` не станет active+IP.
@@ -324,6 +340,49 @@ class BillmgrDriver:
                 msg = err.get("msg") or err.get("$") or err.get("text") or err
             raise DriverError(f"billmgr {func} error: {msg}")
         return doc
+
+
+def _slist_from(doc: dict, field: str) -> list[dict]:
+    """Опции select-list'а ``field`` из формы wizard'а: ``slist`` — список
+    ``[{$name, val:[{$key,$}]}]`` (так у UFO) либо dict ``{field:[...]}``."""
+    slists = (doc or {}).get("slist")
+    entries: list = []
+    if isinstance(slists, list):
+        for s in slists:
+            if isinstance(s, dict) and (s.get("$name") == field or s.get("name") == field):
+                entries = s.get("val") or s.get("value") or []
+                break
+    elif isinstance(slists, dict):
+        entries = slists.get(field) or []
+    out: list[dict] = []
+    for opt in entries if isinstance(entries, list) else []:
+        if not isinstance(opt, dict):
+            continue
+        key = opt.get("$key") or opt.get("key") or opt.get("id")
+        label = opt.get("$") or opt.get("label") or opt.get("name") or str(key)
+        if key is not None:
+            out.append({"id": key, "name": label})
+    return out
+
+
+def _strip_html(s: Any) -> str:
+    if not isinstance(s, str):
+        return str(s)
+    return re.sub(r"<[^>]+>", "", s).strip()
+
+
+def _last_rub(s: Any) -> float | None:
+    """Цена из HTML-строки вида '<del>1025.85 RUB...</del>...<b>605.85 RUB...</b>' —
+    берём последнее число перед 'RUB' (фактическую цену со скидкой)."""
+    if not isinstance(s, str):
+        return None
+    nums = re.findall(r"(\d+(?:\.\d+)?)\s*RUB", s)
+    if nums:
+        try:
+            return float(nums[-1])
+        except ValueError:
+            return None
+    return None
 
 
 def _find_by_domain(doc: dict, name: str) -> dict | None:

@@ -247,15 +247,40 @@ def test_offerings_degrade_to_empty():
     assert _driver(weird_post).list_datacenters() == []
 
 
-def test_slist_parsing_when_shaped():
-    # ожидаемая форма slist → парсим опции
-    def post(url, data=None, timeout=None):
-        return _Resp(_ok({"slist": [
-            {"$name": "pricelist", "val": [
-                {"$key": "6", "$": "VPS Start"},
-                {"$key": "7", "$": "VPS Pro"},
-            ]},
-        ]}))
+def test_offerings_real_ufo_shape():
+    # реальная двухшаговая форма UFO: тарифы в list[tariflist].elem (НЕ slist),
+    # датацентры в slist шага 1, ОС в slist шага 2 (vds.order.param с pricelist).
+    pricelist_doc = _ok({
+        "list": [{"$name": "tariflist", "elem": [
+            {"pricelist": {"$": "150"},
+             "desc": {"$": "<p>Naos, vCore x1, 1 GB RAM</p>"},
+             "price": {"$": "<del>1025.85 RUB per month</del> <b>605.85 RUB per month</b>"}},
+        ]}],
+        "slist": [
+            {"$name": "datacenter", "val": [
+                {"$key": "3", "$": "Russia"}, {"$key": "9", "$": "Russia"}]},
+            {"$name": "period", "val": [{"$key": "1", "$": "Month"}]},
+        ],
+    })
+    param_doc = _ok({"slist": [{"$name": "ostempl", "val": [
+        {"$key": "ISPsystem__Ubuntu-22.04-amd64", "$": "Ubuntu 22.04"}]}]})
 
-    plans = _driver(post).list_plans()
-    assert plans == [{"id": "6", "name": "VPS Start"}, {"id": "7", "name": "VPS Pro"}]
+    def post(url, data=None, timeout=None):
+        f = data["func"]
+        if f == "vds.order.pricelist":
+            return _Resp(pricelist_doc)
+        if f == "vds.order.param":  # шаг 2: pricelist+datacenter обязаны быть выбраны
+            assert data["pricelist"] == "150" and data["datacenter"] == "3"
+            return _Resp(param_doc)
+        raise AssertionError(f)
+
+    d = _driver(post)
+    assert d.list_plans() == [
+        {"id": "150", "name": "Naos, vCore x1, 1 GB RAM", "price": 605.85}
+    ]
+    assert d.list_datacenters() == [
+        {"id": "3", "name": "Russia"}, {"id": "9", "name": "Russia"}
+    ]
+    assert d.list_images() == [
+        {"id": "ISPsystem__Ubuntu-22.04-amd64", "name": "Ubuntu 22.04"}
+    ]
