@@ -2704,11 +2704,14 @@ class ProvisioningOrchestrator:
         """Phase A — диверсная N×M подписка (за флагом ``DIVERSE_SUB_NODES``).
 
         Если флаг > 1, дотягивает к УЖЕ созданному device бандлы с (N-1)
-        дополнительных РАЗНООБРАЗНЫХ нод (разные регионы), чтобы саб-линк отдал
-        эндпоинты нескольких нод и клиент (Auto/url-test) мог прыгать между
-        НОДАМИ, не только протоколами. Берёт ТОЛЬКО тёплые бандлы (warm-pool уже
-        провижинит юзера на ноде) — без лишних ansible-прогонов на каждый сайнап;
-        ноды без тёплого бандла просто пропускает (best-effort, degrade).
+        дополнительных РАЗНЫХ нод (разные регионы ПО ВОЗМОЖНОСТИ — гарантируем
+        distinct-ноды, гео-разнесение лишь предпочитаем; см. двухпассовый цикл
+        ниже), чтобы саб-линк отдал эндпоинты нескольких нод и клиент
+        (Auto/url-test) мог прыгать между НОДАМИ, не только протоколами. Берёт
+        ТОЛЬКО тёплые бандлы (warm-pool уже провижинит юзера на ноде) — без лишних
+        ansible-прогонов на каждый сайнап; ноды без тёплого бандла пропускает
+        (best-effort, degrade). Если пасс-2 добрал ноду БЕЗ нового региона
+        (warm-пул беден на гео-ширину) — пишем warning, чтобы ops это видел.
 
         Полностью аддитивно и за флагом: ``DIVERSE_SUB_NODES`` по умолчанию ``1``
         ⇒ метод — no-op, поведение байт-в-байт как сейчас. Никогда не валит
@@ -2751,40 +2754,74 @@ class ProvisioningOrchestrator:
             if primary_node is not None:
                 exclude_ids.add(primary_node.id)
             exclude_ids.update(extra_exclude or [])
-            exclude_regions: list[str] = [
+            # Регионы нод, УЖЕ в наборе — для гео-разнесения предпочитаем новые.
+            used_regions: set[str] = {
                 row[0]
                 for row in self.db.query(models.VPNNode.region)
                 .filter(models.VPNNode.id.in_(list(existing)))
                 .all()
                 if row[0]
-            ]
+            }
             attached = 0
-            for _ in range(need):
+
+            def _try_one(region_filter: list[str] | None) -> bool:
+                """Взять ОДНУ диверсную ноду. False = кандидатов по фильтру больше
+                нет (choose_node бросил) → пасс исчерпан. True = кандидат был, даже
+                если без warm-бандла и его скипнули → перебираем дальше. КЛЮЧЕВОЕ
+                отличие от старого `for _ in range(need)`: слот не «сгорает» на ноде
+                без бандла — крутим, пока не наберём need ИЛИ не кончатся ноды."""
+                nonlocal attached
                 try:
                     node = choose_node(
-                        self.db,
-                        plan,
+                        self.db, plan,
                         exclude_node_ids=list(exclude_ids),
-                        exclude_regions=list(exclude_regions),
+                        exclude_regions=region_filter,
                     )
-                except Exception:  # noqa: BLE001 — больше диверсных нод нет
-                    break
+                except Exception:  # noqa: BLE001 — кандидатов по фильтру больше нет
+                    return False
+                # Больше эту ноду не пробуем (в т.ч. если она без warm-бандла).
                 exclude_ids.add(node.id)
-                if node.region:
-                    exclude_regions.append(node.region)
                 bundle = warm_pool.try_assign_bundle(self.db, node.id, subscription.id)
                 if not bundle:
-                    continue  # нет тёплого бандла на ноде — пропускаем (без cold-ansible)
+                    return True  # нода была, просто без тёплого бандла — берём следующую
                 for cred in bundle:
                     cred.device_id = device.id
                     self.db.add(cred)
+                if node.region:
+                    used_regions.add(node.region)
                 attached += 1
+                return True
+
+            # Пасс 1 — гео-разнесение: исключаем регионы, уже представленные в
+            # наборе. Пасс 2 — добор: снимаем фильтр по региону и набираем РАЗНЫМИ
+            # нодами (любой регион, в т.ч. region IS NULL — такие SQL-фильтр
+            # `~region.in_(...)` молча отбрасывал). Гарантирует до need РАЗНЫХ тёплых
+            # нод, когда они есть, вместо «застрять на 2».
+            # NB: `list(used_regions)` пересобирается КАЖДУЮ итерацию намеренно —
+            # нода, добранная в новом регионе на шаге k, исключается из шага k+1.
+            # НЕ выносить за цикл (схлопнет гео-разнесение обратно к багу).
+            while attached < need and _try_one(list(used_regions)):
+                pass
+            geo_attached = attached  # сколько набрали с РАЗНЫМИ регионами (пасс 1)
+            while attached < need and _try_one(None):
+                pass
+            fallback_attached = attached - geo_attached  # добор без нового региона
             if attached:
                 self.db.commit()
                 logger.info(
-                    "diverse-sub: device %s topped up by %d node(s) toward %d (sub %s)",
-                    device.id, attached, n_total, subscription.id,
+                    "diverse-sub: device %s topped up by %d node(s) toward %d "
+                    "(%d geo-diverse + %d same-region fallback) (sub %s)",
+                    device.id, attached, n_total, geo_attached,
+                    fallback_attached, subscription.id,
                 )
+                if fallback_attached:
+                    # warm-пул не дал гео-ширины — диверсность вырождена в distinct-IP
+                    # того же региона. Сигнал ops: пора заказать ноды в новых регионах.
+                    logger.warning(
+                        "diverse-sub: device %s — %d нод(ы) добрано БЕЗ нового региона "
+                        "(warm-пул беден на гео-ширину; гео-диверсность вырождена) (sub %s)",
+                        device.id, fallback_attached, subscription.id,
+                    )
         except Exception:  # noqa: BLE001 — бонус, не должен ронять provisioning
             logger.exception(
                 "diverse-sub attach failed for sub %s (primary intact)", subscription.id

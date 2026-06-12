@@ -162,6 +162,57 @@ def test_attach_diverse_skips_nodes_without_warm(
     orch._maybe_attach_diverse(sub, dev, plan, primary)  # не должно бросить
 
 
+def test_attach_diverse_fallback_when_geo_exhausted(
+    db_session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Гео-разнесение исчерпано: все диверсные ноды — тот же регион primary'я или
+    # region IS NULL. Старый цикл застревал (пасс с exclude_regions=["ru"] не
+    # находил ничего — SQL `~region.in_` роняет и same-region, и NULL-ноды) →
+    # device оставался на 1 ноде. Новый — пасс 2 без фильтра региона добирает
+    # РАЗНЫМИ нодами до N. Заодно проверяет, что слот не «сгорает».
+    monkeypatch.setenv("DIVERSE_SUB_NODES", "3")
+    plan = make_plan(db_session)
+    user = make_user(db_session)
+    primary = make_node(db_session, name="ru-fb", region="ru")
+    cfg = make_config(db_session, primary)
+    sub = make_subscription(db_session, user, plan, primary)
+    dev = make_device(db_session, sub, cfg)
+    s1 = make_node(db_session, name="ru-fb-1", region="ru", host="198.51.100.91")
+    s2 = make_node(db_session, name="null-fb", region=None, host="198.51.100.92")
+    w1 = _warm_cred(db_session, s1, "warm-s1")
+    w2 = _warm_cred(db_session, s2, "warm-s2")
+
+    pool = [s1, s2]
+
+    def fake_choose(db, p, *, node_id=None, exclude_node_ids=None, exclude_regions=None):
+        ex_ids = set(exclude_node_ids or [])
+        ex_regs = set(exclude_regions or [])
+        for n in pool:
+            if n.id in ex_ids:
+                continue
+            # Мимикрия SQL `~region.in_(ex_regs)`: при НЕПУСТОМ фильтре строки с
+            # region ∈ ex_regs И region IS NULL отбрасываются (NULL IN → NULL).
+            if ex_regs and (n.region is None or n.region in ex_regs):
+                continue
+            return n
+        raise RuntimeError("no node")
+
+    monkeypatch.setattr(provisioning, "choose_node", fake_choose)
+    monkeypatch.setattr(
+        warm_pool, "try_assign_bundle",
+        lambda db, nid, sid: {s1.id: [w1], s2.id: [w2]}.get(nid),
+    )
+
+    orch = ProvisioningOrchestrator(db_session)
+    orch._maybe_attach_diverse(sub, dev, plan, primary)
+
+    db_session.refresh(w1)
+    db_session.refresh(w2)
+    # обе диверсные ноды добраны, хотя гео-фильтр их прятал (пасс 2 спас набор)
+    assert w1.device_id == dev.id
+    assert w2.device_id == dev.id
+
+
 def test_swap_node_out_replaces_one_node(
     db_session: Session, monkeypatch: pytest.MonkeyPatch
 ) -> None:
