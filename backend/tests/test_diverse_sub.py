@@ -98,15 +98,18 @@ def test_attach_diverse_binds_warm_bundles(
     assert c2.device_id == dev.id
 
 
-def _active_cred_on(db: Session, node: models.VPNNode, device: models.Device, username: str) -> None:
-    db.add(
-        models.Credential(
-            node_id=node.id, device_id=device.id, is_active=True,
-            proto="vless-reality", config_text="enc-uri", access_username=username,
-            pool_state=models.CredentialPoolState.assigned,
-        )
+def _active_cred_on(
+    db: Session, node: models.VPNNode, device: models.Device, username: str
+) -> models.Credential:
+    c = models.Credential(
+        node_id=node.id, device_id=device.id, is_active=True,
+        proto="vless-reality", config_text="enc-uri", access_username=username,
+        pool_state=models.CredentialPoolState.assigned,
     )
+    db.add(c)
     db.commit()
+    db.refresh(c)
+    return c
 
 
 def test_attach_diverse_idempotent_when_full(
@@ -157,3 +160,65 @@ def test_attach_diverse_skips_nodes_without_warm(
 
     orch = ProvisioningOrchestrator(db_session)
     orch._maybe_attach_diverse(sub, dev, plan, primary)  # не должно бросить
+
+
+def test_swap_node_out_replaces_one_node(
+    db_session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("DIVERSE_SUB_NODES", "3")
+    plan = make_plan(db_session)
+    user = make_user(db_session)
+    a = make_node(db_session, name="swp-a", region="ru")
+    b = make_node(db_session, name="swp-b", region="de", host="198.51.100.71")
+    c = make_node(db_session, name="swp-c", region="nl", host="198.51.100.72")
+    cfg = make_config(db_session, a)
+    sub = make_subscription(db_session, user, plan, a)
+    dev = make_device(db_session, sub, cfg, access_username="u")
+    _active_cred_on(db_session, a, dev, "u-a")
+    cred_b = _active_cred_on(db_session, b, dev, "u-b")
+    _active_cred_on(db_session, c, dev, "u-c")
+
+    # свежая нода d + тёплый бандл для добора взамен выкинутой
+    d = make_node(db_session, name="swp-d", region="fr", host="198.51.100.73")
+    warm_d = _warm_cred(db_session, d, "warm-d")
+
+    def fake_choose(db, p, *, node_id=None, exclude_node_ids=None, exclude_regions=None):
+        if d.id not in (exclude_node_ids or []):
+            return d
+        raise RuntimeError("no more")
+
+    monkeypatch.setattr(provisioning, "choose_node", fake_choose)
+    monkeypatch.setattr(
+        warm_pool, "try_assign_bundle",
+        lambda db, nid, sid: [warm_d] if nid == d.id else None,
+    )
+
+    orch = ProvisioningOrchestrator(db_session)
+    added = orch.swap_node_out(dev, b.id)
+
+    db_session.refresh(cred_b)
+    db_session.refresh(warm_d)
+    assert cred_b.is_active is False              # выкинутая нода деактивирована
+    assert cred_b.pool_state == models.CredentialPoolState.revoked
+    assert warm_d.device_id == dev.id             # добрана свежая взамен
+    assert added == 1
+
+
+def test_migrate_device_blocked_for_diverse(
+    db_session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    plan = make_plan(db_session)
+    user = make_user(db_session)
+    a = make_node(db_session, name="mg-a", region="ru")
+    b = make_node(db_session, name="mg-b", region="de", host="198.51.100.81")
+    target = make_node(db_session, name="mg-t", region="fr", host="198.51.100.82")
+    cfg = make_config(db_session, a)
+    sub = make_subscription(db_session, user, plan, a)
+    dev = make_device(db_session, sub, cfg, access_username="u")
+    _active_cred_on(db_session, a, dev, "u-a")
+    _active_cred_on(db_session, b, dev, "u-b")  # 2 ноды → диверсный
+
+    orch = ProvisioningOrchestrator(db_session)
+    # legacy-миграция диверс-девайса должна быть запрещена (иначе схлопнет до 1)
+    with pytest.raises(RuntimeError, match="диверсная"):
+        orch.migrate_device_to_node(dev, target_node_id=target.id)

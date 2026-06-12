@@ -2697,7 +2697,9 @@ class ProvisioningOrchestrator:
         subscription: models.Subscription,
         device: models.Device,
         plan: models.Plan,
-        primary_node: models.VPNNode,
+        primary_node: models.VPNNode | None,
+        *,
+        extra_exclude: list[int] | None = None,
     ) -> None:
         """Phase A — диверсная N×M подписка (за флагом ``DIVERSE_SUB_NODES``).
 
@@ -2722,9 +2724,9 @@ class ProvisioningOrchestrator:
         from . import warm_pool
 
         try:
-            # Ноды, на которых у device УЖЕ есть активный credential (+ primary
-            # всегда). ИДЕМПОТЕНТНО: добираем до n_total РАЗНЫХ нод суммарно, а не
-            # +N-1 на каждый вызов — иначе reprovision/миграция раздували бы набор.
+            # Ноды, на которых у device УЖЕ есть активный credential.
+            # ИДЕМПОТЕНТНО: добираем до n_total РАЗНЫХ нод суммарно, а не +N-1 на
+            # каждый вызов — иначе reprovision/swap раздували бы набор.
             existing: set[int] = {
                 row[0]
                 for row in self.db.query(models.Credential.node_id)
@@ -2736,29 +2738,40 @@ class ProvisioningOrchestrator:
                 .distinct()
                 .all()
             }
-            existing.add(primary_node.id)
-            picked_ids: list[int] = list(existing)
-            picked_regions: list[str] = [
+            # Свежий provision: активных creds ещё нет → primary как стартовая.
+            # При swap primary НЕ форсим в existing (он мог быть выкинутой нодой).
+            if not existing and primary_node is not None:
+                existing = {primary_node.id}
+            need = n_total - len(existing)
+            if need <= 0:
+                return
+            # Из выбора исключаем: что уже есть, primary, и явные exclude (swap'нутая
+            # битая нода — чтобы не добрать её же обратно).
+            exclude_ids: set[int] = set(existing)
+            if primary_node is not None:
+                exclude_ids.add(primary_node.id)
+            exclude_ids.update(extra_exclude or [])
+            exclude_regions: list[str] = [
                 row[0]
                 for row in self.db.query(models.VPNNode.region)
-                .filter(models.VPNNode.id.in_(picked_ids))
+                .filter(models.VPNNode.id.in_(list(existing)))
                 .all()
                 if row[0]
             ]
             attached = 0
-            for _ in range(max(0, n_total - len(existing))):
+            for _ in range(need):
                 try:
                     node = choose_node(
                         self.db,
                         plan,
-                        exclude_node_ids=list(picked_ids),
-                        exclude_regions=list(picked_regions),
+                        exclude_node_ids=list(exclude_ids),
+                        exclude_regions=list(exclude_regions),
                     )
                 except Exception:  # noqa: BLE001 — больше диверсных нод нет
                     break
-                picked_ids.append(node.id)
+                exclude_ids.add(node.id)
                 if node.region:
-                    picked_regions.append(node.region)
+                    exclude_regions.append(node.region)
                 bundle = warm_pool.try_assign_bundle(self.db, node.id, subscription.id)
                 if not bundle:
                     continue  # нет тёплого бандла на ноде — пропускаем (без cold-ansible)
@@ -3582,6 +3595,20 @@ class ProvisioningOrchestrator:
                 "target_node_id matches device's current node"
             )
 
+        # Диверс-гард: legacy-миграция гасит ВЕСЬ device и реподнимает на одной
+        # ноде → схлопнула бы N-нодный набор до одной. Для диверс-девайсов это
+        # запрещено — оператор должен использовать per-node replace
+        # (swap_node_out), который меняет одну ноду, не трогая остальные.
+        active_nodes = {
+            c.node_id for c in device.credentials if c.is_active and c.node_id
+        }
+        if len(active_nodes) > 1:
+            raise RuntimeError(
+                f"device держит {len(active_nodes)} нод (диверсная подписка) — "
+                "миграция схлопнула бы набор до одной. Используй per-node replace "
+                "(POST /api/devices/{id}/nodes/{node_id}/swap), он меняет одну ноду."
+            )
+
         target = choose_node(self.db, plan, node_id=target_node_id)
 
         # Migration-stable URI reuse (per-device variant). Siblings on
@@ -3617,6 +3644,54 @@ class ProvisioningOrchestrator:
             reuse_uuid=reuse_uuid,
         )
         return target, new_device, task
+
+    def swap_node_out(self, device: models.Device, node_id: int) -> int:
+        """Diverse-rotation primitive: выкинуть ноду ``node_id`` из набора device
+        и добрать свежую диверсную взамен. Device и ``sub_token`` НЕ меняются.
+
+        1. Деактивируем активные creds device на ``node_id`` (is_active=False,
+           pool_state=revoked, revoked_at) — строки НЕ удаляем (sub-link инвариант:
+           ревокнутые creds остаются, просто выпадают из выдачи саб-линка).
+        2. ``_maybe_attach_diverse`` доберёт свежую ноду до ``DIVERSE_SUB_NODES``,
+           исключая выкинутую (extra_exclude), из тёплого пула.
+
+        Возвращает число добранных нод. Физическое удаление xray-юзера на
+        ``node_id`` отложено (двухстадийно, как обычный revoke; нода подчистит
+        дрейф ресинком) — для саб-линка cred уже неактивен, клиент его не видит.
+
+        Это и есть «миграция» в диверс-мире (меняем одну ноду, не схлопывая
+        набор), и тот же примитив переиспользует авто-ротация по carrying_fraction.
+        """
+        sub = device.subscription
+        if sub is None:
+            raise RuntimeError("device has no subscription")
+        creds = [
+            c for c in device.credentials if c.node_id == node_id and c.is_active
+        ]
+        if not creds:
+            raise RuntimeError(
+                f"device {device.id} has no active credentials on node {node_id}"
+            )
+        now = utcnow()
+        for c in creds:
+            c.is_active = False
+            c.revoked_at = c.revoked_at or now
+            c.pool_state = models.CredentialPoolState.revoked
+            self.db.add(c)
+        self.db.commit()
+
+        before = {
+            c.node_id for c in device.credentials if c.is_active and c.node_id
+        }
+        primary = sub.node or (device.config.node if device.config else None)
+        self._maybe_attach_diverse(
+            sub, device, sub.plan, primary, extra_exclude=[node_id]
+        )
+        self.db.refresh(device)
+        after = {
+            c.node_id for c in device.credentials if c.is_active and c.node_id
+        }
+        return len(after - before)
 
     def revoke_device(
         self, device: models.Device, *, reason: str | None = None, background: bool = True

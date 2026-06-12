@@ -946,6 +946,86 @@ def migrate_device(
     )
 
 
+def _device_node_set(db: Session, device: models.Device) -> list[dict]:
+    """Набор нод, на которых у device есть АКТИВНЫЕ creds (диверсная подписка):
+    [{node_id, name, region, status, protocols:[...]}]. Для админки — «на каких
+    нодах сидит юзер»."""
+    by_node: dict[int, set[str]] = {}
+    for c in device.credentials:
+        if c.is_active and c.node_id:
+            by_node.setdefault(c.node_id, set()).add(c.proto)
+    if not by_node:
+        return []
+    rows = (
+        db.query(
+            models.VPNNode.id, models.VPNNode.name,
+            models.VPNNode.region, models.VPNNode.status,
+        )
+        .filter(models.VPNNode.id.in_(list(by_node)))
+        .all()
+    )
+    info = {r[0]: r for r in rows}
+    out = []
+    for nid, protos in by_node.items():
+        r = info.get(nid)
+        out.append({
+            "node_id": nid,
+            "name": r[1] if r else None,
+            "region": r[2] if r else None,
+            "status": (r[3].value if r and hasattr(r[3], "value") else None),
+            "protocols": sorted(protos),
+        })
+    return sorted(out, key=lambda x: x["node_id"])
+
+
+@router.get("/devices/{device_id}/nodes")
+def get_device_nodes(
+    device_id: int,
+    db: Session = Depends(get_db),
+    admin_token: str = Depends(require_admin),
+):
+    """Набор нод диверсной подписки device (на каких нодах сидит юзер)."""
+    device = db.get(models.Device, device_id)
+    if not device:
+        raise HTTPException(status_code=404, detail="Device not found")
+    return {"device_id": device_id, "nodes": _device_node_set(db, device)}
+
+
+@router.post("/devices/{device_id}/nodes/{node_id}/swap")
+def swap_device_node(
+    device_id: int,
+    node_id: int,
+    db: Session = Depends(get_db),
+    admin_token: str = Depends(require_admin),
+    admin_actor: str | None = Header(default=None, alias=ADMIN_ACTOR_HEADER),
+):
+    """Diverse-rotation: убрать ноду ``node_id`` из набора device и добрать свежую
+    диверсную взамен (sub_token не меняется). Это «миграция» для диверс-подписок —
+    меняет одну ноду, не схлопывая набор. См. ProvisioningOrchestrator.swap_node_out."""
+    device = db.get(models.Device, device_id)
+    if not device:
+        raise HTTPException(status_code=404, detail="Device not found")
+    orchestrator = ProvisioningOrchestrator(db)
+    try:
+        added = orchestrator.swap_node_out(device, node_id)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    actor, actor_type = _resolve_admin_actor(admin_actor)
+    _audit(
+        db, actor, "device_node_swapped", "device", device_id,
+        actor_type=actor_type,
+        metadata={"removed_node_id": node_id, "added_nodes": added},
+    )
+    db.commit()
+    db.refresh(device)
+    return {
+        "device_id": device_id,
+        "removed_node_id": node_id,
+        "added_nodes": added,
+        "nodes": _device_node_set(db, device),
+    }
+
+
 @router.post(
     "/devices/{device_id}/switch-exit",
     response_model=schemas.DeviceSwitchExitOut,
