@@ -14,7 +14,7 @@ interface CloudProviderOut {
   created_at: string;
 }
 
-const KINDS = ["hetzner", "vultr", "digitalocean", "aeza", "4vps", "vdsina", "manual"] as const;
+const KINDS = ["hetzner", "vultr", "digitalocean", "aeza", "4vps", "vdsina", "billmgr", "manual"] as const;
 
 export default function CloudProviders() {
   const qc = useQueryClient();
@@ -187,7 +187,13 @@ function ProviderForm({
           value={apiToken}
           onChange={(e) => setApiToken(e.target.value)}
           placeholder={
-            kind === "4vps" ? "panel_id:apikey" : isEdit ? "••••••••" : ""
+            kind === "4vps"
+              ? "panel_id:apikey"
+              : kind === "billmgr"
+                ? '{"base_url":"https://bill.ufo.hosting/billmgr","username":"…","password":"…"}'
+                : isEdit
+                  ? "••••••••"
+                  : ""
           }
           className="bg-slate-800 border border-slate-700 rounded px-2 py-1"
         />
@@ -196,6 +202,15 @@ function ProviderForm({
             4vps: формат <code>panel_id:apikey</code> (panel_id из
             /api/public/getPanelIds, apikey — из ЛК). Регион/тариф/ОС задаются
             при заказе ноды, тут можно не заполнять.
+          </span>
+        )}
+        {kind === "billmgr" && (
+          <span className="text-[10px] text-amber-400 mt-1">
+            BILLmanager (DataCheap/UFO/AdminVPS): токен — JSON{" "}
+            <code>{'{"base_url","username","password"}'}</code>, напр.{" "}
+            <code>https://bill.ufo.hosting/billmgr</code> + логин/пароль от ЛК.
+            datacenter/pricelist/ostempl — числовые id из формы заказа. Стартовый
+            хостер — UFO (его API доступен скриптам; DataCheap/AdminVPS режут DC-IP).
           </span>
         )}
       </label>

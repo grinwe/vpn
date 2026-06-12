@@ -62,7 +62,41 @@ PDF; драйвер прошёл 3-линзовый адверсариал-ре�
 **Боевой smoke (нужен токен+баланс):** завести `CloudProvider(kind=vdsina,
 api_token=<token>)` (ssh-ключ авто-зарегается при первом заказе, если воркеру
 примонтирован `ANSIBLE_PRIVATE_KEY_FILE`) → offerings → заказать тест-ноду (числовые
-id ДЦ/тариф/ОС из offerings) → `active` → снести.
+id ДЦ/тариф/ОС из offerings) → `active` → снести. NB: их API (`userapi.vdsina.ru`)
+исторически штормит (видели полный 504 на их гейтвее) — на автоскейл одних не сажать.
+
+### Третий провайдер — generic BILLmanager ✅ (driver, 2026-06-12)
+`services/cloud/billmgr.py` (`CloudProviderKind.billmgr`, миграция `0049`, ветка в
+`get_driver`, kind+hint в `CloudProviders.tsx`). **ОДИН драйвер на пачку RU-хостеров
+на ISPsystem BILLmanager** (DataCheap/UFO/AdminVPS): хост+креды в `api_token_enc` как
+JSON `{"base_url","username","password"}` (целиком Fernet). Контракт сверен по офиц.
+ISPsystem b6sa/v6-докам + рабочим примерам PQ.Hosting/the.hosting.
+- Auth: `authinfo=user:password` параметром каждого запроса (stateless). `out=json` →
+  `{doc}`, ошибка в `doc.error`.
+- Заказ — **одним выстрелом**: `func=vds.order.param …&skipbasket=on&sok=ok` →
+  **СПИСЫВАЕТ С БАЛАНСА** сразу. id услуги в ответе нет → находим по `domain` (=имя
+  ноды) в `func=vds`. Статус+IP: `func=vds` → `elem[].{ip,item_status}` (поллим до
+  `item_status==2`+ip). Delete `vds.delete`, reinstall `vds.edit ostempl` (нет
+  `vds.reinstall`).
+- **Нет инъекции SSH-ключа → root-пароль** (как 4vps): VMmanager генерит свой, мы
+  ставим СВОЙ известный через `service.changepassword` после active → возвращаем как
+  `root_password`. Форма — **блокирующий `create_server` БЕЗ order_server** (заказ+
+  поллинг в фоне `_finalize_spawn` — демон-тред, НЕ в HTTP-запросе → 502 не грозит;
+  он же сохранит пароль; как hetzner по форме). Заказ шлёт `autoprolong=1` (иначе
+  нода удалится в конце периода).
+- **Orphan-guard (из ревью):** заказ СПИСЫВАЕТ баланс до того, как известен id
+  услуги (его находим по `domain` в `func=vds`). Если услуга не поднялась за таймаут
+  / не встал пароль — `create_server` СНОСИТ оплаченную залипшую услугу (`vds.delete`)
+  + ERROR-лог с id, чтобы ретраи (особенно autoscale) не плодили оплаченных сирот.
+  `_wait_active`/`_extract_ip` читают $-обёрнутый billmgr-JSON и список IP корректно.
+- **⚠️ Стартовый хостер — UFO** (`bill.ufo.hosting/billmgr`): его API доказанно
+  доступен скриптам (DDoS-Guard пассивный, чистый JSON голому curl). **DataCheap +
+  AdminVPS режут TLS с DC-IP** (может зарезать и наш воркер — UNCONFIRMED); у AdminVPS
+  ещё одноразовые API-ключи. Так что generic-драйвер обкатываем на UFO первым.
+- **UNCONFIRMED (проверить боевым smoke на UFO до прода):** точные имена slist-полей
+  offerings; поведение `skipbasket` при нехватке баланса (спишет vs создаст unpaid);
+  доступен ли `vds.edit ostempl` под клиентским токеном; не IP-whitelist'нут ли
+  `authinfo`; не мешает ли login-captcha. Драйвер прошёл 3-линзовый ревью.
 
 ---
 

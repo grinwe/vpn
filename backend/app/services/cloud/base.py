@@ -151,6 +151,14 @@ def get_driver(provider: models.CloudProvider) -> CloudDriver:
         # переинжектить наш ключ при ротации ОС.
         return VdsinaDriver(token=token, ssh_key_ids=provider.ssh_key_ids or [])
 
+    if kind == "billmgr":
+        from .billmgr import BillmgrDriver
+
+        if not token:
+            raise DriverError("billmgr provider has no API token configured")
+        # token — JSON {base_url, username, password} (драйвер парсит сам).
+        return BillmgrDriver(token=token)
+
     if kind == "manual":
         from .manual import ManualDriver
 

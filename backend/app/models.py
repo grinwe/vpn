@@ -127,6 +127,11 @@ class CloudProviderKind(str, enum.Enum):
     # поэтому PG-enum label тоже "vdsina" (см. миграция 0048). Custom REST API
     # (userapi.vdsina.ru), инжектит ssh-ключ → как hetzner, без парольного bootstrap.
     vdsina = "vdsina"
+    # ISPsystem BILLmanager — ОДИН generic-драйвер на пачку RU-хостеров (DataCheap/
+    # UFO/AdminVPS), конкретный хост+креды в api_token_enc как JSON
+    # {base_url,username,password}. Имя==value=="billmgr" (см. миграция 0049).
+    # No-key + root-password (как 4vps).
+    billmgr = "billmgr"
     manual = "manual"
 
 
