@@ -123,6 +123,10 @@ class CloudProviderKind(str, enum.Enum):
     # PG-enum cloudproviderkind должен содержать 'fourvps' (см. миграция 0046),
     # а не '4vps'.
     fourvps = "4vps"
+    # VDSina — RU/EU-хостер. Имя == value == "vdsina" (нет рассинхрона как у 4vps),
+    # поэтому PG-enum label тоже "vdsina" (см. миграция 0048). Custom REST API
+    # (userapi.vdsina.ru), инжектит ssh-ключ → как hetzner, без парольного bootstrap.
+    vdsina = "vdsina"
     manual = "manual"
 
 

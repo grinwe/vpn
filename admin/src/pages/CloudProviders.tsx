@@ -14,7 +14,7 @@ interface CloudProviderOut {
   created_at: string;
 }
 
-const KINDS = ["hetzner", "vultr", "digitalocean", "aeza", "4vps", "manual"] as const;
+const KINDS = ["hetzner", "vultr", "digitalocean", "aeza", "4vps", "vdsina", "manual"] as const;
 
 export default function CloudProviders() {
   const qc = useQueryClient();

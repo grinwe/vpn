@@ -39,6 +39,31 @@
 Драйвер сплитит по первому `:`. Если двоеточия нет — значение целиком трактуется
 как `apikey` (panel_id пуст). См. `fourvps.py:_split_token`.
 
+### Второй провайдер — VDSina ✅ (driver, 2026-06-12)
+`services/cloud/vdsina.py` (`CloudProviderKind.vdsina`, миграция `0048`, ветка в
+`get_driver`, kind в `CloudProviders.tsx`). Custom REST `userapi.vdsina.ru/v1`,
+**auth — ГОЛЫЙ `Authorization: <token>` (без Bearer!)**, конверт
+`{status,status_msg,data}` (пустой список = `status:error`+`"No X information"` →
+трактуем как `[]`). Async order→poll как 4vps: `order_server` (POST /server,
+дефисные `server-plan`/`ssh-key`) → `wait_for_ipv4` (poll GET /server/{id} до
+`active`, `data.ip` — **МАССИВ** `[{ip,type}]`). Offerings: `/server-group`+
+`/server-plan/{g}`, `/datacenter`, `/template`. Баланс: `/account.balance.real`.
+**Ключевое отличие от 4vps: VDSina ИНЖЕКТИТ ssh-ключ при заказе** (`ssh-key` id) →
+бокс поднимается с нашим ключом, парольный bootstrap НЕ нужен (как hetzner). Ключ
+берётся так: явный `provider.ssh_key_ids` → иначе **АВТО-регистрация** нашего
+provisioning-pubkey на VDSina (`_ensure_key_id`: ищет ssh-key по имени
+`vpn-provisioning`, иначе `POST /ssh-key`). Путь «без ключа» ВЫПИЛЕН (пароль VDSina
+генерит сам, эндпоинт пароля бывает не сразу готов → ломало bootstrap на оплаченном
+боксе; ревью поймало). `reinstall` тоже переинжектит ключ (его сигнатура ключи не
+получает → `_ensure_key_id`). id (datacenter/server-plan/template) ЧИСЛОВЫЕ —
+валидируем ДО оплаты (fast-fail на строковом `ubuntu-22.04`-дефолте). Имя==value==
+"vdsina" (рассинхрона 0046 нет). Спека сверена по двум community-клиентам + офиц.
+PDF; драйвер прошёл 3-линзовый адверсариал-ревью (no-key майоры устранены авто-ключом).
+**Боевой smoke (нужен токен+баланс):** завести `CloudProvider(kind=vdsina,
+api_token=<token>)` (ssh-ключ авто-зарегается при первом заказе, если воркеру
+примонтирован `ANSIBLE_PRIVATE_KEY_FILE`) → offerings → заказать тест-ноду (числовые
+id ДЦ/тариф/ОС из offerings) → `active` → снести.
+
 ---
 
 ## Фазы
