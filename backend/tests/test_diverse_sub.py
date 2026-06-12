@@ -98,6 +98,42 @@ def test_attach_diverse_binds_warm_bundles(
     assert c2.device_id == dev.id
 
 
+def _active_cred_on(db: Session, node: models.VPNNode, device: models.Device, username: str) -> None:
+    db.add(
+        models.Credential(
+            node_id=node.id, device_id=device.id, is_active=True,
+            proto="vless-reality", config_text="enc-uri", access_username=username,
+            pool_state=models.CredentialPoolState.assigned,
+        )
+    )
+    db.commit()
+
+
+def test_attach_diverse_idempotent_when_full(
+    db_session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # device уже несёт активные creds на 3 разных нодах ⇒ повторный вызов
+    # (reprovision/миграция) НЕ должен добирать ещё (иначе набор раздувается).
+    monkeypatch.setenv("DIVERSE_SUB_NODES", "3")
+    plan = make_plan(db_session)
+    user = make_user(db_session)
+    primary = make_node(db_session, name="ru-idem", region="ru")
+    cfg = make_config(db_session, primary)
+    sub = make_subscription(db_session, user, plan, primary)
+    dev = make_device(db_session, sub, cfg, access_username="u-ru")
+    d1 = make_node(db_session, name="de-idem", region="de", host="198.51.100.50")
+    d2 = make_node(db_session, name="nl-idem", region="nl", host="198.51.100.60")
+    _active_cred_on(db_session, primary, dev, "u-ru")
+    _active_cred_on(db_session, d1, dev, "u-de")
+    _active_cred_on(db_session, d2, dev, "u-nl")
+
+    called: list[int] = []
+    monkeypatch.setattr(provisioning, "choose_node", lambda *a, **k: called.append(1))
+    orch = ProvisioningOrchestrator(db_session)
+    orch._maybe_attach_diverse(sub, dev, plan, primary)
+    assert called == []  # уже 3 ноды (need=0) → choose_node не зовётся
+
+
 def test_attach_diverse_skips_nodes_without_warm(
     db_session: Session, monkeypatch: pytest.MonkeyPatch
 ) -> None:

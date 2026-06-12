@@ -2721,11 +2721,32 @@ class ProvisioningOrchestrator:
 
         from . import warm_pool
 
-        picked_ids: list[int] = [primary_node.id]
-        picked_regions: list[str] = [primary_node.region] if primary_node.region else []
-        attached = 0
         try:
-            for _ in range(n_total - 1):
+            # Ноды, на которых у device УЖЕ есть активный credential (+ primary
+            # всегда). ИДЕМПОТЕНТНО: добираем до n_total РАЗНЫХ нод суммарно, а не
+            # +N-1 на каждый вызов — иначе reprovision/миграция раздували бы набор.
+            existing: set[int] = {
+                row[0]
+                for row in self.db.query(models.Credential.node_id)
+                .filter(
+                    models.Credential.device_id == device.id,
+                    models.Credential.is_active.is_(True),
+                    models.Credential.node_id.isnot(None),
+                )
+                .distinct()
+                .all()
+            }
+            existing.add(primary_node.id)
+            picked_ids: list[int] = list(existing)
+            picked_regions: list[str] = [
+                row[0]
+                for row in self.db.query(models.VPNNode.region)
+                .filter(models.VPNNode.id.in_(picked_ids))
+                .all()
+                if row[0]
+            ]
+            attached = 0
+            for _ in range(max(0, n_total - len(existing))):
                 try:
                     node = choose_node(
                         self.db,
@@ -2740,9 +2761,7 @@ class ProvisioningOrchestrator:
                     picked_regions.append(node.region)
                 bundle = warm_pool.try_assign_bundle(self.db, node.id, subscription.id)
                 if not bundle:
-                    # нет тёплого бандла на этой ноде — пропускаем (не гоним
-                    # cold-ansible на вторичные ноды в MVP).
-                    continue
+                    continue  # нет тёплого бандла на ноде — пропускаем (без cold-ansible)
                 for cred in bundle:
                     cred.device_id = device.id
                     self.db.add(cred)
@@ -2750,8 +2769,8 @@ class ProvisioningOrchestrator:
             if attached:
                 self.db.commit()
                 logger.info(
-                    "diverse-sub: attached %d extra node(s) to device %s (sub %s)",
-                    attached, device.id, subscription.id,
+                    "diverse-sub: device %s topped up by %d node(s) toward %d (sub %s)",
+                    device.id, attached, n_total, subscription.id,
                 )
         except Exception:  # noqa: BLE001 — бонус, не должен ронять provisioning
             logger.exception(
@@ -3116,6 +3135,10 @@ class ProvisioningOrchestrator:
                         reuse_connection_uri=reuse_connection_uri,
                     )
                     self.db.refresh(subscription)
+                    # add-device / unfreeze (generic case = тот же гейт, что и у
+                    # warm-fast-path: target_node/reuse_uuid is None) тоже получает
+                    # диверсный набор. Идемпотентно (см. _maybe_attach_diverse).
+                    self._maybe_attach_diverse(subscription, device, subscription.plan, node)
                     return device, task
                 except Exception:
                     logger.exception("warm-pool wiring failed during reprovision, rolling back")
@@ -3256,6 +3279,11 @@ class ProvisioningOrchestrator:
         self.db.commit()
         self.run_task_async(task, node=node)
         self.db.refresh(subscription)
+        # Диверсный набор только для generic add-device/unfreeze (target_node и
+        # reuse_uuid не заданы); явная миграция на конкретную ноду / reality-dest
+        # refresh остаются однонодовыми. Идемпотентно.
+        if target_node is None and reuse_uuid is None:
+            self._maybe_attach_diverse(subscription, device, subscription.plan, node)
         return device, task
 
     def migrate_subscription_to_new_node(
