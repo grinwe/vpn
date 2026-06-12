@@ -2832,7 +2832,7 @@ class ProvisioningOrchestrator:
                 pass
 
     def backfill_diverse_subscriptions(
-        self, *, limit: int = 20, dry_run: bool = True
+        self, *, limit: int = 20, dry_run: bool = True, user_id: int | None = None
     ) -> dict[str, Any]:
         """Phase A.2 — дотянуть СУЩЕСТВУЮЩИЕ подписки до диверс-набора.
 
@@ -2884,8 +2884,9 @@ class ProvisioningOrchestrator:
             result["note"] = "DIVERSE_SUB_NODES<=1 — диверс выключен, backfill no-op"
             return result
 
+        result["user_id"] = user_id
         # Живые девайсы активных подписок, в id-порядке (резюмируемо между прогонами).
-        devices = (
+        q = (
             self.db.query(models.Device)
             .join(
                 models.Subscription,
@@ -2897,9 +2898,11 @@ class ProvisioningOrchestrator:
                 # (нет смысла докармливать диверсом девайс с нерабочим primary).
                 models.Device.status == models.DeviceStatus.active,
             )
-            .order_by(models.Device.id.asc())
-            .all()
         )
+        if user_id is not None:
+            # таргетированный добор: только подписки конкретного юзера.
+            q = q.filter(models.Subscription.user_id == user_id)
+        devices = q.order_by(models.Device.id.asc()).all()
         for device in devices:
             result["scanned"] += 1
             node_ids = {

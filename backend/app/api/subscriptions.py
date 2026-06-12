@@ -1031,6 +1031,8 @@ class DiverseBackfillIn(BaseModel):
     limit: int = Field(default=20, ge=1, le=500)
     # dry_run=True (дефолт!) — только отчёт охвата, без мутаций.
     dry_run: bool = True
+    # таргетированный добор: только подписки этого user_id (None = вся база).
+    user_id: int | None = None
 
 
 @router.post("/subscriptions/diverse-backfill")
@@ -1050,18 +1052,19 @@ def diverse_backfill(
     ⚠️ Гонять ПО ОДНОМУ — параллельные вызовы могут перебрать набор > N."""
     orchestrator = ProvisioningOrchestrator(db)
     result = orchestrator.backfill_diverse_subscriptions(
-        limit=body.limit, dry_run=body.dry_run
+        limit=body.limit, dry_run=body.dry_run, user_id=body.user_id
     )
     if not body.dry_run and result.get("processed"):
         actor, actor_type = _resolve_admin_actor(admin_actor)
         _audit(
-            db, actor, "diverse_backfill", "subscription", None,
+            db, actor, "diverse_backfill", "subscription", body.user_id,
             actor_type=actor_type,
             metadata={
                 "processed": result["processed"],
                 "nodes_added": result["nodes_added"],
                 "eligible_total": result["eligible_total"],
                 "limit": body.limit,
+                "user_id": body.user_id,
             },
         )
     return result

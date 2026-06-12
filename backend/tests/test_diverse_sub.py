@@ -255,6 +255,36 @@ def test_swap_node_out_replaces_one_node(
     assert added == 1
 
 
+def test_backfill_diverse_targets_user(
+    db_session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Таргетированный backfill: user_id фильтрует — трогаем только подписки юзера.
+    monkeypatch.setenv("DIVERSE_SUB_NODES", "3")
+    plan = make_plan(db_session)
+    ua = make_user(db_session, telegram_id="tg-a")
+    ub = make_user(db_session, telegram_id="tg-b")
+    na = make_node(db_session, name="tu-a", region="ru")
+    nb = make_node(db_session, name="tu-b", region="ru", host="198.51.100.211")
+    cfg_a = make_config(db_session, na)
+    cfg_b = make_config(db_session, nb)
+    sub_a = make_subscription(db_session, ua, plan, na)
+    sub_b = make_subscription(db_session, ub, plan, nb)
+    dev_a = make_device(db_session, sub_a, cfg_a, access_username="ua")
+    dev_b = make_device(db_session, sub_b, cfg_b, access_username="ub")
+    _active_cred_on(db_session, na, dev_a, "ua-1")
+    _active_cred_on(db_session, nb, dev_b, "ub-1")
+
+    seen: list = []
+    orch = ProvisioningOrchestrator(db_session)
+    monkeypatch.setattr(
+        orch, "_maybe_attach_diverse",
+        lambda s, d, p, primary, **k: seen.append(d.id),
+    )
+    res = orch.backfill_diverse_subscriptions(limit=10, dry_run=False, user_id=ua.id)
+    assert res["user_id"] == ua.id
+    assert seen == [dev_a.id]  # тронут ТОЛЬКО девайс юзера A
+
+
 def test_migrate_subscription_attaches_diverse(
     db_session: Session, monkeypatch: pytest.MonkeyPatch
 ) -> None:
