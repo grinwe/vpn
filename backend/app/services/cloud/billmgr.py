@@ -202,12 +202,13 @@ class BillmgrDriver:
     # без pricelist → ``wizard_unavailable``. Всё защитно, дегрейд в [].
 
     def list_datacenters(self) -> list[dict]:
-        return _slist_from(self._order_form("vds.order.pricelist"), "datacenter")
+        return _slist_from(self._order_form("vds.order"), "datacenter")
 
     def list_plans(self) -> list[dict]:
         """Тарифы из шага 1 — блок ``list[$name=tariflist].elem[]`` (pricelist/desc/
-        price), НЕ slist."""
-        doc = self._order_form("vds.order.pricelist")
+        price), НЕ slist. ВХОД через ``func=vds.order`` (он сам отдаёт шаг
+        pricelist); прямой ``vds.order.pricelist`` у UFO давал пусто."""
+        doc = self._order_form("vds.order")
         blocks = doc.get("list")
         if isinstance(blocks, dict):
             blocks = [blocks]
@@ -246,10 +247,12 @@ class BillmgrDriver:
         return _slist_from(doc, "ostempl")
 
     def _order_form(self, func: str, **params: Any) -> dict:
-        """Шаг order-wizard'а (без sok — ничего не заказывает). Дегрейд в {}."""
+        """Шаг order-wizard'а (без sok — ничего не заказывает). Дегрейд в {} +
+        WARNING-лог (чтобы пустые offerings были диагностируемы, а не молчали)."""
         try:
             return self._call(func, **params)
-        except DriverError:
+        except DriverError as exc:
+            logger.warning("billmgr offerings %s degraded to empty: %s", func, exc)
             return {}
 
     # ---------- helpers ----------

@@ -591,16 +591,25 @@ def _finalize_spawn(
 
 
 def destroy_node(db: Session, node: models.VPNNode) -> None:
-    if not node.provider_id or not node.provider_external_id:
-        raise NodeSpawnError("Node has no attached cloud provider; cannot destroy automatically")
-    provider = db.get(models.CloudProvider, node.provider_id)
-    if not provider:
-        raise NodeSpawnError("CloudProvider record missing")
-    driver = get_driver(provider)
-    try:
-        driver.destroy_server(node.provider_external_id)
-    except DriverError as exc:
-        raise NodeSpawnError(str(exc)) from exc
+    # Снести сервер у провайдера МОЖНО только если есть и провайдер, и его
+    # external_id. У упавших заказов (нода ушла в error до выдачи external_id),
+    # ручных нод и нод без провайдера сносить на стороне провайдера нечего —
+    # просто гасим локальную строку (раньше тут был raise → такие ноды
+    # вообще не удалялись из админки, см. баг с error-нодами).
+    provider = (
+        db.get(models.CloudProvider, node.provider_id) if node.provider_id else None
+    )
+    if node.provider_external_id and provider:
+        driver = get_driver(provider)
+        try:
+            driver.destroy_server(node.provider_external_id)
+        except DriverError as exc:
+            raise NodeSpawnError(str(exc)) from exc
+    else:
+        logger.info(
+            "destroy_node %s: нет provider_external_id/провайдера — гашу локально "
+            "(ничего сносить у хостера)", node.id,
+        )
 
     node.is_active = False
     node.status = models.VPNNodeStatus.disabled

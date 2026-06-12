@@ -267,7 +267,7 @@ def test_offerings_real_ufo_shape():
 
     def post(url, data=None, timeout=None):
         f = data["func"]
-        if f == "vds.order.pricelist":
+        if f == "vds.order":  # вход через vds.order (он отдаёт шаг pricelist)
             return _Resp(pricelist_doc)
         if f == "vds.order.param":  # шаг 2: pricelist+datacenter обязаны быть выбраны
             assert data["pricelist"] == "150" and data["datacenter"] == "3"
