@@ -1026,6 +1026,47 @@ def swap_device_node(
     }
 
 
+class DiverseBackfillIn(BaseModel):
+    # сколько девайсов ТРОНУТЬ за прогон (пейсинг, чтоб не осушить warm-пул).
+    limit: int = Field(default=20, ge=1, le=500)
+    # dry_run=True (дефолт!) — только отчёт охвата, без мутаций.
+    dry_run: bool = True
+
+
+@router.post("/subscriptions/diverse-backfill")
+def diverse_backfill(
+    body: DiverseBackfillIn,
+    db: Session = Depends(get_db),
+    admin_token: str = Depends(require_admin),
+    admin_actor: str | None = Header(default=None, alias=ADMIN_ACTOR_HEADER),
+):
+    """Phase A.2 — добрать СУЩЕСТВУЮЩИЕ подписки до диверс-набора, пейсимо.
+
+    Идемпотентно + best-effort (см. ProvisioningOrchestrator.backfill_diverse_
+    subscriptions). dry_run=true (дефолт) — посмотреть охват без мутаций; затем
+    гонять малыми порциями (limit) и проверять в админке node-set девайса.
+    Ответ различает topped_up/no_op — когда topped_up=0 при ненулевом
+    eligible_total, остаток упёрся в дефицит тёплых нод (пора заказывать).
+    ⚠️ Гонять ПО ОДНОМУ — параллельные вызовы могут перебрать набор > N."""
+    orchestrator = ProvisioningOrchestrator(db)
+    result = orchestrator.backfill_diverse_subscriptions(
+        limit=body.limit, dry_run=body.dry_run
+    )
+    if not body.dry_run and result.get("processed"):
+        actor, actor_type = _resolve_admin_actor(admin_actor)
+        _audit(
+            db, actor, "diverse_backfill", "subscription", None,
+            actor_type=actor_type,
+            metadata={
+                "processed": result["processed"],
+                "nodes_added": result["nodes_added"],
+                "eligible_total": result["eligible_total"],
+                "limit": body.limit,
+            },
+        )
+    return result
+
+
 @router.post(
     "/devices/{device_id}/switch-exit",
     response_model=schemas.DeviceSwitchExitOut,

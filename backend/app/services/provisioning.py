@@ -2831,6 +2831,116 @@ class ProvisioningOrchestrator:
             except Exception:  # noqa: BLE001
                 pass
 
+    def backfill_diverse_subscriptions(
+        self, *, limit: int = 20, dry_run: bool = True
+    ) -> dict[str, Any]:
+        """Phase A.2 — дотянуть СУЩЕСТВУЮЩИЕ подписки до диверс-набора.
+
+        Находит ЖИВЫЕ девайсы АКТИВНЫХ подписок, у которых число нод с активными
+        creds < ``DIVERSE_SUB_NODES``, и (до ``limit`` штук за прогон) добирает
+        тёплыми бандлами через ``_maybe_attach_diverse``. Свойства:
+
+        - **Идемпотентно**: уже-диверсные девайсы (набор ≥ N) пропускаются; повтор
+          прогона безопасен, докатывает только недобранное.
+        - **Best-effort**: ``_maybe_attach_diverse`` обёрнут в try/except и никогда
+          не валит существующую раздачу (primary цел, sub_token не трогается).
+        - **Пейсится** через ``limit`` (сколько девайсов ТРОНУТЬ за прогон) — чтобы
+          не осушить warm-пул и не завалить choose_node одним залпом. Сканирование
+          считает ВСЕХ кандидатов (``eligible_total``), чтобы видеть остаток.
+        - **dry_run=True (дефолт!)**: ничего не привязывает, только отчёт охвата.
+
+        Терминальный сигнал «когда остановиться»: в реальном прогоне различаем
+        ``topped_up`` (добрали ≥1 ноду) и ``no_op`` (тронули, но добрать нечего —
+        warm-пул/регион пуст). Когда ``topped_up`` падает в 0, а ``eligible_total``
+        не убывает — остаток упёрся в дефицит тёплых нод: пора заказывать свежие, а
+        не крутить backfill. Берёт ТОЛЬКО ``active`` девайсы (pending/failed с
+        нерабочим primary не докармливаем — не жжём бандлы на полудохлых).
+
+        ⚠️ Гонять ПО ОДНОМУ за раз: два параллельных прогона (или backfill + ручной
+        swap) на одном девайсе оба видят ``need>0`` до коммита и могут перебрать
+        набор > N (овершут; не критично — идемпотентность потом скипнет, но лишние
+        ноды останутся). Row-lock не ставим — операционная модель «один оператор».
+
+        Возвращает счётчики + детали тронутых девайсов. Это ручной/пейсимый
+        backfill: оператор гоняет dry-run → малую порцию → проверяет → повторяет.
+        """
+        try:
+            n_total = int(os.getenv("DIVERSE_SUB_NODES", "1") or "1")
+        except ValueError:
+            n_total = 1
+        result: dict[str, Any] = {
+            "flag_diverse_sub_nodes": n_total,
+            "dry_run": dry_run,
+            "limit": limit,
+            "scanned": 0,
+            "eligible_total": 0,   # сколько ВСЕГО недобранных (для оценки остатка)
+            "processed": 0,        # сколько тронули в этот прогон (≤ limit)
+            "topped_up": 0,        # из processed: добрали ≥1 ноду
+            "no_op": 0,            # из processed: тронули, но добрать нечего (warm пуст)
+            "nodes_added": 0,
+            "details": [],
+        }
+        if n_total <= 1:
+            result["note"] = "DIVERSE_SUB_NODES<=1 — диверс выключен, backfill no-op"
+            return result
+
+        # Живые девайсы активных подписок, в id-порядке (резюмируемо между прогонами).
+        devices = (
+            self.db.query(models.Device)
+            .join(
+                models.Subscription,
+                models.Device.subscription_id == models.Subscription.id,
+            )
+            .filter(
+                models.Subscription.status == models.SubscriptionStatus.active,
+                # только рабочие девайсы: pending/failed/revoked/disabled не трогаем
+                # (нет смысла докармливать диверсом девайс с нерабочим primary).
+                models.Device.status == models.DeviceStatus.active,
+            )
+            .order_by(models.Device.id.asc())
+            .all()
+        )
+        for device in devices:
+            result["scanned"] += 1
+            node_ids = {
+                c.node_id for c in device.credentials if c.is_active and c.node_id
+            }
+            if len(node_ids) >= n_total:
+                continue  # уже диверсный — пропускаем
+            result["eligible_total"] += 1
+            if result["processed"] >= limit:
+                continue  # лимит на прогон исчерпан — досчитываем остаток, но не трогаем
+            sub = device.subscription
+            if sub is None or sub.plan is None:
+                continue
+            if dry_run:
+                result["processed"] += 1
+                result["details"].append(
+                    {"device_id": device.id, "current_nodes": len(node_ids)}
+                )
+                continue
+            before = len(node_ids)
+            # best-effort: внутренний try/except гарантирует, что один битый девайс
+            # не уронит весь backfill и не тронет primary.
+            self._maybe_attach_diverse(sub, device, sub.plan, sub.node)
+            self.db.refresh(device)
+            after = len(
+                {c.node_id for c in device.credentials if c.is_active and c.node_id}
+            )
+            added = after - before
+            result["nodes_added"] += added
+            result["processed"] += 1
+            if added > 0:
+                result["topped_up"] += 1
+            else:
+                # тронули, но добрать нечего — warm-пул/регион пуст для этого девайса.
+                # такой девайс будет всплывать каждый прогон, пока не появятся ноды.
+                result["no_op"] += 1
+            result["details"].append(
+                {"device_id": device.id, "before": before, "after": after, "added": added}
+            )
+        return result
+
     def backfill_credentials_for_new_config(
         self, node: models.VPNNode, new_config: models.VPNConfig
     ) -> int:

@@ -273,3 +273,85 @@ def test_migrate_device_blocked_for_diverse(
     # legacy-миграция диверс-девайса должна быть запрещена (иначе схлопнет до 1)
     with pytest.raises(RuntimeError, match="диверсная"):
         orch.migrate_device_to_node(dev, target_node_id=target.id)
+
+
+def test_backfill_diverse_dry_run_no_mutation(
+    db_session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Phase A.2: dry_run только считает охват, НИЧЕГО не привязывает.
+    monkeypatch.setenv("DIVERSE_SUB_NODES", "3")
+    plan = make_plan(db_session)
+    user = make_user(db_session)
+    primary = make_node(db_session, name="bf-ru", region="ru")
+    cfg = make_config(db_session, primary)
+    sub = make_subscription(db_session, user, plan, primary)
+    dev = make_device(db_session, sub, cfg, access_username="u")
+    _active_cred_on(db_session, primary, dev, "u-ru")  # 1 нода → eligible
+
+    d1 = make_node(db_session, name="bf-de", region="de", host="198.51.100.111")
+    w1 = _warm_cred(db_session, d1, "warm-bf")
+    monkeypatch.setattr(provisioning, "choose_node", lambda *a, **k: d1)
+    monkeypatch.setattr(warm_pool, "try_assign_bundle", lambda db, nid, sid: [w1])
+
+    orch = ProvisioningOrchestrator(db_session)
+    res = orch.backfill_diverse_subscriptions(limit=10, dry_run=True)
+
+    db_session.refresh(w1)
+    assert res["eligible_total"] >= 1
+    assert res["nodes_added"] == 0
+    assert w1.device_id is None  # dry-run ничего не привязал
+
+
+def test_backfill_diverse_tops_up_and_skips_full(
+    db_session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Phase A.2: однонодовый девайс добирается до N; уже-диверсный — пропускается.
+    monkeypatch.setenv("DIVERSE_SUB_NODES", "3")
+    plan = make_plan(db_session)
+    user = make_user(db_session)
+    # девайс A — однонодовый (должен добраться)
+    pa = make_node(db_session, name="bf-a", region="ru")
+    cfg_a = make_config(db_session, pa)
+    sub_a = make_subscription(db_session, user, plan, pa)
+    dev_a = make_device(db_session, sub_a, cfg_a, access_username="ua")
+    _active_cred_on(db_session, pa, dev_a, "ua-ru")
+    # девайс B — уже 3 ноды (должен быть пропущен, не eligible)
+    pb = make_node(db_session, name="bf-b", region="ru", host="198.51.100.121")
+    nb2 = make_node(db_session, name="bf-b2", region="de", host="198.51.100.122")
+    nb3 = make_node(db_session, name="bf-b3", region="nl", host="198.51.100.123")
+    cfg_b = make_config(db_session, pb)
+    sub_b = make_subscription(db_session, user, plan, pb)
+    dev_b = make_device(db_session, sub_b, cfg_b, access_username="ub")
+    _active_cred_on(db_session, pb, dev_b, "ub-1")
+    _active_cred_on(db_session, nb2, dev_b, "ub-2")
+    _active_cred_on(db_session, nb3, dev_b, "ub-3")
+
+    g1 = make_node(db_session, name="bf-g1", region="de", host="198.51.100.131")
+    g2 = make_node(db_session, name="bf-g2", region="nl", host="198.51.100.132")
+    wg1 = _warm_cred(db_session, g1, "warm-g1")
+    wg2 = _warm_cred(db_session, g2, "warm-g2")
+    seq = [g1, g2]
+
+    def fake_choose(db, p, *, node_id=None, exclude_node_ids=None, exclude_regions=None):
+        for n in seq:
+            if n.id not in (exclude_node_ids or []):
+                return n
+        raise RuntimeError("no more")
+
+    monkeypatch.setattr(provisioning, "choose_node", fake_choose)
+    monkeypatch.setattr(
+        warm_pool, "try_assign_bundle",
+        lambda db, nid, sid: {g1.id: [wg1], g2.id: [wg2]}.get(nid),
+    )
+
+    orch = ProvisioningOrchestrator(db_session)
+    res = orch.backfill_diverse_subscriptions(limit=10, dry_run=False)
+
+    db_session.refresh(wg1)
+    db_session.refresh(wg2)
+    assert res["processed"] == 1      # тронут только однонодовый девайс A
+    assert res["topped_up"] == 1      # девайс A реально добрался
+    assert res["no_op"] == 0
+    assert res["nodes_added"] == 2    # добрано 2 ноды (до N=3)
+    assert wg1.device_id == dev_a.id
+    assert wg2.device_id == dev_a.id
