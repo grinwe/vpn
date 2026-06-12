@@ -71,9 +71,25 @@
 
 ### Фаза C — carrying_fraction-детект + ротация
 - Read-only сигнал: per-node `carrying_fraction` во времени из traffic-телеметрии +
-  набора девайсов → метрика/алерт «нода широко гниёт».
-- Ротация: свопнуть creds гниющей ноды из наборов (sub_token стабилен) + авто-заказ
-  свежих диверсных IP в дефицитные ASN/регионы. Связка с авто-ордером.
+  набора девайсов → метрика/алерт «нода широко гниёт». ✅ `services/carrying.py` +
+  `GET /api/nodes/carrying-fractions`.
+- **Ротация-примитив ✅ реализован:** `ProvisioningOrchestrator.swap_node_out(device,
+  node_id)` — убирает ОДНУ ноду из набора (деактивирует её creds; строки НЕ удаляем —
+  инвариант sub_token) и добирает свежую диверсную взамен (`_maybe_attach_diverse` с
+  `extra_exclude=[node_id]`). `Device`/`sub_token` не меняются. Это «миграция» для
+  диверс-subs и кирпич будущей авто-ротации по carrying_fraction. Физическое удаление
+  xray-юзера на ноде отложено (двухстадийно, как обычный revoke).
+- **Гард на legacy-миграцию:** `migrate_device_to_node` теперь падает (raise), если
+  device держит >1 активной ноды — иначе схлопнул бы N-нодный набор до одной. Оператора
+  направляем на per-node swap.
+- **Админка ✅:** `GET /api/subscriptions/devices/{id}/nodes` (набор нод девайса:
+  `[{node_id,name,region,status,protocols}]`) + `POST .../nodes/{node_id}/swap`. В UI
+  (`admin/src/pages/Users.tsx`, `DeviceNodeSet`) — карточка девайса показывает «на каких
+  RU-нодах сидит юзер» и кнопку «↻ заменить» на каждую ноду. Однонодовые девайсы видят
+  старую кнопку «перевести на ноду» (legacy migrate); диверс-девайсы (>1 ноды) — только
+  per-node swap.
+- **TODO (ещё нет):** авто-ротация — связать падение carrying_fraction с авто-`swap_node_out`
+  + авто-заказ свежих диверсных IP в дефицитные ASN/регионы (связка с авто-ордером).
 
 ## Не входит / отдельные задачи
 - **AmneziaWG** как 6-й протокол — новый ansible-role + клиент-конфиг + builder,

@@ -14,9 +14,13 @@ import {
   bulkRegenerateSublink,
   claimOrphanSubscription,
   DeviceMigrateOut,
+  DeviceNodeOut,
+  DeviceNodeSetOut,
   DeviceOut,
   DeviceSwitchExitOut,
+  getDeviceNodes,
   listUserNodeBans,
+  swapDeviceNode,
   migrateSubscriptionAuto,
   NodeRelayLinkOut,
   NodeUserBanOut,
@@ -1336,10 +1340,10 @@ function DeviceCard({
         </div>
       )}
       {isLive && (
-        <MigrateDeviceControl
+        <DeviceNodeSet
           device={d}
           nodes={nodes}
-          mutation={migrateDevice}
+          migrateDevice={migrateDevice}
         />
       )}
       {isLive && d.is_relay && d.node_id != null && (
@@ -1348,6 +1352,102 @@ function DeviceCard({
           mutation={switchDeviceExit}
         />
       )}
+    </div>
+  );
+}
+
+// Диверсная подписка (DIVERSE_SUB_NODES>1): набор RU-нод, на которых сидит
+// device, + per-node «↻ заменить». Однонодовый device (набор ≤1 или ещё
+// грузится) → показываем legacy-миграцию как было; для диверс-набора legacy
+// migrate запрещён на бэке (схлопнул бы набор в одну ноду), поэтому вместо
+// него — точечная замена одной ноды через swap_node_out.
+function DeviceNodeSet({
+  device,
+  nodes,
+  migrateDevice,
+}: {
+  device: DeviceOut;
+  nodes: VPNNodeOut[] | undefined;
+  migrateDevice: {
+    mutate: (args: { deviceId: number; targetNodeId: number }) => void;
+    isPending: boolean;
+  };
+}) {
+  const qc = useQueryClient();
+  const { data, isLoading } = useQuery<DeviceNodeSetOut>({
+    queryKey: ["device-nodes", device.id],
+    queryFn: () => getDeviceNodes(device.id),
+  });
+  const swap = useMutation({
+    mutationFn: (nodeId: number) => swapDeviceNode(device.id, nodeId),
+    onSuccess: (res) => {
+      alert(
+        `Нода #${res.removed_node_id} убрана из набора device #${res.device_id}. ` +
+          `Добрано свежих диверсных: ${res.added_nodes}. sub_token не менялся — ` +
+          `клиент подхватит на обновлении подписки.`,
+      );
+      qc.invalidateQueries({ queryKey: ["device-nodes", device.id] });
+      qc.invalidateQueries({ queryKey: ["user-subs"] });
+      qc.invalidateQueries({ queryKey: ["provisioning-tasks"] });
+    },
+    onError: (e: Error) => alert(`Не удалось заменить ноду: ${e.message}`),
+  });
+
+  const set = data?.nodes ?? [];
+  // Однонодовый девайс (или набор ещё грузится) → legacy «перевести на ноду».
+  if (isLoading || set.length <= 1) {
+    return (
+      <MigrateDeviceControl
+        device={device}
+        nodes={nodes}
+        mutation={migrateDevice}
+      />
+    );
+  }
+
+  // Диверс-набор (>1 ноды): список нод + точечная замена. Legacy-миграцию не
+  // показываем — она схлопнула бы набор (бэк её для таких device запрещает).
+  return (
+    <div className="pt-1 border-t border-slate-700/60 space-y-1">
+      <div className="text-[11px] text-slate-400">
+        Ноды подписки ({set.length}):
+      </div>
+      {set.map((n: DeviceNodeOut) => (
+        <div
+          key={n.node_id}
+          className="flex items-center justify-between gap-2 bg-slate-900/50 rounded px-1.5 py-1"
+        >
+          <span className="truncate text-[11px]">
+            <span className="text-slate-300">{n.name ?? `#${n.node_id}`}</span>
+            {n.region && <span className="text-slate-500"> · {n.region}</span>}
+            {n.status && n.status !== "active" && (
+              <span className="ml-1 px-1 rounded bg-amber-900/60 text-amber-300">
+                {n.status}
+              </span>
+            )}
+            {n.protocols.length > 0 && (
+              <span className="text-slate-500"> · {n.protocols.join(", ")}</span>
+            )}
+          </span>
+          <button
+            disabled={swap.isPending}
+            onClick={() => {
+              if (
+                confirm(
+                  `Заменить ноду «${n.name ?? `#${n.node_id}`}» (#${n.node_id}) в наборе device #${device.id}?\n\n` +
+                    `Нода убирается из подписки, взамен добирается свежая диверсная ` +
+                    `(если есть тёплый запас на другом регионе). sub_token не меняется.`,
+                )
+              )
+                swap.mutate(n.node_id);
+            }}
+            className="shrink-0 text-[11px] px-2 py-0.5 rounded bg-slate-700 hover:bg-slate-600 disabled:opacity-50"
+            title="Убрать эту ноду и добрать свежую взамен"
+          >
+            ↻ заменить
+          </button>
+        </div>
+      ))}
     </div>
   );
 }

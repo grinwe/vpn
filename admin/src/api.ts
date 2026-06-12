@@ -437,6 +437,45 @@ export interface DeviceSwitchExitOut {
   task_ids: number[];
 }
 
+// Диверсная подписка (DIVERSE_SUB_NODES>1): один device несёт активные
+// creds на нескольких нодах. Это — набор тех нод («на каких RU-нодах сидит
+// юзер»), по одной записи на ноду с её протоколами.
+export interface DeviceNodeOut {
+  node_id: number;
+  name: string | null;
+  region: string | null;
+  status: string | null;
+  protocols: string[];
+}
+
+export interface DeviceNodeSetOut {
+  device_id: number;
+  nodes: DeviceNodeOut[];
+}
+
+export interface DeviceNodeSwapOut {
+  device_id: number;
+  removed_node_id: number;
+  added_nodes: number;
+  nodes: DeviceNodeOut[];
+}
+
+export function getDeviceNodes(deviceId: number): Promise<DeviceNodeSetOut> {
+  return api.get<DeviceNodeSetOut>(`/devices/${deviceId}/nodes`);
+}
+
+// Diverse-rotation: убрать ноду из набора device и добрать свежую взамен
+// (sub_token не меняется). Возвращает новый набор нод.
+export function swapDeviceNode(
+  deviceId: number,
+  nodeId: number,
+): Promise<DeviceNodeSwapOut> {
+  return api.post<DeviceNodeSwapOut>(
+    `/devices/${deviceId}/nodes/${nodeId}/swap`,
+    {},
+  );
+}
+
 export interface StatsOut {
   users_total: number;
   subscriptions_active: number;
