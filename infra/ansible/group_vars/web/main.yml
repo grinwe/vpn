@@ -74,8 +74,9 @@ deploy_app_stack_anthropic_api_key: "{{ vault_anthropic_api_key | default('') }}
 deploy_app_stack_agent_enabled: 1
 deploy_app_stack_agent_model: "claude-sonnet-4-6"
 
-# Diverse N×M подписка (Phase A). 1 = текущее однонодовое поведение (инертно).
-# Поднять до 3 (флоу «3 ноды × N протоколов»), КОГДА: (а) warm-pool держит запас
-# на нескольких нодах, (б) проверен HAPP Auto-фейловер. Тогда новые subs получат
-# до N диверсных нод; existing — постепенным backfill'ом (Фаза A.2).
-deploy_app_stack_diverse_sub_nodes: 1
+# Diverse N×M подписка (Phase A). 1 = однонодовое (инертно), 3 = флоу «3 ноды».
+# ВКЛючено 2026-06-12 после проверки HAPP Auto-фейловера. Новые subs получают до
+# N диверсных нод (best-effort: сколько тёплых бандлов на разных регионах);
+# existing subs не трогаются (их миграция — backfill, Фаза A.2, ещё нет).
+# Откат: вернуть 1 + прокат (или тег pre-diverse-sub-e84426a).
+deploy_app_stack_diverse_sub_nodes: 3
