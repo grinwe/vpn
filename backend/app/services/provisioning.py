@@ -3613,6 +3613,16 @@ class ProvisioningOrchestrator:
                 reuse_connection_uri=reuse_uri,
                 reuse_uuid=reuse_uuid,
             )
+            # Мягкая миграция: reprovision на миграции идёт с reuse_uuid → его
+            # внутренний диверс-хук выключен (гейт target_node/reuse_uuid is None),
+            # поэтому юзер после переезда оказался бы на ОДНОЙ ноде. Доберём
+            # диверсный набор тут — как при add-device через админку. Best-effort,
+            # идемпотентно (см. _maybe_attach_diverse); target — новый primary.
+            # extra_exclude=excluded → НЕ добираем старую/забаненные ноды (иначе
+            # фейловер-миграция вернула бы юзеру cred на ту же дохлую ноду).
+            self._maybe_attach_diverse(
+                subscription, device, plan, target, extra_exclude=excluded
+            )
             if first_device is None:
                 first_device = device
                 first_task = task

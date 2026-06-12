@@ -255,6 +255,37 @@ def test_swap_node_out_replaces_one_node(
     assert added == 1
 
 
+def test_migrate_subscription_attaches_diverse(
+    db_session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Мягкая миграция: после переезда подписки на новую ноду юзер должен получить
+    # диверсный набор (как при add-device), а НЕ застрять на одной ноде. Проверяем
+    # проводку: migrate зовёт _maybe_attach_diverse с новой нодой как primary.
+    monkeypatch.setenv("DIVERSE_SUB_NODES", "3")
+    plan = make_plan(db_session)
+    user = make_user(db_session)
+    old = make_node(db_session, name="mig-old", region="ru")
+    new = make_node(db_session, name="mig-new", region="ru", host="198.51.100.201")
+    cfg = make_config(db_session, old)
+    sub = make_subscription(db_session, user, plan, old)
+    dev = make_device(db_session, sub, cfg, access_username="u")
+
+    monkeypatch.setattr(provisioning, "choose_node", lambda *a, **k: new)
+    orch = ProvisioningOrchestrator(db_session)
+    monkeypatch.setattr(orch, "revoke_device", lambda *a, **k: None)
+    monkeypatch.setattr(orch, "reprovision_subscription", lambda *a, **k: (dev, object()))
+    calls: list = []
+    monkeypatch.setattr(
+        orch, "_maybe_attach_diverse",
+        lambda s, d, p, primary, **k: calls.append((d, primary)),
+    )
+
+    target, first_dev, _task = orch.migrate_subscription_to_new_node(sub)
+    assert target.id == new.id
+    # диверс-добор вызван для переехавшего девайса, primary = НОВАЯ нода
+    assert calls and calls[0][1].id == new.id
+
+
 def test_migrate_device_blocked_for_diverse(
     db_session: Session, monkeypatch: pytest.MonkeyPatch
 ) -> None:
