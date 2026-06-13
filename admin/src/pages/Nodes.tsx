@@ -866,56 +866,71 @@ export default function Nodes() {
   // remove a node without poking migrate first. Cloud-provisioned nodes
   // still go through /destroy (teardown playbook + VPS deprovision);
   // only raw DB rows take the migrate-then-delete branch.
+  // «Удалить из панели» — ВСЕГДА убирает ЗАПИСЬ ноды (DELETE). Хостер НЕ трогается
+  // (для этого отдельная кнопка «уничтожить у хостера»). 409 active_subs →
+  // предложить переселить-и-удалить; 409 live_vm → у cloud-ноды живой VPS, спросить
+  // и удалить запись через force (VPS при этом НЕ уничтожается).
   const deleteNode = useMutation({
-    mutationFn: async (node: { id: number; name: string; provider_id: number | null }) => {
-      if (node.provider_id) {
-        return api.post<{ node_id: number }>(`/nodes/${node.id}/destroy`, {});
-      }
-
-      const tryDelete = () =>
+    mutationFn: async (node: { id: number; name: string }) => {
+      const tryDelete = (force = false) =>
         api.del<{
           node_id: number;
           deleted: boolean;
           warm_credentials_deleted?: number;
           bound_credentials_detached?: number;
-        }>(`/nodes/${node.id}`);
+        }>(`/nodes/${node.id}${force ? "?force=true" : ""}`);
 
       try {
         return await tryDelete();
       } catch (err) {
         if (!(err instanceof ApiError) || err.status !== 409) throw err;
-        const detail = err.detail as { error?: string; active_subs?: number } | string;
-        if (typeof detail !== "object" || detail.error !== "active_subs") throw err;
+        const detail = err.detail as
+          | { error?: string; active_subs?: number; message?: string }
+          | string;
+        if (typeof detail !== "object") throw err;
 
-        const n = detail.active_subs ?? 0;
-        const confirmed = window.confirm(
-          `На ноде "${node.name}" ещё ${n} активных/замороженных подписок.\n\n` +
-            `Перенести их на другие ноды (как при обычном переселении), а затем удалить?\n\n` +
-            `OK — перенести и удалить.\nОтмена — ничего не делать.`,
-        );
-        if (!confirmed) throw new Error("отменено пользователем");
-
-        // /migrate kicks off per-sub migrations synchronously at DB level
-        // (subscription.node_id flips immediately), so on return the node
-        // has zero active subs and DELETE can proceed. The device task
-        // fan-out continues in background — doesn't block node removal.
-        const mig = await api.post<{
-          node_id: number;
-          migrated_subscriptions: number[];
-          task_ids: number[];
-          considered_count: number;
-          no_target_count: number;
-        }>(`/nodes/${node.id}/migrate`, {});
-        if (mig.no_target_count > 0 && mig.migrated_subscriptions.length === 0) {
-          throw new Error(
-            `Не удалось выбрать целевую ноду ни для одной из ${mig.considered_count} ` +
-              `подписок — все остальные ноды в cooldown/unhealthy/вне пула. ` +
-              `Разберись с остальными нодами и повтори.`,
+        if (detail.error === "active_subs") {
+          const n = detail.active_subs ?? 0;
+          const confirmed = window.confirm(
+            `На ноде "${node.name}" ещё ${n} активных подписок.\n\n` +
+              `Перенести их на другие ноды (как при обычном переселении), а затем удалить?\n\n` +
+              `OK — перенести и удалить.\nОтмена — ничего не делать.`,
           );
+          if (!confirmed) throw new Error("отменено пользователем");
+
+          // /migrate flips subscription.node_id synchronously at DB level, so on
+          // return the node has zero active subs and DELETE can proceed.
+          const mig = await api.post<{
+            node_id: number;
+            migrated_subscriptions: number[];
+            task_ids: number[];
+            considered_count: number;
+            no_target_count: number;
+          }>(`/nodes/${node.id}/migrate`, {});
+          if (mig.no_target_count > 0 && mig.migrated_subscriptions.length === 0) {
+            throw new Error(
+              `Не удалось выбрать целевую ноду ни для одной из ${mig.considered_count} ` +
+                `подписок — все остальные ноды в cooldown/unhealthy/вне пула. ` +
+                `Разберись с остальными нодами и повтори.`,
+            );
+          }
+          qc.invalidateQueries({ queryKey: ["user-subs"] });
+          qc.invalidateQueries({ queryKey: ["provisioning-tasks"] });
+          return tryDelete();
         }
-        qc.invalidateQueries({ queryKey: ["user-subs"] });
-        qc.invalidateQueries({ queryKey: ["provisioning-tasks"] });
-        return tryDelete();
+
+        if (detail.error === "live_vm") {
+          const ok = window.confirm(
+            `У ноды "${node.name}" возможно ещё ЖИВОЙ VPS у хостера.\n\n` +
+              `Удалить ТОЛЬКО запись из панели? VPS НЕ будет уничтожен — для этого ` +
+              `жми «уничтожить у хостера».\n\n` +
+              `OK — удалить запись (force).\nОтмена — ничего.`,
+          );
+          if (!ok) throw new Error("отменено пользователем");
+          return tryDelete(true);
+        }
+
+        throw err;
       }
     },
     onSuccess: (res) => {
@@ -937,6 +952,24 @@ export default function Nodes() {
           : "";
       alert(`Не удалось удалить: ${e.message}${extra}`);
     },
+  });
+
+  // «Уничтожить у хостера» — только VPS у провайдера (destroy_server) + нода →
+  // disabled. ЗАПИСЬ в панели остаётся (убрать отдельно «удалить из панели»).
+  const destroyAtHoster = useMutation({
+    mutationFn: (node: { id: number }) =>
+      api.post<{ node_id: number; status: string }>(
+        `/nodes/${node.id}/destroy`,
+        {},
+      ),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["nodes"] });
+      alert(
+        "VPS уничтожен у хостера, нода → disabled. Запись осталась в панели — " +
+          "убери отдельно кнопкой «удалить из панели».",
+      );
+    },
+    onError: (e: Error) => alert(`Не удалось уничтожить у хостера: ${e.message}`),
   });
 
   const diagnose = useMutation({
@@ -1474,29 +1507,47 @@ export default function Nodes() {
                       >
                         обновить reality dest
                       </button>
+                      {n.provider_id != null && (
+                        <button
+                          disabled={destroyAtHoster.isPending}
+                          onClick={() => {
+                            if (
+                              confirm(
+                                `Уничтожить VPS ноды #${n.id} (${n.name}) У ХОСТЕРА?\n\n` +
+                                  "VM будет удалена через API провайдера (деньги перестанут " +
+                                  "капать). Запись в панели останется — убери её отдельно " +
+                                  "кнопкой «удалить из панели».",
+                              )
+                            )
+                              destroyAtHoster.mutate({ id: n.id });
+                          }}
+                          className="text-xs px-2 py-1 rounded bg-orange-800 hover:bg-orange-700 disabled:opacity-50"
+                          title="Уничтожить VM у провайдера (хостер). Запись в панели не трогает."
+                        >
+                          уничтожить у хостера
+                        </button>
+                      )}
                       <button
                         disabled={deleteNode.isPending}
                         onClick={() => {
                           if (
                             confirm(
-                              `Удалить ноду #${n.id} (${n.name})?\n\n` +
+                              `Удалить ЗАПИСЬ ноды #${n.id} (${n.name}) из панели?\n\n` +
+                                "Хостер НЕ трогается" +
                                 (n.provider_id
-                                  ? "Cloud-нода — VM будет уничтожена через API провайдера."
-                                  : "Manual-нода — запись будет удалена из БД." +
-                                    "\n\nЕсли на ноде есть подписки — будет " +
-                                    "предложено переселить их и удалить ноду.") +
-                                "",
+                                  ? " (если VPS ещё жив — сначала «уничтожить у хостера», " +
+                                    "иначе осиротеет платный сервер)."
+                                  : ".") +
+                                "\n\nЕсли на ноде есть подписки — будет предложено " +
+                                "переселить их и удалить.",
                             )
                           )
-                            deleteNode.mutate({
-                              id: n.id,
-                              name: n.name,
-                              provider_id: n.provider_id,
-                            });
+                            deleteNode.mutate({ id: n.id, name: n.name });
                         }}
                         className="text-xs px-2 py-1 rounded bg-red-800 hover:bg-red-700 disabled:opacity-50"
+                        title="Убрать запись ноды из панели (хостер не трогается)"
                       >
-                        удалить
+                        удалить из панели
                       </button>
                     </div>
                   </td>

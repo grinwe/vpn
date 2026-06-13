@@ -13,7 +13,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query
-from sqlalchemy import func
+from sqlalchemy import func, or_
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -1360,13 +1360,19 @@ def list_node_users(
             users=[],
         )
 
-    # One JOIN grabs every field the UI needs in a single query. Left
-    # joins so orphan access_usernames (on the node but not in the DB)
-    # still show up with ``device_id=None``.
+    # Резолвим юзера через CREDENTIAL.access_username (а НЕ Device) — xray на ноде
+    # видит access_username КРЕДОВ, а у диверс/warm-кредов он "warm-<node>-<hash>"
+    # и НЕ совпадает с Device.access_username → раньше такие показывались как
+    # «orphan» с голым warm-именем без телеги. Cred несёт device_id → дотягиваем
+    # Device→Sub→User. Фильтр node_id — креды ЭТОЙ ноды ИЛИ легаси/детачнутые с
+    # node_id=NULL (детач при удалении соседней ноды обнуляет node_id, но
+    # access_username warm-бандла уникален по ноде → ложных совпадений нет).
+    # ORDER BY ниже ставит node-specific строку первой, чтобы при дубле она и
+    # выиграла дедуп.
     rows = (
         db.query(
             models.Device.id.label("device_id"),
-            models.Device.access_username,
+            models.Credential.access_username,
             models.Device.name.label("device_name"),
             models.Subscription.id.label("subscription_id"),
             models.Subscription.expires_at,
@@ -1375,22 +1381,33 @@ def list_node_users(
             models.Plan.id.label("plan_id"),
             models.Plan.name.label("plan_name"),
         )
+        .select_from(models.Credential)
+        .outerjoin(models.Device, models.Device.id == models.Credential.device_id)
         .outerjoin(
             models.Subscription,
             models.Subscription.id == models.Device.subscription_id,
         )
         .outerjoin(models.User, models.User.id == models.Device.user_id)
         .outerjoin(models.Plan, models.Plan.id == models.Subscription.plan_id)
-        .filter(models.Device.access_username.in_(list(username_protos.keys())))
+        .filter(models.Credential.access_username.in_(list(username_protos.keys())))
+        .filter(
+            or_(
+                models.Credential.node_id == node_id,
+                models.Credential.node_id.is_(None),
+            )
+        )
+        # node-specific (node_id IS NULL → False/0) сортируется раньше легаси.
+        .order_by(models.Credential.node_id.is_(None))
         .all()
     )
 
     by_username: dict[str, dict] = {}
     for r in rows:
         if r.access_username in by_username:
-            # Multiple Devices sharing access_username shouldn't happen
-            # under current provisioning, but if it does, the first row
-            # wins — the UI only has a single slot per username.
+            # Один access_username может встретиться дважды (node-specific +
+            # легаси/детачнутый кред с node_id=NULL). ORDER BY выше гарантирует,
+            # что node-specific строка пришла первой и уже в словаре — она и
+            # выигрывает (UI держит один слот на username).
             continue
         by_username[r.access_username] = {
             "device_id": r.device_id,
@@ -1613,52 +1630,74 @@ def renew_node_route(
 @router.delete("/nodes/{node_id}", status_code=200)
 def delete_node(
     node_id: int,
+    force: bool = False,
     db: Session = Depends(get_db),
     admin_token: str = Depends(require_admin),
     admin_actor: str | None = Header(default=None, alias=ADMIN_ACTOR_HEADER),
 ):
-    """Remove a node from the database.
+    """Удалить ЗАПИСЬ ноды из админ-панели (БД). НЕ трогает хостер —
+    уничтожение VPS у провайдера это отдельное действие
+    (``POST /nodes/{id}/destroy``: запускает teardown-плейбук и снимает VPS).
 
-    Refuses with 409 if the node still has active/frozen subscriptions —
-    the admin UI uses that signal to offer a migrate-then-delete flow.
-    The response body includes ``active_subs`` so the UI can render a
-    specific confirm rather than a generic error.
+    Гейты (оба обходятся ``?force=true``, фронт это знает):
 
-    Warm-pool credentials bound to this node are deleted before the node
-    row goes — they can't be reassigned once the node is gone. Credentials
-    attached to terminated subs are detached (node_id → NULL) so the
-    historical sub/cred link survives.
+    * ``active_subs`` (409) — на ноде ещё есть АКТИВНЫЕ подписки (node_id ==
+      этой ноды). Фронт предлагает «переселить и удалить»: ``/migrate`` →
+      retry. Замороженные подписки НЕ блокируют: их node_id обнуляется через
+      SET NULL, а при разморозке подписка заново выбирает ноду (``choose_node``);
+      живых кредов на этой ноде у них нет, стрэнда не будет. (Раньше frozen тоже
+      считались — но ``migrate_subscriptions_off`` их не двигает, и нода
+      становилась неудаляемой: dead-end.)
+    * ``live_vm`` (409) — у ноды живой VPS у хостера (provider_external_id +
+      статус не disabled/error). Удалять запись = осиротить платный сервер;
+      сначала «уничтожить у хостера» (/destroy) или force.
 
-    For cloud-provisioned nodes use ``POST /destroy`` instead — that runs
-    the teardown playbook and deprovisions the VPS.
+    Warm-кред'ы, привязанные к ноде, удаляются (без ноды они неназначаемы).
+    Кред'ы привязанных подписок ДЕТАЧАТСЯ (node_id → NULL, is_active → False):
+    исторический sub/cred-линк выживает, но мёртвая нода уходит из sub-link'а
+    (per-device alias пересаживается на живого соседа — diverse-саба продолжает
+    отдавать оставшиеся ноды).
     """
     node = db.get(models.VPNNode, node_id)
     if not node:
         raise HTTPException(status_code=404, detail="Node not found")
 
-    active_subs = (
-        db.query(models.Subscription)
-        .filter(
-            models.Subscription.node_id == node.id,
-            models.Subscription.status.in_([
-                models.SubscriptionStatus.active,
-                models.SubscriptionStatus.frozen,
-            ]),
+    if not force:
+        active_subs = (
+            db.query(models.Subscription)
+            .filter(
+                models.Subscription.node_id == node.id,
+                models.Subscription.status == models.SubscriptionStatus.active,
+            )
+            .count()
         )
-        .count()
-    )
-    if active_subs > 0:
-        raise HTTPException(
-            status_code=409,
-            detail={
-                "error": "active_subs",
-                "active_subs": active_subs,
-                "message": (
-                    f"На ноде ещё {active_subs} активных/замороженных подписок — "
-                    "сперва перенеси их на другую ноду."
-                ),
-            },
-        )
+        if active_subs > 0:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "error": "active_subs",
+                    "active_subs": active_subs,
+                    "message": (
+                        f"На ноде ещё {active_subs} активных подписок — "
+                        "сперва перенеси их на другую ноду."
+                    ),
+                },
+            )
+        if node.provider_external_id and node.status not in (
+            models.VPNNodeStatus.disabled,
+            models.VPNNodeStatus.error,
+        ):
+            # Живой VPS у хостера → удаление записи осиротит платный сервер.
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "error": "live_vm",
+                    "message": (
+                        "У ноды живой VPS у хостера — сначала «уничтожить у "
+                        "хостера» (/destroy), либо force."
+                    ),
+                },
+            )
 
     # Warm-pool credentials (no subscription) can't survive a missing
     # node — they'd never be assignable. Delete them.
@@ -1671,15 +1710,22 @@ def delete_node(
         .delete(synchronize_session=False)
     )
 
-    # Bound credentials on terminated/expired subs: detach (NULL node_id)
-    # so the audit trail survives but the FK stops pinning the node.
+    # Bound credentials (any sub: terminated/expired *or* a live diverse sub
+    # losing one of its N nodes): detach (NULL node_id) so the FK stops
+    # pinning the node, AND deactivate (is_active → False) so the dead node
+    # drops out of the served sub-link. The sub-link's per-device alias then
+    # re-points the now-credless device at a live sibling (api_extensions.py
+    # source_device branch) — a diverse sub keeps serving its other nodes.
     bound_detached = (
         db.query(models.Credential)
         .filter(
             models.Credential.node_id == node.id,
             models.Credential.subscription_id.isnot(None),
         )
-        .update({models.Credential.node_id: None}, synchronize_session=False)
+        .update(
+            {models.Credential.node_id: None, models.Credential.is_active: False},
+            synchronize_session=False,
+        )
     )
 
     # Devices point at configs on this node via config_id. The DB-level
