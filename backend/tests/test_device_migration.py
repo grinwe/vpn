@@ -396,3 +396,95 @@ def test_switch_device_exit_route_disabled_device_400(client, db_session):
     )
     assert resp.status_code == 400
     assert "must be active" in resp.json()["detail"]
+
+
+# ── client_id_hmac reuse-clearing regression (node-drain 500) ─────────
+#
+# Регресс на 500 при /nodes/{id}/migrate: Device.client_id_hmac UNIQUE и
+# ПРОИЗВОДНЫЙ от sub_token. Node-drain пути (migrate_subscription_to_new_node,
+# migrate_subscriptions_off) обнуляли только sub_token — старый ревокнутый
+# девайс сохранял client_id_hmac, и reprovision нового девайса с тем же
+# reuse_sub_token упирался в ix_devices_client_id_hmac (IntegrityError →
+# отравленная сессия → PendingRollbackError → HTTP 500). Чиним: обнуляем
+# client_id_hmac вместе с sub_token (как уже делал migrate_device_to_node).
+
+
+def test_migrate_subscription_clears_client_id_hmac_on_reused_token(
+    db_session, monkeypatch,
+):
+    from app.security import compute_client_id_hmac
+    from app.services import provisioning as prov_mod
+
+    plan = make_plan(db_session)
+    user = make_user(db_session)
+    old = make_node(db_session, name="hmac-old", region="ru")
+    new = make_node(db_session, name="hmac-new", region="ru", host="198.51.100.211")
+    cfg = make_config(db_session, old)
+    make_config(db_session, new)
+    sub = make_subscription(db_session, user, plan, old)
+    dev = make_device(db_session, sub, cfg, access_username="u")
+    token = "tok-reuse-abc"
+    dev.sub_token = token
+    dev.client_id_hmac = compute_client_id_hmac(token)
+    db_session.commit()
+
+    monkeypatch.setattr(prov_mod, "choose_node", lambda *a, **k: new)
+    orch = ProvisioningOrchestrator(db_session)
+    monkeypatch.setattr(orch, "revoke_device", lambda *a, **k: None)
+    # reprovision — no-op: обнуление client_id_hmac происходит ДО него.
+    monkeypatch.setattr(
+        orch, "reprovision_subscription", lambda *a, **k: (dev, object())
+    )
+    monkeypatch.setattr(orch, "_maybe_attach_diverse", lambda *a, **k: None)
+
+    orch.migrate_subscription_to_new_node(sub)
+
+    db_session.refresh(dev)
+    # токен освобождён И его client_id_hmac снят → reuse не упрётся в UNIQUE
+    assert dev.sub_token is None
+    assert dev.client_id_hmac is None
+
+
+def test_migrate_subscriptions_off_clears_client_id_hmac(db_session, monkeypatch):
+    import types
+
+    from app.security import compute_client_id_hmac
+    from app.services import provisioning as prov_mod
+    from app.services.health import migrate_subscriptions_off
+
+    plan = make_plan(db_session)
+    user = make_user(db_session)
+    old = make_node(db_session, name="drain-old", region="ru")
+    new = make_node(db_session, name="drain-new", region="ru", host="198.51.100.221")
+    cfg = make_config(db_session, old)
+    make_config(db_session, new)
+    sub = make_subscription(db_session, user, plan, old)
+    dev = make_device(db_session, sub, cfg, access_username="u")
+    token = "tok-drain-xyz"
+    dev.sub_token = token
+    dev.client_id_hmac = compute_client_id_hmac(token)
+    db_session.commit()
+    did, sid = dev.id, sub.id
+
+    # migrate_subscriptions_off строит свой ProvisioningOrchestrator(db) внутри,
+    # поэтому патчим методы КЛАССА + choose_node/_node_has_vless_family на модуле.
+    monkeypatch.setattr(prov_mod, "choose_node", lambda *a, **k: new)
+    monkeypatch.setattr(prov_mod, "_node_has_vless_family", lambda *a, **k: False)
+    monkeypatch.setattr(
+        ProvisioningOrchestrator, "revoke_device",
+        lambda self, *a, **k: types.SimpleNamespace(id=0),
+    )
+    monkeypatch.setattr(
+        ProvisioningOrchestrator, "reprovision_subscription",
+        lambda self, *a, **k: (None, None),
+    )
+
+    result = migrate_subscriptions_off(db_session, old, reason="test-drain")
+
+    assert sid in result["subscription_ids"]
+    db_session.expire_all()
+    moved = db_session.get(models.Subscription, sid)
+    assert moved.node_id == new.id
+    reused = db_session.get(models.Device, did)
+    assert reused.sub_token is None
+    assert reused.client_id_hmac is None

@@ -3590,6 +3590,11 @@ class ProvisioningOrchestrator:
             for d in live_devices_snapshot:
                 if d.sub_token and d.sub_token in reused_tokens:
                     d.sub_token = None
+                    # client_id_hmac производный от sub_token и тоже UNIQUE —
+                    # сбрасываем вместе, иначе reprovision INSERT с тем же
+                    # reuse_sub_token упрётся в ix_devices_client_id_hmac
+                    # (как в migrate_device_to_node ниже).
+                    d.client_id_hmac = None
             self.db.flush()
 
         subscription.node_id = target.id

@@ -287,22 +287,40 @@ def migrate_subscriptions_off(
         # whose token we intend to reuse on the target node — without
         # NULL-ing here the reprovision INSERT trips the unique
         # constraint (two rows can't share the same non-null sub_token).
-        reused_tokens = {t for t, _, _ in reuse_map.values() if t}
-        if reused_tokens:
-            for d in live_devices_snapshot:
-                if d.sub_token and d.sub_token in reused_tokens:
-                    d.sub_token = None
-            db.flush()
+        # client_id_hmac ПРОИЗВОДНЫЙ от sub_token (compute_client_id_hmac) и
+        # тоже UNIQUE — сбрасываем ВМЕСТЕ, иначе reprovision INSERT нового
+        # Device с тем же reuse_sub_token упрётся в ix_devices_client_id_hmac
+        # (IntegrityError). Раньше его не чистили → IntegrityError ловился
+        # ниже без rollback → сессия «отравлена» → следующий commit кидал
+        # PendingRollbackError → весь /migrate падал в 500 (см.
+        # migrate_device_to_node, где это уже сделано правильно).
+        #
+        # Весь flip обёрнут в try: одиночный сбой на flush/commit НЕ должен
+        # ронять всю пачку — откатываем сессию, логируем, пропускаем sub
+        # (остаётся на старой ноде, ретраится), вместо отравленной сессии.
+        try:
+            reused_tokens = {t for t, _, _ in reuse_map.values() if t}
+            if reused_tokens:
+                for d in live_devices_snapshot:
+                    if d.sub_token and d.sub_token in reused_tokens:
+                        d.sub_token = None
+                        d.client_id_hmac = None
+                db.flush()
 
-        # In-place migration: flip node_id on the existing Subscription row
-        # and reprovision. This preserves sub_token (dynamic sub-link keeps
-        # working) and avoids the "two cards in webapp" UX bug where the
-        # old blocked row and new active row both showed up.
-        sub.node_id = target.id
-        sub.notes = f"migrated: {reason}"
-        db.add(sub)
-        db.commit()
-        db.refresh(sub)
+            # In-place migration: flip node_id on the existing Subscription
+            # row and reprovision. This preserves sub_token (dynamic sub-link
+            # keeps working) and avoids the "two cards in webapp" UX bug where
+            # the old blocked row and new active row both showed up.
+            sub.node_id = target.id
+            sub.notes = f"migrated: {reason}"
+            db.add(sub)
+            db.commit()
+            db.refresh(sub)
+        except Exception:  # noqa: BLE001
+            logger.exception("migrate: flip node_id failed for sub %s", sub.id)
+            db.rollback()
+            no_target_count += 1
+            continue
 
         if not live_names:
             # Sub had zero live devices — still create one so /sub/{token}
@@ -351,6 +369,9 @@ def migrate_subscriptions_off(
                     db.commit()
         except Exception:  # noqa: BLE001
             logger.exception("Failed to re-provision sub %s on node %s", sub.id, target.id)
+            # Un-poison the session so the next sub's commit (and the
+            # end-of-batch resync) don't inherit a rolled-back transaction.
+            db.rollback()
 
     # Resync every target node the batch touched. This covers the
     # "user migrated but still gets `invalid request user id`" case:

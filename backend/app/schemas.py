@@ -763,9 +763,12 @@ class ProbeTargetList(BaseModel):
 
 class NodeHealthOut(BaseModel):
     node_id: int
-    health_score: int
+    # Nullable: нода без probe-сэмплов в lookback-окне даёт overall=None →
+    # health_score=None. Раньше поля были non-nullable → Pydantic
+    # ValidationError → 500 на GET /nodes/{id}/health (и /probes).
+    health_score: int | None = None
     blocked_regions: list[str] = []
-    overall_success_rate: float
+    overall_success_rate: float | None = None
     per_region: dict[str, float]
     migrated_subscriptions: list[int] = Field(default_factory=list)
 
