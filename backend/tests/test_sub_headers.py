@@ -45,7 +45,7 @@ def test_off_by_default() -> None:
 def test_all(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("SUB_HAPP_AUTOCONNECT", "all")
     h = _h(_Sub(None))
-    assert h["subscription-autoconnect"] == "1"
+    assert h["subscription-autoconnect"] == "true"
     assert h["subscription-autoconnect-type"] == "lowestdelay"
 
 

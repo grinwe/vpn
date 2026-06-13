@@ -125,7 +125,7 @@ def _sub_response_headers(
     if sub.expires_at:
         headers["subscription-userinfo"] = f"expire={int(sub.expires_at.timestamp())}"
     if _autoconnect_enabled(sub, device):
-        headers["subscription-autoconnect"] = "1"
+        headers["subscription-autoconnect"] = "true"  # канон (HAPP принимает и "1")
         headers["subscription-autoconnect-type"] = "lowestdelay"
     fallback = (os.getenv("SUB_LINK_FALLBACK_BASE_URL") or "").strip().rstrip("/")
     if fallback and token:
