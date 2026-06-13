@@ -12,6 +12,7 @@ This module adds endpoints for:
 from __future__ import annotations
 
 import logging
+import os
 import secrets
 
 
@@ -56,6 +57,33 @@ class SubLinkResponse(BaseModel):
     status: str
     expires_at: str
     configs: list[SubLinkConfig]
+
+
+def _sub_response_headers(sub: models.Subscription, token: str) -> dict[str, str]:
+    """Заголовки саб-ответа (читаются клиентом на каждом рефреше — existing юзеры
+    подхватят без переимпорта).
+
+    Phase B (HAPP «авто»): ``subscription-autoconnect`` + ``-type: lowestdelay`` →
+    HAPP при (пере)коннекте сам берёт ноду с ЛУЧШИМ ПИНГОМ (дохлые с плохим/нет
+    пинга — мимо). Бесшовного per-server failover у HAPP через плоскую сабу НЕТ
+    (сверено по их докам) — это максимум, и он чисто server-side.
+    ``fallback-url`` (если задан ``SUB_LINK_FALLBACK_BASE_URL``) — фейловер
+    ИСТОЧНИКА сабы на запасной домен, когда основной саб-URL режет РКН.
+    """
+    title = "V8-VPN"
+    headers: dict[str, str] = {
+        "profile-update-interval": "6",
+        "profile-title": title,
+        "content-disposition": f'attachment; filename="{title}"',
+        "subscription-autoconnect": "1",
+        "subscription-autoconnect-type": "lowestdelay",
+    }
+    if sub.expires_at:
+        headers["subscription-userinfo"] = f"expire={int(sub.expires_at.timestamp())}"
+    fallback = (os.getenv("SUB_LINK_FALLBACK_BASE_URL") or "").strip().rstrip("/")
+    if fallback and token:
+        headers["fallback-url"] = f"{fallback}/{token}"
+    return headers
 
 
 @ext_router.get("/sub/{token}")
@@ -176,16 +204,10 @@ def dynamic_sub_link(token: str, db: Session = Depends(get_db)):
 
         uris = "\n".join(c.uri for c in configs)
         encoded = base64.b64encode(uris.encode()).decode()
-        title = "V8-VPN"
         return PlainTextResponse(
             content=encoded,
             media_type="text/plain",
-            headers={
-                "subscription-userinfo": f"expire={int(sub.expires_at.timestamp())}",
-                "profile-update-interval": "6",
-                "profile-title": title,
-                "content-disposition": f'attachment; filename="{title}"',
-            },
+            headers=_sub_response_headers(sub, token),
         )
 
     # ── Legacy per-subscription fallback ───────────────────────────────
@@ -239,16 +261,10 @@ def dynamic_sub_link(token: str, db: Session = Depends(get_db)):
     )
     db.commit()
 
-    title = "V8-VPN"
     return PlainTextResponse(
         content=encoded,
         media_type="text/plain",
-        headers={
-            "subscription-userinfo": f"expire={int(sub.expires_at.timestamp())}",
-            "profile-update-interval": "6",
-            "profile-title": title,
-            "content-disposition": f'attachment; filename="{title}"',
-        },
+        headers=_sub_response_headers(sub, token),
     )
 
 
