@@ -14,6 +14,7 @@ from __future__ import annotations
 import logging
 import os
 import secrets
+from datetime import datetime, timezone
 
 
 from fastapi import APIRouter, Depends, HTTPException, Request
@@ -59,14 +60,59 @@ class SubLinkResponse(BaseModel):
     configs: list[SubLinkConfig]
 
 
-def _sub_response_headers(sub: models.Subscription, token: str) -> dict[str, str]:
+def _autoconnect_enabled(sub: models.Subscription, device) -> bool:
+    """Включать ли HAPP-autoconnect для этой сабы/девайса (Phase B-гейт).
+
+    ``SUB_HAPP_AUTOCONNECT``: ""/"0"/"off" → никому; "all"/"on"/"1" → всем; иначе —
+    CSV ``user_id`` (обкатка на одном юзере, как diverse-backfill).
+    ``SUB_HAPP_AUTOCONNECT_SINCE`` (опц. ISO-метка): доп.фильтр «только НОВЫЕ девайсы»
+    — включаем лишь для девайсов с ``created_at >= метки`` (тест без путаницы со
+    старыми/primary девайсами). Если метка задана, а девайса нет (legacy саб-токен)
+    — не включаем.
+    """
+    ac = (os.getenv("SUB_HAPP_AUTOCONNECT") or "").strip().lower()
+    if ac in ("all", "on", "1", "true"):
+        on = True
+    elif ac and ac not in ("0", "off", "false"):
+        ids = {x.strip() for x in ac.split(",") if x.strip()}
+        on = str(getattr(sub, "user_id", "")) in ids
+    else:
+        on = False
+    if not on:
+        return False
+    since_raw = (os.getenv("SUB_HAPP_AUTOCONNECT_SINCE") or "").strip()
+    if since_raw:
+        return bool(device) and _created_after(device, since_raw)
+    return True
+
+
+def _created_after(device, since_raw: str) -> bool:
+    """device.created_at >= since_raw (ISO). Нормализуем обе в naive-UTC."""
+    try:
+        since = datetime.fromisoformat(since_raw.replace("Z", "+00:00"))
+    except ValueError:
+        return False
+    created = getattr(device, "created_at", None)
+    if created is None:
+        return False
+    if since.tzinfo is not None:
+        since = since.astimezone(timezone.utc).replace(tzinfo=None)
+    if created.tzinfo is not None:
+        created = created.astimezone(timezone.utc).replace(tzinfo=None)
+    return created >= since
+
+
+def _sub_response_headers(
+    sub: models.Subscription, token: str, device=None
+) -> dict[str, str]:
     """Заголовки саб-ответа (читаются клиентом на каждом рефреше — existing юзеры
     подхватят без переимпорта).
 
     Phase B (HAPP «авто»): ``subscription-autoconnect`` + ``-type: lowestdelay`` →
     HAPP при (пере)коннекте сам берёт ноду с ЛУЧШИМ ПИНГОМ (дохлые с плохим/нет
     пинга — мимо). Бесшовного per-server failover у HAPP через плоскую сабу НЕТ
-    (сверено по их докам) — это максимум, и он чисто server-side.
+    (сверено по их докам) — это максимум, и он чисто server-side. За гейтом
+    ``SUB_HAPP_AUTOCONNECT`` (+ опц. ``_SINCE`` для «только новых девайсов»).
     ``fallback-url`` (если задан ``SUB_LINK_FALLBACK_BASE_URL``) — фейловер
     ИСТОЧНИКА сабы на запасной домен, когда основной саб-URL режет РКН.
     """
@@ -78,18 +124,7 @@ def _sub_response_headers(sub: models.Subscription, token: str) -> dict[str, str
     }
     if sub.expires_at:
         headers["subscription-userinfo"] = f"expire={int(sub.expires_at.timestamp())}"
-    # ГЕЙТ (по умолчанию ВЫКЛ — прод не меняется для всех): autoconnect+lowestdelay
-    # меняют поведение HAPP у каждого на рефреше, поэтому катим постепенно.
-    # SUB_HAPP_AUTOCONNECT: ""/"0"/"off" → никому; "all"/"on"/"1" → всем; иначе —
-    # CSV user_id'ов для обкатки на одном юзере (как diverse-backfill по user_id).
-    ac = (os.getenv("SUB_HAPP_AUTOCONNECT") or "").strip().lower()
-    ac_on = False
-    if ac in ("all", "on", "1", "true"):
-        ac_on = True
-    elif ac and ac not in ("0", "off", "false"):
-        ids = {x.strip() for x in ac.split(",") if x.strip()}
-        ac_on = str(getattr(sub, "user_id", "")) in ids
-    if ac_on:
+    if _autoconnect_enabled(sub, device):
         headers["subscription-autoconnect"] = "1"
         headers["subscription-autoconnect-type"] = "lowestdelay"
     fallback = (os.getenv("SUB_LINK_FALLBACK_BASE_URL") or "").strip().rstrip("/")
@@ -219,7 +254,8 @@ def dynamic_sub_link(token: str, db: Session = Depends(get_db)):
         return PlainTextResponse(
             content=encoded,
             media_type="text/plain",
-            headers=_sub_response_headers(sub, token),
+            # device = владелец токена (для гейта «только новые девайсы» по created_at)
+            headers=_sub_response_headers(sub, token, device),
         )
 
     # ── Legacy per-subscription fallback ───────────────────────────────

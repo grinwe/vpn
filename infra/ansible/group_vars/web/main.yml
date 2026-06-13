@@ -85,4 +85,8 @@ deploy_app_stack_diverse_sub_nodes: 3
 # сабы. По умолчанию "off" (прод-поведение не меняется). Обкатка: выставить user_id
 # тест-юзера (CSV), проверить в HAPP, затем "all". Эффект — на рефреше сабы (≤6ч),
 # переимпорт не нужен. См. docs/operations/diverse_subscription_epic.md Фаза B.
-deploy_app_stack_sub_happ_autoconnect: "off"
+# ОБКАТКА 2026-06-13: user_id=1 (owner) + только НОВЫЕ девайсы (created_at >= SINCE).
+deploy_app_stack_sub_happ_autoconnect: "1"
+# ISO-метка «только новые девайсы»: autoconnect лишь для девайсов, созданных ПОСЛЕ.
+# Пусто = без фильтра по дате. Снять/очистить при раскатке на "all".
+deploy_app_stack_sub_happ_autoconnect_since: "2026-06-13T19:09:00Z"

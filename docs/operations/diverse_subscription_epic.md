@@ -117,8 +117,11 @@ url-test/failover.** Бесшовного «прыгания между N нод
   `api_extensions._sub_response_headers` (оба саб-пути: per-device + legacy).
   **ЗА ФЛАГОМ `SUB_HAPP_AUTOCONNECT` (env, default `off` = НИКОМУ — прод не меняется).**
   Обкатка как у diverse-backfill: `off` → CSV `user_id` тест-юзера → проверить в HAPP
-  → `all`. Меняется на рефреше сабы (≤6ч), переимпорт не нужен. Плюмбинг: env.j2 +
-  `deploy_app_stack_sub_happ_autoconnect` в main.yml.
+  → `all`. Доп.фильтр `SUB_HAPP_AUTOCONNECT_SINCE` (ISO-метка) = «только НОВЫЕ девайсы»
+  (`created_at >= метки`) — чтобы тест не путался со старыми/primary девайсами; пусто =
+  без фильтра. Меняется на рефреше сабы (≤6ч), переимпорт не нужен. Плюмбинг: env.j2 +
+  `deploy_app_stack_sub_happ_autoconnect[_since]` в main.yml. Обкатка 2026-06-13:
+  `user_id=1` + новые девайсы.
 - **`fallback-url`** (если задан env `SUB_LINK_FALLBACK_BASE_URL`) — фейловер ИСТОЧНИКА
   сабы на запасной домен, когда основной саб-URL режет РКН. Дормант, пока env не задан
   (плюмбинг compose+env.j2+main.yml — когда появится запасной домен).
