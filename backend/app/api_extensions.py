@@ -75,11 +75,23 @@ def _sub_response_headers(sub: models.Subscription, token: str) -> dict[str, str
         "profile-update-interval": "6",
         "profile-title": title,
         "content-disposition": f'attachment; filename="{title}"',
-        "subscription-autoconnect": "1",
-        "subscription-autoconnect-type": "lowestdelay",
     }
     if sub.expires_at:
         headers["subscription-userinfo"] = f"expire={int(sub.expires_at.timestamp())}"
+    # ГЕЙТ (по умолчанию ВЫКЛ — прод не меняется для всех): autoconnect+lowestdelay
+    # меняют поведение HAPP у каждого на рефреше, поэтому катим постепенно.
+    # SUB_HAPP_AUTOCONNECT: ""/"0"/"off" → никому; "all"/"on"/"1" → всем; иначе —
+    # CSV user_id'ов для обкатки на одном юзере (как diverse-backfill по user_id).
+    ac = (os.getenv("SUB_HAPP_AUTOCONNECT") or "").strip().lower()
+    ac_on = False
+    if ac in ("all", "on", "1", "true"):
+        ac_on = True
+    elif ac and ac not in ("0", "off", "false"):
+        ids = {x.strip() for x in ac.split(",") if x.strip()}
+        ac_on = str(getattr(sub, "user_id", "")) in ids
+    if ac_on:
+        headers["subscription-autoconnect"] = "1"
+        headers["subscription-autoconnect-type"] = "lowestdelay"
     fallback = (os.getenv("SUB_LINK_FALLBACK_BASE_URL") or "").strip().rstrip("/")
     if fallback and token:
         headers["fallback-url"] = f"{fallback}/{token}"

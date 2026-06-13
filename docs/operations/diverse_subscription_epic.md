@@ -115,6 +115,10 @@ url-test/failover.** Бесшовного «прыгания между N нод
   Модель не «бесшовно», а «нода упала → переподключение → lowestdelay сам выбирает
   живую»; с autoconnect=1 переподключение автоматическое. Реализовано в
   `api_extensions._sub_response_headers` (оба саб-пути: per-device + legacy).
+  **ЗА ФЛАГОМ `SUB_HAPP_AUTOCONNECT` (env, default `off` = НИКОМУ — прод не меняется).**
+  Обкатка как у diverse-backfill: `off` → CSV `user_id` тест-юзера → проверить в HAPP
+  → `all`. Меняется на рефреше сабы (≤6ч), переимпорт не нужен. Плюмбинг: env.j2 +
+  `deploy_app_stack_sub_happ_autoconnect` в main.yml.
 - **`fallback-url`** (если задан env `SUB_LINK_FALLBACK_BASE_URL`) — фейловер ИСТОЧНИКА
   сабы на запасной домен, когда основной саб-URL режет РКН. Дормант, пока env не задан
   (плюмбинг compose+env.j2+main.yml — когда появится запасной домен).
