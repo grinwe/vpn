@@ -52,7 +52,11 @@ from .base import CloudServer, DriverError
 
 logger = logging.getLogger(__name__)
 
-_TIMEOUT = 40
+# offerings/order делают несколько последовательных вызовов; держим короткий
+# таймаут, чтобы недоступный/каптч-walled billmgr фейлился быстро и читаемо
+# (а не висел до CF-502 на 100s). UFO с дата-центрового IP бэкенда отдаёт
+# captcha_verification_failed — см. hoster_api_epic.md.
+_TIMEOUT = 12
 _POLL_TIMEOUT = 900
 _POLL_INTERVAL = 12
 _PW_RETRIES = 3
@@ -248,7 +252,9 @@ class BillmgrDriver:
 
     def _order_form(self, func: str, **params: Any) -> dict:
         """Шаг order-wizard'а (без sok — ничего не заказывает). Дегрейд в {} +
-        WARNING-лог (чтобы пустые offerings были диагностируемы, а не молчали)."""
+        WARNING-лог: пустые offerings обычно значат, что хостер режет IP бэкенда
+        (UFO с дата-центрового IP отдаёт captcha_verification_failed). Не валим
+        502 (его всё равно прячет CF) — отдаём пустой каталог + лог-причину."""
         try:
             return self._call(func, **params)
         except DriverError as exc:
