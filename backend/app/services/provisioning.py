@@ -3858,6 +3858,96 @@ class ProvisioningOrchestrator:
         }
         return len(after - before)
 
+    def failover_device(
+        self, device: models.Device,
+    ) -> tuple[models.VPNNode, models.Device, models.ProvisioningTask | None, int | None]:
+        """Per-device failover: «ЭТО устройство не работает».
+
+        Перетряхивает НАБОР нод ТОЛЬКО этого device на свежие, НЕ трогая
+        соседние устройства подписки и НЕ баня ноду для юзера user-wide (в
+        отличие от sub-level ``migrate_subscription_to_free_node``, который
+        гребёт всю подписку + ставит NodeUserBan — из-за чего рабочие девайсы
+        зря передёргивались и теряли живую ноду).
+
+        Diverse-aware: для diverse-устройства (creds на >1 ноде) обычный
+        ``migrate_device_to_node`` ЗАПРЕЩЁН (схлопнул бы набор). Здесь вместо
+        этого: ревокаем ВСЕ текущие ноды устройства (юзер сказал «не работает»
+        → на его сети не пашет ни одна), реподнимаем device на свежей primary
+        (robust full-provision, не warm-only), затем ``_maybe_attach_diverse``
+        добирает остальной набор, исключая ВЕСЬ битый набор сразу (наивный
+        цикл ``swap_node_out`` мог бы добрать обратно ещё не выкинутую битую
+        ноду). Для одно-нодового устройства диверс-добор = no-op.
+
+        ``sub_token``/UUID сохраняются (reuse) → установленный клиент не рвётся.
+        Возвращает ``(target_node, new_device, task, old_primary_node_id)``.
+        Бросает ``RuntimeError`` если свежей ноды нет (всё исключено/нездорово).
+        """
+        if device.status in (
+            models.DeviceStatus.disabled,
+            models.DeviceStatus.revoked,
+        ):
+            raise RuntimeError(
+                f"device is {device.status.value}, must be active/pending"
+            )
+        sub = device.subscription
+        if sub is None:
+            raise RuntimeError("device has no subscription")
+        plan = sub.plan
+        if plan is None:
+            raise RuntimeError("subscription has no plan")
+
+        # Весь текущий набор нод устройства = «битый» (исключаем из выбора свежей).
+        blocked: set[int] = {
+            c.node_id for c in device.credentials if c.is_active and c.node_id
+        }
+        old_primary = (
+            device.config.node.id
+            if device.config and device.config.node
+            else sub.node_id
+        )
+        if old_primary:
+            blocked.add(old_primary)
+        # Плюс уже забаненные юзером ноды — не возвращаем на них.
+        if sub.user is not None:
+            for (nid,) in (
+                self.db.query(models.NodeUserBan.node_id)
+                .filter(models.NodeUserBan.user_id == sub.user_id)
+                .all()
+            ):
+                if nid:
+                    blocked.add(nid)
+
+        # Свежая primary, исключая весь битый набор. RuntimeError если нет.
+        target = choose_node(self.db, plan, exclude_node_ids=list(blocked))
+
+        reuse_token = device.sub_token
+        reuse_uri = device.connection_uri
+        reuse_uuid = _device_vless_uuid(device)
+
+        self.revoke_device(
+            device,
+            reason=f"device-failover {old_primary}->{target.id}",
+            background=True,
+        )
+        if reuse_token:
+            device.sub_token = None
+            device.client_id_hmac = None  # производный от sub_token → сбрасываем
+            self.db.flush()
+        new_device, task = self.reprovision_subscription(
+            sub,
+            device_name=device.name,
+            target_node=target,
+            reuse_sub_token=reuse_token,
+            reuse_connection_uri=reuse_uri,
+            reuse_uuid=reuse_uuid,
+        )
+        # Перетряхиваем диверс-набор ТОЛЬКО этого device на свежие, исключая
+        # весь битый набор (reprovision с reuse_uuid НЕ дёргает диверс сам).
+        self._maybe_attach_diverse(
+            sub, new_device, plan, target, extra_exclude=list(blocked),
+        )
+        return target, new_device, task, old_primary
+
     def revoke_device(
         self, device: models.Device, *, reason: str | None = None, background: bool = True
     ) -> models.ProvisioningTask:

@@ -4,6 +4,8 @@
 
 > **2026-06: закрыт пробел сбора.** Раньше `OperatorNodeReport` писал ТОЛЬКО бот-флоу (`report-broken`), а webapp-кнопка «VPN не работает» (`/webapp/health-ping-report` → `_do_failover`) переселяла юзера, но репорт НЕ создавала → `operator_node_reports` пустела, матрица не строилась. Теперь `_do_failover` пишет репорт на КАЖДЫЙ user-reported failover (operator=None), а webapp после пересадки спрашивает оператора одним тапом (`POST /webapp/report-operator` → `report_id` из ответа health-ping-report) — зеркало бот-флоу. Watcher по `target_access_username` доводит outcome.
 
+> **2026-06: per-device failover.** Sub-level «VPN не работает» гребёт ВСЮ подписку (все устройства → новая нода + user-wide `NodeUserBan`) — для multi-device юзера это передёргивало рабочие устройства и отнимало у них живую ноду. Теперь, если у активной подписки **>1 устройства**, webapp (`Help.tsx`) сперва спрашивает «какое устройство не работает?» → `POST /webapp/report-broken-device {device_id}` → `ProvisioningOrchestrator.failover_device(device)`: перетряхивает ноды ТОЛЬКО этого устройства (diverse-aware — реподнимает на свежей primary + `_maybe_attach_diverse` исключая весь битый набор; `migrate_device_to_node` для diverse запрещён, схлопнул бы набор), соседние устройства и ноду user-wide НЕ трогает. Репорт пишется с правильным `device_id`. Одно устройство → старый whole-sub путь (разницы нет).
+
 > Связано: [data-model.md](../data-model.md) (`operator_node_reports`), `migrate-auto` + `NodeUserBan` (фундамент уже зашиплен), connection-tracking (`NodeTrafficSample.details["users"]`).
 
 ## Идея

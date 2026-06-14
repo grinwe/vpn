@@ -389,3 +389,12 @@ export async function setReportOperator(reportId: number, operator: string) {
     { method: "POST", body: JSON.stringify({ report_id: reportId, operator }) },
   );
 }
+
+// Per-device «это устройство не работает» (multi-device юзер выбрал одно).
+// Перетряхивает ноды ТОЛЬКО этого устройства, соседние не трогает.
+export async function reportBrokenDevice(deviceId: number) {
+  return request<HealthPingReportResponse>(
+    "/api/webapp/report-broken-device",
+    { method: "POST", body: JSON.stringify({ device_id: deviceId }) },
+  );
+}

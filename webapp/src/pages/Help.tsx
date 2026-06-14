@@ -1,9 +1,18 @@
 import { useState } from "react";
 import { navigate } from "../router";
-import { reportVpnBroken, setReportOperator, VPN_OPERATORS } from "../api";
+import {
+  reportVpnBroken,
+  reportBrokenDevice,
+  setReportOperator,
+  VPN_OPERATORS,
+  DeviceSummary,
+} from "../api";
 
 interface Props {
   botUsername?: string;
+  // Устройства активной подписки. Если их >1 — спрашиваем «какое не работает?»
+  // и перетряхиваем ноды ТОЛЬКО выбранного, не трогая соседние.
+  devices?: DeviceSummary[];
 }
 
 // Состояния кнопки «у меня прямо сейчас не работает VPN». Используется
@@ -17,6 +26,7 @@ type SelfReportState =
   | "pending"
   | "sent"
   | "error"
+  | "pick_device"
   | "pick_operator"
   | "operator_done";
 
@@ -52,7 +62,7 @@ const FAQ: { title: string; body: string }[] = [
   },
 ];
 
-export default function Help({ botUsername }: Props) {
+export default function Help({ botUsername, devices = [] }: Props) {
   const [open, setOpen] = useState<number | null>(null);
   const [selfReportState, setSelfReportState] = useState<SelfReportState>("idle");
   const [reportId, setReportId] = useState<number | null>(null);
@@ -61,26 +71,50 @@ export default function Help({ botUsername }: Props) {
     ? `https://t.me/${botUsername}?start=support`
     : null;
 
+  const applyReportResult = (res: {
+    migrated?: boolean;
+    report_id?: number | null;
+  }) => {
+    if (res.migrated && res.report_id) {
+      // Переселили → спрашиваем оператора (один тап).
+      setReportId(res.report_id);
+      setSelfReportState("pick_operator");
+    } else {
+      setSelfReportState("sent");
+      setTimeout(() => setSelfReportState("idle"), 5 * 60 * 1000);
+    }
+  };
+
   const handleReportBroken = async () => {
     if (
       selfReportState === "pending" ||
       selfReportState === "sent" ||
+      selfReportState === "pick_device" ||
       selfReportState === "pick_operator"
     )
       return;
+    // >1 устройства → сперва спросим, какое именно барахлит, и перетряхнём ноды
+    // ТОЛЬКО его (рабочие не трогаем). Одно устройство → сразу отчёт по сабе.
+    if (devices.length > 1) {
+      setSelfReportState("pick_device");
+      return;
+    }
     setSelfReportState("pending");
     try {
-      const res = await reportVpnBroken();
-      if (res.migrated && res.report_id) {
-        // Нас переселили на свободную ноду → спрашиваем оператора (один тап).
-        setReportId(res.report_id);
-        setSelfReportState("pick_operator");
-      } else {
-        setSelfReportState("sent");
-        setTimeout(() => setSelfReportState("idle"), 5 * 60 * 1000);
-      }
+      applyReportResult(await reportVpnBroken());
     } catch (err) {
       console.error("reportVpnBroken failed", err);
+      setSelfReportState("error");
+      setTimeout(() => setSelfReportState("idle"), 5000);
+    }
+  };
+
+  const handlePickDevice = async (deviceId: number) => {
+    setSelfReportState("pending");
+    try {
+      applyReportResult(await reportBrokenDevice(deviceId));
+    } catch (err) {
+      console.error("reportBrokenDevice failed", err);
       setSelfReportState("error");
       setTimeout(() => setSelfReportState("idle"), 5000);
     }
@@ -161,7 +195,32 @@ export default function Help({ botUsername }: Props) {
           ткнул сам». Намеренно без красного — на Home.tsx эта кнопка
           читалась как «сервис сломан», что путало. */}
       <div className="pt-2">
-        {selfReportState === "pick_operator" ? (
+        {selfReportState === "pick_device" ? (
+          <div className="space-y-2">
+            <p className="text-sm">Какое устройство сейчас не работает?</p>
+            <p className="text-tg-hint text-xs">
+              Перетряхнём серверы только для него — остальные устройства не
+              тронем.
+            </p>
+            <div className="grid grid-cols-1 gap-2">
+              {devices.map((d) => (
+                <button
+                  key={d.id}
+                  onClick={() => handlePickDevice(d.id)}
+                  className="py-2 px-3 rounded-lg text-sm text-left border border-white/10 hover:bg-white/5 transition-colors"
+                >
+                  📱 {d.name}
+                </button>
+              ))}
+              <button
+                onClick={() => setSelfReportState("idle")}
+                className="py-2 rounded-lg text-xs text-tg-hint hover:bg-white/5 transition-colors"
+              >
+                Отмена
+              </button>
+            </div>
+          </div>
+        ) : selfReportState === "pick_operator" ? (
           <div className="space-y-2">
             <p className="text-sm">
               🔄 Поменяли тебе сервер. Попробуй подключиться через пару минут.

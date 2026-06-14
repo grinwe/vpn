@@ -1881,3 +1881,96 @@ def webapp_set_operator(
     report.operator = body.operator if body.operator in _OPERATORS else "unknown"
     db.commit()
     return {"report_id": report.id, "operator": report.operator}
+
+
+class ReportBrokenDeviceRequest(BaseModel):
+    device_id: int
+
+
+@webapp_router.post("/report-broken-device", response_model=HealthPingReportResponse)
+def webapp_report_broken_device(
+    body: ReportBrokenDeviceRequest,
+    user: models.User = Depends(require_webapp_user),
+    db: Session = Depends(get_db),
+):
+    """Per-device «ЭТО устройство не работает» (multi-device юзер выбрал одно).
+
+    Перетряхиваем ноды ТОЛЬКО этого устройства (``failover_device``) — соседние
+    девайсы не трогаем, ноду user-wide не баним. Репорт оператора пишем с
+    ``device_id`` (матрица оператор×нода). Anti-forge: устройство обязано
+    принадлежать юзеру. Затем webapp одним тапом проставляет карьер
+    (``/webapp/report-operator``). См. operator_routing_roadmap.md.
+    """
+    from .services.provisioning import ProvisioningOrchestrator
+
+    device = db.get(models.Device, body.device_id)
+    if device is None or device.user_id != user.id:
+        raise HTTPException(status_code=404, detail="Device not found")
+    if device.status in (models.DeviceStatus.disabled, models.DeviceStatus.revoked):
+        raise HTTPException(status_code=400, detail="device is not active")
+
+    sub_id = device.subscription_id
+    db.add(
+        models.AuditLog(
+            actor=str(user.id),
+            actor_type=models.AuditActor.user,
+            action="health_ping_response",
+            target_type="subscription",
+            target_id=sub_id,
+            extra={
+                "telegram_id": user.telegram_id,
+                "answer": "bad",
+                "source": "self_reported",
+                "scope": "device",
+                "device_id": device.id,
+            },
+        )
+    )
+
+    migrated = False
+    report_id: int | None = None
+    target_node_name: str | None = None
+    old_primary: int | None = None
+    target = None
+    try:
+        target, new_device, _task, old_primary = ProvisioningOrchestrator(
+            db
+        ).failover_device(device)
+    except RuntimeError:
+        # Нет свежей ноды (всё исключено/нездорово) — аудит оставляем, миграции
+        # нет; webapp покажет «попробуй позже».
+        target = None
+    except Exception:  # noqa: BLE001
+        if db.is_active:
+            db.rollback()
+        logger.exception(
+            "webapp report-broken-device: failover failed for device %s", device.id
+        )
+        target = None
+
+    if target is not None:
+        report = models.OperatorNodeReport(
+            user_id=user.id,
+            subscription_id=sub_id,
+            device_id=new_device.id,
+            operator=None,
+            failed_node_id=old_primary,
+            target_node_id=target.id,
+            target_access_username=new_device.access_username,
+            outcome="pending",
+        )
+        db.add(report)
+        db.flush()
+        migrated = True
+        report_id = report.id
+        target_node_name = target.name
+
+    db.commit()
+    return HealthPingReportResponse(
+        ok=True,
+        subscription_id=sub_id,
+        node_id=old_primary,
+        migrated=migrated,
+        report_id=report_id,
+        target_node_name=target_node_name,
+    )

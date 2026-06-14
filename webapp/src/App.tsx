@@ -65,9 +65,17 @@ export default function App() {
     fetchMe().then(setMe).catch(() => undefined);
   };
 
+  // Устройства активной подписки — для per-device флоу «какое не работает?» в
+  // Help (бэк берёт первую активную подписку по id; матчим тем же правилом).
+  const helpActiveSub = me?.subscriptions?.find((s) => s.status === "active");
+  const helpDevices =
+    me?.subscription_extras
+      ?.find((e) => e.subscription_id === helpActiveSub?.id)
+      ?.devices.filter((d) => d.status === "active") ?? [];
+
   if (route.name === "plans") return <Plans onActivated={refreshMe} subLinkBase={me?.sub_link_base_url ?? ""} me={me!} changeSubscriptionId={route.subscriptionId} />;
   if (route.name === "history") return <History />;
-  if (route.name === "help") return <Help botUsername={me?.bot_username} />;
+  if (route.name === "help") return <Help botUsername={me?.bot_username} devices={helpDevices} />;
   if (route.name === "checkout") return <CheckoutPending invoiceId={route.invoiceId} />;
   return <Home me={me!} onRefresh={refreshMe} />;
 }
