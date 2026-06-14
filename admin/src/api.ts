@@ -712,6 +712,32 @@ export function renewNode(
   );
 }
 
+// Правка дисплейных/маршрутных полей ноды (name/region/pool_id/notes).
+// Бэк валидирует name как inventory-хост + уникальность; rename без
+// re-bootstrap (ansible коннектится по host, name это alias).
+export interface VPNNodeUpdateIn {
+  name?: string;
+  region?: string;
+  pool_id?: number | null;
+  notes?: string | null;
+}
+
+export function updateNode(
+  nodeId: number,
+  payload: VPNNodeUpdateIn,
+): Promise<VPNNodeOut> {
+  return api.patch<VPNNodeOut>(`/nodes/${nodeId}`, payload);
+}
+
+export interface ServerPoolMini {
+  id: number;
+  name: string;
+}
+
+export function listPools(): Promise<ServerPoolMini[]> {
+  return api.get<ServerPoolMini[]>("/pools");
+}
+
 // Протоколы должны быть в синке с VPNConfigProtocol enum в
 // backend/app/models.py — backend ругнётся 400 на неизвестный.
 // shadowtls+shadowsocks и hysteria2 оставлены в типе, так как их всё

@@ -32,6 +32,10 @@ import {
   spawnNode,
   reinstallNode,
   renewNode,
+  updateNode,
+  listPools,
+  VPNNodeUpdateIn,
+  ServerPoolMini,
 } from "../api";
 import { HealthDots } from "../linkHealth";
 import { DiagnoseResult } from "../diagnoseResult";
@@ -610,7 +614,36 @@ export default function Nodes() {
     node_id: number;
     node_name: string;
   } | null>(null);
+  const [editNode, setEditNode] = useState<VPNNodeOut | null>(null);
   const qc = useQueryClient();
+
+  // Пулы для дропдауна правки ноды (id+name). Может быть пусто, если пулы
+  // ещё не заведены — тогда в форме только «— без пула —».
+  const pools = useQuery<ServerPoolMini[]>({
+    queryKey: ["pools"],
+    queryFn: listPools,
+  });
+
+  const updateNodeMut = useMutation({
+    mutationFn: ({ id, payload }: { id: number; payload: VPNNodeUpdateIn }) =>
+      updateNode(id, payload),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["nodes"] });
+      setEditNode(null);
+    },
+    onError: (e: Error) => {
+      const extra =
+        e instanceof ApiError && typeof e.detail === "string"
+          ? `\n\n${e.detail}`
+          : e instanceof ApiError &&
+              typeof e.detail === "object" &&
+              e.detail &&
+              "detail" in e.detail
+            ? `\n\n${(e.detail as { detail?: string }).detail}`
+            : "";
+      alert(`Не удалось сохранить: ${e.message}${extra}`);
+    },
+  });
 
   // Sync tracked ops from localStorage whenever the component mounts
   // or regains focus (navigate away → back). The storage event fires
@@ -1219,6 +1252,18 @@ export default function Nodes() {
         />
       )}
 
+      {editNode && (
+        <EditNodeModal
+          node={editNode}
+          pools={pools.data ?? []}
+          pending={updateNodeMut.isPending}
+          onCancel={() => setEditNode(null)}
+          onSubmit={(payload) =>
+            updateNodeMut.mutate({ id: editNode.id, payload })
+          }
+        />
+      )}
+
       {trackedOps.map((op) => (
         <OperationProgressBanner
           key={`${op.kind}-${op.nodeId}-${op.startedAt}`}
@@ -1498,6 +1543,13 @@ export default function Nodes() {
                         mutedUntil={n.alerts_muted_until}
                       />
                       <button
+                        onClick={() => setEditNode(n)}
+                        className="text-xs px-2 py-1 rounded bg-slate-700 hover:bg-slate-600"
+                        title="Править имя / регион / пул ноды (без re-bootstrap)"
+                      >
+                        ✎ правка
+                      </button>
+                      <button
                         disabled={refreshRealityDest.isPending}
                         onClick={() =>
                           setRefreshDestModal({ node_id: n.id, node_name: n.name })
@@ -1697,6 +1749,120 @@ function MigrateToModal({
 // активные подписки (revoke старого Device + cold reprovision нового).
 // Клиенты подхватят новый URI через sub-refresh (окно деградации 1-2
 // реконнекта). "auto" = _pick_reality_sni по пулу на бэке.
+
+function EditNodeModal({
+  node,
+  pools,
+  pending,
+  onCancel,
+  onSubmit,
+}: {
+  node: VPNNodeOut;
+  pools: ServerPoolMini[];
+  pending: boolean;
+  onCancel: () => void;
+  onSubmit: (payload: VPNNodeUpdateIn) => void;
+}) {
+  const [name, setName] = useState(node.name);
+  const [region, setRegion] = useState(node.region);
+  const [poolId, setPoolId] = useState<number | null>(node.pool_id);
+
+  const nameValid = /^[a-z0-9][a-z0-9-]{0,62}$/.test(name.trim());
+  const dirty =
+    name.trim() !== node.name ||
+    region.trim() !== node.region ||
+    poolId !== node.pool_id;
+
+  function submit() {
+    const payload: VPNNodeUpdateIn = {};
+    if (name.trim() !== node.name) payload.name = name.trim();
+    if (region.trim() !== node.region) payload.region = region.trim();
+    if (poolId !== node.pool_id) payload.pool_id = poolId;
+    onSubmit(payload);
+  }
+
+  return (
+    <div
+      className="fixed inset-0 bg-black/60 flex items-center justify-center z-50"
+      onClick={onCancel}
+    >
+      <div
+        className="bg-slate-800 border border-slate-700 rounded-lg p-6 max-w-lg w-full mx-4"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <h2 className="text-lg font-semibold mb-1">Править ноду #{node.id}</h2>
+        <p className="text-sm text-slate-400 mb-4">
+          Имя / регион / пул — <span className="font-semibold">без re-bootstrap</span>:
+          ansible коннектится по{" "}
+          <code className="font-mono">host={node.host}</code>, имя — это alias
+          инвентаря. host/ssh_port тут не меняются (это reinstall/renew).
+        </p>
+
+        <label className="block text-sm mb-1">Имя (inventory-хост)</label>
+        <input
+          className="w-full bg-slate-900 border border-slate-600 rounded px-2 py-1.5 mb-1 font-mono"
+          value={name}
+          onChange={(e) => setName(e.target.value)}
+          placeholder="ru-msk-01"
+        />
+        {!nameValid && (
+          <div className="text-xs text-amber-400 mb-2">
+            Только [a-z0-9-], начинается с буквы/цифры, до 63 символов (как
+            ru-pq-01).
+          </div>
+        )}
+
+        <label className="block text-sm mb-1 mt-2">
+          Регион (дисплей + фильтр choose_node)
+        </label>
+        <input
+          className="w-full bg-slate-900 border border-slate-600 rounded px-2 py-1.5 mb-3"
+          value={region}
+          onChange={(e) => setRegion(e.target.value)}
+          placeholder="ru-msk"
+        />
+
+        <label className="block text-sm mb-1">Пул</label>
+        <select
+          className="w-full bg-slate-900 border border-slate-600 rounded px-2 py-1.5 mb-4"
+          value={poolId ?? ""}
+          onChange={(e) =>
+            setPoolId(e.target.value === "" ? null : Number(e.target.value))
+          }
+        >
+          <option value="">— без пула —</option>
+          {pools.map((p) => (
+            <option key={p.id} value={p.id}>
+              #{p.id} · {p.name}
+            </option>
+          ))}
+        </select>
+        {pools.length === 0 && (
+          <div className="text-xs text-slate-500 -mt-3 mb-4">
+            Пулов нет — заведение пулов пока отдельно (вне этой формы).
+          </div>
+        )}
+
+        <div className="flex justify-end gap-2">
+          <button
+            className="px-3 py-1.5 rounded bg-slate-700 hover:bg-slate-600 text-sm"
+            onClick={onCancel}
+            disabled={pending}
+          >
+            Отмена
+          </button>
+          <button
+            className="px-3 py-1.5 rounded bg-indigo-700 hover:bg-indigo-600 text-sm disabled:opacity-50"
+            disabled={pending || !dirty || !nameValid || !region.trim()}
+            onClick={submit}
+          >
+            {pending ? "Сохраняем…" : "Сохранить"}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
 
 function RefreshRealityDestModal({
   nodeId,

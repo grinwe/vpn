@@ -1627,6 +1627,98 @@ def renew_node_route(
     return {"node_id": node.id, "renewed": True}
 
 
+@router.get("/pools", response_model=list[schemas.ServerPoolMini])
+def list_server_pools(
+    db: Session = Depends(get_db),
+    admin_token: str = Depends(require_admin),
+):
+    """Список пулов (id+name) — для дропдауна правки ноды."""
+    return [
+        schemas.ServerPoolMini(id=p.id, name=p.name)
+        for p in db.query(models.ServerPool).order_by(models.ServerPool.name).all()
+    ]
+
+
+@router.patch("/nodes/{node_id}", response_model=schemas.VPNNodeOut)
+def update_node(
+    node_id: int,
+    payload: schemas.VPNNodeUpdate,
+    db: Session = Depends(get_db),
+    admin_token: str = Depends(require_admin),
+    admin_actor: str | None = Header(default=None, alias=ADMIN_ACTOR_HEADER),
+):
+    """Править дисплейные/маршрутные поля ноды: name / region / pool_id / notes.
+
+    ``name`` валидируется как inventory-хост (``[a-z0-9][a-z0-9-]{0,62}``) и
+    проверяется на уникальность. Переименование БЕЗОПАСНО без re-bootstrap:
+    ``build_inventory_for_node`` рендерит name как alias, а ansible коннектится
+    по ``ansible_host=host`` — IP не меняется, развёрнутые клиенты не рвутся.
+    ``region``/``pool_id`` влияют только на будущий ``choose_node``; ``notes`` —
+    текст. ``host``/``ssh_port`` тут нельзя (identity у провайдера →
+    reinstall/renew). ``model_fields_set`` различает «не передано» и «=null».
+    """
+    from ..time_utils import utcnow
+
+    node = db.get(models.VPNNode, node_id)
+    if not node:
+        raise HTTPException(status_code=404, detail="Node not found")
+
+    fields = payload.model_fields_set
+    changed: list[str] = []
+
+    if "name" in fields and payload.name != node.name:
+        new_name = (payload.name or "").strip()
+        try:
+            validate_node_name(new_name)
+        except InvalidNodeIdentity as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        clash = (
+            db.query(models.VPNNode)
+            .filter(models.VPNNode.name == new_name, models.VPNNode.id != node.id)
+            .first()
+        )
+        if clash:
+            raise HTTPException(
+                status_code=409,
+                detail=f"Нода с именем '{new_name}' уже есть (#{clash.id})",
+            )
+        node.name = new_name
+        changed.append("name")
+
+    if "region" in fields and payload.region != node.region:
+        new_region = (payload.region or "").strip()
+        if not new_region:
+            raise HTTPException(status_code=400, detail="region не может быть пустым")
+        node.region = new_region
+        changed.append("region")
+
+    if "pool_id" in fields and payload.pool_id != node.pool_id:
+        if payload.pool_id is not None and not db.get(
+            models.ServerPool, payload.pool_id
+        ):
+            raise HTTPException(
+                status_code=400, detail=f"Пул #{payload.pool_id} не найден"
+            )
+        node.pool_id = payload.pool_id
+        changed.append("pool_id")
+
+    if "notes" in fields and payload.notes != node.notes:
+        node.notes = payload.notes
+        changed.append("notes")
+
+    if changed:
+        node.updated_at = utcnow()
+        db.add(node)
+        actor, actor_type = _resolve_admin_actor(admin_actor)
+        # _audit коммитит сам → флашит и правки ноды в той же транзакции.
+        _audit(
+            db, actor, "node_updated", "vpn_node", node.id,
+            actor_type=actor_type, metadata={"changed_fields": changed},
+        )
+        db.refresh(node)
+    return schemas.VPNNodeOut.from_orm(node)
+
+
 @router.delete("/nodes/{node_id}", status_code=200)
 def delete_node(
     node_id: int,

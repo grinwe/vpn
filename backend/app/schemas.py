@@ -198,6 +198,29 @@ class VPNNodeCreate(BaseModel):
     notes: str | None = None
 
 
+class VPNNodeUpdate(BaseModel):
+    """PATCH /nodes/{id} — правка дисплейных/маршрутных полей ноды.
+
+    Только безопасные поля: ``name`` (валидируется как inventory-хост;
+    переименование НЕ требует bootstrap — инвентарь рендерит name как alias,
+    ansible коннектится по ansible_host=host, IP не меняется), ``region``
+    (дисплей + фильтр choose_node), ``pool_id`` (членство в пуле), ``notes``.
+    ``host``/``ssh_port`` сюда НЕ входят — это identity у провайдера
+    (меняется через reinstall/renew). model_fields_set различает «не
+    передано» и «выставлено в null» (нужно для очистки pool_id).
+    """
+    name: str | None = None
+    region: str | None = None
+    pool_id: int | None = None
+    notes: str | None = None
+
+
+class ServerPoolMini(BaseModel):
+    """id+name пула для дропдауна правки ноды (GET /pools)."""
+    id: int
+    name: str
+
+
 class VPNNodeWithConfigsCreate(BaseModel):
     """Composite create-node-and-configs: за один запрос делаем INSERT
     ноды + N INSERT'ов VPN-конфигов + один общий bootstrap.
