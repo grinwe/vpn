@@ -15,6 +15,7 @@
 Сводные счётчики. Поллится раз в 15 секунд (`refetchInterval: 15_000`). Данные из `GET /api/stats`:
 
 - **Пользователи**: `users_total`, `subscriptions_active`/`subscriptions_total`, `devices_active`
+- **Активность за 24ч** (по РЕАЛЬНОМУ трафику): `users_active_24h` / `devices_active_24h` / `orphans_active_24h`. Считается из `NodeTrafficSample.details[*]["users"]` за 24ч — distinct `access_username` резолвится в `Credential→Device→User` (xray видит имя креда, не Device — поэтому считаем и вторичные устройства, не только праймари). Сироты (recovery-плейсхолдер `user_id=999999`, инцидент 2026-05) исключены из `users_active_24h` и показаны отдельной (жёлтой при >0) карточкой. Дороже остальных COUNT(*) — скан окна сэмплов + IN-join по индексированному `access_username`; ок для малого флота на 15с-поллинге.
 - **Ноды**: `nodes_total`, `nodes_active`, `nodes_down = total − active` (красная карточка, если > 0)
 - **Очередь / платежи**: `invoices_pending` (жёлтая, если > 0), `provisioning_tasks_pending`, `provisioning_tasks_failed` (красная, если > 0)
 

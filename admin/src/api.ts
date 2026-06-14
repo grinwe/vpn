@@ -484,6 +484,10 @@ export interface StatsOut {
   nodes_total: number;
   nodes_active: number;
   devices_active: number;
+  // «Активны за 24ч» по реальному трафику (NodeTrafficSample).
+  users_active_24h: number;
+  devices_active_24h: number;
+  orphans_active_24h: number;
   provisioning_tasks_pending: number;
   provisioning_tasks_failed: number;
 }

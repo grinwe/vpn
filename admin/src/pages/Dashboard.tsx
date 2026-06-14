@@ -62,6 +62,28 @@ export default function Dashboard() {
       </section>
 
       <section className="mb-6">
+        <h2 className="text-xs uppercase text-slate-400 mb-2">
+          Активность за 24ч{" "}
+          <span className="normal-case text-slate-500">
+            (по реальному трафику нод)
+          </span>
+        </h2>
+        <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+          <Card
+            title="Юзеры (24ч)"
+            value={data.users_active_24h}
+            tone="good"
+          />
+          <Card title="Устройства (24ч)" value={data.devices_active_24h} />
+          <Card
+            title="Сироты активны (24ч)"
+            value={data.orphans_active_24h}
+            tone={data.orphans_active_24h > 0 ? "warn" : "default"}
+          />
+        </div>
+      </section>
+
+      <section className="mb-6">
         <h2 className="text-xs uppercase text-slate-400 mb-2">Ноды</h2>
         <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
           <Card title="Всего" value={data.nodes_total} />

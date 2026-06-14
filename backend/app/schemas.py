@@ -972,6 +972,12 @@ class StatsOut(BaseModel):
     nodes_total: int
     nodes_active: int
     devices_active: int
+    # «Активны за 24ч» по реальному трафику (NodeTrafficSample) — distinct
+    # юзеры / устройства / активные сироты (recovery-плейсхолдер 999999).
+    # Дефолты 0 для обратной совместимости.
+    users_active_24h: int = 0
+    devices_active_24h: int = 0
+    orphans_active_24h: int = 0
     provisioning_tasks_pending: int
     provisioning_tasks_failed: int
 
