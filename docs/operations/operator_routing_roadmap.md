@@ -2,6 +2,8 @@
 
 Статус: **Phase 1 в работе.** Маршрутизация по оператору на основе сигнала, собранного из юзерского флоу «VPN не работает». Проб-SIM-ок **нет и не будет** (дорого/неэффективно/региональная дисперсия блоков) → краудсорс — **первичный** сигнал, не дополнение.
 
+> **2026-06: закрыт пробел сбора.** Раньше `OperatorNodeReport` писал ТОЛЬКО бот-флоу (`report-broken`), а webapp-кнопка «VPN не работает» (`/webapp/health-ping-report` → `_do_failover`) переселяла юзера, но репорт НЕ создавала → `operator_node_reports` пустела, матрица не строилась. Теперь `_do_failover` пишет репорт на КАЖДЫЙ user-reported failover (operator=None), а webapp после пересадки спрашивает оператора одним тапом (`POST /webapp/report-operator` → `report_id` из ответа health-ping-report) — зеркало бот-флоу. Watcher по `target_access_username` доводит outcome.
+
 > Связано: [data-model.md](../data-model.md) (`operator_node_reports`), `migrate-auto` + `NodeUserBan` (фундамент уже зашиплен), connection-tracking (`NodeTrafficSample.details["users"]`).
 
 ## Идея

@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { navigate } from "../router";
-import { reportVpnBroken } from "../api";
+import { reportVpnBroken, setReportOperator, VPN_OPERATORS } from "../api";
 
 interface Props {
   botUsername?: string;
@@ -10,7 +10,15 @@ interface Props {
 // как priority-сигнал для админов поверх плановых health-ping'ов бота.
 // Клиентский 5-мин cooldown после успешной отправки — сервер повторы
 // тоже принимает, но нет смысла плодить AuditLog одним тапом.
-type SelfReportState = "idle" | "pending" | "sent" | "error";
+// pick_operator — нас переселили на свободную ноду, спрашиваем оператора
+// (operator-routing P1, operator_routing_roadmap.md); operator_done — спасибо.
+type SelfReportState =
+  | "idle"
+  | "pending"
+  | "sent"
+  | "error"
+  | "pick_operator"
+  | "operator_done";
 
 const FAQ: { title: string; body: string }[] = [
   {
@@ -47,22 +55,49 @@ const FAQ: { title: string; body: string }[] = [
 export default function Help({ botUsername }: Props) {
   const [open, setOpen] = useState<number | null>(null);
   const [selfReportState, setSelfReportState] = useState<SelfReportState>("idle");
+  const [reportId, setReportId] = useState<number | null>(null);
 
   const supportUrl = botUsername
     ? `https://t.me/${botUsername}?start=support`
     : null;
 
   const handleReportBroken = async () => {
-    if (selfReportState === "pending" || selfReportState === "sent") return;
+    if (
+      selfReportState === "pending" ||
+      selfReportState === "sent" ||
+      selfReportState === "pick_operator"
+    )
+      return;
     setSelfReportState("pending");
     try {
-      await reportVpnBroken();
-      setSelfReportState("sent");
-      setTimeout(() => setSelfReportState("idle"), 5 * 60 * 1000);
+      const res = await reportVpnBroken();
+      if (res.migrated && res.report_id) {
+        // Нас переселили на свободную ноду → спрашиваем оператора (один тап).
+        setReportId(res.report_id);
+        setSelfReportState("pick_operator");
+      } else {
+        setSelfReportState("sent");
+        setTimeout(() => setSelfReportState("idle"), 5 * 60 * 1000);
+      }
     } catch (err) {
       console.error("reportVpnBroken failed", err);
       setSelfReportState("error");
       setTimeout(() => setSelfReportState("idle"), 5000);
+    }
+  };
+
+  const handlePickOperator = async (operator: string) => {
+    const rid = reportId;
+    // Сразу переводим в «спасибо» — выбор оператора best-effort, не блокируем
+    // юзера, если запрос не дойдёт (карьер — advisory-сигнал для матрицы).
+    setSelfReportState("operator_done");
+    setReportId(null);
+    setTimeout(() => setSelfReportState("idle"), 5 * 60 * 1000);
+    if (rid == null) return;
+    try {
+      await setReportOperator(rid, operator);
+    } catch (err) {
+      console.error("setReportOperator failed", err);
     }
   };
 
@@ -126,22 +161,50 @@ export default function Help({ botUsername }: Props) {
           ткнул сам». Намеренно без красного — на Home.tsx эта кнопка
           читалась как «сервис сломан», что путало. */}
       <div className="pt-2">
-        <button
-          onClick={handleReportBroken}
-          disabled={
-            selfReportState === "pending" || selfReportState === "sent"
-          }
-          className="w-full py-2 rounded-lg text-sm text-tg-hint border border-white/10 hover:bg-white/5 disabled:opacity-60 transition-colors"
-        >
-          {selfReportState === "pending" && "Отправляем..."}
-          {selfReportState === "sent" && "✓ Жалоба отправлена — админы смотрят"}
-          {selfReportState === "error" && "Не удалось отправить, попробуй позже"}
-          {selfReportState === "idle" && "Сообщить, что VPN сейчас не работает"}
-        </button>
-        <p className="text-tg-hint text-xs mt-2">
-          Кнопка отправит маячок админам с номером твоей подписки и ноды.
-          Это не замена поддержке — для диалога используй кнопку выше.
-        </p>
+        {selfReportState === "pick_operator" ? (
+          <div className="space-y-2">
+            <p className="text-sm">
+              🔄 Поменяли тебе сервер. Попробуй подключиться через пару минут.
+            </p>
+            <p className="text-tg-hint text-xs">
+              Через какой интернет сейчас выходишь? Поможет нам понять, где
+              блокируют (один тап, по желанию).
+            </p>
+            <div className="grid grid-cols-2 gap-2">
+              {VPN_OPERATORS.map((op) => (
+                <button
+                  key={op.value}
+                  onClick={() => handlePickOperator(op.value)}
+                  className="py-2 rounded-lg text-sm border border-white/10 hover:bg-white/5 transition-colors"
+                >
+                  {op.label}
+                </button>
+              ))}
+            </div>
+          </div>
+        ) : (
+          <>
+            <button
+              onClick={handleReportBroken}
+              disabled={selfReportState === "pending"}
+              className="w-full py-2 rounded-lg text-sm text-tg-hint border border-white/10 hover:bg-white/5 disabled:opacity-60 transition-colors"
+            >
+              {selfReportState === "pending" && "Отправляем..."}
+              {selfReportState === "operator_done" &&
+                "✓ Спасибо! Проверяй подключение"}
+              {selfReportState === "sent" &&
+                "✓ Жалоба отправлена — админы смотрят"}
+              {selfReportState === "error" &&
+                "Не удалось отправить, попробуй позже"}
+              {selfReportState === "idle" &&
+                "Сообщить, что VPN сейчас не работает"}
+            </button>
+            <p className="text-tg-hint text-xs mt-2">
+              Кнопка переселит тебя на свободный сервер и пошлёт маячок админам.
+              Это не замена поддержке — для диалога используй кнопку выше.
+            </p>
+          </>
+        )}
       </div>
     </div>
   );

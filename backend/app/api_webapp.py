@@ -1763,6 +1763,12 @@ class HealthPingReportResponse(BaseModel):
     ok: bool
     subscription_id: int | None
     node_id: int | None
+    # operator-routing P1 (operator_routing_roadmap.md): если юзера переселили,
+    # отдаём report_id + инфо о новой ноде, чтобы webapp показал «поменяли
+    # сервер» и спросил мобильного оператора (POST /webapp/report-operator).
+    migrated: bool = False
+    report_id: int | None = None
+    target_node_name: str | None = None
 
 
 @webapp_router.post("/health-ping-report", response_model=HealthPingReportResponse)
@@ -1815,11 +1821,21 @@ def webapp_health_ping_report(
     # подписку»: переселяем на свободную ноду + БАНИМ проблемную для него +
     # краудсорс-эскалация «плохости» ноды. _do_failover сам throttle'ит
     # (5 мин/sub). Best-effort — не ломаем user-facing ответ.
+    migrated = False
+    report_id: int | None = None
+    target_node_name: str | None = None
     if sub is not None:
         from .api.client_control import _do_failover
 
         try:
-            _do_failover(db, sub, kind="user_reported", actor=f"user:{user.id}")
+            res = _do_failover(db, sub, kind="user_reported", actor=f"user:{user.id}")
+            if res.action == "migrated":
+                # _do_failover уже закоммитил миграцию + OperatorNodeReport
+                # (через внутренний _audit). Прокидываем report_id наверх,
+                # чтобы webapp одним тапом проставил оператора.
+                migrated = True
+                report_id = res.report_id
+                target_node_name = res.target_node_name
         except Exception:  # noqa: BLE001
             # Roll back a mid-migration failure so the trailing db.commit()
             # can't flush a half-migrated sub (inner commits already persisted
@@ -1831,4 +1847,37 @@ def webapp_health_ping_report(
             )
 
     db.commit()
-    return HealthPingReportResponse(ok=True, subscription_id=sub_id, node_id=node_id)
+    return HealthPingReportResponse(
+        ok=True,
+        subscription_id=sub_id,
+        node_id=node_id,
+        migrated=migrated,
+        report_id=report_id,
+        target_node_name=target_node_name,
+    )
+
+
+class WebappSetOperatorRequest(BaseModel):
+    report_id: int
+    operator: str
+
+
+@webapp_router.post("/report-operator")
+def webapp_set_operator(
+    body: WebappSetOperatorRequest,
+    user: models.User = Depends(require_webapp_user),
+    db: Session = Depends(get_db),
+):
+    """Юзер выбрал свой мобильный оператор после «VPN не работает» →
+    проставляем его на OperatorNodeReport (operator-routing P1, см.
+    operator_routing_roadmap.md). Репорт обязан принадлежать ЭТОМУ юзеру
+    (anti-forge: чужой report_id не прокатит). Карьер вне таксономии → unknown.
+    """
+    from .api.client_control import _OPERATORS
+
+    report = db.get(models.OperatorNodeReport, body.report_id)
+    if report is None or report.user_id != user.id:
+        raise HTTPException(status_code=404, detail="Report not found")
+    report.operator = body.operator if body.operator in _OPERATORS else "unknown"
+    db.commit()
+    return {"report_id": report.id, "operator": report.operator}

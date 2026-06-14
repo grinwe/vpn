@@ -358,11 +358,34 @@ export interface HealthPingReportResponse {
   ok: boolean;
   subscription_id: number | null;
   node_id: number | null;
+  // operator-routing P1: если переселили — id репорта + новая нода, чтобы
+  // спросить оператора одним тапом.
+  migrated?: boolean;
+  report_id?: number | null;
+  target_node_name?: string | null;
 }
 
 export async function reportVpnBroken() {
   return request<HealthPingReportResponse>(
     "/api/webapp/health-ping-report",
     { method: "POST" },
+  );
+}
+
+// Мобильные операторы (таксономия operator_routing_roadmap.md). value идёт
+// на бэк, label показываем юзеру.
+export const VPN_OPERATORS: { value: string; label: string }[] = [
+  { value: "mts", label: "МТС" },
+  { value: "beeline", label: "Билайн" },
+  { value: "megafon", label: "МегаФон" },
+  { value: "tele2", label: "Tele2" },
+  { value: "home_wifi", label: "Домашний Wi-Fi" },
+  { value: "other", label: "Другое" },
+];
+
+export async function setReportOperator(reportId: number, operator: string) {
+  return request<{ report_id: number; operator: string }>(
+    "/api/webapp/report-operator",
+    { method: "POST", body: JSON.stringify({ report_id: reportId, operator }) },
   );
 }

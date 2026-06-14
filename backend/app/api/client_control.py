@@ -120,6 +120,10 @@ class ReportFailureResponse(BaseModel):
     target_node_id: int | None = None
     target_node_name: str | None = None
     task_id: int | None = None
+    # ID созданного OperatorNodeReport (operator-routing P1). Клиент его
+    # возвращает в set-operator, чтобы привязать выбранный карьер. NULL если
+    # миграции не было (throttled / no_target / inactive — репорт не пишем).
+    report_id: int | None = None
     # Action taken — для клиента UX и для отладки. Возможные:
     # "migrated" / "no_target_available" / "throttled" / "subscription_inactive".
     action: str
@@ -366,7 +370,7 @@ def _do_failover(
         # disable-флаги и NodeUserBan этого юзера), мигрирует с сохранением
         # sub_token и АВТО-БАНИТ старую ноду для юзера (NodeUserBan) — чтобы
         # auto-pick больше не вернул его на проблемную ноду.
-        new_node, _new_device, task, banned_old = (
+        new_node, new_device, task, banned_old = (
             orchestrator.migrate_subscription_to_free_node(sub, banned_by=actor)
         )
         task_id = task.id if task else None
@@ -401,6 +405,29 @@ def _do_failover(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"migration failed: {exc}",
         ) from exc
+
+    # Operator-routing P1 (см. docs/operations/operator_routing_roadmap.md):
+    # КАЖДЫЙ user-reported failover пишет OperatorNodeReport — зеркало бот-флоу
+    # report-broken. operator=None: webapp/self-report не знает карьера, он
+    # проставляется отдельным тапом (set-operator). Watcher по
+    # target_access_username на target-ноде определит outcome → матрица. Раньше
+    # репорт писал ТОЛЬКО бот, а webapp-путь (_do_failover) — нет, поэтому
+    # operator_node_reports пустела и карта оператор×нода не строилась.
+    report = models.OperatorNodeReport(
+        user_id=sub.user_id,
+        subscription_id=sub.id,
+        device_id=new_device.id if new_device else None,
+        operator=None,
+        failed_node_id=old_node_id,
+        target_node_id=new_node.id,
+        target_access_username=(
+            new_device.access_username if new_device else None
+        ),
+        outcome="pending",
+    )
+    db.add(report)
+    db.flush()  # нужен report.id для ответа (set-operator привяжется к нему)
+    report_id = report.id
 
     _audit(
         db,
@@ -440,6 +467,7 @@ def _do_failover(
         target_node_id=new_node.id,
         target_node_name=new_node.name,
         task_id=task_id,
+        report_id=report_id,
         action="migrated",
     )
 
