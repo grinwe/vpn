@@ -1,7 +1,9 @@
 """VDSina cloud driver.
 
 Mirrors :mod:`fourvps` / :mod:`hetzner`. Talks raw HTTP to the VDSina public
-API (https://userapi.vdsina.ru/v1). Спека сверена по двум независимым community-
+API. ВАЖНО: vdsina.com и vdsina.ru — РАЗНЫЕ API-инсталляции, токен доменно-
+специфичен; дефолт ``.com`` (наш аккаунт там), override env ``VDSINA_API_BASE``.
+Спека сверена по двум независимым community-
 клиентам (scinfra-pro/terraform-provider-vdsina, hugmouse/go-vdsina) + офиц. PDF
 (vdsina.ru/files/docs/public_api.pdf), 2026-06-12.
 
@@ -28,6 +30,7 @@ API (https://userapi.vdsina.ru/v1). Спека сверена по двум не
 from __future__ import annotations
 
 import logging
+import os
 import time
 from typing import Any
 
@@ -37,7 +40,11 @@ from .base import CloudServer, DriverError
 
 logger = logging.getLogger(__name__)
 
-_BASE = "https://userapi.vdsina.ru/v1"
+# VDSina .ru и .com — РАЗНЫЕ инсталляции публичного API; постоянный токен из
+# панели валиден ТОЛЬКО на своём домене (токен из cp.vdsina.com на .ru даёт
+# 401 "Incorrect token", проверено 2026-06-15). Наш аккаунт на .com → дефолт
+# .com. Override через env VDSINA_API_BASE, если появится .ru-аккаунт.
+_BASE = os.getenv("VDSINA_API_BASE", "https://userapi.vdsina.com/v1").rstrip("/")
 _TIMEOUT = 30
 _POLL_TIMEOUT = 600
 _POLL_INTERVAL = 8

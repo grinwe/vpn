@@ -41,8 +41,8 @@
 
 ### Второй провайдер — VDSina ✅ (driver, 2026-06-12)
 `services/cloud/vdsina.py` (`CloudProviderKind.vdsina`, миграция `0048`, ветка в
-`get_driver`, kind в `CloudProviders.tsx`). Custom REST `userapi.vdsina.ru/v1`,
-**auth — ГОЛЫЙ `Authorization: <token>` (без Bearer!)**, конверт
+`get_driver`, kind в `CloudProviders.tsx`). Custom REST `userapi.vdsina.com/v1`
+(дефолт; override env `VDSINA_API_BASE`), **auth — ГОЛЫЙ `Authorization: <token>` (без Bearer!)**, конверт
 `{status,status_msg,data}` (пустой список = `status:error`+`"No X information"` →
 трактуем как `[]`). Async order→poll как 4vps: `order_server` (POST /server,
 дефисные `server-plan`/`ssh-key`) → `wait_for_ipv4` (poll GET /server/{id} до
@@ -59,11 +59,18 @@ provisioning-pubkey на VDSina (`_ensure_key_id`: ищет ssh-key по име�
 валидируем ДО оплаты (fast-fail на строковом `ubuntu-22.04`-дефолте). Имя==value==
 "vdsina" (рассинхрона 0046 нет). Спека сверена по двум community-клиентам + офиц.
 PDF; драйвер прошёл 3-линзовый адверсариал-ревью (no-key майоры устранены авто-ключом).
+**Токен (2026-06-15):** НЕ через `POST /v1/auth` (email+пароль) — он **deprecated**
+(`Method deprecated`, data null). Берётся **постоянный токен из панели**
+(`cp.vdsina.com` → Пользователь → «Токен для доступа через публичный API», все права).
+**ДОМЕН КРИТИЧЕН:** токен из `.com`-аккаунта на `.ru`-эндпоинте даёт `401 "Incorrect
+token"` — это и был баг (драйвер хардкодил `.ru`). Дефолт теперь `.com`, аккаунт
+adept38 там; баланс через `.com` подтверждён (`real: 9.79`).
+
 **Боевой smoke (нужен токен+баланс):** завести `CloudProvider(kind=vdsina,
-api_token=<token>)` (ssh-ключ авто-зарегается при первом заказе, если воркеру
-примонтирован `ANSIBLE_PRIVATE_KEY_FILE`) → offerings → заказать тест-ноду (числовые
-id ДЦ/тариф/ОС из offerings) → `active` → снести. NB: их API (`userapi.vdsina.ru`)
-исторически штормит (видели полный 504 на их гейтвее) — на автоскейл одних не сажать.
+api_token=<постоянный токен из cp.vdsina.com>)` (ssh-ключ авто-зарегается при первом
+заказе, если воркеру примонтирован `ANSIBLE_PRIVATE_KEY_FILE`) → offerings → заказать
+тест-ноду (числовые id ДЦ/тариф/ОС из offerings) → `active` → снести. NB: VDSina
+исторически штормит (видели полный 504) — на автоскейл одних не сажать, пара к 4vps.
 
 ### Третий провайдер — generic BILLmanager ✅ (driver, 2026-06-12)
 `services/cloud/billmgr.py` (`CloudProviderKind.billmgr`, миграция `0049`, ветка в
