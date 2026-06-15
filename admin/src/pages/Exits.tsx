@@ -380,8 +380,9 @@ export default function Exits() {
                         <button
                           onClick={() => { setEditId(e.id); setShowForm(true); }}
                           className="text-xs px-2 py-1 rounded bg-blue-700 hover:bg-blue-600"
+                          title="Править имя / регион / host / WG-параметры exit-ноды"
                         >
-                          edit
+                          ✎ правка
                         </button>
                         <button
                           disabled={keygenMut.isPending}
