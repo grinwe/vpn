@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import time
 from typing import Any
 
@@ -50,6 +51,13 @@ _POLL_TIMEOUT = 600
 _POLL_INTERVAL = 8
 # Имя, под которым авто-регистрируем наш provisioning-pubkey в VDSina (идемпотентно).
 _KEY_NAME = "vpn-provisioning"
+# VDSina валидирует ``host`` как ДОМЕННОЕ имя (FQDN с реальным TLD), а не
+# свободный лейбл — голое имя ноды («vdsina-ru-01») даёт
+# "hostname must be a valid domain name" (проверено 2026-06-15). Синтезируем
+# валидный FQDN из имени; хостнейм всё равно перетрёт bootstrap_node, поле чисто
+# для прохождения валидации. Домен override через env (дефолт — RFC-2606
+# example.com: реальный TLD .com проходит валидатор, никуда не резолвится).
+_HOST_DOMAIN = os.getenv("VDSINA_HOST_DOMAIN", "example.com")
 
 
 class VdsinaDriver:
@@ -121,7 +129,9 @@ class VdsinaDriver:
             "server-plan": sp,
             "template": tpl,
             "name": name,
-            "host": name,
+            # host — отдельное поле, VDSina валидирует его как FQDN (см.
+            # _HOST_DOMAIN). name остаётся свободным лейблом для панели.
+            "host": _hostname_fqdn(name),
             "ssh-key": key_id,
             # ip4 — кол-во IPv4 (обязательное, иначе "Validation Error" без
             # деталей). Сверено по офиц. PDF + terraform-провайдеру: без него
@@ -386,6 +396,14 @@ class VdsinaDriver:
         if err_data:
             detail = f"{detail} (data={err_data})"
         raise DriverError(f"VDSina {method} {path}: {detail}")
+
+
+def _hostname_fqdn(name: str) -> str:
+    """Валидный FQDN для поля ``host`` VDSina (требует домен, не лейбл).
+    Санитизируем имя ноды в hostname-лейбл и вешаем _HOST_DOMAIN."""
+    label = re.sub(r"[^a-z0-9-]+", "-", (name or "node").lower())
+    label = re.sub(r"-{2,}", "-", label).strip("-")[:63].strip("-")
+    return f"{label or 'node'}.{_HOST_DOMAIN}"
 
 
 def _to_int(v: Any) -> int | None:
