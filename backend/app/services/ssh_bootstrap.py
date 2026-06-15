@@ -32,7 +32,13 @@ def provisioning_pubkey() -> str | None:
 
     Сначала ``<key>.pub`` (если лежит рядом — не требует passphrase), затем
     дерив из приватного файла через paramiko (для passphrase-less ключа)."""
-    key_path = os.getenv("ANSIBLE_PRIVATE_KEY_FILE")
+    # env.j2 прокидывает путь как PROVISIONING_SSH_KEY (не ANSIBLE_PRIVATE_KEY_FILE)
+    # — даём тот же fallback, что diagnostics/traffic_stats/relay_link_health/
+    # subscriptions. Без него VDSina-spawn падал: _ensure_key_id не мог достать
+    # pubkey для авто-регистрации ключа на боксе (ssh-ключ не задан → 400).
+    key_path = os.getenv("ANSIBLE_PRIVATE_KEY_FILE") or os.getenv(
+        "PROVISIONING_SSH_KEY"
+    )
     if not key_path:
         return None
     pub_path = f"{key_path}.pub"
