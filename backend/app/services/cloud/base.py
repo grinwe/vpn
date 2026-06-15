@@ -142,14 +142,18 @@ def get_driver(provider: models.CloudProvider) -> CloudDriver:
             raise DriverError("4vps provider has no API token configured")
         return FourVpsDriver(token=token)
 
-    if kind == "vdsina":
+    if kind in ("vdsina", "vdsina_ru"):
         from .vdsina import VdsinaDriver
 
         if not token:
             raise DriverError("VDSina provider has no API token configured")
-        # ssh_key_ids нужны reinstall'у (его сигнатура их не получает) — чтобы
-        # переинжектить наш ключ при ротации ОС.
-        return VdsinaDriver(token=token, ssh_key_ids=provider.ssh_key_ids or [])
+        # vdsina = .com (драйверный дефолт _BASE), vdsina_ru = .ru-инсталляция.
+        # Токен доменно-специфичен (см. vdsina.py). ssh_key_ids нужны reinstall'у
+        # (его сигнатура их не получает) — переинжектить наш ключ при ротации ОС.
+        base = "https://userapi.vdsina.ru/v1" if kind == "vdsina_ru" else None
+        return VdsinaDriver(
+            token=token, ssh_key_ids=provider.ssh_key_ids or [], base=base
+        )
 
     if kind == "billmgr":
         from .billmgr import BillmgrDriver

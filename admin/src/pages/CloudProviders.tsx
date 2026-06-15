@@ -14,7 +14,7 @@ interface CloudProviderOut {
   created_at: string;
 }
 
-const KINDS = ["hetzner", "vultr", "digitalocean", "aeza", "4vps", "vdsina", "billmgr", "manual"] as const;
+const KINDS = ["hetzner", "vultr", "digitalocean", "aeza", "4vps", "vdsina", "vdsina_ru", "billmgr", "manual"] as const;
 
 export default function CloudProviders() {
   const qc = useQueryClient();
@@ -211,6 +211,16 @@ function ProviderForm({
             <code>https://bill.ufo.hosting/billmgr</code> + логин/пароль от ЛК.
             datacenter/pricelist/ostempl — числовые id из формы заказа. Стартовый
             хостер — UFO (его API доступен скриптам; DataCheap/AdminVPS режут DC-IP).
+          </span>
+        )}
+        {(kind === "vdsina" || kind === "vdsina_ru") && (
+          <span className="text-[10px] text-amber-400 mt-1">
+            VDSina: токен — <b>постоянный</b> из панели (Пользователь → «Токен для
+            доступа через публичный API»), НЕ через email/пароль (deprecated).{" "}
+            <b>Домен критичен:</b> <code>vdsina</code> = аккаунт на{" "}
+            <code>vdsina.com</code>, <code>vdsina_ru</code> = на{" "}
+            <code>vdsina.ru</code> — это РАЗНЫЕ аккаунты/токены/балансы; токен с
+            чужого домена даёт 401. Заводи отдельный провайдер на каждый домен.
           </span>
         )}
       </label>

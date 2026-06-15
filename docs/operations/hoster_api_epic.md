@@ -41,8 +41,11 @@
 
 ### Второй провайдер — VDSina ✅ (driver, 2026-06-12)
 `services/cloud/vdsina.py` (`CloudProviderKind.vdsina`, миграция `0048`, ветка в
-`get_driver`, kind в `CloudProviders.tsx`). Custom REST `userapi.vdsina.com/v1`
-(дефолт; override env `VDSINA_API_BASE`), **auth — ГОЛЫЙ `Authorization: <token>` (без Bearer!)**, конверт
+`get_driver`, kind в `CloudProviders.tsx`). **ДВЕ разновидности (один драйвер,
+param `base`):** `kind=vdsina` → `userapi.vdsina.com/v1` (дефолт `_BASE`, override
+env `VDSINA_API_BASE`), `kind=vdsina_ru` → `userapi.vdsina.ru/v1` (миграция 0051).
+.ru и .com — разные аккаунты/токены/балансы; токен доменно-специфичен. Заводи
+отдельный `CloudProvider` на каждый домен. **auth — ГОЛЫЙ `Authorization: <token>` (без Bearer!)**, конверт
 `{status,status_msg,data}` (пустой список = `status:error`+`"No X information"` →
 трактуем как `[]`). Async order→poll как 4vps: `order_server` (POST /server,
 дефисные `server-plan`/`ssh-key`) → `wait_for_ipv4` (poll GET /server/{id} до

@@ -124,9 +124,13 @@ class CloudProviderKind(str, enum.Enum):
     # а не '4vps'.
     fourvps = "4vps"
     # VDSina — RU/EU-хостер. Имя == value == "vdsina" (нет рассинхрона как у 4vps),
-    # поэтому PG-enum label тоже "vdsina" (см. миграция 0048). Custom REST API
-    # (userapi.vdsina.ru), инжектит ssh-ключ → как hetzner, без парольного bootstrap.
+    # PG-enum label "vdsina" (миграция 0048). Custom REST API, инжектит ssh-ключ →
+    # как hetzner, без парольного bootstrap. ``vdsina`` = .com-инсталляция
+    # (userapi.vdsina.com); ``vdsina_ru`` ниже = .ru (другой токен/баланс/домен).
     vdsina = "vdsina"
+    # Отдельная .ru-инсталляция VDSina — тот же драйвер, base → userapi.vdsina.ru
+    # (см. get_driver). Токен .ru-аккаунта на .com даёт 401 и наоборот. Миграция 0051.
+    vdsina_ru = "vdsina_ru"
     # ISPsystem BILLmanager — ОДИН generic-драйвер на пачку RU-хостеров (DataCheap/
     # UFO/AdminVPS), конкретный хост+креды в api_token_enc как JSON
     # {base_url,username,password}. Имя==value=="billmgr" (см. миграция 0049).

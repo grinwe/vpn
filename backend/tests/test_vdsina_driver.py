@@ -255,3 +255,18 @@ def test_error_envelope_raises_on_money_path():
     d = _driver(lambda *a, **k: _Resp(_err("Invalid token")))
     with pytest.raises(DriverError, match="Invalid token"):
         d.get_balance()
+
+
+def test_base_defaults_com_and_ru_override():
+    """vdsina = .com (драйверный дефолт), vdsina_ru → base=.ru (get_driver)."""
+    from app.services.cloud.vdsina import _BASE
+
+    # дефолт (kind=vdsina) — модульный _BASE (.com, если не переопределён env)
+    assert VdsinaDriver(token="t")._base == _BASE
+    # явный base (kind=vdsina_ru из get_driver) — .ru-инсталляция
+    assert (
+        VdsinaDriver(token="t", base="https://userapi.vdsina.ru/v1")._base
+        == "https://userapi.vdsina.ru/v1"
+    )
+    # трейлинг-слеш срезается (склейка f"{base}{path}" не должна давать //)
+    assert VdsinaDriver(token="t", base="https://x/v1/")._base == "https://x/v1"

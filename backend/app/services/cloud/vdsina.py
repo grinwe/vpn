@@ -55,10 +55,18 @@ _KEY_NAME = "vpn-provisioning"
 class VdsinaDriver:
     kind = "vdsina"
 
-    def __init__(self, token: str, ssh_key_ids: list | None = None) -> None:
+    def __init__(
+        self,
+        token: str,
+        ssh_key_ids: list | None = None,
+        base: str | None = None,
+    ) -> None:
         token = (token or "").strip()
         if not token:
             raise DriverError("VDSina provider has no API token configured")
+        # API-инсталляция: .com (дефолт _BASE) или .ru (kind=vdsina_ru, base из
+        # get_driver). Токен валиден только на своём домене.
+        self._base = (base or _BASE).rstrip("/")
         # явный ключ провайдера; иначе авто-регистрируем (см. _ensure_key_id).
         self._ssh_key_id = _first_int(ssh_key_ids)
         self._session = requests.Session()
@@ -344,7 +352,7 @@ class VdsinaDriver:
     def _call(self, method: str, path: str, body: dict | None) -> Any:
         try:
             resp = self._session.request(
-                method, f"{_BASE}{path}", json=body, timeout=_TIMEOUT
+                method, f"{self._base}{path}", json=body, timeout=_TIMEOUT
             )
         except requests.RequestException as exc:
             raise DriverError(f"VDSina {method} {path} failed: {exc}") from exc
