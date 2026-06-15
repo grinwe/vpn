@@ -371,8 +371,12 @@ class VdsinaDriver:
         # status != "ok": реальная ошибка ИЛИ пустой список ("No X information").
         # Не угадываем по тексту — поднимаем; offerings-методы (list_*) ловят и
         # дегрейдят в []. Денежные пути (order/create/balance) ошибку увидят.
-        msg = payload.get("status_msg") or payload
-        raise DriverError(f"VDSina {method} {path}: {msg}")
+        # VDSina кладёт КОНКРЕТИКУ в ``description`` (status_msg часто generic
+        # «Bad Request»/«Unauthorized») — сёрфим оба, иначе причина теряется.
+        msg = payload.get("status_msg") or ""
+        desc = payload.get("description")
+        detail = f"{msg}: {desc}" if desc else (msg or str(payload))
+        raise DriverError(f"VDSina {method} {path}: {detail}")
 
 
 def _to_int(v: Any) -> int | None:
