@@ -802,8 +802,10 @@ async def health_ping_response(callback_query: types.CallbackQuery):
 async def self_report_vpn_broken(message: types.Message) -> None:
     # Operator-aware routing P1: тап → бэкенд авто-мигрирует на свободную
     # ноду (+бан старой) и заводит OperatorNodeReport → спрашиваем оператора
-    # одним тапом. «Всё равно не работает» → поддержка. Watcher через 15м
-    # проставит исход по факту переподключения.
+    # одним тапом. Через 15м (_STILL_BROKEN_DELAY_S), если бэкенд НЕ видит
+    # переподключения по трафику, шлём условный нудж «всё ещё не работает?»
+    # → поддержка. Исход для операторской матрицы отдельно проставляет
+    # backend-watcher (resolve_pending_reports, окно ~10м).
     tg_id = message.from_user.id
     now_mono = asyncio.get_event_loop().time()
     last = _self_report_last.get(tg_id)
@@ -871,7 +873,11 @@ async def self_report_vpn_broken(message: types.Message) -> None:
 # «Всё равно не работает» показываем не сразу, а через этот делей — даём
 # юзеру время переподключиться. Через делей дёргаем бэк: если он ВИДИТ
 # переподключение — молчим; если нет — присылаем пуш с этой кнопкой.
-_STILL_BROKEN_DELAY_S = 300
+# 15 мин (а не 5): делей ДОЛЖЕН быть заметно больше TRAFFIC_STATS_INTERVAL
+# (300с) — иначе к моменту проверки между жалобой и now может не лечь ни
+# одного traffic-сэмпла → reconnected=False у реально переподключившегося →
+# ложный пуш. За 15м ложится 2-3 сэмпла, переподключение видно надёжно.
+_STILL_BROKEN_DELAY_S = 900
 
 
 def _still_broken_keyboard(report_id: int) -> types.InlineKeyboardMarkup:
@@ -918,6 +924,18 @@ async def _delayed_still_broken_prompt(bot, chat_id: int, report_id: int) -> Non
         )
 
 
+# value → человекочитаемый ярлык для ответа юзеру (value стабилен, уходит в
+# бэкенд). Держим в синхроне с кнопками operator_keyboard и webapp/api.ts.
+_OPERATOR_LABELS = {
+    "mts": "МТС",
+    "beeline": "Билайн",
+    "megafon": "МегаФон (Yota)",
+    "tele2": "Tele2 (Т-Мобайл)",
+    "home_wifi": "домашний интернет / Wi-Fi",
+    "other": "другой провайдер",
+}
+
+
 def operator_keyboard(report_id: int) -> types.InlineKeyboardMarkup:
     """Выбор оператора после авто-миграции (operator-aware routing P1).
 
@@ -933,7 +951,10 @@ def operator_keyboard(report_id: int) -> types.InlineKeyboardMarkup:
     return types.InlineKeyboardMarkup(
         inline_keyboard=[
             [_b("МТС", "mts"), _b("Билайн", "beeline")],
-            [_b("МегаФон", "megafon"), _b("Tele2", "tele2")],
+            # Yota — MVNO на сети МегаФона, Т-Мобайл (бывш. Tinkoff) — на сети
+            # Tele2: их юзеры не находили себя в списке (см. «Йота в сделку не
+            # входила») и уходили в «Другое», теряя точность роутинга. Подписываем.
+            [_b("МегаФон (Yota)", "megafon"), _b("Tele2 (Т-Мобайл)", "tele2")],
             [_b("🏠 Домашний/WiFi", "home_wifi"), _b("Другое", "other")],
         ]
     )
@@ -986,13 +1007,21 @@ async def operator_choice(callback_query: types.CallbackQuery) -> None:
         )
     except aiohttp.ClientError:
         pass
-    await callback_query.answer("Спасибо! 🙏")
+    await callback_query.answer()
     # Операторскую клавиатуру убираем. «Всё равно не работает» придёт
     # отдельным сообщением через делей (_delayed_still_broken_prompt).
     try:
         await callback_query.message.edit_reply_markup(reply_markup=None)
     except Exception:  # noqa: BLE001
         pass
+    # callback_query.answer(text) — это эфемерный тост, юзер его не видит в
+    # чате («а мне не ответили ничего»). Отвечаем настоящим сообщением: он
+    # подсказал нам сеть — подтверждаем, что услышали.
+    label = _OPERATOR_LABELS.get(operator, "твоя сеть")
+    await callback_query.message.answer(
+        f"Понял — у тебя {label}. Спасибо, что подсказал! 🙏 Учтём, чтобы "
+        f"быстрее ловить блокировки на твоей сети.",
+    )
 
 
 def health_ping_keyboard(sub_id: int | None) -> types.InlineKeyboardMarkup:

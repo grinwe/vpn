@@ -377,8 +377,10 @@ export async function reportVpnBroken() {
 export const VPN_OPERATORS: { value: string; label: string }[] = [
   { value: "mts", label: "МТС" },
   { value: "beeline", label: "Билайн" },
-  { value: "megafon", label: "МегаФон" },
-  { value: "tele2", label: "Tele2" },
+  // Yota — MVNO на сети МегаФона, Т-Мобайл (бывш. Tinkoff) — на сети Tele2:
+  // подписываем в скобках, чтобы их юзеры находили себя (синхрон с ботом).
+  { value: "megafon", label: "МегаФон (Yota)" },
+  { value: "tele2", label: "Tele2 (Т-Мобайл)" },
   { value: "home_wifi", label: "Домашний Wi-Fi" },
   { value: "other", label: "Другое" },
 ];
