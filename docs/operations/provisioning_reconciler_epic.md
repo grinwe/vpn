@@ -1,12 +1,11 @@
 # EPIC: Provisioning reconciler — от «задача-на-действие» к desired-state convergence
 
-**Статус:** Phase 0 ✅ · Phase 1 ✅ · Phase 2+3 ✅ собраны, отревьюены
-(адверс-ревью: 1 CRIT + 6 HIGH закрыты) и **проброшены через ansible** —
-`RECONCILER_ENABLED` включён в `group_vars/web/main.yml`, раскатывается
-ближайшим деплоем (role-default остаётся OFF) · Phase 4 ⏳ частично
-(cap+ordering, backoff — есть; diff-skip, стриминг ansible, reconciler'ы
-exit/relay — deferred, см. ниже) · **Создан:** 2026-06-08 · **Обновлён:**
-2026-06-08
+**Статус:** Phase 0 ✅ · Phase 1 ✅ · Phase 2+3 ✅ — **`RECONCILER_ENABLED=1`
+в проде с 2026-06-15** (role-default остаётся OFF). Предусловие — перевод
+ручных bootstrap-эндпоинтов на `defer_to_reconciler=False` — выполнено (см.
+«Состояние реализации» ниже) · Phase 4 ⏳ частично (cap+ordering, backoff —
+есть; diff-skip, стриминг ansible, reconciler'ы exit/relay — deferred) ·
+**Создан:** 2026-06-08 · **Обновлён:** 2026-06-15
 
 ## Зачем
 Сейчас каждое действие (правка/добавление/удаление конфига, ручной bootstrap)
@@ -114,11 +113,20 @@ generation сошёлся) — UI истории/прогресса живёт.
 Код Phase 2+3 собран, отревьюен и **проброшен через ansible**. Флаг
 `RECONCILER_ENABLED` переключает точку входа оркестрации с «правка →
 bootstrap» на «правка → bump desired → reconcile-тик». Role-default OFF
-(`deploy_app_stack/defaults/main.yml`); **в проде сейчас тоже OFF**
-(`group_vars/web/main.yml` (`deploy_app_stack_reconciler_enabled: "0"`),
-откат в `4acddab` на время CDN-дебага). Возврат в `"1"` — после того как
-ручные/операторские bootstrap-эндпоинты перестанут дефолтить на defer (см.
-«Видимость и скорость» ниже).
+(`deploy_app_stack/defaults/main.yml`); **в проде ВКЛючён 2026-06-15**
+(`group_vars/web/main.yml` `deploy_app_stack_reconciler_enabled: "1"`).
+
+Предусловие включения (выполнено 2026-06-15): ручные/операторские
+bootstrap-эндпоинты теперь зовут `defer_to_reconciler=False` → создают
+немедленную таску, не дебаунсятся (раньше при флаге дефолт `True` они молча
+возвращали `(None, False)` и кнопка «висела» — из-за чего флаг и был
+откатан в `4acddab`). Список переведённых на `False`: `create_node`,
+`create_node_with_configs`, `rebootstrap_node`, `refresh_reality_dest`
+(ordering-critical: bootstrap до device-apply) в `api/nodes.py`, плюс
+spawn-finalize в `node_spawner.py`. **Config-edit-сайты** (create/update/
+delete config) сознательно ОСТАЮТСЯ на дефолтном `defer=True` — их
+коалесинг реконсайлером это и есть фича. Откат всего: флаг `"0"` + redeploy
+(тег `pre-reconciler-enable-*`).
 
 ### Видимость и скорость (вариант C — оставить reconcile-модель, убрать «тишину»)
 Чтобы операторское действие при включённом флаге не выглядело как «ничего не

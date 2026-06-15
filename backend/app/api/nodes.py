@@ -75,8 +75,10 @@ def create_node(
     actor, actor_type = _resolve_admin_actor(admin_actor)
     _audit(db, actor, "node_created", "vpn_node", node.id, actor_type=actor_type)
     orchestrator = ProvisioningOrchestrator(db)
+    # Ручное создание ноды — нужна немедленная bootstrap-таска (оператор ждёт
+    # провижининг + трекаемую таску), НЕ дефёрим в reconciler-debounce.
     task, _created = orchestrator.create_or_coalesce_node_bootstrap(
-        node, {"pool_id": payload.pool_id}
+        node, {"pool_id": payload.pool_id}, defer_to_reconciler=False
     )
     db.commit()
     if _created:
@@ -340,6 +342,8 @@ def create_node_with_configs(
         raise
 
     orchestrator = ProvisioningOrchestrator(db)
+    # Первичный bootstrap новой ноды — немедленно (НЕ дефёрим): оператор ждёт,
+    # пока нода поднимется, и трекает таску. initial=True не коалесить.
     task, _created = orchestrator.create_or_coalesce_node_bootstrap(
         node,
         {
@@ -347,6 +351,7 @@ def create_node_with_configs(
             "initial": True,
             "config_change": len(created_configs) > 0,
         },
+        defer_to_reconciler=False,
     )
     db.commit()
     if _created:
@@ -603,14 +608,16 @@ def rebootstrap_node(
     if not node:
         raise HTTPException(status_code=404, detail="Node not found")
     orchestrator = ProvisioningOrchestrator(db)
+    # Явная кнопка «перекатить site.yml» — оператор ждёт НЕМЕДЛЕННУЮ таску,
+    # поэтому НЕ дефёрим в reconciler (иначе при RECONCILER_ENABLED=1 кнопка
+    # молча возвращала (None, False) и «висела» — root-фикс под включение).
     task, _created = orchestrator.create_or_coalesce_node_bootstrap(
-        node, {"pool_id": node.pool_id, "rerun": True}
+        node, {"pool_id": node.pool_id, "rerun": True}, defer_to_reconciler=False
     )
     db.commit()
     if _created:
         orchestrator.run_task_async(task, node=node)
-    # RECONCILER_ENABLED on → coalesce ушёл в defer (mark_node_dirty) и вернул
-    # (None, False); правка зачтена, таски нет. task.id дёргаем None-safe.
+    # defer_to_reconciler=False → таска создаётся всегда; None-safe на всякий.
     task_id = task.id if task else None
     actor, actor_type = _resolve_admin_actor(admin_actor)
     _audit(
@@ -2192,15 +2199,18 @@ def refresh_reality_dest(
     # cfg.sni/cfg.settings.dest). Device-apply таски встанут в очередь
     # ПОСЛЕ bootstrap'а ноды — xray к тому моменту уже рестартнёт с
     # новым конфигом, новые UUID'ы добавятся штатно через API.
+    # Ordering-critical: bootstrap ОБЯЗАН пройти ПЕРЕД device-apply тасками
+    # (xray должен рестартнуть с новым sni/dest до добавления UUID'ов). Дефёр
+    # в reconciler сломал бы порядок (device-apply ушли бы раньше реконсайл-
+    # тика) → defer_to_reconciler=False, таска немедленно.
     bootstrap_task, _created = orchestrator.create_or_coalesce_node_bootstrap(
         node,
         {"pool_id": node.pool_id, "rerun": True, "reason": "reality-dest refresh"},
+        defer_to_reconciler=False,
     )
     db.commit()
     if _created:
         orchestrator.run_task_async(bootstrap_task, node=node)
-    # RECONCILER_ENABLED on → coalesce ушёл в defer и вернул (None, False):
-    # bootstrap зачтён через mark_node_dirty, отдельной таски нет. id None-safe.
     bootstrap_task_id = bootstrap_task.id if bootstrap_task else None
 
     subs = (

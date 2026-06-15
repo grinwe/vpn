@@ -340,8 +340,10 @@ def spawn_node(
     ensure_reality_config(db, node, sni=reality_sni, dest=reality_dest)
 
     orchestrator = ProvisioningOrchestrator(db)
+    # Свежеподнятая spawn-нода — bootstrap нужен немедленно (как в _finalize_spawn
+    # ниже), НЕ дефёрим в reconciler-debounce.
     task, _created = orchestrator.create_or_coalesce_node_bootstrap(
-        node, {"pool_id": pool_id, "auto_spawn": True}
+        node, {"pool_id": pool_id, "auto_spawn": True}, defer_to_reconciler=False
     )
     db.commit()
     if _created:
