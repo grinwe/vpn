@@ -1668,11 +1668,18 @@ def run_node_reachability_tick() -> dict:
         return {"enabled": False}
 
     max_diag = int(os.getenv("NODE_REACHABILITY_MAX_DIAGNOSE_PER_TICK", "4"))
+    # Анти-спам: не диагностируем/алертим, пока недоступность не подтвердилась
+    # серией пробов длиной >= confirm_min минут (единичный пропущенный пинг —
+    # не повод будить админа). Дефолт 20 мин ≈ «5 мин + 15 мин» из ТЗ; при
+    # интервале тика 300с это ~4 проба подряд. Тюнится NODE_ALERT_CONFIRM_MIN;
+    # 0 = старое поведение (алерт с первого DOWN).
+    confirm_min = float(os.getenv("NODE_ALERT_CONFIRM_MIN", "20"))
     summary: dict = {
         "enabled": True,
         "checked": 0,
         "down": [],
         "recovered": [],
+        "suspect": [],
         "diagnosed": [],
         "pushed": [],
     }
@@ -1737,6 +1744,7 @@ def run_node_reachability_tick() -> dict:
             if probe.ssh_ok:
                 target.last_probe_at = now
                 target.last_probe_status = "ok"
+                target.unreachable_since = None  # серия прервалась — сброс
                 if diagnostics_state.close_incident(target):
                     summary["recovered"].append(ref)
                 session.commit()
@@ -1746,6 +1754,19 @@ def run_node_reachability_tick() -> dict:
             target.last_probe_at = now
             target.last_probe_status = "unreachable"
             summary["down"].append(ref)
+
+            # Confirm-окно: первый DOWN только запоминаем (начало серии), не
+            # диагностируем и не алертим. Эскалируем (диагностика + пуш) лишь
+            # когда недоступность держится >= confirm_min — несколько пробов
+            # подряд. Транзиентный 1-2 пропущенных пинга сюда не дотянет →
+            # recovery очистит unreachable_since и серия не накопится.
+            if getattr(target, "unreachable_since", None) is None:
+                target.unreachable_since = now
+            elapsed_min = (now - target.unreachable_since).total_seconds() / 60.0
+            if confirm_min > 0 and elapsed_min < confirm_min:
+                summary["suspect"].append(ref)
+                session.commit()
+                continue
 
             do_diag, reason = diagnostics_state.should_diagnose(target, now)
             if not do_diag or diagnosed >= max_diag:

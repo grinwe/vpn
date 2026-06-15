@@ -173,9 +173,17 @@ default 300s) пробит **ВСЕ active VPNNode + WGExitNode** (не толь
 relay'и). Анти-спам — через **инцидент-стейт** (`services/
 diagnostics_state.py::should_diagnose`):
 
-* нода упала → диагностика **ОДИН раз** → говорящий пуш → тишина;
-* recovery (`ssh_ok`) → `close_incident` сбрасывает стейт → следующее
-  падение = новый инцидент;
+* **confirm-окно перед алертом** (`NODE_ALERT_CONFIRM_MIN`, default **20
+  мин**; анти-спам на транзиентные блипы): первый непрошедший probe только
+  ставит `unreachable_since=now` (suspect), НЕ диагностирует и НЕ пушит.
+  Эскалация (диагностика + пуш + открытие инцидента) — лишь когда
+  недоступность держится `>= NODE_ALERT_CONFIRM_MIN` (несколько пробов
+  подряд при интервале 300с ≈ 4 проба). Единичный 1–2 пропущенных пинга
+  recovery очистит `unreachable_since` → серия не накопится, админа не будим.
+  `0` = старое поведение (алерт с первого DOWN);
+* нода упала и **подтвердилась** → диагностика **ОДИН раз** → говорящий пуш → тишина;
+* recovery (`ssh_ok`) → чистит `unreachable_since` + `close_incident`
+  сбрасывает стейт → следующее (подтверждённое) падение = новый инцидент;
 * экспонента (30m→2h→6h) и мьют — **по кнопке из пуша**, не дефолт;
 * `should_diagnose` — единый гейт для всех триггеров (заменил три
   раздельные 30-мин AuditLog-дебаунс зоны). Relay-тик больше НЕ делает
@@ -228,6 +236,7 @@ admin-push. Идемпотентно: уже cooled-нода повторно н
 ### Env (все с дефолтами в коде)
 
 `NODE_REACHABILITY_INTERVAL=300`, `NODE_REACHABILITY_ENABLED=true`,
+`NODE_ALERT_CONFIRM_MIN=20` (confirm-окно перед алертом; 0 = алерт с первого DOWN),
 `NODE_REACHABILITY_MAX_DIAGNOSE_PER_TICK=4`, `NODE_REACHABILITY_BUDGET_SEC=200`,
 `DIAGNOSE_SAFETY_RECAP_HOURS=12`, `ADMIN_ALERT_DIAGNOSIS_WINDOW_SEC=1800`.
 Краудсорс: `NODE_FAILURE_REPORT_WINDOW_MIN=60`, `NODE_FAILURE_BAN_THRESHOLD=4`,

@@ -291,6 +291,11 @@ class VPNNode(Base):
     # Reachability-tick telemetry (ping/ssh from controller).
     last_probe_at = Column(DateTime, nullable=True)
     last_probe_status = Column(String, nullable=True)  # ok | unreachable
+    # Начало текущей серии непрошедших probe'ов (reachability-tick). Алерт о
+    # недоступности шлётся только если серия длится >= NODE_ALERT_CONFIRM_MIN
+    # (анти-спам: единичные пропущенные пинги не будят админа). Чистится на
+    # recovery. Своя колонка, НЕ suspect_since (та — у traffic-drop детектора).
+    unreachable_since = Column(DateTime, nullable=True)
 
     pool = relationship("ServerPool", back_populates="nodes")
     configs = relationship("VPNConfig", back_populates="node", cascade="all, delete-orphan")
@@ -833,6 +838,10 @@ class WGExitNode(Base):
     diagnose_backoff_until = Column(DateTime, nullable=True)
     diagnose_follow_mode = Column(String, nullable=True)
     diagnose_acked_at = Column(DateTime, nullable=True)
+    # Начало серии непрошедших probe'ов — confirm-окно перед алертом (см.
+    # VPNNode.unreachable_since). Reachability-tick гоняет nodes + exits общим
+    # кодом, поэтому колонка нужна на обеих таблицах.
+    unreachable_since = Column(DateTime, nullable=True)
 
     provider = relationship("CloudProvider")
 
