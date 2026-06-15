@@ -114,6 +114,14 @@ services:
       # docs/operations/provisioning_reconciler_epic.md.
       RECONCILER_ENABLED: ${RECONCILER_ENABLED:-}
       RECONCILE_DEBOUNCE_S: ${RECONCILE_DEBOUNCE_S:-5}
+      # Provisioning-ключ нужен и БЭКЕНДУ (не только воркеру): спавн
+      # key-инжектящих провайдеров (VDSina) дёргает order_server СИНХРОННО в
+      # HTTP-роуте /nodes/spawn → _ensure_key_id → provisioning_pubkey() деривит
+      # pubkey из этого ключа для авто-регистрации на хостере. Без mount'а ключа
+      # в backend-контейнер VDSina-заказ падал «ssh-ключ не задан».
+      ANSIBLE_PRIVATE_KEY_FILE: /run/secrets/provisioning_key
+    volumes:
+      - ${PROVISIONING_SSH_KEY:?Set PROVISIONING_SSH_KEY to the host path of the SSH private key}:/run/secrets/provisioning_key:ro
     ports:
       - "127.0.0.1:8000:8000"
     depends_on:
