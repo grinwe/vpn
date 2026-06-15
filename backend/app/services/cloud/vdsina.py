@@ -123,6 +123,10 @@ class VdsinaDriver:
             "name": name,
             "host": name,
             "ssh-key": key_id,
+            # ip4 — кол-во IPv4 (обязательное, иначе "Validation Error" без
+            # деталей). Сверено по офиц. PDF + terraform-провайдеру: без него
+            # POST /server падает. 1 адрес — дефолт для VPN-ноды.
+            "ip4": 1,
         }
         data = self._call("POST", "/server", body)
         server_id = str((data or {}).get("id") or "") if isinstance(data, dict) else ""
@@ -376,6 +380,11 @@ class VdsinaDriver:
         msg = payload.get("status_msg") or ""
         desc = payload.get("description")
         detail = f"{msg}: {desc}" if desc else (msg or str(payload))
+        # На "Validation Error" VDSina кладёт пофайловый разбор в ``data``
+        # ({"ip4":"required",...}) — без него причина теряется. Сёрфим, если есть.
+        err_data = payload.get("data")
+        if err_data:
+            detail = f"{detail} (data={err_data})"
         raise DriverError(f"VDSina {method} {path}: {detail}")
 
 
