@@ -115,6 +115,20 @@ ISPsystem b6sa/v6-докам + рабочим примерам PQ.Hosting/the.ho
   доступен ли `vds.edit ostempl` под клиентским токеном; не IP-whitelist'нут ли
   `authinfo`; не мешает ли login-captcha. Драйвер прошёл 3-линзовый ревью.
 
+### Node-management расширения (2026-06-17)
+- **Читаемый регион.** `node_spawner._display_region` резолвит id ДЦ → country/name
+  через `list_datacenters` (фолбэк на id), чтобы в `VPNNode.region` была «Russia», а
+  не сырая «3»; сырой id остаётся в `provider_region`.
+- **Авто-имя ноды.** `resolve_spawn_name` → `<хостер>-<cc>-<NN>` при пустом поле имени
+  (префикс из kind; для billmgr — из хоста `base_url`; cc из региона; NN — следующий
+  по relay+exit). `name` в `NodeSpawnRequest`/`ExitSpawnRequest` опционален.
+- **Reboot без панели хостера.** `reboot_server` в драйверах (4vps/VDSina `PUT
+  /server.reboot/{id}`/billmgr `vds.reboot`) + `ssh_bootstrap.reboot_via_ssh` (graceful
+  по ключу). `node_spawner._reboot_target`: API hard-reboot → SSH-фолбэк. Эндпоинты
+  `POST /nodes/{id}/reboot` и `/exits/{id}/reboot` + кнопки «↻ reboot» в админке.
+  ⚠️ VDSina-путь `server.reboot` — по аналогии с reinstall, не сверен боевым; SSH-фолбэк
+  страхует достижимые ноды.
+
 ---
 
 ## Фазы
