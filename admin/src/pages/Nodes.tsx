@@ -874,6 +874,23 @@ export default function Nodes() {
     onError: (e: Error) => alert(`Не удалось запустить bootstrap: ${e.message}`),
   });
 
+  // Перезагрузка сервера без захода в панель хостера: cloud-нода → hard-reboot
+  // через API провайдера (даже если зависла), иначе/при сбое — graceful по SSH.
+  const reboot = useMutation({
+    mutationFn: (node: { id: number; name: string }) =>
+      api
+        .post<{ node_id: number; method: string }>(`/nodes/${node.id}/reboot`, {})
+        .then((res) => ({ ...res, nodeName: node.name })),
+    onSuccess: (res) => {
+      alert(
+        `Нода #${res.node_id} (${res.nodeName}): команда reboot отправлена ` +
+          `(${res.method === "api" ? "API хостера" : "SSH"}). Поднимется через ~1 мин.`,
+      );
+      qc.invalidateQueries({ queryKey: ["nodes"] });
+    },
+    onError: (e: Error) => alert(`Не удалось перезагрузить: ${e.message}`),
+  });
+
   // Переустановка ОС через API провайдера (только cloud-ноды). IP сохраняется,
   // поэтому reality-ключи и sub-токены остаются валидны; после reinstall бэк
   // сам перекатывает site.yml.
@@ -1449,6 +1466,22 @@ export default function Nodes() {
                         className="text-xs px-2 py-1 rounded bg-purple-700 hover:bg-purple-600 disabled:opacity-50"
                       >
                         bootstrap
+                      </button>
+                      <button
+                        disabled={reboot.isPending}
+                        onClick={() => {
+                          if (
+                            confirm(
+                              `Перезагрузить ноду #${n.id} (${n.name})?\n\n` +
+                                `Cloud-нода → hard-reboot через API хостера (работает даже если зависла). Иначе/при сбое — graceful по SSH. Клиенты переподключатся за ~1 мин.`,
+                            )
+                          )
+                            reboot.mutate({ id: n.id, name: n.name });
+                        }}
+                        className="text-xs px-2 py-1 rounded bg-amber-700 hover:bg-amber-600 disabled:opacity-50"
+                        title="Перезагрузить сервер: API хостера (hard) или SSH (graceful) — без захода в панель"
+                      >
+                        ↻ reboot
                       </button>
                       {n.provider_id && (
                         <button
@@ -2106,7 +2139,7 @@ function OrderCloudNodeForm({ onDone }: { onDone: () => void }) {
     mutationFn: () =>
       spawnNode({
         provider_id: providerId as number,
-        name: name.trim(),
+        name: name.trim() || null,
         region: dc.trim(),
         plan: plan.trim(),
         image: image.trim() || null,
@@ -2125,7 +2158,7 @@ function OrderCloudNodeForm({ onDone }: { onDone: () => void }) {
     e.preventDefault();
     setErr(null);
     if (providerId == null) return setErr("выбери провайдера");
-    if (!name.trim()) return setErr("имя обязательно (kebab-case)");
+    // имя необязательно: пусто → бэкенд сгенерит «<хостер>-<cc>-<NN>»
     if (!dc.trim()) return setErr("укажи дата-центр");
     if (!plan.trim()) return setErr("укажи тариф");
     mutation.mutate();
@@ -2165,11 +2198,11 @@ function OrderCloudNodeForm({ onDone }: { onDone: () => void }) {
         </label>
         <label className="flex flex-col">
           <span className="text-slate-400 text-xs mb-1">
-            Имя (уникальное, kebab-case)
+            Имя (пусто → авто «хостер-cc-NN»)
           </span>
           <input
             className={`${inputCls} font-mono`}
-            placeholder="ru-4vps-01"
+            placeholder="авто, или вручную: vdsina-ru-01"
             value={name}
             onChange={(e) => setName(e.target.value)}
           />

@@ -178,6 +178,11 @@ class BillmgrDriver:
             raw=elem,
         )
 
+    def reboot_server(self, external_id: str) -> None:
+        """func=vds.reboot&elid=<id>&sok=ok — перезагрузка VDS через панель.
+        Best-effort: при ошибке reboot-роут падёт на SSH-фолбэк."""
+        self._call("vds.reboot", elid=external_id, sok="ok")
+
     def destroy_server(self, external_id: str) -> None:
         """func=vds.delete&elid=<id>&sok=ok."""
         self._call("vds.delete", elid=external_id, sok="ok")

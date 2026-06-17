@@ -209,6 +209,12 @@ class VdsinaDriver:
             )
         self._call("PUT", f"/server.reinstall/{external_id}", body)
 
+    def reboot_server(self, external_id: str) -> None:
+        """PUT /v1/server.reboot/{id} — мягкая (ACPI) перезагрузка. Форма экшена
+        как у reinstall/prolong. Если эндпоинт ответит ошибкой — вызывающий
+        (reboot-роут) падёт на SSH-фолбэк, так что путь best-effort."""
+        self._call("PUT", f"/server.reboot/{external_id}", None)
+
     def destroy_server(self, external_id: str) -> None:
         self._call("DELETE", f"/server/{external_id}", None)
 

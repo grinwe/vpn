@@ -168,6 +168,21 @@ export default function Exits() {
     onError: (e: Error) => alert(`Ошибка: ${e.message}`),
   });
 
+  // Перезагрузка exit'а без панели хостера: cloud → hard-reboot через API
+  // (даже если завис), иначе/при сбое — graceful по SSH.
+  const rebootMut = useMutation({
+    mutationFn: (id: number) =>
+      api.post<{ exit_id: number; method: string }>(`/exits/${id}/reboot`, {}),
+    onSuccess: (res) => {
+      alert(
+        `Exit #${res.exit_id}: команда reboot отправлена ` +
+          `(${res.method === "api" ? "API хостера" : "SSH"}). Поднимется через ~1 мин.`,
+      );
+      qc.invalidateQueries({ queryKey: ["wg-exits"] });
+    },
+    onError: (e: Error) => alert(`Не удалось перезагрузить: ${e.message}`),
+  });
+
   const diagnoseMut = useMutation({
     mutationFn: (id: number) =>
       api.post<{ exit_id: number; task_id: number }>(
@@ -416,6 +431,23 @@ export default function Exits() {
                           className="text-xs px-2 py-1 rounded bg-purple-700 hover:bg-purple-600 disabled:opacity-50"
                         >
                           bootstrap
+                        </button>
+                        <button
+                          disabled={rebootMut.isPending}
+                          title="Перезагрузить exit: API хостера (hard) или SSH (graceful) — без захода в панель"
+                          onClick={() => {
+                            if (
+                              confirm(
+                                `Перезагрузить exit #${e.id} (${e.name})?\n\n` +
+                                  "Cloud → hard-reboot через API хостера (даже если завис), " +
+                                  "иначе/при сбое — graceful по SSH. Тоннели поднимутся за ~1 мин.",
+                              )
+                            )
+                              rebootMut.mutate(e.id);
+                          }}
+                          className="text-xs px-2 py-1 rounded bg-amber-700 hover:bg-amber-600 disabled:opacity-50"
+                        >
+                          ↻ reboot
                         </button>
                         <button
                           disabled={diagnoseMut.isPending}
@@ -1929,7 +1961,7 @@ function OrderCloudExitForm({ onDone }: { onDone: () => void }) {
     mutationFn: () =>
       spawnExit({
         provider_id: providerId as number,
-        name: name.trim(),
+        name: name.trim() || null,
         region: dc.trim(),
         plan: plan.trim(),
         image: image.trim() || null,
@@ -1947,7 +1979,7 @@ function OrderCloudExitForm({ onDone }: { onDone: () => void }) {
     e.preventDefault();
     setErr(null);
     if (providerId == null) return setErr("выбери провайдера");
-    if (!name.trim()) return setErr("имя обязательно (kebab-case)");
+    // имя необязательно: пусто → бэкенд сгенерит «<хостер>-<cc>-<NN>»
     if (!dc.trim()) return setErr("укажи дата-центр");
     if (!plan.trim()) return setErr("укажи тариф");
     mutation.mutate();
@@ -1986,11 +2018,11 @@ function OrderCloudExitForm({ onDone }: { onDone: () => void }) {
         </label>
         <label className="flex flex-col">
           <span className="text-slate-400 text-xs mb-1">
-            Имя (уникальное, kebab-case)
+            Имя (пусто → авто «хостер-cc-NN»)
           </span>
           <input
             className={`${inputCls} font-mono`}
-            placeholder="fi-exit-01"
+            placeholder="авто, или вручную: aeza-nl-01"
             value={name}
             onChange={(e) => setName(e.target.value)}
           />

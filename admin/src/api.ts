@@ -660,7 +660,7 @@ export interface ProviderOfferings {
 
 export interface NodeSpawnIn {
   provider_id: number;
-  name: string;
+  name?: string | null; // пусто → бэкенд сгенерит «<хостер>-<cc>-<NN>»
   region: string; // datacenter id (строкой)
   plan: string; // tariff id (строкой)
   image?: string | null; // ostempl id (строкой)
@@ -689,7 +689,7 @@ export function spawnNode(payload: NodeSpawnIn): Promise<VPNNodeOut> {
 // список), поэтому unknown.
 export interface ExitSpawnIn {
   provider_id: number;
-  name: string;
+  name?: string | null; // пусто → бэкенд сгенерит «<хостер>-<cc>-<NN>»
   region: string; // datacenter (локация) id строкой
   plan: string; // tariff (preset) id строкой
   image?: string | null; // ostempl id строкой

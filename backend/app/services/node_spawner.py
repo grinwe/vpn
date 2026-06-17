@@ -15,6 +15,7 @@ provisioning pattern.
 """
 from __future__ import annotations
 
+import json
 import logging
 import os
 import secrets
@@ -27,7 +28,7 @@ from sqlalchemy.orm import Session
 
 from .. import models
 from ..db import SessionLocal
-from ..security import encrypt
+from ..security import decrypt, encrypt
 from ..time_utils import utcnow
 from .ansible_runner import (
     InvalidNodeIdentity,
@@ -108,6 +109,87 @@ def _display_region(driver, region_id: str) -> str:
     except Exception:  # noqa: BLE001 — оффлайн-резолв имени не должен ронять заказ
         pass
     return str(region_id)
+
+
+# Короткие префиксы хостеров для авто-имени ноды. billmgr — общий kind на
+# UFO/AdminVPS/DataCheap → префикс берём из хоста base_url (см. _hoster_prefix).
+_KIND_PREFIX = {
+    "vdsina": "vdsina", "vdsina_ru": "vdsina", "4vps": "4vps", "aeza": "aeza",
+    "hetzner": "hz", "vultr": "vultr", "digitalocean": "do",
+}
+# Страна (из _display_region) → 2-буквенный код для имени. Фолбэк — первые 2
+# буквы региона (непокрытые страны).
+_COUNTRY_CC = {
+    "russia": "ru", "россия": "ru", "netherlands": "nl", "нидерланды": "nl",
+    "denmark": "dk", "дания": "dk", "germany": "de", "германия": "de",
+    "finland": "fi", "финляндия": "fi", "india": "in", "индия": "in",
+    "usa": "us", "united states": "us", "сша": "us", "france": "fr",
+    "poland": "pl", "sweden": "se", "kazakhstan": "kz", "казахстан": "kz",
+    "turkey": "tr", "турция": "tr",
+}
+
+
+def _slug(s: str) -> str:
+    return "".join(ch for ch in (s or "").lower() if ch.isalnum())
+
+
+def _hoster_prefix(provider) -> str:
+    """Короткий префикс хостера для имени ноды. По ``kind``; для billmgr — из
+    хоста ``base_url`` (``bill.ufo.hosting`` → ``ufo``); фолбэк — слаг имени
+    провайдера."""
+    kind = getattr(provider.kind, "value", str(provider.kind))
+    if kind in _KIND_PREFIX:
+        return _KIND_PREFIX[kind]
+    if kind == "billmgr":
+        try:
+            tok = json.loads(decrypt(provider.api_token_enc) or "{}")
+            host = (tok.get("base_url") or "").split("//")[-1].split("/")[0]
+            parts = [
+                p for p in host.split(".")
+                if p not in ("bill", "www", "my", "cp", "panel", "billing")
+            ]
+            if parts:
+                return _slug(parts[0]) or "vds"
+        except Exception:  # noqa: BLE001 — не смогли распарсить → слаг имени
+            pass
+    return _slug(provider.name)[:8] or "node"
+
+
+def _country_cc(region: str) -> str:
+    r = (region or "").strip().lower()
+    if r in _COUNTRY_CC:
+        return _COUNTRY_CC[r]
+    letters = "".join(ch for ch in r if ch.isalpha())
+    return letters[:2] or "xx"
+
+
+def _auto_node_name(db: Session, provider, region_display: str) -> str:
+    """``<хостер>-<cc>-<NN>`` по конвенции. NN — следующий номер по ОБЕИМ
+    таблицам (relay+exit), чтобы имена нод не сталкивались."""
+    base = f"{_hoster_prefix(provider)}-{_country_cc(region_display)}-"
+    nums: list[int] = []
+    for model in (models.VPNNode, models.WGExitNode):
+        for (nm,) in db.query(model.name).filter(model.name.like(base + "%")).all():
+            tail = (nm or "")[len(base):]
+            if tail.isdigit():
+                nums.append(int(tail))
+    nn = (max(nums) + 1) if nums else 1
+    return f"{base}{nn:02d}"
+
+
+def resolve_spawn_name(
+    db: Session, provider_id: int, region: str, name: str | None = None
+) -> str:
+    """Имя ноды для заказа: явное от админа, иначе авто ``<хостер>-<cc>-<NN>``.
+    Зовётся спавн-роутами перед заказом (autoscale-тик передаёт имя сам)."""
+    if name and name.strip():
+        return name.strip()
+    provider = db.get(models.CloudProvider, provider_id)
+    if not provider:
+        raise NodeSpawnError(f"CloudProvider {provider_id} not found")
+    return _auto_node_name(
+        db, provider, _display_region(get_driver(provider), region)
+    )
 
 
 def _wait_for_ssh(
@@ -636,6 +718,53 @@ def destroy_node(db: Session, node: models.VPNNode) -> None:
     node.updated_at = utcnow()
     db.add(node)
     db.commit()
+
+
+def _reboot_target(
+    db: Session, provider_id: int | None, external_id: str | None,
+    host: str, ssh_port: int | None,
+) -> str:
+    """Перезагрузка cloud/ручной ноды без захода в панель хостера: сначала
+    hard-reboot через API провайдера (работает даже когда нода зависла), при
+    отсутствии cloud-API или его сбое — graceful по SSH через provisioning-ключ.
+    Возвращает использованный метод (``api``|``ssh``). NodeSpawnError, если оба
+    пути недоступны (нет API и SSH не отвечает)."""
+    from .ssh_bootstrap import reboot_via_ssh
+
+    if provider_id and external_id:
+        provider = db.get(models.CloudProvider, provider_id)
+        if provider:
+            driver = get_driver(provider)
+            if hasattr(driver, "reboot_server"):
+                try:
+                    driver.reboot_server(external_id)
+                    return "api"
+                except DriverError as exc:
+                    logger.warning(
+                        "reboot: API reboot failed for %s (%s) — SSH fallback",
+                        host, exc,
+                    )
+    if reboot_via_ssh(host, port=ssh_port or 22):
+        return "ssh"
+    raise NodeSpawnError(
+        "reboot failed: no cloud-API reboot available and node SSH unreachable"
+    )
+
+
+def reboot_node(db: Session, node: models.VPNNode) -> str:
+    """Перезагрузить relay-ноду (API hard-reboot → SSH-фолбэк)."""
+    return _reboot_target(
+        db, node.provider_id, node.provider_external_id,
+        node.host, getattr(node, "ssh_port", None),
+    )
+
+
+def reboot_exit(db: Session, exit_node: models.WGExitNode) -> str:
+    """Перезагрузить exit-ноду (API hard-reboot → SSH-фолбэк)."""
+    return _reboot_target(
+        db, exit_node.provider_id, exit_node.provider_external_id,
+        exit_node.host, getattr(exit_node, "ssh_port", None),
+    )
 
 
 def reinstall_node(

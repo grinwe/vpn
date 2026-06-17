@@ -28,8 +28,10 @@ from ..services.health import recompute_node_health
 from ..services.node_spawner import (
     NodeSpawnError,
     destroy_node,
+    reboot_node,
     reinstall_node,
     renew_node,
+    resolve_spawn_name,
     spawn_node_async,
 )
 from ..services.provisioning import ProvisioningOrchestrator
@@ -1518,8 +1520,15 @@ def spawn_node_route(
     # checked at this point; the host is resolved later by the cloud driver
     # and re-validated inside ``_finalize_spawn`` before the real host is
     # written onto the row.
+    # Имя: явное от админа или авто «<хостер>-<cc>-<NN>» при пустом поле.
     try:
-        validate_node_name(payload.name)
+        name = resolve_spawn_name(
+            db, payload.provider_id, payload.region, payload.name
+        )
+    except NodeSpawnError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    try:
+        validate_node_name(name)
     except InvalidNodeIdentity as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     # Неблокирующий спавн: синхронно делаем только быстрый заказ (order_server)
@@ -1530,7 +1539,7 @@ def spawn_node_route(
         node = spawn_node_async(
             db,
             provider_id=payload.provider_id,
-            name=payload.name,
+            name=name,
             region=payload.region,
             plan=payload.plan,
             image=payload.image,
@@ -1580,6 +1589,32 @@ def destroy_node_route(
     actor, actor_type = _resolve_admin_actor(admin_actor)
     _audit(db, actor, "node_destroyed", "vpn_node", node.id, actor_type=actor_type)
     return {"node_id": node.id, "status": node.status.value}
+
+
+@router.post("/nodes/{node_id}/reboot")
+def reboot_node_route(
+    node_id: int,
+    db: Session = Depends(get_db),
+    admin_token: str = Depends(require_admin),
+    admin_actor: str | None = Header(default=None, alias=ADMIN_ACTOR_HEADER),
+):
+    """Перезагрузить relay-ноду без захода в панель хостера: hard-reboot через
+    API провайдера (даже если нода зависла), иначе/при сбое — graceful по SSH."""
+    node = db.get(models.VPNNode, node_id)
+    if not node:
+        raise HTTPException(status_code=404, detail="Node not found")
+    try:
+        method = reboot_node(db, node)
+    except NodeSpawnError as exc:
+        # 400 (не 502): CF подменяет 5xx HTML-страницей и прячет detail; а текст
+        # «нет API-reboot и SSH недоступен» админу как раз нужен (см. spawn-роуты).
+        raise HTTPException(status_code=400, detail=f"reboot failed: {exc}") from exc
+    actor, actor_type = _resolve_admin_actor(admin_actor)
+    _audit(
+        db, actor, "node_rebooted", "vpn_node", node.id,
+        metadata={"method": method}, actor_type=actor_type,
+    )
+    return {"node_id": node.id, "method": method}
 
 
 @router.post("/nodes/{node_id}/reinstall", response_model=schemas.VPNNodeOut)

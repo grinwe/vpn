@@ -863,7 +863,8 @@ class PoolDecisionOut(BaseModel):
 
 class NodeSpawnRequest(BaseModel):
     provider_id: int
-    name: str
+    # Пусто → авто-имя «<хостер>-<cc>-<NN>» по конвенции (resolve_spawn_name).
+    name: str | None = None
     region: str
     plan: str
     image: str | None = None
@@ -882,7 +883,8 @@ class ExitSpawnRequest(BaseModel):
     # Заказ облачной WG-exit-ноды (зеркало NodeSpawnRequest без pool_id —
     # exit'ы не входят в choose_node-пул).
     provider_id: int
-    name: str
+    # Пусто → авто-имя «<хостер>-<cc>-<NN>» (resolve_spawn_name).
+    name: str | None = None
     region: str
     plan: str
     image: str | None = None

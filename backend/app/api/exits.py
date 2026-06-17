@@ -33,7 +33,12 @@ from ..services.relay import (
     validate_requested_address,
 )
 from ..services.ansible_runner import InvalidNodeIdentity, validate_node_name
-from ..services.node_spawner import NodeSpawnError, spawn_exit_async
+from ..services.node_spawner import (
+    NodeSpawnError,
+    reboot_exit,
+    resolve_spawn_name,
+    spawn_exit_async,
+)
 from ..services.vless import generate_wireguard_keypair
 from ._common import ADMIN_ACTOR_HEADER, _audit, _resolve_admin_actor, get_db
 
@@ -349,8 +354,15 @@ def spawn_exit_route(
     ``bootstrap_exit`` — в фоне (см. ``node_spawner.spawn_exit_async``).
     Зарубежные серверы заводят так — как exit за РУ-relay, а не прямой нодой.
     """
+    # Имя: явное от админа или авто «<хостер>-<cc>-<NN>» при пустом поле.
     try:
-        validate_node_name(payload.name)
+        name = resolve_spawn_name(
+            db, payload.provider_id, payload.region, payload.name
+        )
+    except NodeSpawnError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    try:
+        validate_node_name(name)
     except InvalidNodeIdentity as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     # 400 (не 502): ошибка заказа у провайдера; CF прячет 5xx — на 4xx detail
@@ -359,7 +371,7 @@ def spawn_exit_route(
         exit_node = spawn_exit_async(
             db,
             provider_id=payload.provider_id,
-            name=payload.name,
+            name=name,
             region=payload.region,
             plan=payload.plan,
             image=payload.image,
@@ -560,6 +572,31 @@ def rebootstrap_exit(
         metadata={"task_id": task.id},
     )
     return {"exit_id": exit_node.id, "task_id": task.id}
+
+
+@router.post("/exits/{exit_id}/reboot")
+def reboot_exit_route(
+    exit_id: int,
+    db: Session = Depends(get_db),
+    admin_token: str = Depends(require_admin),
+    admin_actor: str | None = Header(default=None, alias=ADMIN_ACTOR_HEADER),
+):
+    """Перезагрузить exit-ноду без захода в панель хостера: hard-reboot через
+    API провайдера (даже если зависла), иначе/при сбое — graceful по SSH."""
+    exit_node = db.get(models.WGExitNode, exit_id)
+    if not exit_node:
+        raise HTTPException(status_code=404, detail="Exit node not found")
+    try:
+        method = reboot_exit(db, exit_node)
+    except NodeSpawnError as exc:
+        # 400 (не 502): CF прячет 5xx HTML'ом; admin'у нужен текст ошибки.
+        raise HTTPException(status_code=400, detail=f"reboot failed: {exc}") from exc
+    actor, actor_type = _resolve_admin_actor(admin_actor)
+    _audit(
+        db, actor, "wg_exit_rebooted", "wg_exit_node", exit_node.id,
+        metadata={"method": method}, actor_type=actor_type,
+    )
+    return {"exit_id": exit_node.id, "method": method}
 
 
 @router.post("/exits/{exit_id}/diagnose")
