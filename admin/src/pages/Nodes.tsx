@@ -16,7 +16,7 @@ import {
   NodeRelayLinkOut,
   NodeTrafficHistoryOut,
   ProvisioningTaskOut,
-  REALITY_DEST_POOL_SUGGESTIONS,
+  realityPoolForRegion,
   VPNConfigCreateIn,
   VPNConfigOut,
   VPNConfigProtocol,
@@ -613,6 +613,7 @@ export default function Nodes() {
   const [refreshDestModal, setRefreshDestModal] = useState<{
     node_id: number;
     node_name: string;
+    node_region: string | null;
   } | null>(null);
   const [editNode, setEditNode] = useState<VPNNodeOut | null>(null);
   const qc = useQueryClient();
@@ -1257,6 +1258,7 @@ export default function Nodes() {
         <RefreshRealityDestModal
           nodeId={refreshDestModal.node_id}
           nodeName={refreshDestModal.node_name}
+          nodeRegion={refreshDestModal.node_region}
           pending={refreshRealityDest.isPending}
           onCancel={() => setRefreshDestModal(null)}
           onSubmit={(sni) =>
@@ -1585,7 +1587,7 @@ export default function Nodes() {
                       <button
                         disabled={refreshRealityDest.isPending}
                         onClick={() =>
-                          setRefreshDestModal({ node_id: n.id, node_name: n.name })
+                          setRefreshDestModal({ node_id: n.id, node_name: n.name, node_region: n.region })
                         }
                         className="text-xs px-2 py-1 rounded bg-indigo-700 hover:bg-indigo-600 disabled:opacity-50"
                         title="Сменить Reality SNI/dest и перепровижинить активные подписки ноды"
@@ -1900,21 +1902,23 @@ function EditNodeModal({
 function RefreshRealityDestModal({
   nodeId,
   nodeName,
+  nodeRegion,
   pending,
   onCancel,
   onSubmit,
 }: {
   nodeId: number;
   nodeName: string;
+  nodeRegion: string | null;
   pending: boolean;
   onCancel: () => void;
   onSubmit: (sni: string | null) => void;
 }) {
   type Mode = "auto" | "pool" | "custom";
+  // Пул suggestion'ов по стране ноды (не плоский РУ) — фолбэк РУ, как на бэке.
+  const pool = realityPoolForRegion(nodeRegion);
   const [mode, setMode] = useState<Mode>("auto");
-  const [poolChoice, setPoolChoice] = useState<string>(
-    REALITY_DEST_POOL_SUGGESTIONS[0],
-  );
+  const [poolChoice, setPoolChoice] = useState<string>(pool[0]);
   const [custom, setCustom] = useState<string>("");
 
   const resolvedSni =
@@ -1975,7 +1979,7 @@ function RefreshRealityDestModal({
               onChange={(e) => setPoolChoice(e.target.value)}
               disabled={pending || mode !== "pool"}
             >
-              {REALITY_DEST_POOL_SUGGESTIONS.map((sni) => (
+              {pool.map((sni) => (
                 <option key={sni} value={sni}>
                   {sni}
                 </option>

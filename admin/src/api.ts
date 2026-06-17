@@ -578,17 +578,43 @@ export interface VPNNodeCreateIn {
   notes: string | null;
 }
 
-// Список в синке с REALITY_DEST_POOL в backend/app/services/node_spawner.py.
-// Используется как suggestion'ы в refresh-dest модалке. Захардкожен
-// вместо fetch'а из API сознательно: пул меняется редко, лишний
-// роундтрип при открытии модалки — не нужен.
-export const REALITY_DEST_POOL_SUGGESTIONS = [
-  "www.yandex.ru",
-  "vk.ru",
-  "mail.ru",
-  "rutube.ru",
-  "lenta.ru",
-] as const;
+// Региональные пулы reality-dest — зеркало REALITY_DEST_POOLS в
+// backend/app/services/node_spawner.py. Suggestion'ы в refresh-dest модалке
+// показываются ПО СТРАНЕ ноды. Хардкод вместо fetch'а осознанно: пул меняется
+// редко, лишний роундтрип при открытии модалки не нужен.
+export const REALITY_DEST_POOLS_BY_CC: Record<string, readonly string[]> = {
+  ru: ["www.yandex.ru", "vk.ru", "mail.ru", "rutube.ru", "lenta.ru"],
+  de: ["www.bmw.de", "www.mercedes-benz.com", "www.zalando.de"],
+  nl: ["www.bol.com", "www.philips.com", "www.adyen.com"],
+  fr: ["www.louisvuitton.com", "www.decathlon.fr", "www.sncf-connect.com"],
+  cz: ["www.seznam.cz", "www.alza.cz"],
+  fi: ["www.nokia.com", "www.kone.com", "www.fortum.com"],
+  se: ["www.ikea.com", "www.volvocars.com"],
+  gb: ["www.bbc.co.uk", "www.gov.uk", "www.bt.com"],
+  es: ["www.zara.com", "www.bbva.es", "www.iberia.com"],
+  at: ["www.redbull.com", "www.swarovski.com", "www.erstegroup.com"],
+  pl: ["www.allegro.pl", "www.onet.pl"],
+  ch: ["www.nestle.com", "www.swatch.com"],
+  it: ["www.ferrari.com", "www.eni.com", "www.unicredit.it"],
+};
+// region (название страны) → cc. Зеркало _COUNTRY_CC на бэке.
+const REALITY_REGION_CC: Record<string, string> = {
+  russia: "ru", "россия": "ru", netherlands: "nl", "нидерланды": "nl",
+  germany: "de", "германия": "de", france: "fr", "франция": "fr",
+  czech: "cz", czechia: "cz", "czech republic": "cz", "чехия": "cz",
+  finland: "fi", "финляндия": "fi", sweden: "se", "швеция": "se",
+  "united kingdom": "gb", "great britain": "gb", britain: "gb", uk: "gb",
+  england: "gb", "великобритания": "gb", spain: "es", "испания": "es",
+  austria: "at", "австрия": "at", switzerland: "ch", "швейцария": "ch",
+  italy: "it", "италия": "it", poland: "pl", "польша": "pl",
+};
+// Пул suggestion'ов по региону ноды (фолбэк — РУ, как на бэке).
+export function realityPoolForRegion(
+  region: string | null | undefined,
+): readonly string[] {
+  const cc = REALITY_REGION_CC[(region || "").trim().toLowerCase()];
+  return REALITY_DEST_POOLS_BY_CC[cc] || REALITY_DEST_POOLS_BY_CC.ru;
+}
 
 export interface NodeRefreshDestIn {
   // null/undefined → бэкенд автоматически выберет из пула наименее
