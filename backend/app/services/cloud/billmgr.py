@@ -76,6 +76,12 @@ def _parse_token(token: str) -> tuple[str, str, str]:
             "billmgr token must be JSON {base_url, username, password}"
         ) from exc
     base_url = str(data.get("base_url") or "").strip().rstrip("/")
+    # _call сам дописывает /billmgr. Форма-подсказка просит вводить base_url
+    # ВМЕСТЕ с /billmgr → без нормализации выходит /billmgr/billmgr → HTML 404.
+    # Вскрылось 2026-06-17, когда сняли captcha с DC-IP (раньше DDoS-Guard
+    # маскировал это капчей). Снимаем хвостовой /billmgr — работает в любом виде.
+    if base_url.lower().endswith("/billmgr"):
+        base_url = base_url[: -len("/billmgr")].rstrip("/")
     username = str(data.get("username") or "").strip()
     password = str(data.get("password") or "")
     if not base_url or not username or not password:

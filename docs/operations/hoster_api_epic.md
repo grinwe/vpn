@@ -99,16 +99,17 @@ ISPsystem b6sa/v6-докам + рабочим примерам PQ.Hosting/the.ho
   / не встал пароль — `create_server` СНОСИТ оплаченную залипшую услугу (`vds.delete`)
   + ERROR-лог с id, чтобы ретраи (особенно autoscale) не плодили оплаченных сирот.
   `_wait_active`/`_extract_ip` читают $-обёрнутый billmgr-JSON и список IP корректно.
-- **⚠️ БЛОКЕР (боевой тест 2026-06-12): все 3 billmgr-хостера враждебны к API с
-  дата-центрового IP бэкенда.** UFO (`bill.ufo.hosting`) с IP воркера (185.242.87.250)
-  отдаёт `captcha_verification_failed` (Яндекс-капча на авторизации; `authinfo=` её НЕ
-  обходит — проверено прямым curl с nl-web). С ЛИЧНОГО IP юзера те же запросы проходят
-  → IP воркера флагнут (капча/DDoS-Guard). DataCheap + AdminVPS вообще режут TLS с
-  DC-IP. **Итого: драйвер корректен, но auto-order billmgr С ЭТОГО БЭКЕНДА не работает
-  без чистого egress.** Варианты: (а) попросить UFO whitelist'нуть IP воркера для API
-  + отключить капчу; (б) гонять billmgr-вызовы через резидентный/чистый прокси; (в)
-  забить на billmgr-тройку и держать флот на REST-хостерах без капчи (VDSina, 4vps).
-  offerings при блоке дегрейдят в пустой каталог + WARNING-лог (CF прячет наш 502).
+- **✅ UFO captcha-блок СНЯТ (2026-06-17).** Раньше (тест 2026-06-12) UFO
+  (`bill.ufo.hosting`) с IP воркера `185.242.87.250` отдавал `captcha_verification_failed`
+  (Яндекс-капча/DDoS-Guard флагует DC-IP). На 2026-06-17 IP расфлагнут: dummy-авторизация
+  с nl-web вернула обычный billmgr-JSON `badpassword` (`remote_addr [185.242.87.250]`, БЕЗ
+  капчи). Снятие капчи вскрыло следующий баг: `base_url` в форме вводят С `/billmgr`, а
+  `_call` дописывает `/billmgr` ещё раз → `/billmgr/billmgr` → HTML 404 (DDoS-Guard раньше
+  маскировал это капчей). Пофикшено в `_parse_token` (снимаем хвостовой `/billmgr` —
+  работает при любом вводе). UFO auto-order теперь ждёт живого offerings/order-smoke.
+- **⚠️ DataCheap + AdminVPS** по-прежнему режут TLS с DC-IP — нужен чистый egress
+  (резидентный прокси) или whitelist; либо держать флот на REST-хостерах (4vps; VDSina —
+  свой блокер по scrubbing'у). offerings при блоке дегрейдят в пустой каталог + WARNING-лог.
 - **UNCONFIRMED (проверить боевым smoke на UFO до прода):** точные имена slist-полей
   offerings; поведение `skipbasket` при нехватке баланса (спишет vs создаст unpaid);
   доступен ли `vds.edit ostempl` под клиентским токеном; не IP-whitelist'нут ли
