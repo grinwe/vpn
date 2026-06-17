@@ -259,3 +259,24 @@ def agent_ops_execute(
         ) from exc
 
     return {"status": "enqueued", "plan_id": plan.id, "job_id": job.id}
+
+
+@router.get("/agent/ops/plan/{plan_id}")
+def agent_ops_plan_status(
+    plan_id: int,
+    db: Session = Depends(get_db),
+    admin_token: str = Depends(require_admin),
+):
+    """Статус сохранённого плана + результат исполнения. Бот поллит после
+    ``/execute``, чтобы показать оператору исход заказа."""
+    plan = db.get(models.OpsPlan, plan_id)
+    if not plan:
+        raise HTTPException(status_code=404, detail="plan not found")
+    return {
+        "plan_id": plan.id,
+        "status": plan.status,
+        "feasible": plan.feasible,
+        "needs_confirmation": plan.needs_confirmation,
+        "execution": plan.execution,
+        "expires_at": plan.expires_at.isoformat() if plan.expires_at else None,
+    }

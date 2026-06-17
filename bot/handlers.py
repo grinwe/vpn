@@ -1778,6 +1778,97 @@ def _render_ops_plan(result: dict) -> str:
     return _truncate_lines(lines, 4000)
 
 
+_OPS_EXEC_TERMINAL = {"executed", "partial", "failed", "expired", "cancelled"}
+
+
+def _ops_exec_keyboard(payload: dict) -> "types.InlineKeyboardMarkup | None":
+    """Кнопка «Исполнить» под планом — если он выполним и есть шаги."""
+    plan = (payload or {}).get("plan") or {}
+    plan_id = (payload or {}).get("plan_id")
+    if not plan_id or plan.get("feasible") is False or not (plan.get("steps") or []):
+        return None
+    return types.InlineKeyboardMarkup(
+        inline_keyboard=[[
+            types.InlineKeyboardButton(text="🚀 Исполнить", callback_data=f"opsx:{plan_id}")
+        ]]
+    )
+
+
+def _ops_confirm_keyboard(plan_id: str) -> types.InlineKeyboardMarkup:
+    return types.InlineKeyboardMarkup(
+        inline_keyboard=[[
+            types.InlineKeyboardButton(text="✅ Да, исполнить", callback_data=f"opsxgo:{plan_id}"),
+            types.InlineKeyboardButton(text="✖️ Отмена", callback_data=f"opsxno:{plan_id}"),
+        ]]
+    )
+
+
+def _ops_run_keyboard(plan_id: str) -> types.InlineKeyboardMarkup:
+    return types.InlineKeyboardMarkup(
+        inline_keyboard=[[
+            types.InlineKeyboardButton(text="🚀 Исполнить", callback_data=f"opsx:{plan_id}")
+        ]]
+    )
+
+
+def _render_ops_exec(payload: dict) -> str:
+    """Результат исполнения (из GET /agent/ops/plan/{id}) → HTML-сообщение."""
+    esc = html.escape
+    status = str((payload or {}).get("status") or "?")
+    execn = (payload or {}).get("execution") or {}
+    head = {
+        "executed": "✅ <b>План исполнен</b>",
+        "partial": "⚠️ <b>Исполнено частично</b>",
+        "failed": "⛔ <b>Ошибка исполнения</b>",
+        "expired": "⌛ <b>План протух</b>",
+        "executing": "⏳ <b>Ещё выполняется…</b>",
+    }.get(status, f"<b>Статус: {esc(status)}</b>")
+    lines = [head]
+
+    # Ранний отказ (validate/preflight/integrity) — покажем причину.
+    phase = execn.get("phase")
+    if phase in ("validate", "preflight", "integrity"):
+        why = execn.get("rejections") or execn.get("reasons") or [execn.get("reason")]
+        lines.append("⛔ " + esc("; ".join(str(x) for x in why if x)))
+
+    for s in execn.get("steps") or []:
+        ic = {"done": "✅", "skipped": "⏭", "failed": "⛔"}.get(str(s.get("status")), "•")
+        line = f"{ic} {esc(str(s.get('kind')))} — {esc(str(s.get('status')))}"
+        ids = s.get("created_node_ids")
+        if ids:
+            line += f" (ноды: {esc(', '.join(str(i) for i in ids))})"
+        lines.append(line)
+        if s.get("status") == "failed" and s.get("detail"):
+            lines.append(f"   ⚠️ {esc(str(s['detail']))}")
+
+    if execn.get("total_cost"):
+        lines.append(f"\n💸 ~{esc(str(execn['total_cost']))}₽")
+    if status == "executing":
+        lines.append("\n<i>Заказ ещё идёт — проверь ноды через минуту.</i>")
+    return _truncate_lines(lines, 4000)
+
+
+async def _poll_ops_exec(session, plan_id: int, actor_id: int, *, tries: int = 20, delay: float = 3.0) -> dict:
+    """Поллим статус плана, пока не терминальный. Возвращает последний снимок."""
+    last: dict = {"status": "executing", "plan_id": plan_id}
+    for _ in range(tries):
+        await asyncio.sleep(delay)
+        try:
+            async with session.request(
+                "GET",
+                f"{BACKEND_URL}/api/agent/ops/plan/{plan_id}",
+                headers=_admin_headers(actor_id),
+                timeout=aiohttp.ClientTimeout(total=15),
+            ) as resp:
+                if resp.status == 200:
+                    last = await resp.json()
+                    if str(last.get("status")) in _OPS_EXEC_TERMINAL:
+                        return last
+        except aiohttp.ClientError:
+            continue
+    return last
+
+
 @router.message(Command("ops"))
 async def ops_plan(message: types.Message, command: CommandObject):
     """Admin: NL ops-команда → dry-run план от агента. НИЧЕГО НЕ ВЫПОЛНЯЕТ —
@@ -1843,16 +1934,102 @@ async def ops_plan(message: types.Message, command: CommandObject):
         return
 
     rendered = _render_ops_plan(payload)
+    kb = _ops_exec_keyboard(payload)
     try:
         await wait.edit_text(
             rendered,
             parse_mode="HTML",
             disable_web_page_preview=True,
+            reply_markup=kb,
         )
     except TelegramBadRequest:
         # Невалидный HTML (сырьё от LLM / несбалансированный тег) — Telegram
         # отверг разметку. Отдаём план без неё, чтобы он ДОШЁЛ до админа, а не
         # завис на «⏳ Собираю план…».
         await wait.edit_text(
-            _strip_html(rendered)[:4000], disable_web_page_preview=True
+            _strip_html(rendered)[:4000], disable_web_page_preview=True, reply_markup=kb
         )
+
+
+@router.callback_query(F.data.startswith("opsx:"))
+async def ops_exec_confirm(callback_query: types.CallbackQuery) -> None:
+    """Тап «Исполнить» → экран подтверждения (двойной тап вместо PIN)."""
+    if not _is_admin(callback_query.from_user.id):
+        await callback_query.answer("Только для админов.", show_alert=True)
+        return
+    plan_id = callback_query.data.split(":", maxsplit=1)[1]
+    try:
+        await callback_query.message.edit_reply_markup(
+            reply_markup=_ops_confirm_keyboard(plan_id)
+        )
+    except TelegramBadRequest:
+        pass
+    await callback_query.answer("Подтверди исполнение плана")
+
+
+@router.callback_query(F.data.startswith("opsxno:"))
+async def ops_exec_cancel(callback_query: types.CallbackQuery) -> None:
+    if not _is_admin(callback_query.from_user.id):
+        await callback_query.answer("Только для админов.", show_alert=True)
+        return
+    plan_id = callback_query.data.split(":", maxsplit=1)[1]
+    try:
+        await callback_query.message.edit_reply_markup(reply_markup=_ops_run_keyboard(plan_id))
+    except TelegramBadRequest:
+        pass
+    await callback_query.answer("Отменено")
+
+
+@router.callback_query(F.data.startswith("opsxgo:"))
+async def ops_exec_go(callback_query: types.CallbackQuery) -> None:
+    """Подтверждение → POST /execute → «запускаю» → поллинг статуса → результат."""
+    if not _is_admin(callback_query.from_user.id):
+        await callback_query.answer("Только для админов.", show_alert=True)
+        return
+    plan_id = callback_query.data.split(":", maxsplit=1)[1]
+    actor_id = callback_query.from_user.id
+    await callback_query.answer()
+    try:  # убираем кнопки — чтобы повторно не тапнули
+        await callback_query.message.edit_reply_markup(reply_markup=None)
+    except TelegramBadRequest:
+        pass
+    launching = await callback_query.message.answer("🚀 Запускаю исполнение…")
+
+    session = await get_session()
+    try:
+        async with session.request(
+            "POST",
+            f"{BACKEND_URL}/api/agent/ops/execute",
+            json={"plan_id": int(plan_id)},
+            headers=_admin_headers(actor_id),
+            timeout=aiohttp.ClientTimeout(total=30),
+        ) as resp:
+            status = resp.status
+            try:
+                data = await resp.json()
+            except Exception:  # noqa: BLE001
+                data = {"message": await resp.text()}
+    except aiohttp.ClientError as exc:
+        await launching.edit_text(f"Бэкенд недоступен: {html.escape(str(exc))}")
+        return
+
+    if status == 503:
+        detail = (data or {}).get("detail") or "исполнение недоступно"
+        await launching.edit_text(f"Исполнение недоступно: {html.escape(str(detail))}")
+        return
+    if status == 409:
+        await launching.edit_text("Этот план уже исполняется или исполнен.")
+        return
+    if status != 200:
+        detail = (data or {}).get("detail") or (data or {}).get("message") or status
+        await launching.edit_text(f"Не удалось запустить: {html.escape(str(detail))}")
+        return
+
+    await launching.edit_text("🚀 Запущено, жду результат заказа…")
+    result = await _poll_ops_exec(session, int(plan_id), actor_id)
+    try:
+        await launching.edit_text(
+            _render_ops_exec(result), parse_mode="HTML", disable_web_page_preview=True
+        )
+    except TelegramBadRequest:
+        await launching.edit_text(_strip_html(_render_ops_exec(result))[:4000])
