@@ -2193,7 +2193,8 @@ def refresh_reality_dest(
         )
 
     old_sni = cfg.sni or ""
-    new_sni = payload.sni or pick_reality_sni(db)
+    # region-aware: dest из пула страны ДЦ ноды (немецкая нода — немецкий dest).
+    new_sni = payload.sni or pick_reality_sni(db, node.region)
     # Допускаем и sni вне пула — callsite может захотеть форсить
     # конкретный fallback для ноды (edge-case, whitelist RKN). Но
     # warn'им если domen явно подозрительный — в MVP только проверяем

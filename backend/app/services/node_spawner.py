@@ -57,13 +57,29 @@ from .vless import (
 # whitelist после ~15-20KB). ``REALITY_SNI`` env-override форсит один
 # SNI для всех новых нод (dev/test). ``REALITY_DEST`` нацеливается
 # на ``<sni>:443`` — меняйте только вместе с sni.
-REALITY_DEST_POOL: tuple[str, ...] = (
-    "www.yandex.ru",
-    "vk.ru",
-    "mail.ru",
-    "rutube.ru",
-    "lenta.ru",
-)
+# Региональные пулы reality-dest: dest выбирается по стране ДЦ ноды (geo-плотный
+# + плаузибл — немецкая нода фронтит немецкий сайт, а не yandex, и латентность
+# хендшейк-миррора низкая). Все домены проверены на TLS1.3+HTTP/2 (обязательно
+# для reality), 2026-06-17. Фолбэк (неизвестный регион / старые ноды) — РУ-пул
+# (релеи в основном РУ). dest = <sni>:443 — меняешь sni, меняй вместе.
+REALITY_DEST_POOLS: dict[str, tuple[str, ...]] = {
+    "ru": ("www.yandex.ru", "vk.ru", "mail.ru", "rutube.ru", "lenta.ru"),
+    "de": ("www.bmw.de", "www.mercedes-benz.com", "www.zalando.de"),
+    "nl": ("www.bol.com", "www.philips.com", "www.adyen.com"),
+    "fr": ("www.louisvuitton.com", "www.decathlon.fr", "www.sncf-connect.com"),
+    "cz": ("www.seznam.cz", "www.alza.cz"),
+    "fi": ("www.nokia.com", "www.kone.com", "www.fortum.com"),
+    "se": ("www.ikea.com", "www.volvocars.com"),
+    "gb": ("www.bbc.co.uk", "www.gov.uk", "www.bt.com"),
+    "es": ("www.zara.com", "www.bbva.es", "www.iberia.com"),
+    "at": ("www.redbull.com", "www.swarovski.com", "www.erstegroup.com"),
+    "pl": ("www.allegro.pl", "www.onet.pl"),
+    "ch": ("www.nestle.com", "www.swatch.com"),
+    "it": ("www.ferrari.com", "www.eni.com", "www.unicredit.it"),
+}
+# Плоский фолбэк-пул (РУ) — pick_reality_sni при неизвестном регионе +
+# импортируется refresh_reality_dest-роутом.
+REALITY_DEST_POOL: tuple[str, ...] = REALITY_DEST_POOLS["ru"]
 DEFAULT_REALITY_SNI = os.getenv("REALITY_SNI") or REALITY_DEST_POOL[0]
 DEFAULT_REALITY_DEST = os.getenv("REALITY_DEST", f"{DEFAULT_REALITY_SNI}:443")
 DEFAULT_REALITY_PORT = int(os.getenv("REALITY_PORT", "443"))
@@ -123,9 +139,19 @@ _COUNTRY_CC = {
     "russia": "ru", "россия": "ru", "netherlands": "nl", "нидерланды": "nl",
     "denmark": "dk", "дания": "dk", "germany": "de", "германия": "de",
     "finland": "fi", "финляндия": "fi", "india": "in", "индия": "in",
-    "usa": "us", "united states": "us", "сша": "us", "france": "fr",
-    "poland": "pl", "sweden": "se", "kazakhstan": "kz", "казахстан": "kz",
+    "usa": "us", "united states": "us", "сша": "us",
+    "france": "fr", "франция": "fr", "poland": "pl", "польша": "pl",
+    "sweden": "se", "швеция": "se", "kazakhstan": "kz", "казахстан": "kz",
     "turkey": "tr", "турция": "tr",
+    "czech": "cz", "czechia": "cz", "czech republic": "cz", "чехия": "cz",
+    "united kingdom": "gb", "great britain": "gb", "britain": "gb",
+    "uk": "gb", "england": "gb", "великобритания": "gb",
+    "spain": "es", "испания": "es", "austria": "at", "австрия": "at",
+    "switzerland": "ch", "швейцария": "ch", "italy": "it", "италия": "it",
+    "ireland": "ie", "ирландия": "ie", "belgium": "be", "бельгия": "be",
+    "norway": "no", "норвегия": "no", "greece": "gr", "греция": "gr",
+    "portugal": "pt", "португалия": "pt", "lithuania": "lt", "литва": "lt",
+    "latvia": "lv", "латвия": "lv", "estonia": "ee", "эстония": "ee",
 }
 
 
@@ -219,20 +245,25 @@ def _wait_for_ssh(
     return False
 
 
-def pick_reality_sni(db: Session) -> str:
-    """Выбор SNI из пула: наименее используемый среди уже сконфигурированных
-    vless-reality нод. Разносим ноды по разным SNI чтобы RKN-событие по
-    одному домену не клало весь флот. Env ``REALITY_SNI`` форсит один SNI
-    для всех новых нод (dev/test override)."""
+def pick_reality_sni(db: Session, region: str | None = None) -> str:
+    """Выбор reality-SNI: наименее используемый из пула СТРАНЫ ДЦ ноды
+    (``REALITY_DEST_POOLS`` по cc региона; неизвестный регион → РУ-фолбэк).
+    Geo-привязка убирает палево (немецкая нода не фронтит yandex) и режет
+    латентность хендшейк-миррора. Разносим по SNI, чтобы RKN-событие по одному
+    домену не клало весь флот. Env ``REALITY_SNI`` форсит один SNI (dev/test)."""
     if _REALITY_SNI_ENV_OVERRIDE:
         return _REALITY_SNI_ENV_OVERRIDE
+    pool = (
+        REALITY_DEST_POOLS.get(_country_cc(region), REALITY_DEST_POOL)
+        if region else REALITY_DEST_POOL
+    )
     used: dict[str, int] = dict(
         db.query(models.VPNConfig.sni, func.count(models.VPNConfig.id))
         .filter(models.VPNConfig.protocol == models.VPNConfigProtocol.vless_reality)
         .group_by(models.VPNConfig.sni)
         .all()
     )
-    return min(REALITY_DEST_POOL, key=lambda s: used.get(s, 0))
+    return min(pool, key=lambda s: used.get(s, 0))
 
 
 def ensure_reality_config(
@@ -267,7 +298,7 @@ def ensure_reality_config(
 
     public_key, private_key = generate_reality_keypair()
     short_id = generate_short_id()
-    sni_value = sni or pick_reality_sni(db)
+    sni_value = sni or pick_reality_sni(db, node.region)
     dest_value = dest or f"{sni_value}:443"
     cfg = models.VPNConfig(
         node_id=node.id,
