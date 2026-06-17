@@ -14,10 +14,13 @@ from __future__ import annotations
 import json
 import logging
 import os
+import time
 
 from sqlalchemy.orm import Session
 
 from ... import models
+from . import _runtime
+from ._runtime import AgentError
 from .tools import TOOL_REGISTRY, tool_schemas
 
 logger = logging.getLogger(__name__)
@@ -50,10 +53,6 @@ traffic-сэмплы, конфиги протоколов, недавние prov
 """
 
 
-class AgentError(RuntimeError):
-    """Агент выключен, не сконфигурирован, или вызов LLM упал."""
-
-
 def _enabled() -> bool:
     return os.getenv("AGENT_ENABLED", "").lower() in ("1", "true", "yes", "on")
 
@@ -76,7 +75,7 @@ def triage_node(db: Session, node_id: int, *, model: str | None = None) -> dict:
 
     model = model or os.getenv("AGENT_MODEL", _DEFAULT_MODEL)
     max_iter = max(1, int(os.getenv("AGENT_MAX_ITERATIONS", "10")))
-    client = anthropic.Anthropic()
+    client = anthropic.Anthropic(**_runtime.client_kwargs())
     tools = tool_schemas()
 
     messages: list[dict] = [
@@ -86,75 +85,95 @@ def triage_node(db: Session, node_id: int, *, model: str | None = None) -> dict:
         }
     ]
     tool_calls: list[str] = []
+    tool_cache: dict[str, str] = {}  # дедуп одинаковых read-вызовов за прогон
 
-    for iteration in range(max_iter):
-        try:
-            resp = client.messages.create(
-                model=model,
-                max_tokens=_MAX_TOKENS,
-                system=_SYSTEM_PROMPT,
-                thinking={"type": "adaptive"},
-                tools=tools,
-                messages=messages,
-            )
-        except anthropic.APIError as exc:
-            raise AgentError(f"Claude API error: {exc}") from exc
-
-        if resp.stop_reason != "tool_use":
-            # Финальный ответ — собираем текст.
-            report = "\n".join(
-                b.text for b in resp.content if getattr(b, "type", None) == "text"
-            ).strip()
-            return {
-                "node_id": node_id,
-                "model": model,
-                "report": report or "(агент не вернул текст)",
-                "iterations": iteration + 1,
-                "tool_calls": tool_calls,
-                "stop_reason": resp.stop_reason,
-            }
-
-        # Сохраняем ассистент-ход целиком (включая thinking-блоки с сигнатурами).
-        messages.append({"role": "assistant", "content": resp.content})
-
-        results = []
-        for block in resp.content:
-            if getattr(block, "type", None) != "tool_use":
-                continue
-            tool_calls.append(block.name)
-            entry = TOOL_REGISTRY.get(block.name)
-            if not entry:
-                results.append(
-                    {
-                        "type": "tool_result",
-                        "tool_use_id": block.id,
-                        "content": f"unknown tool {block.name}",
-                        "is_error": True,
-                    }
+    # run_budget: общий семафор (ops+triage) + wall-clock дедлайн на цикл.
+    with _runtime.run_budget("triage") as deadline:
+        for iteration in range(max_iter):
+            if time.monotonic() > deadline:
+                raise AgentError(
+                    f"триаж не сошёлся за отведённое время (~{int(_runtime.DEADLINE_S)}с)"
                 )
-                continue
             try:
-                # Все тулы — read-only, принимают (db, **input).
-                out = entry["fn"](db, **(block.input or {}))
-                results.append(
-                    {
-                        "type": "tool_result",
-                        "tool_use_id": block.id,
-                        "content": json.dumps(out, ensure_ascii=False),
-                    }
+                resp = client.messages.create(
+                    model=model,
+                    max_tokens=_MAX_TOKENS,
+                    system=_SYSTEM_PROMPT,
+                    thinking={"type": "adaptive"},
+                    tools=tools,
+                    messages=messages,
                 )
-            except Exception as exc:  # noqa: BLE001
-                logger.exception("agent tool %s failed", block.name)
-                results.append(
-                    {
-                        "type": "tool_result",
-                        "tool_use_id": block.id,
-                        "content": f"tool error: {exc}",
-                        "is_error": True,
-                    }
-                )
-        messages.append({"role": "user", "content": results})
+            except anthropic.APIError as exc:
+                raise AgentError(f"Claude API error: {exc}") from exc
 
-    raise AgentError(
-        f"триаж не сошёлся за {max_iter} итераций (увеличь AGENT_MAX_ITERATIONS)"
-    )
+            if resp.stop_reason != "tool_use":
+                # Финальный ответ — собираем текст.
+                report = "\n".join(
+                    b.text for b in resp.content if getattr(b, "type", None) == "text"
+                ).strip()
+                return {
+                    "node_id": node_id,
+                    "model": model,
+                    "report": report or "(агент не вернул текст)",
+                    "iterations": iteration + 1,
+                    "tool_calls": tool_calls,
+                    "stop_reason": resp.stop_reason,
+                }
+
+            # Сохраняем ассистент-ход целиком (включая thinking-блоки с сигнатурами).
+            messages.append({"role": "assistant", "content": resp.content})
+
+            results = []
+            for block in resp.content:
+                if getattr(block, "type", None) != "tool_use":
+                    continue
+                tool_calls.append(block.name)
+                entry = TOOL_REGISTRY.get(block.name)
+                if not entry:
+                    results.append(
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": block.id,
+                            "content": f"unknown tool {block.name}",
+                            "is_error": True,
+                        }
+                    )
+                    continue
+                cache_key = (
+                    block.name
+                    + ":"
+                    + json.dumps(block.input or {}, sort_keys=True, ensure_ascii=False)
+                )
+                cached = tool_cache.get(cache_key)
+                if cached is not None:
+                    results.append(
+                        {"type": "tool_result", "tool_use_id": block.id, "content": cached}
+                    )
+                    continue
+                try:
+                    # Все тулы — read-only, принимают (db, **input).
+                    out = entry["fn"](db, **(block.input or {}))
+                    content = _runtime.cap_json(out)
+                    tool_cache[cache_key] = content
+                    results.append(
+                        {"type": "tool_result", "tool_use_id": block.id, "content": content}
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        "agent tool %s failed: %s",
+                        block.name,
+                        _runtime.redact(f"{type(exc).__name__}: {exc}"),
+                    )
+                    results.append(
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": block.id,
+                            "content": _runtime.redact(f"tool error: {exc}"),
+                            "is_error": True,
+                        }
+                    )
+            messages.append({"role": "user", "content": results})
+
+        raise AgentError(
+            f"триаж не сошёлся за {max_iter} итераций (увеличь AGENT_MAX_ITERATIONS)"
+        )

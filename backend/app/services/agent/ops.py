@@ -17,31 +17,18 @@ from __future__ import annotations
 import json
 import logging
 import os
-import threading
 import time
 from typing import Any
 
 from sqlalchemy.orm import Session
 
-from . import ops_tools
+from . import _runtime, ops_tools
+from ._runtime import AgentError
 
 logger = logging.getLogger(__name__)
 
 _DEFAULT_MODEL = "claude-sonnet-4-6"
 _MAX_TOKENS = 8192
-
-# ── Анти-DoS бюджеты (env-override, дефолты безопасны) ──
-# Каждый /ops — полный агентный прогон Claude. Без этих границ зависший вызов
-# пережил бы 120с-таймаут бота (бэкенд продолжает крутить и биллить), а burst
-# параллельных прогонов забил бы sync-threadpool и застопорил весь app.
-_REQUEST_TIMEOUT_S = float(os.getenv("AGENT_REQUEST_TIMEOUT", "60"))  # на один вызов Claude
-# Дефолт 0: один вызов капится timeout'ом (60с), без ретрая он не растягивается
-# до 2×60с=120с — иначе один зависший вызов упёрся бы в 120с-таймаут бота, а
-# межитерационный дедлайн одиночный вызов не прерывает.
-_MAX_RETRIES = max(0, int(os.getenv("AGENT_MAX_RETRIES", "0")))
-_DEADLINE_S = float(os.getenv("AGENT_DEADLINE_S", "100"))  # на весь цикл (< 120с бота)
-_MAX_CONCURRENCY = max(1, int(os.getenv("AGENT_MAX_CONCURRENCY", "3")))
-_run_slots = threading.BoundedSemaphore(_MAX_CONCURRENCY)
 
 _SYSTEM_PROMPT = """\
 Ты — ops-планировщик VPN-as-a-service. Тебе дают команду оператора на естественном
@@ -71,10 +58,6 @@ _SYSTEM_PROMPT = """\
 данных (нет провайдера/баланса/ноды) — всё равно вызови submit_plan с feasible=false
 и blocked_reason. Не выдумывай id, цены и количества.
 """
-
-
-class AgentError(RuntimeError):
-    """Агент выключен, не сконфигурирован, или вызов LLM упал."""
 
 
 def _enabled() -> bool:
@@ -173,28 +156,23 @@ def plan_ops(db: Session, command: str, *, model: str | None = None) -> dict:
 
     model = model or os.getenv("AGENT_MODEL", _DEFAULT_MODEL)
     max_iter = max(1, int(os.getenv("AGENT_MAX_ITERATIONS", "12")))
-    client = anthropic.Anthropic(timeout=_REQUEST_TIMEOUT_S, max_retries=_MAX_RETRIES)
+    client = anthropic.Anthropic(**_runtime.client_kwargs())
     tools = [*ops_tools.tool_schemas(), _SUBMIT_PLAN_SCHEMA]
 
     messages: list[dict] = [
         {"role": "user", "content": f"Команда оператора:\n{command}"}
     ]
     tool_calls: list[str] = []
+    tool_cache: dict[str, str] = {}  # дедуп одинаковых read-вызовов за прогон
 
-    # Семафор: burst /ops не должен выжрать sync-threadpool и застопорить app.
-    if not _run_slots.acquire(blocking=False):
-        raise AgentError(
-            f"агент занят: уже идёт {_MAX_CONCURRENCY} планирований "
-            "(AGENT_MAX_CONCURRENCY) — повтори через минуту"
-        )
-    deadline = time.monotonic() + _DEADLINE_S
-    try:
+    # run_budget: общий семафор (ops+triage) + wall-clock дедлайн на цикл.
+    with _runtime.run_budget("ops") as deadline:
         for iteration in range(max_iter):
             # Wall-clock дедлайн на весь цикл: бэкенд не должен пережить
             # 120с-таймаут бота, продолжая крутить и биллить.
             if time.monotonic() > deadline:
                 raise AgentError(
-                    f"план не собрался за отведённое время (~{int(_DEADLINE_S)}с) — упрости команду"
+                    f"план не собрался за отведённое время (~{int(_runtime.DEADLINE_S)}с) — упрости команду"
                 )
             try:
                 resp = client.messages.create(
@@ -248,22 +226,40 @@ def plan_ops(db: Session, command: str, *, model: str | None = None) -> dict:
                         }
                     )
                     continue
+                # Дедуп: одинаковый (тул, аргументы) за прогон не бьёт повторно
+                # по API провайдера и не раздувает контекст (provider_balance/
+                # offerings — живые вызовы драйвера).
+                cache_key = (
+                    block.name
+                    + ":"
+                    + json.dumps(block.input or {}, sort_keys=True, ensure_ascii=False)
+                )
+                cached = tool_cache.get(cache_key)
+                if cached is not None:
+                    results.append(
+                        {"type": "tool_result", "tool_use_id": block.id, "content": cached}
+                    )
+                    continue
                 try:
                     out = entry["fn"](db, **(block.input or {}))
+                    content = _runtime.cap_json(out)
+                    tool_cache[cache_key] = content
                     results.append(
-                        {
-                            "type": "tool_result",
-                            "tool_use_id": block.id,
-                            "content": json.dumps(out, ensure_ascii=False),
-                        }
+                        {"type": "tool_result", "tool_use_id": block.id, "content": content}
                     )
                 except Exception as exc:  # noqa: BLE001
-                    logger.exception("ops planner tool %s failed", block.name)
+                    # redact: read-тулы расшифровывают провайдерский токен — не
+                    # тащим полный трейсбек/секреты в лог и в контекст LLM.
+                    logger.warning(
+                        "ops planner tool %s failed: %s",
+                        block.name,
+                        _runtime.redact(f"{type(exc).__name__}: {exc}"),
+                    )
                     results.append(
                         {
                             "type": "tool_result",
                             "tool_use_id": block.id,
-                            "content": f"tool error: {exc}",
+                            "content": _runtime.redact(f"tool error: {exc}"),
                             "is_error": True,
                         }
                     )
@@ -272,5 +268,3 @@ def plan_ops(db: Session, command: str, *, model: str | None = None) -> dict:
         raise AgentError(
             f"план не собрался за {max_iter} итераций (увеличь AGENT_MAX_ITERATIONS)"
         )
-    finally:
-        _run_slots.release()

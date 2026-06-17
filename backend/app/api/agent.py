@@ -31,8 +31,11 @@ class OpsPlanRequest(BaseModel):
 
 
 @router.post("/agent/triage/{node_id}")
+@limiter.limit("30/minute")  # глобальный потолок на источник
+@limiter.limit("6/minute", key_func=_ops_actor_key)  # на оператора
 def agent_triage_node(
     node_id: int,
+    request: Request,
     db: Session = Depends(get_db),
     admin_token: str = Depends(require_admin),
     admin_actor: str | None = Header(default=None, alias=ADMIN_ACTOR_HEADER),
