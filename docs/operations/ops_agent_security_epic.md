@@ -74,12 +74,21 @@ fleet-тулы строит план, но НИЧЕГО не исполняет.
   `AgentError`) — ops и triage больше не расходятся по границам. Семафор теперь
   **общий** на оба агента (суммарный кап параллельных прогонов).
 
-## Блок B — фундамент Phase 3 (7 гейтов, до исполнения)
+## Блок B — фундамент Phase 3 (7 гейтов, до исполнения) 🚧
 
-1. **Персистить план + связать confirm→execute.** Таблица `OpsPlan` (id, command,
-   полный план+params JSONB, server-cost, hash, TTL, status); `/execute` принимает
-   **только** `plan_id`, грузит сохранённый план, перепроверяет prerequisites. Никаких
-   params от клиента на исполнении.
+1. **Персистить план + связать confirm→execute.**
+   - [x] **Персист (безопасная половина, приземлено).** Таблица `ops_plans`
+         (`models.OpsPlan`, миграция `0052`): id, actor, полная NL-команда (без
+         обрезки), весь план+params JSONB, `content_hash` (sha256 каноничного
+         плана), feasible, needs_confirmation, status (`proposed`), `expires_at`
+         (TTL `OPS_PLAN_TTL_MIN`, дефолт 60м). `plan_ops` пишет КАЖДЫЙ план;
+         аудит `agent_ops_planned` теперь ссылается на реальный `plan_id` (раньше
+         target_id=0) + кладёт `content_hash`. Ответ отдаёт `plan_id`/`content_hash`/
+         `expires_at`. Это закрывает HIGH-находки по аудиту и даёт якорь для confirm.
+   - [ ] **`/execute` (решение-зависимая половина, НЕ начато).** Принимает ТОЛЬКО
+         `plan_id`, грузит сохранённый план, сверяет `content_hash`, проверяет TTL/
+         status, перепроверяет prerequisites. Никаких params от клиента. ← гейтит
+         открытый вопрос «где живёт исполнитель + канал подтверждения».
 2. **Не доверять выводу LLM.** Строгая per-kind схема params (`additionalProperties:false`),
    `kind` — закрытый enum; **сервер** пересчитывает cost из живых offerings и **сам**
    выводит `needs_confirmation` из tier; флаги модели для гейтинга игнорируются.

@@ -1002,6 +1002,41 @@ class AuditLog(Base):
     extra = Column("metadata", JSONB, nullable=True)
 
 
+class OpsPlan(Base):
+    """Сохранённый dry-run ops-план (AI_AGENT_ROADMAP Phase 2 → фундамент Phase 3).
+
+    Планировщик (``services/agent/ops.py::plan_ops``) пишет сюда КАЖДЫЙ
+    построенный план целиком — шаги, params, оценку стоимости/влияния, хэш. Это:
+
+    1. Полноценный аудит-след. Раньше в ``audit_logs`` лежал только счётчик шагов;
+       по нему нельзя восстановить, ЧТО предлагалось (provider_id/node_id/count).
+       Теперь план персистится дословно.
+    2. Фундамент Phase 3 (исполнение «по одному подтверждению»). Confirm→execute
+       ОБЯЗАН ссылаться на сохранённый план по ``id`` + ``content_hash``, чтобы
+       исполнялось РОВНО то, что оператор видел и подтвердил — без params от
+       клиента и без переплана LLM на момент confirm (TOCTOU). ``expires_at`` —
+       якорь TTL: протухший план переисполнять нельзя.
+
+    Пока НИЧЕГО не исполняется — это только запись. ``status`` — свободная строка
+    (``proposed`` сейчас; ``expired|executed|cancelled`` — для Phase 3), чтобы не
+    плодить миграции enum-типа.
+    """
+
+    __tablename__ = "ops_plans"
+
+    id = Column(Integer, primary_key=True)
+    actor = Column(String, nullable=False, index=True)  # X-Admin-Actor (TG-id)
+    command = Column(Text, nullable=False)  # полная NL-команда (без обрезки [:500])
+    model = Column(String, nullable=True)  # модель LLM
+    plan = Column(JSONB, nullable=False)  # весь план целиком (шаги/params/оценка)
+    content_hash = Column(String(64), nullable=False)  # sha256 каноничного плана
+    feasible = Column(Boolean, nullable=True)
+    needs_confirmation = Column(Boolean, nullable=True)
+    status = Column(String, nullable=False, default="proposed", server_default="proposed")
+    created_at = Column(DateTime, default=utcnow, index=True)
+    expires_at = Column(DateTime, nullable=True)  # TTL-якорь для Phase 3 confirm
+
+
 class ReferralCode(Base):
     """Referral invite code owned by a user.
 

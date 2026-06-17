@@ -82,3 +82,35 @@ def test_plan_ops_empty_command_raises(monkeypatch: pytest.MonkeyPatch, db_sessi
     monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key-not-used")
     with pytest.raises(ops.AgentError, match="пустая команда"):
         ops.plan_ops(db_session, "   ")
+
+
+def test_ops_plan_persist_roundtrip(db_session: Session) -> None:
+    # Фундамент Phase 3: план персистится целиком (шаги/params), id+hash —
+    # якорь для confirm→execute. conftest гоняет alembic-миграции → тест
+    # заодно валидирует миграцию 0052 и модель OpsPlan.
+    p = models.OpsPlan(
+        actor="123",
+        command="закажи 2 ноды в германии, подними туннель",
+        model="claude-sonnet-4-6",
+        plan={
+            "summary": "заказ 2 нод",
+            "feasible": True,
+            "steps": [{"kind": "order_node", "tier": "costly", "params": {"count": 2}}],
+            "needs_confirmation": True,
+        },
+        content_hash="ab" * 32,  # 64 hex
+        feasible=True,
+        needs_confirmation=True,
+        status="proposed",
+    )
+    db_session.add(p)
+    db_session.commit()
+    db_session.refresh(p)
+
+    assert p.id is not None
+    assert p.created_at is not None  # default=utcnow
+    got = db_session.get(models.OpsPlan, p.id)
+    assert got.command == "закажи 2 ноды в германии, подними туннель"
+    assert got.plan["steps"][0]["params"]["count"] == 2
+    assert got.status == "proposed"
+    assert len(got.content_hash) == 64

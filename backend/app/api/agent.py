@@ -6,6 +6,11 @@ AGENT_ENABLED; требует ANTHROPIC_API_KEY. Мутаций инфры не�
 """
 from __future__ import annotations
 
+import hashlib
+import json
+import os
+from datetime import timedelta
+
 from fastapi import APIRouter, Depends, Header, HTTPException, Request
 from pydantic import BaseModel
 from slowapi.util import get_remote_address
@@ -14,6 +19,7 @@ from sqlalchemy.orm import Session
 from .. import models
 from ..auth import require_admin
 from ..rate_limit import limiter
+from ..time_utils import utcnow
 from ._common import ADMIN_ACTOR_HEADER, _audit, _resolve_admin_actor, get_db
 
 router = APIRouter()
@@ -95,12 +101,33 @@ def agent_ops_plan(
 
     plan = result.get("plan") or {}
     actor, actor_type = _resolve_admin_actor(admin_actor)
+
+    # Персист всего плана: полный аудит-след + фундамент Phase 3 confirm-binding
+    # (исполнение обязано ссылаться на план по id+content_hash, чтобы исполнялось
+    # ровно то, что подтвердил оператор — без params от клиента и без переплана).
+    canonical = json.dumps(plan, sort_keys=True, ensure_ascii=False)
+    content_hash = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    ttl_min = max(1, int(os.getenv("OPS_PLAN_TTL_MIN", "60")))
+    ops_plan = models.OpsPlan(
+        actor=actor,
+        command=payload.command,
+        model=result.get("model"),
+        plan=plan,
+        content_hash=content_hash,
+        feasible=plan.get("feasible"),
+        needs_confirmation=plan.get("needs_confirmation"),
+        status="proposed",
+        expires_at=utcnow() + timedelta(minutes=ttl_min),
+    )
+    db.add(ops_plan)
+    db.flush()  # получить id до записи аудита
+
     _audit(
         db,
         actor,
         "agent_ops_planned",
         "ops_plan",
-        0,
+        ops_plan.id,
         actor_type=actor_type,
         metadata={
             "command": payload.command[:500],
@@ -110,7 +137,15 @@ def agent_ops_plan(
             "feasible": plan.get("feasible"),
             "needs_confirmation": plan.get("needs_confirmation"),
             "steps": len(plan.get("steps") or []),
+            "plan_id": ops_plan.id,
+            "content_hash": content_hash,
         },
     )
     db.commit()
+
+    # Отдаём ссылку на сохранённый план — будущий confirm-эндпоинт примет ТОЛЬКО
+    # plan_id (+ свериться по content_hash), а не сырой план от клиента.
+    result["plan_id"] = ops_plan.id
+    result["content_hash"] = content_hash
+    result["expires_at"] = ops_plan.expires_at.isoformat()
     return result
