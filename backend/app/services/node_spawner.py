@@ -92,6 +92,24 @@ def _gen_root_password(length: int = 20) -> str:
     return "".join(secrets.choice(_PW_ALPHABET) for _ in range(length))
 
 
+def _display_region(driver, region_id: str) -> str:
+    """Человекочитаемое имя региона по id датацентра хостера — для
+    ``VPNNode.region`` (сырой id остаётся в ``provider_region``). Без этого в
+    админке светилась голая «3» (id ДЦ VDSina/UFO) вместо «Russia». Резолвим
+    через ``list_datacenters`` (id→country/name); драйверы без каталога ДЦ
+    (hetzner и т.п.) или офлайн-сбой → фолбэк на сам id, как было раньше."""
+    lister = getattr(driver, "list_datacenters", None)
+    if not callable(lister):
+        return str(region_id)
+    try:
+        for dc in lister():
+            if str(dc.get("id")) == str(region_id):
+                return str(dc.get("country") or dc.get("name") or region_id)
+    except Exception:  # noqa: BLE001 — оффлайн-резолв имени не должен ронять заказ
+        pass
+    return str(region_id)
+
+
 def _wait_for_ssh(
     host: str, port: int = 22, *, timeout_s: int | None = None, interval: int = 10
 ) -> bool:
@@ -300,7 +318,7 @@ def spawn_node(
 
     node = models.VPNNode(
         name=name,
-        region=region,
+        region=_display_region(driver, region),
         host=server.ipv4,
         status=models.VPNNodeStatus.registering,
         is_active=True,
@@ -421,7 +439,7 @@ def spawn_node_async(
 
     node = models.VPNNode(
         name=name,
-        region=region,
+        region=_display_region(driver, region),
         host=SPAWN_PLACEHOLDER_HOST,  # реальный IP проставит _finalize_spawn
         status=models.VPNNodeStatus.registering,
         is_active=False,  # вне choose_node, пока нет настоящего IP
@@ -782,7 +800,7 @@ def spawn_exit_async(
     public_key, private_key = generate_wireguard_keypair()
     exit_node = models.WGExitNode(
         name=name,
-        region=region,
+        region=_display_region(driver, region),
         host=SPAWN_PLACEHOLDER_HOST,  # реальный IP проставит _finalize_exit_spawn
         status=models.WGExitNodeStatus.registering,
         is_active=False,  # вне привязки, пока нет реального IP
