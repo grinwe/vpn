@@ -11,7 +11,7 @@ from sqlalchemy.orm import Session
 
 from app import models
 from app.security import encrypt
-from app.services.agent import ops, ops_tools
+from app.services.agent import ops, ops_execution, ops_tools
 
 
 def _provider(db: Session) -> models.CloudProvider:
@@ -114,3 +114,117 @@ def test_ops_plan_persist_roundtrip(db_session: Session) -> None:
     assert got.plan["steps"][0]["params"]["count"] == 2
     assert got.status == "proposed"
     assert len(got.content_hash) == 64
+
+
+# ── validate_plan (Phase 3 gate 2/3/6, без сети/исполнения) ──
+
+
+def _ops_plan(steps: list[dict], *, feasible: bool = True) -> models.OpsPlan:
+    return models.OpsPlan(
+        actor="1", command="c", model="m",
+        plan={"feasible": feasible, "summary": "s", "steps": steps},
+        content_hash="0" * 64,
+    )
+
+
+def _active_node(db: Session, name: str, host: str) -> models.VPNNode:
+    n = models.VPNNode(
+        name=name, region="ru", host=host,
+        status=models.VPNNodeStatus.active, is_active=True,
+    )
+    db.add(n)
+    db.commit()
+    db.refresh(n)
+    return n
+
+
+def test_validate_rejects_unknown_kind(db_session: Session) -> None:
+    res = ops_execution.validate_plan(db_session, _ops_plan([{"kind": "nuke", "params": {}}]))
+    assert not res["ok"]
+    assert any("allowlist" in r for r in res["rejections"])
+
+
+def test_validate_order_ok_server_tier_overrides_llm(db_session: Session) -> None:
+    p = _provider(db_session)
+    res = ops_execution.validate_plan(
+        db_session,
+        # LLM наврал tier=read на платном заказе — сервер должен поставить costly.
+        _ops_plan([{"kind": "order_node", "tier": "read",
+                    "params": {"provider_id": p.id, "count": 2}}]),
+    )
+    assert res["ok"], res["rejections"]
+    assert res["steps"][0]["tier"] == "costly"
+    assert res["needs_confirmation"] is True
+    assert res["totals"]["order_count"] == 2
+
+
+def test_validate_count_cap(db_session: Session, monkeypatch: pytest.MonkeyPatch) -> None:
+    p = _provider(db_session)
+    monkeypatch.setenv("OPS_MAX_ORDER_COUNT", "3")
+    res = ops_execution.validate_plan(
+        db_session,
+        _ops_plan([{"kind": "order_node", "params": {"provider_id": p.id, "count": 9}}]),
+    )
+    assert not res["ok"]
+    assert any("OPS_MAX_ORDER_COUNT" in r for r in res["rejections"])
+
+
+def test_validate_max_nodes_per_plan(db_session: Session, monkeypatch: pytest.MonkeyPatch) -> None:
+    p = _provider(db_session)
+    monkeypatch.setenv("OPS_MAX_ORDER_COUNT", "5")
+    monkeypatch.setenv("OPS_MAX_NODES_PER_PLAN", "2")
+    res = ops_execution.validate_plan(
+        db_session,
+        _ops_plan([
+            {"kind": "order_node", "params": {"provider_id": p.id, "count": 2}},
+            {"kind": "order_node", "params": {"provider_id": p.id, "count": 2}},
+        ]),
+    )
+    assert not res["ok"]
+    assert any("OPS_MAX_NODES_PER_PLAN" in r for r in res["rejections"])
+
+
+def test_validate_provider_not_found(db_session: Session) -> None:
+    res = ops_execution.validate_plan(
+        db_session,
+        _ops_plan([{"kind": "order_node", "params": {"provider_id": 999999, "count": 1}}]),
+    )
+    assert not res["ok"]
+    assert any("не найден" in r for r in res["rejections"])
+
+
+def test_validate_destructive_invariant_blocks(
+    db_session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    node = _active_node(db_session, "ru-node-d1", "9.9.9.1")
+    monkeypatch.setattr(ops_execution, "_assigned_subscriptions", lambda db, nid: 5)
+    res = ops_execution.validate_plan(
+        db_session, _ops_plan([{"kind": "destroy", "params": {"node_id": node.id}}])
+    )
+    assert not res["ok"]
+    assert any("gate 6" in r for r in res["rejections"])
+
+
+def test_validate_destructive_ok_after_migrate(
+    db_session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    src = _active_node(db_session, "ru-node-d2", "9.9.9.2")
+    dst = _active_node(db_session, "ru-node-d3", "9.9.9.3")
+    monkeypatch.setattr(ops_execution, "_assigned_subscriptions", lambda db, nid: 5)
+    res = ops_execution.validate_plan(
+        db_session,
+        _ops_plan([
+            {"kind": "migrate_users",
+             "params": {"from_node_id": src.id, "to_node_id": dst.id}},
+            {"kind": "destroy", "params": {"node_id": src.id}},
+        ]),
+    )
+    assert res["ok"], res["rejections"]
+    assert res["totals"]["destructive"] == 2
+
+
+def test_validate_feasible_false_rejected(db_session: Session) -> None:
+    res = ops_execution.validate_plan(
+        db_session, _ops_plan([{"kind": "set_active", "params": {}}], feasible=False)
+    )
+    assert not res["ok"]
