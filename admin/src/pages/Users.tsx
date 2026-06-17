@@ -1128,7 +1128,7 @@ export default function Users() {
                             }}
                             className="text-xs px-2 py-1 rounded bg-red-700 hover:bg-red-600 disabled:opacity-50"
                           >
-                            revoke now
+                            ⏸ Отключить
                           </button>
                         )}
                         {s.status === "active" && (
@@ -1182,14 +1182,18 @@ export default function Users() {
                             onClick={() => {
                               if (
                                 confirm(
-                                  `Включить подписку #${s.id}?\n\nБудет перепровижнен один девайс через Ansible.`
+                                  `Реактивировать подписку #${s.id} (сейчас ${s.status})?\n\n` +
+                                    `Статус → active, перепровижн одного девайса через Ansible. ` +
+                                    `frozen разморозится с сохранением токена и годового бюджета. ` +
+                                    `Если срок истёк (expired) — продлится на срок плана.`
                                 )
                               )
                                 enableSub.mutate(s.id);
                             }}
+                            title="Вернуть подписку в active: expired/blocked → active+reprovision (expired продлевается на срок плана), frozen → unfreeze."
                             className="text-xs px-2 py-1 rounded bg-emerald-700 hover:bg-emerald-600 disabled:opacity-50"
                           >
-                            enable
+                            {enableSub.isPending ? "…" : "✅ Реактивировать"}
                           </button>
                         )}
                         {s.sharing_blocked && (

@@ -7,6 +7,8 @@ those are webapp-JWT gated.
 """
 from __future__ import annotations
 
+from datetime import timedelta
+
 from fastapi import APIRouter, Depends, Header, HTTPException, Query
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
@@ -594,6 +596,11 @@ def enable_subscription(
     * ``blocked`` / ``expired`` → flipped back to ``active`` and
       reprovisioned. Caller is responsible for having topped up the
       balance first — we don't gate on it, just resume.
+
+    For a LAPSED term (``expires_at`` in the past — i.e. ``expired``, or a
+    ``blocked`` sub that also outlived its term) we bump ``expires_at`` by the
+    plan's ``duration_days``. Without it the expiry tick would re-flag the sub
+    ``expired`` on its next run and the resume would silently bounce back.
     """
     from ..services import balance as balance_svc
 
@@ -609,9 +616,16 @@ def enable_subscription(
         except RuntimeError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
     else:
+        now = utcnow()
+        # Истёкший срок продлеваем на срок плана — иначе expiry-тик worker'а
+        # снова пометит sub `expired` и резюм отвалится. blocked с ещё живым
+        # сроком не трогаем (не дарим лишних дней).
+        if sub.expires_at is None or sub.expires_at < now:
+            days = sub.plan.duration_days if sub.plan else 30
+            sub.expires_at = now + timedelta(days=days)
         sub.status = models.SubscriptionStatus.active
         sub.notes = None
-        sub.next_charge_at = utcnow()
+        sub.next_charge_at = now
         db.add(sub)
         db.flush()
         orchestrator = ProvisioningOrchestrator(db)
@@ -637,6 +651,7 @@ def enable_subscription(
     return {
         "subscription_id": sub.id,
         "status": sub.status.value,
+        "expires_at": sub.expires_at.isoformat() if sub.expires_at else None,
     }
 
 
