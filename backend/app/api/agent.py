@@ -14,6 +14,7 @@ from datetime import timedelta
 from fastapi import APIRouter, Depends, Header, HTTPException, Request
 from pydantic import BaseModel
 from slowapi.util import get_remote_address
+from sqlalchemy import update
 from sqlalchemy.orm import Session
 
 from .. import models
@@ -149,3 +150,112 @@ def agent_ops_plan(
     result["content_hash"] = content_hash
     result["expires_at"] = ops_plan.expires_at.isoformat()
     return result
+
+
+class OpsExecuteRequest(BaseModel):
+    plan_id: int
+
+
+@router.post("/agent/ops/execute")
+@limiter.limit("30/minute")
+@limiter.limit("6/minute", key_func=_ops_actor_key)
+def agent_ops_execute(
+    payload: OpsExecuteRequest,
+    request: Request,
+    db: Session = Depends(get_db),
+    admin_token: str = Depends(require_admin),
+    admin_actor: str | None = Header(default=None, alias=ADMIN_ACTOR_HEADER),
+):
+    """Исполнить РАНЕЕ СОХРАНЁННЫЙ план по ``plan_id`` (Phase 3, за флагом
+    OPS_EXECUTE_ENABLED). Принимает ТОЛЬКО ``plan_id`` — никаких params от клиента
+    (исполняется ровно то, что планировщик сохранил и оператор подтвердил).
+
+    Синхронно: грузит план → проверяет флаг/статус/TTL → ре-валидирует (быстрый
+    отказ до постановки в очередь) → армит (status=executing) → энкьюит RQ-джобу
+    ``run_ops_plan_execute``. Тяжёлая работа (pre-flight по живым ценам/балансу,
+    заказ нод) — в воркере. Денежные/destructive гарды — в валидаторе и pre-flight,
+    НЕ здесь."""
+    from ..services.agent.ops_execution import execute_enabled, validate_plan
+
+    if not execute_enabled():
+        raise HTTPException(
+            status_code=503, detail="исполнение планов выключено (OPS_EXECUTE_ENABLED=0)"
+        )
+
+    plan = db.get(models.OpsPlan, payload.plan_id)
+    if not plan:
+        raise HTTPException(status_code=404, detail="plan not found")
+    if plan.status != "proposed":
+        raise HTTPException(
+            status_code=409, detail=f"план в статусе {plan.status} — исполнить нельзя"
+        )
+    if plan.expires_at and plan.expires_at < utcnow():
+        plan.status = "expired"
+        db.commit()
+        raise HTTPException(status_code=409, detail="план протух (TTL) — построй заново")
+
+    # Быстрый отказ до очереди: ре-валидация (флот мог измениться).
+    validated = validate_plan(db, plan)
+    if not validated["ok"]:
+        raise HTTPException(
+            status_code=422,
+            detail="план не исполним: " + "; ".join(validated["rejections"][:5]),
+        )
+
+    actor, actor_type = _resolve_admin_actor(admin_actor)
+
+    # АТОМАРНЫЙ арминг: условный UPDATE proposed→executing под row-lock. Это
+    # единственная защита от двойного заказа — in-Python read-check-write под
+    # READ COMMITTED гонится (два параллельных POST оба видят proposed). rowcount=0
+    # → план уже армлен/исполнен/протух → 409. (См. ops-executor-review: CRITICAL.)
+    armed = db.execute(
+        update(models.OpsPlan)
+        .where(models.OpsPlan.id == plan.id, models.OpsPlan.status == "proposed")
+        .values(status="executing")
+    ).rowcount
+    if not armed:
+        db.rollback()
+        raise HTTPException(
+            status_code=409, detail="план уже исполняется или исполнен (гонка)"
+        )
+    _audit(
+        db, actor, "agent_ops_execute_armed", "ops_plan", plan.id,
+        actor_type=actor_type,
+        metadata={
+            "content_hash": plan.content_hash,
+            "needs_confirmation": validated["needs_confirmation"],
+            "order_count": validated["totals"]["order_count"],
+            "destructive": validated["totals"]["destructive"],
+        },
+    )  # _audit коммитит арм+аудит одной транзакцией
+
+    def _disarm() -> None:
+        db.execute(
+            update(models.OpsPlan)
+            .where(models.OpsPlan.id == plan.id, models.OpsPlan.status == "executing")
+            .values(status="proposed")
+        )
+        db.commit()
+
+    from ..queue import get_queue
+
+    queue = get_queue()
+    if queue is None:
+        _disarm()  # иначе план застрянет executing навсегда
+        raise HTTPException(status_code=503, detail="очередь недоступна")
+    try:
+        # Детерминированный job_id — RQ схлопывает дубли (belt-and-suspenders к
+        # атомарному армингу против at-least-once доставки).
+        job = queue.enqueue(
+            "app.worker.run_ops_plan_execute",
+            plan.id,
+            job_id=f"ops-exec-{plan.id}",
+            job_timeout=1800,
+        )
+    except Exception as exc:  # noqa: BLE001
+        _disarm()
+        raise HTTPException(
+            status_code=503, detail=f"не удалось поставить job: {exc}"
+        ) from exc
+
+    return {"status": "enqueued", "plan_id": plan.id, "job_id": job.id}

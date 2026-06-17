@@ -228,3 +228,151 @@ def test_validate_feasible_false_rejected(db_session: Session) -> None:
         db_session, _ops_plan([{"kind": "set_active", "params": {}}], feasible=False)
     )
     assert not res["ok"]
+
+
+# ── execute_plan (Phase 3 исполнитель, за флагом; pre-flight/dispatch замоканы) ──
+
+
+def _persist_plan(
+    db: Session, steps: list[dict], *, status: str = "proposed"
+) -> models.OpsPlan:
+    p = models.OpsPlan(
+        actor="1", command="c", model="m",
+        plan={"feasible": True, "summary": "s", "steps": steps},
+        content_hash="0" * 64, status=status,
+    )
+    db.add(p)
+    db.commit()
+    db.refresh(p)
+    return p
+
+
+def test_execute_disabled_raises(
+    db_session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("OPS_EXECUTE_ENABLED", raising=False)
+    p = _persist_plan(db_session, [{"kind": "set_active", "params": {}}])
+    with pytest.raises(ops_execution.OpsExecError, match="выключено"):
+        ops_execution.execute_plan(db_session, p)
+
+
+def test_execute_terminal_status_raises(
+    db_session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("OPS_EXECUTE_ENABLED", "1")
+    p = _persist_plan(db_session, [{"kind": "set_active", "params": {}}], status="executed")
+    with pytest.raises(ops_execution.OpsExecError, match="повторное"):
+        ops_execution.execute_plan(db_session, p)
+
+
+def test_execute_validation_fail_marks_failed(
+    db_session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("OPS_EXECUTE_ENABLED", "1")
+    p = _persist_plan(db_session, [{"kind": "nuke", "params": {}}])
+    with pytest.raises(ops_execution.OpsExecError, match="валидацию"):
+        ops_execution.execute_plan(db_session, p)
+    db_session.refresh(p)
+    assert p.status == "failed"
+    assert p.execution["phase"] == "validate"
+
+
+def test_execute_preflight_fail_marks_failed(
+    db_session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("OPS_EXECUTE_ENABLED", "1")
+    prov = _provider(db_session)
+    p = _persist_plan(db_session, [
+        {"kind": "order_node",
+         "params": {"provider_id": prov.id, "count": 1, "region": "de", "plan": "cx01"}},
+    ])
+    monkeypatch.setattr(
+        ops_execution, "_preflight",
+        lambda db, v: {"ok": False, "reasons": ["баланс мал"], "total_cost": 0, "step_costs": {}},
+    )
+    with pytest.raises(ops_execution.OpsExecError, match="pre-flight"):
+        ops_execution.execute_plan(db_session, p)
+    db_session.refresh(p)
+    assert p.status == "failed"
+    assert p.execution["phase"] == "preflight"
+
+
+def test_execute_happy_path_order(
+    db_session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("OPS_EXECUTE_ENABLED", "1")
+    prov = _provider(db_session)
+    p = _persist_plan(db_session, [
+        {"kind": "order_node",
+         "params": {"provider_id": prov.id, "count": 2, "region": "de", "plan": "cx01"}},
+    ])
+    monkeypatch.setattr(
+        ops_execution, "_preflight",
+        lambda db, v: {"ok": True, "reasons": [], "total_cost": 1180.0, "step_costs": {0: 1180.0}},
+    )
+    monkeypatch.setattr(ops_execution, "_exec_order_node", lambda db, step, plan_id: ([101, 102], None))
+    res = ops_execution.execute_plan(db_session, p)
+    assert res["status"] == "executed"
+    db_session.refresh(p)
+    assert p.status == "executed"
+    assert p.execution["steps"][0]["created_node_ids"] == [101, 102]
+
+
+def test_execute_partial_on_unsupported_kind(
+    db_session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("OPS_EXECUTE_ENABLED", "1")
+    prov = _provider(db_session)
+    p = _persist_plan(db_session, [
+        {"kind": "order_node",
+         "params": {"provider_id": prov.id, "count": 1, "region": "de", "plan": "cx01"}},
+        {"kind": "set_active", "params": {}},
+    ])
+    monkeypatch.setattr(
+        ops_execution, "_preflight",
+        lambda db, v: {"ok": True, "reasons": [], "total_cost": 590.0, "step_costs": {0: 590.0}},
+    )
+    monkeypatch.setattr(ops_execution, "_exec_order_node", lambda db, step, plan_id: ([201], None))
+    res = ops_execution.execute_plan(db_session, p)
+    # исполнимая часть (order) прошла → executed; skipped помечены, не downgrade'ят.
+    assert res["status"] == "executed"
+    db_session.refresh(p)
+    statuses = {s["kind"]: s["status"] for s in p.execution["steps"]}
+    assert statuses["order_node"] == "done"
+    assert statuses["set_active"] == "skipped"
+    assert p.execution["skipped"] == 1
+
+
+def test_execute_partial_failure_keeps_created_ids(
+    db_session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Сбой на середине заказа: уже оплаченные ноды должны остаться в отчёте.
+    monkeypatch.setenv("OPS_EXECUTE_ENABLED", "1")
+    prov = _provider(db_session)
+    p = _persist_plan(db_session, [
+        {"kind": "order_node",
+         "params": {"provider_id": prov.id, "count": 3, "region": "de", "plan": "cx01"}},
+    ])
+    monkeypatch.setattr(
+        ops_execution, "_preflight",
+        lambda db, v: {"ok": True, "reasons": [], "total_cost": 1770.0, "step_costs": {0: 1770.0}},
+    )
+    # заказала 1, упала на 2-й — created=[301], error
+    monkeypatch.setattr(ops_execution, "_exec_order_node", lambda db, step, plan_id: ([301], "DriverError: boom"))
+    res = ops_execution.execute_plan(db_session, p)
+    assert res["status"] == "failed"
+    db_session.refresh(p)
+    step0 = p.execution["steps"][0]
+    assert step0["status"] == "failed"
+    assert step0["created_node_ids"] == [301]  # оплаченная нода не потеряна
+
+
+def test_validate_order_bad_pool_id_rejected(db_session: Session) -> None:
+    prov = _provider(db_session)
+    res = ops_execution.validate_plan(
+        db_session,
+        _ops_plan([{"kind": "order_node",
+                    "params": {"provider_id": prov.id, "count": 1, "pool_id": 999999}}]),
+    )
+    assert not res["ok"]
+    assert any("pool_id" in r for r in res["rejections"])

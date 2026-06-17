@@ -2211,6 +2211,33 @@ def dlq_exception_handler(job, exc_type, exc_value, tb):  # noqa: ARG001
     return True  # let RQ continue its normal failure flow
 
 
+def run_ops_plan_execute(plan_id: int) -> dict:
+    """RQ-джоба: исполнить сохранённый ops-план (Phase 3, за флагом
+    OPS_EXECUTE_ENABLED). Эндпоинт ``/api/agent/ops/execute`` армит план
+    (status=executing) и энкьюит сюда; вся тяжёлая работа (ре-валидация,
+    pre-flight по живым ценам/балансу, заказ нод через spawn_node_async) — тут,
+    без HTTP-таймаута. Результат пишется в ``ops_plans.execution``."""
+    from . import models
+    from .db import SessionLocal
+    from .services.agent.ops_execution import OpsExecError, execute_plan
+
+    session = SessionLocal()
+    try:
+        plan = session.get(models.OpsPlan, plan_id)
+        if not plan:
+            return {"ok": False, "error": f"ops_plan {plan_id} not found"}
+        result = execute_plan(session, plan)
+        return {"ok": True, **result}
+    except OpsExecError as exc:
+        logger.warning("ops plan %s execution rejected/failed: %s", plan_id, exc)
+        return {"ok": False, "error": str(exc)}
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("ops plan %s execution crashed", plan_id)
+        return {"ok": False, "error": str(exc)}
+    finally:
+        session.close()
+
+
 def main() -> None:
     from .logging_config import configure_logging
     # ``schedule_tick`` тут критически важный импорт: все 8 bootstrap'ов

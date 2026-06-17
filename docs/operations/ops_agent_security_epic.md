@@ -85,39 +85,71 @@ fleet-тулы строит план, но НИЧЕГО не исполняет.
          аудит `agent_ops_planned` теперь ссылается на реальный `plan_id` (раньше
          target_id=0) + кладёт `content_hash`. Ответ отдаёт `plan_id`/`content_hash`/
          `expires_at`. Это закрывает HIGH-находки по аудиту и даёт якорь для confirm.
-   - [ ] **`/execute` (решение-зависимая половина, НЕ начато).** Принимает ТОЛЬКО
-         `plan_id`, грузит сохранённый план, сверяет `content_hash`, проверяет TTL/
-         status, перепроверяет prerequisites. Никаких params от клиента. ← гейтит
-         открытый вопрос «где живёт исполнитель + канал подтверждения».
+   - [x] **`/execute` (приземлено, за флагом `OPS_EXECUTE_ENABLED=0`).** `POST
+         /api/agent/ops/execute {plan_id}` — принимает ТОЛЬКО `plan_id`, грузит
+         план, проверяет флаг/status/TTL, ре-валидирует, **атомарно армит**
+         (условный UPDATE proposed→executing под row-lock — анти-двойной-заказ),
+         энкьюит RQ-джобу `run_ops_plan_execute` (детерминированный `job_id`).
+         Воркер (`execute_plan`) перепроверяет TTL + `content_hash` (целостность),
+         ре-валидирует, pre-flight, исполняет. Колонка `ops_plans.execution`
+         (миграция `0053`) — per-step результат.
 2. **Не доверять выводу LLM.**
    - [x] **Валидатор (структурная/DB-часть, приземлено):** `services/agent/ops_execution.py::validate_plan`
          — закрытый allowlist `kind` (reject `other`/неизвестных), ре-резолв
          `provider_id`/`node_id`/`exit_id` в существующие (активные) строки, серверный
          tier из `kind` (флаг модели игнор), серверный `needs_confirmation`. Покрыт
          тестами (без сети).
-   - [ ] **Сетевой pre-flight (в исполнителе):** регион/тариф/ОС по живым offerings,
-         пересчёт cost = цена×count, проверка баланса — перед каждым costly-шагом.
+   - [x] **Сетевой pre-flight (`_preflight`):** регион/тариф по живым offerings,
+         cost = цена×count, проверка баланса провайдера — перед заказом. Диспетчер
+         читает ТОЛЬКО `step["resolved"]` (валидированный спек), не сырые params.
 3. **Spend-cap / max_nodes / rate-limit** на costly/destructive — жёстко на сервере.
-   - [x] **Структурные капы:** `OPS_MAX_ORDER_COUNT` (на шаг) + `OPS_MAX_NODES_PER_PLAN`
-         (на план) в валидаторе.
-   - [ ] **Денежный spend-cap** (`OPS_MAX_SPEND_RUB`) по реальным ценам — pre-flight.
+   - [x] **Структурные капы:** `OPS_MAX_ORDER_COUNT` + `OPS_MAX_NODES_PER_PLAN` (валидатор).
+   - [x] **Денежный spend-cap** (`OPS_MAX_SPEND_RUB`) по реальным ценам — в `_preflight`.
 4. **Scoped-токен вместо мастер-ключа.** `agent:plan`/`agent:execute` в `api_tokens`;
    `actor_type=agent` (добавить значение в `AuditActor`); аппрув привязан к
    аутентифицированному принципалу, а не к подделываемому `X-Admin-Actor`. — НЕ начато.
-5. **Исполнение через валидированные пути** (`node_spawner.spawn_node`/`destroy_node`,
-   существующий provisioning), а не прямой `get_driver()` — per-action аудит,
-   валидация, скоуп (принцип #2). — НЕ начато.
+5. **Исполнение через валидированные пути.**
+   - [x] **order_node → `spawn_node_async`** (тот же путь, что кнопка «Заказать
+         ноду», не raw driver). Остальные kind'ы исполнитель пока ЯВНО пропускает
+         (skipped) — непротестированные destructive-пути не стреляют.
+   - [ ] **destroy/reinstall/migrate/tunnel** — отдельными ревьюируемыми проходами.
 6. **destructive ≠ costly.**
    - [x] **Server-derive tier + инвариант** «нельзя `destroy`/`reinstall` ноду с
-         `assigned_subscriptions>0`, пока в плане раньше нет `migrate_users` с неё»
-         — в валидаторе, покрыт тестами.
-   - [ ] **Усиленный ack** для destructive поверх обычной кнопки confirm.
-7. **Идемпотентность/откат.** Per-step id + idempotency key + статусы; политика
-   частичного отказа (не сносить старую ноду, пока новая не здорова и юзеры не
-   мигрированы). — НЕ начато (исполнитель).
+         `assigned_subscriptions>0` без предшествующей `migrate_users`» — валидатор.
+   - [ ] **Усиленный ack** — оператор отказался от PIN; берём обычную кнопку confirm.
+7. **Идемпотентность/откат.**
+   - [x] **Идемпотентность:** атомарный арм (proposed→executing условным UPDATE) +
+         детерминированный `job_id` + отказ от терминальных статусов. Stop-on-first-
+         failure; created-id оплаченных нод сохраняются даже при сбое на середине.
+   - [ ] **Авто-recovery** застрявших `executing` (sweep/reaper) — НЕ начато (manual reset).
 
 Плюс: **data-fence** в системном промпте (тул-вывод = ДАННЫЕ, не инструкции) +
 слугификация `region` перед сохранением (mirror `validate_node_name`).
+
+### Исполнитель MVP — adversarial-ревью (2026-06-17, перед коммитом)
+
+Фокусный ревью деньги-тратящего кода: **19 находок (3 critical, 5 high, 3 medium,
+8 low), все confirmed.** Исправлено перед коммитом:
+- **CRITICAL ×3 + HIGH (двойной заказ):** неатомарный арминг (read-check-write под
+  READ COMMITTED) + нет идемпотентности джобы → два POST'а / re-enqueue заказывали
+  ноды дважды. → **атомарный условный UPDATE** + детерминированный `job_id`.
+- **HIGH `pool_id`** из сырых params → деньги потрачены, потом FK-падение на commit.
+  → валидируем `pool_id` (резолв в `ServerPool`) до заказа.
+- **HIGH/MEDIUM** потеря id оплаченных нод при сбое на середине → `_exec_order_node`
+  возвращает created даже при ошибке.
+- **LOW:** TTL не перепроверялся в воркере → добавлено; `content_hash` не сверялся →
+  сверяем (ловит мутацию плана); семантика `partial`/`executed`; безопасный парсинг
+  env-капов (set-but-empty не обнуляет cap молча).
+
+**Известные ограничения (приняты для MVP):** только `order_node` исполняется;
+застрявший `executing` чинится вручную (нет reaper); баланс-TOCTOU между pre-flight
+и заказом ограничен провайдерским отказом при заказе + spend-cap; `image` валидирует
+драйвер (битый → провайдер отклоняет заказ до списания); нет глобального
+кумулятивного fleet-cost кэпа (только per-execution).
+
+### Осталось до бот-доступности
+- **Бот:** inline-кнопка «Исполнить» под планом → callback с `plan_id` → `/execute`.
+- **Включение:** `OPS_EXECUTE_ENABLED=1` (через ansible) — только после бота + проверки.
 
 ## Решения (2026-06-17, с оператором)
 

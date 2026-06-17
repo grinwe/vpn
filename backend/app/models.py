@@ -1035,6 +1035,9 @@ class OpsPlan(Base):
     status = Column(String, nullable=False, default="proposed", server_default="proposed")
     created_at = Column(DateTime, default=utcnow, index=True)
     expires_at = Column(DateTime, nullable=True)  # TTL-якорь для Phase 3 confirm
+    # Результат исполнения (per-step статусы/созданные ноды/стоимость) — для
+    # отчёта оператору; пишется исполнителем. None пока план не исполнялся.
+    execution = Column(JSONB, nullable=True)
 
 
 class ReferralCode(Base):

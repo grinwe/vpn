@@ -25,6 +25,9 @@ pre-flight исполнителя — отдельно, чтобы этот сл
 """
 from __future__ import annotations
 
+import hashlib
+import json
+import logging
 import os
 from typing import Any
 
@@ -32,6 +35,23 @@ from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from ... import models
+from ...time_utils import utcnow
+from . import _runtime
+
+logger = logging.getLogger(__name__)
+
+
+def _env_num(name: str, default: str, cast):
+    """Безопасный разбор env-кнобов: пустое/мусор → дефолт (+warning), не падаем
+    и НЕ обнуляем cap молча (set-but-empty иначе вернул бы '' и упал/обнулил)."""
+    raw = os.getenv(name)
+    if raw is None or raw.strip() == "":
+        return cast(default)
+    try:
+        return cast(raw)
+    except (TypeError, ValueError):
+        logger.warning("ops: bad %s=%r — беру дефолт %s", name, raw, default)
+        return cast(default)
 
 # Серверная карта kind → tier (НЕ доверяем tier от LLM).
 _KIND_TIER: dict[str, str] = {
@@ -48,11 +68,11 @@ _DESTRUCTIVE_KINDS = frozenset({"reinstall", "destroy"})
 
 
 def _max_order_count() -> int:
-    return max(1, int(os.getenv("OPS_MAX_ORDER_COUNT", "5")))
+    return max(1, _env_num("OPS_MAX_ORDER_COUNT", "5", int))
 
 
 def _max_nodes_per_plan() -> int:
-    return max(1, int(os.getenv("OPS_MAX_NODES_PER_PLAN", "5")))
+    return max(1, _env_num("OPS_MAX_NODES_PER_PLAN", "5", int))
 
 
 def _assigned_subscriptions(db: Session, node_id: int) -> int:
@@ -143,6 +163,22 @@ def validate_plan(db: Session, ops_plan: models.OpsPlan) -> dict[str, Any]:
             else:
                 resolved["count"] = count
                 order_count += count
+            # pool_id (FK): если задан — обязан резолвиться, иначе spawn потратит
+            # деньги и упадёт на db.commit() с битым FK → осиротевший платный сервер.
+            pool_id = params.get("pool_id")
+            if pool_id is not None:
+                pool_int = _as_int(pool_id)
+                if pool_int is None or not db.get(models.ServerPool, pool_int):
+                    step_errors.append(f"pool_id={pool_id!r} не найден")
+                else:
+                    resolved["pool_id"] = pool_int
+            # region/plan/image кладём в resolved как ЕДИНЫЙ авторитетный источник
+            # для диспетчера (region/plan валидирует сетевой pre-flight по offerings;
+            # image валидирует драйвер при заказе — битый → провайдер отклоняет заказ
+            # ДО списания). Диспетчер читает ТОЛЬКО resolved, не сырые params.
+            resolved["region"] = params.get("region")
+            resolved["plan"] = params.get("plan")
+            resolved["image"] = params.get("image")
 
         elif kind in _DESTRUCTIVE_KINDS:  # destroy | reinstall
             node_id = _as_int(params.get("node_id"))
@@ -223,4 +259,244 @@ def validate_plan(db: Session, ops_plan: models.OpsPlan) -> dict[str, Any]:
             "steps": len(out_steps),
             "destructive": sum(1 for s in out_steps if s["tier"] == "destructive"),
         },
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Исполнитель (Phase 3). За флагом OPS_EXECUTE_ENABLED (по умолчанию OFF). MVP:
+# реально исполняется только order_node (заказ нод) через ОБКАТАННЫЙ
+# spawn_node_async (тот же путь, что кнопка «Заказать ноду» — gate 5, не raw
+# driver). Остальные kind'ы исполнитель пока ЯВНО пропускает (skipped), чтобы
+# непротестированные destructive-пути не стреляли. destroy/reinstall/migrate/
+# tunnel — отдельными ревьюируемыми проходами.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Терминальные статусы — повторное исполнение запрещено.
+_TERMINAL_STATUS = frozenset({"executed", "partial", "failed", "cancelled", "expired"})
+# Что MVP реально исполняет (остальное — skipped).
+_SUPPORTED_EXEC_KINDS = frozenset({"order_node"})
+
+
+class OpsExecError(RuntimeError):
+    """Исполнение невозможно/запрещено/упало."""
+
+
+def execute_enabled() -> bool:
+    return os.getenv("OPS_EXECUTE_ENABLED", "").lower() in ("1", "true", "yes", "on")
+
+
+def _max_spend_rub() -> float:
+    return float(os.getenv("OPS_MAX_SPEND_RUB", "5000"))
+
+
+def _preflight(db: Session, validated: dict[str, Any]) -> dict[str, Any]:
+    """Сетевой pre-flight для order-шагов: регион/тариф по ЖИВЫМ offerings +
+    cost = цена×count + проверка баланса провайдера + общий spend-cap.
+
+    Авторитетная денежная проверка (не доверяем est_cost от LLM). Бьёт по API
+    провайдера — выполняется в RQ-воркере, без HTTP-таймаута."""
+    from ..cloud import DriverError, get_driver
+
+    reasons: list[str] = []
+    step_costs: dict[int, float] = {}
+    total = 0.0
+
+    by_provider: dict[int, list[dict]] = {}
+    for s in validated["steps"]:
+        if s["kind"] != "order_node":
+            continue
+        pid = s["resolved"].get("provider_id")
+        if pid is None:
+            continue  # уже отклонён валидатором
+        by_provider.setdefault(pid, []).append(s)
+
+    for pid, steps in by_provider.items():
+        provider = db.get(models.CloudProvider, pid)
+        if not provider:
+            reasons.append(f"provider {pid} исчез между планом и исполнением")
+            continue
+        try:
+            driver = get_driver(provider)
+            plans = {
+                str(pl.get("id")): pl
+                for pl in (driver.list_plans() if hasattr(driver, "list_plans") else [])
+            }
+            dcs = {
+                str(d.get("id"))
+                for d in (driver.list_datacenters() if hasattr(driver, "list_datacenters") else [])
+            }
+            balance = driver.get_balance() if hasattr(driver, "get_balance") else None
+        except DriverError as exc:
+            reasons.append(f"provider {pid}: offerings/баланс недоступны ({exc})")
+            continue
+
+        prov_cost = 0.0
+        for s in steps:
+            r = s["resolved"]
+            count = int(r.get("count", 1))
+            plan_id = str(r.get("plan") or "")
+            region = str(r.get("region") or "")
+            if dcs and region not in dcs:
+                reasons.append(
+                    f"шаг #{s['index'] + 1}: регион {region!r} вне offerings провайдера {pid}"
+                )
+            pl = plans.get(plan_id)
+            if pl is None:
+                reasons.append(
+                    f"шаг #{s['index'] + 1}: тариф {plan_id!r} вне offerings провайдера {pid}"
+                )
+                continue
+            cost = float(pl.get("price") or 0) * count
+            step_costs[s["index"]] = cost
+            prov_cost += cost
+        total += prov_cost
+        if balance is not None and balance < prov_cost:
+            reasons.append(
+                f"provider {pid}: баланс {balance}₽ < нужно {prov_cost}₽"
+            )
+
+    if total > _max_spend_rub():
+        reasons.append(
+            f"итого {total}₽ > spend-cap {_max_spend_rub()}₽ (OPS_MAX_SPEND_RUB)"
+        )
+
+    return {"ok": not reasons, "reasons": reasons, "total_cost": total, "step_costs": step_costs}
+
+
+def _exec_order_node(
+    db: Session, step: dict[str, Any], plan_id: int
+) -> tuple[list[int], str | None]:
+    """Заказать count нод через spawn_node_async (быстрый order + bg bootstrap).
+    Читает ТОЛЬКО step["resolved"] (валидированный спек, не сырые params).
+    Возвращает (созданные node-id, ошибка|None) — created сохраняется ДАЖЕ при
+    сбое на середине, чтобы оператор не потерял уже оплаченные серверы."""
+    from ..node_spawner import resolve_spawn_name, spawn_node_async
+
+    r = step["resolved"]
+    pid = int(r["provider_id"])
+    count = int(r.get("count", 1))
+    region = str(r.get("region") or "")
+    plan = str(r.get("plan") or "")
+    image = r.get("image")
+    pool_id = r.get("pool_id")
+    created: list[int] = []
+    try:
+        for _ in range(count):
+            name = resolve_spawn_name(db, pid, region, None)  # авто-имя
+            node = spawn_node_async(
+                db,
+                provider_id=pid,
+                name=name,
+                region=region,
+                plan=plan,
+                image=image,
+                pool_id=pool_id,
+                notes=f"ops-agent plan #{plan_id}",
+            )
+            created.append(node.id)
+    except Exception as exc:  # noqa: BLE001
+        return created, _runtime.redact(f"{type(exc).__name__}: {exc}")
+    return created, None
+
+
+def execute_plan(db: Session, ops_plan: models.OpsPlan) -> dict[str, Any]:
+    """Исполнить сохранённый план. Гоняется в RQ-воркере (см.
+    ``app.worker.run_ops_plan_execute``). Идемпотентен по ``status``: терминальный
+    план не переисполняется. Перед исполнением — ре-валидация (gate 2/3/6) и
+    сетевой pre-flight (живые цены/баланс/spend-cap). Пишет результат в
+    ``ops_plan.execution`` и финальный ``status``."""
+    if not execute_enabled():
+        raise OpsExecError("исполнение выключено (OPS_EXECUTE_ENABLED=0)")
+    if ops_plan.status in _TERMINAL_STATUS:
+        raise OpsExecError(
+            f"план в статусе {ops_plan.status} — повторное исполнение запрещено"
+        )
+
+    # TTL — авторитетно на пути воркера (не только в эндпоинте): джоба могла
+    # отлежаться в очереди/пережить простой воркера и стартовать после протухания.
+    if ops_plan.expires_at and ops_plan.expires_at < utcnow():
+        ops_plan.status = "expired"
+        db.commit()
+        raise OpsExecError("план протух (TTL) — построй заново")
+
+    # Целостность: ловим мутацию ops_plans.plan в обход (план write-once; если
+    # хэш не сходится — исполняем НЕ то, что подтвердил оператор).
+    canonical = json.dumps(ops_plan.plan or {}, sort_keys=True, ensure_ascii=False)
+    if hashlib.sha256(canonical.encode("utf-8")).hexdigest() != ops_plan.content_hash:
+        ops_plan.status = "failed"
+        ops_plan.execution = {"phase": "integrity", "reason": "content_hash не совпал"}
+        db.commit()
+        raise OpsExecError("content_hash не совпал — план изменён после сохранения")
+
+    # Ре-валидация на момент исполнения (флот мог измениться после планирования).
+    validated = validate_plan(db, ops_plan)
+    if not validated["ok"]:
+        ops_plan.status = "failed"
+        ops_plan.execution = {"phase": "validate", "rejections": validated["rejections"]}
+        db.commit()
+        raise OpsExecError("план не прошёл валидацию: " + "; ".join(validated["rejections"][:5]))
+
+    # Авторитетный денежный pre-flight (живые цены/баланс/spend-cap).
+    pre = _preflight(db, validated)
+    if not pre["ok"]:
+        ops_plan.status = "failed"
+        ops_plan.execution = {
+            "phase": "preflight",
+            "reasons": pre["reasons"],
+            "total_cost": pre["total_cost"],
+        }
+        db.commit()
+        raise OpsExecError("pre-flight: " + "; ".join(pre["reasons"][:5]))
+
+    ops_plan.status = "executing"
+    db.commit()
+
+    results: list[dict[str, Any]] = []
+    failed = False
+    for s in validated["steps"]:
+        kind = s["kind"]
+        if kind not in _SUPPORTED_EXEC_KINDS:
+            results.append({
+                "index": s["index"], "kind": kind, "status": "skipped",
+                "detail": "kind не поддержан исполнителем (MVP — только order_node)",
+            })
+            continue
+        # _exec_order_node возвращает (created, error): created сохраняем ВСЕГДА,
+        # даже при сбое на середине — иначе оплаченные серверы теряются из отчёта.
+        created, err = _exec_order_node(db, s, ops_plan.id)
+        entry = {
+            "index": s["index"], "kind": kind,
+            "created_node_ids": created,
+            "est_cost_rub": pre["step_costs"].get(s["index"]),
+        }
+        if err:
+            logger.warning("ops plan %s step %s (%s) failed: %s", ops_plan.id, s["index"], kind, err)
+            entry["status"] = "failed"
+            entry["detail"] = err
+            results.append(entry)
+            failed = True
+            break  # stop-on-first-failure: не продолжаем после сбоя заказа
+        entry["status"] = "done"
+        results.append(entry)
+
+    done_count = sum(1 for r in results if r["status"] == "done")
+    if failed:
+        status = "failed"
+    elif done_count == 0:
+        status = "partial"  # ничего реально не исполнено (всё skipped вне MVP)
+    else:
+        status = "executed"  # исполнимая часть прошла; skipped помечены в execution
+    ops_plan.status = status
+    ops_plan.execution = {
+        "phase": "done",
+        "total_cost": pre["total_cost"],
+        "skipped": sum(1 for r in results if r["status"] == "skipped"),
+        "steps": results,
+    }
+    db.commit()
+    return {
+        "status": status,
+        "plan_id": ops_plan.id,
+        "total_cost": pre["total_cost"],
+        "steps": results,
     }
