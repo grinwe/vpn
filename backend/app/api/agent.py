@@ -6,15 +6,24 @@ AGENT_ENABLED; требует ANTHROPIC_API_KEY. Мутаций инфры не�
 """
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, Header, HTTPException
+from fastapi import APIRouter, Depends, Header, HTTPException, Request
 from pydantic import BaseModel
+from slowapi.util import get_remote_address
 from sqlalchemy.orm import Session
 
 from .. import models
 from ..auth import require_admin
+from ..rate_limit import limiter
 from ._common import ADMIN_ACTOR_HEADER, _audit, _resolve_admin_actor, get_db
 
 router = APIRouter()
+
+
+def _ops_actor_key(request: Request) -> str:
+    """Ключ рейт-лимита для агент-эндпоинтов — по X-Admin-Actor (TG-id), не по IP:
+    весь трафик бота приходит с одного backend-контейнера, поэтому IP-ключ
+    схлопывает всех операторов в один бакет и бесполезен как per-actor лимит."""
+    return request.headers.get(ADMIN_ACTOR_HEADER) or get_remote_address(request)
 
 
 class OpsPlanRequest(BaseModel):
@@ -61,8 +70,11 @@ def agent_triage_node(
 
 
 @router.post("/agent/ops/plan")
+@limiter.limit("30/minute")  # глобальный потолок на источник (бот = один IP)
+@limiter.limit("6/minute", key_func=_ops_actor_key)  # на оператора
 def agent_ops_plan(
     payload: OpsPlanRequest,
+    request: Request,
     db: Session = Depends(get_db),
     admin_token: str = Depends(require_admin),
     admin_actor: str | None = Header(default=None, alias=ADMIN_ACTOR_HEADER),

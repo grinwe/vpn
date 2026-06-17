@@ -17,6 +17,8 @@ from __future__ import annotations
 import json
 import logging
 import os
+import threading
+import time
 from typing import Any
 
 from sqlalchemy.orm import Session
@@ -27,6 +29,19 @@ logger = logging.getLogger(__name__)
 
 _DEFAULT_MODEL = "claude-sonnet-4-6"
 _MAX_TOKENS = 8192
+
+# ── Анти-DoS бюджеты (env-override, дефолты безопасны) ──
+# Каждый /ops — полный агентный прогон Claude. Без этих границ зависший вызов
+# пережил бы 120с-таймаут бота (бэкенд продолжает крутить и биллить), а burst
+# параллельных прогонов забил бы sync-threadpool и застопорил весь app.
+_REQUEST_TIMEOUT_S = float(os.getenv("AGENT_REQUEST_TIMEOUT", "60"))  # на один вызов Claude
+# Дефолт 0: один вызов капится timeout'ом (60с), без ретрая он не растягивается
+# до 2×60с=120с — иначе один зависший вызов упёрся бы в 120с-таймаут бота, а
+# межитерационный дедлайн одиночный вызов не прерывает.
+_MAX_RETRIES = max(0, int(os.getenv("AGENT_MAX_RETRIES", "0")))
+_DEADLINE_S = float(os.getenv("AGENT_DEADLINE_S", "100"))  # на весь цикл (< 120с бота)
+_MAX_CONCURRENCY = max(1, int(os.getenv("AGENT_MAX_CONCURRENCY", "3")))
+_run_slots = threading.BoundedSemaphore(_MAX_CONCURRENCY)
 
 _SYSTEM_PROMPT = """\
 Ты — ops-планировщик VPN-as-a-service. Тебе дают команду оператора на естественном
@@ -158,7 +173,7 @@ def plan_ops(db: Session, command: str, *, model: str | None = None) -> dict:
 
     model = model or os.getenv("AGENT_MODEL", _DEFAULT_MODEL)
     max_iter = max(1, int(os.getenv("AGENT_MAX_ITERATIONS", "12")))
-    client = anthropic.Anthropic()
+    client = anthropic.Anthropic(timeout=_REQUEST_TIMEOUT_S, max_retries=_MAX_RETRIES)
     tools = [*ops_tools.tool_schemas(), _SUBMIT_PLAN_SCHEMA]
 
     messages: list[dict] = [
@@ -166,80 +181,96 @@ def plan_ops(db: Session, command: str, *, model: str | None = None) -> dict:
     ]
     tool_calls: list[str] = []
 
-    for iteration in range(max_iter):
-        try:
-            resp = client.messages.create(
-                model=model,
-                max_tokens=_MAX_TOKENS,
-                system=_SYSTEM_PROMPT,
-                thinking={"type": "adaptive"},
-                tools=tools,
-                messages=messages,
-            )
-        except anthropic.APIError as exc:
-            raise AgentError(f"Claude API error: {exc}") from exc
-
-        if resp.stop_reason != "tool_use":
-            # Финал без submit_plan — модель не дала план. Возвращаем как
-            # неуспех планирования (не выдумываем).
-            text = "\n".join(
-                b.text for b in resp.content if getattr(b, "type", None) == "text"
-            ).strip()
-            raise AgentError(
-                f"планировщик не вызвал submit_plan (вернул текст): {text[:300]}"
-            )
-
-        messages.append({"role": "assistant", "content": resp.content})
-
-        results = []
-        for block in resp.content:
-            if getattr(block, "type", None) != "tool_use":
-                continue
-            tool_calls.append(block.name)
-
-            # Терминальный тул — захватываем план и выходим (НИЧЕГО не выполняем).
-            if block.name == "submit_plan":
-                plan = dict(block.input or {})
-                return {
-                    "command": command,
-                    "model": model,
-                    "plan": plan,
-                    "iterations": iteration + 1,
-                    "tool_calls": tool_calls,
-                }
-
-            entry = ops_tools.TOOL_REGISTRY.get(block.name)
-            if not entry:
-                results.append(
-                    {
-                        "type": "tool_result",
-                        "tool_use_id": block.id,
-                        "content": f"unknown tool {block.name}",
-                        "is_error": True,
-                    }
+    # Семафор: burst /ops не должен выжрать sync-threadpool и застопорить app.
+    if not _run_slots.acquire(blocking=False):
+        raise AgentError(
+            f"агент занят: уже идёт {_MAX_CONCURRENCY} планирований "
+            "(AGENT_MAX_CONCURRENCY) — повтори через минуту"
+        )
+    deadline = time.monotonic() + _DEADLINE_S
+    try:
+        for iteration in range(max_iter):
+            # Wall-clock дедлайн на весь цикл: бэкенд не должен пережить
+            # 120с-таймаут бота, продолжая крутить и биллить.
+            if time.monotonic() > deadline:
+                raise AgentError(
+                    f"план не собрался за отведённое время (~{int(_DEADLINE_S)}с) — упрости команду"
                 )
-                continue
             try:
-                out = entry["fn"](db, **(block.input or {}))
-                results.append(
-                    {
-                        "type": "tool_result",
-                        "tool_use_id": block.id,
-                        "content": json.dumps(out, ensure_ascii=False),
-                    }
+                resp = client.messages.create(
+                    model=model,
+                    max_tokens=_MAX_TOKENS,
+                    system=_SYSTEM_PROMPT,
+                    thinking={"type": "adaptive"},
+                    tools=tools,
+                    messages=messages,
                 )
-            except Exception as exc:  # noqa: BLE001
-                logger.exception("ops planner tool %s failed", block.name)
-                results.append(
-                    {
-                        "type": "tool_result",
-                        "tool_use_id": block.id,
-                        "content": f"tool error: {exc}",
-                        "is_error": True,
-                    }
-                )
-        messages.append({"role": "user", "content": results})
+            except anthropic.APIError as exc:
+                raise AgentError(f"Claude API error: {exc}") from exc
 
-    raise AgentError(
-        f"план не собрался за {max_iter} итераций (увеличь AGENT_MAX_ITERATIONS)"
-    )
+            if resp.stop_reason != "tool_use":
+                # Финал без submit_plan — модель не дала план. Возвращаем как
+                # неуспех планирования (не выдумываем).
+                text = "\n".join(
+                    b.text for b in resp.content if getattr(b, "type", None) == "text"
+                ).strip()
+                raise AgentError(
+                    f"планировщик не вызвал submit_plan (вернул текст): {text[:300]}"
+                )
+
+            messages.append({"role": "assistant", "content": resp.content})
+
+            results = []
+            for block in resp.content:
+                if getattr(block, "type", None) != "tool_use":
+                    continue
+                tool_calls.append(block.name)
+
+                # Терминальный тул — захватываем план и выходим (НИЧЕГО не выполняем).
+                if block.name == "submit_plan":
+                    plan = dict(block.input or {})
+                    return {
+                        "command": command,
+                        "model": model,
+                        "plan": plan,
+                        "iterations": iteration + 1,
+                        "tool_calls": tool_calls,
+                    }
+
+                entry = ops_tools.TOOL_REGISTRY.get(block.name)
+                if not entry:
+                    results.append(
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": block.id,
+                            "content": f"unknown tool {block.name}",
+                            "is_error": True,
+                        }
+                    )
+                    continue
+                try:
+                    out = entry["fn"](db, **(block.input or {}))
+                    results.append(
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": block.id,
+                            "content": json.dumps(out, ensure_ascii=False),
+                        }
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    logger.exception("ops planner tool %s failed", block.name)
+                    results.append(
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": block.id,
+                            "content": f"tool error: {exc}",
+                            "is_error": True,
+                        }
+                    )
+            messages.append({"role": "user", "content": results})
+
+        raise AgentError(
+            f"план не собрался за {max_iter} итераций (увеличь AGENT_MAX_ITERATIONS)"
+        )
+    finally:
+        _run_slots.release()

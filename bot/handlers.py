@@ -2,10 +2,12 @@ import asyncio
 import html
 import logging
 import os
+import re
 from urllib.parse import urlparse
 
 import aiohttp
 from aiogram import F, Router, types
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command, CommandObject, CommandStart
 from aiogram.fsm.context import FSMContext
 
@@ -138,6 +140,13 @@ def _admin_headers(actor_id: int) -> dict[str, str]:
 # 2-3 лишние строчки в AuditLog не страшны.
 _SELF_REPORT_COOLDOWN_S = 300  # 5 минут
 _self_report_last: dict[int, float] = {}
+
+# ── /ops debounce ──
+# /ops запускает полный агентный прогон Claude (дорого, ~до минуты). Кулдаун на
+# юзера — анти-даблтап/анти-спам; настоящий потолок держит бэкенд (рейт-лимит по
+# X-Admin-Actor + семафор), это лишь первый барьер.
+_OPS_COOLDOWN_S = 20
+_ops_last: dict[int, float] = {}
 
 
 # Удаляем ack-сообщение опроса «Помогите нам улучшить сервис» через N сек.
@@ -1684,6 +1693,31 @@ async def go_referral(callback_query: types.CallbackQuery):
 _OPS_TIER_ICON = {"read": "👀", "reversible": "♻️", "costly": "💸", "destructive": "⚠️"}
 
 
+def _truncate_lines(lines: list[str], limit: int) -> str:
+    """Склеить строки в HTML-сообщение, не превышая limit. Режем по ЦЕЛЫМ
+    строкам (не посреди тега/entity — иначе Telegram отдаёт 400 на parse_mode=HTML)
+    и явно помечаем обрез, чтобы скрытые шаги были видны как скрытые."""
+    text = "\n".join(lines)
+    if len(text) <= limit:
+        return text
+    marker = "\n…<i>план обрезан</i>"
+    budget = limit - len(marker)
+    kept: list[str] = []
+    used = 0
+    for ln in lines:
+        add = len(ln) + (1 if kept else 0)
+        if used + add > budget:
+            break
+        kept.append(ln)
+        used += add
+    return "\n".join(kept) + marker
+
+
+def _strip_html(text: str) -> str:
+    """HTML → плоский текст для фолбэка, если Telegram отверг разметку."""
+    return html.unescape(re.sub(r"<[^>]+>", "", text))
+
+
 def _render_ops_plan(result: dict) -> str:
     """Plan dict из POST /api/agent/ops/plan → HTML-сообщение Telegram.
     Все динамические строки экранируем (план приходит от LLM, может содержать <>&)."""
@@ -1741,8 +1775,7 @@ def _render_ops_plan(result: dict) -> str:
         f"итераций: {result.get('iterations')}</i>"
     )
 
-    text = "\n".join(lines)
-    return text[:4000] + ("…" if len(text) > 4000 else "")
+    return _truncate_lines(lines, 4000)
 
 
 @router.message(Command("ops"))
@@ -1761,6 +1794,16 @@ async def ops_plan(message: types.Message, command: CommandObject):
             parse_mode="HTML",
         )
         return
+
+    tg_id = message.from_user.id
+    now_mono = asyncio.get_event_loop().time()
+    last = _ops_last.get(tg_id)
+    if last is not None and (now_mono - last) < _OPS_COOLDOWN_S:
+        await message.answer(
+            f"⏳ Подожди ~{_OPS_COOLDOWN_S}с между /ops — агент ещё считает прошлый запрос."
+        )
+        return
+    _ops_last[tg_id] = now_mono
 
     wait = await message.answer("⏳ Собираю план… (агент опрашивает флот, до ~минуты)")
     # Прямой single-shot вызов (НЕ _fetch_json): у него ретрай на 5xx, а 503 от
@@ -1791,13 +1834,25 @@ async def ops_plan(message: types.Message, command: CommandObject):
         detail = (payload or {}).get("detail") or "агент недоступен"
         await wait.edit_text(f"Агент недоступен: {html.escape(str(detail))}")
         return
+    if status == 429:
+        await wait.edit_text("⏳ Слишком часто — рейт-лимит агента. Повтори через минуту.")
+        return
     if status != 200:
         detail = (payload or {}).get("detail") or (payload or {}).get("message") or status
         await wait.edit_text(f"Не удалось построить план: {html.escape(str(detail))}")
         return
 
-    await wait.edit_text(
-        _render_ops_plan(payload),
-        parse_mode="HTML",
-        disable_web_page_preview=True,
-    )
+    rendered = _render_ops_plan(payload)
+    try:
+        await wait.edit_text(
+            rendered,
+            parse_mode="HTML",
+            disable_web_page_preview=True,
+        )
+    except TelegramBadRequest:
+        # Невалидный HTML (сырьё от LLM / несбалансированный тег) — Telegram
+        # отверг разметку. Отдаём план без неё, чтобы он ДОШЁЛ до админа, а не
+        # завис на «⏳ Собираю план…».
+        await wait.edit_text(
+            _strip_html(rendered)[:4000], disable_web_page_preview=True
+        )

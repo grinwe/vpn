@@ -67,8 +67,14 @@ tool-use'ом и выдаёт человекочитаемый **root-cause + р
   (`api/agent.py`), audit `agent_ops_planned`. **Ничего не выполняет** — чистый
   dry-run; за флагом `AGENT_ENABLED` + `ANTHROPIC_API_KEY`, кап итераций.
   Решено с оператором: модель автономии = «план → одно подтверждение»; старт = dry-run.
-  - TODO: точка входа (TG admin-команда / админка) + выполнение плана за одним
-    подтверждением (costly/destructive шаги — order/destroy/migrate — за гейтом).
+  - Точка входа: TG admin-команда `/ops <NL>` (`bot/handlers.py`).
+  - **Секьюрити-эпик:** [operations/ops_agent_security_epic.md](operations/ops_agent_security_epic.md)
+    — ревью 2026-06-17 (26 находок, 0 false-pos). Блок A (hardening dry-run:
+    рейт-лимит по actor + бот-кулдаун + Anthropic-таймаут/дедлайн/семафор +
+    безопасный показ плана) ✅. Блок B (7 гейтов до исполнения) — до Phase 3.
+  - TODO: выполнение плана за одним подтверждением — только поверх блока B
+    (персист плана + confirm-binding, валидация params, spend-cap/max_nodes,
+    scoped-токен, destructive-инвариант). costly/destructive — order/destroy/migrate.
 - **Support-агент:** RAG по `docs/` с цитатами → черновик ответа юзеру. На старте — **human-approve** перед отправкой; потом автоответ на FAQ-класс. Анти-галлюцинации: только из доков, с источником.
 - **Ops-агент (reversible):** предлагает действие (`migrate sub X`, `mute node Y`, `ban-node`) с обоснованием → кнопка «применить». После обкатки — часть reversible переводим в автономный режим с rate-limit.
 
