@@ -1172,3 +1172,35 @@ export function cancelBroadcast(id: number, reason?: string) {
     reason: reason ?? null,
   });
 }
+
+// ── Ad links (managed campaign deep-links + воронка) ──
+// Управляемая рекламная ссылка: name (ярлык) + tag (метка в t.me/bot?start=<tag>
+// → User.source). started/trial/paid/revenue — живая воронка по метке.
+// is_active=false гасит атрибуцию новых заходов. См.
+// docs/operations/ad_source_attribution.md.
+
+export interface AdLinkOut {
+  id: number;
+  name: string;
+  tag: string;
+  is_active: boolean;
+  notes: string | null;
+  created_at: string;
+  share_url: string | null;
+  started: number;
+  trial: number;
+  paid: number;
+  revenue_kopecks: number;
+}
+
+export interface AdLinkCreateIn {
+  name: string;
+  tag?: string | null; // пусто → бэкенд сгенерит ad_<random>
+  notes?: string | null;
+}
+
+export interface AdLinkUpdateIn {
+  name?: string | null;
+  is_active?: boolean | null;
+  notes?: string | null;
+}

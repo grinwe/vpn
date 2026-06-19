@@ -1067,6 +1067,29 @@ class ReferralCode(Base):
     owner = relationship("User", back_populates="referral_codes", foreign_keys=[owner_id])
 
 
+class AdLink(Base):
+    """Управляемая рекламная ссылка (deep-link метка) для админки.
+
+    Админ заводит именованную ссылку под рекламщика/размещение: ``name`` (ярлык) +
+    ``tag`` (метка в ``t.me/bot?start=<tag>`` → пишется в ``User.source``).
+    Статистика-воронка (started→trial→paid) считается по ``User.source == tag``.
+    ``is_active=False`` = новые заходы по ссылке БОЛЬШЕ не атрибутируются
+    (см. ``api_extensions.register_user``); историческая стата сохраняется.
+
+    Это аналитический слой над source-меткой, БЕЗ бонусов — в отличие от
+    [[ReferralCode]] (реферал человека с наградами).
+    """
+
+    __tablename__ = "ad_links"
+
+    id = Column(Integer, primary_key=True)
+    name = Column(String, nullable=False)  # человекочитаемый ярлык
+    tag = Column(String(64), unique=True, nullable=False, index=True)  # метка в start-param
+    is_active = Column(Boolean, nullable=False, default=True, server_default="true")
+    notes = Column(String, nullable=True)
+    created_at = Column(DateTime, default=utcnow)
+
+
 class BalanceTransaction(Base):
     """Append-only ledger of balance changes (stage 4).
 

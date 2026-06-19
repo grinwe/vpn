@@ -459,8 +459,12 @@ def register_user(
     if not user.source:
         cleaned = _clean_source(body.source)
         if cleaned:
-            user.source = cleaned
-            db.flush()
+            # Управляемая AdLink выключена → ссылку «погасили», новые заходы не
+            # атрибутируем. Неизвестная метка (ad-hoc, без AdLink) — атрибутируем.
+            link = db.query(models.AdLink).filter_by(tag=cleaned).first()
+            if link is None or link.is_active:
+                user.source = cleaned
+                db.flush()
 
     db.commit()
     return {
@@ -495,16 +499,10 @@ class AdSourcesResponse(BaseModel):
     total_revenue_kopecks: int
 
 
-@ext_router.get("/admin/ad-sources", response_model=AdSourcesResponse)
-def ad_sources_funnel(
-    db: Session = Depends(get_db),
-    admin_token: str = Depends(require_admin),
-):
-    """Воронка по рекламным меткам: started→trial→paid + выручка, на источник.
-
-    ДВА запроса (started/trial по users; paid/revenue по topup-транзакциям) с
-    мержем в Python — join транзакций к users иначе раздул бы счётчик ``started``
-    кратно числу транзакций юзера (классический join-fanout)."""
+def _compute_source_funnel(db: Session) -> dict[str, dict[str, int]]:
+    """``{source: {started, trial, paid, revenue_kopecks}}``. ДВА запроса с
+    мержем — join транзакций к users раздул бы ``started`` кратно числу транзакций
+    юзера (join-fanout). Переиспользуется и воронкой, и листингом AdLink."""
     base = (
         db.query(
             models.User.source.label("source"),
@@ -533,14 +531,30 @@ def ad_sources_funnel(
         .all()
     )
     paid_map = {r.source: (int(r.paid), int(r.revenue or 0)) for r in paid}
-
-    rows: list[AdSourceRow] = []
+    out: dict[str, dict[str, int]] = {}
     for r in base:
         p, rev = paid_map.get(r.source, (0, 0))
-        rows.append(AdSourceRow(
-            source=r.source, started=int(r.started), trial=int(r.trial),
-            paid=p, revenue_kopecks=rev,
-        ))
+        out[r.source] = {
+            "started": int(r.started), "trial": int(r.trial),
+            "paid": p, "revenue_kopecks": rev,
+        }
+    return out
+
+
+@ext_router.get("/admin/ad-sources", response_model=AdSourcesResponse)
+def ad_sources_funnel(
+    db: Session = Depends(get_db),
+    admin_token: str = Depends(require_admin),
+):
+    """Воронка по ВСЕМ рекламным меткам (включая ad-hoc без управляемой AdLink)."""
+    funnel = _compute_source_funnel(db)
+    rows = [
+        AdSourceRow(
+            source=src, started=f["started"], trial=f["trial"],
+            paid=f["paid"], revenue_kopecks=f["revenue_kopecks"],
+        )
+        for src, f in funnel.items()
+    ]
     rows.sort(key=lambda x: x.started, reverse=True)
     return AdSourcesResponse(
         sources=rows,
@@ -548,6 +562,128 @@ def ad_sources_funnel(
         total_paid=sum(x.paid for x in rows),
         total_revenue_kopecks=sum(x.revenue_kopecks for x in rows),
     )
+
+
+# ── Ad links (управляемые рекламные deep-link'и, admin) ──
+
+class AdLinkCreate(BaseModel):
+    name: str
+    tag: str | None = None  # пусто → сгенерим ad_<random>
+    notes: str | None = None
+
+
+class AdLinkUpdate(BaseModel):
+    name: str | None = None
+    is_active: bool | None = None
+    notes: str | None = None
+
+
+class AdLinkOut(BaseModel):
+    id: int
+    name: str
+    tag: str
+    is_active: bool
+    notes: str | None
+    created_at: datetime
+    share_url: str | None
+    # воронка по этой метке
+    started: int
+    trial: int
+    paid: int
+    revenue_kopecks: int
+
+
+def _ad_link_share_url(tag: str) -> str | None:
+    bot = os.getenv("BOT_USERNAME")
+    return f"https://t.me/{bot}?start={tag}" if bot else None
+
+
+def _ad_link_out(link: models.AdLink, funnel: dict[str, dict[str, int]]) -> AdLinkOut:
+    f = funnel.get(link.tag) or {}
+    return AdLinkOut(
+        id=link.id, name=link.name, tag=link.tag, is_active=link.is_active,
+        notes=link.notes, created_at=link.created_at,
+        share_url=_ad_link_share_url(link.tag),
+        started=f.get("started", 0), trial=f.get("trial", 0),
+        paid=f.get("paid", 0), revenue_kopecks=f.get("revenue_kopecks", 0),
+    )
+
+
+@ext_router.get("/admin/ad-links", response_model=list[AdLinkOut])
+def list_ad_links(
+    db: Session = Depends(get_db),
+    admin_token: str = Depends(require_admin),
+):
+    """Список управляемых рекламных ссылок + живая воронка по каждой."""
+    funnel = _compute_source_funnel(db)
+    links = db.query(models.AdLink).order_by(models.AdLink.created_at.desc()).all()
+    return [_ad_link_out(link, funnel) for link in links]
+
+
+@ext_router.post("/admin/ad-links", response_model=AdLinkOut)
+def create_ad_link(
+    body: AdLinkCreate,
+    db: Session = Depends(get_db),
+    admin_token: str = Depends(require_admin),
+):
+    """Завести рекламную ссылку. tag валидируется как source-метка; пустой → ad_<random>."""
+    name = (body.name or "").strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="name обязателен")
+    raw_tag = (body.tag or "").strip() or f"ad_{secrets.token_urlsafe(6)}"
+    tag = _clean_source(raw_tag)
+    if not tag:
+        raise HTTPException(
+            status_code=400,
+            detail="tag недопустим: только [A-Za-z0-9_-], ≤64, не служебный (ref_/support)",
+        )
+    if db.query(models.AdLink).filter_by(tag=tag).first():
+        raise HTTPException(status_code=409, detail=f"ссылка с меткой '{tag}' уже существует")
+    link = models.AdLink(name=name, tag=tag, notes=(body.notes or None))
+    db.add(link)
+    db.commit()
+    db.refresh(link)
+    return _ad_link_out(link, _compute_source_funnel(db))
+
+
+@ext_router.patch("/admin/ad-links/{link_id}", response_model=AdLinkOut)
+def update_ad_link(
+    link_id: int,
+    body: AdLinkUpdate,
+    db: Session = Depends(get_db),
+    admin_token: str = Depends(require_admin),
+):
+    """Правка ярлыка/заметок и вкл/выкл (tag неизменяем — иначе осиротит стату)."""
+    link = db.get(models.AdLink, link_id)
+    if not link:
+        raise HTTPException(status_code=404, detail="ad link not found")
+    if body.name is not None:
+        nm = body.name.strip()
+        if not nm:
+            raise HTTPException(status_code=400, detail="name не может быть пустым")
+        link.name = nm
+    if body.is_active is not None:
+        link.is_active = body.is_active
+    if body.notes is not None:
+        link.notes = body.notes or None
+    db.commit()
+    db.refresh(link)
+    return _ad_link_out(link, _compute_source_funnel(db))
+
+
+@ext_router.delete("/admin/ad-links/{link_id}", status_code=204)
+def delete_ad_link(
+    link_id: int,
+    db: Session = Depends(get_db),
+    admin_token: str = Depends(require_admin),
+):
+    """Удалить управляемую ссылку. Историческая атрибуция в User.source НЕ
+    трогается (метка останется в /ad-sources как ad-hoc, но без ярлыка)."""
+    link = db.get(models.AdLink, link_id)
+    if not link:
+        raise HTTPException(status_code=404, detail="ad link not found")
+    db.delete(link)
+    db.commit()
 
 
 # ── Free trial activation ──

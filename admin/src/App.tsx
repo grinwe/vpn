@@ -14,6 +14,7 @@ import Exits from "./pages/Exits";
 import HealthPings from "./pages/HealthPings";
 import Broadcasts from "./pages/Broadcasts";
 import OperatorMatrix from "./pages/OperatorMatrix";
+import AdLinks from "./pages/AdLinks";
 
 function Layout({ children }: { children: React.ReactNode }) {
   const { logout } = useAuth();
@@ -34,6 +35,7 @@ function Layout({ children }: { children: React.ReactNode }) {
           <NavLink to="/health-pings" className={linkCls}>Health</NavLink>
           <NavLink to="/operators" className={linkCls}>Operators</NavLink>
           <NavLink to="/broadcasts" className={linkCls}>Broadcasts</NavLink>
+          <NavLink to="/ad-links" className={linkCls}>Реклама</NavLink>
           <NavLink to="/tokens" className={linkCls}>API tokens</NavLink>
           <NavLink to="/cloud" className={linkCls}>Cloud</NavLink>
           <NavLink to="/audit" className={linkCls}>Audit</NavLink>
@@ -86,6 +88,7 @@ export default function App() {
         path="/operators"
         element={<Protected><OperatorMatrix /></Protected>}
       />
+      <Route path="/ad-links" element={<Protected><AdLinks /></Protected>} />
       <Route path="*" element={<Navigate to="/" replace />} />
     </Routes>
   );

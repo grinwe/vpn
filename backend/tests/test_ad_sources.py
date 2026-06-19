@@ -97,3 +97,56 @@ def test_ad_sources_funnel(client, db_session: Session) -> None:
     assert data["total_started"] == 3
     assert data["total_paid"] == 2
     assert data["total_revenue_kopecks"] == 25000
+
+
+# ── AdLink (управляемые рекламные ссылки) ──
+
+
+def test_ad_link_crud_and_stats(client, db_session: Session) -> None:
+    r = client.post("/api/admin/ad-links", json={"name": "Блогер Вася", "tag": "tg_vasya"})
+    assert r.status_code == 200, r.text
+    link = r.json()
+    assert link["tag"] == "tg_vasya"
+    assert link["is_active"] is True
+    assert link["started"] == 0
+    lid = link["id"]
+
+    # дубликат метки → 409; невалидная/служебная → 400
+    assert client.post("/api/admin/ad-links", json={"name": "x", "tag": "tg_vasya"}).status_code == 409
+    assert client.post("/api/admin/ad-links", json={"name": "x", "tag": "bad tag!!"}).status_code == 400
+    assert client.post("/api/admin/ad-links", json={"name": "x", "tag": "ref_x"}).status_code == 400
+
+    # юзер с этой меткой + триал + topup → статистика подтянулась
+    u = models.User(telegram_id="al-1", source="tg_vasya", trial_activated_at=utcnow())
+    db_session.add(u)
+    db_session.commit()
+    db_session.refresh(u)
+    db_session.add(models.BalanceTransaction(
+        user_id=u.id, amount_kopecks=10000, kind=models.BalanceTxKind.topup, reference="al-t",
+    ))
+    db_session.commit()
+
+    row = next(x for x in client.get("/api/admin/ad-links").json() if x["id"] == lid)
+    assert row["started"] == 1 and row["trial"] == 1 and row["paid"] == 1
+    assert row["revenue_kopecks"] == 10000
+
+    # выключаем → новый заход по этой метке НЕ атрибутируется
+    assert client.patch(f"/api/admin/ad-links/{lid}", json={"is_active": False}).status_code == 200
+    client.post("/api/users/register", json={"telegram_id": "al-2", "source": "tg_vasya"})
+    u2 = db_session.query(models.User).filter_by(telegram_id="al-2").one()
+    assert u2.source is None
+
+    assert client.delete(f"/api/admin/ad-links/{lid}").status_code == 204
+
+
+def test_ad_link_unknown_tag_still_attributes(client, db_session: Session) -> None:
+    # ad-hoc метка без управляемой AdLink → атрибутируется (backward compat)
+    client.post("/api/users/register", json={"telegram_id": "al-3", "source": "adhoc_promo"})
+    u = db_session.query(models.User).filter_by(telegram_id="al-3").one()
+    assert u.source == "adhoc_promo"
+
+
+def test_ad_link_auto_tag_when_blank(client, db_session: Session) -> None:
+    r = client.post("/api/admin/ad-links", json={"name": "Без метки"})
+    assert r.status_code == 200
+    assert r.json()["tag"].startswith("ad_")
