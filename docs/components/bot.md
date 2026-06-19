@@ -203,10 +203,12 @@ Lazy-init, один на процесс. Закрывается в `bot/bot.py:1
 
 ## Deep-link reference
 
-Бот понимает три типа `/start <arg>`:
+Бот понимает несколько типов `/start <arg>` (хендлер `cmd_start`):
 
-- `/start support` → сразу перебрасывает в support-FSM (`handlers.py:167-179`).
-- `/start ref_XXXXX` → передаёт `referral_code=XXXXX` в `/api/users/register` (`handlers.py:181-200`).
+- `/start support` → сразу перебрасывает в support-FSM.
+- `/start ref_XXXXX` → передаёт `referral_code=XXXXX` в `/api/users/register` (реферал человека → `User.referred_by_id`).
+- `/start <МЕТКА>` (любой другой непустой payload) → **рекламная метка** `source` (first-touch),
+  передаётся в `/api/users/register`. См. [operations/ad_source_attribution.md](../operations/ad_source_attribution.md).
 - `/start` без аргумента → обычный welcome.
 
 WebApp Mini App открывается не через `/start` аргумент, а через inline-кнопку с `web_app` action (см. `bot/keyboards.py::webapp_inline_keyboard`).

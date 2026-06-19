@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import secrets
 from datetime import datetime, timezone
 
@@ -22,6 +23,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from .auth import optional_admin, require_admin  # noqa: F401 — re-exported for legacy imports
 from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from . import models
@@ -388,9 +390,30 @@ def get_or_create_referral(
 
 # ── User registration with referral ──
 
+_SOURCE_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+# Внутренние start-ключи бота/вебаппа — НЕ рекламные метки (иначе, напр.,
+# t.me/bot?start=support из вебаппа попал бы в рекламную воронку). ``ref_*``
+# отсекается отдельно (это реферал). Пополнять при новых служебных deep-link'ах.
+_RESERVED_SOURCES = frozenset({"support"})
+
+
+def _clean_source(raw: str | None) -> str | None:
+    """Рекламная метка из deep-link: только Telegram-допустимые символы старт-
+    параметра (``[A-Za-z0-9_-]``, ≤64), не служебный ключ. Мусор/пусто/служебное
+    → None (не пишем)."""
+    if not raw:
+        return None
+    raw = raw.strip()
+    low = raw.lower()  # служебные ключи отсекаем регистронезависимо
+    if low in _RESERVED_SOURCES or low.startswith("ref_"):
+        return None
+    return raw if _SOURCE_RE.match(raw) else None
+
+
 class UserRegisterRequest(BaseModel):
     telegram_id: str
     referral_code: str | None = None
+    source: str | None = None  # рекламная метка (first-touch)
 
 
 @ext_router.post("/users/register")
@@ -430,6 +453,15 @@ def register_user(
                 db.add(ref)
                 db.flush()
 
+    # Рекламная метка (first-touch): ставим один раз, если ещё не задана —
+    # как и referral, чтобы органик-старт без метки не блокировал атрибуцию
+    # при последующем заходе по рекламной ссылке.
+    if not user.source:
+        cleaned = _clean_source(body.source)
+        if cleaned:
+            user.source = cleaned
+            db.flush()
+
     db.commit()
     return {
         "id": user.id,
@@ -444,6 +476,78 @@ def register_user(
         # who registered before this column existed.
         "trial_available": user.trial_activated_at is None,
     }
+
+
+# ── Ad-source funnel (admin) ──
+
+class AdSourceRow(BaseModel):
+    source: str
+    started: int  # юзеров пришло с метки
+    trial: int  # из них активировали триал (trial_activated_at)
+    paid: int  # из них сделали ≥1 реальную оплату (topup)
+    revenue_kopecks: int  # суммарная выручка с этой метки (topup'ы)
+
+
+class AdSourcesResponse(BaseModel):
+    sources: list[AdSourceRow]
+    total_started: int
+    total_paid: int
+    total_revenue_kopecks: int
+
+
+@ext_router.get("/admin/ad-sources", response_model=AdSourcesResponse)
+def ad_sources_funnel(
+    db: Session = Depends(get_db),
+    admin_token: str = Depends(require_admin),
+):
+    """Воронка по рекламным меткам: started→trial→paid + выручка, на источник.
+
+    ДВА запроса (started/trial по users; paid/revenue по topup-транзакциям) с
+    мержем в Python — join транзакций к users иначе раздул бы счётчик ``started``
+    кратно числу транзакций юзера (классический join-fanout)."""
+    base = (
+        db.query(
+            models.User.source.label("source"),
+            func.count(models.User.id).label("started"),
+            func.count(models.User.trial_activated_at).label("trial"),
+        )
+        .filter(models.User.source.isnot(None))
+        .group_by(models.User.source)
+        .all()
+    )
+    paid = (
+        db.query(
+            models.User.source.label("source"),
+            func.count(func.distinct(models.BalanceTransaction.user_id)).label("paid"),
+            func.coalesce(func.sum(models.BalanceTransaction.amount_kopecks), 0).label("revenue"),
+        )
+        .join(
+            models.BalanceTransaction,
+            models.BalanceTransaction.user_id == models.User.id,
+        )
+        .filter(
+            models.User.source.isnot(None),
+            models.BalanceTransaction.kind == models.BalanceTxKind.topup,
+        )
+        .group_by(models.User.source)
+        .all()
+    )
+    paid_map = {r.source: (int(r.paid), int(r.revenue or 0)) for r in paid}
+
+    rows: list[AdSourceRow] = []
+    for r in base:
+        p, rev = paid_map.get(r.source, (0, 0))
+        rows.append(AdSourceRow(
+            source=r.source, started=int(r.started), trial=int(r.trial),
+            paid=p, revenue_kopecks=rev,
+        ))
+    rows.sort(key=lambda x: x.started, reverse=True)
+    return AdSourcesResponse(
+        sources=rows,
+        total_started=sum(x.started for x in rows),
+        total_paid=sum(x.paid for x in rows),
+        total_revenue_kopecks=sum(x.revenue_kopecks for x in rows),
+    )
 
 
 # ── Free trial activation ──

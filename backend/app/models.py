@@ -367,6 +367,11 @@ class User(Base):
     email = Column(String, unique=True, index=True, nullable=True)
     created_at = Column(DateTime, default=utcnow)
     referred_by_id = Column(Integer, ForeignKey("users.id"), nullable=True)
+    # Рекламный источник (first-touch): метка из deep-link старт-параметра
+    # ``t.me/bot?start=<tag>`` (не ``ref_``-префикс — те идут в referred_by_id).
+    # Ставится ОДИН раз при первом /start с меткой. Воронка started→trial→paid
+    # по этой колонке. См. docs/operations/ad_source_attribution.md.
+    source = Column(String(64), nullable=True, index=True)
     # Pay-as-you-go balance (stage 4). Stored in kopecks (1₽ = 100 kop)
     # to dodge floating-point rounding on every daily-billing tick.
     # The legacy invoice/subscription model still works while

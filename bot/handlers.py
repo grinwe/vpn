@@ -251,9 +251,17 @@ async def cmd_start(message: types.Message, state: FSMContext):
         )
         return
 
+    # Deep-link старт-параметр: ``ref_<code>`` — реферал человека (referred_by_id);
+    # любой другой непустой payload — рекламная метка (source, first-touch).
+    # Бэкенд валидирует/чистит метку, так что прокидываем сыро.
     referral_code = None
-    if len(args) > 1 and args[1].startswith("ref_"):
-        referral_code = args[1][4:]
+    source = None
+    if len(args) > 1 and args[1].strip():
+        payload = args[1].strip()
+        if payload.startswith("ref_"):
+            referral_code = payload[4:]
+        else:
+            source = payload
 
     # Register user (and apply referral if present). Backend returns
     # {"created": bool} so we can pick a new-vs-returning welcome copy.
@@ -262,6 +270,8 @@ async def cmd_start(message: types.Message, state: FSMContext):
     register_payload = {"telegram_id": str(message.from_user.id)}
     if referral_code:
         register_payload["referral_code"] = referral_code
+    if source:
+        register_payload["source"] = source
 
     is_new = False
     trial_available = False
@@ -1481,6 +1491,56 @@ async def list_pending_invoices(message: types.Message):
 
     keyboard = types.InlineKeyboardMarkup(inline_keyboard=keyboard_rows)
     await message.answer("\n".join(text_lines), reply_markup=keyboard)
+
+
+@router.message(Command("adstats"))
+async def ad_sources_stats(message: types.Message):
+    """Admin: воронка по рекламным меткам (старт → триал → оплата + выручка)."""
+    if not _is_admin(message.from_user.id):
+        await message.answer("Эта команда только для админов.")
+        return
+    try:
+        status, data = await _fetch_json(
+            "GET",
+            f"{BACKEND_URL}/api/admin/ad-sources",
+            headers=_admin_headers(message.from_user.id),
+        )
+    except aiohttp.ClientError:
+        await message.answer("Бэкенд недоступен.")
+        return
+    if status != 200 or not isinstance(data, dict):
+        await message.answer("Не удалось загрузить статистику рекламы.")
+        return
+
+    sources = data.get("sources") or []
+    if not sources:
+        await message.answer(
+            "Пока нет данных по рекламным меткам.\n\nМетка ставится из ссылки "
+            "<code>t.me/имя_бота?start=МЕТКА</code> (напр. <code>?start=tg_blogger1</code>).",
+            parse_mode="HTML",
+        )
+        return
+
+    esc = html.escape
+    lines = ["📊 <b>Реклама — воронка по меткам</b>", ""]
+    for s in sources:
+        started = int(s.get("started", 0) or 0)
+        trial = int(s.get("trial", 0) or 0)
+        paid = int(s.get("paid", 0) or 0)
+        rev = (s.get("revenue_kopecks", 0) or 0) / 100
+        cr = f"{paid / started * 100:.0f}%" if started else "—"
+        lines.append(
+            f"<b>{esc(str(s.get('source')))}</b>: старт {started} → триал {trial} "
+            f"→ оплата {paid} ({cr}) · {rev:.0f}₽"
+        )
+    lines.append("")
+    lines.append(
+        f"<b>Итого:</b> старт {int(data.get('total_started', 0) or 0)}, "
+        f"оплат {int(data.get('total_paid', 0) or 0)}, "
+        f"выручка {(data.get('total_revenue_kopecks', 0) or 0) / 100:.0f}₽"
+    )
+    text = "\n".join(lines)
+    await message.answer(text[:4000], parse_mode="HTML", disable_web_page_preview=True)
 
 
 @router.callback_query(F.data.startswith("invoice_paid:"))
