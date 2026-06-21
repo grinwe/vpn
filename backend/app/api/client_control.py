@@ -556,6 +556,9 @@ class ReportBrokenResponse(BaseModel):
     new_node_region: str | None = None
     task_id: int | None = None
     retry_after_sec: int | None = None
+    # Для per-device миграции — имя перенесённого устройства (как записал юзер),
+    # чтобы бот показал «Поменяли сервер для «<имя>»». None для whole-sub пути.
+    device_name: str | None = None
 
 
 @router.post(
@@ -659,6 +662,171 @@ def report_broken_by_telegram(
         new_node_name=new_node.name,
         new_node_region=new_node.region,
         task_id=task.id if task else None,
+    )
+
+
+# ── Per-device failover (bot multi-device picker) ────────────────────────
+#
+# Юзер с несколькими устройствами тапнул «VPN не работает» → бот спрашивает,
+# КАКОЕ перенести, и зовёт report-broken-device с device_id. Переносим ноды
+# ТОЛЬКО этого устройства (failover_device) — соседние девайсы не трогаем,
+# ноду user-wide НЕ баним (в отличие от whole-sub report-broken). Зеркало
+# webapp /webapp/report-broken-device, но в bot-канале (shared admin-token).
+
+
+class DeviceMini(BaseModel):
+    device_id: int
+    name: str
+    status: str
+
+
+class DevicesByTelegramResponse(BaseModel):
+    devices: list[DeviceMini]
+
+
+@router.get(
+    "/admin/client-control/devices-by-telegram",
+    response_model=DevicesByTelegramResponse,
+)
+def devices_by_telegram(
+    telegram_id: str,
+    db: Session = Depends(get_db),
+    admin_token: str = Depends(require_admin),  # noqa: ARG001 — bot shared token
+) -> DevicesByTelegramResponse:
+    """Живые устройства первой активной подписки — для bot-пикера «какое
+    перенести». Имя = Device.name (как записал юзер). Пустой список = нет
+    активной подписки/устройств (бот покажет «нет подписки»)."""
+    user = (
+        db.query(models.User)
+        .filter(models.User.telegram_id == str(telegram_id))
+        .first()
+    )
+    if user is None:
+        return DevicesByTelegramResponse(devices=[])
+    sub = (
+        db.query(models.Subscription)
+        .filter(
+            models.Subscription.user_id == user.id,
+            models.Subscription.status == models.SubscriptionStatus.active,
+        )
+        .order_by(models.Subscription.id)
+        .first()
+    )
+    if sub is None:
+        return DevicesByTelegramResponse(devices=[])
+    live = [
+        DeviceMini(
+            device_id=d.id,
+            name=d.name or "Устройство",
+            status=getattr(d.status, "value", str(d.status)),
+        )
+        for d in sub.devices
+        if d.status
+        not in (models.DeviceStatus.disabled, models.DeviceStatus.revoked)
+    ]
+    live.sort(key=lambda x: x.device_id)  # стабильный порядок кнопок
+    return DevicesByTelegramResponse(devices=live)
+
+
+class ReportBrokenDeviceByTelegramRequest(BaseModel):
+    telegram_id: str
+    device_id: int
+    operator: str | None = None
+
+
+@router.post(
+    "/admin/client-control/report-broken-device",
+    response_model=ReportBrokenResponse,
+)
+def report_broken_device_by_telegram(
+    body: ReportBrokenDeviceByTelegramRequest,
+    db: Session = Depends(get_db),
+    admin_token: str = Depends(require_admin),  # noqa: ARG001 — bot shared token
+) -> ReportBrokenResponse:
+    """Перенести ОДНО выбранное устройство на свободную ноду.
+
+    Resolve user по telegram_id, anti-forge (устройство обязано принадлежать
+    юзеру), затем ``failover_device`` — перетряхивает ноды только этого
+    устройства, ``sub_token``/UUID сохраняются (установленный клиент не
+    рвётся), user-wide ``NodeUserBan`` НЕ ставится. Троттла нет намеренно:
+    перенесённое устройство сразу становится revoked → повторный тап по нему
+    отсекается проверкой статуса ниже (как в шипнутом webapp-пути); а раз
+    бана нет — спам не выжигает пул нод.
+    """
+    user = (
+        db.query(models.User)
+        .filter(models.User.telegram_id == str(body.telegram_id))
+        .first()
+    )
+    if user is None:
+        return ReportBrokenResponse(action="user_not_found")
+
+    device = db.get(models.Device, body.device_id)
+    if device is None or device.user_id != user.id:
+        # Anti-forge: чужое/несуществующее устройство.
+        return ReportBrokenResponse(action="no_subscription")
+    if device.status in (
+        models.DeviceStatus.disabled,
+        models.DeviceStatus.revoked,
+    ):
+        # Уже перенесли/отключили (напр. повторный тап по старой клавиатуре).
+        return ReportBrokenResponse(action="no_subscription")
+
+    sub = device.subscription
+    if sub is None or sub.plan is None:
+        return ReportBrokenResponse(action="no_subscription")
+
+    orchestrator = ProvisioningOrchestrator(db)
+    try:
+        target, new_device, task, old_primary = orchestrator.failover_device(device)
+    except RuntimeError:
+        # Нет свежей ноды (всё исключено/нездорово) → бот предложит поддержку.
+        return ReportBrokenResponse(action="no_target")
+    except Exception:  # noqa: BLE001
+        if db.is_active:
+            db.rollback()
+        logger.exception(
+            "report-broken-device: failover failed for device %s", device.id
+        )
+        return ReportBrokenResponse(action="no_target")
+
+    operator = body.operator if body.operator in _OPERATORS else None
+    report = models.OperatorNodeReport(
+        user_id=user.id,
+        subscription_id=sub.id,
+        device_id=new_device.id,
+        operator=operator,
+        failed_node_id=old_primary,
+        target_node_id=target.id,
+        target_access_username=new_device.access_username,
+        outcome="pending",
+    )
+    db.add(report)
+    db.commit()
+    db.refresh(report)
+    _audit(
+        db,
+        f"user:{user.telegram_id}",
+        "client_reported_failure",
+        "subscription",
+        sub.id,
+        metadata={
+            "report_id": report.id,
+            "failed_node_id": old_primary,
+            "target_node_id": target.id,
+            "device_id": new_device.id,
+            "scope": "device",
+            "source": "bot_vpn_broken",
+        },
+        actor_type=models.AuditActor.user,
+    )
+    return ReportBrokenResponse(
+        action="migrated",
+        report_id=report.id,
+        new_node_name=target.name,
+        new_node_region=target.region,
+        task_id=task.id if task else None,
+        device_name=new_device.name or "Устройство",
     )
 
 
