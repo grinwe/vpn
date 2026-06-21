@@ -922,6 +922,16 @@ export function diagnosticsMute(
   );
 }
 
+// Вручную закрыть открытый diagnose-инцидент (остаточный/ложный). В отличие от
+// ack (он лишь глушит ре-диагностику), снимает сам красный бейдж: зануляет
+// diagnose_incident_open_at + сбрасывает серию падений unreachable_since.
+export function diagnosticsClose(kind: DiagnosticsTargetKind, id: number) {
+  return api.post<Record<string, unknown>>(
+    `/diagnostics/${kind}/${id}/close`,
+    {},
+  );
+}
+
 // ── Client control channel (admin trigger) ────────────────────────────
 // Имитирует client report от имени оператора — юзер написал в саппорт
 // через второй канал, оператор кликает кнопку → backend мигрирует

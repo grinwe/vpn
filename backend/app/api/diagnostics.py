@@ -136,6 +136,37 @@ def diagnostics_ack(
     return {"kind": kind, "id": target_id, "label": _label(target), **_state(target)}
 
 
+@router.post("/diagnostics/{kind}/{target_id}/close")
+def diagnostics_close(
+    kind: str,
+    target_id: int,
+    db: Session = Depends(get_db),
+    admin_token: str = Depends(require_admin),
+    admin_actor: str | None = Header(default=None, alias=ADMIN_ACTOR_HEADER),
+):
+    """Вручную закрыть открытый diagnose-инцидент (остаточный/ложный).
+
+    В отличие от ``ack`` (тот лишь глушит ре-диагностику, ОСТАВЛЯЯ красный
+    бейдж), это снимает сам инцидент: зануляет ``diagnose_incident_open_at`` и
+    сбрасывает серию падений ``unreachable_since``. Если нода реально
+    недоступна, ближайший reachability-тик заново подтвердит недоступность за
+    NODE_ALERT_CONFIRM_MIN и откроет свежий инцидент.
+    """
+    target = _resolve_target(db, kind, target_id)
+    was_open = diagnostics_state.close_incident(target)
+    # Сбрасываем серию падений, чтобы остаточный unreachable_since не «доехал»
+    # до повторного открытия сразу после ручного закрытия.
+    if getattr(target, "unreachable_since", None) is not None:
+        target.unreachable_since = None
+    db.commit()
+    actor, actor_type = _resolve_admin_actor(admin_actor)
+    _audit(db, actor, "diagnose_incident_closed", kind, target_id, actor_type=actor_type)
+    return {
+        "kind": kind, "id": target_id, "label": _label(target),
+        "was_open": was_open, **_state(target),
+    }
+
+
 @router.post("/diagnostics/{kind}/{target_id}/follow")
 def diagnostics_follow(
     kind: str,

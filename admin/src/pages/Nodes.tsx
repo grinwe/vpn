@@ -36,6 +36,7 @@ import {
   listPools,
   VPNNodeUpdateIn,
   ServerPoolMini,
+  diagnosticsClose,
 } from "../api";
 import { HealthDots } from "../linkHealth";
 import { DiagnoseResult } from "../diagnoseResult";
@@ -673,6 +674,12 @@ export default function Nodes() {
       api.post<VPNNodeOut>(`/nodes/${id}/active`, { is_active }),
     onSuccess: () => qc.invalidateQueries({ queryKey: ["nodes"] }),
     onError: (e: Error) => alert(`Не удалось изменить флаг: ${e.message}`),
+  });
+
+  const closeIncident = useMutation({
+    mutationFn: (id: number) => diagnosticsClose("node", id),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ["nodes"] }),
+    onError: (e: Error) => alert(`Не удалось закрыть инцидент: ${e.message}`),
   });
 
   const resync = useMutation({
@@ -1361,11 +1368,32 @@ export default function Nodes() {
                         blocked={n.blocked_regions}
                       />
                       {n.diagnose_incident_open_at && (
-                        <span
-                          className="text-[10px] px-1 py-0.5 rounded bg-red-900 text-red-300"
-                          title={`Открыт diagnose-инцидент с ${new Date(n.diagnose_incident_open_at).toLocaleString()}`}
-                        >
-                          🔴 инцидент
+                        <span className="inline-flex items-center gap-1">
+                          <span
+                            className="text-[10px] px-1 py-0.5 rounded bg-red-900 text-red-300"
+                            title={`Открыт diagnose-инцидент с ${new Date(n.diagnose_incident_open_at).toLocaleString()}`}
+                          >
+                            🔴 инцидент
+                          </span>
+                          <button
+                            disabled={closeIncident.isPending}
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              if (
+                                confirm(
+                                  `Закрыть diagnose-инцидент ноды #${n.id} (${n.name})?\n\n` +
+                                    "Красный бейдж снимется, серия падений сбросится. " +
+                                    "Если нода реально недоступна, тик откроет инцидент " +
+                                    "заново через NODE_ALERT_CONFIRM_MIN.",
+                                )
+                              )
+                                closeIncident.mutate(n.id);
+                            }}
+                            title="Вручную закрыть инцидент (в отличие от ack — снимает бейдж)"
+                            className="text-[10px] px-1 py-0.5 rounded bg-slate-700 hover:bg-slate-600 text-slate-200 disabled:opacity-50"
+                          >
+                            ✕ закрыть
+                          </button>
                         </span>
                       )}
                       {n.last_probe_status && (

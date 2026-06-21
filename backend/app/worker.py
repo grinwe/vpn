@@ -1679,6 +1679,7 @@ def run_node_reachability_tick() -> dict:
         "checked": 0,
         "down": [],
         "recovered": [],
+        "reconciled": [],
         "suspect": [],
         "diagnosed": [],
         "pushed": [],
@@ -1698,6 +1699,22 @@ def run_node_reachability_tick() -> dict:
             .all()
         ):
             targets.append(("exit", e))
+
+        # Бэкстоп-реконсиляция: закрыть инциденты, оставшиеся открытыми на уже
+        # здоровых целях (last_probe_status=='ok', серии падений нет). Покрывает
+        # пропуски штатного закрытия на ssh_ok — обрезанный бюджетом хвост,
+        # крауд-открытые инциденты на SSH-здоровой ноде, подвисший тик. Дешёвый
+        # проход без SSH, до бюджетного цикла, поэтому не голодает. Штатное
+        # немедленное закрытие на ssh_ok ниже остаётся.
+        recon_now = utcnow()
+        recon_max_age = float(os.getenv("NODE_INCIDENT_RECONCILE_MAX_AGE_MIN", "30"))
+        for kind, target in targets:
+            if diagnostics_state.reconcile_healthy_incident(
+                target, now=recon_now, max_age_min=recon_max_age
+            ):
+                summary["reconciled"].append(f"{kind}:{target.id}")
+        if summary["reconciled"]:
+            session.commit()
 
         import time as _time
 

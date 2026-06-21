@@ -123,6 +123,40 @@ def close_incident(target) -> bool:
     return True
 
 
+def reconcile_healthy_incident(
+    target, now: datetime | None = None, max_age_min: float = 30.0
+) -> bool:
+    """Бэкстоп-закрытие: снять инцидент, оставшийся открытым на уже здоровой цели.
+
+    Reachability-тик закрывает инцидент СРАЗУ на свежем ``ssh_ok`` пробе. Но это
+    штатное закрытие можно пропустить: рекавери-проб обрезан wall-clock бюджетом
+    тика (хвост списка целей не пробился), инцидент открыт крауд-путём на
+    SSH-здоровой ноде, или тик подвисал. Реконсилит остаточное состояние
+    «инцидент открыт + probe ok» каждый тик — дёшево, без SSH, — чтобы красный
+    бейдж не висел, пока нода доказуемо жива. Закрытие на ``ssh_ok`` в тике
+    остаётся как было; это лишь подстраховка для рассинхрона.
+
+    Закрывает iff: инцидент открыт, последний проб == ``ok``, нет активной серии
+    падений (``unreachable_since`` is None) и этот проб свежий (``last_probe_at``
+    не старше ``max_age_min`` — чтобы не действовать по протухшей телеметрии
+    подвисшего тика). Возвращает True, если закрыл. ``max_age_min`` <= 0 снимает
+    проверку свежести.
+    """
+    now = now or utcnow()
+    if getattr(target, "diagnose_incident_open_at", None) is None:
+        return False
+    if getattr(target, "last_probe_status", None) != "ok":
+        return False
+    if getattr(target, "unreachable_since", None) is not None:
+        return False
+    last_probe_at = getattr(target, "last_probe_at", None)
+    if last_probe_at is None:
+        return False
+    if max_age_min > 0 and last_probe_at < now - timedelta(minutes=max_age_min):
+        return False
+    return close_incident(target)
+
+
 # ── Toggle / button mutations (called by api/diagnostics.py + bot) ──────────
 
 def set_diagnostics_disabled(target, disabled: bool, now: datetime | None = None) -> None:

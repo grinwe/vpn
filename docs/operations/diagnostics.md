@@ -238,7 +238,8 @@ admin-push. Идемпотентно: уже cooled-нода повторно н
 `NODE_REACHABILITY_INTERVAL=300`, `NODE_REACHABILITY_ENABLED=true`,
 `NODE_ALERT_CONFIRM_MIN=20` (confirm-окно перед алертом; 0 = алерт с первого DOWN),
 `NODE_REACHABILITY_MAX_DIAGNOSE_PER_TICK=4`, `NODE_REACHABILITY_BUDGET_SEC=200`,
-`DIAGNOSE_SAFETY_RECAP_HOURS=12`, `ADMIN_ALERT_DIAGNOSIS_WINDOW_SEC=1800`.
+`DIAGNOSE_SAFETY_RECAP_HOURS=12`, `ADMIN_ALERT_DIAGNOSIS_WINDOW_SEC=1800`,
+`NODE_INCIDENT_RECONCILE_MAX_AGE_MIN=30` (бэкстоп авто-закрытия, см. раздел 2026-06-21).
 Краудсорс: `NODE_FAILURE_REPORT_WINDOW_MIN=60`, `NODE_FAILURE_BAN_THRESHOLD=4`,
 `NODE_FAILURE_COOLDOWN_HOURS=2`.
 
@@ -303,3 +304,53 @@ job → чистят сырой ключ `rq:job:<id>` → свежий enqueue.
 больше не вешает тик. Расклинить уже-битый прод-джоб: **deploy** (новый код
 вычистит на рестарте воркера) либо вручную `redis del
 rq:job:tick-node-reachability` + рестарт `worker-scheduler`.
+
+## Бэкстоп авто-закрытия инцидентов + ручной close (2026-06-21)
+
+Закрывает класс «красный 🔴 инцидент висит, хотя нода уже здорова» (`probe:
+ok`, SSH свежий, WG зелёный) — тот же симптом, что замёрзшие инциденты после
+12ч-сталла тика (self-heal выше), но по другим причинам.
+
+### Почему инцидент залипает
+Штатное закрытие живёт ТОЛЬКО в `run_node_reachability_tick`: ветка
+`if probe.ssh_ok:` зовёт `close_incident` немедленно на первом удачном пробе
+(`worker.py`). До этой ветки можно НЕ дойти:
+* тик обрезан wall-clock бюджетом (`NODE_REACHABILITY_BUDGET_SEC`) — хвост
+  списка целей в этот цикл не пробивается, рекавери-проб пропущен;
+* инцидент открыт **крауд-путём** (`client_control.py`, ≥4 жалобы за час) на
+  SSH-здоровой ноде — `last_probe_status` и так `ok`, ssh_ok-ветке нечего
+  закрывать, рассинхрон крауд-инцидента и проба никто не сводит;
+* тик подвисал (битый RQ-джоб).
+
+Асимметрия: открытие — с confirm-окном `NODE_ALERT_CONFIRM_MIN` (20 мин),
+закрытие — одним `ssh_ok` без гистерезиса; поэтому любой пропуск этой ветки
+оставляет бейдж красным при живой ноде.
+
+### Фикс 1 — бэкстоп-реконсиляция (авто)
+`diagnostics_state.reconcile_healthy_incident(target, now, max_age_min)` +
+вызов в начале `run_node_reachability_tick` ОТДЕЛЬНЫМ дешёвым проходом по всем
+active-целям, ДО бюджетного цикла (без SSH → не голодает под бюджетом).
+Закрывает инцидент iff: он открыт, `last_probe_status=='ok'`, серии падений нет
+(`unreachable_since is None`) и проб свежий (`last_probe_at` ≤
+`NODE_INCIDENT_RECONCILE_MAX_AGE_MIN`, default 30 мин — чтобы не действовать по
+протухшей телеметрии подвисшего тика). Закрытые рефы → `summary["reconciled"]`.
+Штатное немедленное закрытие на `ssh_ok` остаётся как было. Тест:
+`test_reachability_confirm.py::test_reachability_backstop_reconcile`.
+
+### Фикс 2 — ручное закрытие (оператор)
+`POST /api/diagnostics/{kind}/{id}/close` (`api/diagnostics.py`, generic
+node|exit, `require_admin`). В отличие от `ack` (тот лишь глушит ре-диагностику,
+ОСТАВЛЯЯ бейдж) — снимает сам инцидент: `close_incident` + сброс
+`unreachable_since`. Если нода реально недоступна, ближайший тик заново
+подтвердит за `NODE_ALERT_CONFIRM_MIN` и откроет свежий инцидент. Аудит
+`diagnose_incident_closed`, ответ включает `was_open`. Тесты:
+`test_diagnostics_close.py`.
+
+UI: кнопка «✕ закрыть» рядом с 🔴-бейджем в строке ноды
+(`admin/src/pages/Nodes.tsx`, мутация `closeIncident` → `diagnosticsClose` в
+`admin/src/api.ts`); `confirm()` поясняет, что серия сбросится и тик может
+открыть заново. Пока только для нод (`kind="node"`).
+
+### Env
+`NODE_INCIDENT_RECONCILE_MAX_AGE_MIN=30` — макс. возраст `last_probe_at`, при
+котором бэкстоп доверяет `ok` и закрывает; `<=0` снимает проверку свежести.
