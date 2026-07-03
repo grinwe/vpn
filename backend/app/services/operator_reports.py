@@ -27,10 +27,22 @@ def report_reconnected(db: Session, report: models.OperatorNodeReport) -> bool:
     """Did the user reconnect on the target node since the report?
 
     True iff ``target_access_username`` shows up in any
-    ``NodeTrafficSample.details["users"]`` for the target node with
-    ``observed_at >= reported_at``. Used both by the watcher (to set the
-    matrix outcome) and on-demand by the bot's conditional «всё ещё не
-    работает» push (only nudge if we did NOT observe a reconnect).
+    ``NodeTrafficSample.details["<proto>"]["users"]`` for the target node
+    with ``observed_at >= reported_at``. ``details`` is keyed by protocol
+    (см. ``traffic_stats.to_details``); список юзеров лежит на уровень
+    глубже, ПЕР-протокол — та же вложенная форма, что толерантно читает
+    ``api/nodes.py::list_node_users``.
+
+    NB: раньше читался верхнеуровневый ``details["users"]`` (его НЕ
+    существует) → функция всегда возвращала False: каждый репорт резолвился
+    в ``inconclusive`` (никогда ``ok``), а бот слал «всё ещё не работает»
+    даже тем, кто УЖЕ переподключился. Гранулярность при этом верная
+    (per-device: ровно один ``target_access_username`` на одной
+    ``target_node_id``) — лечим только обход вложенной структуры.
+
+    Используется и watcher'ом (исход для матрицы), и on-demand ботом для
+    условного пуша «всё ещё не работает» (нуджим только если reconnect НЕ
+    наблюдали).
     """
     if not (report.target_node_id and report.target_access_username):
         return False
@@ -43,9 +55,13 @@ def report_reconnected(db: Session, report: models.OperatorNodeReport) -> bool:
         .all()
     )
     for sample in samples:
-        users = (sample.details or {}).get("users") or []
-        if report.target_access_username in users:
-            return True
+        # details = {"<proto>": {"users": [access_username, ...], ...}, "_errors": {...}}
+        for proto, payload in (sample.details or {}).items():
+            if proto == "_errors" or not isinstance(payload, dict):
+                continue
+            users = payload.get("users")
+            if isinstance(users, list) and report.target_access_username in users:
+                return True
     return False
 
 

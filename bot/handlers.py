@@ -1007,10 +1007,16 @@ def _still_broken_keyboard(report_id: int) -> types.InlineKeyboardMarkup:
         inline_keyboard=[
             [
                 types.InlineKeyboardButton(
+                    text="✅ Всё работает",
+                    callback_data=f"op:ok:{report_id}",
+                )
+            ],
+            [
+                types.InlineKeyboardButton(
                     text="❌ Всё равно не работает",
                     callback_data=f"op:still:{report_id}",
                 )
-            ]
+            ],
         ]
     )
 
@@ -1136,6 +1142,25 @@ async def operator_choice(callback_query: types.CallbackQuery) -> None:
     tg_id = callback_query.from_user.id
     if len(parts) < 3:
         await callback_query.answer()
+        return
+
+    # op:ok:<report_id> — «всё работает» → target-нода ok (позитивный сигнал).
+    if parts[1] == "ok":
+        try:
+            await _fetch_json(
+                "POST",
+                f"{BACKEND_URL}/api/admin/client-control/report-ok",
+                json={"report_id": int(parts[2])},
+                headers=_admin_headers(tg_id),
+            )
+        except (aiohttp.ClientError, ValueError):
+            pass
+        await callback_query.answer()
+        try:
+            await callback_query.message.edit_reply_markup(reply_markup=None)
+        except Exception:  # noqa: BLE001
+            pass
+        await callback_query.message.answer("Отлично, рад что заработало! 🎉")
         return
 
     # op:still:<report_id> — «всё равно не работает» → поддержка + target=fail.

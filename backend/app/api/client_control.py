@@ -876,6 +876,31 @@ def report_still_broken(
     return {"report_id": report.id, "outcome": report.outcome}
 
 
+@router.post("/admin/client-control/report-ok")
+def report_ok(
+    body: ReportIdRequest,
+    db: Session = Depends(get_db),
+    admin_token: str = Depends(require_admin),  # noqa: ARG001
+):
+    """«Всё работает» после миграции → target-нода ok (позитивный сигнал матрице).
+
+    Единственный user-driven путь в outcome=ok (иначе ok ставит только watcher
+    по факту трафика — а тот долго был сломан, см. report_reconnected). Уже
+    разрешённый ЯВНО юзером исход не перетираем: ok и fail («всё равно не
+    работает») оставляем как есть; апгрейдим только pending/inconclusive
+    (последнее — слабый сигнал watcher'а). Идемпотентно к двойному тапу.
+    """
+    report = db.get(models.OperatorNodeReport, body.report_id)
+    if report is None:
+        raise HTTPException(status_code=404, detail="Report not found")
+    if report.outcome in ("ok", "fail"):
+        return {"report_id": report.id, "outcome": report.outcome}
+    report.outcome = "ok"
+    report.resolved_at = utcnow()
+    db.commit()
+    return {"report_id": report.id, "outcome": report.outcome}
+
+
 @router.get("/admin/client-control/report-status/{report_id}")
 def report_status(
     report_id: int,
