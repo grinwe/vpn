@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import signal
 import subprocess
 import tempfile
 import threading
@@ -409,13 +410,39 @@ def run_playbook(
     # теряет вывод (см. python docs: "retrying communication will not lose
     # any output"). poll каждые ANSIBLE_CANCEL_POLL_S сек.
     poll_s = float(os.getenv("ANSIBLE_CANCEL_POLL_S", "3"))
+    # start_new_session=True → ansible-playbook становится лидером своей
+    # process group (setsid). Тогда timeout/cancel убивает ВСЮ группу через
+    # os.killpg (см. _kill_process_group ниже), а не только родителя: иначе
+    # форк-воркеры ansible и порождённые ими ssh продолжают крутить таски на
+    # ноде уже после того, как backend посчитал прогон убитым (гонка на
+    # config.json xray/wg + утечка осиротевших ssh в контейнере воркера).
     proc = subprocess.Popen(  # noqa: S603
         cmd,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
         cwd=str(ANSIBLE_ROOT),
+        start_new_session=True,
     )
+
+    def _kill_process_group(sig: int) -> None:
+        """Послать сигнал всей process group ansible-playbook.
+
+        pid лидера группы == pgid (start_new_session). ProcessLookupError —
+        группа уже мертва (нормальный финал эскалации TERM→KILL или гонка с
+        самозавершением), глушим. Fallback на proc-сигнал на случай, если
+        по какой-то причине setsid не сработал.
+        """
+        try:
+            os.killpg(proc.pid, sig)
+        except ProcessLookupError:
+            pass
+        except OSError:
+            # На всякий случай — если killpg недоступен, бьём хотя бы родителя.
+            try:
+                proc.send_signal(sig)
+            except ProcessLookupError:
+                pass
     start = time.monotonic()
     while True:
         try:
@@ -426,11 +453,11 @@ def run_playbook(
         except subprocess.TimeoutExpired:
             # Запрошена отмена → SIGTERM, добиваем kill'ом если не реагирует.
             if cancel_check is not None and cancel_check():
-                proc.terminate()
+                _kill_process_group(signal.SIGTERM)
                 try:
                     stdout, stderr = proc.communicate(timeout=15)
                 except subprocess.TimeoutExpired:
-                    proc.kill()
+                    _kill_process_group(signal.SIGKILL)
                     stdout, stderr = proc.communicate()
                 raise AnsibleCancelled(
                     "Ansible playbook cancelled by operator",
@@ -439,7 +466,7 @@ def run_playbook(
                 )
             # Общий timeout — kill + tail в сообщение (как раньше).
             if time.monotonic() - start > timeout:
-                proc.kill()
+                _kill_process_group(signal.SIGKILL)
                 try:
                     stdout, stderr = proc.communicate(timeout=15)
                 except subprocess.TimeoutExpired:

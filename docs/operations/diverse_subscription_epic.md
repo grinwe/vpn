@@ -141,7 +141,11 @@ url-test/failover.** Бесшовного «прыгания между N нод
 ### Фаза C — carrying_fraction-детект + ротация
 - Read-only сигнал: per-node `carrying_fraction` во времени из traffic-телеметрии +
   набора девайсов → метрика/алерт «нода широко гниёт». ✅ `services/carrying.py` +
-  `GET /api/nodes/carrying-fractions`.
+  `GET /api/nodes/carrying-fractions`. Числитель (carrying) и знаменатель (eligible)
+  фильтруются одинаково по `Credential.is_active` → fraction ≤ 1.0. Протухший сэмпл
+  (старше `CARRYING_SAMPLE_MAX_AGE_MIN`, по умолчанию 3×`TRAFFIC_STATS_INTERVAL`)
+  отдаёт `carrying_fraction=null` + `"stale": true`, чтобы недельной давности carrying
+  не выдавался как текущий.
 - **Ротация-примитив ✅ реализован:** `ProvisioningOrchestrator.swap_node_out(device,
   node_id)` — убирает ОДНУ ноду из набора (деактивирует её creds; строки НЕ удаляем —
   инвариант sub_token) и добирает свежую диверсную взамен (`_maybe_attach_diverse` с

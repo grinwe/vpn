@@ -162,7 +162,7 @@ if invoice.kind == "topup":
                       reference=f"invoice:{invoice.id}", kind=BalanceTxKind.topup)
 ```
 
-Важно: **referrer payout проверяется ДО записи своего топапа**, чтобы условие «первый топап» было однозначным. Дубль-защита — идемпотентный reference `referral_payout:{user_id}`. Подробнее: [TRIAL_SYSTEM.md § Stage 3](TRIAL_SYSTEM.md#stage-3--referrer-payout-on-referees-first-real-topup).
+Важно: **referrer payout проверяется ДО записи своего топапа**, чтобы условие «первый топап» было однозначным. Дубль-защита — идемпотентный reference `referral_payout:{user_id}` плюс блокировка строки пополняемого пользователя (`SELECT ... FOR UPDATE`) перед проверкой: два одновременных topup-вебхука одного юзера сериализуются, второй видит уже записанный первый топап и бонус не повторяет. Подробнее: [TRIAL_SYSTEM.md § Stage 3](TRIAL_SYSTEM.md#stage-3--referrer-payout-on-referees-first-real-topup).
 
 ## Activation: `activate_prepaid()` / `refund_prepaid()`
 

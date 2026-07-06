@@ -14,6 +14,30 @@ from prometheus_client import Counter, Gauge
 
 logger = logging.getLogger(__name__)
 
+
+def _env_int(name: str, default: int) -> int:
+    """``int(os.getenv(name))`` с защитой от мусорного значения.
+
+    Голый ``int(os.getenv(...))`` на невалидной переменной кидает ValueError.
+    На module-level это роняет импорт ``app.worker`` — а его импортит КАЖДАЯ
+    RQ-джоба и ``main()``, поэтому одна опечатка в .env (``FOO=24h``) кладёт
+    весь фоновый контур в crash-loop. В теле тика ValueError до self-reschedule
+    убивает цепочку периодики молча. Здесь мусор/пустая строка → warning +
+    дефолт, чтобы контур пережил кривую переменную.
+    """
+    raw = os.getenv(name)
+    if raw is None or raw.strip() == "":
+        return default
+    try:
+        return int(raw.strip())
+    except (TypeError, ValueError):
+        logger.warning(
+            "env %s=%r не парсится как int — использую дефолт %s",
+            name, raw, default,
+        )
+        return default
+
+
 # NB: this module MUST be imported under its canonical name `app.worker`, not
 # as `__main__`. RQ executes jobs by calling importlib.import_module("app.worker"),
 # and if the module was originally loaded as `__main__` (via `python -m app.worker`),
@@ -39,7 +63,14 @@ RENEWAL_REVOKED = Counter(
 
 # Grace window after expires_at before we actually rip the user off the node.
 # Default: 24h. Set to 0 for instant revoke.
-RENEWAL_GRACE_HOURS = int(os.getenv("RENEWAL_GRACE_HOURS", "24"))
+RENEWAL_GRACE_HOURS = _env_int("RENEWAL_GRACE_HOURS", 24)
+
+# Верхняя граница числа подписок, обрабатываемых за один тик продлений в
+# каждом окне. Без лимита выборки .all() тянут всё окно, а per-sub цикл делает
+# по несколько запросов на подписку — при тысячах истекающих тик упирается в
+# job_timeout и хвост окна не обрабатывается. Обходим окна в порядке
+# expires_at ASC (самые срочные первыми), остаток донесётся следующим тиком.
+RENEWAL_WINDOW_LIMIT = _env_int("RENEWAL_WINDOW_LIMIT", 2000)
 
 
 PENDING_RESCUE = Counter(
@@ -97,7 +128,7 @@ def run_cloud_billing_tick() -> dict:
     from .services.admin_notify import notify_admins
     from .services.cloud.base import DriverError, get_driver
 
-    interval = int(os.getenv("CLOUD_BILLING_INTERVAL", "3600"))
+    interval = _env_int("CLOUD_BILLING_INTERVAL", 3600)
     if interval > 0:
         try:
             schedule_tick(
@@ -190,7 +221,7 @@ def run_pending_rescue_tick() -> dict:
     # Перепланируем ДО начала работы. Если body упадёт / будет убит по
     # job_timeout — следующий запуск уже в ScheduledJobRegistry. replace=True
     # обязателен: текущий job в "started", default-dedup вернул бы early.
-    interval = int(os.getenv("PENDING_RESCUE_INTERVAL", "60"))
+    interval = _env_int("PENDING_RESCUE_INTERVAL", 60)
     if interval > 0:
         try:
             schedule_tick(
@@ -202,7 +233,7 @@ def run_pending_rescue_tick() -> dict:
         except Exception:  # noqa: BLE001
             logger.exception("pending_rescue: failed to re-enqueue tick (at start)")
 
-    age = int(os.getenv("PENDING_RESCUE_AGE", "60"))
+    age = _env_int("PENDING_RESCUE_AGE", 60)
     rescued = 0
     scanned = 0
 
@@ -255,7 +286,7 @@ def run_operator_report_watch_tick() -> dict:
     from .services.operator_reports import resolve_pending_reports
 
     # Reschedule в начале — см. run_pending_rescue_tick.
-    interval = int(os.getenv("OPERATOR_REPORT_WATCH_INTERVAL", "300"))
+    interval = _env_int("OPERATOR_REPORT_WATCH_INTERVAL", 300)
     if interval > 0:
         try:
             schedule_tick(
@@ -285,7 +316,7 @@ def run_reconcile_tick() -> dict:
     from .queue import schedule_tick
     from .services.provisioning import ProvisioningOrchestrator
 
-    interval = int(os.getenv("RECONCILE_INTERVAL", "3"))
+    interval = _env_int("RECONCILE_INTERVAL", 3)
     if interval > 0:
         try:
             schedule_tick(
@@ -404,7 +435,7 @@ def run_autoscale_tick() -> list[dict]:
     from .services.autoscale import evaluate_all_pools
 
     # Reschedule в начале — см. run_pending_rescue_tick.
-    interval = int(os.getenv("AUTOSCALE_INTERVAL", "0"))
+    interval = _env_int("AUTOSCALE_INTERVAL", 0)
     if interval > 0:
         try:
             schedule_tick(
@@ -448,7 +479,7 @@ def run_renewal_check() -> dict:
     from .time_utils import utcnow
 
     # Reschedule в начале — см. run_pending_rescue_tick.
-    interval = int(os.getenv("RENEWAL_CHECK_INTERVAL", "3600"))
+    interval = _env_int("RENEWAL_CHECK_INTERVAL", 3600)
     if interval > 0:
         try:
             schedule_tick(
@@ -575,76 +606,91 @@ def run_renewal_check() -> dict:
                 models.Subscription.expires_at <= remind_horizon,
                 models.Subscription.expires_at > now,
             )
+            .order_by(models.Subscription.expires_at.asc())
+            .limit(RENEWAL_WINDOW_LIMIT)
             .all()
         )
         for sub in expiring_soon:
-            existing = (
-                session.query(models.Invoice)
-                .filter(
-                    models.Invoice.subscription_id == sub.id,
-                    models.Invoice.action == models.InvoiceAction.renewal,
-                    models.Invoice.status == models.InvoiceStatus.pending,
-                )
-                .first()
-            )
-            if existing:
-                continue
-            plan = session.get(models.Plan, sub.plan_id)
-            if not plan:
-                continue
-            invoice = models.Invoice(
-                user_id=sub.user_id,
-                plan_id=sub.plan_id,
-                subscription_id=sub.id,
-                amount=float(plan.price),
-                currency="USD",
-                action=models.InvoiceAction.renewal,
-            )
-            session.add(invoice)
-            session.flush()
+            # Per-item SAVEPOINT-изоляция: битая строка (IntegrityError на
+            # flush инвойса, обрыв соединения посреди цикла) откатывается
+            # только сама и не рушит ни остальные подписки этого пасса, ни
+            # последующие пассы (1-day/manual напоминания). Без этого одна
+            # запись глушила напоминания всем.
+            try:
+                with session.begin_nested():
+                    existing = (
+                        session.query(models.Invoice)
+                        .filter(
+                            models.Invoice.subscription_id == sub.id,
+                            models.Invoice.action == models.InvoiceAction.renewal,
+                            models.Invoice.status == models.InvoiceStatus.pending,
+                        )
+                        .first()
+                    )
+                    if existing:
+                        continue
+                    plan = session.get(models.Plan, sub.plan_id)
+                    if not plan:
+                        continue
+                    invoice = models.Invoice(
+                        user_id=sub.user_id,
+                        plan_id=sub.plan_id,
+                        subscription_id=sub.id,
+                        amount=float(plan.price),
+                        currency="USD",
+                        action=models.InvoiceAction.renewal,
+                    )
+                    session.add(invoice)
+                    session.flush()
 
-            user = session.get(models.User, sub.user_id)
-            if not user or not user.telegram_id or not user.notify_renewals:
-                stats["reminded"] += 1
-                continue
-            # Skip notification if balance covers next renewal — V2
-            # balance tick will silently auto-renew, no need to bug user.
-            wallet = user.balance_kopecks or 0
-            cost = balance_svc.total_renewal_cost_kopecks(sub)
-            if cost > 0 and wallet >= cost:
-                stats["reminded"] += 1
-                continue
-            # Idempotency in addition to invoice-check: invoice can be
-            # marked paid/cancelled by admin, after which the existing
-            # invoice query returns nothing and we'd otherwise re-spam.
-            existing_log = (
-                session.query(models.AuditLog)
-                .filter(
-                    models.AuditLog.action.in_(
-                        ["renewal_reminder", "renewal_reminder:delivered"]
-                    ),
-                    models.AuditLog.target_type == "subscription",
-                    models.AuditLog.target_id == sub.id,
+                    user = session.get(models.User, sub.user_id)
+                    if not user or not user.telegram_id or not user.notify_renewals:
+                        stats["reminded"] += 1
+                        continue
+                    # Skip notification if balance covers next renewal — V2
+                    # balance tick will silently auto-renew, no need to bug user.
+                    wallet = user.balance_kopecks or 0
+                    cost = balance_svc.total_renewal_cost_kopecks(sub)
+                    if cost > 0 and wallet >= cost:
+                        stats["reminded"] += 1
+                        continue
+                    # Idempotency in addition to invoice-check: invoice can be
+                    # marked paid/cancelled by admin, after which the existing
+                    # invoice query returns nothing and we'd otherwise re-spam.
+                    existing_log = (
+                        session.query(models.AuditLog)
+                        .filter(
+                            models.AuditLog.action.in_(
+                                ["renewal_reminder", "renewal_reminder:delivered"]
+                            ),
+                            models.AuditLog.target_type == "subscription",
+                            models.AuditLog.target_id == sub.id,
+                        )
+                        .first()
+                    )
+                    if existing_log:
+                        stats["reminded"] += 1
+                        continue
+                    log = models.AuditLog(
+                        actor="system",
+                        actor_type=models.AuditActor.system,
+                        action="renewal_reminder",
+                        target_type="subscription",
+                        target_id=sub.id,
+                        extra={
+                            "telegram_id": user.telegram_id,
+                            "invoice_id": invoice.id,
+                            "expires_at": sub.expires_at.isoformat(),
+                        },
+                    )
+                    session.add(log)
+                    stats["reminded"] += 1
+            except Exception:  # noqa: BLE001
+                logger.exception(
+                    "renewal_check: 3d reminder pass failed for sub %s", sub.id
                 )
-                .first()
-            )
-            if existing_log:
-                stats["reminded"] += 1
+                stats["errors"] += 1
                 continue
-            log = models.AuditLog(
-                actor="system",
-                actor_type=models.AuditActor.system,
-                action="renewal_reminder",
-                target_type="subscription",
-                target_id=sub.id,
-                extra={
-                    "telegram_id": user.telegram_id,
-                    "invoice_id": invoice.id,
-                    "expires_at": sub.expires_at.isoformat(),
-                },
-            )
-            session.add(log)
-            stats["reminded"] += 1
         session.commit()
 
         # ── 1-day urgent reminder for auto_renew subs ──
@@ -656,6 +702,8 @@ def run_renewal_check() -> dict:
                 models.Subscription.expires_at <= remind_horizon_1d,
                 models.Subscription.expires_at > now,
             )
+            .order_by(models.Subscription.expires_at.asc())
+            .limit(RENEWAL_WINDOW_LIMIT)
             .all()
         )
         logger.info(
@@ -663,78 +711,65 @@ def run_renewal_check() -> dict:
             len(expiring_1d),
         )
         for sub in expiring_1d:
-            user = session.get(models.User, sub.user_id)
-            if not user or not user.telegram_id or not user.notify_renewals:
-                logger.info(
-                    "renewal_check.1d: sub=%s skip (no user/tg/notify_renewals)",
-                    sub.id,
+            try:
+                with session.begin_nested():
+                    user = session.get(models.User, sub.user_id)
+                    if not user or not user.telegram_id or not user.notify_renewals:
+                        logger.info(
+                            "renewal_check.1d: sub=%s skip (no user/tg/notify_renewals)",
+                            sub.id,
+                        )
+                        continue
+                    # Same balance-gate as 3-day: silent auto-renew, no need to bug.
+                    wallet = user.balance_kopecks or 0
+                    cost = balance_svc.total_renewal_cost_kopecks(sub)
+                    if cost > 0 and wallet >= cost:
+                        logger.info(
+                            "renewal_check.1d: sub=%s skip balance-gate wallet=%s cost=%s",
+                            sub.id, wallet, cost,
+                        )
+                        continue
+                    # `.in_(...)` covers post-ACK state: bot's POST /ack appends
+                    # `:delivered` to action, so a plain `== "renewal_reminder_1d"`
+                    # check would miss the prior log and re-spam every 5-min tick.
+                    existing_log = (
+                        session.query(models.AuditLog)
+                        .filter(
+                            models.AuditLog.action.in_(
+                                ["renewal_reminder_1d", "renewal_reminder_1d:delivered"]
+                            ),
+                            models.AuditLog.target_type == "subscription",
+                            models.AuditLog.target_id == sub.id,
+                        )
+                        .first()
+                    )
+                    if existing_log:
+                        logger.info(
+                            "renewal_check.1d: sub=%s SKIP dedup matched log_id=%s "
+                            "action=%r",
+                            sub.id, existing_log.id, existing_log.action,
+                        )
+                        continue
+                    new_log = models.AuditLog(
+                        actor="system",
+                        actor_type=models.AuditActor.system,
+                        action="renewal_reminder_1d",
+                        target_type="subscription",
+                        target_id=sub.id,
+                        extra={
+                            "telegram_id": user.telegram_id,
+                            "subscription_id": sub.id,
+                            "expires_at": sub.expires_at.isoformat(),
+                        },
+                    )
+                    session.add(new_log)
+                    stats["reminded_1d"] += 1
+            except Exception:  # noqa: BLE001
+                logger.exception(
+                    "renewal_check: 1d reminder pass failed for sub %s", sub.id
                 )
+                stats["errors"] += 1
                 continue
-            # Same balance-gate as 3-day: silent auto-renew, no need to bug.
-            wallet = user.balance_kopecks or 0
-            cost = balance_svc.total_renewal_cost_kopecks(sub)
-            if cost > 0 and wallet >= cost:
-                logger.info(
-                    "renewal_check.1d: sub=%s skip balance-gate wallet=%s cost=%s",
-                    sub.id, wallet, cost,
-                )
-                continue
-            # `.in_(...)` covers post-ACK state: bot's POST /ack appends
-            # `:delivered` to action, so a plain `== "renewal_reminder_1d"`
-            # check would miss the prior log and re-spam every 5-min tick.
-            existing_log = (
-                session.query(models.AuditLog)
-                .filter(
-                    models.AuditLog.action.in_(
-                        ["renewal_reminder_1d", "renewal_reminder_1d:delivered"]
-                    ),
-                    models.AuditLog.target_type == "subscription",
-                    models.AuditLog.target_id == sub.id,
-                )
-                .first()
-            )
-            # Дополнительная диагностика для разбора майского спама: смотрим
-            # ВСЁ, что лежит в audit_logs по этой подписке, чтобы поймать
-            # action со странным суффиксом (типа ":delivered:delivered"),
-            # mismatched target_id, NULL target_id и т.д.
-            all_for_sub = (
-                session.query(models.AuditLog.id, models.AuditLog.action)
-                .filter(
-                    models.AuditLog.target_type == "subscription",
-                    models.AuditLog.target_id == sub.id,
-                )
-                .order_by(models.AuditLog.created_at.desc())
-                .limit(10)
-                .all()
-            )
-            if existing_log:
-                logger.info(
-                    "renewal_check.1d: sub=%s SKIP dedup matched log_id=%s action=%r "
-                    "(all_recent=%s)",
-                    sub.id, existing_log.id, existing_log.action,
-                    [(i, a) for (i, a) in all_for_sub],
-                )
-                continue
-            new_log = models.AuditLog(
-                actor="system",
-                actor_type=models.AuditActor.system,
-                action="renewal_reminder_1d",
-                target_type="subscription",
-                target_id=sub.id,
-                extra={
-                    "telegram_id": user.telegram_id,
-                    "subscription_id": sub.id,
-                    "expires_at": sub.expires_at.isoformat(),
-                },
-            )
-            session.add(new_log)
-            logger.warning(
-                "renewal_check.1d: sub=%s CREATED new log user=%s wallet=%s cost=%s "
-                "(all_recent_for_sub=%s) — investigate why dedup missed",
-                sub.id, user.id, wallet, cost,
-                [(i, a) for (i, a) in all_for_sub],
-            )
-            stats["reminded_1d"] += 1
         session.commit()
 
         # ── Remind non-auto-renew users about expiration (3-day) ──
@@ -746,37 +781,48 @@ def run_renewal_check() -> dict:
                 models.Subscription.expires_at <= remind_horizon,
                 models.Subscription.expires_at > now,
             )
+            .order_by(models.Subscription.expires_at.asc())
+            .limit(RENEWAL_WINDOW_LIMIT)
             .all()
         )
         for sub in expiring_manual:
-            user = session.get(models.User, sub.user_id)
-            if not user or not user.telegram_id or not user.notify_renewals:
-                continue
-            existing_log = (
-                session.query(models.AuditLog)
-                .filter(
-                    models.AuditLog.action.in_(
-                        ["expiry_reminder", "expiry_reminder:delivered"]
-                    ),
-                    models.AuditLog.target_type == "subscription",
-                    models.AuditLog.target_id == sub.id,
+            try:
+                with session.begin_nested():
+                    user = session.get(models.User, sub.user_id)
+                    if not user or not user.telegram_id or not user.notify_renewals:
+                        continue
+                    existing_log = (
+                        session.query(models.AuditLog)
+                        .filter(
+                            models.AuditLog.action.in_(
+                                ["expiry_reminder", "expiry_reminder:delivered"]
+                            ),
+                            models.AuditLog.target_type == "subscription",
+                            models.AuditLog.target_id == sub.id,
+                        )
+                        .first()
+                    )
+                    if existing_log:
+                        continue
+                    session.add(models.AuditLog(
+                        actor="system",
+                        actor_type=models.AuditActor.system,
+                        action="expiry_reminder",
+                        target_type="subscription",
+                        target_id=sub.id,
+                        extra={
+                            "telegram_id": user.telegram_id,
+                            "subscription_id": sub.id,
+                            "expires_at": sub.expires_at.isoformat(),
+                        },
+                    ))
+            except Exception:  # noqa: BLE001
+                logger.exception(
+                    "renewal_check: 3d manual reminder pass failed for sub %s",
+                    sub.id,
                 )
-                .first()
-            )
-            if existing_log:
+                stats["errors"] += 1
                 continue
-            session.add(models.AuditLog(
-                actor="system",
-                actor_type=models.AuditActor.system,
-                action="expiry_reminder",
-                target_type="subscription",
-                target_id=sub.id,
-                extra={
-                    "telegram_id": user.telegram_id,
-                    "subscription_id": sub.id,
-                    "expires_at": sub.expires_at.isoformat(),
-                },
-            ))
         session.commit()
 
         # ── 1-day urgent reminder for non-auto-renew subs ──
@@ -788,6 +834,8 @@ def run_renewal_check() -> dict:
                 models.Subscription.expires_at <= remind_horizon_1d,
                 models.Subscription.expires_at > now,
             )
+            .order_by(models.Subscription.expires_at.asc())
+            .limit(RENEWAL_WINDOW_LIMIT)
             .all()
         )
         logger.info(
@@ -795,60 +843,53 @@ def run_renewal_check() -> dict:
             len(expiring_manual_1d),
         )
         for sub in expiring_manual_1d:
-            user = session.get(models.User, sub.user_id)
-            if not user or not user.telegram_id or not user.notify_renewals:
-                logger.info(
-                    "renewal_check.manual_1d: sub=%s skip (no user/tg/notify)",
+            try:
+                with session.begin_nested():
+                    user = session.get(models.User, sub.user_id)
+                    if not user or not user.telegram_id or not user.notify_renewals:
+                        logger.info(
+                            "renewal_check.manual_1d: sub=%s skip (no user/tg/notify)",
+                            sub.id,
+                        )
+                        continue
+                    existing_log = (
+                        session.query(models.AuditLog)
+                        .filter(
+                            models.AuditLog.action.in_(
+                                ["expiry_reminder_1d", "expiry_reminder_1d:delivered"]
+                            ),
+                            models.AuditLog.target_type == "subscription",
+                            models.AuditLog.target_id == sub.id,
+                        )
+                        .first()
+                    )
+                    if existing_log:
+                        logger.info(
+                            "renewal_check.manual_1d: sub=%s SKIP dedup matched "
+                            "log_id=%s action=%r",
+                            sub.id, existing_log.id, existing_log.action,
+                        )
+                        continue
+                    session.add(models.AuditLog(
+                        actor="system",
+                        actor_type=models.AuditActor.system,
+                        action="expiry_reminder_1d",
+                        target_type="subscription",
+                        target_id=sub.id,
+                        extra={
+                            "telegram_id": user.telegram_id,
+                            "subscription_id": sub.id,
+                            "expires_at": sub.expires_at.isoformat(),
+                        },
+                    ))
+                    stats["reminded_1d"] += 1
+            except Exception:  # noqa: BLE001
+                logger.exception(
+                    "renewal_check: 1d manual reminder pass failed for sub %s",
                     sub.id,
                 )
+                stats["errors"] += 1
                 continue
-            existing_log = (
-                session.query(models.AuditLog)
-                .filter(
-                    models.AuditLog.action.in_(
-                        ["expiry_reminder_1d", "expiry_reminder_1d:delivered"]
-                    ),
-                    models.AuditLog.target_type == "subscription",
-                    models.AuditLog.target_id == sub.id,
-                )
-                .first()
-            )
-            all_for_sub = (
-                session.query(models.AuditLog.id, models.AuditLog.action)
-                .filter(
-                    models.AuditLog.target_type == "subscription",
-                    models.AuditLog.target_id == sub.id,
-                )
-                .order_by(models.AuditLog.created_at.desc())
-                .limit(10)
-                .all()
-            )
-            if existing_log:
-                logger.info(
-                    "renewal_check.manual_1d: sub=%s SKIP dedup matched "
-                    "log_id=%s action=%r (all_recent=%s)",
-                    sub.id, existing_log.id, existing_log.action,
-                    [(i, a) for (i, a) in all_for_sub],
-                )
-                continue
-            session.add(models.AuditLog(
-                actor="system",
-                actor_type=models.AuditActor.system,
-                action="expiry_reminder_1d",
-                target_type="subscription",
-                target_id=sub.id,
-                extra={
-                    "telegram_id": user.telegram_id,
-                    "subscription_id": sub.id,
-                    "expires_at": sub.expires_at.isoformat(),
-                },
-            ))
-            logger.warning(
-                "renewal_check.manual_1d: sub=%s CREATED new log "
-                "(all_recent_for_sub=%s) — investigate why dedup missed",
-                sub.id, [(i, a) for (i, a) in all_for_sub],
-            )
-            stats["reminded_1d"] += 1
         session.commit()
 
         RENEWAL_RUNS.labels(outcome="ok").inc()
@@ -859,6 +900,11 @@ def run_renewal_check() -> dict:
         RENEWAL_RUNS.labels(outcome="error").inc()
         if session.is_active:
             session.rollback()
+        # Ре-бросаем: self-reschedule уже сделан в начале тика, поэтому
+        # периодичность не пострадает, а джоба честно уйдёт в failed и
+        # подсветится в /ops (иначе проглоченное падение неотличимо от
+        # успеха — статус RQ остаётся finished).
+        raise
     finally:
         session.close()
 
@@ -882,7 +928,7 @@ def run_warm_pool_check() -> dict:
     from .services import warm_pool
 
     # Reschedule в начале — см. run_pending_rescue_tick.
-    interval = int(os.getenv("WARM_POOL_CHECK_INTERVAL", "120"))
+    interval = _env_int("WARM_POOL_CHECK_INTERVAL", 120)
     if interval > 0:
         try:
             schedule_tick(
@@ -900,13 +946,16 @@ def run_warm_pool_check() -> dict:
         summary = warm_pool.ensure_pool(session)
     except Exception:  # noqa: BLE001
         logger.exception("warm_pool: ensure_pool failed")
+        # Ре-бросаем — см. run_renewal_check: падение тика должно уйти в
+        # failed и подсветиться в /ops, а не молча вернуть finished.
+        raise
     finally:
         session.close()
 
     return summary
 
 
-_LOW_BALANCE_THRESHOLD_DAYS = int(os.getenv("LOW_BALANCE_WARN_DAYS", "3"))
+_LOW_BALANCE_THRESHOLD_DAYS = _env_int("LOW_BALANCE_WARN_DAYS", 3)
 
 
 def _maybe_emit_low_balance_warning(session, sub) -> None:
@@ -1129,7 +1178,7 @@ def run_balance_charge_tick() -> dict:
     from .time_utils import utcnow
 
     # Reschedule в начале — см. run_pending_rescue_tick.
-    interval = int(os.getenv("BALANCE_CHARGE_INTERVAL", "3600"))
+    interval = _env_int("BALANCE_CHARGE_INTERVAL", 3600)
     if interval > 0:
         try:
             schedule_tick(
@@ -1148,23 +1197,53 @@ def run_balance_charge_tick() -> dict:
         now = utcnow()
 
         # ── Pass 1: renew due active subs (auto_renew=True) ───────────
-        due_renew = (
-            session.query(models.Subscription)
+        # Берём только id должников БЕЗ удержания локов: commit после каждой
+        # подписки внутри цикла всё равно закрывал бы транзакцию и снимал
+        # FOR UPDATE со ВСЕХ ещё не обработанных строк батча — оставшиеся 499
+        # дальше «продлевались» бы без блокировки, и параллельный продлеватель
+        # (renewal_check, второй тиковый воркер, ручной прогон) мог списать
+        # деньги дважды. Поэтому лочим каждую подписку индивидуально в своей
+        # короткой транзакции и перепроверяем условие уже под локом.
+        due_renew_ids = [
+            row[0]
+            for row in session.query(models.Subscription.id)
             .filter(
                 models.Subscription.status == models.SubscriptionStatus.active,
                 models.Subscription.auto_renew.is_(True),
                 models.Subscription.expires_at.isnot(None),
                 models.Subscription.expires_at <= now,
             )
-            .with_for_update(skip_locked=True)
+            .order_by(models.Subscription.expires_at.asc())
             .limit(500)
             .all()
-        )
-        for sub in due_renew:
+        ]
+        for sub_id in due_renew_ids:
             try:
+                sub = (
+                    session.query(models.Subscription)
+                    .filter(models.Subscription.id == sub_id)
+                    .with_for_update(skip_locked=True)
+                    .first()
+                )
+                if sub is None:
+                    # Строку залочил другой воркер (skip_locked) или её удалили —
+                    # чужой тик её обработает, пропускаем.
+                    session.rollback()
+                    continue
+                # Перепроверка под локом: пока строка ждала лока, параллельный
+                # продлеватель мог уже продлить/экспайрить её (status/expires_at/
+                # тумблер изменились) — тогда повторно списывать нельзя.
+                if (
+                    sub.status != models.SubscriptionStatus.active
+                    or not sub.auto_renew
+                    or sub.expires_at is None
+                    or sub.expires_at > now
+                ):
+                    session.rollback()
+                    continue
                 ok = balance.renew_subscription(session, sub)
             except Exception:
-                logger.exception("balance: renew failed for sub %s", sub.id)
+                logger.exception("balance: renew failed for sub %s", sub_id)
                 stats["errors"] += 1
                 session.rollback()
                 continue
@@ -1198,24 +1277,44 @@ def run_balance_charge_tick() -> dict:
             session.commit()
 
         # ── Pass 3: auto-unfreeze expired pauses ─────────────────────
-        expired_freezes = (
-            session.query(models.Subscription)
+        # Тот же паттерн, что и в пассе 1: commit-в-цикле после общего
+        # with_for_update снимал локи со всего батча, поэтому лочим каждую
+        # подписку по отдельности и перепроверяем условие под локом.
+        expired_freeze_ids = [
+            row[0]
+            for row in session.query(models.Subscription.id)
             .filter(
                 models.Subscription.status == models.SubscriptionStatus.frozen,
                 models.Subscription.frozen_until.isnot(None),
                 models.Subscription.frozen_until <= now,
             )
-            .with_for_update(skip_locked=True)
+            .order_by(models.Subscription.frozen_until.asc())
             .limit(100)
             .all()
-        )
-        for sub in expired_freezes:
+        ]
+        for sub_id in expired_freeze_ids:
             try:
+                sub = (
+                    session.query(models.Subscription)
+                    .filter(models.Subscription.id == sub_id)
+                    .with_for_update(skip_locked=True)
+                    .first()
+                )
+                if sub is None:
+                    session.rollback()
+                    continue
+                if (
+                    sub.status != models.SubscriptionStatus.frozen
+                    or sub.frozen_until is None
+                    or sub.frozen_until > now
+                ):
+                    session.rollback()
+                    continue
                 balance.unfreeze_subscription(session, sub, auto=True)
                 stats["unfrozen"] += 1
                 session.commit()
             except Exception:
-                logger.exception("balance: auto-unfreeze failed for sub %s", sub.id)
+                logger.exception("balance: auto-unfreeze failed for sub %s", sub_id)
                 stats["errors"] += 1
                 session.rollback()
 
@@ -1232,6 +1331,8 @@ def run_balance_charge_tick() -> dict:
         stats["errors"] += 1
         if session.is_active:
             session.rollback()
+        # Ре-бросаем — см. run_renewal_check: тик уходит в failed → виден в /ops.
+        raise
     finally:
         session.close()
 
@@ -1264,7 +1365,7 @@ def run_traffic_stats_tick() -> dict:
     # это особенно критично: SSH-сессии по всем нодам регулярно зависают
     # и job убивается по job_timeout=120s, end-of-body reschedule бы не
     # выполнился.
-    interval = int(os.getenv("TRAFFIC_STATS_INTERVAL", "300"))
+    interval = _env_int("TRAFFIC_STATS_INTERVAL", 300)
     if interval > 0:
         try:
             schedule_tick(
@@ -1303,6 +1404,8 @@ def run_traffic_stats_tick() -> dict:
         logger.exception("traffic_stats: tick failed")
         if session.is_active:
             session.rollback()
+        # Ре-бросаем — см. run_renewal_check: тик уходит в failed → виден в /ops.
+        raise
     finally:
         session.close()
 
@@ -1342,10 +1445,10 @@ def _auto_diagnose_stale_links(session) -> dict:
     from .services.provisioning import ProvisioningOrchestrator
     from .time_utils import utcnow
 
-    stale_hs_min = int(os.getenv("AUTO_DIAGNOSE_HANDSHAKE_STALE_MIN", "10"))
-    observed_fresh_min = int(os.getenv("AUTO_DIAGNOSE_OBSERVED_FRESH_MIN", "8"))
-    debounce_min = int(os.getenv("AUTO_DIAGNOSE_DEBOUNCE_MIN", "30"))
-    max_per_tick = int(os.getenv("AUTO_DIAGNOSE_MAX_PER_TICK", "3"))
+    stale_hs_min = _env_int("AUTO_DIAGNOSE_HANDSHAKE_STALE_MIN", 10)
+    observed_fresh_min = _env_int("AUTO_DIAGNOSE_OBSERVED_FRESH_MIN", 8)
+    debounce_min = _env_int("AUTO_DIAGNOSE_DEBOUNCE_MIN", 30)
+    max_per_tick = _env_int("AUTO_DIAGNOSE_MAX_PER_TICK", 3)
 
     now = utcnow()
     observed_cutoff = now - timedelta(minutes=observed_fresh_min)
@@ -1517,8 +1620,8 @@ def _auto_diagnose_unreachable_nodes(
     from .services.provisioning import ProvisioningOrchestrator
     from .time_utils import utcnow
 
-    debounce_min = int(os.getenv("AUTO_DIAGNOSE_NODE_DEBOUNCE_MIN", "30"))
-    max_per_tick = int(os.getenv("AUTO_DIAGNOSE_NODE_MAX_PER_TICK", "2"))
+    debounce_min = _env_int("AUTO_DIAGNOSE_NODE_DEBOUNCE_MIN", 30)
+    max_per_tick = _env_int("AUTO_DIAGNOSE_NODE_MAX_PER_TICK", 2)
 
     now = utcnow()
     debounce_cutoff = now - timedelta(minutes=debounce_min)
@@ -1620,7 +1723,7 @@ def run_relay_link_health_tick() -> dict:
     # Reschedule в начале — см. run_pending_rescue_tick. Аналогично
     # traffic-stats, SSH ходит по всем relay нодам и периодически
     # зависает, поэтому reschedule ДО работы обязателен.
-    interval = int(os.getenv("RELAY_LINK_HEALTH_INTERVAL", "300"))
+    interval = _env_int("RELAY_LINK_HEALTH_INTERVAL", 300)
     if interval > 0:
         try:
             schedule_tick(
@@ -1663,6 +1766,8 @@ def run_relay_link_health_tick() -> dict:
         logger.exception("relay_link_health: tick failed")
         if session.is_active:
             session.rollback()
+        # Ре-бросаем — см. run_renewal_check: тик уходит в failed → виден в /ops.
+        raise
     finally:
         session.close()
 
@@ -1695,7 +1800,7 @@ def run_node_reachability_tick() -> dict:
     from .time_utils import utcnow
 
     # Reschedule first (SSH can hang) — same pattern as the other ticks.
-    interval = int(os.getenv("NODE_REACHABILITY_INTERVAL", "300"))
+    interval = _env_int("NODE_REACHABILITY_INTERVAL", 300)
     if interval > 0:
         try:
             schedule_tick(
@@ -1710,7 +1815,7 @@ def run_node_reachability_tick() -> dict:
     if os.getenv("NODE_REACHABILITY_ENABLED", "true").lower() not in {"1", "true", "yes"}:
         return {"enabled": False}
 
-    max_diag = int(os.getenv("NODE_REACHABILITY_MAX_DIAGNOSE_PER_TICK", "4"))
+    max_diag = _env_int("NODE_REACHABILITY_MAX_DIAGNOSE_PER_TICK", 4)
     # Анти-спам: не диагностируем/алертим, пока недоступность не подтвердилась
     # серией пробов длиной >= confirm_min минут (единичный пропущенный пинг —
     # не повод будить админа). Дефолт 20 мин ≈ «5 мин + 15 мин» из ТЗ; при
@@ -1779,7 +1884,7 @@ def run_node_reachability_tick() -> dict:
         # tail is picked up next cycle instead of the whole tick getting
         # killed mid-loop by the RQ kill-horse (which would also rotate which
         # targets get starved). Default 200s leaves headroom under 240s.
-        budget_s = int(os.getenv("NODE_REACHABILITY_BUDGET_SEC", "200"))
+        budget_s = _env_int("NODE_REACHABILITY_BUDGET_SEC", 200)
         started = _time.monotonic()
         diagnosed = 0
         for kind, target in targets:
@@ -1897,6 +2002,8 @@ def run_node_reachability_tick() -> dict:
         logger.exception("node_reachability: tick failed")
         if session.is_active:
             session.rollback()
+        # Ре-бросаем — см. run_renewal_check: тик уходит в failed → виден в /ops.
+        raise
     finally:
         session.close()
 
@@ -1931,8 +2038,8 @@ def run_user_health_ping_tick() -> dict:
 
     import random as _random
 
-    interval = int(os.getenv("USER_HEALTH_PING_INTERVAL", "1800"))
-    batch = int(os.getenv("USER_HEALTH_PING_BATCH", "50"))
+    interval = _env_int("USER_HEALTH_PING_INTERVAL", 1800)
+    batch = _env_int("USER_HEALTH_PING_BATCH", 50)
     # Базовая дебаунс-дельта = минимум между ping'ами. Jitter (random
     # forward-offset) добавляется к `health_ping_last_at` при записи,
     # чтобы фактический интервал растянулся в [base, base+jitter] на
@@ -1940,8 +2047,8 @@ def run_user_health_ping_tick() -> dict:
     # каждые 7-14 дней случайно. Раньше было 24ч fixed — юзеры жали
     # «не работает» в игнор из-за фоновой усталости, и реальные
     # жалобы тонули в шуме.
-    debounce_hours = int(os.getenv("USER_HEALTH_PING_DEBOUNCE_HOURS", "168"))
-    jitter_hours = int(os.getenv("USER_HEALTH_PING_DEBOUNCE_JITTER_HOURS", "168"))
+    debounce_hours = _env_int("USER_HEALTH_PING_DEBOUNCE_HOURS", 168)
+    jitter_hours = _env_int("USER_HEALTH_PING_DEBOUNCE_JITTER_HOURS", 168)
 
     # Reschedule в начале — см. run_pending_rescue_tick. Важно: ставим
     # reschedule ДО early-return по MSK-окну, иначе вне окна тик умрёт.
@@ -1958,8 +2065,8 @@ def run_user_health_ping_tick() -> dict:
 
     # Only send health pings during MSK lunch window (11:00–14:00)
     # to avoid waking users at night. Configurable via env.
-    ping_hour_start = int(os.getenv("HEALTH_PING_HOUR_START", "11"))
-    ping_hour_end = int(os.getenv("HEALTH_PING_HOUR_END", "14"))
+    ping_hour_start = _env_int("HEALTH_PING_HOUR_START", 11)
+    ping_hour_end = _env_int("HEALTH_PING_HOUR_END", 14)
 
     summary = {"queued": 0, "skipped": 0}
     session = SessionLocal()
@@ -2045,6 +2152,8 @@ def run_user_health_ping_tick() -> dict:
         logger.exception("user_health_ping: tick failed")
         if session.is_active:
             session.rollback()
+        # Ре-бросаем — см. run_renewal_check: тик уходит в failed → виден в /ops.
+        raise
     finally:
         session.close()
 
@@ -2080,8 +2189,8 @@ def run_broadcast_dispatch_tick() -> dict:
     from .queue import schedule_tick
     from .time_utils import utcnow
 
-    interval = int(os.getenv("BROADCAST_DISPATCH_INTERVAL", "10"))
-    batch_size = int(os.getenv("BROADCAST_BATCH_SIZE", "50"))
+    interval = _env_int("BROADCAST_DISPATCH_INTERVAL", 10)
+    batch_size = _env_int("BROADCAST_BATCH_SIZE", 50)
 
     if interval > 0:
         try:
@@ -2177,6 +2286,8 @@ def run_broadcast_dispatch_tick() -> dict:
         logger.exception("broadcast_dispatch: tick failed")
         if session.is_active:
             session.rollback()
+        # Ре-бросаем — см. run_renewal_check: тик уходит в failed → виден в /ops.
+        raise
     finally:
         session.close()
 
@@ -2217,11 +2328,45 @@ def run_provisioning_task(task_id: int, node_id: int | None = None) -> dict:
 
 
 def dlq_exception_handler(job, exc_type, exc_value, tb):  # noqa: ARG001
-    """Called by RQ when a job permanently fails (all retries exhausted).
+    """RQ exception handler — вызывается на КАЖДОМ падении джобы.
 
-    Writes an AuditLog entry so ops can see the failure in the admin UI
-    without digging through Redis.  Also bumps the Prometheus counter.
+    ВАЖНО: RQ зовёт exception handlers ДО retry-логики (handle_exception →
+    handle_job_failure), поэтому обработчик срабатывает на каждой попытке, а
+    не только на финальной. Наивная реализация инкрементила DLQ-счётчик, писала
+    provisioning_dlq в аудит и пушила админу «Провижининг упал» уже на первой
+    транзиентной ошибке ansible-джобы (у неё Retry(max=3)), хотя через 10с она
+    успешно ретраилась.
+
+    Поэтому:
+      * пока у джобы остались ретраи (``job.retries_left`` > 0) — это НЕ
+        финальное падение: только warning, без DLQ/аудита/пуша;
+      * реальный dead-letter — когда ретраи исчерпаны (retries_left == 0) или
+        у джобы вовсе нет Retry (retries_left is None → падение сразу
+        финальное);
+      * аудит/пуш с ``target_type='provisioning_task'`` пишем ТОЛЬКО для
+        provisioning-джоб (``run_provisioning_task``), у которых ``args[0]`` —
+        это task_id. У ``run_ops_plan_execute`` args[0] — plan_id, у
+        ``run_scale_workers`` — число реплик; приписывать их id несуществующей
+        provisioning-таске нельзя.
     """
+    retries_left = getattr(job, "retries_left", None)
+    if retries_left:
+        # retries_left > 0 (truthy) — впереди ещё ретрай, падение транзиентное.
+        logger.warning(
+            "Job %s (%s) упала, но остались ретраи (retries_left=%s): %s",
+            job.id, getattr(job, "func_name", "?"), retries_left, exc_value,
+        )
+        return True  # let RQ continue its normal failure/retry flow
+
+    func_name = getattr(job, "func_name", "") or ""
+    if not func_name.endswith("run_provisioning_task"):
+        # Не provisioning-джоба — args[0] не task_id, DLQ-аудит неприменим.
+        logger.error(
+            "Job %s (%s) dead-lettered после ретраев: %s",
+            job.id, func_name or "?", exc_value,
+        )
+        return True  # let RQ continue its normal failure flow
+
     DLQ_ENTRIES.inc()
     task_id = job.args[0] if job.args else None
     logger.error(
@@ -2406,7 +2551,7 @@ def run_ops_plan_reaper_tick() -> dict:
     from .time_utils import utcnow
 
     # Reschedule в начале — см. run_pending_rescue_tick.
-    interval = int(os.getenv("OPS_PLAN_REAPER_INTERVAL", "300"))
+    interval = _env_int("OPS_PLAN_REAPER_INTERVAL", 300)
     if interval > 0:
         try:
             schedule_tick(
@@ -2420,8 +2565,8 @@ def run_ops_plan_reaper_tick() -> dict:
 
     # job_timeout джобы run_ops_plan_execute (см. api/agent.py, 1800с) +
     # запас на ожидание в очереди/clock skew.
-    job_timeout = int(os.getenv("OPS_EXECUTE_JOB_TIMEOUT", "1800"))
-    grace = int(os.getenv("OPS_PLAN_REAPER_GRACE", "120"))
+    job_timeout = _env_int("OPS_EXECUTE_JOB_TIMEOUT", 1800)
+    grace = _env_int("OPS_PLAN_REAPER_GRACE", 120)
     summary: dict = {"checked": 0, "reaped": []}
     session = SessionLocal()
     try:
@@ -2489,6 +2634,8 @@ def run_ops_plan_reaper_tick() -> dict:
         logger.exception("ops_plan_reaper: tick failed")
         if session.is_active:
             session.rollback()
+        # Ре-бросаем — см. run_renewal_check: тик уходит в failed → виден в /ops.
+        raise
     finally:
         session.close()
 
@@ -2571,7 +2718,7 @@ def main() -> None:
     # *alongside* the still-scheduled one from the prior incarnation —
     # N restarts → N parallel chains per tick. See ``queue.schedule_tick``
     # and ``docs/components/worker.md`` § Дедупликация тиков.
-    pending_rescue_interval = int(os.getenv("PENDING_RESCUE_INTERVAL", "60"))
+    pending_rescue_interval = _env_int("PENDING_RESCUE_INTERVAL", 60)
     if do_bootstrap and pending_rescue_interval > 0:
         try:
             schedule_tick(
@@ -2589,7 +2736,7 @@ def main() -> None:
 
     # Schedule operator-report watcher (Phase 1 operator-aware routing) —
     # resolves «VPN не работает» reports by observed reconnect. Default 5 min.
-    operator_watch_interval = int(os.getenv("OPERATOR_REPORT_WATCH_INTERVAL", "300"))
+    operator_watch_interval = _env_int("OPERATOR_REPORT_WATCH_INTERVAL", 300)
     if do_bootstrap and operator_watch_interval > 0:
         try:
             schedule_tick(
@@ -2608,7 +2755,7 @@ def main() -> None:
     # Phase 3 reconcile tick — сходит ноды по desired-state generations.
     # No-op пока RECONCILER_ENABLED выключен (сам тик short-circuit'ит).
     # Дефолт 3s; debounce RECONCILE_DEBOUNCE_S коллапсит burst правок.
-    reconcile_interval = int(os.getenv("RECONCILE_INTERVAL", "3"))
+    reconcile_interval = _env_int("RECONCILE_INTERVAL", 3)
     if do_bootstrap and reconcile_interval > 0:
         try:
             schedule_tick(
@@ -2625,7 +2772,7 @@ def main() -> None:
             logger.exception("Failed to schedule reconcile tick")
 
     # Schedule autoscale tick
-    autoscale_interval = int(os.getenv("AUTOSCALE_INTERVAL", "0"))
+    autoscale_interval = _env_int("AUTOSCALE_INTERVAL", 0)
     if do_bootstrap and autoscale_interval > 0:
         try:
             schedule_tick(
@@ -2639,7 +2786,7 @@ def main() -> None:
             logger.exception("Failed to schedule autoscale tick")
 
     # Schedule renewal check (default: every hour)
-    renewal_interval = int(os.getenv("RENEWAL_CHECK_INTERVAL", "3600"))
+    renewal_interval = _env_int("RENEWAL_CHECK_INTERVAL", 3600)
     if do_bootstrap and renewal_interval > 0:
         try:
             schedule_tick(
@@ -2655,7 +2802,7 @@ def main() -> None:
     # Schedule cloud-billing guard (default: every hour). Pulls provider
     # balance (gauge + low-balance alert) + fleet monthly-cost gauge. No-op
     # без cloud-провайдеров. CLOUD_BILLING_INTERVAL=0 → выключить.
-    cloud_billing_interval = int(os.getenv("CLOUD_BILLING_INTERVAL", "3600"))
+    cloud_billing_interval = _env_int("CLOUD_BILLING_INTERVAL", 3600)
     if do_bootstrap and cloud_billing_interval > 0:
         try:
             schedule_tick(
@@ -2674,7 +2821,7 @@ def main() -> None:
     # Schedule warm-pool check (default: every 2 min). Stage 2.5 of the
     # WebApp roadmap — keeps each active node's pool topped up so user
     # purchases hit a warm bundle instead of paying the Ansible cost.
-    warm_interval = int(os.getenv("WARM_POOL_CHECK_INTERVAL", "120"))
+    warm_interval = _env_int("WARM_POOL_CHECK_INTERVAL", 120)
     warm_enabled = os.getenv("WARM_POOL_ENABLED", "1").lower() not in {"0", "false", "no"}
     if do_bootstrap and warm_interval > 0 and warm_enabled:
         try:
@@ -2694,7 +2841,7 @@ def main() -> None:
     # Schedule balance charge tick (default: hourly). Stage 4 — drives
     # daily-billing ticks for balance subscriptions and auto-unfreezes
     # paused ones whose frozen_until has lapsed.
-    balance_interval = int(os.getenv("BALANCE_CHARGE_INTERVAL", "3600"))
+    balance_interval = _env_int("BALANCE_CHARGE_INTERVAL", 3600)
     if do_bootstrap and balance_interval > 0:
         try:
             schedule_tick(
@@ -2713,7 +2860,7 @@ def main() -> None:
     # Phase B — passive xray stats collector. SSHs into each active
     # node every TRAFFIC_STATS_INTERVAL seconds (default 300) and
     # writes a row into node_traffic_samples. Disabled when set to 0.
-    traffic_stats_interval = int(os.getenv("TRAFFIC_STATS_INTERVAL", "300"))
+    traffic_stats_interval = _env_int("TRAFFIC_STATS_INTERVAL", 300)
     if do_bootstrap and traffic_stats_interval > 0:
         try:
             schedule_tick(
@@ -2733,7 +2880,7 @@ def main() -> None:
     # relay, апдейтит last_handshake_at / rx / tx / observed_at в
     # relay_exit_links. Интервал RELAY_LINK_HEALTH_INTERVAL (default
     # 300s), Disabled at 0.
-    relay_link_health_interval = int(os.getenv("RELAY_LINK_HEALTH_INTERVAL", "300"))
+    relay_link_health_interval = _env_int("RELAY_LINK_HEALTH_INTERVAL", 300)
     if do_bootstrap and relay_link_health_interval > 0:
         try:
             schedule_tick(
@@ -2754,7 +2901,7 @@ def main() -> None:
     # detection, the once-per-incident anti-spam gate, the speaking admin
     # push and the on-host diagnose enqueue. Interval
     # NODE_REACHABILITY_INTERVAL (default 300s), disabled at 0.
-    node_reach_interval = int(os.getenv("NODE_REACHABILITY_INTERVAL", "300"))
+    node_reach_interval = _env_int("NODE_REACHABILITY_INTERVAL", 300)
     if do_bootstrap and node_reach_interval > 0:
         try:
             schedule_tick(
@@ -2774,7 +2921,7 @@ def main() -> None:
     # "помогите нам улучшить сервис" prompt to active users at most
     # once per USER_HEALTH_PING_DEBOUNCE_HOURS, capped at
     # USER_HEALTH_PING_BATCH per tick. Disabled when set to 0.
-    health_ping_interval = int(os.getenv("USER_HEALTH_PING_INTERVAL", "1800"))
+    health_ping_interval = _env_int("USER_HEALTH_PING_INTERVAL", 1800)
     if do_bootstrap and health_ping_interval > 0:
         try:
             schedule_tick(
@@ -2794,7 +2941,7 @@ def main() -> None:
     # таблицы broadcasts и пишет AuditLog(admin_broadcast) по одной
     # строке на юзера. Интервал BROADCAST_DISPATCH_INTERVAL (default 10s),
     # disabled при 0.
-    broadcast_interval = int(os.getenv("BROADCAST_DISPATCH_INTERVAL", "10"))
+    broadcast_interval = _env_int("BROADCAST_DISPATCH_INTERVAL", 10)
     if do_bootstrap and broadcast_interval > 0:
         try:
             schedule_tick(
@@ -2813,7 +2960,7 @@ def main() -> None:
 
     # Бэкстоп залипших ops-планов: executing старше job_timeout+grace →
     # failed (воркер умер / джоба убита по таймауту). См. run_ops_plan_reaper_tick.
-    ops_reaper_interval = int(os.getenv("OPS_PLAN_REAPER_INTERVAL", "300"))
+    ops_reaper_interval = _env_int("OPS_PLAN_REAPER_INTERVAL", 300)
     if do_bootstrap and ops_reaper_interval > 0:
         try:
             schedule_tick(

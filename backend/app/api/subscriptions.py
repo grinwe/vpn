@@ -610,6 +610,7 @@ def enable_subscription(
     if sub.status == models.SubscriptionStatus.active:
         raise HTTPException(status_code=400, detail="Subscription is already active")
 
+    reprovision_ok = True
     if sub.status == models.SubscriptionStatus.frozen:
         try:
             balance_svc.unfreeze_subscription(db, sub, auto=False)
@@ -636,6 +637,10 @@ def enable_subscription(
                 "enable_subscription: reprovision failed sub=%s — left active w/o device",
                 sub.id,
             )
+            # Репровижининг упал: подписка active, но рабочего конфига нет —
+            # прокидываем факт сбоя в ответ, чтобы админка показала оператору,
+            # а не молча отрапортовала успех (иначе sub-link отдаст 503).
+            reprovision_ok = False
 
     db.commit()
     db.refresh(sub)
@@ -652,6 +657,7 @@ def enable_subscription(
         "subscription_id": sub.id,
         "status": sub.status.value,
         "expires_at": sub.expires_at.isoformat() if sub.expires_at else None,
+        "reprovision_failed": not reprovision_ok,
     }
 
 
@@ -1164,6 +1170,7 @@ def unblock_sharing(
     and re-adds the user to xray.
     """
     import os
+    import time
 
     sub = db.get(models.Subscription, subscription_id)
     if not sub:
@@ -1215,10 +1222,26 @@ def unblock_sharing(
             allow_agent=False,
             look_for_keys=False,
         )
+        # TCP keepalive: рвём half-open соединение, а не висим на нём вечно
+        # (нездоровая нода / тихо оборванный TCP).
+        transport = client.get_transport()
+        if transport is not None:
+            transport.set_keepalive(5)
         # Append each email on a separate line
         email_lines = "\\n".join(sorted(emails))
         cmd = f'printf "{email_lines}\\n" >> /var/log/xray/enforcer_unblock.txt'
         stdin, stdout, stderr = client.exec_command(cmd, timeout=10)
+        # recv_exit_status() ждёт status_event БЕЗ таймаута (paramiko #448):
+        # channel timeout на него не распространяется. Поллим готовность с
+        # дедлайном, иначе поток threadpool'а зависнет навсегда на больной ноде.
+        deadline = time.monotonic() + 15
+        while not stdout.channel.exit_status_ready():
+            if time.monotonic() > deadline:
+                raise HTTPException(
+                    status_code=504,
+                    detail="SSH command timed out waiting for exit status",
+                )
+            time.sleep(0.2)
         exit_status = stdout.channel.recv_exit_status()
         if exit_status != 0:
             err = stderr.read().decode("utf-8", errors="replace")

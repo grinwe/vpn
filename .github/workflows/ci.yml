@@ -60,3 +60,27 @@ jobs:
         run: docker build bot --tag bot:ci
       - name: Build probe image
         run: docker build probes --tag probe:ci
+
+  # Фронтенды (admin/ и webapp/) собираются отдельным job'ом: npm ci +
+  # `npm run build` (= tsc -b && vite build). Ловим TS-ошибки и битые
+  # импорты в React-коде на PR, а не в момент ansible-деплоя на прод.
+  frontend:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        app: [admin, webapp]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+          cache-dependency-path: ${{ matrix.app }}/package-lock.json
+      - name: Install dependencies
+        run: npm ci --no-audit --no-fund
+        working-directory: ${{ matrix.app }}
+      - name: Type-check and build
+        run: npm run build
+        working-directory: ${{ matrix.app }}

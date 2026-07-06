@@ -13,6 +13,13 @@ from .support import support_router
 
 logger = logging.getLogger(__name__)
 
+# Рейт-лимит для лога не-200 ответов /pending: не чаще раза в 60с,
+# чтобы при стабильном 401/500 не сыпать warning каждый poll-interval.
+# Состояние вынесено на уровень модуля (поллер — единственный писатель).
+_PENDING_ERR_LOG_INTERVAL = 60.0
+_pending_err_last_log = 0.0
+_pending_err_last_status: int | None = None
+
 
 async def notification_poller(bot: Bot):
     """Background task: poll backend for pending notifications and deliver them.
@@ -37,7 +44,31 @@ async def notification_poller(bot: Bot):
                 timeout=__import__("aiohttp").ClientTimeout(total=5),
             ) as resp:
                 if resp.status != 200:
+                    # Логируем не-200 с дедупом: сразу при смене статуса,
+                    # иначе не чаще раза в _PENDING_ERR_LOG_INTERVAL секунд.
+                    # Иначе рассинхрон ADMIN_API_TOKEN (401) или 500 гасят
+                    # ВСЮ доставку (конфиги после оплаты, health-пинги,
+                    # админ-алерты) абсолютно молча — инцидент виден только
+                    # по жалобам, а причина не восстановима по логам.
+                    global _pending_err_last_log, _pending_err_last_status
+                    now = asyncio.get_event_loop().time()
+                    if (
+                        resp.status != _pending_err_last_status
+                        or now - _pending_err_last_log >= _PENDING_ERR_LOG_INTERVAL
+                    ):
+                        body = (await resp.text())[:200]
+                        logger.warning(
+                            "notifications/pending returned %s (delivery "
+                            "stalled): %s",
+                            resp.status, body,
+                        )
+                        _pending_err_last_log = now
+                        _pending_err_last_status = resp.status
                     continue
+                # Успешный ответ — сбрасываем дедуп, чтобы следующий сбой
+                # залогировался сразу, а не «проглотился» окном 60с.
+                if _pending_err_last_status is not None:
+                    _pending_err_last_status = None
                 notifications = await resp.json()
 
             async def _ack(notif_id_inner: int) -> None:

@@ -13,6 +13,7 @@ block+revoke path is identical on both ends.
 from __future__ import annotations
 
 from fastapi import APIRouter, Depends, Header, HTTPException
+from sqlalchemy import func, select, update
 from sqlalchemy.orm import Session
 
 from .. import models, schemas
@@ -45,27 +46,55 @@ def _apply_traffic_delta(
     duplicated. Commits on its own; caller should not have open changes
     on the same subscription row.
     """
-    sub.traffic_used_mb = (sub.traffic_used_mb or 0) + max(0, int(delta_mb))
-    over_limit = bool(
-        sub.traffic_limit_mb is not None and sub.traffic_used_mb > sub.traffic_limit_mb
-    )
+    delta = max(0, int(delta_mb))
+    # Атомарный SQL-инкремент (UPDATE ... SET x = x + delta) вместо
+    # read-modify-write в Python: коллекторы с разных нод шлют отчёты
+    # параллельно, а после per-device миграции устройства одной подписки
+    # живут на разных нодах — конкурентные апдейты одной строки реальны, и
+    # присваивание из ранее прочитанного значения теряло бы одну из дельт.
+    used_mb, limit_mb = db.execute(
+        update(models.Subscription)
+        .where(models.Subscription.id == sub.id)
+        .values(
+            traffic_used_mb=func.coalesce(models.Subscription.traffic_used_mb, 0) + delta
+        )
+        .returning(
+            models.Subscription.traffic_used_mb,
+            models.Subscription.traffic_limit_mb,
+        )
+        .execution_options(synchronize_session=False)
+    ).one()
+    over_limit = bool(limit_mb is not None and used_mb > limit_mb)
 
     revocation_task_ids: list[int] = []
-    if over_limit and sub.status != models.SubscriptionStatus.blocked:
-        sub.status = models.SubscriptionStatus.blocked
-        sub.notes = "traffic limit exceeded"
-        orchestrator = ProvisioningOrchestrator(db)
-        tasks = orchestrator.revoke_subscription_devices(sub, reason="traffic limit exceeded")
-        revocation_task_ids = [task.id for task in tasks]
-        _audit(
-            db,
-            actor,
-            "subscription_over_limit",
-            "subscription",
-            sub.id,
-            actor_type=actor_type,
-            metadata={"used_mb": sub.traffic_used_mb, "limit_mb": sub.traffic_limit_mb},
-        )
+    if over_limit:
+        # Берём row-lock на подписку и перечитываем статус под блокировкой,
+        # чтобы два коллектора не запустили revoke дважды (populate_existing
+        # обновляет уже загруженный ORM-объект актуальным статусом).
+        db.execute(
+            select(models.Subscription)
+            .where(models.Subscription.id == sub.id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        ).scalar_one()
+        if sub.status != models.SubscriptionStatus.blocked:
+            sub.status = models.SubscriptionStatus.blocked
+            sub.notes = "traffic limit exceeded"
+            orchestrator = ProvisioningOrchestrator(db)
+            tasks = orchestrator.revoke_subscription_devices(
+                sub, reason="traffic limit exceeded"
+            )
+            revocation_task_ids = [task.id for task in tasks]
+            _audit(
+                db,
+                actor,
+                "subscription_over_limit",
+                "subscription",
+                sub.id,
+                actor_type=actor_type,
+                metadata={"used_mb": used_mb, "limit_mb": limit_mb},
+            )
+        db.commit()
     else:
         db.commit()
 

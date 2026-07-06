@@ -26,7 +26,9 @@ from .tools import TOOL_REGISTRY, tool_schemas
 logger = logging.getLogger(__name__)
 
 _DEFAULT_MODEL = "claude-sonnet-4-6"
-_MAX_TOKENS = 4096
+# adaptive thinking делит тот же бюджет с текстом ответа, поэтому берём с запасом,
+# чтобы разбор не обрывался на полуслове (см. обработку stop_reason=='max_tokens').
+_MAX_TOKENS = 8192
 
 _SYSTEM_PROMPT = """\
 Ты — ops-агент диагностического триажа VPN-as-a-service. Тебе дают ID ноды.
@@ -111,10 +113,19 @@ def triage_node(db: Session, node_id: int, *, model: str | None = None) -> dict:
                 report = "\n".join(
                     b.text for b in resp.content if getattr(b, "type", None) == "text"
                 ).strip()
+                report = report or "(агент не вернул текст)"
+                if resp.stop_reason == "max_tokens":
+                    # Отчёт обрезан по лимиту токенов — оператор мог не увидеть
+                    # секции «Рекомендация»/«Уверенность». Помечаем явно, чтобы
+                    # усечение не выглядело как полный разбор.
+                    report += (
+                        "\n\n⚠️ Отчёт обрезан по лимиту токенов (max_tokens) — "
+                        "разбор может быть неполным. Перезапусти триаж."
+                    )
                 return {
                     "node_id": node_id,
                     "model": model,
-                    "report": report or "(агент не вернул текст)",
+                    "report": report,
                     "iterations": iteration + 1,
                     "tool_calls": tool_calls,
                     "stop_reason": resp.stop_reason,

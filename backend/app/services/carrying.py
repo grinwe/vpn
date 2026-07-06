@@ -18,12 +18,15 @@
 """
 from __future__ import annotations
 
+import os
+from datetime import timedelta
 from typing import Any
 
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from .. import models
+from ..time_utils import utcnow
 
 
 def _sample_usernames(sample: models.NodeTrafficSample | None) -> set[str]:
@@ -70,12 +73,32 @@ def compute_carrying_fractions(db: Session) -> list[dict[str, Any]]:
             .order_by(models.NodeTrafficSample.observed_at.desc())
             .first()
         )
+        # Сэмпл старше порога протух: сбор трафика на ноде мог умереть неделю
+        # назад, и carrying той давности нельзя выдавать как текущий (это
+        # маскирует именно тот случай, что метрика должна ловить). Порог —
+        # несколько трафик-тиков (TRAFFIC_STATS_INTERVAL=300s по умолчанию),
+        # переопределяется CARRYING_SAMPLE_MAX_AGE_MIN; <=0 отключает проверку.
+        interval = int(os.getenv("TRAFFIC_STATS_INTERVAL", "300"))
+        max_age_min = float(
+            os.getenv("CARRYING_SAMPLE_MAX_AGE_MIN", str(interval * 3 / 60))
+        )
+        stale = bool(
+            sample is not None
+            and max_age_min > 0
+            and sample.observed_at is not None
+            and sample.observed_at < utcnow() - timedelta(minutes=max_age_min)
+        )
         usernames = _sample_usernames(sample)
         if usernames:
+            # is_active.is_(True) — иначе девайс с деактивированным кредом, чей
+            # access_username ещё светится в сэмпле, попадает в числитель, но не
+            # в знаменатель (eligible), и carrying_fraction вылезает за 1.0.
+            # С фильтром carrying — строгое подмножество eligible.
             carrying = (
                 db.query(func.count(func.distinct(models.Credential.device_id)))
                 .filter(
                     models.Credential.node_id == node.id,
+                    models.Credential.is_active.is_(True),
                     models.Credential.device_id.isnot(None),
                     models.Credential.access_username.in_(list(usernames)),
                 )
@@ -84,7 +107,7 @@ def compute_carrying_fractions(db: Session) -> list[dict[str, Any]]:
             )
         else:
             carrying = 0
-        frac = round(carrying / eligible, 3) if eligible else None
+        frac = None if stale else (round(carrying / eligible, 3) if eligible else None)
         out.append(
             {
                 "node_id": node.id,
@@ -94,6 +117,7 @@ def compute_carrying_fractions(db: Session) -> list[dict[str, Any]]:
                 "carrying_devices": int(carrying),
                 "carrying_fraction": frac,
                 "sample_at": sample.observed_at.isoformat() if sample else None,
+                "stale": stale,
             }
         )
     return out

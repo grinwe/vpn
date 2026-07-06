@@ -5,6 +5,7 @@ import {
   activateSubscription,
   changePlan,
   createTopup,
+  fetchMe,
   fetchPlans,
   MeResponse,
   WebAppPlan,
@@ -62,6 +63,11 @@ export default function Plans({ onActivated, subLinkBase, me, changeSubscription
     subToken: string | null;
   } | null>(null);
   const [toast, setToast] = useState<string | null>(null);
+  // Состояние платежа-пополнения из TopupHintSheet:
+  //   "paying"    — летит createTopup / открыто окно Telegram (защита от
+  //                 повторного тапа → дублей инвойсов);
+  //   "crediting" — платёж прошёл, ждём зачисления на бэке перед refetch.
+  const [topupState, setTopupState] = useState<"paying" | "crediting" | null>(null);
 
   // When changing an existing subscription, find the current plan ID
   // so we can highlight it and use changePlan API instead of activate.
@@ -130,25 +136,59 @@ export default function Plans({ onActivated, subLinkBase, me, changeSubscription
     }
   }
 
+  // Поллит /me, пока баланс не превысит baseline (платёж зачислен) или пока
+  // не выйдет таймаут. Колбэк openInvoice приходит раньше, чем вебхук Stars
+  // успевает записать платёж, поэтому мгновенный refetch отдаёт старый баланс
+  // и активация снова словит 402. ~6 попыток по 1.2 с ≈ 7 с — с запасом на
+  // медленную обработку вебхука.
+  async function waitForBalance(baselineKopecks: number): Promise<void> {
+    for (let i = 0; i < 6; i++) {
+      await new Promise((r) => setTimeout(r, 1200));
+      try {
+        const fresh = await fetchMe();
+        if (fresh.balance.balance_kopecks > baselineKopecks) return;
+      } catch {
+        // Сетевой сбой при поллинге не критичен: onActivated ниже всё равно
+        // перезапросит /me.
+      }
+    }
+  }
+
   async function payTopup(amountKopecks: number) {
     const tg = getTg();
     if (!tg) {
       showToast("Открой эту страницу в Telegram");
       return;
     }
+    // Защита от повторного тапа: пока платёж в работе, не создаём новый инвойс.
+    if (topupState) return;
+    setTopupState("paying");
+    // Баланс до пополнения — точка отсчёта для ожидания зачисления.
+    const baseline = me.balance.balance_kopecks;
     try {
       const res = await createTopup(amountKopecks, "telegram_stars");
       tg.openInvoice(res.pay_url, (status) => {
         if (status === "paid") {
           tg.HapticFeedback?.notificationOccurred("success");
-          setTopupHint(null);
-          onActivated();
-        } else if (status === "failed") {
-          tg.HapticFeedback?.notificationOccurred("error");
-          showToast("Оплата не прошла. Попробуй ещё раз.");
+          // Не полагаемся на мгновенный refetch: ждём фактического зачисления,
+          // затем закрываем подсказку и обновляем /me.
+          setTopupState("crediting");
+          waitForBalance(baseline).finally(() => {
+            setTopupState(null);
+            setTopupHint(null);
+            onActivated();
+          });
+        } else {
+          // failed / cancelled — снимаем занятость, подсказка остаётся открытой.
+          setTopupState(null);
+          if (status === "failed") {
+            tg.HapticFeedback?.notificationOccurred("error");
+            showToast("Оплата не прошла. Попробуй ещё раз.");
+          }
         }
       });
     } catch (e) {
+      setTopupState(null);
       showToast(friendlyActivateError((e as Error).message));
     }
   }
@@ -220,6 +260,8 @@ export default function Plans({ onActivated, subLinkBase, me, changeSubscription
       {topupHint && createPortal(
         <TopupHintSheet
           suggested={topupHint.suggested}
+          busy={topupState !== null}
+          crediting={topupState === "crediting"}
           onPay={(kop) => payTopup(kop)}
           onClose={() => setTopupHint(null)}
         />,
@@ -368,15 +410,22 @@ function HelpSheet({ onClose }: { onClose: () => void }) {
 
 function TopupHintSheet({
   suggested,
+  busy,
+  crediting,
   onPay,
   onClose,
 }: {
   suggested: number;
+  busy: boolean;
+  crediting: boolean;
   onPay: (kop: number) => void;
   onClose: () => void;
 }) {
   return (
-    <div className="fixed inset-0 bg-black/60 flex items-end justify-center" onClick={onClose}>
+    <div
+      className="fixed inset-0 bg-black/60 flex items-end justify-center"
+      onClick={busy ? undefined : onClose}
+    >
       <div
         className="bg-tg-bg rounded-t-3xl border-t border-white/10 p-6 max-w-xl w-full"
         onClick={(e) => e.stopPropagation()}
@@ -386,11 +435,12 @@ function TopupHintSheet({
           Чтобы активировать этот тариф, нужно пополнить баланс. Рекомендуем{" "}
           {(suggested / 100).toFixed(0)} ₽ — этого хватит примерно на месяц.
         </p>
-        <button onClick={() => onPay(suggested)} className="btn-primary w-full">
-          Пополнить на {(suggested / 100).toFixed(0)} ₽
+        <button onClick={() => onPay(suggested)} disabled={busy} className="btn-primary w-full">
+          {crediting ? "Зачисляем…" : `Пополнить на ${(suggested / 100).toFixed(0)} ₽`}
         </button>
         <button
           onClick={onClose}
+          disabled={busy}
           className="w-full mt-2 py-2 text-tg-hint text-sm"
         >
           Отмена

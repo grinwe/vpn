@@ -13,6 +13,7 @@
 | `DB_POOL_SIZE` | `10` | backend, worker | SQLAlchemy pool size. Растить при `QueuePool limit reached`. |
 | `DB_MAX_OVERFLOW` | `10` | backend, worker | Допкоэффициент pool overflow. |
 | `DB_POOL_RECYCLE` | `1800` | backend, worker | Секунды, после которых соединение пересоздаётся (bypass stale-conn bug'ов за NAT'ом). |
+| `DB_POOL_TIMEOUT` | `5` | backend, worker | Секунды ожидания свободного соединения из пула перед `TimeoutError`. Короткий таймаут даёт быстрый отказ (500) вместо 30-секундной очереди под всплеском (bot flood). |
 | `SKIP_MIGRATIONS` | `0` | backend, worker | Если `1` — не запускать `alembic upgrade head` на старте. **В `docker-compose.yml` хардкод `"1"` для worker'а**, чтобы backend и worker не дрались за advisory lock (см. `docker-compose.yml:98-102`). |
 
 ## Security / Auth
@@ -61,7 +62,7 @@
 | `PROVISIONING_SSH_KEY` | **обязателен** | compose, worker volume | Путь **на хосте** к ed25519 приватнику для SSH на VPN-ноды. compose откажется стартовать без неё (`?:` required). Обычно `/opt/vpn/secrets/provisioning_key`. |
 | `ANSIBLE_PRIVATE_KEY_FILE` | — | worker | Путь **внутри контейнера** к тому же ключу (обычно `/run/secrets/provisioning_key`, туда маппится volume). |
 | `ANSIBLE_ROOT` | — | worker | Директория с `playbooks/` и `roles/`. По умолчанию `/app/infra/ansible`. |
-| `MAX_CONCURRENT_ANSIBLE` | `3` | worker | Размер `_ansible_semaphore` в `ProvisioningOrchestrator`. Каждый процесс ansible ест ~200MB. Отдельный от warm-pool семафора. |
+| `MAX_CONCURRENT_ANSIBLE` | `3` | worker | Размер `_ansible_semaphore` в `ProvisioningOrchestrator`. Каждый процесс ansible ест ~200MB. Отдельный от warm-pool семафора. **PER-PROCESS, не глобальный кап** (audit #200): при нескольких RQ-воркерах реальный параллелизм ansible = `WORKER_REPLICAS`, а не это число. |
 | `ALLOW_INPROCESS_PROVISIONING` | `""` | backend | Dev escape-hatch: `"1"` → backend выполняет ansible сам, без RQ. **Не** включать в prod — блокирует HTTP request'ы. |
 | `MIN_HEALTHY_SCORE` | `50` | backend, worker | Минимальный `health_score` ноды для попадания в `choose_node` / `_eligible_nodes`. |
 
@@ -73,6 +74,7 @@
 |---|---|---|---|
 | `RENEWAL_CHECK_INTERVAL` | `300` | worker | `run_renewal_check` — находит expiring-подписки, шлёт reminder'ы, флипает expired → revoked после grace. |
 | `RENEWAL_GRACE_HOURS` | `24` | worker | Сколько часов после `expires_at` подписка висит в `expired` до hard revoke'а. |
+| `RENEWAL_WINDOW_LIMIT` | `2000` | worker | Верхняя граница подписок, обрабатываемых `run_renewal_check` за один тик в каждом окне напоминаний (ORDER BY `expires_at` ASC, хвост — следующим тиком). Не даёт тику упереться в `job_timeout` на тысячах истекающих. |
 | `BALANCE_CHARGE_INTERVAL` | `3600` | worker | `charge_subscriptions` — hourly tick, burns daily_rate × devices из `prepaid_kopecks`. Плюс trial-expiry фаза. |
 | `LOW_BALANCE_WARN_DAYS` | `3` | worker | Триггерит `low_balance_warning` notification, когда runway (balance / daily_rate) < этого. |
 | `WARM_POOL_CHECK_INTERVAL` | `120` | worker | `run_warm_pool_check` — тик warmer'а (ensure_pool + revoke GC). |

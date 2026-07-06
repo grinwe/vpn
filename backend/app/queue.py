@@ -15,14 +15,26 @@ from __future__ import annotations
 
 import logging
 import os
-from functools import lru_cache
+import threading
+import time
 from typing import TYPE_CHECKING
+
+from prometheus_client import Counter
 
 logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:  # pragma: no cover
     from rq import Queue
     from redis import Redis
+
+
+# Счётчик тихих деградаций «RQ недоступен → inline-исполнение в API-процессе».
+# Рост говорит, что ansible-раны текут в API-контейнер вместо выделенного
+# worker'а (см. get_redis: раньше отрицательный результат кешировался навечно).
+INLINE_FALLBACK_COUNTER = Counter(
+    "vpn_queue_inline_fallback_total",
+    "Задачи, ушедшие в inline-исполнение из-за недоступной RQ-очереди",
+)
 
 
 QUEUE_NAME = os.getenv("RQ_QUEUE", "vpn-provisioning")
@@ -44,31 +56,64 @@ def _backend_enabled() -> bool:
     return os.getenv("QUEUE_BACKEND", "").lower() == "rq" and bool(os.getenv("REDIS_URL"))
 
 
-@lru_cache(maxsize=1)
+# Кулдаун между повторными попытками подключиться к Redis после неудачи.
+# КЛЮЧЕВОЙ момент: раньше get_redis был обёрнут @lru_cache — первый же
+# неуспешный ping (типично при одновременном рестарте контейнеров, когда
+# Redis поднимается на пару секунд позже backend'а) кешировал None до конца
+# жизни процесса, и весь API навсегда переключался на inline-исполнение
+# ansible. Теперь кешируем ТОЛЬКО живой клиент; при None пробуем снова, но не
+# чаще раза в REDIS_RETRY_COOLDOWN секунд, чтобы не долбить недоступный Redis
+# на каждом enqueue.
+REDIS_RETRY_COOLDOWN = float(os.getenv("REDIS_RETRY_COOLDOWN", "30"))
+
+_conn_lock = threading.Lock()
+_redis_client: "Redis | None" = None
+_redis_last_fail: float = 0.0
+# Кеш успешно созданных Queue по имени. None сюда НЕ пишем — иначе повторили бы
+# залипание lru_cache: очередь бы не пересоздалась после восстановления Redis.
+_queues: dict[str, "Queue"] = {}
+
+
 def get_redis() -> "Redis | None":
+    global _redis_client, _redis_last_fail
     if not _backend_enabled():
         return None
-    try:
-        from redis import Redis
+    # Быстрый путь без блокировки: клиент уже есть.
+    if _redis_client is not None:
+        return _redis_client
+    with _conn_lock:
+        # Повторная проверка под локом — другой поток мог успеть подключиться.
+        if _redis_client is not None:
+            return _redis_client
+        if time.monotonic() - _redis_last_fail < REDIS_RETRY_COOLDOWN:
+            return None
+        try:
+            from redis import Redis
 
-        url = os.environ["REDIS_URL"]
-        client = Redis.from_url(url)
-        client.ping()
-        return client
-    except Exception:  # noqa: BLE001
-        logger.exception("Failed to connect to Redis; falling back to inline execution")
-        return None
+            url = os.environ["REDIS_URL"]
+            client = Redis.from_url(url)
+            client.ping()
+            _redis_client = client
+            return client
+        except Exception:  # noqa: BLE001
+            logger.exception("Failed to connect to Redis; falling back to inline execution")
+            _redis_last_fail = time.monotonic()
+            return None
 
 
-@lru_cache(maxsize=4)
 def _queue_by_name(name: str) -> "Queue | None":
     redis = get_redis()
     if redis is None:
         return None
+    cached = _queues.get(name)
+    if cached is not None:
+        return cached
     try:
         from rq import Queue
 
-        return Queue(name, connection=redis, default_timeout=DEFAULT_JOB_TIMEOUT)
+        queue = Queue(name, connection=redis, default_timeout=DEFAULT_JOB_TIMEOUT)
+        _queues[name] = queue
+        return queue
     except Exception:  # noqa: BLE001
         logger.exception(
             "Failed to construct RQ Queue %s; falling back to inline execution",
@@ -95,6 +140,15 @@ def enqueue_task(task_id: int, node_id: int | None) -> str | None:
     """
     queue = get_queue()
     if queue is None:
+        # Очередь недоступна — вызывающий выполнит задачу inline-потоком внутри
+        # API-процесса. Это осознанная деградация, но её надо видеть в логах и
+        # метриках: если считать растёт при живом Redis, значит разделение
+        # API/worker поехало (см. get_redis + REDIS_RETRY_COOLDOWN).
+        INLINE_FALLBACK_COUNTER.inc()
+        logger.warning(
+            "enqueue_task: RQ queue unavailable — task %s falls back to inline execution",
+            task_id,
+        )
         return None
     try:
         from rq import Retry

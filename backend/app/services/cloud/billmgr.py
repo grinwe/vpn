@@ -57,6 +57,13 @@ logger = logging.getLogger(__name__)
 # (а не висел до CF-502 на 100s). UFO с дата-центрового IP бэкенда отдаёт
 # captcha_verification_failed — см. hoster_api_epic.md.
 _TIMEOUT = 12
+# Ордер (vds.order.param) СПИСЫВАЕТ баланс — обрыв ответа = деньги ушли, а услугу
+# мы ещё не знаем. Даём ему отдельный больший таймаут (медленные RU-панели за
+# DDoS-Guard/CF — норма), чтобы реже ловить timeout ровно на денежном вызове.
+_ORDER_TIMEOUT = 30
+# После сетевого обрыва ордера — короткая сверка с панелью: появилась ли НОВАЯ
+# услуга (списание прошло) или ордер не дошёл вовсе.
+_ORDER_RECONCILE_TIMEOUT = 60
 _POLL_TIMEOUT = 900
 _POLL_INTERVAL = 12
 _PW_RETRIES = 3
@@ -64,6 +71,13 @@ _PW_INTERVAL = 3
 # item_status у billmgr-VDS
 _ST_ACTIVE = "2"
 _ST_DELETED = "4"
+
+
+class _NetworkError(DriverError):
+    """Обрыв запроса на сетевом уровне (timeout/сброс), а НЕ бизнес-ошибка billmgr.
+    Подкласс DriverError → все существующие ``except DriverError`` его ловят; но
+    ордер-путь ловит его отдельно, чтобы после обрыва денежного вызова свериться с
+    панелью (услуга могла оплатиться, хоть ответ и не дошёл)."""
 
 
 def _parse_token(token: str) -> tuple[str, str, str]:
@@ -127,15 +141,39 @@ class BillmgrDriver:
                 f"billmgr order needs datacenter/pricelist/ostempl ids "
                 f"(got region={region!r}, plan={plan!r}, image={image!r})"
             )
+        # 0) снимок услуг с этим domain ДО заказа. Ретрай спавна с тем же именем —
+        #    типовой путь оператора; снимок нужен, чтобы (а) после сетевого обрыва
+        #    ордера отличить НОВУЮ услугу от старой, (б) не принять старую снесённую
+        #    услугу-тёзку за только что оплаченную (иначе orphan новой услуги).
+        known_ids = self._existing_ids(name)
         # 1) заказ + оплата с баланса. autoprolong=1 — иначе нода удалится в конце
         #    периода. domain=name — по нему находим услугу (id в ответе не приходит).
-        self._call(
-            "vds.order.param",
-            pricelist=pl, datacenter=dc, ostempl=tpl,
-            period="1", autoprolong="1", domain=name, skipbasket="on", sok="ok",
-        )
-        # 2) найти услугу по domain + дождаться active с IP.
-        service_id, ipv4, cost, elem = self._wait_active(name)
+        #    Отдельный больший таймаут: ордер СПИСЫВАЕТ баланс.
+        try:
+            self._call(
+                "vds.order.param",
+                pricelist=pl, datacenter=dc, ostempl=tpl,
+                period="1", autoprolong="1", domain=name, skipbasket="on", sok="ok",
+                timeout=_ORDER_TIMEOUT,
+            )
+        except _NetworkError as exc:
+            # ответ на ордер не дошёл (timeout/сеть) — заказ МОГ пройти и списать
+            # баланс. Сверяемся с панелью: появилась ли НОВАЯ услуга (не из known_ids).
+            # Появилась → продолжаем обычным путём (ниже _wait_active её поднимет).
+            # Нет за _ORDER_RECONCILE_TIMEOUT → авто-снос вслепую опасен (могли не
+            # списать вовсе) → просим оператора проверить панель вручную.
+            logger.warning(
+                "billmgr: ордер %s оборвался (%s) — сверяюсь с панелью %s",
+                name, exc, self._base,
+            )
+            if not self._new_service_present(name, known_ids, _ORDER_RECONCILE_TIMEOUT):
+                raise DriverError(
+                    f"billmgr order {name} оборвался по сети и новой услуги не видно "
+                    f"за {_ORDER_RECONCILE_TIMEOUT}s — проверь панель ВРУЧНУЮ "
+                    f"(возможен orphan)"
+                ) from exc
+        # 2) найти услугу по domain + дождаться active с IP (старые тёзки — known_ids).
+        service_id, ipv4, cost, elem = self._wait_active(name, known_ids)
         if not service_id:
             # заказ СПИСАЛ баланс, но услуга не появилась в func=vds — снести нечем.
             logger.error(
@@ -300,10 +338,42 @@ class BillmgrDriver:
                 time.sleep(_PW_INTERVAL)
         return ""
 
-    def _wait_active(self, name: str) -> tuple[str, str, float | None, dict]:
+    def _existing_ids(self, name: str) -> set[str]:
+        """Снимок id всех услуг func=vds с ``domain==name`` (best-effort). Пусто при
+        сетевой/бизнес-ошибке — тогда поведение как раньше (без фильтра тёзок)."""
+        try:
+            doc = self._call("vds")
+        except DriverError:
+            return set()
+        return _ids_by_domain(doc, name)
+
+    def _new_service_present(
+        self, name: str, known_ids: set[str], timeout_s: float
+    ) -> bool:
+        """Короткий поллинг после обрыва ордера: появилась ли НОВАЯ услуга (id не из
+        ``known_ids``) с ``domain==name``. Отличает 'ордер прошёл и списал' от
+        'ордер не дошёл'."""
+        deadline = time.time() + timeout_s
+        while True:
+            try:
+                doc = self._call("vds")
+            except DriverError:
+                doc = {}
+            if _find_by_domain(doc, name, exclude_ids=known_ids):
+                return True
+            if time.time() >= deadline:
+                return False
+            time.sleep(_POLL_INTERVAL)
+
+    def _wait_active(
+        self, name: str, known_ids: set[str] | None = None
+    ) -> tuple[str, str, float | None, dict]:
         """Поллим func=vds, пока услуга с ``domain==name`` не станет active+IP.
         Возвращаем ``(service_id, ipv4, monthly_cost, elem)``. item_status/id/ip
-        могут быть $-обёрнуты → всё через _scalar/_extract_ip."""
+        могут быть $-обёрнуты → всё через _scalar/_extract_ip. ``known_ids`` —
+        услуги-тёзки, существовавшие ДО заказа: их deleted-статус НЕ терминален
+        (иначе старая снесённая тёзка перехватит ожидание новой услуги)."""
+        known_ids = known_ids or set()
         deadline = time.time() + _POLL_TIMEOUT
         last_id = ""
         last_elem: dict = {}
@@ -321,13 +391,15 @@ class BillmgrDriver:
                 status = str(_scalar(elem.get("item_status")) or "")
                 if ipv4 and status == _ST_ACTIVE:
                     return last_id, ipv4, _to_float(elem.get("cost")), elem
-                if status == _ST_DELETED:
-                    # терминально — дальше ждать смысла нет (вернём без ip → orphan-guard).
+                if status == _ST_DELETED and last_id not in known_ids:
+                    # deleted терминально ТОЛЬКО для НОВОЙ услуги (не старой тёзки):
+                    # дальше ждать смысла нет (вернём без ip → orphan-guard). Старую
+                    # снесённую тёзку пропускаем и ждём появления новой услуги.
                     return last_id, "", _to_float(elem.get("cost")), elem
             time.sleep(_POLL_INTERVAL)
         return last_id, _extract_ip(last_elem), _to_float(last_elem.get("cost")), last_elem
 
-    def _call(self, func: str, **params: Any) -> dict:
+    def _call(self, func: str, *, timeout: float | None = None, **params: Any) -> dict:
         """POST к ``<base>/billmgr?func=<func>`` с authinfo + out=json. Возвращает
         ``doc``. Бросает DriverError на doc.error / HTTP-ошибке (с телом ответа —
         чтобы 'insufficient funds' было видно в логах)."""
@@ -339,9 +411,13 @@ class BillmgrDriver:
             **{k: str(v) for k, v in params.items()},
         }
         try:
-            resp = self._session.post(f"{self._base}/billmgr", data=body, timeout=_TIMEOUT)
+            resp = self._session.post(
+                f"{self._base}/billmgr", data=body, timeout=timeout or _TIMEOUT
+            )
         except requests.RequestException as exc:
-            raise DriverError(f"billmgr {func} request failed: {exc}") from exc
+            # сетевой обрыв (в т.ч. timeout) — отдельный тип, чтобы ордер-путь мог
+            # свериться с панелью (услуга могла оплатиться, хоть ответ не дошёл).
+            raise _NetworkError(f"billmgr {func} request failed: {exc}") from exc
         if resp.status_code >= 400:
             raise DriverError(
                 f"billmgr {func} -> HTTP {resp.status_code}: {resp.text[:200]}"
@@ -405,8 +481,11 @@ def _last_rub(s: Any) -> float | None:
     return None
 
 
-def _find_by_domain(doc: dict, name: str) -> dict | None:
-    """Найти в ответе func=vds элемент с ``domain==name`` (свежайший по id)."""
+def _find_by_domain(
+    doc: dict, name: str, exclude_ids: set[str] | None = None
+) -> dict | None:
+    """Найти в ответе func=vds элемент с ``domain==name`` (свежайший по id).
+    ``exclude_ids`` — игнорировать эти id (сверка «появилась ли НОВАЯ услуга»)."""
     elems = doc.get("elem")
     if isinstance(elems, dict):
         elems = [elems]
@@ -416,9 +495,30 @@ def _find_by_domain(doc: dict, name: str) -> dict | None:
         e for e in elems
         if isinstance(e, dict) and _scalar(e.get("domain")) == name
     ]
+    if exclude_ids:
+        matched = [
+            e for e in matched
+            if str(_scalar(e.get("id") or e.get("elid")) or "") not in exclude_ids
+        ]
     if not matched:
         return None
     return max(matched, key=lambda e: _to_int(e.get("id") or e.get("elid")) or 0)
+
+
+def _ids_by_domain(doc: dict, name: str) -> set[str]:
+    """Множество id всех услуг func=vds с ``domain==name`` (любого статуса)."""
+    elems = doc.get("elem")
+    if isinstance(elems, dict):
+        elems = [elems]
+    if not isinstance(elems, list):
+        return set()
+    out: set[str] = set()
+    for e in elems:
+        if isinstance(e, dict) and _scalar(e.get("domain")) == name:
+            sid = str(_scalar(e.get("id") or e.get("elid")) or "")
+            if sid:
+                out.add(sid)
+    return out
 
 
 def _extract_ip(elem: dict) -> str:

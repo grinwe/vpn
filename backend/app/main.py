@@ -1,3 +1,4 @@
+import logging
 import os
 import uuid
 
@@ -21,6 +22,8 @@ from .telegram_webhook import router as tg_webhook_router, register_webhook
 
 configure_logging()
 run_migrations()
+
+logger = logging.getLogger(__name__)
 
 
 def _check_required_settings() -> None:
@@ -112,6 +115,22 @@ async def _cold_path_throttled_handler(request: Request, exc: ColdPathThrottled)
         headers={"Retry-After": str(exc.retry_after_seconds)},
     )
 
+
+@app.exception_handler(Exception)
+async def _unhandled_exception_handler(request: Request, exc: Exception):
+    # Ловим необработанные исключения (реальные 500-краши): логируем трейс и
+    # возвращаем клиенту request_id, по которому его можно найти в логах.
+    # ServerErrorMiddleware — самый внешний слой, поэтому этот ответ НЕ проходит
+    # обратно через add_request_id, и заголовок надо проставить здесь вручную.
+    # Метрику 500 при этом инкрементит add_metrics на пути исключения.
+    rid = request_id_var.get() or ""
+    logger.exception("unhandled_exception", extra={"path": request.url.path})
+    return JSONResponse(
+        status_code=500,
+        content={"detail": "Внутренняя ошибка сервера.", "request_id": rid},
+        headers={"X-Request-ID": rid} if rid else None,
+    )
+
 # CORS — restrict to explicit origins. WEBAPP_ORIGIN env controls which
 # frontend domains may call the API. Falls back to same-origin only (empty
 # list = no cross-origin requests allowed).
@@ -137,15 +156,30 @@ async def add_request_id(request: Request, call_next):
     return response
 
 
-@app.middleware("http")
-async def add_metrics(request: Request, call_next):
-    response = await call_next(request)
-    status_code = response.status_code
+def _metrics_path_label(request: Request) -> str:
     # Use the matched route template (e.g. "/api/users/{user_id}") instead of
     # the raw request path — otherwise every unique id becomes its own label
-    # value and Prometheus cardinality explodes.
+    # value and Prometheus cardinality explodes. request.scope["route"] is set
+    # by the router even when the endpoint later raises, so this stays valid on
+    # the exception path too.
     route = request.scope.get("route")
-    path_label = getattr(route, "path", None) or "unmatched"
+    return getattr(route, "path", None) or "unmatched"
+
+
+@app.middleware("http")
+async def add_metrics(request: Request, call_next):
+    try:
+        response = await call_next(request)
+    except Exception:
+        # Необработанное исключение = настоящий 500-краш. Считаем его в обоих
+        # счётчиках, иначе всплеск багов после деплоя не виден на дашбордах, и
+        # пере-бросываем — финальный ответ строит exception-handler ниже.
+        path_label = _metrics_path_label(request)
+        REQUEST_COUNTER.labels(path=path_label, status="500").inc()
+        ERROR_COUNTER.labels(path=path_label, status="500").inc()
+        raise
+    status_code = response.status_code
+    path_label = _metrics_path_label(request)
     REQUEST_COUNTER.labels(path=path_label, status=str(status_code)).inc()
     if status_code >= 400:
         ERROR_COUNTER.labels(path=path_label, status=str(status_code)).inc()

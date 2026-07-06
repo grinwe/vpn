@@ -27,8 +27,8 @@ from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from . import models
+from .api._common import get_db  # единый источник FastAPI-зависимости сессии (без третьей копии)
 from .config import get_settings
-from .db import SessionLocal
 from .rate_limit import limiter
 from .security import decrypt as _decrypt
 from .services.admin_notify import notify_admins
@@ -38,14 +38,6 @@ logger = logging.getLogger(__name__)
 settings = get_settings()
 
 ext_router = APIRouter(prefix="/api")
-
-
-def get_db():
-    db = SessionLocal()
-    try:
-        yield db
-    finally:
-        db.close()
 
 
 # ── Dynamic subscription link ──
@@ -133,6 +125,26 @@ def _sub_response_headers(
     if fallback and token:
         headers["fallback-url"] = f"{fallback}/{token}"
     return headers
+
+
+def _should_log_sub_fetch() -> bool:
+    """Сэмплирование записи ``subscription_fetch`` в самом горячем read-пути.
+
+    Клиенты (Hiddify/v2rayNG) опрашивают ссылку каждые 6 ч (``profile-update-
+    interval``) + ручные рефреши, и каждый успешный фетч пишет строку
+    ``AuditLog`` + ``COMMIT`` — таблица ``audit_logs`` растёт неограниченно
+    (ретеншен-джоба живёт в worker.py, вне этого модуля — см. аудит #247).
+    ``SUB_FETCH_AUDIT_SAMPLE`` (int, по умолчанию 1 = писать каждый фетч) —
+    прод-рубильник: при N>1 пишем примерно 1 фетч из N, срезая write-
+    amplification в горячем эндпоинте, сохраняя сам сигнал активности. N<=1 или
+    мусор → писать всегда (текущее поведение, дефолт-noop для тестов)."""
+    try:
+        n = int(os.getenv("SUB_FETCH_AUDIT_SAMPLE") or "1")
+    except ValueError:
+        n = 1
+    if n <= 1:
+        return True
+    return secrets.randbelow(n) == 0
 
 
 @ext_router.get("/sub/{token}")
@@ -233,23 +245,26 @@ def dynamic_sub_link(token: str, db: Session = Depends(get_db)):
                 detail="No active endpoints — provisioning in progress, retry shortly",
             )
 
-        db.add(
-            models.AuditLog(
-                actor=str(sub.user_id),
-                actor_type=models.AuditActor.user,
-                action="subscription_fetch",
-                target_type="device",
-                target_id=device.id,
-                extra={
-                    "protocols": [c.protocol for c in configs],
-                    "device_token": True,
-                    "aliased_to_device_id": (
-                        source_device.id if source_device.id != device.id else None
-                    ),
-                },
+        # Read-путь ничего, кроме audit-строки, не пишет — при сэмплировании
+        # (SUB_FETCH_AUDIT_SAMPLE>1) просто пропускаем и INSERT, и COMMIT.
+        if _should_log_sub_fetch():
+            db.add(
+                models.AuditLog(
+                    actor=str(sub.user_id),
+                    actor_type=models.AuditActor.user,
+                    action="subscription_fetch",
+                    target_type="device",
+                    target_id=device.id,
+                    extra={
+                        "protocols": [c.protocol for c in configs],
+                        "device_token": True,
+                        "aliased_to_device_id": (
+                            source_device.id if source_device.id != device.id else None
+                        ),
+                    },
+                )
             )
-        )
-        db.commit()
+            db.commit()
 
         uris = "\n".join(c.uri for c in configs)
         encoded = base64.b64encode(uris.encode()).decode()
@@ -299,17 +314,19 @@ def dynamic_sub_link(token: str, db: Session = Depends(get_db)):
     uris = "\n".join(c.uri for c in configs)
     encoded = base64.b64encode(uris.encode()).decode()
 
-    db.add(
-        models.AuditLog(
-            actor=str(sub.user_id),
-            actor_type=models.AuditActor.user,
-            action="subscription_fetch",
-            target_type="subscription",
-            target_id=sub.id,
-            extra={"protocols": [c.protocol for c in configs], "legacy_token": True},
+    # См. per-device ветку: сэмплируем горячую audit-запись (аудит #247).
+    if _should_log_sub_fetch():
+        db.add(
+            models.AuditLog(
+                actor=str(sub.user_id),
+                actor_type=models.AuditActor.user,
+                action="subscription_fetch",
+                target_type="subscription",
+                target_id=sub.id,
+                extra={"protocols": [c.protocol for c in configs], "legacy_token": True},
+            )
         )
-    )
-    db.commit()
+        db.commit()
 
     return PlainTextResponse(
         content=encoded,

@@ -14,6 +14,8 @@
   gather_facts: false
   vars:
     db_backup_dir: /opt/vpn-backups
+    # Ротация: дампы старше N дней удаляются после успешного нового бэкапа.
+    db_backup_retention_days: 14
   tasks:
     - name: Freeze backup filename once (lookup in vars re-evaluates per use)
       set_fact:
@@ -56,3 +58,37 @@
         src: "{{ db_backup_file }}"
         dest: "{{ lookup('env', 'HOME') }}/vpn-backups/"
         flat: true
+
+    # --- Ротация: чистим старые дампы ТОЛЬКО после успешного нового бэкапа ---
+    # (assert выше уже гарантировал целостность свежего дампа).
+    - name: Find old dumps on the web host
+      find:
+        paths: "{{ db_backup_dir }}"
+        patterns: "vpn-*.dump"
+        age: "{{ db_backup_retention_days }}d"
+      register: db_backup_old_host
+
+    - name: Prune old dumps on the web host
+      file:
+        path: "{{ item.path }}"
+        state: absent
+      loop: "{{ db_backup_old_host.files }}"
+      loop_control:
+        label: "{{ item.path }}"
+
+    - name: Find old dumps on the controller
+      find:
+        paths: "{{ lookup('env', 'HOME') }}/vpn-backups"
+        patterns: "vpn-*.dump"
+        age: "{{ db_backup_retention_days }}d"
+      register: db_backup_old_ctrl
+      delegate_to: localhost
+
+    - name: Prune old dumps on the controller
+      file:
+        path: "{{ item.path }}"
+        state: absent
+      loop: "{{ db_backup_old_ctrl.files }}"
+      loop_control:
+        label: "{{ item.path }}"
+      delegate_to: localhost

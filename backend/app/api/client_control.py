@@ -253,12 +253,23 @@ def _escalate_node_failure_reports(db: Session, node_id: int) -> None:
         return
 
     cutoff = now - timedelta(minutes=window_min)
+    # Считаем крауд-репорты по operator_node_reports (failed_node_id и
+    # reported_at — btree-индексированы), а не JSONB-containment'ом по
+    # audit_logs. Это user-facing путь: именно на аварии ноды десятки
+    # клиентов жмут «не работает» одновременно, и полный скан
+    # многомиллионной audit_logs внутри HTTP-запроса недопустим. Каждый
+    # успешный failover (webapp/control-channel и оба бот-пути) пишет
+    # OperatorNodeReport с failed_node_id = старая нода — те же события,
+    # что раньше искали в audit-метаданных current_node_id. DISTINCT по
+    # подписке: один нетерпеливый юзер не перебьёт порог сам.
     reports = (
-        db.query(sa_func.count(sa_func.distinct(models.AuditLog.target_id)))
-        .filter(models.AuditLog.action == "client_reported_failure")
-        .filter(models.AuditLog.target_type == "subscription")
-        .filter(models.AuditLog.created_at >= cutoff)
-        .filter(models.AuditLog.extra.contains({"current_node_id": node_id}))
+        db.query(
+            sa_func.count(
+                sa_func.distinct(models.OperatorNodeReport.subscription_id)
+            )
+        )
+        .filter(models.OperatorNodeReport.failed_node_id == node_id)
+        .filter(models.OperatorNodeReport.reported_at >= cutoff)
         .scalar()
     ) or 0
     if reports < threshold:
@@ -411,12 +422,14 @@ def _do_failover(
         )
 
     recent_migrate_cutoff = utcnow() - timedelta(minutes=5)
+    # Троттл по operator_node_reports (reported_at индексирован) вместо
+    # скана audit_logs: каждый успешный failover пишет ровно один
+    # OperatorNodeReport по этой подписке, так что сигнал тот же, но без
+    # полного скана таблицы аудита внутри клиентского запроса.
     recent_migrate = (
-        db.query(models.AuditLog)
-        .filter(models.AuditLog.action == "client_reported_failure")
-        .filter(models.AuditLog.target_type == "subscription")
-        .filter(models.AuditLog.target_id == sub.id)
-        .filter(models.AuditLog.created_at >= recent_migrate_cutoff)
+        db.query(models.OperatorNodeReport.id)
+        .filter(models.OperatorNodeReport.subscription_id == sub.id)
+        .filter(models.OperatorNodeReport.reported_at >= recent_migrate_cutoff)
         .first()
     )
     if recent_migrate:

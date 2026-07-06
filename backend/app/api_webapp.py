@@ -1523,7 +1523,16 @@ def webapp_add_device(
     from .services import balance as balance_svc
     from .services.provisioning import ProvisioningOrchestrator
 
-    sub = db.get(models.Subscription, subscription_id)
+    # FOR UPDATE-блокировка строки подписки на весь запрос: два
+    # параллельных add_device (даблклик) сериализуются на этом локе,
+    # поэтому second-запрос читает уже инкрементированный
+    # extra_device_slots и не затирает чужое списание.
+    sub = (
+        db.query(models.Subscription)
+        .filter(models.Subscription.id == subscription_id)
+        .with_for_update()
+        .first()
+    )
     if not sub or sub.user_id != user.id:
         raise HTTPException(status_code=404, detail="Subscription not found")
     if sub.status != models.SubscriptionStatus.active:
@@ -1593,10 +1602,9 @@ def webapp_add_device(
             )
             db.commit()
             raise HTTPException(status_code=402, detail=str(exc))
-        # Persist the bought slot — this is what makes subsequent
-        # renewals include the surcharge.
-        sub.extra_device_slots = current_slots + 1
-        db.add(sub)
+        # Слот уже проинкрементирован внутри charge_extra_device
+        # (services/balance.py) — не перезаписываем current_slots + 1,
+        # иначе конкурентная покупка второго слота была бы затёрта.
 
     db.commit()
     db.refresh(user)

@@ -75,6 +75,13 @@ type TrackedOp = {
 
 const LS_KEY = "vpn-admin-tracked-ops";
 
+// Grace-окно для задач, которых нет в ответе поллинга (не попали в срез
+// последних 500 — например, после массовой миграции создано >500 задач).
+// Пока op моложе этого порога, missing-задачи считаем pending (воркер ещё
+// мог их не создать). После порога — считаем «неизвестными» и терминальными,
+// иначе прогресс-баннер и поллинг зависают навсегда (см. audit #164).
+const MISSING_TASK_GRACE_MS = 30 * 60 * 1000;
+
 function loadTrackedOps(): TrackedOp[] {
   try {
     const raw = localStorage.getItem(LS_KEY);
@@ -687,13 +694,20 @@ export default function Nodes() {
       if (!tasks) return 3_000;
       const statusById = new Map(tasks.map((t) => [t.id, t.status]));
       // Задача «живая», пока она pending/running или ещё не попала в
-      // окно последних 500 (воркер не успел её создать/подхватить).
-      const live = trackedOps.some((op) =>
-        op.taskIds.some((id) => {
+      // окно последних 500 (воркер не успел её создать/подхватить). Но
+      // missing-задачу держим «живой» только внутри grace-окна — иначе
+      // задача, навсегда выпавшая из среза last-500, крутила бы поллинг
+      // бесконечно (audit #164).
+      const now = Date.now();
+      const live = trackedOps.some((op) => {
+        const withinGrace = now - op.startedAt <= MISSING_TASK_GRACE_MS;
+        return op.taskIds.some((id) => {
           const st = statusById.get(id);
-          return st === undefined || st === "pending" || st === "running";
-        }),
-      );
+          if (st === "pending" || st === "running") return true;
+          if (st === undefined) return withinGrace;
+          return false;
+        });
+      });
       return live ? 3_000 : false;
     },
   });
@@ -3189,8 +3203,11 @@ function BatchEditConfigsForm({
     );
 
     // Если все ops провалились — не палим bootstrap (нечего применять).
+    // total=totalOps (без +1 за незапущенный bootstrap), чтобы done===total
+    // и состояние стало терминальным: иначе «Отмена» (disabled при done<total)
+    // и submit остались бы заблокированы навсегда — форма-тупик (audit #166).
     if (failures.length === totalOps) {
-      setProgress({ done, total: totalOps + 1, current: null, failures });
+      setProgress({ done, total: totalOps, current: null, failures });
       setErr(
         `Все ${totalOps} оп. провалились — bootstrap не запущен. Поправь и попробуй заново.`,
       );
@@ -3386,7 +3403,7 @@ function BatchEditConfigsForm({
         </button>
         <button
           type="submit"
-          disabled={progress != null}
+          disabled={progress != null && progress.done < progress.total}
           className="px-3 py-1 rounded bg-emerald-600 hover:bg-emerald-500 text-xs font-semibold disabled:opacity-50"
         >
           Сохранить всё + 1 bootstrap
@@ -3479,12 +3496,24 @@ function NodeActiveUsers({ nodeId }: { nodeId: number }) {
                   </td>
                   <td>
                     {u.device_id ? (
-                      <Link
-                        to={`/subscriptions?device_id=${u.device_id}`}
-                        className="text-blue-400 hover:underline"
-                      >
-                        {u.device_name ?? `#${u.device_id}`}
-                      </Link>
+                      // Маршрута /subscriptions в админке нет — раньше ссылка
+                      // проваливалась в catch-all и редиректила на Dashboard
+                      // (audit #165). Девайс принадлежит юзеру, поэтому ведём
+                      // на реальный /users, отфильтрованный по telegram_id;
+                      // если tg неизвестен (orphan) — просто текст без ссылки.
+                      u.user_telegram_id ? (
+                        <Link
+                          to={`/users?telegram_id=${encodeURIComponent(u.user_telegram_id)}`}
+                          className="text-blue-400 hover:underline"
+                          title="Открыть юзера этого девайса в разделе Users"
+                        >
+                          {u.device_name ?? `#${u.device_id}`}
+                        </Link>
+                      ) : (
+                        <span className="text-slate-300">
+                          {u.device_name ?? `#${u.device_id}`}
+                        </span>
+                      )
                     ) : (
                       <span className="text-slate-500">—</span>
                     )}
@@ -3867,14 +3896,22 @@ function OperationProgressBanner({
   const seen = new Set(related.map((t) => t.id));
   const missing = op.taskIds.filter((id) => !seen.has(id));
 
+  // После grace-окна missing-задачи (вне среза last-500) больше не считаем
+  // pending, а помечаем «unknown» и терминальными — иначе done<total никогда
+  // не сойдётся, баннер вечно «в процессе», поллинг не гаснет (audit #164).
+  const pastGrace = Date.now() - op.startedAt > MISSING_TASK_GRACE_MS;
+
   const counts = {
-    pending: related.filter((t) => t.status === "pending").length + missing.length,
+    pending:
+      related.filter((t) => t.status === "pending").length +
+      (pastGrace ? 0 : missing.length),
     running: related.filter((t) => t.status === "running").length,
     success: related.filter((t) => t.status === "success").length,
     failed: related.filter((t) => t.status === "failed").length,
+    unknown: pastGrace ? missing.length : 0,
   };
   const total = op.taskIds.length;
-  const done = counts.success + counts.failed;
+  const done = counts.success + counts.failed + counts.unknown;
   const allDone = done === total && total > 0;
   const pct = total === 0 ? 0 : Math.round((done / total) * 100);
 
@@ -3961,6 +3998,14 @@ function OperationProgressBanner({
         <span className="text-emerald-400">ok: {counts.success}</span>
         {counts.failed > 0 && (
           <span className="text-red-400">failed: {counts.failed}</span>
+        )}
+        {counts.unknown > 0 && (
+          <span
+            className="text-amber-400"
+            title="Задачи вне окна последних 500 — статус неизвестен (op старше 30 мин). Смотри детали в /tasks."
+          >
+            unknown: {counts.unknown}
+          </span>
         )}
       </div>
       {op.kind === "diagnose_link" && (

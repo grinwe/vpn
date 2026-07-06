@@ -156,6 +156,35 @@ def create_broadcast(
     actor_header: str | None = Header(default=None, alias=ADMIN_ACTOR_HEADER),
 ):
     actor, _actor_type = _resolve_admin_actor(actor_header)
+    # Защита от дублей: двойной клик по Send, ретрай HTTP-клиента или
+    # залипший фронт создают две одинаковые queued-рассылки, и dispatch-тик
+    # честно разошлёт обе всей базе. Отклоняем создание, если уже есть
+    # активная (queued/sending) рассылка с тем же текстом и фильтром.
+    # target_filter сравниваем в нормализованном виде (тот же exclude_none,
+    # что и при insert ниже), чтобы JSONB-равенство совпало.
+    normalized_filter = body.target_filter.model_dump(exclude_none=True)
+    existing = (
+        db.query(models.Broadcast)
+        .filter(
+            models.Broadcast.status.in_(
+                (
+                    models.BroadcastStatus.queued,
+                    models.BroadcastStatus.sending,
+                )
+            ),
+            models.Broadcast.text == body.text,
+            models.Broadcast.target_filter == normalized_filter,
+        )
+        .first()
+    )
+    if existing is not None:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "уже есть активная рассылка с тем же текстом и фильтром "
+                f"(id={existing.id})"
+            ),
+        )
     # Предпосчитываем count на create — UI покажет в detail-view до
     # первого тика dispatch. Если резолвер вернёт 0, всё равно создаём —
     # админ увидит completed+sent_count=0 и поймёт что фильтр пустой.
@@ -164,7 +193,7 @@ def create_broadcast(
     bc = models.Broadcast(
         created_by=actor,
         text=body.text,
-        target_filter=body.target_filter.model_dump(exclude_none=True),
+        target_filter=normalized_filter,
         status=models.BroadcastStatus.queued,
         total_recipients=count,
     )

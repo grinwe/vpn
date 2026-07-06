@@ -153,7 +153,7 @@ class VdsinaDriver:
                 f"VDSina server {external_id} got no IPv4 within {_POLL_TIMEOUT}s "
                 f"(last status={status})"
             )
-        return ipv4, None, srv
+        return ipv4, self._server_cost(srv), srv
 
     def create_server(
         self,
@@ -347,6 +347,35 @@ class VdsinaDriver:
         data = self._call("POST", "/ssh-key", {"name": _KEY_NAME, "data": pub})
         self._ssh_key_id = _to_int(data.get("id")) if isinstance(data, dict) else None
         return self._ssh_key_id
+
+    def _server_cost(self, srv: dict) -> float | None:
+        """Стоимость сервера из ответа GET /server/{id} (за период ``period``,
+        как в list_plans). VDSina кладёт тариф во вложенный объект
+        ``server_plan`` с полем цены ``cost`` (сверено по hugmouse/go-vdsina);
+        дефис-вариант ключа и top-level ``cost`` подстрахованы. Если цены в
+        объекте сервера нет — подтягиваем из /server-plan (list_plans) по id
+        тарифа, иначе node.monthly_cost у vdsina-нод осталось бы пустым и
+        cloud-billing занижал бы расходы флота."""
+        srv = srv or {}
+        plan = srv.get("server_plan") or srv.get("server-plan")
+        plan_id: Any = None
+        if isinstance(plan, dict):
+            cost = _to_float(plan.get("cost"))
+            if cost is not None:
+                return cost
+            plan_id = plan.get("id")
+        elif plan is not None:
+            plan_id = plan  # server-plan мог прийти голым id
+        top = _to_float(srv.get("cost"))
+        if top is not None:
+            return top
+        # В объекте сервера цены нет — ищем тариф в offerings по id.
+        pid = _to_int(plan_id)
+        if pid is not None:
+            for p in self.list_plans():
+                if _to_int(p.get("id")) == pid:
+                    return p.get("price")
+        return None
 
     def _wait_active(self, server_id: str) -> tuple[str, str, dict]:
         """Поллим GET /v1/server/{id}, пока status=active и есть IPv4.

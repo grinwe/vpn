@@ -111,6 +111,18 @@ def plan_price_kopecks(plan: models.Plan) -> int:
     return int(round(float(plan.price) * 100))
 
 
+def _plan_months(plan: models.Plan | None) -> int:
+    """Число 30-дневных «месяцев» в периоде плана.
+
+    ``EXTRA_DEVICE_MONTHLY_KOPECKS`` — цена за календарный месяц, поэтому
+    доп. слоты на годовом плане стоят ``N * EXTRA * 12`` за весь период.
+    Единый источник множителя для renewal / change_plan / runway.
+    """
+    if plan is None:
+        return 1
+    return max(1, (plan.duration_days or 30) // 30)
+
+
 def total_renewal_cost_kopecks(sub: models.Subscription) -> int:
     """Full kopecks that the next renewal will bill: plan + slots.
 
@@ -130,7 +142,7 @@ def total_renewal_cost_kopecks(sub: models.Subscription) -> int:
         return 0
     base = plan_price_kopecks(plan)
     slots = sub.extra_device_slots or 0
-    months = max(1, (plan.duration_days or 30) // 30)
+    months = _plan_months(plan)
     return base + slots * EXTRA_DEVICE_MONTHLY_KOPECKS * months
 
 
@@ -296,7 +308,11 @@ def renew_subscription(db: Session, sub: models.Subscription) -> bool:
 
     base_price = plan_price_kopecks(sub.plan)
     extra_slots = sub.extra_device_slots or 0
-    device_surcharge = extra_slots * EXTRA_DEVICE_MONTHLY_KOPECKS
+    # Доп. слоты — помесячная цена, масштабируем на длительность плана
+    # (годовой = ×12), как в total_renewal_cost_kopecks. Иначе слоты на
+    # годовом плане недосчитываются в 12 раз.
+    months = _plan_months(sub.plan)
+    device_surcharge = extra_slots * EXTRA_DEVICE_MONTHLY_KOPECKS * months
     price = base_price + device_surcharge
     if price <= 0:
         logger.warning("renew: plan %s has no price, skipping sub %s", sub.plan_id, sub.id)
@@ -357,6 +373,10 @@ def change_plan(
         total_days = old_plan.duration_days
         remaining_seconds = (sub.expires_at - now).total_seconds()
         remaining_days = max(remaining_seconds / 86400, 0)
+        # Кап: заморозка (expires_at += FREEZE_DAYS) растягивает остаток
+        # сверх duration_days → рефанд не должен превышать цену плана,
+        # иначе создаём деньги из воздуха в леджере.
+        remaining_days = min(remaining_days, total_days)
         refund = int(math.floor(old_price * remaining_days / total_days))
 
     user = _lock_user(db, sub.user_id)
@@ -399,8 +419,10 @@ def change_plan(
     overflow = max(live_devices - new_bundled, 0)
     sub.extra_device_slots = overflow
 
-    # Charge for overflow slots (pro-rated for the full new period = full price).
-    device_surcharge = overflow * EXTRA_DEVICE_MONTHLY_KOPECKS
+    # Charge for overflow slots (за весь период нового плана; помесячная
+    # цена × число месяцев, чтобы годовой план не недосчитывал слоты).
+    months = _plan_months(new_plan)
+    device_surcharge = overflow * EXTRA_DEVICE_MONTHLY_KOPECKS * months
     if device_surcharge > 0:
         if (user.balance_kopecks or 0) < device_surcharge:
             raise ValueError(

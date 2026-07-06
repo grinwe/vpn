@@ -20,6 +20,7 @@ that the account is reachable. The dropped update is simply consumed.
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 from typing import Any, Awaitable, Callable
@@ -33,6 +34,9 @@ from .config import ADMIN_API_TOKEN, BACKEND_URL
 logger = logging.getLogger(__name__)
 
 _TTL_SECONDS = 30.0
+# Бэкофф после неудачного fetch: не долбим бэкенд на каждом апдейте, но
+# и не ждём целое TTL-окно, если бэкенд просто моргнул.
+_RETRY_SECONDS = 5.0
 _FETCH_TIMEOUT = aiohttp.ClientTimeout(total=5)
 
 
@@ -40,6 +44,13 @@ class BanGuard(BaseMiddleware):
     def __init__(self) -> None:
         self._banned: set[str] = set()
         self._loaded_at: float = 0.0
+        # Когда разрешён следующий refresh. Ставится синхронно при постановке
+        # задачи, чтобы параллельные апдейты не наплодили гонку fetch'ей.
+        self._next_refresh_at: float = 0.0
+        # Сериализует сам fetch: если refresh уже в полёте — новый не запускаем.
+        self._lock = asyncio.Lock()
+        # Держим ссылку на фоновую задачу, чтобы её не собрал GC до завершения.
+        self._refresh_task: asyncio.Task[None] | None = None
 
     async def _refresh(self) -> None:
         headers: dict[str, str] = {}
@@ -56,16 +67,35 @@ class BanGuard(BaseMiddleware):
                             "ban list fetch got HTTP %s; keeping stale cache",
                             resp.status,
                         )
+                        # Короткий бэкофф вместо ретрая на каждом апдейте.
+                        self._next_refresh_at = time.monotonic() + _RETRY_SECONDS
                         return
                     data = await resp.json()
             self._banned = {str(x) for x in data if x is not None}
             self._loaded_at = time.monotonic()
+            self._next_refresh_at = self._loaded_at + _TTL_SECONDS
         except Exception:
             logger.exception("ban list fetch failed; keeping stale cache")
+            # Короткий бэкофф: держим stale-кэш, но не заваливаем бэкенд.
+            self._next_refresh_at = time.monotonic() + _RETRY_SECONDS
 
-    async def _maybe_refresh(self) -> None:
-        if time.monotonic() - self._loaded_at >= _TTL_SECONDS:
+    async def _run_refresh(self) -> None:
+        # Второй барьер сериализации на случай гонки постановки задач.
+        if self._lock.locked():
+            return
+        async with self._lock:
             await self._refresh()
+
+    def _maybe_refresh(self) -> None:
+        # НЕ блокирует обработку апдейта: fetch уходит в фон, текущий апдейт
+        # проходит по (возможно stale) кэшу. Окно застолбливаем синхронно.
+        now = time.monotonic()
+        if now < self._next_refresh_at or self._lock.locked():
+            return
+        # Резервируем следующее окно немедленно, до всякого await, чтобы
+        # соседние апдейты в этом же тике не поставили ещё один fetch.
+        self._next_refresh_at = now + _TTL_SECONDS
+        self._refresh_task = asyncio.create_task(self._run_refresh())
 
     @staticmethod
     def _extract_user_id(event: TelegramObject) -> str | None:
@@ -97,7 +127,7 @@ class BanGuard(BaseMiddleware):
         event: TelegramObject,
         data: dict[str, Any],
     ) -> Any:
-        await self._maybe_refresh()
+        self._maybe_refresh()
         tg_id = self._extract_user_id(event)
         if tg_id and tg_id in self._banned:
             return None

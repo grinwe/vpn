@@ -518,9 +518,70 @@ def spawn_node(
         node, {"pool_id": pool_id, "auto_spawn": True}, defer_to_reconciler=False
     )
     db.commit()
+    # #77 — bootstrap НЕ запускаем сразу: свежий VPS грузится несколько минут,
+    # ранний site.yml падает на 'No route to host', нода уходит в error, а
+    # автоскейл (исключающий error-ноды из cap) в следующий тик покупает ЕЩЁ
+    # один сервер — цикл «купить→упасть→купить». Раньше _wait_for_ssh был только
+    # в _finalize_spawn (путь spawn_node_async), а синхронный spawn_node
+    # (автоскейл) стартовал bootstrap без ожидания. Дожидаемся SSH и запускаем
+    # таску в фоновом daemon-потоке со своей сессией (как _finalize_spawn) —
+    # синхронный контракт spawn_node (возврат готовой таски) сохраняется, а
+    # долгое ожидание не держит вызывающую сессию/соединение из пула (#74).
     if _created:
-        orchestrator.run_task_async(task, node=node)
+        threading.Thread(
+            target=_deferred_bootstrap_after_ssh,
+            args=(node.id, task.id),
+            daemon=True,
+        ).start()
     return node, task
+
+
+def _deferred_bootstrap_after_ssh(node_id: int, task_id: int) -> None:
+    """Дождаться SSH на свежеспавненной ноде и запустить готовую bootstrap-таску.
+
+    Крутится в daemon-потоке backend'а со своей сессией (как :func:`_finalize_spawn`).
+    Таска уже создана и закоммичена вызывающим :func:`spawn_node` — здесь только
+    ждём доступности SSH (#77) и запускаем исполнение. Транзакцию на время
+    ожидания не держим (#74)."""
+    session = SessionLocal()
+    try:
+        node = session.get(models.VPNNode, node_id)
+        if not node:
+            logger.error("deferred bootstrap: node %s vanished", node_id)
+            return
+        host = node.host
+        ssh_port = node.ssh_port or 22
+        # #74 — освобождаем соединение из пула ДО ожидания SSH (до 480s).
+        session.rollback()
+
+        if _wait_for_ssh(host, ssh_port):
+            logger.info("spawn_node deferred bootstrap: SSH up on %s", host)
+        else:
+            logger.warning(
+                "spawn_node deferred bootstrap: SSH on %s not up within wait "
+                "window — enqueuing bootstrap anyway (key-inject/ansible will "
+                "retry)", host,
+            )
+
+        node = session.get(models.VPNNode, node_id)
+        task = session.get(models.ProvisioningTask, task_id)
+        if not node or not task:
+            logger.error(
+                "deferred bootstrap: node %s / task %s vanished before enqueue",
+                node_id, task_id,
+            )
+            return
+        orchestrator = ProvisioningOrchestrator(session)
+        orchestrator.run_task_async(task, node=node)
+        logger.info(
+            "spawn_node deferred bootstrap: node %s bootstrap enqueued", node_id
+        )
+    except Exception:  # noqa: BLE001
+        logger.exception("deferred bootstrap crashed for node %s", node_id)
+        if session.is_active:
+            session.rollback()
+    finally:
+        session.close()
 
 
 def spawn_node_async(
@@ -703,10 +764,20 @@ def _finalize_spawn(
             _mark_spawn_error(session, node)
             return
         driver = get_driver(provider)
+        # #74 — считываем нужные поля и ЗАКРЫВАЕМ транзакцию ДО долгого сетевого
+        # ожидания. wait_for_ipv4 у 4vps поллит до 600s: держать всё это время
+        # idle-in-transaction соединение из пула SQLAlchemy нельзя (несколько
+        # параллельных спавнов исчерпали бы пул и подвесили HTTP-запросы, а
+        # долгоживущий snapshot xmin блокирует autovacuum в Postgres). Драйвер
+        # уже держит расшифрованный токен (get_driver не хранит ORM-ссылку), так
+        # что ожидание идёт без сессии; ноду перечитываем свежей транзакцией.
+        external_id = node.provider_external_id
+        session.rollback()
 
+        root_password: str | None = None
         try:
-            if node.provider_external_id and hasattr(driver, "wait_for_ipv4"):
-                ipv4, monthly_cost, _raw = driver.wait_for_ipv4(node.provider_external_id)
+            if external_id and hasattr(driver, "wait_for_ipv4"):
+                ipv4, monthly_cost, _raw = driver.wait_for_ipv4(external_id)
             else:
                 # Драйвер без order_server — полный (блокирующий) заказ тут, в фоне.
                 server = driver.create_server(
@@ -719,50 +790,72 @@ def _finalize_spawn(
                 )
                 ipv4 = server.ipv4
                 monthly_cost = server.monthly_cost
-                node.provider_external_id = server.external_id
-                if server.root_password:
-                    node.provider_root_password_enc = encrypt(server.root_password)
+                external_id = server.external_id
+                root_password = server.root_password
         except DriverError:
             logger.exception("spawn finalize: driver failed for node %s", node_id)
-            _mark_spawn_error(session, node)
+            node = session.get(models.VPNNode, node_id)
+            if node:
+                _mark_spawn_error(session, node)
             return
 
         try:
-            validate_node_identity_fields(node.name, ipv4, 22)
+            validate_node_identity_fields(name, ipv4, 22)
         except InvalidNodeIdentity:
             logger.exception("spawn finalize: invalid IPv4 %r for node %s", ipv4, node_id)
-            _mark_spawn_error(session, node)
+            node = session.get(models.VPNNode, node_id)
+            if node:
+                _mark_spawn_error(session, node)
             return
 
+        # Свежая транзакция — перечитываем ноду и фиксируем host/external_id.
+        node = session.get(models.VPNNode, node_id)
+        if not node:
+            logger.error("spawn finalize: node %s vanished mid-flight", node_id)
+            return
         node.host = ipv4
         node.is_active = True  # реальный IP есть → нода доступна для choose_node
+        node.provider_external_id = external_id
+        if root_password:
+            node.provider_root_password_enc = encrypt(root_password)
         if monthly_cost is not None:
             node.monthly_cost = monthly_cost
         node.updated_at = utcnow()
         session.add(node)
         session.commit()
-        session.refresh(node)
 
         # Авто-продление на стороне провайдера (best-effort) — теперь точно есть
         # external_id. Сбой не должен валить достройку.
-        if node.provider_external_id and hasattr(driver, "set_autoprolong"):
+        if external_id and hasattr(driver, "set_autoprolong"):
             try:
-                driver.set_autoprolong(node.provider_external_id, True)
+                driver.set_autoprolong(external_id, True)
                 logger.info("autoprolong enabled for node %s (%s)", node.id, node.name)
             except Exception:  # noqa: BLE001
                 logger.warning("autoprolong enable failed for node %s (ignored)", node.id)
 
+        # #74 — снова считываем host/port и завершаем транзакцию ДО ожидания SSH
+        # (до NODE_SSH_WAIT_TIMEOUT=480s): держать соединение из пула всё это
+        # время нельзя (тот же idle-in-transaction, что и на wait_for_ipv4 выше).
+        host = node.host
+        ssh_port = node.ssh_port or 22
+        session.commit()
+
         # Ждём, пока на свежем VPS поднимется SSH, ПЕРЕД bootstrap'ом — иначе
         # site.yml стартует слишком рано и падает на 'No route to host'. Ждём
         # тут (фоновый поток, без RQ-таймаута), не в воркере.
-        if _wait_for_ssh(node.host, node.ssh_port or 22):
-            logger.info("spawn finalize: SSH up on %s", node.host)
+        if _wait_for_ssh(host, ssh_port):
+            logger.info("spawn finalize: SSH up on %s", host)
         else:
             logger.warning(
                 "spawn finalize: SSH on %s not up within wait window — enqueuing "
-                "bootstrap anyway (key-inject/ansible will retry)", node.host,
+                "bootstrap anyway (key-inject/ansible will retry)", host,
             )
 
+        # Свежая транзакция для постановки bootstrap-таски.
+        node = session.get(models.VPNNode, node_id)
+        if not node:
+            logger.error("spawn finalize: node %s vanished before bootstrap", node_id)
+            return
         orchestrator = ProvisioningOrchestrator(session)
         # defer_to_reconciler=False — нода только что поднялась, bootstrap нужен
         # сразу (как в reinstall_node), не ждём reconcile-тик.
@@ -865,14 +958,73 @@ def reboot_exit(db: Session, exit_node: models.WGExitNode) -> str:
     )
 
 
+def _warn_lost_hysteria2_users(db: Session, node: models.VPNNode) -> list[str]:
+    """Собрать пер-юзерные hysteria2-учётки на ноде, которые авто-resync после
+    reinstall НЕ восстановит (#78), и залогировать warning для оператора.
+
+    hysteria2 использует per-user auth (userpass): manage_hy2_user.sh правит
+    конфиг на диске ноды, а resync_node_clients покрывает только vless-семейство
+    — после стирания диска эти пользователи молча пропадают. ShadowTLS сюда НЕ
+    входит: там общий node-wide пароль из VPNConfig.settings, который site.yml
+    восстанавливает на каждом прогоне (manage_vpn_user.sh — noop).
+
+    Возвращает отсортированный список ``access_username`` (пусто — таких нет)."""
+    hy2 = models.VPNConfigProtocol.hysteria2.value
+    usernames: set[str] = set()
+    # Активные учётки — через подписку, привязанную к ноде (как в resync).
+    assigned = (
+        db.query(models.Credential.access_username)
+        .join(
+            models.Subscription,
+            models.Subscription.id == models.Credential.subscription_id,
+        )
+        .filter(
+            models.Subscription.node_id == node.id,
+            models.Credential.proto == hy2,
+            models.Credential.is_active.is_(True),
+        )
+        .all()
+    )
+    # Warm-бандлы — через Credential.node_id, ещё без подписки.
+    warm = (
+        db.query(models.Credential.access_username)
+        .filter(
+            models.Credential.node_id == node.id,
+            models.Credential.subscription_id.is_(None),
+            models.Credential.proto == hy2,
+        )
+        .all()
+    )
+    for (uname,) in list(assigned) + list(warm):
+        if uname:
+            usernames.add(uname)
+    if usernames:
+        logger.warning(
+            "reinstall node %s (%s): %d пер-юзерных hysteria2-учёток НЕ будут "
+            "восстановлены авто-resync'ом (#78) — переспровижиньте вручную: %s",
+            node.id, node.name, len(usernames), sorted(usernames),
+        )
+    return sorted(usernames)
+
+
 def reinstall_node(
     db: Session, node: models.VPNNode, *, image: str | None = None,
     password: str | None = None,
 ) -> tuple[models.VPNNode, models.ProvisioningTask | None]:
     """Переустановить ОС на ноде через API провайдера, затем заново
-    прокатить site.yml (reinstall стирает диск — клиентов на ноде не остаётся,
-    бэк их пере-провижинит через bootstrap). IP сохраняется, поэтому VPNConfig
-    (reality-ключи, sub-токены) и так валидны — нода вернётся той же.
+    прокатить site.yml. IP сохраняется, поэтому VPNConfig (reality-ключи,
+    sub-токены) и так валидны — нода вернётся той же.
+
+    Reinstall стирает диск — пер-юзерных учёток на ноде не остаётся. После
+    успешного bootstrap авто-resync (``resync_node_clients``) возвращает их,
+    но покрывает ТОЛЬКО vless-семейство (reality/xhttp/ws_cdn). Пер-юзерные
+    hysteria2-учётки (auth=userpass) после reinstall на ноду НЕ возвращаются
+    (#78) — их владельцы молча теряют доступ (ссылка в подписке жива, сервер про
+    них не знает). ShadowTLS НЕ затронут: там общий node-wide пароль из
+    VPNConfig.settings, который site.yml восстанавливает сам. Ниже логируем
+    warning со списком затронутых hysteria2-пользователей, чтобы оператор
+    переспровижинил их вручную. Полный фикс — расширить ``resync_node_clients``
+    на hysteria2 (см. note аудита #78).
 
     Провайдер обязан уметь ``reinstall_server`` (capability-проверка через
     hasattr; напр. 4vps умеет, manual — нет)."""
@@ -886,6 +1038,9 @@ def reinstall_node(
         raise NodeSpawnError(
             f"Provider {provider.kind} driver does not support OS reinstall"
         )
+    # #78 — предупреждаем оператора о пер-юзерных hysteria2-учётках, которые
+    # авто-resync после reinstall НЕ восстановит (shadowtls вернёт site.yml).
+    _warn_lost_hysteria2_users(db, node)
     img = image or provider.default_image or "ubuntu-22.04"
     # Reinstall СБРАСЫВАЕТ root-пароль. Генерим его сами (а не отдаём драйверу
     # на самогенерацию) и СОХРАНЯЕМ — иначе после переустановки мы не сможем
@@ -1102,10 +1257,16 @@ def _finalize_exit_spawn(
             _mark_exit_error(session, exit_node)
             return
         driver = get_driver(provider)
+        # #74 — закрываем транзакцию ДО долгого ожидания IP (wait_for_ipv4 до
+        # 600s): не держим idle-in-transaction соединение из пула. Драйвер уже
+        # несёт токен; ноду перечитываем свежей транзакцией после ожидания.
+        external_id = exit_node.provider_external_id
+        session.rollback()
 
+        root_password: str | None = None
         try:
-            if exit_node.provider_external_id and hasattr(driver, "wait_for_ipv4"):
-                ipv4, _cost, _raw = driver.wait_for_ipv4(exit_node.provider_external_id)
+            if external_id and hasattr(driver, "wait_for_ipv4"):
+                ipv4, _cost, _raw = driver.wait_for_ipv4(external_id)
             else:
                 server = driver.create_server(
                     name=name,
@@ -1116,45 +1277,66 @@ def _finalize_exit_spawn(
                     user_data=user_data,
                 )
                 ipv4 = server.ipv4
-                exit_node.provider_external_id = server.external_id
-                if server.root_password:
-                    exit_node.provider_root_password_enc = encrypt(server.root_password)
+                external_id = server.external_id
+                root_password = server.root_password
         except DriverError:
             logger.exception("exit spawn finalize: driver failed for exit %s", exit_id)
-            _mark_exit_error(session, exit_node)
+            exit_node = session.get(models.WGExitNode, exit_id)
+            if exit_node:
+                _mark_exit_error(session, exit_node)
             return
 
         try:
-            validate_node_identity_fields(exit_node.name, ipv4, 22)
+            validate_node_identity_fields(name, ipv4, 22)
         except InvalidNodeIdentity:
             logger.exception(
                 "exit spawn finalize: invalid IPv4 %r for exit %s", ipv4, exit_id
             )
-            _mark_exit_error(session, exit_node)
+            exit_node = session.get(models.WGExitNode, exit_id)
+            if exit_node:
+                _mark_exit_error(session, exit_node)
             return
 
+        # Свежая транзакция — перечитываем exit и фиксируем host/external_id.
+        exit_node = session.get(models.WGExitNode, exit_id)
+        if not exit_node:
+            logger.error("exit spawn finalize: exit %s vanished mid-flight", exit_id)
+            return
         exit_node.host = ipv4
         exit_node.is_active = True
+        exit_node.provider_external_id = external_id
+        if root_password:
+            exit_node.provider_root_password_enc = encrypt(root_password)
         exit_node.updated_at = utcnow()
         session.add(exit_node)
         session.commit()
-        session.refresh(exit_node)
 
-        if exit_node.provider_external_id and hasattr(driver, "set_autoprolong"):
+        if external_id and hasattr(driver, "set_autoprolong"):
             try:
-                driver.set_autoprolong(exit_node.provider_external_id, True)
+                driver.set_autoprolong(external_id, True)
                 logger.info("autoprolong enabled for exit %s (%s)", exit_node.id, name)
             except Exception:  # noqa: BLE001
                 logger.warning("autoprolong enable failed for exit %s (ignored)", exit_id)
 
-        if _wait_for_ssh(exit_node.host, exit_node.ssh_port or 22):
-            logger.info("exit spawn finalize: SSH up on %s", exit_node.host)
+        # #74 — завершаем транзакцию ДО ожидания SSH (до 480s): соединение из
+        # пула не держим.
+        host = exit_node.host
+        ssh_port = exit_node.ssh_port or 22
+        session.commit()
+
+        if _wait_for_ssh(host, ssh_port):
+            logger.info("exit spawn finalize: SSH up on %s", host)
         else:
             logger.warning(
                 "exit spawn finalize: SSH on %s not up within wait window — "
-                "enqueuing bootstrap anyway", exit_node.host,
+                "enqueuing bootstrap anyway", host,
             )
 
+        # Свежая транзакция для постановки bootstrap-таски.
+        exit_node = session.get(models.WGExitNode, exit_id)
+        if not exit_node:
+            logger.error("exit spawn finalize: exit %s vanished before bootstrap", exit_id)
+            return
         orchestrator = ProvisioningOrchestrator(session)
         task = orchestrator.create_task("exit", exit_node.id, "bootstrap", {})
         session.commit()

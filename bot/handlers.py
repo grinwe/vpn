@@ -98,9 +98,17 @@ def _format_plan_button(plan: dict) -> str:
     return f"{name} — {price}₽ / {duration}д{devices_label}"
 
 
-async def _fetch_json(method: str, url: str, **kwargs):
-    """Call backend with retries and a shared session."""
+async def _fetch_json(method: str, url: str, *, retry: bool | None = None, **kwargs):
+    """Call backend with retries and a shared session.
+
+    retry управляет повторами (сеть/таймаут/5xx). По умолчанию (retry=None)
+    повторяем ТОЛЬКО идемпотентные GET: повтор POST после обрыва соединения,
+    случившегося уже ПОСЛЕ того как бэкенд принял запрос, породил бы дубль
+    (второй счёт, повторная миграция устройства). Для заведомо идемпотентного
+    POST можно явно передать retry=True.
+    """
     session = await get_session()
+    do_retry = (method.upper() == "GET") if retry is None else retry
     last_exc: Exception | None = None
     for attempt in range(_RETRIES + 1):
         try:
@@ -110,20 +118,41 @@ async def _fetch_json(method: str, url: str, **kwargs):
                     payload = await resp.json()
                 except Exception:
                     payload = {"message": text}
-                if resp.status >= 500 and attempt < _RETRIES:
+                if resp.status >= 500 and do_retry and attempt < _RETRIES:
                     await asyncio.sleep(0.3 * (attempt + 1))
                     continue
+                # Финальный 5xx логируем — иначе деградация бэкенда невидима
+                # в логах бота (вызыватели часто показывают юзеру общий текст).
+                if resp.status >= 500:
+                    logger.warning(
+                        "backend %s %s -> %s: %.200s", method, url, resp.status, text
+                    )
                 return resp.status, payload
         except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
             # asyncio.TimeoutError — общий ClientTimeout(total=...) aiohttp;
             # он НЕ подкласс ClientError, но должен идти тем же путём
             # «ретрай → status=0», иначе таймаут бэкенда роняет хендлер.
             last_exc = exc
-            if attempt < _RETRIES:
+            if do_retry and attempt < _RETRIES:
                 await asyncio.sleep(0.3 * (attempt + 1))
                 continue
+            break
     logger.warning("backend request failed: %s %s: %s", method, url, last_exc)
     return 0, {"message": f"backend unreachable: {last_exc}"}
+
+
+# ── Фоновые задачи с сильной ссылкой ──
+# asyncio держит незакреплённую задачу лишь по weak-ref: fire-and-forget
+# create_task может быть собран GC до завершения (особенно долгий 15-мин нудж).
+# Кладём в модульный set и снимаем по завершении — держим сильную ссылку.
+_BG_TASKS: set[asyncio.Task] = set()
+
+
+def _spawn(coro) -> asyncio.Task:
+    task = asyncio.create_task(coro)
+    _BG_TASKS.add(task)
+    task.add_done_callback(_BG_TASKS.discard)
+    return task
 
 
 def _admin_headers(actor_id: int) -> dict[str, str]:
@@ -479,17 +508,26 @@ async def _stars_successful_payment(message: types.Message) -> None:
     }
 
     try:
+        # retry=True: апдейт Telegram consumed единожды, юзер не может повторить
+        # тап — держим ретраи, чтобы пережить короткий 5xx/рестарт бэка. Форвард
+        # идемпотентен (бэкенд дедупит по telegram_payment_charge_id).
         status, _ = await _fetch_json(
             "POST",
             f"{BACKEND_URL}/api/payments/webhook/telegram_stars",
             json=forward,
             headers={"X-Telegram-Stars-Secret": TELEGRAM_STARS_WEBHOOK_SECRET},
+            retry=True,
         )
     except aiohttp.ClientError:
         status = 0
 
     if status != 200:
-        logger.error("failed to forward Stars payment (status=%s)", status)
+        # Апдейт Telegram consumed один раз, очереди нет — логируем ПОЛНЫЙ
+        # payload (в т.ч. telegram_payment_charge_id) на ERROR, чтобы платёж
+        # можно было восстановить вручную из логов бота, а не потерять.
+        logger.error(
+            "failed to forward Stars payment (status=%s) payload=%s", status, forward
+        )
         await message.answer("Оплата получена, но бэкенд не подтвердил её. Админ разберётся.")
         return
 
@@ -511,6 +549,12 @@ async def cmd_config(message: types.Message):
             f"{BACKEND_URL}/api/users/by_telegram/{message.from_user.id}",
             headers=_admin_headers(message.from_user.id),
         )
+        # status_code==0 → бэкенд недоступен (_fetch_json уже съел ClientError).
+        # Не путаем это с «нет подписок»: иначе во время деплоя платящий юзер
+        # видит ложное «у тебя нет подписок».
+        if status_code == 0:
+            await message.answer("Сервис временно недоступен. Попробуй позже.")
+            return
         if status_code != 200:
             await message.answer("У тебя пока нет активных подписок. Используй /plans для покупки.")
             return
@@ -594,6 +638,9 @@ async def status(message: types.Message):
             f"{BACKEND_URL}/api/users/by_telegram/{message.from_user.id}",
             headers=_admin_headers(message.from_user.id),
         )
+        if status_code == 0:
+            await message.answer("Сервис временно недоступен. Попробуй позже.")
+            return
         if status_code != 200:
             await message.answer("Подписок не найдено. Используй /plans для покупки.")
             return
@@ -602,13 +649,16 @@ async def status(message: types.Message):
         return
 
     lines = ["📊 <b>Твои подписки:</b>\n"]
+    esc = html.escape
     for sub in data:
         auto_renew = "✅" if sub.get("auto_renew") else "❌"
+        # Имена нод/плана/региона приходят с бэкенда — экранируем перед HTML.
+        node = sub.get("node") or sub.get("server", "n/a")
         lines.append(
-            f"<b>План:</b> {sub['plan_name']}\n"
-            f"<b>Сервер:</b> {sub.get('node') or sub.get('server', 'n/a')} ({sub.get('region', '??')})\n"
-            f"<b>Истекает:</b> {sub['expires_at'][:10]}\n"
-            f"<b>Статус:</b> {sub['status']}\n"
+            f"<b>План:</b> {esc(str(sub['plan_name']))}\n"
+            f"<b>Сервер:</b> {esc(str(node))} ({esc(str(sub.get('region', '??')))})\n"
+            f"<b>Истекает:</b> {esc(str(sub['expires_at'][:10]))}\n"
+            f"<b>Статус:</b> {esc(str(sub['status']))}\n"
             f"<b>Автопродление:</b> {auto_renew}"
         )
     await message.answer("\n\n".join(lines), parse_mode="HTML")
@@ -625,6 +675,9 @@ async def cmd_renew(message: types.Message):
             f"{BACKEND_URL}/api/users/by_telegram/{message.from_user.id}",
             headers=_admin_headers(message.from_user.id),
         )
+        if status_code == 0:
+            await message.answer("Сервис временно недоступен. Попробуй позже.")
+            return
         if status_code != 200 or not data:
             await message.answer("Нет подписок для продления. Используй /plans.")
             return
@@ -804,7 +857,7 @@ async def health_ping_response(callback_query: types.CallbackQuery):
     # в toast `callback_query.answer("Спасибо! Чиним.")` и админы уже
     # оповещены через notify_admins, повторное чтение бабла юзеру не нужно.
     if HEALTH_PING_ACK_DELETE_DELAY_S > 0:
-        asyncio.create_task(
+        _spawn(
             _delete_message_after(
                 callback_query.bot,
                 callback_query.message.chat.id,
@@ -909,7 +962,10 @@ async def _do_device_failover(
     action = data.get("action")
     if action == "migrated":
         report_id = data.get("report_id")
-        dev_name = data.get("device_name") or "устройство"
+        # Имя устройства задаёт юзер в webapp — экранируем перед вставкой в
+        # HTML-сообщение (default parse_mode=HTML), иначе '<' / несбалансированный
+        # тег → 400 «can't parse entities», и юзер не получит ни клавиатуры, ни нуджа.
+        dev_name = html.escape(data.get("device_name") or "устройство")
         await bot.send_message(
             chat_id,
             f"🔄 Поменяли сервер для «{dev_name}». Подписка обновится в "
@@ -921,7 +977,7 @@ async def _do_device_failover(
             ),
         )
         if report_id:
-            asyncio.create_task(
+            _spawn(
                 _delayed_still_broken_prompt(bot, chat_id, int(report_id))
             )
     elif action == "no_subscription":
@@ -975,7 +1031,7 @@ async def _do_whole_sub_failover(bot, chat_id: int, tg_id: int) -> None:
             ),
         )
         if report_id:
-            asyncio.create_task(
+            _spawn(
                 _delayed_still_broken_prompt(bot, chat_id, int(report_id))
             )
     elif action == "throttled":
@@ -1150,14 +1206,27 @@ async def operator_choice(callback_query: types.CallbackQuery) -> None:
     # op:ok:<report_id> — «всё работает» → target-нода ok (позитивный сигнал).
     if parts[1] == "ok":
         try:
-            await _fetch_json(
-                "POST",
-                f"{BACKEND_URL}/api/admin/client-control/report-ok",
-                json={"report_id": int(parts[2])},
-                headers=_admin_headers(tg_id),
+            rid = int(parts[2])
+        except ValueError:
+            await callback_query.answer()
+            return
+        # Проверяем статус ответа (как в health_ping_response): при 4xx/5xx/0
+        # сигнал не записан — не рапортуем успех, оставляем клавиатуру для повтора.
+        status_code, _ = await _fetch_json(
+            "POST",
+            f"{BACKEND_URL}/api/admin/client-control/report-ok",
+            json={"report_id": rid},
+            headers=_admin_headers(tg_id),
+        )
+        if status_code != 200:
+            logger.warning(
+                "operator_choice report-ok failed: report_id=%s status=%s",
+                rid, status_code,
             )
-        except (aiohttp.ClientError, ValueError):
-            pass
+            await callback_query.answer(
+                "Не получилось сохранить, попробуй ещё раз", show_alert=True
+            )
+            return
         await callback_query.answer()
         try:
             await callback_query.message.edit_reply_markup(reply_markup=None)
@@ -1169,14 +1238,25 @@ async def operator_choice(callback_query: types.CallbackQuery) -> None:
     # op:still:<report_id> — «всё равно не работает» → поддержка + target=fail.
     if parts[1] == "still":
         try:
-            await _fetch_json(
-                "POST",
-                f"{BACKEND_URL}/api/admin/client-control/report-still-broken",
-                json={"report_id": int(parts[2])},
-                headers=_admin_headers(tg_id),
+            rid = int(parts[2])
+        except ValueError:
+            await callback_query.answer()
+            return
+        status_code, _ = await _fetch_json(
+            "POST",
+            f"{BACKEND_URL}/api/admin/client-control/report-still-broken",
+            json={"report_id": rid},
+            headers=_admin_headers(tg_id),
+        )
+        if status_code != 200:
+            logger.warning(
+                "operator_choice report-still-broken failed: report_id=%s status=%s",
+                rid, status_code,
             )
-        except (aiohttp.ClientError, ValueError):
-            pass
+            await callback_query.answer(
+                "Не получилось сохранить, попробуй ещё раз", show_alert=True
+            )
+            return
         await callback_query.answer()
         try:
             await callback_query.message.edit_reply_markup(reply_markup=None)
@@ -1196,15 +1276,21 @@ async def operator_choice(callback_query: types.CallbackQuery) -> None:
         await callback_query.answer()
         return
     operator = parts[2]
-    try:
-        await _fetch_json(
-            "POST",
-            f"{BACKEND_URL}/api/admin/client-control/report-operator",
-            json={"report_id": report_id, "operator": operator},
-            headers=_admin_headers(tg_id),
+    status_code, _ = await _fetch_json(
+        "POST",
+        f"{BACKEND_URL}/api/admin/client-control/report-operator",
+        json={"report_id": report_id, "operator": operator},
+        headers=_admin_headers(tg_id),
+    )
+    if status_code != 200:
+        logger.warning(
+            "operator_choice report-operator failed: report_id=%s operator=%s status=%s",
+            report_id, operator, status_code,
         )
-    except aiohttp.ClientError:
-        pass
+        await callback_query.answer(
+            "Не получилось сохранить, попробуй ещё раз", show_alert=True
+        )
+        return
     await callback_query.answer()
     # Операторскую клавиатуру убираем. «Всё равно не работает» придёт
     # отдельным сообщением через делей (_delayed_still_broken_prompt).
@@ -1550,7 +1636,11 @@ async def _send_balance(target: types.Message, telegram_id: int) -> None:
             else:
                 exp_str = ""
             renew_str = " · автопродление" if auto_renew else ""
-            lines.append(f"{badge} {s['plan_name']} — {price_str}{exp_str}{renew_str}")
+            # plan_name с бэкенда — экранируем перед HTML.
+            lines.append(
+                f"{badge} {html.escape(str(s['plan_name']))} — "
+                f"{price_str}{exp_str}{renew_str}"
+            )
     else:
         lines.append("Нет активных подписок. Нажмите /plans, чтобы выбрать тариф.")
 
@@ -1577,39 +1667,44 @@ async def cmd_balance(message: types.Message):
 
 # ── /referral — реферальная ссылка ──
 
-@router.message(F.text == BTN_INVITE)
-@router.message(F.text == "Реферальная ссылка")
-@router.message(Command("referral"))
-async def cmd_referral(message: types.Message):
-    try:
-        status_code, data = await _fetch_json(
-            "POST",
-            f"{BACKEND_URL}/api/referral/code",
-            json={"telegram_id": str(message.from_user.id)},
-            headers=_admin_headers(message.from_user.id),
-        )
-    except aiohttp.ClientError:
-        await message.answer("Бэкенд недоступен.")
+async def _send_referral(msg: types.Message, bot, user_id: int) -> None:
+    """Единый флоу выдачи реферальной ссылки (общий для команды и inline-кнопки
+    приветствия). Раньше был скопирован в cmd_referral и go_referral 1-в-1 —
+    правки текста/бонуса разъезжались."""
+    status_code, data = await _fetch_json(
+        "POST",
+        f"{BACKEND_URL}/api/referral/code",
+        json={"telegram_id": str(user_id)},
+        headers=_admin_headers(user_id),
+    )
+    if status_code == 0:
+        await msg.answer("Бэкенд недоступен.")
         return
-
     if status_code != 200 or not data:
-        await message.answer("Не удалось получить реферальную ссылку.")
+        await msg.answer("Не удалось получить реферальную ссылку.")
         return
 
     code = data.get("code", "")
     uses = data.get("uses", 0)
-    bot_info = await message.bot.get_me()
+    bot_info = await bot.get_me()
     ref_link = f"https://t.me/{bot_info.username}?start=ref_{code}"
 
     # Stage 4: реферал теперь через денежный бонус, не через дни.
     # Сумма берётся из бэкенда (REFERRAL_BONUS_KOPECKS, дефолт 50 ₽).
-    await message.answer(
+    await msg.answer(
         f"🎁 <b>Твоя реферальная ссылка:</b>\n\n"
         f"<code>{ref_link}</code>\n\n"
         f"Приглашённый получает <b>+50 ₽ на баланс</b>, ты — <b>+50 ₽</b>.\n"
         f"Приглашено: {uses} чел.",
         parse_mode="HTML",
     )
+
+
+@router.message(F.text == BTN_INVITE)
+@router.message(F.text == "Реферальная ссылка")
+@router.message(Command("referral"))
+async def cmd_referral(message: types.Message):
+    await _send_referral(message, message.bot, message.from_user.id)
 
 
 # ── Self-service: смена ноды, перегенерация конфига ──
@@ -1769,34 +1864,56 @@ async def mark_invoice_paid(callback_query: types.CallbackQuery):
     action = invoice.get("action", "")
     credentials = invoice.get("credentials", [])
 
-    if kind == "topup":
-        amount = invoice.get("amount", 0)
-        await callback_query.message.bot.send_message(
-            chat_id=user_id,
-            text=f"✅ Баланс пополнен на {amount:.0f} ₽",
+    # Уведомление юзеру оборачиваем в try/except: юзер мог заблокировать бота
+    # (TelegramForbiddenError) или конфиг содержит символы, ломающие HTML
+    # (TelegramBadRequest). Без обёртки момент «оплата подтверждена» роняет
+    # хендлер молча, и админ уверен, что всё доставлено (тост уже показан).
+    bot = callback_query.message.bot
+    try:
+        if kind == "topup":
+            amount = invoice.get("amount", 0)
+            await bot.send_message(
+                chat_id=user_id,
+                text=f"✅ Баланс пополнен на {amount:.0f} ₽",
+            )
+        elif action == "renewal":
+            await bot.send_message(
+                chat_id=user_id,
+                text="✅ Подписка продлена!",
+            )
+        elif credentials:
+            configs_text = ["✅ Оплата подтверждена! Твои конфиги:\n"]
+            for cred in credentials:
+                # proto/config_text приходят с бэкенда — vless-ссылки содержат
+                # '&', имена нод в fragment — спецсимволы; экранируем под HTML.
+                configs_text.append(f"<b>{html.escape(str(cred['proto']))}:</b>")
+                configs_text.append(
+                    f"<code>{html.escape(str(cred['config_text']))}</code>"
+                )
+            configs_text.append("\nНе знаешь как настроить? 👇")
+            await bot.send_message(
+                chat_id=user_id,
+                text="\n".join(configs_text),
+                parse_mode="HTML",
+                reply_markup=onboarding_keyboard(),
+            )
+        else:
+            await bot.send_message(
+                chat_id=user_id,
+                text="✅ Счет оплачен! Конфиг будет готов через минуту. Используй /config.",
+            )
+    except Exception as exc:  # noqa: BLE001 — блокировка бота, битый HTML и т.п.
+        logger.error(
+            "invoice #%s marked paid but user notify failed (user=%s): %s",
+            invoice.get("id"), user_id, exc,
         )
-    elif action == "renewal":
-        await callback_query.message.bot.send_message(
-            chat_id=user_id,
-            text="✅ Подписка продлена!",
-        )
-    elif credentials:
-        configs_text = ["✅ Оплата подтверждена! Твои конфиги:\n"]
-        for cred in credentials:
-            configs_text.append(f"<b>{cred['proto']}:</b>")
-            configs_text.append(f"<code>{cred['config_text']}</code>")
-        configs_text.append("\nНе знаешь как настроить? 👇")
-        await callback_query.message.bot.send_message(
-            chat_id=user_id,
-            text="\n".join(configs_text),
-            parse_mode="HTML",
-            reply_markup=onboarding_keyboard(),
-        )
-    else:
-        await callback_query.message.bot.send_message(
-            chat_id=user_id,
-            text="✅ Счет оплачен! Конфиг будет готов через минуту. Используй /config.",
-        )
+        try:
+            await callback_query.message.answer(
+                f"⚠️ Счёт #{invoice.get('id')} отмечен оплаченным, но уведомить "
+                f"юзера {user_id} не удалось ({exc}). Свяжись вручную."
+            )
+        except Exception:  # noqa: BLE001
+            pass
 
 
 # ── /help — support and FAQ ──
@@ -1906,34 +2023,12 @@ async def go_referral(callback_query: types.CallbackQuery):
     """Run the /referral flow from an inline button on the welcome msg.
 
     cmd_referral reads message.from_user; from a callback that'd be the
-    bot itself, so we re-implement the same 3-line backend call here
-    against callback_query.from_user instead of refactoring the command.
+    bot itself, поэтому передаём callback_query.from_user.id в общий хелпер
+    _send_referral (текст/бонус живут в одном месте).
     """
     await callback_query.answer()
-    user = callback_query.from_user
-    try:
-        status_code, data = await _fetch_json(
-            "POST",
-            f"{BACKEND_URL}/api/referral/code",
-            json={"telegram_id": str(user.id)},
-            headers=_admin_headers(user.id),
-        )
-    except aiohttp.ClientError:
-        await callback_query.message.answer("Бэкенд недоступен.")
-        return
-    if status_code != 200 or not data:
-        await callback_query.message.answer("Не удалось получить реферальную ссылку.")
-        return
-    code = data.get("code", "")
-    uses = data.get("uses", 0)
-    bot_info = await callback_query.bot.get_me()
-    ref_link = f"https://t.me/{bot_info.username}?start=ref_{code}"
-    await callback_query.message.answer(
-        f"🎁 <b>Твоя реферальная ссылка:</b>\n\n"
-        f"<code>{ref_link}</code>\n\n"
-        f"Приглашённый получает <b>+50 ₽ на баланс</b>, ты — <b>+50 ₽</b>.\n"
-        f"Приглашено: {uses} чел.",
-        parse_mode="HTML",
+    await _send_referral(
+        callback_query.message, callback_query.bot, callback_query.from_user.id
     )
 
 

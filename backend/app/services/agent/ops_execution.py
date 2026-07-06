@@ -157,8 +157,17 @@ def validate_plan(db: Session, ops_plan: models.OpsPlan) -> dict[str, Any]:
                     step_errors.append(f"provider_id={provider_id} неактивен")
                 else:
                     resolved["provider_id"] = provider_id
-            count = _as_int(params.get("count", 1)) or 1
-            if count < 1 or count > _max_order_count():
+            # Различаем «count не задан» (дефолт 1) и «count задан, но битый/нулевой».
+            # Молчаливая коэрция мусора (0, "два", true) в 1 = заказ ноды, которую
+            # оператор в плане не видел и не подтверждал → отклоняем такой план.
+            raw_count = params.get("count")
+            if raw_count is None:
+                count = 1
+            else:
+                count = _as_int(raw_count)
+            if count is None:
+                step_errors.append(f"count={raw_count!r} не число")
+            elif count < 1 or count > _max_order_count():
                 step_errors.append(
                     f"count={count} вне [1..{_max_order_count()}] (OPS_MAX_ORDER_COUNT)"
                 )
@@ -288,7 +297,9 @@ def execute_enabled() -> bool:
 
 
 def _max_spend_rub() -> float:
-    return float(os.getenv("OPS_MAX_SPEND_RUB", "5000"))
+    # Через _env_num: set-but-empty (OPS_MAX_SPEND_RUB="") или мусор иначе
+    # уронил бы весь pre-flight ValueError'ом → план залипает в executing.
+    return _env_num("OPS_MAX_SPEND_RUB", "5000", float)
 
 
 def _finalize_wait_s() -> float:
@@ -384,6 +395,13 @@ def _preflight(db: Session, validated: dict[str, Any]) -> dict[str, Any]:
         except DriverError as exc:
             reasons.append(f"provider {pid}: offerings/баланс недоступны ({exc})")
             continue
+        except Exception as exc:  # noqa: BLE001
+            # Любой иной сбой драйвера/парсинга offerings — это отказ pre-flight,
+            # а не необработанное исключение (иначе план залипнет в executing).
+            reasons.append(
+                f"provider {pid}: pre-flight упал ({_runtime.redact(str(exc))})"
+            )
+            continue
 
         prov_cost = 0.0
         for s in steps:
@@ -401,7 +419,16 @@ def _preflight(db: Session, validated: dict[str, Any]) -> dict[str, Any]:
                     f"шаг #{s['index'] + 1}: тариф {plan_id!r} вне offerings провайдера {pid}"
                 )
                 continue
-            cost = float(pl.get("price") or 0) * count
+            # Цена приходит из API провайдера — нечисловой мусор не должен
+            # ронять весь исполнитель; это отказ pre-flight по шагу.
+            try:
+                cost = float(pl.get("price") or 0) * count
+            except (TypeError, ValueError):
+                reasons.append(
+                    f"шаг #{s['index'] + 1}: нечисловая цена тарифа {plan_id!r} "
+                    f"у провайдера {pid}"
+                )
+                continue
             step_costs[s["index"]] = cost
             prov_cost += cost
         total += prov_cost
@@ -450,6 +477,14 @@ def _exec_order_node(
             )
             created.append(node.id)
     except Exception as exc:  # noqa: BLE001
+        # Откатываем возможную грязную сессию (напр. IntegrityError на unique-имени
+        # ноды при гонке с autoscale): иначе финальный db.commit() статуса плана
+        # в execute_plan бросит PendingRollbackError и план залипнет в executing,
+        # потеряв и терминальный статус, и отчёт об уже созданных нодах.
+        try:
+            db.rollback()
+        except Exception:  # noqa: BLE001 — rollback не должен маскировать исходную ошибку
+            logger.warning("ops: rollback после сбоя заказа не удался", exc_info=True)
         return created, _runtime.redact(f"{type(exc).__name__}: {exc}")
     return created, None
 

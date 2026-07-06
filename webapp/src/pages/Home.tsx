@@ -701,7 +701,9 @@ function TopupModal({
           />
           <button
             disabled={busy || !customRub || Number(customRub) < 100}
-            onClick={() => pay(Number(customRub) * 100)}
+            // Округляем до целых копеек: ввод «100.1»/«100.505» иначе
+            // ушёл бы на бэкенд как float и упал бы на int-валидации (422).
+            onClick={() => pay(Math.round(Number(customRub) * 100))}
             className="btn-primary"
           >
             Оплатить

@@ -171,7 +171,21 @@ def collect_all_relay_links(session) -> dict[str, Any]:
     }
     now = utcnow()
 
-    for relay_id, relay_links in links_by_relay.items():
+    # Обходим relay в порядке «самый протухший last_observed_at первым»,
+    # чтобы при повторных kill-по-таймауту не голодали одни и те же relay
+    # в хвосте. Ключ сортировки — минимальный last_observed_at среди links
+    # relay; None (ни разу не наблюдали) считаем максимально старым.
+    _oldest_first = datetime.min
+
+    def _relay_staleness(item):
+        _relay_id, _relay_links = item
+        return min(
+            (lk.last_observed_at or _oldest_first) for lk in _relay_links
+        )
+
+    for relay_id, relay_links in sorted(
+        links_by_relay.items(), key=_relay_staleness
+    ):
         relay = session.get(models.VPNNode, relay_id)
         if relay is None:
             continue
@@ -235,6 +249,13 @@ def collect_all_relay_links(session) -> dict[str, Any]:
             link.last_observed_at = now
             stats["links_updated"] += 1
 
-    session.commit()
+        # Коммитим по мере обхода: RQ kill-по-таймауту тика (120с) при
+        # нескольких лежащих relay (до ~10с SSH-таймаута на каждый) может
+        # убить джоб до конца прохода. Один общий commit в конце терял бы
+        # обновления ВСЕХ relay, включая уже успешно опрошенных, и
+        # last_observed_at всего флота протухал бы разом. Per-relay commit
+        # сохраняет частичный прогресс.
+        session.commit()
+
     logger.info("relay_link_health: summary=%s", stats)
     return stats

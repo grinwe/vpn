@@ -195,12 +195,16 @@ class ServerPool(Base):
     autoscale_image = Column(String, nullable=True)
     autoscale_high_watermark = Column(Numeric(4, 3), nullable=True)
     autoscale_max_nodes = Column(Integer, nullable=True)
-    # Stage 5 — downscale knobs. low_watermark is the symmetric counterpart
-    # to high_watermark: when ``active/capacity < low_watermark`` AND we
-    # still have more than ``min_nodes`` eligible nodes, the drain tick
-    # picks the youngest auto-spawned node and starts moving its subs off.
-    # ``min_nodes`` is the floor — never shrink below it, even at 0%
-    # utilization, so the pool always has at least one warm node ready.
+    # Stage 5 — downscale knobs. ЗАРЕЗЕРВИРОВАНО, ПОКА НЕ ИСПОЛЬЗУЕТСЯ (audit
+    # #137): колонки заведены миграцией 0010 под будущий авто-downscale, но
+    # ни autoscale-тик, ни provisioning их не читают, и ни одна схема
+    # (PoolAutoscaleConfig/Out) их не отдаёт. Даунскейл сегодня — только
+    # ручной перевод ноды в status=draining. Задумка (когда фичу доведут):
+    # low_watermark — симметричный порог к high_watermark (при
+    # ``active/capacity < low_watermark`` и числе eligible-нод выше
+    # ``min_nodes`` drain-тик снимает subs с самой молодой авто-ноды);
+    # min_nodes — нижняя граница, ниже которой пул не сжимается. НЕ выставляй
+    # эти значения прямым UPDATE в расчёте на автодаунскейл — эффекта не будет.
     autoscale_low_watermark = Column(Numeric(4, 3), nullable=True)
     autoscale_min_nodes = Column(Integer, nullable=True)
     # Stage 6 — multi-cloud fallback chain. When the primary
@@ -222,8 +226,18 @@ class VPNNode(Base):
     region = Column(String, nullable=False)
     host = Column(String, nullable=False)
     ssh_port = Column(Integer, default=22)
-    status = Column(Enum(VPNNodeStatus), default=VPNNodeStatus.registering)
-    is_active = Column(Boolean, default=True)
+    # NOT NULL + server_default (audit #131): статус/флаг нельзя оставлять
+    # NULL — NULL-строка молча выпадает из filter(is_active == True) и
+    # filter(status == active), «нода исчезает» из выборок без ошибки.
+    status = Column(
+        Enum(VPNNodeStatus),
+        nullable=False,
+        server_default=VPNNodeStatus.registering.value,
+        default=VPNNodeStatus.registering,
+    )
+    is_active = Column(
+        Boolean, nullable=False, server_default="true", default=True
+    )
     pool_id = Column(Integer, ForeignKey("server_pools.id"))
     created_at = Column(DateTime, default=utcnow)
     updated_at = Column(DateTime, default=utcnow, onupdate=utcnow)
@@ -325,7 +339,12 @@ class VPNConfig(Base):
     __tablename__ = "vpn_configs"
 
     id = Column(Integer, primary_key=True)
-    node_id = Column(Integer, ForeignKey("vpn_nodes.id", ondelete="CASCADE"), nullable=False)
+    node_id = Column(
+        Integer,
+        ForeignKey("vpn_nodes.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,  # FK-индекс (audit #129) — удаление ноды/выборки по node_id
+    )
     name = Column(String, nullable=False)
     protocol = Column(Enum(VPNConfigProtocol), nullable=False)
     port = Column(Integer, nullable=False)
@@ -333,7 +352,10 @@ class VPNConfig(Base):
     public_key = Column(String, nullable=True)
     fallback = Column(String, nullable=True)
     settings = Column(JSONB, nullable=True)
-    is_enabled = Column(Boolean, default=True)
+    # NOT NULL + server_default (audit #131).
+    is_enabled = Column(
+        Boolean, nullable=False, server_default="true", default=True
+    )
     created_at = Column(DateTime, default=utcnow)
     updated_at = Column(DateTime, default=utcnow, onupdate=utcnow)
 
@@ -348,10 +370,19 @@ class Plan(Base):
     id = Column(Integer, primary_key=True)
     name = Column(String, unique=True, nullable=False)
     duration_days = Column(Integer, nullable=False)
-    max_devices = Column(Integer, default=1)
-    price = Column(Numeric(10, 2), default=0)
+    # NOT NULL + server_default (audit #131) — NULL в этих колонках рвал
+    # ORM-выборки/PlanOut (защитный None-гард в schemas.py стоял именно из-за
+    # NULL is_visible).
+    max_devices = Column(
+        Integer, nullable=False, server_default="1", default=1
+    )
+    price = Column(
+        Numeric(10, 2), nullable=False, server_default="0", default=0
+    )
     traffic_limit_mb = Column(Integer, nullable=True)
-    is_visible = Column(Boolean, default=True)
+    is_visible = Column(
+        Boolean, nullable=False, server_default="true", default=True
+    )
     # Pay-as-you-go price per device per day, in kopecks (stage 4).
     # When NULL, daily_billing() falls back to ``price * 100 / duration_days``.
     # Set this explicitly when you want to decouple period pricing from
@@ -536,10 +567,22 @@ class OperatorNodeReport(Base):
 
 class Subscription(Base):
     __tablename__ = "subscriptions"
+    # Композитный индекс под биллинг-/экспирацион-тики, которые фильтруют
+    # по (status, expires_at)/next_charge_at (audit #129). Одиночные FK-
+    # индексы — через index=True на колонках ниже.
+    __table_args__ = (
+        Index(
+            "ix_subscriptions_status_expires_at", "status", "expires_at"
+        ),
+    )
 
     id = Column(Integer, primary_key=True)
-    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
-    plan_id = Column(Integer, ForeignKey("plans.id"), nullable=False)
+    user_id = Column(
+        Integer, ForeignKey("users.id"), nullable=False, index=True
+    )
+    plan_id = Column(
+        Integer, ForeignKey("plans.id"), nullable=False, index=True
+    )
     # Nullable + SET NULL so deleting a VPNNode detaches historical
     # (terminated/expired) subs instead of hitting an IntegrityError.
     # Active/frozen subs are guarded at the /nodes/{id} DELETE endpoint.
@@ -547,15 +590,26 @@ class Subscription(Base):
         Integer,
         ForeignKey("vpn_nodes.id", ondelete="SET NULL"),
         nullable=True,
+        index=True,  # FK-индекс под choose_node/подсчёт подписок на ноде (audit #129)
     )
     created_at = Column(DateTime, default=utcnow)
     updated_at = Column(DateTime, default=utcnow, onupdate=utcnow)
     expires_at = Column(DateTime, nullable=False)
-    status = Column(Enum(SubscriptionStatus), default=SubscriptionStatus.active)
+    # NOT NULL + server_default (audit #131) — NULL-статус выпадал из фильтров.
+    status = Column(
+        Enum(SubscriptionStatus),
+        nullable=False,
+        server_default=SubscriptionStatus.active.value,
+        default=SubscriptionStatus.active,
+    )
     notes = Column(Text)
     traffic_limit_mb = Column(Integer, nullable=True)
-    traffic_used_mb = Column(Integer, default=0)
-    auto_renew = Column(Boolean, default=False)
+    traffic_used_mb = Column(
+        Integer, nullable=False, server_default="0", default=0
+    )
+    auto_renew = Column(
+        Boolean, nullable=False, server_default="false", default=False
+    )
     # Stable token for the dynamic subscription link — survives migrations.
     sub_token = Column(String, unique=True, index=True, nullable=True)
 
@@ -611,7 +665,18 @@ class Device(Base):
 
     id = Column(Integer, primary_key=True)
     user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
-    subscription_id = Column(Integer, ForeignKey("subscriptions.id", ondelete="CASCADE"), nullable=False)
+    # ON DELETE RESTRICT — часть sub-link инварианта (audit #130): Device-строки
+    # НИКОГДА не удаляются (revoked-девайсы держат sub_token, /api/sub/{token}
+    # алиасит на живого соседа; см. provisioning.py «DO NOT revert to
+    # db.delete(device)»). CASCADE молча снёс бы revoked-девайсы вместе с их
+    # sub_token'ами при удалении Subscription — RESTRICT заставляет БД охранять
+    # инвариант. index=True — FK-индекс под выдачу sub-link (audit #129).
+    subscription_id = Column(
+        Integer,
+        ForeignKey("subscriptions.id", ondelete="RESTRICT"),
+        nullable=False,
+        index=True,
+    )
     # Nullable + ON DELETE SET NULL so deleting a node (which CASCADEs
     # into its vpn_configs) doesn't trip the FK on historical disabled
     # Device rows. Those rows survive on purpose — their sub_token keeps
@@ -620,9 +685,16 @@ class Device(Base):
         Integer,
         ForeignKey("vpn_configs.id", ondelete="SET NULL"),
         nullable=True,
+        index=True,  # FK-индекс (audit #129)
     )
     name = Column(String, nullable=False)
-    status = Column(Enum(DeviceStatus), default=DeviceStatus.pending)
+    # NOT NULL + server_default (audit #131).
+    status = Column(
+        Enum(DeviceStatus),
+        nullable=False,
+        server_default=DeviceStatus.pending.value,
+        default=DeviceStatus.pending,
+    )
     access_username = Column(String, nullable=True)
     connection_uri = Column(Text, nullable=True)
     # Per-device dynamic sub-link token — each device gets its own URL
@@ -649,9 +721,17 @@ class Credential(Base):
 
     id = Column(Integer, primary_key=True)
     # NULL for warm credentials waiting in the pool — bound on assignment.
-    subscription_id = Column(Integer, ForeignKey("subscriptions.id"), nullable=True)
-    device_id = Column(Integer, ForeignKey("devices.id"), nullable=True)
-    config_id = Column(Integer, ForeignKey("vpn_configs.id"), nullable=True)
+    # index=True — FK-индексы под выдачу sub-link (credentials по sub/device)
+    # и удаление ноды/конфига (audit #129).
+    subscription_id = Column(
+        Integer, ForeignKey("subscriptions.id"), nullable=True, index=True
+    )
+    device_id = Column(
+        Integer, ForeignKey("devices.id"), nullable=True, index=True
+    )
+    config_id = Column(
+        Integer, ForeignKey("vpn_configs.id"), nullable=True, index=True
+    )
     # Denormalized for the warm-pool partial index. We could derive it
     # from config_id but the index can't traverse a join, and warm-pool
     # SELECT must be sub-millisecond.
@@ -674,7 +754,10 @@ class Credential(Base):
     # one identity in a single transaction.
     access_username = Column(String, nullable=True, index=True)
     created_at = Column(DateTime, default=utcnow)
-    is_active = Column(Boolean, default=True)
+    # NOT NULL + server_default (audit #131).
+    is_active = Column(
+        Boolean, nullable=False, server_default="true", default=True
+    )
     revoked_at = Column(DateTime, nullable=True)
     # Stage 2.5 warm pool. ``warm`` = ready, ``assigned`` = bound to a sub,
     # ``revoked`` = pending physical removal. Defaults to ``assigned`` so
@@ -707,11 +790,21 @@ class Payment(Base):
     )
 
     id = Column(Integer, primary_key=True)
-    subscription_id = Column(Integer, ForeignKey("subscriptions.id"), nullable=True)
+    subscription_id = Column(
+        Integer, ForeignKey("subscriptions.id"), nullable=True, index=True
+    )  # FK-индекс (audit #129)
     invoice_id = Column(Integer, ForeignKey("invoices.id"), nullable=True, index=True)
-    amount = Column(Numeric(10, 2), default=0)
+    # NOT NULL + server_default (audit #131).
+    amount = Column(
+        Numeric(10, 2), nullable=False, server_default="0", default=0
+    )
     currency = Column(String, default="USD")
-    status = Column(Enum(PaymentStatus), default=PaymentStatus.pending)
+    status = Column(
+        Enum(PaymentStatus),
+        nullable=False,
+        server_default=PaymentStatus.pending.value,
+        default=PaymentStatus.pending,
+    )
     provider = Column(String, default="manual")
     external_id = Column(String, nullable=True)
     created_at = Column(DateTime, default=utcnow)
@@ -725,14 +818,24 @@ class Invoice(Base):
     __tablename__ = "invoices"
 
     id = Column(Integer, primary_key=True)
-    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    user_id = Column(
+        Integer, ForeignKey("users.id"), nullable=False, index=True
+    )  # FK-индекс (audit #129)
     # Nullable since stage 4 — topup invoices (kind='topup') don't bind
     # to a plan. Subscription invoices still set this on creation.
     plan_id = Column(Integer, ForeignKey("plans.id"), nullable=True)
-    subscription_id = Column(Integer, ForeignKey("subscriptions.id"), nullable=True)
+    subscription_id = Column(
+        Integer, ForeignKey("subscriptions.id"), nullable=True, index=True
+    )  # FK-индекс (audit #129)
     amount = Column(Numeric(10, 2), default=0)
     currency = Column(String, default="USD")
-    status = Column(Enum(InvoiceStatus), default=InvoiceStatus.pending)
+    # NOT NULL + server_default (audit #131).
+    status = Column(
+        Enum(InvoiceStatus),
+        nullable=False,
+        server_default=InvoiceStatus.pending.value,
+        default=InvoiceStatus.pending,
+    )
     action = Column(Enum(InvoiceAction), default=InvoiceAction.new_subscription)
     # Stage 4 discriminator. ``subscription`` = legacy plan-purchase
     # invoice; on paid the orchestrator provisions/renews a subscription.
@@ -791,7 +894,10 @@ class CloudProvider(Base):
     ssh_key_ids = Column(JSONB, nullable=True)
     default_region = Column(String, nullable=True)
     default_plan = Column(String, nullable=True)
-    is_active = Column(Boolean, default=True)
+    # NOT NULL + server_default (audit #131).
+    is_active = Column(
+        Boolean, nullable=False, server_default="true", default=True
+    )
     created_at = Column(DateTime, default=utcnow)
 
     nodes = relationship("VPNNode", back_populates="provider")
@@ -954,13 +1060,22 @@ class NodeTrafficSample(Base):
     baseline against.
     """
     __tablename__ = "node_traffic_samples"
+    # Композитный индекс из миграции 0019 (ix_node_traffic_samples_node_observed)
+    # обслуживает запросы «последний сэмпл ноды» (order_by(observed_at.desc())).
+    # Одиночный index=True на node_id убран: композит покрывает node_id как
+    # префикс, а лишний одиночный индекс раньше вызывал дрейф модель↔схема
+    # (миграция 0019 его не создавала). См. audit #134.
+    __table_args__ = (
+        Index(
+            "ix_node_traffic_samples_node_observed", "node_id", "observed_at"
+        ),
+    )
 
     id = Column(Integer, primary_key=True)
     node_id = Column(
         Integer,
         ForeignKey("vpn_nodes.id", ondelete="CASCADE"),
         nullable=False,
-        index=True,
     )
     observed_at = Column(DateTime, default=utcnow, nullable=False)
     interval_seconds = Column(Integer, nullable=False, default=0, server_default="0")

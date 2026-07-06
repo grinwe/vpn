@@ -204,15 +204,33 @@ rsync --delete --exclude=.git --exclude=__pycache__ --exclude=admin/node_modules
 ### 6. Build + up
 
 ```yaml
-# deploy_app_stack/tasks/main.yml:119-128
+- name: Invalidate build marker when repo changed
+  file:
+    path: "{{ deploy_app_stack_dir }}/.built_ok"
+    state: absent
+  when: repo_sync.changed
+
+- name: Check build marker
+  stat:
+    path: "{{ deploy_app_stack_dir }}/.built_ok"
+  register: _build_marker
+
 - name: Build docker images
   command: docker compose build --no-cache
   when:
     - deploy_app_stack_build | bool
-    - repo_sync.changed
+    - not _build_marker.stat.exists
+
+- name: Record successful build marker
+  copy:
+    dest: "{{ deploy_app_stack_dir }}/.built_ok"
+    content: "built\n"
+  when:
+    - deploy_app_stack_build | bool
+    - not _build_marker.stat.exists
 ```
 
-`--no-cache` + гейт `repo_sync.changed` = пересборка **только** когда реально что-то синкнулось. Повторный запуск роли против неизменённого дерева практически бесплатен.
+Гейт билда — **крах-безопасный**. Раньше он висел прямо на `repo_sync.changed`, и это было не идемпотентно: если прогон падал ПОСЛЕ rsync, но ДО/ВО ВРЕМЯ build (обрыв сети до registry, OOM, Ctrl-C), повторный запуск видел `changed=false`, пропускал build и `up -d` молча поднимал старые образы (healthcheck при этом зелёный). Теперь «нужен rebuild» персистентен через файл-маркер `.built_ok`: rsync-изменение сбрасывает маркер, а записывается он **только** после успешного build (упавший build прерывает плей до задачи записи). Пока маркера нет — образы пересобираются, даже если дерево не менялось. Маркер добавлен в `--exclude` rsync, чтобы `--delete` его не стирал. Повторный запуск роли против неизменённого, успешно собранного дерева по-прежнему практически бесплатен.
 
 ```yaml
 - name: Bring the stack up

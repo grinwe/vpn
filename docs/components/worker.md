@@ -60,6 +60,11 @@ Backend прогоняет `alembic upgrade head` на старте (`main.py:18
 | `run_pending_rescue_tick`  | `PENDING_RESCUE_INTERVAL=60` | Сканирует `ProvisioningTask.status=pending` старше `PENDING_RESCUE_AGE` секунд и re-enqueue'ит через `enqueue_task`. Дедуп по `job_id=provision-<task_id>` — если задача уже в RQ, это no-op. Закрывает дыру, когда `run_task_async` закоммитил row, но `enqueue_task` упал (транзиентный Redis hiccup, serialization issue) — до этого фикса такие задачи висели в pending до следующего рестарта бэкенда (`reset_stuck_tasks` в main.py срабатывает только на boot). Метрика: `vpn_provisioning_pending_rescue_total` инкрементится на каждый rescue |
 | `run_reconcile_tick`       | `RECONCILE_INTERVAL=3`       | Phase 3 reconcile: сходит dirty-ноды (`desired_generation > reconciled_generation` и `reconcile_due_at <= now`) одним coalesced bootstrap'ом, до `RECONCILE_MAX_PER_TICK=15` нод/тик (FIFO по due_at). No-op пока `RECONCILER_ENABLED` выкл. Self-reschedules. Watchdog-гейджи `vpn_reconcile_pending_nodes` / `vpn_reconcile_oldest_overdue_seconds` (+ WARNING при `oldest_overdue > RECONCILE_OVERDUE_WARN_S=120`) — ловят cap-starvation, повторно падающий bootstrap и (через staleness гейджа) зависший scheduler. См. `docs/operations/provisioning_reconciler_epic.md` |
 
+**Изоляция ошибок и видимость падений (аудит-фиксы #64/#215/#249):**
+
+- Все тики делают self-reschedule **в начале тела** (до реальной работы), поэтому неожиданное исключение в теле тика теперь **ре-бросается** после `logger.exception` (`raise`), а не глотается: джоба честно уходит в `failed` и подсвечивается в `/ops` (снапшот RQ-registries) — раньше проглоченное падение оставляло статус `finished`, и падающий каждый прогон тик месяцами «светился зелёным». Периодичность при этом не страдает — следующий тик уже запланирован.
+- В `run_renewal_check` каждый пасс напоминаний обрабатывает подписки под per-item `SAVEPOINT` (`session.begin_nested`): битая строка (IntegrityError на инвойсе, обрыв соединения) откатывается только сама и не глушит напоминания остальным + последующим пассам. Выборки окон ограничены `RENEWAL_WINDOW_LIMIT` (default 2000) с `ORDER BY expires_at ASC` — самые срочные первыми, хвост доносится следующим тиком; тик больше не рискует упереться в `job_timeout` на тысячах истекающих.
+
 ### Bootstrap при старте воркера
 
 В `main()` (`worker.py:1220-1401`) каждая тика первый раз ставится в очередь через `schedule_tick(func_name, min(interval, X), tick_id)` — где `X` маленькое (30-60с), чтобы после рестарта воркера первый прогон был почти сразу, а дальше уже с полным интервалом. Пример:
@@ -251,11 +256,16 @@ return summary
 - воркер вообще не поднят (`depends_on` / redis недоступен), или
 - `Retry(max=3)` исчерпан и job ушёл в DLQ до того, как автосамохил успел его пере-enqueue'нуть (по задумке — дальше `dlq_exception_handler` + audit-лог).
 
-Если все 3 retry исчерпаны, RQ вызывает `dlq_exception_handler` (зарегистрирован на Worker через `exception_handlers`). Хендлер:
+`dlq_exception_handler` зарегистрирован на Worker через `exception_handlers`. **ВАЖНО:** RQ зовёт exception handlers на КАЖДОМ падении джобы, ДО retry-логики (`handle_exception` → `handle_job_failure`), а не только на финальном провале. Поэтому хендлер сначала фильтрует (аудит-фикс #60):
+
+- если у джобы остались ретраи (`job.retries_left` > 0) — падение транзиентное: только `logger.warning`, БЕЗ инкремента счётчика / аудита / админ-пуша (раньше первая же транзиентная ошибка ansible-джобы слала админу «Провижининг упал», хотя через 10с был успешный ретрай);
+- аудит/пуш с `target_type='provisioning_task'` пишутся ТОЛЬКО для `run_provisioning_task` (у неё `args[0]` — task_id); у `run_ops_plan_execute` `args[0]` — plan_id, у `run_scale_workers` — число реплик, поэтому для них только лог, без ложного provisioning-аудита.
+
+Когда ретраи исчерпаны (`retries_left == 0`) или у джобы нет `Retry` (`retries_left is None`) и это `run_provisioning_task`, хендлер:
 
 1. Инкрементирует `vpn_provisioning_dlq_total` Prometheus counter
 2. Пишет `AuditLog(action="provisioning_dlq")` с `job_id`, `exc_type`, `error` (первые 500 символов)
-3. Логирует через `logger.error`
+3. Логирует через `logger.error` + шлёт админ-пуш `infra_dlq`
 
 Отдельной DLQ-очереди нет — RQ's FailedJobRegistry и есть DLQ. Audit-лог обеспечивает видимость в admin UI без ковыряния Redis.
 
@@ -274,6 +284,8 @@ return summary
 Воркер — единственный процесс, который вызывает `subprocess.run(["ansible-playbook", ...])` (`backend/app/services/ansible_runner.py`). Backend'а может не быть в контейнере ansible вовсе — см. `api.py:181-195`: deep health-check на backend'е умеет проверять только доступность queue, не ansible'а, потому что «API image intentionally ships without ansible».
 
 То есть backend'у для провижининга **обязательно** нужен работающий воркер. Без воркера у backend'а есть legacy in-process thread fallback (упоминается в комментарии `api.py:189-190`), но это безопасная крайность, не штатный путь.
+
+Fallback на Redis **не залипает**: `queue.get_redis` кеширует только живой клиент, а после неудачного `ping` повторяет попытку не чаще раза в `REDIS_RETRY_COOLDOWN` (default 30 с). Раньше `@lru_cache` кешировал `None` до конца жизни процесса — один транзиентный blip при одновременном рестарте контейнеров (Redis поднимается на пару секунд позже backend'а) навсегда переводил весь API на inline-исполнение ansible. Каждый уход в inline виден в логах (WARNING `enqueue_task: RQ queue unavailable`) и в метрике `vpn_queue_inline_fallback_total` — ненулевой рост при живом Redis сигналит о поломке разделения API/worker.
 
 ## Восстановление после падения
 

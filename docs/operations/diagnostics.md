@@ -71,6 +71,14 @@ ansible-роль `diagnose_relay_link`, результат каждого = сл
 пишет `RelayExitLink.last_handshake_at` + `last_observed_at`. После
 этого вызывается `_auto_diagnose_stale_links(session)`:
 
+Коммит идёт per-relay, а не одним `session.commit()` в конце прохода
+(аудит-фикс #102): RQ kill-по-таймауту тика при нескольких лежащих relay
+(до ~10с SSH-таймаута на каждый) иначе терял бы обновления ВСЕХ relay,
+включая уже успешно опрошенных — `last_observed_at` всего флота протухал
+разом и авто-диагностика молча гасла. Relay обходятся в порядке
+`last_observed_at` ASC (самый протухший первым), чтобы под повторными
+kill не голодал один и тот же хвост.
+
 * **Условие unhealthy**: `last_observed_at` свежий (≤ 8 мин — относится к
   `AUTO_DIAGNOSE_OBSERVED_FRESH_MIN`) И (`last_handshake_at IS NULL` OR
   `last_handshake_at` старше 10 мин — `AUTO_DIAGNOSE_HANDSHAKE_STALE_MIN`).
@@ -154,6 +162,12 @@ message,details}`. `.ssh_ok` — гейт: **если ssh не дошёл, on-ho
 `_execute_task` через `_run_node_diagnose` / `_run_exit_diagnose`.
 Worker-образу нужны `iputils-ping` + `traceroute` (см.
 `backend/Dockerfile.worker`), иначе эти этапы деградируют в `skip`.
+`.ssh_skipped` — отдельный флаг: `True`, когда ssh-стадию НЕ смогли
+выполнить (нет `paramiko` / нет файла ключа), а не «проверили —
+недоступно». Reachability-тик обязан НЕ метить цель `unreachable` при
+`ssh_skipped` — иначе потеря одного ssh-ключа (ротация секрета,
+пересборка контейнера, опечатка в `ANSIBLE_PRIVATE_KEY_FILE`) кладёт
+весь флот в ложный DOWN и открывает лавину инцидентов (finding #97).
 
 ### 2. Структурный чек-лист для node/exit
 
@@ -219,8 +233,8 @@ response`, или webapp Help → `/webapp/health-ping-report`) — и backend
 `_do_failover` → `migrate_subscription_to_free_node` переселяет на
 свободную healthy-ноду (sub_token сохраняется) И **банит проблемную ноду
 для этого юзера** (`NodeUserBan`), чтобы auto-pick не вернул его назад.
-5-мин per-sub throttle (по `client_reported_failure` в AuditLog) не даёт
-спамить миграциями.
+5-мин per-sub throttle (по свежему `OperatorNodeReport` этой подписки,
+`reported_at` индексирован) не даёт спамить миграциями.
 
 Плюс **краудсорс «плохости»** (`_escalate_node_failure_reports`): считаем
 DISTINCT подписки, пожаловавшиеся на ноду за окно; по порогу — нода
@@ -228,10 +242,14 @@ DISTINCT подписки, пожаловавшиеся на ноду за ок�
 открывается diagnose-инцидент + enqueue диагностики + говорящий
 admin-push. Идемпотентно: уже cooled-нода повторно не охлаждается. Так
 ноды само-ранжируются по реальным юзер-сигналам, а не только по нашему ssh.
-Голосуют ВСЕ user-driven каналы: webapp/control-channel (`_do_failover`)
-**и бот-флоу operator-routing** (`report-broken` / `report-broken-device` —
-их audit-метаданные пишут `current_node_id`, ключ окна подсчёта, и после
-миграции зовут ту же эскалацию).
+Счётчик берётся из `operator_node_reports` по `failed_node_id` (btree-
+индекс), а не JSONB-containment'ом по `audit_logs` — это user-facing путь
+под нагрузкой на аварии ноды, полный скан таблицы аудита внутри запроса
+недопустим. Голосуют ВСЕ user-driven каналы: webapp/control-channel
+(`_do_failover`) **и бот-флоу operator-routing** (`report-broken` /
+`report-broken-device`) — каждый успешный failover пишет
+`OperatorNodeReport` с `failed_node_id` = старая нода, и после миграции
+зовёт ту же эскалацию.
 
 Авто-баны `NodeUserBan` при этом не вечные: перед каждым user-driven
 failover'ом протухшие авто-баны юзера снимаются (TTL, env

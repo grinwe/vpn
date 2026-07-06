@@ -9,9 +9,10 @@ from __future__ import annotations
 
 import logging
 import uuid
-from typing import Any
+from typing import Any, Literal
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query
+from pydantic import BaseModel, Field
 from sqlalchemy import and_, func, or_
 from sqlalchemy.orm import Session
 
@@ -329,9 +330,19 @@ def cancel_task(
     return schemas.ProvisioningTaskOut.from_orm(task)
 
 
+class BatchTasksRequest(BaseModel):
+    # ids ограничены по образцу BatchBanRequest в users.py: min 1 (пустой
+    # батч бессмыслен) и max 500 (иначе неограниченный список крутит тысячи
+    # одиночных db.get в цикле и держит соединение БД). Literal на action
+    # заменяет ручную проверку и отдаёт 422 при мусоре вместо 500 посреди
+    # батча (нетиповой id больше не доедет до db.get).
+    ids: list[int] = Field(min_length=1, max_length=500)
+    action: Literal["delete", "rerun"]
+
+
 @router.post("/provisioning/tasks/batch")
 def batch_tasks(
-    body: dict,
+    body: BatchTasksRequest,
     db: Session = Depends(get_db),
     admin_token: str = Depends(require_admin),
     admin_actor: str | None = Header(default=None, alias=ADMIN_ACTOR_HEADER),
@@ -340,13 +351,8 @@ def batch_tasks(
 
     Body: ``{ "ids": [1,2,3], "action": "delete" | "rerun" }``
     """
-    ids = body.get("ids", [])
-    action = body.get("action", "")
-    if not ids or action not in ("delete", "rerun"):
-        raise HTTPException(
-            status_code=400,
-            detail="ids (list) and action (delete|rerun) required",
-        )
+    ids = body.ids
+    action = body.action
 
     actor, actor_type = _resolve_admin_actor(admin_actor)
     results: dict[str, list[int]] = {"ok": [], "skipped": [], "not_found": []}

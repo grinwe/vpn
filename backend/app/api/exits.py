@@ -1524,36 +1524,47 @@ def refresh_relay_link_health(
       * ``enqueued=false`` — очередь недоступна (Redis down), тогда
         индикаторы не обновятся пока не поднимется очередь.
     """
-    from ..queue import RESULT_TTL, TICK_IDS, get_queue
+    from ..queue import TICK_IDS, get_ticks_queue, schedule_tick
     from rq.exceptions import NoSuchJobError
     from rq.job import Job
     from rq.registry import StartedJobRegistry
 
-    queue = get_queue()
+    # Форсируем тик на ТИКОВОЙ очереди (get_ticks_queue), а не на
+    # provisioning'е (get_queue). Раньше здесь стоял get_queue(): под
+    # нагрузкой (bulk bootstrap) форс кидал SSH-тяжёлый тик в хвост за
+    # ansible-run'ами И удалял его scheduled-джобу из тиковой очереди —
+    # health-индикаторы замирали на весь бэклог, а сам тик исполнялся на
+    # воркере не своей роли и без per-tick timeout (900s вместо 120s).
+    queue = get_ticks_queue()
     if queue is None:
         return {"enqueued": False, "reason": "queue unavailable"}
 
     tick_id = TICK_IDS["app.worker.run_relay_link_health_tick"]
 
+    # Уже идёт сбор — не дёргаем: тик вот-вот сам обновит health-колонки.
     try:
         StartedJobRegistry(queue=queue).cleanup()
     except Exception:  # noqa: BLE001
         pass
-
     try:
         existing = Job.fetch(tick_id, connection=queue.connection)
         if existing.get_status(refresh=True) == "started":
             return {"enqueued": True, "job_id": existing.id, "note": "already running"}
-        existing.delete()
     except NoSuchJobError:
         pass
 
-    job = queue.enqueue(
+    # replace=True снимает stale scheduled/queued job и кладёт свежий без
+    # задержки с per-tick job_timeout (TICK_TIMEOUTS) — та же безопасная
+    # замена scheduled-джобы, что делает периодический self-reschedule.
+    job_id = schedule_tick(
         "app.worker.run_relay_link_health_tick",
-        job_id=tick_id,
-        result_ttl=RESULT_TTL,
+        0,
+        tick_id,
+        replace=True,
     )
-    return {"enqueued": True, "job_id": job.id}
+    if job_id is None:
+        return {"enqueued": False, "reason": "queue unavailable"}
+    return {"enqueued": True, "job_id": job_id}
 
 
 @router.post(

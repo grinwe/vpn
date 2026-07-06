@@ -74,8 +74,22 @@ for url in "${URLS[@]}"; do
             continue
         fi
 
+        # Бинарь мог не оказаться в zip'е при смене layout релиза — проверяем
+        # до install, иначе install упадёт молча и на диске останется старый xray.
+        if [ ! -f "$UNPACK/xray" ]; then
+            echo "  ✗ в архиве нет бинаря xray (изменился layout релиза?), пропускаю" >&2
+            rm -rf "$ZIP" "$UNPACK"
+            continue
+        fi
+
         mkdir -p /usr/local/share/xray
-        install -m 0755 "$UNPACK/xray" /usr/local/bin/xray
+        # rc install проверяем явно: ENOSPC на /usr/local, RO-FS и пр. иначе
+        # проглотятся (set -e не включён), и мы отрапортуем успех со старым бинарём.
+        if ! install -m 0755 "$UNPACK/xray" /usr/local/bin/xray; then
+            echo "  ✗ install xray не удался (нет места/права?), прерываю" >&2
+            rm -rf "$ZIP" "$UNPACK"
+            exit 1
+        fi
         # geoip/geosite пакуются в release zip как первая инициализация —
         # weekly geoip-update.timer потом подтянет свежее. geosite.dat
         # auto-update'а у нас нет, поэтому обновится только на bump'е
@@ -85,6 +99,14 @@ for url in "${URLS[@]}"; do
 
         rm -rf "$ZIP" "$UNPACK"
         ver=$(/usr/local/bin/xray version | head -n1)
+        # Сверяем фактически установленную версию с запрошенной: если бинарь
+        # почему-то остался старым — это тихий провал апгрейда, падаем с rc=1.
+        got=$(printf '%s\n' "$ver" | awk '{print $2}')
+        want="${VERSION#v}"
+        if [ "$got" != "$want" ]; then
+            echo "  ✗ после установки версия '$got' != требуемой '$want' — апгрейд не применился" >&2
+            exit 1
+        fi
         echo "✓ установлен: $ver (источник: $url)"
         exit 0
     else

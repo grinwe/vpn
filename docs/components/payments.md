@@ -47,7 +47,7 @@ Legacy fallback: если `PAYMENT_PROVIDERS` не задан, читается 
 
 Единственный honest-to-god внешний провайдер. API `@CryptoBot` (Crypto Pay API).
 
-- `create_invoice`: POST `/createInvoice` с `asset: "USDT"` (маппится из `USD`), `payload: str(invoice_id)`. Возвращает `pay_url` и `invoice_id` провайдера → в `ProviderInvoice`.
+- `create_invoice`: POST `/createInvoice`, `payload: str(invoice_id)`. Валюта различается по коду (аудит #115): крипто-ассеты (`USDT`/`TON`/`BTC`/…, и исторический `USD`→`USDT`) уходят как `currency_type=crypto` + `asset`; всё остальное (`RUB`/`EUR`/…) — как `currency_type=fiat` + `fiat=<код>` (топап-путь `webapp_topup` шлёт `RUB` напрямую без конвертации). Возвращает `pay_url` и `invoice_id` провайдера → в `ProviderInvoice`.
 - `verify_webhook`: подпись в заголовке `Crypto-Pay-Api-Signature`. Секрет считается как `sha256(token)` (не сам токен!), затем `HMAC-SHA256(raw_body)`. `cryptobot.py:88-92`. Распаковывается `payload.payload` — это наш же `invoice_id`, отправленный на этапе create.
 - Статусы: `invoice_paid → "paid"`, `invoice_expired → "expired"`, всё остальное → `"other"`.
 - Токен передаётся в `Crypto-Pay-API-Token` header, **не в query** (`cryptobot.py:33-34`). Явный комментарий: «never in query strings».
@@ -168,6 +168,14 @@ POST /api/payments/webhook/sbp:robokassa
                │            log & return  log & return
                ▼
        invoice_id = int(external_id)
+               │
+               ▼
+       сверка суммы/валюты (#111):
+         expected = _convert_for_provider(invoice.amount, invoice.currency, provider)
+         if event.amount is not None and (недоплата или валюта≠) →
+             notify_admins + HTTPException 409, счёт остаётся pending
+               │
+               ▼
        pending_payment = SELECT p FROM payments
              WHERE invoice_id=? AND provider=?
              ORDER BY id DESC LIMIT 1
@@ -187,6 +195,7 @@ POST /api/payments/webhook/sbp:robokassa
 - **Idempotency защитой инвойса.** `_mark_invoice_paid_core` берёт `SELECT ... FOR UPDATE` на `Invoice`, и если `status == paid` — возвращает уже готовый результат без повторного провижининга. Повтор webhook'а (CryptoBot иногда шлёт два раза при таймауте) не создаёт дубликата credential'ов.
 - **Только `"paid"` обрабатывается.** `expired` / `other` логируются и возвращают 200 — это нужно, иначе провайдер решит, что webhook не доставлен, и будет ретраить до бесконечности.
 - **Actor зашивается как `<provider>:webhook`** — чтобы в `audit_logs` было видно, какой провайдер инициировал переход в paid. Actor type = `system`, не `admin`/`bot`/`user`.
+- **Сверка суммы и валюты (#111).** Перед зачислением webhook сравнивает `event.amount`/`event.currency` с ожидаемой суммой счёта. Счёт хранится в рублях, а провайдер присылает свою валюту (XTR/USDT), поэтому ожидание считается тем же `_convert_for_provider`, что и в `/checkout`, и сравнивается уже в валюте провайдера (синоним `RUR`≡`RUB`). Недоплата (сверх допуска в копейку) или несовпадение валюты → `HTTPException 409` + `notify_admins(kind="payment_amount_mismatch")`, счёт остаётся `pending`. Переплата зачисляется, но пишет `warning`. Если `event.amount` не пришёл (template-режим SBP не фиксирует сумму) — сверять нечего, зачисляем как раньше.
 
 ## Взаимодействие с `_mark_invoice_paid_core`
 

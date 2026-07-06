@@ -137,7 +137,27 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
   };
   if (token) headers["Authorization"] = `Bearer ${token}`;
 
-  const res = await fetch(path, { ...init, headers });
+  // Таймаут на голый fetch: на мобильных сетях (основная среда Mini App)
+  // TCP-соединение может висеть минутами без ответа и без ошибки, оставляя
+  // юзера на вечной «Загрузке…». 15 с → бросаем "timeout", чтобы сработала
+  // ветка NETWORK_HINT в friendlyError и показалась понятная ошибка.
+  let res: Response;
+  try {
+    res = await fetch(path, {
+      ...init,
+      headers,
+      signal: init.signal ?? AbortSignal.timeout(15000),
+    });
+  } catch (e) {
+    // TimeoutError (от AbortSignal.timeout) и AbortError → сетевой таймаут.
+    if (
+      e instanceof DOMException &&
+      (e.name === "TimeoutError" || e.name === "AbortError")
+    ) {
+      throw new Error("timeout");
+    }
+    throw e;
+  }
   if (!res.ok) {
     const text = await res.text();
     throw new Error(`${res.status}: ${text || res.statusText}`);

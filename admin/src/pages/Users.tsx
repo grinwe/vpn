@@ -56,7 +56,12 @@ export default function Users() {
   // of hundreds of rows that the operator only wants to see intentionally
   // (either to review the wave or to batch-unban a false positive).
   const [banned, setBanned] = useState<BannedFilter>("active");
-  const [selected, setSelected] = useState<UserOut | null>(null);
+  // Выбранный юзер храним как id, а сам объект деривим из загруженного
+  // списка (см. `selected` ниже). Так любой refetch списка (после ban,
+  // batch-операций, пополнения) автоматически перерисовывает сайдбар —
+  // не нужно вручную патчить снапшот в каждом onSuccess (иначе сайдбар
+  // показывает устаревшее состояние: незабаненного юзера с кнопкой ban).
+  const [selectedId, setSelectedId] = useState<number | null>(null);
   const [topupRub, setTopupRub] = useState("");
   const [topupNote, setTopupNote] = useState("");
   // claim-orphan form state — operator pastes either a bare UUID or
@@ -108,11 +113,16 @@ export default function Users() {
     },
   });
   const users = usersData?.pages.flat() ?? [];
+  // Деривим выбранного юзера из актуальных данных списка — единственный
+  // источник правды. Если юзер выпал из текущего фильтра (напр. забанен
+  // на вкладке «Активные»), selected → null и сайдбар закрывается: это
+  // корректно отражает реальность, а не показывает застывший снапшот.
+  const selected = users.find((u) => u.id === selectedId) ?? null;
 
   const { data: subs } = useQuery<SubscriptionOut[]>({
-    queryKey: ["user-subs", selected?.id],
-    queryFn: () => api.get(`/users/${selected!.id}`),
-    enabled: selected !== null,
+    queryKey: ["user-subs", selectedId],
+    queryFn: () => api.get(`/users/${selectedId}`),
+    enabled: selectedId !== null,
   });
 
   // Only loaded when a user is selected — the list is used to populate
@@ -122,7 +132,7 @@ export default function Users() {
   const { data: allNodes } = useQuery<VPNNodeOut[]>({
     queryKey: ["nodes-for-migrate"],
     queryFn: () => api.get(`/nodes`),
-    enabled: selected !== null,
+    enabled: selectedId !== null,
   });
 
   const topup = useMutation({
@@ -135,12 +145,10 @@ export default function Users() {
       amountKopecks: number;
       note: string;
     }) => adminTopupByTelegram(telegramId, amountKopecks, note),
-    onSuccess: (res) => {
-      // Optimistically patch the selected user's balance so the UI
-      // updates instantly without waiting for the users-list refetch.
-      if (selected && selected.id === res.user_id) {
-        setSelected({ ...selected, balance_kopecks: res.balance_kopecks });
-      }
+    onSuccess: () => {
+      // Баланс в сайдбаре обновится сам через invalidateQueries(["users"])
+      // → refetch списка → derive selected. Ручной патч снапшота больше
+      // не нужен.
       setTopupRub("");
       setTopupNote("");
       qc.invalidateQueries({ queryKey: ["users"] });
@@ -381,14 +389,10 @@ export default function Users() {
   const singleBan = useMutation({
     mutationFn: ({ id, action }: { id: number; action: "ban" | "unban" }) =>
       batchBanUsers([id], action),
-    onSuccess: (res) => {
-      const id = res.done[0];
-      if (id !== undefined && selected && selected.id === id) {
-        setSelected({
-          ...selected,
-          banned_at: res.action === "ban" ? new Date().toISOString() : null,
-        });
-      }
+    onSuccess: () => {
+      // banned_at в сайдбаре подтянется из refetch списка (derive selected).
+      // На вкладке «Активные» забаненный юзер выпадет из списка и сайдбар
+      // закроется — это ожидаемо и отражает реальное состояние.
       qc.invalidateQueries({ queryKey: ["users"] });
     },
     onError: (e: Error) => alert(`Не удалось изменить статус бана: ${e.message}`),
@@ -848,7 +852,7 @@ export default function Users() {
                 {users.map((u, idx) => (
                   <tr
                     key={u.id}
-                    onClick={() => setSelected(u)}
+                    onClick={() => setSelectedId(u.id)}
                     className={`cursor-pointer border-b border-slate-800 hover:bg-slate-800 ${
                       selected?.id === u.id ? "bg-slate-800" : ""
                     } ${selectedIds.has(u.id) ? "bg-blue-950/30" : ""} ${

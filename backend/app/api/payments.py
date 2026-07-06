@@ -26,6 +26,16 @@ from .invoices import _mark_invoice_paid_core
 router = APIRouter()
 
 
+def _norm_currency(currency: str | None) -> str:
+    """Нормализовать код валюты для сравнения (аудит #111).
+
+    Приводим к верхнему регистру и схлопываем синоним RUR→RUB, чтобы
+    сверка суммы вебхука не падала на косметическом различии кодов.
+    """
+    cur = (currency or "").upper()
+    return "RUB" if cur == "RUR" else cur
+
+
 def _convert_for_provider(amount: float, currency: str, provider_name: str) -> tuple[float, str]:
     """Привести сумму счёта к валюте платёжного провайдера (аудит #108).
 
@@ -228,6 +238,90 @@ async def payment_webhook(
     # (включая /api/sub/{token}), пока ждётся row-lock. Уводим их в
     # threadpool через asyncio.to_thread.
     def _process_paid_event() -> dict:
+        # #111: сверяем сумму и валюту вебхука с ожидаемой суммой счёта,
+        # прежде чем зачислять. Провайдер присылает сумму в СВОЕЙ валюте
+        # (XTR/USDT), а счёт хранится в рублях, поэтому сравниваем не с
+        # invoice.amount напрямую, а с тем же _convert_for_provider,
+        # которым сумма считалась при создании счёта в checkout. Иначе
+        # недоплата или ошибочно смэтченный платёж молча кредитуют баланс
+        # на полную сумму.
+        invoice = db.get(models.Invoice, invoice_id)
+        if invoice is None:
+            raise HTTPException(status_code=404, detail="Invoice not found")
+
+        if event.amount is not None:
+            try:
+                expected_amount, expected_currency = _convert_for_provider(
+                    float(invoice.amount), invoice.currency, provider.name
+                )
+            except ProviderError as exc:
+                # Курс не задан (обычно он был на этапе checkout) — сверить
+                # не можем. Подпись вебхука валидна и счёт существует,
+                # поэтому зачисляем, но громко логируем для ручной сверки.
+                logger.warning(
+                    "webhook %s invoice %d: не удалось вычислить ожидаемую сумму для сверки: %s",
+                    provider.name,
+                    invoice_id,
+                    exc,
+                )
+                expected_amount = None
+                expected_currency = None
+
+            if expected_amount is not None:
+                # Допуск на копейки/дробное округление при конвертации.
+                eps = 0.01
+                underpaid = event.amount + eps < float(expected_amount)
+                currency_ok = event.currency is None or _norm_currency(
+                    event.currency
+                ) == _norm_currency(expected_currency)
+                if underpaid or not currency_ok:
+                    from ..services.admin_notify import notify_admins
+
+                    logger.warning(
+                        "webhook %s invoice %d: сумма/валюта не совпали "
+                        "(получено %s %s, ожидалось %s %s) — счёт НЕ зачислен",
+                        provider.name,
+                        invoice_id,
+                        event.amount,
+                        event.currency,
+                        expected_amount,
+                        expected_currency,
+                    )
+                    notify_admins(
+                        db,
+                        kind="payment_amount_mismatch",
+                        text=(
+                            f"⚠️ Вебхук {provider.name} по счёту #{invoice_id}: "
+                            f"сумма/валюта не совпали. Получено "
+                            f"{event.amount} {event.currency or '?'}, ожидалось "
+                            f"{expected_amount} {expected_currency}. Счёт оставлен pending."
+                        ),
+                        dedup_key={"invoice_id": invoice_id},
+                        extra={
+                            "invoice_id": invoice_id,
+                            "provider": provider.name,
+                            "got_amount": event.amount,
+                            "got_currency": event.currency,
+                            "expected_amount": float(expected_amount),
+                            "expected_currency": expected_currency,
+                        },
+                        autocommit=True,
+                    )
+                    raise HTTPException(
+                        status_code=409, detail="webhook amount/currency mismatch"
+                    )
+                # Переплата не блокирует зачисление (клиент заплатил не
+                # меньше), но фиксируем расхождение в логах для сверки.
+                if event.amount - eps > float(expected_amount):
+                    logger.warning(
+                        "webhook %s invoice %d: переплата — получено %s, "
+                        "ожидалось %s; зачисляем",
+                        provider.name,
+                        invoice_id,
+                        event.amount,
+                        expected_amount,
+                    )
+
         # Lock the invoice row and mark a Payment as paid if we have one.
         pending_payment = (
             db.query(models.Payment)

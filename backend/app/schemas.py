@@ -123,8 +123,8 @@ class VPNConfigCreate(BaseModel):
 class VPNConfigOut(VPNConfigCreate):
     id: int
     node_id: int
-    created_at: datetime
-    updated_at: datetime
+    created_at: UTCDateTime
+    updated_at: UTCDateTime
 
     class Config:
         from_attributes = True
@@ -163,7 +163,7 @@ class NodeActiveUserOut(BaseModel):
     plan_id: int | None = None
     plan_name: str | None = None
     protocols: list[str] = Field(default_factory=list)
-    subscription_expires_at: datetime | None = None
+    subscription_expires_at: UTCDateTime | None = None
 
 
 class NodeActiveUsersOut(BaseModel):
@@ -307,8 +307,8 @@ class VPNNodeOut(VPNNodeCreate):
     last_diagnosed_at: UTCDateTime | None = None
     last_probe_at: UTCDateTime | None = None
     last_probe_status: str | None = None
-    created_at: datetime
-    updated_at: datetime
+    created_at: UTCDateTime
+    updated_at: UTCDateTime
 
     @field_validator("blocked_regions", mode="before")
     @classmethod
@@ -384,7 +384,7 @@ class SubscriptionOut(BaseModel):
     # data paths may still hit this code before node_id is set.
     node_id: int | None = None
     region: str
-    expires_at: datetime
+    expires_at: UTCDateTime
     status: str
     auto_renew: bool = False
     sub_token: str | None = None
@@ -437,7 +437,7 @@ class NodeUserBanOut(BaseModel):
     node_name: str | None = None
     reason: str | None = None
     created_by: str | None = None
-    created_at: datetime
+    created_at: UTCDateTime
 
     class Config:
         from_attributes = True
@@ -603,7 +603,7 @@ class DisableRequest(BaseModel):
 class SubscriptionStatusOut(BaseModel):
     plan_name: str
     server_name: str
-    expires_at: datetime
+    expires_at: UTCDateTime
     is_active: bool
     proto_configs: List[CredentialOut]
 
@@ -611,7 +611,7 @@ class SubscriptionStatusOut(BaseModel):
 class SubscriptionProvisionResponse(BaseModel):
     subscription_id: int
     status: str
-    expires_at: datetime
+    expires_at: UTCDateTime
     node_id: int
     plan_id: int
     device: DeviceStatusOut
@@ -657,14 +657,18 @@ class InvoiceMarkPaidRequest(BaseModel):
 class InvoiceOut(BaseModel):
     id: int
     user_id: int
-    plan_id: int
+    # Nullable: топап-инвойсы (kind="topup") создаются с plan_id=None
+    # (см. models.Invoice.plan_id nullable). Без Optional cancel/mark_unpaid
+    # такого инвойса роняли from_orm в ValidationError уже ПОСЛЕ commit'а —
+    # 500 на UI при уже применённом статусе (по аналогии с InvoiceListItem).
+    plan_id: int | None = None
     subscription_id: int | None = None
     amount: float
     currency: str
     status: str
     action: str
-    created_at: datetime
-    updated_at: datetime
+    created_at: UTCDateTime
+    updated_at: UTCDateTime
 
     class Config:
         from_attributes = True
@@ -698,7 +702,7 @@ class InvoiceListItem(BaseModel):
     status: str
     action: str
     kind: str = "subscription"
-    created_at: datetime
+    created_at: UTCDateTime
 
 
 class InvoicePaidOut(InvoiceListItem):
@@ -821,7 +825,7 @@ class CloudProviderOut(BaseModel):
     default_plan: str | None
     ssh_key_ids: list[str] | None
     is_active: bool
-    created_at: datetime
+    created_at: UTCDateTime
 
     class Config:
         from_attributes = True
@@ -954,8 +958,8 @@ class ApiTokenOut(BaseModel):
     name: str
     scopes: list[str]
     is_active: bool
-    created_at: datetime
-    last_used_at: datetime | None = None
+    created_at: UTCDateTime
+    last_used_at: UTCDateTime | None = None
 
     class Config:
         from_attributes = True
@@ -988,10 +992,10 @@ class UserOut(BaseModel):
     id: int
     telegram_id: str | None = None
     email: str | None = None
-    created_at: datetime
+    created_at: UTCDateTime
     subscription_count: int = 0
     balance_kopecks: int = 0
-    banned_at: datetime | None = None
+    banned_at: UTCDateTime | None = None
 
     class Config:
         from_attributes = True
@@ -1011,7 +1015,7 @@ class AuditLogOut(BaseModel):
     action: str
     target_type: str
     target_id: int | None
-    created_at: datetime
+    created_at: UTCDateTime
     extra: dict | None = None
 
     class Config:
@@ -1058,7 +1062,7 @@ class HealthPingSummaryOut(BaseModel):
 
 
 class HealthPingRecentBadItem(BaseModel):
-    created_at: datetime
+    created_at: UTCDateTime
     telegram_id: str | None
     user_id: int | None
     node_id: int | None
@@ -1079,7 +1083,7 @@ class NodeHealthPingStatsOut(BaseModel):
     ok: int
     bad: int
     bad_ratio: float  # 0..1
-    last_bad_at: datetime | None
+    last_bad_at: UTCDateTime | None
 
 
 class WGExitNodeCreate(BaseModel):
@@ -1164,8 +1168,8 @@ class WGExitNodeOut(BaseModel):
     diagnose_follow_mode: str | None = None
     diagnose_acked_at: UTCDateTime | None = None
     last_diagnosed_at: UTCDateTime | None = None
-    created_at: datetime
-    updated_at: datetime
+    created_at: UTCDateTime
+    updated_at: UTCDateTime
 
     class Config:
         from_attributes = True
@@ -1279,7 +1283,7 @@ class RelayExitLinkOut(BaseModel):
     wg_interface_name: str
     wg_client_public_key: str
     wg_client_address_v4: str
-    created_at: datetime
+    created_at: UTCDateTime
     # Health telemetry — заполняется worker-тиком
     # run_relay_link_health_tick (см. services/relay_link_health.py).
     # NULL = тик ещё не прошёл / SSH не дошёл / peer не найден в wg.
@@ -1320,7 +1324,7 @@ class NodeRelayLinkOut(BaseModel):
     wg_client_address_v4: str
     wg_client_public_key: str
     credentials_count: int
-    created_at: datetime
-    last_auto_diagnose_at: datetime | None = None
+    created_at: UTCDateTime
+    last_auto_diagnose_at: UTCDateTime | None = None
     last_auto_diagnose_task_id: int | None = None
     last_auto_diagnose_symptom: str | None = None

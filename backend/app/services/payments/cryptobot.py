@@ -23,6 +23,23 @@ logger = logging.getLogger(__name__)
 MAINNET_API = "https://pay.crypt.bot/api"
 TESTNET_API = "https://testnet-pay.crypt.bot/api"
 
+# Крипто-активы, которые Crypto Pay принимает в поле ``asset``. Всё остальное
+# (RUB/USD/EUR/…) — фиат и задаётся парой ``currency_type=fiat`` + ``fiat``.
+_CRYPTO_ASSETS = {
+    "USDT",
+    "TON",
+    "BTC",
+    "ETH",
+    "LTC",
+    "BNB",
+    "TRX",
+    "USDC",
+    "JET",
+    "GRAM",
+    "DOGE",
+    "SEND",
+}
+
 
 class CryptoBotProvider:
     name = "cryptobot"
@@ -44,12 +61,14 @@ class CryptoBotProvider:
         description: str | None = None,
         return_url: str | None = None,
     ) -> ProviderInvoice:
-        # Crypto Pay expects the fiat/crypto asset in ``asset``; we accept
-        # both USDT-like codes ("USDT") and internal currency codes ("USD")
-        # by mapping the common case to USDT.
-        asset = "USDT" if currency.upper() == "USD" else currency.upper()
-        body = {
-            "asset": asset,
+        # Crypto Pay различает крипто- и фиат-инвойсы: крипта задаётся полем
+        # ``asset`` (USDT/TON/…), фиат — парой ``currency_type=fiat`` + ``fiat``
+        # (RUB/USD/EUR/…). Наши счета почти все рублёвые, поэтому по умолчанию
+        # неизвестный код трактуем как фиат, а исторический "USD" маппим в USDT.
+        code = currency.upper()
+        if code == "USD":
+            code = "USDT"
+        body: dict = {
             "amount": f"{amount:.2f}",
             "description": description or f"Order #{invoice_id}",
             # ``payload`` is returned verbatim in webhook events and lets us
@@ -58,6 +77,12 @@ class CryptoBotProvider:
             "allow_comments": False,
             "allow_anonymous": True,
         }
+        if code in _CRYPTO_ASSETS:
+            body["currency_type"] = "crypto"
+            body["asset"] = code
+        else:
+            body["currency_type"] = "fiat"
+            body["fiat"] = code
         if return_url:
             body["paid_btn_name"] = "openBot"
             body["paid_btn_url"] = return_url

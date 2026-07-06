@@ -46,7 +46,9 @@ tool-use'ом и выдаёт человекочитаемый **root-cause + р
 - Реализация: `backend/app/services/agent/tools.py` (read-only tool-слой:
   `get_node_overview`, `get_node_configs`, `get_node_health_probes`,
   `get_node_traffic`, `get_node_provisioning_tasks`), `services/agent/triage.py`
-  (manual tool-use loop, `claude-sonnet-4-6` по умолчанию, adaptive thinking),
+  (manual tool-use loop, `claude-sonnet-4-6` по умолчанию, adaptive thinking;
+  `max_tokens=8192` с запасом под thinking, а `stop_reason=='max_tokens'` помечает
+  отчёт видимой пометкой об усечении, чтобы обрезанный разбор не выглядел как полный),
   `POST /api/agent/triage/{node_id}` (`api/agent.py`).
 - Гардрейлы: kill switch `AGENT_ENABLED` (по умолчанию OFF), отдельный
   `ANTHROPIC_API_KEY` (не мастер-ключ системы), `AGENT_MAX_ITERATIONS` кап,

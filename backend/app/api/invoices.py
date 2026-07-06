@@ -96,6 +96,12 @@ def _mark_invoice_paid_core(
 
     latest_subscription = invoice.subscription
     if invoice.status == models.InvoiceStatus.paid:
+        # Инвойс уже оплачен (ретрай вебхука после ручного mark_paid или
+        # повторная доставка вебхука провайдера). Payment мог быть только
+        # что помечён paid выше — зафиксируем его, иначе get_db закроет
+        # сессию с неявным откатом и Payment навсегда останется pending.
+        if payment_id:
+            db.commit()
         if not latest_subscription:
             latest_subscription = (
                 db.query(models.Subscription)
@@ -137,13 +143,43 @@ def _mark_invoice_paid_core(
         if amount_kopecks <= 0:
             raise HTTPException(status_code=400, detail="Topup invoice has non-positive amount")
 
+        # Идемпотентность топапа: инвариант «оплаченный topup-инвойс = ровно
+        # одна topup-транзакция». Если строка reference=invoice:<id> уже есть
+        # (ретрай вебхука CryptoBot при не-2xx, либо mark_paid после ошибочного
+        # mark_unpaid), баланс уже зачислен — не кредитуем повторно, только
+        # возвращаем инвойс в статус paid. balance.py дедупа по reference не
+        # делает, поэтому защита живёт здесь.
+        existing_tx = (
+            db.query(models.BalanceTransaction)
+            .filter_by(reference=f"invoice:{invoice.id}")
+            .first()
+        )
+        if existing_tx is not None:
+            invoice.status = models.InvoiceStatus.paid
+            db.add(invoice)
+            db.commit()
+            db.refresh(invoice)
+            return _invoice_with_credentials(invoice, [])
+
         # Referrer payout: runs strictly BEFORE we write the user's own
         # topup row so "first kind=topup" detection is unambiguous. If
         # the user was attributed to a referrer (via /users/register)
         # and has never completed a real topup before, credit
         # REFERRAL_BONUS_KOPECKS to the referrer. Idempotent by
         # reference — a retried webhook can't double-pay.
-        topup_user = db.get(models.User, invoice.user_id)
+        #
+        # Блокируем строку пополняемого пользователя (SELECT ... FOR UPDATE)
+        # ДО проверок prior/already: два одновременных вебхука по двум
+        # разным topup-инвойсам одного юзера лочат разные Invoice-строки и
+        # без этой блокировки оба прошли бы дедуп до коммита друг друга →
+        # двойная выплата бонуса. Блокировка сериализует их по одному
+        # пользователю: второй увидит уже записанную topup-строку первого.
+        topup_user = (
+            db.query(models.User)
+            .filter(models.User.id == invoice.user_id)
+            .with_for_update()
+            .first()
+        )
         if topup_user and topup_user.referred_by_id is not None:
             prior = (
                 db.query(models.BalanceTransaction)
@@ -430,6 +466,11 @@ def batch_invoices(
             if invoice.status == models.InvoiceStatus.pending:
                 results["skipped"].append(inv_id)
                 continue
+            # topup-инвойсы не откатываем (см. mark_invoice_unpaid): баланс
+            # уже зачислен, откат ведёт к двойному зачислению.
+            if invoice.kind == "topup":
+                results["skipped"].append(inv_id)
+                continue
             invoice.status = models.InvoiceStatus.pending
             _audit(db, actor, "invoice_marked_unpaid", "invoice", inv_id, actor_type=actor_type)
 
@@ -456,6 +497,14 @@ def mark_invoice_unpaid(
         raise HTTPException(status_code=404, detail="Invoice not found")
     if invoice.status == models.InvoiceStatus.pending:
         return schemas.InvoiceOut.from_orm(invoice)
+    # topup-инвойс откатывать нельзя: баланс уже зачислен, а возврат в
+    # pending открыл бы путь к повторному зачислению (mark_paid снова или
+    # запоздалый ретрай вебхука). Для коррекции — balance adjustment.
+    if invoice.kind == "topup":
+        raise HTTPException(
+            status_code=400,
+            detail="Cannot revert a topup invoice — balance was already credited; use a balance adjustment instead",
+        )
     invoice.status = models.InvoiceStatus.pending
     db.commit()
     db.refresh(invoice)

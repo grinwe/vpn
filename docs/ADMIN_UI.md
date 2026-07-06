@@ -38,7 +38,7 @@
 - Клик на строку — загружает `GET /api/users/{id}` и показывает список подписок с девайсами.
 - **Пополнить баланс** — форма в детали-панели (только если у юзера есть `telegram_id`). `POST /api/users/by_telegram/{tg_id}/topup` пишет `kind=adjust` с note `admin_topup`. В ledger'е появляется отдельная строка, user balance обновляется оптимистично в UI.
 - **revoke now** на подписке (если `status != blocked|expired`) — `POST /api/subscriptions/{id}/disable`. Юзер отключается от ноды через Ansible за 1-2 минуты, sub переходит в `blocked`.
-- **enable** на подписке (если `status != active`) — `POST /api/subscriptions/{id}/enable`. Если sub был `frozen` — прозрачно зовёт `balance_svc.unfreeze_subscription`. Если `blocked`/`expired` — флипит статус в `active`, ресет `notes`, `next_charge_at = now`, перепровижнивает один девайс через orchestrator.
+- **enable** на подписке (если `status != active`) — `POST /api/subscriptions/{id}/enable`. Если sub был `frozen` — прозрачно зовёт `balance_svc.unfreeze_subscription`. Если `blocked`/`expired` — флипит статус в `active`, ресет `notes`, `next_charge_at = now`, перепровижнивает один девайс через orchestrator. Если репровижининг упал — подписка всё равно остаётся `active`, но в ответе выставляется `reprovision_failed: true` (конфига нет, sub-link отдаст 503); UI должен показать оператору предупреждение.
 - **+ add device** на подписке (только когда `status=active`) — `POST /api/subscriptions/{id}/devices`, админский обход prepaid-гейта. Считает текущие live-девайсы, создаёт новый с именем `device-{N+1}`, запускает ansible. Используется, когда юзер нагрешил руками или нужен тест-девайс на его аккаунте.
 - **unbind** на конкретном девайсе (если `status != revoked|disabled`) — `POST /api/devices/{id}/revoke`. Отвязывает от ноды через ansible, sub остаётся живой — удобно когда один юзер просит освободить слот на ноде.
 - **переселить** per-sub (только когда `status=active`) — dropdown со всеми active-нодами + кнопка. `POST /api/subscriptions/{id}/migrate` с `{target_node_id}`. Это **ручной admin-override**: пул/health/cooldown-фильтры обходятся, проверяется только `is_active=True` на целевой ноде. Старые девайсы revoke'аются в фоне, новый проводится через `reprovision_subscription`. `sub_token` сохраняется, поэтому sub-link у клиента продолжает работать. Отличается от node-wide `POST /nodes/{id}/migrate` тем, что переселяет ровно одну подписку на заданную ноду — альтернатива ушедшей в 2026-04 webapp-кнопке «поменять ноду» (она осознанно не возвращается).
@@ -51,7 +51,7 @@
 
 Действия:
 - **mark paid** на `pending` → `POST /api/invoices/{id}/mark_paid`. Триггерит тот же `_mark_invoice_paid_core` что и вебхуки: для `kind=topup` начисляет баланс (и при первом топапе — реферер payout, см. [TRIAL_SYSTEM.md](TRIAL_SYSTEM.md)); для `kind=subscription` создаёт/продлевает подписку и enqueue'ит провижининг.
-- **mark unpaid** на `paid` → `POST /api/invoices/{id}/mark_unpaid`. **Только bookkeeping** — подписка/девайсы НЕ отзываются. Нужен, если руками помеченный инвойс оказался ошибкой; снятие денег/ревок делать отдельно.
+- **mark unpaid** на `paid` → `POST /api/invoices/{id}/mark_unpaid`. **Только bookkeeping** — подписка/девайсы НЕ отзываются. Нужен, если руками помеченный инвойс оказался ошибкой; снятие денег/ревок делать отдельно. **`kind=topup` откатить нельзя** (400): баланс уже зачислен, для коррекции — balance adjustment. Batch-вариант такие инвойсы пропускает (`skipped`).
 
 ### `/admin/plans` — Plans ([Plans.tsx](../admin/src/pages/Plans.tsx))
 

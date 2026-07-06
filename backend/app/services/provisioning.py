@@ -17,7 +17,7 @@ from ..time_utils import utcnow
 from typing import Any
 
 from prometheus_client import Counter
-from sqlalchemy import case, func
+from sqlalchemy import case, func, or_
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -42,6 +42,15 @@ from .relay import (
 logger = logging.getLogger(__name__)
 TASK_STATUS_COUNTER = Counter("vpn_provisioning_tasks_total", "Provisioning tasks processed", ["status"])
 
+# audit #200: ВНИМАНИЕ — это PER-PROCESS семафор (threading.Semaphore).
+# Провижининг исполняется в RQ-воркерах, каждый в СВОЁМ процессе и берёт по
+# одной джобе за раз, поэтому реальный ГЛОБАЛЬНЫЙ параллелизм ansible =
+# число реплик воркера (WORKER_REPLICAS, скейлится /ops/worker/scale до 20),
+# а НЕ MAX_CONCURRENT_ANSIBLE. Внутри одного процесса семафор насыщается
+# только при inproc-fallback (ALLOW_INPROCESS_PROVISIONING) или нескольких
+# потоках на процесс. Настоящий кросс-воркерный кап требует разделяемого
+# состояния (Redis-семафор) — см. needs_decision в аудите. НЕ полагайся на
+# этот объект как на глобальный предохранитель против лавины прогонов.
 MAX_CONCURRENT_ANSIBLE = int(os.getenv("MAX_CONCURRENT_ANSIBLE", "3"))
 _ansible_semaphore = threading.Semaphore(MAX_CONCURRENT_ANSIBLE)
 
@@ -802,20 +811,39 @@ def _node_has_vless_family(node: models.VPNNode) -> bool:
     return False
 
 
-def _extract_vless_uuid(config_text_enc: str) -> str | None:
+def _extract_vless_uuid(
+    config_text_enc: str, *, cred_id: int | None = None
+) -> str | None:
     """Pull the user UUID out of an encrypted VLESS credential blob.
 
     Credentials are stored as encrypted ``vless://<uuid>@host:port?...``
     URIs — we don't have a dedicated column for the UUID, so the resync
     path has to parse it back out. Returns ``None`` if decryption or
     parsing fails, so a single corrupt row doesn't sink the whole batch.
+
+    ``cred_id`` is optional context: when the extraction fails on the
+    migrate path we log a warning with it so the битую строку можно
+    найти в БД (audit #216 — иначе UUID-наследование при переезде
+    отваливалось бесследно и клиент тихо переподписывался).
     """
     try:
         uri = decrypt(config_text_enc)
     except Exception:  # noqa: BLE001
+        logger.warning(
+            "vless-uuid: decrypt failed for credential %s — "
+            "UUID не унаследуется при миграции",
+            cred_id,
+        )
         return None
     match = _VLESS_UUID_RE.match(uri)
-    return match.group(1) if match else None
+    if not match:
+        logger.warning(
+            "vless-uuid: regexp mismatch for credential %s — "
+            "UUID не унаследуется при миграции",
+            cred_id,
+        )
+        return None
+    return match.group(1)
 
 
 def _device_vless_uuid(device: models.Device) -> str | None:
@@ -827,11 +855,23 @@ def _device_vless_uuid(device: models.Device) -> str | None:
     this, every relay move forces installed clients to refetch and
     rebind, which is the bug this helper exists to nail down.
     """
+    saw_vless = False
     for cred in device.credentials:
         if cred.proto in _VLESS_FAMILY_PROTOS:
-            extracted = _extract_vless_uuid(cred.config_text)
+            saw_vless = True
+            extracted = _extract_vless_uuid(cred.config_text, cred_id=cred.id)
             if extracted:
                 return extracted
+    if saw_vless:
+        # audit #216: у девайса были vless-строки, но ни одна не дала UUID —
+        # именно тот регресс, ради которого хелпер написан (клиент после
+        # переезда получит новый UUID и переподпишется). Логируем контекст.
+        logger.warning(
+            "vless-uuid: no VLESS credential yielded a UUID for device %s "
+            "(subscription %s) — новый UUID будет сгенерирован при миграции",
+            device.id,
+            device.subscription_id,
+        )
     return None
 
 
@@ -1033,8 +1073,11 @@ class ProvisioningOrchestrator:
         (default 15), отсортированных по reconcile_due_at ASC (дольше всех
         ждавшие — первыми, FIFO-справедливость). Остальные созревшие подождут
         следующего тика (RECONCILE_INTERVAL=3s). Это back-pressure против
-        thundering herd при bulk-правке (50 нод сразу): семафор всё равно
-        пускает MAX_CONCURRENT_ANSIBLE параллельно, но кап не плодит лишние
+        thundering herd при bulk-правке (50 нод сразу): диспатченные джобы
+        реально бегут параллельно вплоть до WORKER_REPLICAS воркеров (audit
+        #200: per-process _ansible_semaphore НЕ капит их глобально — не
+        полагайся на него здесь), но RECONCILE_MAX_PER_TICK ограничивает,
+        сколько нод созревает за один тик, и кап не плодит лишние
         pending-строки впереди ёмкости. Берём limit+1, чтобы честно
         репортить ``capped`` (есть ли ещё созревшие сверх капа), не считая
         второй COUNT."""
@@ -1150,14 +1193,35 @@ class ProvisioningOrchestrator:
         *,
         error: str | None = None,
         result: dict[str, Any] | None = None,
+        commit: bool = True,
     ) -> None:
         task.status = status
         task.error_message = error
         task.result = result
         task.finished_at = utcnow()
         self.db.add(task)
-        self.db.commit()
+        # audit #52: на success-пути run_task передаёт commit=False, чтобы
+        # статус таски и активация девайса (в _handle_task_outcome) легли
+        # ОДНИМ commit'ом — иначе краш между двумя commit'ами оставлял
+        # девайс pending навсегда при уже success-таске.
+        if commit:
+            self.db.commit()
         TASK_STATUS_COUNTER.labels(status=status.value).inc()
+
+    def _fail_cancelled_device(self, task: models.ProvisioningTask) -> None:
+        """audit #56: отменённую device-apply таску нельзя оставлять с девайсом
+        в pending — он числится живым в лимитах (notin_ revoked/disabled), висит
+        «настраивается» в ЛК, и никакой sweep его не подбирает. Отмена ноду не
+        демотит, поэтому НЕ зовём _handle_task_outcome (тот тронул бы логику
+        нод/exit'ов) — точечно переводим только pending-девайс в failed."""
+        if task.target_type != "device" or task.action != "apply":
+            return
+        device = self.db.get(models.Device, task.target_id)
+        if device and device.status == models.DeviceStatus.pending:
+            device.status = models.DeviceStatus.failed
+            device.updated_at = utcnow()
+            self.db.add(device)
+            self.db.commit()
 
     def _is_cancel_requested(self, task_id: int) -> bool:
         """Свежая короткая сессия — видеть cancel_requested_at, выставленный
@@ -1185,6 +1249,7 @@ class ProvisioningOrchestrator:
                 task, models.ProvisioningTaskStatus.cancelled,
                 error="cancelled before start",
             )
+            self._fail_cancelled_device(task)  # audit #56
             return task
 
         task.started_at = utcnow()
@@ -1206,6 +1271,7 @@ class ProvisioningOrchestrator:
                 error="cancelled by operator (SIGTERM)",
                 result={"stdout": exc.stdout, "stderr": exc.stderr},
             )
+            self._fail_cancelled_device(task)  # audit #56
             return task
         except Exception as exc:  # noqa: BLE001
             # Unexpected error BEFORE or AFTER ansible (setup/teardown,
@@ -1213,6 +1279,18 @@ class ProvisioningOrchestrator:
             # *not* raised here anymore — _execute_task returns the payload
             # with returncode and we branch below, so the stdout is always
             # visible in the Tasks UI.
+            #
+            # audit #205: если исходное исключение пришло из aborted-сессии
+            # (обрыв БД, deadlock, ошибка commit'а в хелпере), то commit
+            # внутри _mark_task упал бы PendingRollbackError — реальная
+            # ошибка потерялась бы, а таска осталась running (зомби). Сначала
+            # откатываем сессию, чтобы _mark_task смог записать статус failed.
+            try:
+                self.db.rollback()
+            except Exception:  # noqa: BLE001
+                logger.exception(
+                    "rollback before marking task %s failed also failed", task.id
+                )
             logger.exception("Provisioning task %s failed", task.id)
             self._mark_task(
                 task, models.ProvisioningTaskStatus.failed,
@@ -1244,8 +1322,23 @@ class ProvisioningOrchestrator:
             self._handle_task_outcome(task, success=False)
             return task
 
-        self._mark_task(task, models.ProvisioningTaskStatus.success, result=result_payload)
+        # audit #52: раньше здесь было два раздельных commit'а — _mark_task
+        # фиксировал таску success, а _handle_task_outcome отдельным commit'ом
+        # активировал девайс/креды. Краш между ними (обрыв БД, kill, timeout)
+        # оставлял девайс pending навсегда при уже-зелёной таске (оператор
+        # проблему в /admin/tasks не видит). Теперь помечаем таску БЕЗ commit'а,
+        # затем _handle_task_outcome (device-ветка коммитит статус таски +
+        # активацию девайса ОДНОЙ транзакцией на 1638). Трейлинг-commit добивает
+        # те outcome-пути, что делают return без commit'а (retired-in-flight,
+        # relay_tunnel, device-not-found) — тогда success фиксируется здесь, а
+        # если краш случится ДО него, таска ещё не success и RQ-retry честно
+        # переиграет идемпотентный ansible.
+        self._mark_task(
+            task, models.ProvisioningTaskStatus.success,
+            result=result_payload, commit=False,
+        )
         self._handle_task_outcome(task, success=True)
+        self.db.commit()
         return task
 
     def run_task_async(
@@ -1295,7 +1388,12 @@ class ProvisioningOrchestrator:
                 session.rollback()
             try:
                 task = session.get(models.ProvisioningTask, task_id)
-                if task:
+                # audit #52: НЕ перетираем терминальный статус. run_task мог
+                # уже пометить таску success/failed/cancelled и упасть позже
+                # (например в _handle_task_outcome) — переписать её в failed
+                # значило бы затереть корректный success. Ремаркаем только
+                # ещё-бегущую таску (обрыв до терминальной пометки).
+                if task and task.status == models.ProvisioningTaskStatus.running:
                     orchestrator = ProvisioningOrchestrator(session)
                     orchestrator._mark_task(  # noqa: SLF001
                         task, models.ProvisioningTaskStatus.failed, error=str(exc),
@@ -1738,6 +1836,13 @@ class ProvisioningOrchestrator:
                                 "(continuing — ansible will retry)", node.id,
                             )
                     site_vars = _collect_site_extra_vars(self.db, node)
+                    node_name = node.name
+                    # audit #54: снапшот БД собран (node/site_vars/inventory уже
+                    # материализованы) — коммитим, чтобы отдать соединение из
+                    # пула на время долгого (до 900с) прогона. Иначе сессия
+                    # висит idle in transaction весь site.yml: держит коннект
+                    # и блокирует autovacuum по прочитанным таблицам.
+                    self.db.commit()
                     # 900s (15мин) потому что site.yml на свежей relay/jump-ноде
                     # гонит подряд bootstrap_node + install_vless_reality +
                     # install_vless_xhttp (certbot/ACME) + relay_jump_node (wg)
@@ -1749,7 +1854,7 @@ class ProvisioningOrchestrator:
                     result = run_playbook(
                         "site.yml",
                         inventory,
-                        limit=node.name,
+                        limit=node_name,
                         extra_vars=site_vars,
                         timeout=900,
                     )
@@ -1789,10 +1894,14 @@ class ProvisioningOrchestrator:
                                 "provisioning-key bootstrap failed for exit %s "
                                 "(continuing — ansible will retry)", exit_node.id,
                             )
+                    exit_name = exit_node.name
+                    # audit #54: снапшот собран — отдаём соединение из пула
+                    # на время bootstrap_exit (до 600с), см. site.yml-ветку.
+                    self.db.commit()
                     result = run_playbook(
                         "playbooks/bootstrap_exit.yml",
                         inventory,
-                        limit=exit_node.name,
+                        limit=exit_name,
                         extra_vars=exit_vars,
                         timeout=600,
                     )
@@ -1848,9 +1957,14 @@ class ProvisioningOrchestrator:
                         "device has no config/subscription pointing at a node"
                     )
                 inventory = build_inventory_for_node(node)
+                node_name = node.name
+                # audit #54: снапшот собран (payload — из task.payload, уже
+                # материализован) — отдаём соединение из пула на время
+                # provision_device.yml, см. site.yml-ветку.
+                self.db.commit()
                 result = run_playbook(
                     "playbooks/provision_device.yml",
-                    inventory, limit=node.name, extra_vars=payload,
+                    inventory, limit=node_name, extra_vars=payload,
                 )
             else:
                 raise RuntimeError(f"Unsupported target type {task.target_type}")
@@ -2532,6 +2646,16 @@ class ProvisioningOrchestrator:
         device_name: str | None = None,
         expires_at_override: datetime | None = None,
     ) -> tuple[models.Subscription, models.ProvisioningTask]:
+        # audit #55: сериализуем проверку лимита устройств per-user. Без
+        # row-lock два конкурентных запроса (даблклик в webapp, ретрай
+        # бота при таймауте) оба видят active_device_count < max_devices и
+        # оба создают подписку+девайс, перебирая plan.max_devices. Берём
+        # FOR UPDATE строки User ПЕРВЫМ (до node-локов в choose_node —
+        # единый порядок захвата, без deadlock'а): конкурент ждёт наш
+        # commit и пересчитывает актуальный count.
+        self.db.query(models.User).filter(
+            models.User.id == user.id
+        ).with_for_update().one()
         node = choose_node(self.db, plan, node_id=node_id)
 
         # All enabled configs become credentials under one subscription so
@@ -3056,7 +3180,7 @@ class ProvisioningOrchestrator:
                 user_uuid: str | None = None
                 for cred in device.credentials:
                     if cred.proto in _VLESS_FAMILY_PROTOS:
-                        user_uuid = _extract_vless_uuid(cred.config_text)
+                        user_uuid = _extract_vless_uuid(cred.config_text, cred_id=cred.id)
                         if user_uuid:
                             break
                 if not user_uuid:
@@ -3213,7 +3337,7 @@ class ProvisioningOrchestrator:
             key = (cred.proto, username)
             if key in seen:
                 return
-            user_uuid = _extract_vless_uuid(cred.config_text)
+            user_uuid = _extract_vless_uuid(cred.config_text, cred_id=cred.id)
             if not user_uuid:
                 logger.warning(
                     "resync: skipping credential %s (no UUID parsed)", cred.id
@@ -3628,13 +3752,7 @@ class ProvisioningOrchestrator:
         if reused_tokens:
             for d in live_devices_snapshot:
                 if d.sub_token and d.sub_token in reused_tokens:
-                    d.sub_token = None
-                    # client_id_hmac производный от sub_token и тоже UNIQUE —
-                    # сбрасываем вместе, иначе reprovision INSERT с тем же
-                    # reuse_sub_token упрётся в ix_devices_client_id_hmac
-                    # (как в migrate_device_to_node ниже).
-                    d.client_id_hmac = None
-            self.db.flush()
+                    self._release_sub_token(d)
 
         subscription.node_id = target.id
         self.db.add(subscription)
@@ -3833,12 +3951,7 @@ class ProvisioningOrchestrator:
             background=True,
         )
         if reuse_token:
-            device.sub_token = None
-            # client_id_hmac производный от sub_token — сбрасываем
-            # вместе, иначе UNIQUE-индекс заблокирует reuse этого
-            # client_id_hmac на новом Device.
-            device.client_id_hmac = None
-            self.db.flush()
+            self._release_sub_token(device)
         new_device, task = self.reprovision_subscription(
             sub,
             device_name=device.name,
@@ -3969,9 +4082,7 @@ class ProvisioningOrchestrator:
             background=True,
         )
         if reuse_token:
-            device.sub_token = None
-            device.client_id_hmac = None  # производный от sub_token → сбрасываем
-            self.db.flush()
+            self._release_sub_token(device)
         new_device, task = self.reprovision_subscription(
             sub,
             device_name=device.name,
@@ -4031,10 +4142,39 @@ class ProvisioningOrchestrator:
     ) -> list[models.ProvisioningTask]:
         tasks: list[models.ProvisioningTask] = []
         for device in subscription.devices:
+            # audit #53: revoked/disabled девайсы по инварианту саб-линка
+            # НЕ удаляются и копятся после каждого переезда/failover. Без
+            # фильтра каждое отключение (блок, превышение трафика, экспайр)
+            # плодило бы бессмысленный ansible-revoke на КАЖДУЮ историческую
+            # строку — самый дорогой ресурс системы. Скипаем терминальные,
+            # как это уже делает migrate_subscription_to_new_node.
+            if device.status in (
+                models.DeviceStatus.revoked,
+                models.DeviceStatus.disabled,
+            ):
+                continue
             tasks.append(self.revoke_device(device, reason=reason))
         subscription.status = models.SubscriptionStatus.blocked
         self.db.commit()
         return tasks
+
+    def _release_sub_token(self, device: models.Device) -> None:
+        """Освободить UNIQUE-слоты sub_token перед INSERT нового Device с тем
+        же токеном (миграция/failover переиспользуют sub_token — см. sub-link
+        инвариант в docs/components/backend-api.md).
+
+        Обнуляем ОБА поля: ``client_id_hmac`` производный от ``sub_token`` и
+        тоже под UNIQUE-индексом (ix_devices_client_id_hmac). Если сбросить
+        только sub_token, reprovision INSERT с ``reuse_sub_token`` упрётся в
+        ix_devices_client_id_hmac. ``flush`` фиксирует NULL до INSERT нового
+        ряда. Раньше эта пара «танцевала» дословно в трёх методах миграции
+        (audit #243) — знание об инварианте жило в перекрёстных комментариях,
+        а не в коде; третий путь без обеих строк упал бы IntegrityError'ом
+        посреди миграции (старый девайс уже revoked, новый не создан).
+        """
+        device.sub_token = None
+        device.client_id_hmac = None
+        self.db.flush()
 
     def _disable_device_keep_on_node(self, device: models.Device) -> None:
         """Retire a device in the DB WITHOUT revoking it on the node.
@@ -4209,7 +4349,7 @@ class ProvisioningOrchestrator:
                 builder = builders.get(cfg.protocol)
                 if builder is None:
                     continue  # shadowtls / hysteria2 — nothing sni/port-derived
-                user_uuid = _extract_vless_uuid(cred.config_text)
+                user_uuid = _extract_vless_uuid(cred.config_text, cred_id=cred.id)
                 if not user_uuid:
                     continue  # can't rebuild without the existing UUID
                 cred.config_text = encrypt(builder(node, cfg, user_uuid))
@@ -4277,8 +4417,19 @@ class ProvisioningOrchestrator:
         # not lag behind the new pin. reconcile_xray only reads
         # active (+ warm) creds, so revoked rows don't leak into the
         # regenerated routing rules.
+        # audit #58: ограничиваем UPDATE кредами ЦЕЛЕВОЙ ноды. Линк выше
+        # провалидирован только для node = subscription.node; без фильтра
+        # по node_id мы перепинывали бы exit_id и на кредах, добранных
+        # _maybe_attach_diverse на других нодах (B/C) — там такого линка
+        # нет, resolve_exit_interface вернул бы None и routing тихо
+        # деградировал. node_id IS NULL — legacy cold-path строки этой же
+        # ноды (до появления Credential.node_id).
         self.db.query(models.Credential).filter(
-            models.Credential.subscription_id == subscription.id
+            models.Credential.subscription_id == subscription.id,
+            or_(
+                models.Credential.node_id == node.id,
+                models.Credential.node_id.is_(None),
+            ),
         ).update(
             {models.Credential.exit_id: new_exit_id},
             synchronize_session=False,
@@ -4352,8 +4503,15 @@ class ProvisioningOrchestrator:
                 "device is already routed through this exit"
             )
 
+        # audit #58: как и в switch_subscription_exit — линк валиден только
+        # для node этого девайса, поэтому не трогаем exit_id кредов того же
+        # девайса на других нодах диверс-набора (node_id IS NULL — legacy).
         self.db.query(models.Credential).filter(
-            models.Credential.device_id == device.id
+            models.Credential.device_id == device.id,
+            or_(
+                models.Credential.node_id == node.id,
+                models.Credential.node_id.is_(None),
+            ),
         ).update(
             {models.Credential.exit_id: new_exit_id},
             synchronize_session=False,

@@ -18,7 +18,7 @@ app.include_router(webapp_router)  # api_webapp       — Mini App
 Middleware порядок:
 1. SlowAPI rate limiter (`rate_limit.py`: кастомный `rate_limit_key`, default `300/minute; 60/second`, storage `SLOWAPI_STORAGE_URI` → `REDIS_URL` → `memory://`). Ключ — реальный клиентский IP: за доверенным прокси (private-сети докера либо `RATE_LIMIT_TRUSTED_PROXIES`) берётся `X-Real-IP` (fallback — последний элемент `X-Forwarded-For`, дописанный nginx), с недоверенных адресов заголовки игнорируются. Запросы с валидным `X-Admin-Token` (бот, админка) освобождены от per-IP лимитов (уникальный ключ на запрос), кроме `/api/agent/*` — там «потолок на источник» намеренный.
 2. CORS — включается только если задан `CORS_ALLOWED_ORIGINS` (comma-separated).
-3. Кастомный `add_metrics` — пишет `vpn_requests_total` / `vpn_requests_errors_total` в Prometheus, используя **matched route template** (`/api/users/{user_id}`), чтобы cardinality не взрывалась на каждом id (`main.py:92-104`).
+3. Кастомный `add_metrics` — пишет `vpn_requests_total` / `vpn_requests_errors_total` в Prometheus, используя **matched route template** (`/api/users/{user_id}`), чтобы cardinality не взрывалась на каждом id. Необработанные исключения (реальные 500-краши) тоже считаются в оба счётчика с `status="500"` — краш перехватывается в `except` и пере-бросывается, финальный ответ строит `@app.exception_handler(Exception)` (`main.py`).
 
 `/metrics` доступен только под `require_admin` — `main.py:122-124`.
 
@@ -74,7 +74,7 @@ Middleware порядок:
 
 ### Audit logging
 
-Внутри admin-роутов любое state-changing действие пишется через `_audit(db, actor, action, target_type, target_id, metadata=...)` (`api/_common.py:42-69`). `actor` приходит из `_resolve_admin_actor(actor_header)` — **заголовок `X-Admin-Actor` не проверяется криптографически**, это self-declared идентификатор для различения действий бота от действий человека. См. `api/_common.py:72-81`.
+Внутри admin-роутов любое state-changing действие пишется через `_audit(db, actor, action, target_type, target_id, metadata=..., commit=True)`. По умолчанию `_audit` коммитит сам (обратная совместимость со ~100 call-site'ами); передайте `commit=False`, чтобы только застейджить строку и зафиксировать действие вместе с аудитом одной транзакцией (без окна «мутация есть, следа нет»). Так, например, работает `_get_or_create_user` — User и его `user_created`-строка пишутся атомарно, а гонка на уникальном `telegram_id` ловится через `IntegrityError` + перечитывание (409 только если строка так и не нашлась). `actor` приходит из `_resolve_admin_actor(actor_header)` — **заголовок `X-Admin-Actor` не проверяется криптографически**, это self-declared идентификатор для различения действий бота от действий человека.
 
 > ⚠️ Shared admin token + unchecked actor header = если компрометируется любой носитель токена, audit trail теряет доверие. См. audit/...
 
@@ -157,7 +157,7 @@ def dynamic_sub_link(token: str, db: Session = Depends(get_db)):
     # legacy per-subscription path
 ```
 
-Два уровня lookup'а: сначала `Device.sub_token` (добавлен alembic `0022_device_sub_token`, выдаётся webapp'ом при покупке), затем legacy `Subscription.sub_token` для старых клиентов, установленных до миграции. Выдаёт base64-кодированный список URI активных credential'ов + заголовки `subscription-userinfo` (expire) и `profile-update-interval: 6`, которые Hiddify/v2rayNG читают для автообновления. Пишет `AuditLog(action='subscription_fetch')` на каждый опрос (`target_type='device'` или `'subscription'` в зависимости от пути).
+Два уровня lookup'а: сначала `Device.sub_token` (добавлен alembic `0022_device_sub_token`, выдаётся webapp'ом при покупке), затем legacy `Subscription.sub_token` для старых клиентов, установленных до миграции. Выдаёт base64-кодированный список URI активных credential'ов + заголовки `subscription-userinfo` (expire) и `profile-update-interval: 6`, которые Hiddify/v2rayNG читают для автообновления. Пишет `AuditLog(action='subscription_fetch')` на каждый опрос (`target_type='device'` или `'subscription'` в зависимости от пути); в горячем read-пути запись сэмплируется env-рубильником `SUB_FETCH_AUDIT_SAMPLE` (int, по умолчанию 1 = писать каждый фетч; N>1 — примерно 1 из N, чтобы `audit_logs` не рос неограниченно без retention-джобы).
 
 **Alias-fallback для seamless migration.** Миграция (admin override, drain, auto-migrate-on-block) revoke'ает старый Device и создаёт новый с **другим** `sub_token`. Сохранённый в Hiddify URL указывал бы на revoked device и отдавал бы пустой список — юзер вынужден был бы копировать новый URL из webapp. Фикс: если найденный по токену device имеет `status != active` или у него нет активных credential'ов — ищем любой живой device на **той же** Subscription (берём самый свежий по `updated_at`, чтобы цепочка миграций A→B→C alias'илась на C) и отдаём его креды. В AuditLog extra пишется `aliased_to_device_id`, чтобы alias-путь был виден. Для multi-device подписок есть известное ограничение: `reprovision_subscription` на миграции создаёт один device, и все старые URL'ы alias'нутся на него (коллапс в единственного выжившего).
 
@@ -209,7 +209,7 @@ def dynamic_sub_link(token: str, db: Session = Depends(get_db)):
 ## Обработка ошибок
 
 - FastAPI `HTTPException` — для бизнес-ошибок, превращается в `{"detail": "..."}`.
-- Внутренние сбои логируются через `logger.exception`, наружу уходит generic 500. Исключения — провижининг: `_create_subscription_for_user` ловит любую ошибку, делает rollback, отдаёт 500 "Provisioning failed" (`api/_common.py:129-160`).
+- Внутренние сбои логируются через `logger.exception` в `@app.exception_handler(Exception)`; наружу уходит generic 500 с `request_id` в теле и заголовке `X-Request-ID`, по которому краш находится в логах. Исключения — провижининг: `_create_subscription_for_user` ловит любую ошибку, делает rollback, отдаёт 500 "Provisioning failed" (`api/_common.py:129-160`).
 - Rate limit превышение — 429, обрабатывается SlowAPI middleware.
 - Cold-path throttle — 503 с `Retry-After` header. Вызывается, когда окно `COLD_PROVISION_MAX_PER_WINDOW / COLD_PROVISION_WINDOW_SECONDS` исчерпано на cold branch `provision_subscription` (warm-pool промах). Migrations и `reprovision_subscription` лимит **не** трогают — только user-initiated активации. Перехватывается централизованно в `main.py` (`@app.exception_handler(ColdPathThrottled)`). Реализация — `services/provisioning_throttle.py`. Защита, придуманная после инцидента 2026-04-15 с bot-флудом.
 

@@ -199,16 +199,65 @@ class FourVpsDriver:
 
     def set_autoprolong(self, external_id: str, enabled: bool = True) -> bool:
         """Включить/выключить авто-продление. 4vps `/action/autoprolong` —
-        ТОГГЛ: возвращает НОВОЕ состояние (data: true/false). Дёргаем и, если
-        состояние не совпало с желаемым, дёргаем второй раз. Возвращает
-        итоговое состояние."""
+        ТОГГЛ (возвращает НОВОЕ состояние, data: true/false), а не установка
+        значения. Слепой тоггл опасен: если состояние УЖЕ желаемое, первый
+        вызов его инвертирует, и корректность держится только на втором вызове;
+        падение второго (сеть/429) молча оставляет автопродление выключенным, а
+        вызывающий код глотает ошибку (node_spawner) → нода сносится хостером в
+        конце периода. Поэтому сначала читаем текущее состояние из /myservers и
+        тоггаем ТОЛЬКО при несовпадении. Возвращает итоговое состояние."""
+        current = self._read_autoprolong(external_id)
+        if current is not None:
+            if current == enabled:
+                # уже нужное состояние — тоггл не трогаем (он бы инвертировал).
+                return current
+            # знаем исходное → ровно один целенаправленный тоггл + проверка.
+            data = self._call("POST", "/action/autoprolong", {"serverid": external_id})
+            state = bool(data)
+            if state != enabled:
+                raise DriverError(
+                    f"4vps autoprolong {external_id}: toggle landed on {state}, "
+                    f"expected {enabled}"
+                )
+            return state
+        # состояние прочитать не удалось (сервер/поле не найдены) — осторожный
+        # слепой тоггл до 2 раз, но при неуспехе БРОСАЕМ DriverError, а не тихо
+        # возвращаем инвертированное состояние.
         state = False
         for _ in range(2):
             data = self._call("POST", "/action/autoprolong", {"serverid": external_id})
             state = bool(data)
             if state == enabled:
                 return state
-        return state
+        raise DriverError(
+            f"4vps autoprolong {external_id}: could not reach {enabled} "
+            f"after 2 toggles (last={state})"
+        )
+
+    def _read_autoprolong(self, external_id: str) -> bool | None:
+        """Прочитать текущее состояние автопродления сервера из /myservers.
+
+        Возвращает True/False, либо None если сервер не найден / поле
+        отсутствует / запрос упал (тогда вызывающий делает осторожный слепой
+        тоггл). Точное написание поля в /myservers у 4vps не задокументировано
+        (док перечисляет ``{id,name,ipv4,status,tid,dc,price,…}``); эндпоинт —
+        ``/action/autoprolong``, поэтому ищем ключ, содержащий ``prolong``
+        (регистр игнорируем). Если реальный ответ API называет поле иначе —
+        сверить и поправить подстроку здесь."""
+        try:
+            data = self._call("GET", "/myservers", {})
+        except DriverError:
+            return None
+        for srv in (data or {}).get("serverlist") or []:
+            if not isinstance(srv, dict):
+                continue
+            if str(srv.get("id") or "") != str(external_id):
+                continue
+            for key, val in srv.items():
+                if "prolong" in str(key).lower():
+                    return _truthy(val)
+            return None
+        return None
 
     def list_regions(self) -> list[str]:
         """Protocol-метод: id датацентров строками."""
@@ -392,3 +441,11 @@ def _to_int(v) -> int | None:
         return int(v)
     except (TypeError, ValueError):
         return None
+
+
+def _truthy(v) -> bool:
+    """Нормализовать «включённость» из ответа 4vps: строки ``"1"/"true"/"on"``
+    и числа/bool. Всё прочее (в т.ч. ``"0"/"false"/None``) → False."""
+    if isinstance(v, str):
+        return v.strip().lower() in ("1", "true", "yes", "on", "y")
+    return bool(v)

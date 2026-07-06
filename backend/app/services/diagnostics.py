@@ -60,6 +60,12 @@ class PathProbeResult:
     checks: list[Check] = field(default_factory=list)
     ping_ok: bool = False
     ssh_ok: bool = False
+    # True когда ssh-стадию НЕ смогли выполнить (нет paramiko / нет файла ключа),
+    # а не «проверили — недоступно». Отличает конфиг-ошибку контроллера от
+    # реальной недоступности хоста: при skip вызывающий (reachability-тик) не
+    # должен переводить цель в unreachable — иначе потеря одного ключа кладёт
+    # весь флот в ложный DOWN. См. finding #97.
+    ssh_skipped: bool = False
     summary: str = ""
 
 
@@ -213,6 +219,10 @@ def run_local_path_probe(
     ssh_ok, ssh_check = _probe_ssh(host, ssh_port)
     result.checks.append(ssh_check)
     result.ssh_ok = ssh_ok
+    # skip = ssh-стадию не смогли выполнить (нет paramiko / нет ключа), а не
+    # доказанная недоступность. Вызывающий использует флаг, чтобы не метить
+    # цель unreachable по конфиг-ошибке контроллера (finding #97).
+    result.ssh_skipped = ssh_check["status"] == "skip"
 
     if not ssh_ok and traceroute_on_fail:
         result.checks.append(_probe_traceroute(host))

@@ -172,7 +172,9 @@ cmd_add() {
   chown root:nogroup "${CONFIG}"
   chmod 0640 "${CONFIG}"
   rewrite_routing "${email}" "add"
-  reload_xray
+  # reload_xray is deliberately NOT called here — the restart runs
+  # outside the flock section (see bottom of file) so a hung
+  # systemctl can't wedge the lock for every subsequent invocation.
   echo "added vless user ${email}${EXIT_INTERFACE:+ via ${EXIT_INTERFACE}}"
 }
 
@@ -203,7 +205,7 @@ cmd_del() {
   chown root:nogroup "${CONFIG}"
   chmod 0640 "${CONFIG}"
   rewrite_routing "${email}" "del"
-  reload_xray
+  # reload_xray runs outside the flock section (see bottom of file).
   echo "removed vless user ${email}"
 }
 
@@ -235,8 +237,19 @@ main() {
 # The symptom is "invalid request user id" / EOF for one of the
 # users until a manual resync re-adds them. flock(1) is POSIX,
 # available on every Debian/Ubuntu, and the held time is <50ms
-# (jq parse + write + systemctl restart), so there's no meaningful
-# serialization overhead.
-exec 200>"${LOCKFILE}"
-flock 200
-main "$@"
+# (jq parse + write), so there's no meaningful serialization overhead.
+#
+# Two invariants (mirrors manage_vless_xhttp_user.sh):
+#   1. `-w 30` bounds the wait — a stuck lock holder makes this call
+#      fail (exit 1) instead of hanging forever. ansible's command
+#      module has no timeout of its own, so an unbounded wait would
+#      block the playbook and, with it, a provisioning-orchestrator
+#      worker slot (they're semaphore-limited).
+#   2. The `systemctl restart xray` (reload_xray) runs OUTSIDE the
+#      locked section. Restart under the lock means one hung
+#      systemctl wedges every subsequent invocation on the node.
+(
+  flock -w 30 200 || { echo "manage_vless_user: lock timeout after 30s" >&2; exit 1; }
+  main "$@"
+) 200>"${LOCKFILE}"
+reload_xray
