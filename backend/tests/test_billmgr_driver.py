@@ -45,7 +45,9 @@ def _driver(post_handler) -> BillmgrDriver:
 
 def test_parse_token():
     base, user, pw = _parse_token(_TOKEN)
-    assert base == "https://bill.ufo.hosting/billmgr"  # trailing / срезан
+    # _parse_token срезает хвостовой /billmgr (его дописывает _call → иначе
+    # /billmgr/billmgr = HTML 404); trailing / тоже снимается.
+    assert base == "https://bill.ufo.hosting"
     assert user == "u" and pw == "p"
     with pytest.raises(DriverError):
         _parse_token("not json")

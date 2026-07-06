@@ -25,6 +25,7 @@ from app.services.node_spawner import NodeSpawnError
 from tests.factories import (
     make_node,
     make_plan,
+    make_provider,
     make_subscription_with_device,
     make_user,
 )
@@ -95,10 +96,20 @@ def _hot_pool(
     primary: int,
     fallbacks: list[int] | None,
 ) -> models.ServerPool:
+    # ServerPool.autoscale_provider_id — enforced FK на cloud_providers.id,
+    # поэтому засеваем реальные CloudProvider-строки, иначе IntegrityError.
+    # После TRUNCATE ... RESTART IDENTITY id стартуют с 1, так что засеваем
+    # провайдеров по порядку до максимального нужного id (primary + fallbacks) —
+    # так их id детерминированно совпадают с ожидаемыми в ассертах цепочки.
+    # autoscale_fallback_provider_ids — JSONB без FK, но реальные строки под
+    # них тоже держим, чтобы id в цепочке были предсказуемы.
+    needed = max([primary, *(fallbacks or [])])
+    providers = [make_provider(db, name=f"cloud-prov-{primary}-{i}") for i in range(1, needed + 1)]
+    primary_provider = providers[primary - 1]
     pool = models.ServerPool(
         name=f"chain-pool-{primary}",
         autoscale_enabled=True,
-        autoscale_provider_id=primary,
+        autoscale_provider_id=primary_provider.id,
         autoscale_region="fsn1",
         autoscale_plan="cx11",
         autoscale_high_watermark=0.5,

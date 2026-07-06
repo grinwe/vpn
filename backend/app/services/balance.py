@@ -19,7 +19,7 @@ from __future__ import annotations
 import logging
 import math
 import os
-from datetime import datetime, timedelta
+from datetime import timedelta
 
 from prometheus_client import Counter, Gauge
 from sqlalchemy.orm import Session

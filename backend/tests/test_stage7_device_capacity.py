@@ -6,7 +6,6 @@ under-provisions once users start adding extras.
 """
 from __future__ import annotations
 
-import pytest
 from sqlalchemy.orm import Session
 
 from app import models
@@ -17,6 +16,7 @@ from tests.factories import (
     make_device,
     make_node,
     make_plan,
+    make_provider,
     make_subscription,
     make_subscription_with_device,
     make_user,
@@ -68,10 +68,13 @@ def test_choose_node_ignores_revoked_devices(db_session: Session) -> None:
 
 def test_autoscale_counts_devices_not_subs(db_session: Session) -> None:
     """A single sub with 3 devices on a max_users=3 node → 100% util."""
+    # ServerPool.autoscale_provider_id — FK на cloud_providers.id, поэтому
+    # сначала засеваем провайдера и берём его реальный id.
+    provider = make_provider(db_session)
     pool = models.ServerPool(
         name="dev-pool",
         autoscale_enabled=True,
-        autoscale_provider_id=1,
+        autoscale_provider_id=provider.id,
         autoscale_region="fsn1",
         autoscale_plan="cx11",
         autoscale_high_watermark=0.5,
@@ -98,10 +101,12 @@ def test_autoscale_counts_devices_not_subs(db_session: Session) -> None:
 def test_autoscale_counts_zero_when_only_revoked_devices(
     db_session: Session,
 ) -> None:
+    # FK на cloud_providers.id — засеваем провайдера перед пулом.
+    provider = make_provider(db_session)
     pool = models.ServerPool(
         name="rev-pool",
         autoscale_enabled=True,
-        autoscale_provider_id=1,
+        autoscale_provider_id=provider.id,
         autoscale_region="fsn1",
         autoscale_plan="cx11",
     )

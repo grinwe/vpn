@@ -218,7 +218,9 @@ def build_inventory_for_node(node: models.VPNNode, ansible_user: str = "root") -
     inventory keys. The validation runs *before* any filesystem work,
     so a rejected call leaves ``/tmp`` untouched.
     """
-    _ensure_ansible_root()
+    # Сборка inventory-строки во временный файл не требует каталога
+    # infra/ansible — гард _ensure_ansible_root() остаётся только в
+    # run_playbook перед реальным прогоном.
     _validate_node_for_inventory(node)
     inventory_content = """
 all:
@@ -254,7 +256,8 @@ def build_inventory_for_exit_node(
 
     Caller must unlink the returned temp file in a ``finally`` block.
     """
-    _ensure_ansible_root()
+    # Сборка inventory-строки во временный файл не требует каталога
+    # infra/ansible — гард остаётся только в run_playbook.
     validate_node_identity_fields(exit_node.name, exit_node.host, exit_node.ssh_port)
     inventory_content = """
 all:
@@ -294,7 +297,8 @@ def build_inventory_for_relay_link_diagnose(
 
     Caller must unlink the returned temp file in a ``finally`` block.
     """
-    _ensure_ansible_root()
+    # Сборка inventory-строки во временный файл не требует каталога
+    # infra/ansible — гард остаётся только в run_playbook.
     _validate_node_for_inventory(relay)
     validate_node_identity_fields(exit_node.name, exit_node.host, exit_node.ssh_port)
     inventory_content = """

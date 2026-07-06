@@ -74,7 +74,9 @@ def test_order_server_injects_explicit_ssh_key():
     assert (method, path) == ("POST", "/server")
     assert body == {
         "datacenter": 1, "server-plan": 10, "template": 20,
-        "name": "ru-x", "host": "ru-x", "ssh-key": 42,
+        # host — валидный FQDN (VDSina требует домен), name — свободный лейбл;
+        # ip4 — обязательное кол-во IPv4 (без него POST /server = Validation Error).
+        "name": "ru-x", "host": "ru-x.example.com", "ssh-key": 42, "ip4": 1,
     }
 
 

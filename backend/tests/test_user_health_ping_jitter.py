@@ -21,8 +21,9 @@ def _msk_lunch_window() -> mock._patch:
     HEALTH_PING_HOUR_START/END.
     """
     # 12:00 MSK = 09:00 UTC. utcnow().hour == 9 → (9 + 3) % 24 == 12 — окно.
+    # worker импортирует utcnow локально из .time_utils → патчим модуль-источник.
     fake_now = datetime(2026, 5, 12, 9, 30, 0)
-    return mock.patch("app.worker.utcnow", return_value=fake_now)
+    return mock.patch("app.time_utils.utcnow", return_value=fake_now)
 
 
 def test_first_ping_stores_future_timestamp(db_session):

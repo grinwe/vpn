@@ -15,6 +15,7 @@ from sqlalchemy import (
     Table,
     Text,
     UniqueConstraint,
+    text,
 )
 from sqlalchemy.dialects.postgresql import ARRAY, JSONB, UUID
 from sqlalchemy.orm import relationship
@@ -445,6 +446,7 @@ class User(Base):
     banned_at = Column(DateTime, nullable=True)
 
     invoices = relationship("Invoice", back_populates="user")
+    subscriptions = relationship("Subscription", back_populates="user")
     devices = relationship("Device", back_populates="user")
     referral_codes = relationship(
         "ReferralCode", back_populates="owner", foreign_keys="ReferralCode.owner_id"
@@ -574,6 +576,15 @@ class Subscription(Base):
         Index(
             "ix_subscriptions_status_expires_at", "status", "expires_at"
         ),
+        # Partial-индекс под биллинг-тик due-charge (миграция 0009). Имя и
+        # WHERE обязаны точно совпадать с миграцией, иначе alembic-drift.
+        Index(
+            "ix_subscriptions_due_charge",
+            "next_charge_at",
+            postgresql_where=text(
+                "status = 'active' AND next_charge_at IS NOT NULL"
+            ),
+        ),
     )
 
     id = Column(Integer, primary_key=True)
@@ -652,7 +663,7 @@ class Subscription(Base):
         Integer, nullable=False, server_default="0", default=0
     )
 
-    user = relationship("User")
+    user = relationship("User", back_populates="subscriptions")
     plan = relationship("Plan")
     node = relationship("VPNNode", back_populates="subscriptions")
     credentials = relationship("Credential", back_populates="subscription")
@@ -718,6 +729,15 @@ class Device(Base):
 
 class Credential(Base):
     __tablename__ = "credentials"
+    # Partial-индекс под warm-pool SELECT (миграция 0008). Имя и WHERE
+    # обязаны точно совпадать с миграцией, иначе alembic-drift.
+    __table_args__ = (
+        Index(
+            "ix_credentials_warm_node",
+            "node_id",
+            postgresql_where=text("pool_state = 'warm'"),
+        ),
+    )
 
     id = Column(Integer, primary_key=True)
     # NULL for warm credentials waiting in the pool — bound on assignment.
@@ -852,6 +872,20 @@ class Invoice(Base):
 
 class ProvisioningTask(Base):
     __tablename__ = "provisioning_tasks"
+    # Partial UNIQUE — инвариант ≤1 активный node-bootstrap на ноду
+    # (миграция 0041). Имя и WHERE обязаны точно совпадать с миграцией.
+    __table_args__ = (
+        Index(
+            "uq_active_node_bootstrap",
+            "target_id",
+            unique=True,
+            postgresql_where=text(
+                "status IN ('pending', 'running') "
+                "AND target_type = 'node' "
+                "AND action = 'bootstrap'"
+            ),
+        ),
+    )
 
     id = Column(Integer, primary_key=True)
     target_type = Column(String, nullable=False)
@@ -1002,6 +1036,9 @@ class RelayExitLink(Base):
         Integer,
         ForeignKey("wg_exit_nodes.id", ondelete="RESTRICT"),
         nullable=False,
+        # FK-индекс ix_relay_exit_links_exit_id (миграция 0027); имя даёт
+        # дефолтная конвенция SQLAlchemy ix_<table>_<col>.
+        index=True,
     )
     # Kernel interface name on the relay — each link gets its own
     # wg-quick@wgN unit so the relay_jump_node role can loop cleanly.

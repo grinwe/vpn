@@ -178,7 +178,10 @@ def test_attach_diverse_fallback_when_geo_exhausted(
     sub = make_subscription(db_session, user, plan, primary)
     dev = make_device(db_session, sub, cfg)
     s1 = make_node(db_session, name="ru-fb-1", region="ru", host="198.51.100.91")
-    s2 = make_node(db_session, name="null-fb", region=None, host="198.51.100.92")
+    # region NOT NULL в схеме → NULL нельзя. Тот же регион primary'я ("ru") даёт
+    # тот же эффект «гео исчерпано»: пасс 1 (exclude_regions=["ru"]) прячет ноду,
+    # пасс 2 (без фильтра) её добирает.
+    s2 = make_node(db_session, name="same-fb", region="ru", host="198.51.100.92")
     w1 = _warm_cred(db_session, s1, "warm-s1")
     w2 = _warm_cred(db_session, s2, "warm-s2")
 

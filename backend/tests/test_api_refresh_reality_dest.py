@@ -13,6 +13,7 @@ from __future__ import annotations
 
 from app import models
 from app.services import node_spawner
+from app.services.provisioning import ProvisioningOrchestrator
 
 from .factories import (
     make_config,
@@ -22,6 +23,23 @@ from .factories import (
     make_subscription_with_device,
     make_user,
 )
+
+
+def _drain_reprovision_tasks(db_session, task_ids):
+    """conftest глушит ``run_task_async``, поэтому reprovision-таски
+    остаются pending, а новые Device'ы — неактивными (активация живёт в
+    ``_handle_task_outcome`` на успехе ansible). Прогоняем исход вручную
+    по device-apply таскам, как это делает реальная стейт-машина
+    исполнения — тогда свежие Device'ы становятся active."""
+    orch = ProvisioningOrchestrator(db_session)
+    for tid in task_ids:
+        task = db_session.get(models.ProvisioningTask, tid)
+        # Только device-apply таски активируют Device; bootstrap-таску
+        # ноды (target_type="node") пропускаем — её исход тянет resync и
+        # к активации девайсов отношения не имеет.
+        if task is None or task.target_type != "device":
+            continue
+        orch._handle_task_outcome(task, success=True)
 
 
 def test_refresh_reality_dest_node_not_found(client):
@@ -79,6 +97,7 @@ def test_refresh_reality_dest_updates_config_and_reprovisions(client, db_session
 
     # sub остаётся active, на ноде появляется новый device с свежим
     # cred_text (UUID и sni — новые). Старый device disabled.
+    _drain_reprovision_tasks(db_session, body["task_ids"])
     db_session.refresh(sub)
     assert sub.status == models.SubscriptionStatus.active
     active_devices = [d for d in sub.devices if d.status == models.DeviceStatus.active]
@@ -139,6 +158,7 @@ def test_refresh_reality_dest_preserves_multi_device_count(client, db_session):
     )
     assert resp.status_code == 200, resp.text
 
+    _drain_reprovision_tasks(db_session, resp.json()["task_ids"])
     db_session.refresh(sub)
     active = [d for d in sub.devices if d.status == models.DeviceStatus.active]
     # После refresh на ноде должно быть 3 fresh Device'а (по одному на

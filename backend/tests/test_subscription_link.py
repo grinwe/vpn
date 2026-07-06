@@ -58,7 +58,13 @@ def test_sub_link_returns_all_protocols_base64(client, db_session):
     user = make_user(db_session)
     plan = make_plan(db_session)
     orch = ProvisioningOrchestrator(db_session)
-    sub, _ = orch.provision_subscription(user, plan, node_id=node.id)
+    sub, task = orch.provision_subscription(user, plan, node_id=node.id)
+    # Провижн создаёт Device=pending и Credential.is_active=False; активация
+    # (device→active, creds.is_active=True) выполняется в _handle_task_outcome
+    # на успехе ansible. conftest глушит run_task_async, поэтому прогоняем
+    # исход apply-таски вручную — иначе эндпоинт отбросит неактивные креды и
+    # вернёт 503 вместо base64-выдачи всех протоколов.
+    orch._handle_task_outcome(task, success=True)
     db_session.refresh(sub)
 
     resp = client.get(f"/api/sub/{sub.sub_token}", headers={})

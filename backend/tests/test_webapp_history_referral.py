@@ -1,5 +1,4 @@
 """Tests for Stage 5.5/8 webapp endpoints: /transactions, /referral, /me."""
-import os
 from app import models
 from app.api_webapp import issue_token
 from app.config import get_settings

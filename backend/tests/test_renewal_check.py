@@ -31,12 +31,14 @@ def test_renewal_reminder_1d_not_resent_after_ack(db_session, monkeypatch):
     plan = make_plan(db_session)
     node = make_node(db_session)
     sub = make_subscription(db_session, user, plan, node)
+    sub.auto_renew = True  # renewal_reminder_1d fires only for auto-renew subs
     _fast_forward(sub, days_left=1)
     db_session.add_all([user, sub])
     db_session.commit()
 
     # Reschedule path uses the queue — bypass.
-    monkeypatch.setattr(worker, "schedule_tick", lambda *a, **k: None)
+    # worker импортирует schedule_tick локально из .queue → патчим модуль-источник.
+    monkeypatch.setattr("app.queue.schedule_tick", lambda *a, **k: None)
 
     worker.run_renewal_check()
 
@@ -77,7 +79,8 @@ def test_expiry_reminder_3d_not_resent_after_ack(db_session, monkeypatch):
     db_session.add(sub)
     db_session.commit()
 
-    monkeypatch.setattr(worker, "schedule_tick", lambda *a, **k: None)
+    # worker импортирует schedule_tick локально из .queue → патчим модуль-источник.
+    monkeypatch.setattr("app.queue.schedule_tick", lambda *a, **k: None)
     worker.run_renewal_check()
 
     logs = (
@@ -114,7 +117,8 @@ def test_renewal_reminder_skipped_when_balance_sufficient(db_session, monkeypatc
     db_session.add_all([user, sub])
     db_session.commit()
 
-    monkeypatch.setattr(worker, "schedule_tick", lambda *a, **k: None)
+    # worker импортирует schedule_tick локально из .queue → патчим модуль-источник.
+    monkeypatch.setattr("app.queue.schedule_tick", lambda *a, **k: None)
     worker.run_renewal_check()
 
     logs = (
@@ -132,11 +136,13 @@ def test_renewal_reminder_emitted_when_balance_insufficient(db_session, monkeypa
     _set_balance(user, 100)  # well below 1000 kopecks
     node = make_node(db_session)
     sub = make_subscription(db_session, user, plan, node)
+    sub.auto_renew = True  # renewal_reminder is emitted only for auto-renew subs
     _fast_forward(sub, days_left=2)
     db_session.add_all([user, sub])
     db_session.commit()
 
-    monkeypatch.setattr(worker, "schedule_tick", lambda *a, **k: None)
+    # worker импортирует schedule_tick локально из .queue → патчим модуль-источник.
+    monkeypatch.setattr("app.queue.schedule_tick", lambda *a, **k: None)
     worker.run_renewal_check()
 
     logs = (
@@ -159,11 +165,13 @@ def test_overdue_auto_renew_with_balance_renews(db_session, monkeypatch):
     _set_balance(user, 1_000_000)
     node = make_node(db_session)
     sub = make_subscription(db_session, user, plan, node)
+    sub.auto_renew = True  # eligible for the V2 balance-renew-before-expire path
     sub.expires_at = datetime.utcnow() - timedelta(minutes=10)  # already expired
     db_session.add_all([user, sub])
     db_session.commit()
 
-    monkeypatch.setattr(worker, "schedule_tick", lambda *a, **k: None)
+    # worker импортирует schedule_tick локально из .queue → патчим модуль-источник.
+    monkeypatch.setattr("app.queue.schedule_tick", lambda *a, **k: None)
     worker.run_renewal_check()
 
     db_session.refresh(sub)
@@ -184,7 +192,8 @@ def test_overdue_auto_renew_without_balance_expires(db_session, monkeypatch):
     db_session.add_all([user, sub])
     db_session.commit()
 
-    monkeypatch.setattr(worker, "schedule_tick", lambda *a, **k: None)
+    # worker импортирует schedule_tick локально из .queue → патчим модуль-источник.
+    monkeypatch.setattr("app.queue.schedule_tick", lambda *a, **k: None)
     worker.run_renewal_check()
 
     db_session.refresh(sub)
@@ -204,7 +213,8 @@ def test_overdue_manual_sub_still_expires(db_session, monkeypatch):
     db_session.add_all([user, sub])
     db_session.commit()
 
-    monkeypatch.setattr(worker, "schedule_tick", lambda *a, **k: None)
+    # worker импортирует schedule_tick локально из .queue → патчим модуль-источник.
+    monkeypatch.setattr("app.queue.schedule_tick", lambda *a, **k: None)
     worker.run_renewal_check()
 
     db_session.refresh(sub)
@@ -223,11 +233,13 @@ def test_yearly_plan_renews_correctly(db_session, monkeypatch):
     _set_balance(user, 1_000_000)
     node = make_node(db_session)
     sub = make_subscription(db_session, user, yearly, node)
+    sub.auto_renew = True  # eligible for the V2 balance-renew-before-expire path
     sub.expires_at = datetime.utcnow() - timedelta(minutes=5)
     db_session.add_all([user, yearly, sub])
     db_session.commit()
 
-    monkeypatch.setattr(worker, "schedule_tick", lambda *a, **k: None)
+    # worker импортирует schedule_tick локально из .queue → патчим модуль-источник.
+    monkeypatch.setattr("app.queue.schedule_tick", lambda *a, **k: None)
     worker.run_renewal_check()
 
     db_session.refresh(sub)

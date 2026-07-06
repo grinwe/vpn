@@ -6,6 +6,9 @@ Claude). Боевую генерацию плана проверяем вруч�
 """
 from __future__ import annotations
 
+import hashlib
+import json
+
 import pytest
 from sqlalchemy.orm import Session
 
@@ -236,10 +239,15 @@ def test_validate_feasible_false_rejected(db_session: Session) -> None:
 def _persist_plan(
     db: Session, steps: list[dict], *, status: str = "proposed"
 ) -> models.OpsPlan:
+    plan = {"feasible": True, "summary": "s", "steps": steps}
+    # Каноникализация обязана совпадать с продом (api/agent.py:109-110), иначе
+    # гард integrity в execute_plan сработает раньше validate/preflight.
+    canonical = json.dumps(plan, sort_keys=True, ensure_ascii=False)
+    content_hash = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
     p = models.OpsPlan(
         actor="1", command="c", model="m",
-        plan={"feasible": True, "summary": "s", "steps": steps},
-        content_hash="0" * 64, status=status,
+        plan=plan,
+        content_hash=content_hash, status=status,
     )
     db.add(p)
     db.commit()
