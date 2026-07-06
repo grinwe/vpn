@@ -243,6 +243,19 @@ async def notification_poller(bot: Bot):
                         telegram_id, e.message, notif_id,
                     )
                     _spawn_ack(notif_id)
+                except (ValueError, TypeError):
+                    # Нечисловой telegram_id (напр. плейсхолдер-юзер
+                    # ``__recovery_orphans__``, id=999999) — int() падает, а
+                    # доставить такую запись нельзя НИКОГДА. Терминально, как
+                    # TelegramBadRequest: ACK-аем, иначе с переходом очереди
+                    # на FIFO (oldest-first) она висит в голове и спамит
+                    # «Failed to deliver» каждый тик, забивая логи.
+                    logger.warning(
+                        "Non-numeric telegram_id %r for notif=%s — "
+                        "undeliverable, marking delivered",
+                        telegram_id, notif_id,
+                    )
+                    _spawn_ack(notif_id)
                 except Exception:
                     # Сетевые/временные ошибки — НЕ ACK-аем, поллер
                     # попробует снова на следующем тике.
