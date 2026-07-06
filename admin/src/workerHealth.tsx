@@ -40,6 +40,11 @@ type Severity = "ok" | "warn" | "down";
 // пропущенных, уверенный признак что воркер действительно мёртв, а не
 // просто занят тяжёлым provisioning'ом.
 const WORKER_DEAD_MS = 180_000;
+// Базовый интервал опроса статуса. При ошибке опрашиваем реже (см. useQuery),
+// а данные старше двух интервалов считаем протухшими — светофор тогда не
+// имеет права показывать зелёный, потому что оценка построена на устаревшем
+// снимке (backend/прокси/сеть могли отвалиться уже после него).
+const REFETCH_MS = 15_000;
 // Тик может быть overdue из-за того что воркер доделывает долгий job
 // (ansible-run 2-3 мин). Триггерим warn только если пропустили >2 цикла
 // + 60с запас — тогда это не "занят", а реально scheduler не кикает.
@@ -47,10 +52,18 @@ function tickOverdueThreshold(intervalSeconds: number): number {
   return intervalSeconds * 3 + 60;
 }
 
-function severity(data: TicksStatusOut | undefined): {
+function severity(
+  data: TicksStatusOut | undefined,
+  monitoringDown = false,
+): {
   s: Severity;
   label: string;
 } {
+  // Мониторинг ослеп (запрос падает или последний удачный ответ протух) —
+  // это важнее любой сохранённой оценки. React-Query держит последний data
+  // даже когда запрос уже стабильно падает, поэтому без этой проверки бейдж
+  // рисовал бы зелёный «Worker OK» во время аварии backend.
+  if (monitoringDown) return { s: "down", label: "Нет связи с backend" };
   if (!data) return { s: "down", label: "…" };
   if (!data.queue_available) return { s: "down", label: "Redis down" };
 
@@ -98,12 +111,20 @@ export function WorkerHealthBadge() {
   // Желаемое число реплик; null = "следовать текущему счётчику воркеров".
   const [desired, setDesired] = useState<number | null>(null);
   const qc = useQueryClient();
-  const { data } = useQuery<TicksStatusOut>({
+  const { data, isError, dataUpdatedAt } = useQuery<TicksStatusOut>({
     queryKey: ["ops-ticks-status"],
     queryFn: () => api.get("/ops/ticks/status"),
-    refetchInterval: 15_000,
+    // На ошибке опрашиваем вдвое реже, чтобы не долбить упавший backend
+    // двумя запросами каждые 15с; в норме — штатный интервал.
+    refetchInterval: (q) => (q.state.error ? REFETCH_MS * 2 : REFETCH_MS),
     retry: false,
   });
+
+  // Данные старше двух интервалов — протухшие: даже без явной ошибки последний
+  // ответ уже не отражает текущее состояние (refetch мог начать падать).
+  const isStale =
+    dataUpdatedAt > 0 && Date.now() - dataUpdatedAt > REFETCH_MS * 2;
+  const monitoringDown = isError || isStale;
 
   const restart = useMutation({
     mutationFn: () =>
@@ -158,7 +179,7 @@ export function WorkerHealthBadge() {
     onError: (e: Error) => alert(`Не удалось: ${e.message}`),
   });
 
-  const { s, label } = severity(data);
+  const { s, label } = severity(data, monitoringDown);
   const colorClass =
     s === "ok"
       ? "bg-emerald-700 hover:bg-emerald-600"
@@ -343,7 +364,7 @@ export function WorkerHealthBadge() {
             </tbody>
           </table>
 
-          {severity(data).s !== "ok" && (
+          {severity(data, monitoringDown).s !== "ok" && (
             <div className="text-[11px] text-amber-300 bg-amber-950/30 border border-amber-900/40 p-2 rounded">
               Если тики overdue / worker stalled — перезапусти воркер-контейнер.
               Bootstrap теперь использует replace=True, так что stale scheduled-job

@@ -15,6 +15,36 @@ import { getTg } from "../telegram";
 
 type Period = "month" | "year";
 
+// Ретраи загрузки тарифов на транзиентных сетевых сбоях — тот же принцип,
+// что и withRetries в App.tsx. Без них один секундный обрыв на экране
+// покупки давал тупик «Ошибка загрузки тарифов» без пути назад.
+const PLANS_LOAD_RETRIES = 2;
+const PLANS_RETRY_DELAY_MS = 800;
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
+async function fetchPlansResilient(): Promise<WebAppPlan[]> {
+  let lastErr: unknown;
+  for (let attempt = 0; attempt <= PLANS_LOAD_RETRIES; attempt++) {
+    try {
+      return await fetchPlans();
+    } catch (e) {
+      lastErr = e;
+      if (attempt < PLANS_LOAD_RETRIES) await sleep(PLANS_RETRY_DELAY_MS);
+    }
+  }
+  throw lastErr;
+}
+
+// Страховочный таймаут снятия «занятости» пополнения: openInvoice в норме
+// всегда зовёт callback, но у редких клиентов/версий при закрытии окна
+// оплаты свайпом или обрыве callback может не прийти — тогда topupState
+// навсегда завис бы в "paying" и шторка «Не хватает баланса» залипала бы
+// (закрыть/оплатить нельзя). По таймауту принудительно размыкаем.
+const TOPUP_CALLBACK_TIMEOUT_MS = 90_000;
+
 // Превращает сырой текст ошибки от fetch ("503: {...}", "500: ...")
 // в человекочитаемое сообщение. Юзеру не надо видеть JSON и коды.
 function friendlyActivateError(raw: string): string {
@@ -77,10 +107,51 @@ export default function Plans({ onActivated, subLinkBase, me, changeSubscription
   const currentPlanId = changeSub?.plan_id ?? null;
   const isChangeMode = !!changeSub;
 
+  // Признак «сейчас показана ошибка загрузки» для слушателей ниже — читать
+  // state из их замыкания (пустые deps) нельзя, там он был бы устаревшим.
+  const erroredRef = useRef(false);
+  // Гард от параллельных повторов (online + visibilitychange могут прийти
+  // одновременно): не запускаем второй loadPlans, пока первый в полёте.
+  const loadingRef = useRef(false);
+
+  // Загрузка тарифов с ретраями. При повторе сбрасывает экран ошибки в
+  // «Загрузка…», а не оставляет юзера в тупике «Ошибка загрузки тарифов».
+  const loadPlans = useRef(async () => {
+    if (loadingRef.current) return;
+    loadingRef.current = true;
+    erroredRef.current = false;
+    setError(null);
+    setPlans(null);
+    try {
+      const data = await fetchPlansResilient();
+      setPlans(data);
+    } catch (e) {
+      erroredRef.current = true;
+      setError(friendlyActivateError((e as Error).message));
+    } finally {
+      loadingRef.current = false;
+    }
+  });
+
   useEffect(() => {
-    fetchPlans()
-      .then(setPlans)
-      .catch((e) => setError(friendlyActivateError((e as Error).message)));
+    loadPlans.current();
+
+    // Авто-восстановление после обрыва: если тарифы не загрузились, повторяем
+    // попытку при возврате связи и при возврате в приложение — чтобы юзер не
+    // застревал на экране ошибки без единого способа повторить.
+    const retryIfFailed = () => {
+      if (erroredRef.current) loadPlans.current();
+    };
+    const onOnline = () => retryIfFailed();
+    const onVisibility = () => {
+      if (document.visibilityState === "visible") retryIfFailed();
+    };
+    window.addEventListener("online", onOnline);
+    document.addEventListener("visibilitychange", onVisibility);
+    return () => {
+      window.removeEventListener("online", onOnline);
+      document.removeEventListener("visibilitychange", onVisibility);
+    };
   }, []);
 
   if (error)
@@ -154,6 +225,24 @@ export default function Plans({ onActivated, subLinkBase, me, changeSubscription
     }
   }
 
+  // Таймер-страховка для случая, когда openInvoice не вызовет callback.
+  const topupTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const clearTopupTimer = () => {
+    if (topupTimerRef.current !== null) {
+      clearTimeout(topupTimerRef.current);
+      topupTimerRef.current = null;
+    }
+  };
+  // Закрытие шторки пополнения: всегда снимает занятость и таймер, чтобы
+  // шторка не могла залипнуть навсегда.
+  function closeTopupHint() {
+    clearTopupTimer();
+    setTopupState(null);
+    setTopupHint(null);
+  }
+  // Снимаем страховочный таймер при размонтировании страницы.
+  useEffect(() => () => clearTopupTimer(), []);
+
   async function payTopup(amountKopecks: number) {
     const tg = getTg();
     if (!tg) {
@@ -168,6 +257,8 @@ export default function Plans({ onActivated, subLinkBase, me, changeSubscription
     try {
       const res = await createTopup(amountKopecks, "telegram_stars");
       tg.openInvoice(res.pay_url, (status) => {
+        // Callback пришёл — страховочный таймер больше не нужен.
+        clearTopupTimer();
         if (status === "paid") {
           tg.HapticFeedback?.notificationOccurred("success");
           // Не полагаемся на мгновенный refetch: ждём фактического зачисления,
@@ -187,7 +278,16 @@ export default function Plans({ onActivated, subLinkBase, me, changeSubscription
           }
         }
       });
+      // Если callback так и не придёт (редкие клиенты/обрыв при свайпе окна
+      // оплаты) — принудительно размыкаем занятость, чтобы шторку можно было
+      // закрыть/повторить, а не перезапускать Mini App.
+      clearTopupTimer();
+      topupTimerRef.current = setTimeout(() => {
+        topupTimerRef.current = null;
+        setTopupState((prev) => (prev === "paying" ? null : prev));
+      }, TOPUP_CALLBACK_TIMEOUT_MS);
     } catch (e) {
+      clearTopupTimer();
       setTopupState(null);
       showToast(friendlyActivateError((e as Error).message));
     }
@@ -263,7 +363,7 @@ export default function Plans({ onActivated, subLinkBase, me, changeSubscription
           busy={topupState !== null}
           crediting={topupState === "crediting"}
           onPay={(kop) => payTopup(kop)}
-          onClose={() => setTopupHint(null)}
+          onClose={closeTopupHint}
         />,
         document.body,
       )}
@@ -424,7 +524,10 @@ function TopupHintSheet({
   return (
     <div
       className="fixed inset-0 bg-black/60 flex items-end justify-center"
-      onClick={busy ? undefined : onClose}
+      // Закрытие блокируем только на короткой фазе зачисления ("crediting").
+      // На "paying" оставляем выход открытым: если окно оплаты закрыли свайпом
+      // и callback не пришёл, шторка не должна залипнуть незакрываемой.
+      onClick={crediting ? undefined : onClose}
     >
       <div
         className="bg-tg-bg rounded-t-3xl border-t border-white/10 p-6 max-w-xl w-full"
@@ -440,7 +543,7 @@ function TopupHintSheet({
         </button>
         <button
           onClick={onClose}
-          disabled={busy}
+          disabled={crediting}
           className="w-full mt-2 py-2 text-tg-hint text-sm"
         >
           Отмена

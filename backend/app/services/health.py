@@ -9,9 +9,11 @@ Two sides:
   aggregated health on the node.
 
 * **Reaction** — :func:`recompute_node_health` recalculates ``health_score``
-  and ``blocked_regions`` from the most recent probes and, when a node is
-  considered dead in a region, calls :func:`migrate_subscriptions_off` to
-  move affected subscriptions to a healthy node and notify the users.
+  and ``blocked_regions`` from the most recent probes. Авто-миграция по
+  healthcheck отключена с 2026-04-15 (флаппинг переселял активных юзеров);
+  вместо неё на probe-блок региона / probe-смерть уходит админ-пуш через
+  :func:`_alert_probe_degradation`, а решение о ручной миграции принимает
+  оператор. Ручной маршрут по-прежнему зовёт :func:`migrate_subscriptions_off`.
 
 The "healthy node" selector reuses :func:`services.provisioning.choose_node`
 so capacity, cooldown and pool constraints are respected identically to the
@@ -20,6 +22,7 @@ purchase flow.
 from __future__ import annotations
 
 import logging
+import os
 from collections import defaultdict
 from datetime import datetime, timedelta
 
@@ -140,6 +143,16 @@ def recompute_node_health(
     node.last_health_check_at = utcnow()
 
     migrated: list[int] = []
+    # Признак «probe-смерти» ноды: агрегатный success-rate ниже порога при
+    # достаточной выборке. Единственный сигнал DPI-блока/деградации, который
+    # reachability-тик по SSH НЕ видит (SSH до ноды жив, а клиентский трафик
+    # режется). Считаем всегда — используется и для алерта ниже.
+    global_death = (
+        overall is not None
+        and overall < DEAD_THRESHOLD
+        and total_samples >= MIN_SAMPLES
+    )
+
     # DISABLED 2026-04-15: автомиграция по healthcheck отключена — на
     # транзиентных сбоях probes (сетевой дребезг, единичные таймауты)
     # мы флипали ноду в error и переселяли активных пользователей, что
@@ -147,11 +160,6 @@ def recompute_node_health(
     # порогов / anti-flap логики оставляем функцию считать score и
     # blocked_regions, но решения о миграции теперь принимает админ
     # через ручной маршрут. Чтобы вернуть поведение — расхешировать блок.
-    # global_death = (
-    #     overall is not None
-    #     and overall < DEAD_THRESHOLD
-    #     and total_samples >= MIN_SAMPLES
-    # )
     # if auto_migrate and (global_death or blocked):
     #     logger.warning(
     #         "Node %s degraded: health=%.2f blocked_regions=%s — considering migration",
@@ -167,6 +175,23 @@ def recompute_node_health(
     #             "subscription_ids"
     #         ]
 
+    # #7 — маршрутизация сигнала probe-блокировки/probe-смерти. Даже при
+    # отключённой авто-миграции оператор ДОЛЖЕН получить сигнал: probe-риги
+    # (RU/KZ/EU) — единственный детектор DPI-блока, который SSH-тик не ловит.
+    # Раньше блок молча копился в node.blocked_regions без единого алерта.
+    # Шлём админ-пуш вместо молчания; только на автоматическом (probe-driven)
+    # пути — ручной пересчёт из админки (auto_migrate=False) не алертит, чтобы
+    # клик по «пересчитать» не порождал пуши.
+    if auto_migrate and (blocked or global_death):
+        _alert_probe_degradation(
+            db,
+            node,
+            blocked=blocked,
+            overall=overall,
+            total_samples=total_samples,
+            global_death=global_death,
+        )
+
     db.add(node)
     db.commit()
     return {
@@ -177,6 +202,91 @@ def recompute_node_health(
         "per_region": per_region,
         "migrated_subscriptions": migrated,
     }
+
+
+def _alert_probe_degradation(
+    db: Session,
+    node: models.VPNNode,
+    *,
+    blocked: list[str],
+    overall: float | None,
+    total_samples: int,
+    global_death: bool,
+) -> None:
+    """Админ-пуш о probe-блокировке региона / probe-смерти ноды.
+
+    Замена молчания после отключения авто-миграции: probe-риги детектят
+    DPI-блок, который reachability-тик по SSH не видит, — оператор должен
+    узнать и решить о ручной миграции. Без изменения самой ноды (только
+    сигнал).
+
+    Анти-спам (по плану находки #7):
+      * ``diagnostics_state.is_alerts_muted`` — если оператор заглушил
+        алерты по этой ноде, молчим (тот же mute, что и для SSH-инцидентов);
+      * dedup-окно ``notify_admins`` по (node_id + отпечаток deg-состояния):
+        флаппинг даёт один пуш на окно ``ADMIN_ALERT_BLOCKED_WINDOW_SEC``
+        (default 1800с), а не поток. Отпечаток включает список blocked-
+        регионов и флаг probe-смерти, чтобы НОВЫЙ регион/переход в death
+        пробивал дедуп свежим алертом.
+
+    ``notify_admins`` вызывается с ``autocommit=False`` — строки уедут в БД
+    вместе с финальным ``db.commit()`` в ``recompute_node_health``.
+    """
+    from . import diagnostics_state
+    from .admin_notify import notify_admins
+
+    # Уважаем ручной mute алертов по ноде (оператор уже в курсе / работает).
+    if diagnostics_state.is_alerts_muted(node):
+        return
+
+    name = getattr(node, "name", None) or str(getattr(node, "id", "?"))
+    host = getattr(node, "host", "") or ""
+    host_suffix = f" ({host})" if host else ""
+    pct = f"{round(overall * 100)}%" if overall is not None else "n/a"
+
+    if global_death:
+        kind = "node_probe_death"
+        text = (
+            f"🔴 Нода <b>{name}</b>{host_suffix} — probe-смерть: успех {pct} "
+            f"по {total_samples} пробам за {int(LOOKBACK.total_seconds() // 60)} мин. "
+            f"SSH может быть жив, но клиентский трафик не проходит. "
+            f"Авто-миграция отключена — решите о ручной миграции (/admin/nodes)."
+        )
+    else:
+        kind = "node_region_blocked"
+        regions = ", ".join(blocked) if blocked else "?"
+        text = (
+            f"🔴 Нода <b>{name}</b>{host_suffix} заблокирована в регионе(ах): "
+            f"<b>{regions}</b>. Probe-риги видят DPI-блок (SSH до ноды жив). "
+            f"Авто-миграция отключена — решите о ручной миграции (/admin/nodes)."
+        )
+
+    window = int(os.getenv("ADMIN_ALERT_BLOCKED_WINDOW_SEC", "1800"))
+    try:
+        notify_admins(
+            db,
+            kind=kind,
+            text=text,
+            dedup_key={
+                "node_id": node.id,
+                "regions": blocked,
+                "probe_death": bool(global_death),
+            },
+            extra={
+                "node_id": node.id,
+                "target_kind": "node",
+                "target_id": node.id,
+                "blocked_regions": blocked,
+                "health_score": node.health_score,
+            },
+            window_sec=window,
+            autocommit=False,
+        )
+    except Exception:  # noqa: BLE001
+        # Алерт — best-effort: сбой пуша НЕ должен рушить пересчёт health.
+        logger.exception(
+            "health: не удалось поставить админ-алерт о деградации ноды %s", node.id
+        )
 
 
 def migrate_subscriptions_off(

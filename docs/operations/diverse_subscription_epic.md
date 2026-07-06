@@ -142,7 +142,11 @@ url-test/failover.** Бесшовного «прыгания между N нод
 - Read-only сигнал: per-node `carrying_fraction` во времени из traffic-телеметрии +
   набора девайсов → метрика/алерт «нода широко гниёт». ✅ `services/carrying.py` +
   `GET /api/nodes/carrying-fractions`. Числитель (carrying) и знаменатель (eligible)
-  фильтруются одинаково по `Credential.is_active` → fraction ≤ 1.0. Протухший сэмпл
+  фильтруются одинаково по `Credential.is_active` **И** «живости» девайса — активная
+  подписка (`Subscription.status=active`) + активный девайс (`Device.status=active`),
+  иначе девайсы протухших/замороженных подписок с ещё-неподметёнными кредами раздували
+  бы знаменатель и топили долю, маскируя мёртвые подписки под широкий блок ноды
+  (audit-#8). Симметричный фильтр → fraction ≤ 1.0. Протухший сэмпл
   (старше `CARRYING_SAMPLE_MAX_AGE_MIN`, по умолчанию 3×`TRAFFIC_STATS_INTERVAL`)
   отдаёт `carrying_fraction=null` + `"stale": true`, чтобы недельной давности carrying
   не выдавался как текущий.

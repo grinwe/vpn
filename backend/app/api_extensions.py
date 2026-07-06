@@ -37,6 +37,11 @@ from .time_utils import utcnow
 logger = logging.getLogger(__name__)
 settings = get_settings()
 
+# Порог «здоровья» ноды для фильтрации кредов в саб-линке — зеркалит
+# provisioning.MIN_HEALTHY_SCORE (читаем env напрямую, без импорта тяжёлого
+# модуля в горячий read-путь).
+MIN_HEALTHY_SCORE = int(os.getenv("MIN_HEALTHY_SCORE", "50"))
+
 ext_router = APIRouter(prefix="/api")
 
 
@@ -109,12 +114,32 @@ def _sub_response_headers(
     ``SUB_HAPP_AUTOCONNECT`` (+ опц. ``_SINCE`` для «только новых девайсов»).
     ``fallback-url`` (если задан ``SUB_LINK_FALLBACK_BASE_URL``) — фейловер
     ИСТОЧНИКА сабы на запасной домен, когда основной саб-URL режет РКН.
+
+    ``profile-update-interval`` (часы) — как часто Hiddify/v2rayNG/HAPP сами
+    перечитывают сабу и через sibling-alias подхватывают новую ноду после
+    failover/миграции. Захардкоженные 6ч означали окно устаревания конфига
+    до полусуток; для анти-РКН профиля (РУ-ноды-расходники, частые баны)
+    дефолт снижен до 2ч и вынесен в ``SUB_PROFILE_UPDATE_INTERVAL_H`` — прод
+    может ужать до 1ч (компромисс свежесть-failover ↔ нагрузка read-пути;
+    write-amplification уже срезается ``SUB_FETCH_AUDIT_SAMPLE``).
+
+    ``cache-control: no-store, private`` (+ ``pragma``) — тело саб-ответа это
+    ПЕРСОНАЛЬНЫЙ динамический конфиг, меняющийся при каждой миграции/ротации
+    токена; запрещаем CF-Worker'у и любым промежуточным прокси его кэшировать,
+    иначе seamless-alias-инвариант обнулится закэшированным старым конфигом.
     """
     title = "V8-VPN"
+    try:
+        interval_h = int(os.getenv("SUB_PROFILE_UPDATE_INTERVAL_H") or "2")
+    except ValueError:
+        interval_h = 2
+    interval_h = max(1, interval_h)
     headers: dict[str, str] = {
-        "profile-update-interval": "6",
+        "profile-update-interval": str(interval_h),
         "profile-title": title,
         "content-disposition": f'attachment; filename="{title}"',
+        "cache-control": "no-store, private",
+        "pragma": "no-cache",
     }
     if sub.expires_at:
         headers["subscription-userinfo"] = f"expire={int(sub.expires_at.timestamp())}"
@@ -147,6 +172,111 @@ def _should_log_sub_fetch() -> bool:
     return secrets.randbelow(n) == 0
 
 
+def _retry_after_sec() -> str:
+    """Значение заголовка ``Retry-After`` для транзиентных 503 саб-линка (сек).
+
+    Настраивается через ``SUB_RETRY_AFTER_SEC`` (дефолт 60). Без него «retry
+    shortly» на практике вырождается в плановый ``profile-update-interval``
+    (часы); заголовок даёт корректному клиенту машиночитаемый хинт перезапросить
+    конфиг сразу после провижининга/разморозки."""
+    try:
+        n = int(os.getenv("SUB_RETRY_AFTER_SEC") or "60")
+    except ValueError:
+        n = 60
+    return str(max(1, n))
+
+
+def _node_serviceable(node, now) -> bool:
+    """Пригодна ли нода к выдаче в саб-линке (зеркалит фильтр ``choose_node``):
+    активна, не в cooldown, не заглушена диагностикой, ``health_score`` не ниже
+    порога. Нездоровые ноды исключаем из набора, чтобы клиент не держал мёртвый
+    эндпоинт в ротации client-side failover."""
+    if not getattr(node, "is_active", True):
+        return False
+    cd = getattr(node, "cooldown_until", None)
+    if cd is not None and cd > now:
+        return False
+    if getattr(node, "auto_diagnose_disabled_at", None) is not None:
+        return False
+    if getattr(node, "diagnostics_disabled_at", None) is not None:
+        return False
+    hs = getattr(node, "health_score", None)
+    if hs is not None and hs < MIN_HEALTHY_SCORE:
+        return False
+    return True
+
+
+def _healthy_node_ids(db: Session, creds) -> set[int]:
+    """node_id активных кредов, чьи ноды пригодны к выдаче.
+
+    Пустой результат = «фильтр не применять» (kill-switch ``SUB_FILTER_
+    UNHEALTHY_NODES=0``, у кредов нет node_id, ИЛИ все ноды нездоровы — в
+    последнем случае вызывающий деградирует к нефильтрованному набору: живой-
+    но-неоптимальный конфиг лучше 503)."""
+    if (os.getenv("SUB_FILTER_UNHEALTHY_NODES") or "1").strip().lower() in (
+        "0", "off", "false",
+    ):
+        return set()
+    node_ids = {c.node_id for c in creds if c.is_active and c.node_id is not None}
+    if not node_ids:
+        return set()
+    now = utcnow()
+    rows = db.query(models.VPNNode).filter(models.VPNNode.id.in_(node_ids)).all()
+    return {n.id for n in rows if _node_serviceable(n, now)}
+
+
+def _decrypt_configs(creds, *, sub, device_id=None, node_filter=None):
+    """Собирает ``SubLinkConfig`` из АКТИВНЫХ кредов, расшифровывая config_text.
+
+    ``node_filter`` — множество допустимых node_id (креды на прочих нодах
+    пропускаем); None = без фильтра по нодам. Пустой результат ``_decrypt``
+    логируется с полным контекстом (cred/proto/node/device/sub) — раньше
+    per-device ветка молча выкидывала недешифруемый кред, и частичная
+    деградация подписки (рассинхрон APP_SECRET_KEY, битый config_text) была
+    невидима для диагностики."""
+    out: list[SubLinkConfig] = []
+    for cred in creds:
+        if not cred.is_active:
+            continue
+        if (
+            node_filter is not None
+            and cred.node_id is not None
+            and cred.node_id not in node_filter
+        ):
+            continue
+        decrypted = _decrypt(cred.config_text)
+        if decrypted:
+            out.append(SubLinkConfig(protocol=cred.proto, uri=decrypted))
+        else:
+            logger.warning(
+                "sub-link: decrypt returned empty for credential %s "
+                "(proto=%s, node=%s, device=%s, sub=%s)",
+                cred.id, cred.proto, cred.node_id, device_id, sub.id,
+            )
+    return out
+
+
+def _raise_if_sub_not_serviceable(sub: models.Subscription) -> None:
+    """Гейт статуса/срока подписки для саб-линка.
+
+    ``frozen`` — ВРЕМЕННАЯ user-initiated пауза (sub_token сохраняется, при
+    разморозке alias-блок переклеит старый URL на живого сиблинга) → отдаём
+    503+Retry-After, а НЕ 403: многие клиенты на 403 чистят сохранённый
+    профиль и перестают опрашивать ссылку, и после пополнения/разморозки
+    бесшовного авто-восстановления не происходит. ``blocked``/``expired`` —
+    терминальные состояния, 403 корректен (и покрыт тестами)."""
+    if sub.status == models.SubscriptionStatus.frozen:
+        raise HTTPException(
+            status_code=503,
+            detail="Subscription temporarily paused — retry shortly",
+            headers={"Retry-After": _retry_after_sec()},
+        )
+    if sub.status != models.SubscriptionStatus.active:
+        raise HTTPException(status_code=403, detail="Subscription is not active")
+    if sub.expires_at and sub.expires_at < utcnow():
+        raise HTTPException(status_code=403, detail="Subscription expired")
+
+
 @ext_router.get("/sub/{token}")
 def dynamic_sub_link(token: str, db: Session = Depends(get_db)):
     """Dynamic subscription link — per-device or legacy per-subscription.
@@ -165,10 +295,7 @@ def dynamic_sub_link(token: str, db: Session = Depends(get_db)):
     device = db.query(models.Device).filter_by(sub_token=token).first()
     if device:
         sub = device.subscription
-        if sub.status != models.SubscriptionStatus.active:
-            raise HTTPException(status_code=403, detail="Subscription is not active")
-        if sub.expires_at and sub.expires_at < utcnow():
-            raise HTTPException(status_code=403, detail="Subscription expired")
+        _raise_if_sub_not_serviceable(sub)
 
         # ╔══════════════════════════════════════════════════════════════╗
         # ║  DO NOT TOUCH without reading docs/components/backend-api.md ║
@@ -221,20 +348,31 @@ def dynamic_sub_link(token: str, db: Session = Depends(get_db)):
             if live is not None:
                 source_device = live
 
-        configs = []
-        for cred in source_device.credentials:
-            if not cred.is_active:
-                continue
-            decrypted = _decrypt(cred.config_text)
-            if decrypted:
-                configs.append(SubLinkConfig(protocol=cred.proto, uri=decrypted))
+        # Исключаем креды нод в cooldown/декоммишене/с низким health_score —
+        # иначе клиент держит заведомо мёртвый эндпоинт в ротации client-side
+        # failover (лишние таймауты на каждом реконнекте).
+        healthy = _healthy_node_ids(db, source_device.credentials)
+        configs = _decrypt_configs(
+            source_device.credentials,
+            sub=sub,
+            device_id=source_device.id,
+            node_filter=healthy or None,
+        )
+        # Fallback: фильтр по здоровью выкинул все креды (единственная нода в
+        # cooldown) → лучше отдать живой-но-неоптимальный набор, чем 503.
+        if not configs and healthy:
+            configs = _decrypt_configs(
+                source_device.credentials, sub=sub, device_id=source_device.id
+            )
 
         # Safety net: if neither the direct device nor its alias
         # yielded a single working config, return 503 instead of an
         # empty 200. Empty-200 = "subscription with zero servers" and
         # most clients will *overwrite* the local cached profile with
         # nothing, stranding the user. 503 tells the client to retry
-        # and keeps the last-known-good profile in place.
+        # and keeps the last-known-good profile in place. Retry-After даёт
+        # клиенту хинт перезапросить через ~минуту (провижининг обычно
+        # укладывается в секунды-минуты), а не ждать planовый refresh.
         if not configs:
             logger.warning(
                 "sub-link: no active configs for token=%s sub=%s device=%s (source=%s)",
@@ -243,6 +381,7 @@ def dynamic_sub_link(token: str, db: Session = Depends(get_db)):
             raise HTTPException(
                 status_code=503,
                 detail="No active endpoints — provisioning in progress, retry shortly",
+                headers={"Retry-After": _retry_after_sec()},
             )
 
         # Read-путь ничего, кроме audit-строки, не пишет — при сэмплировании
@@ -280,24 +419,14 @@ def dynamic_sub_link(token: str, db: Session = Depends(get_db)):
     if not sub:
         raise HTTPException(status_code=404, detail="Subscription not found")
 
-    if sub.status != models.SubscriptionStatus.active:
-        raise HTTPException(status_code=403, detail="Subscription is not active")
+    _raise_if_sub_not_serviceable(sub)
 
-    if sub.expires_at and sub.expires_at < utcnow():
-        raise HTTPException(status_code=403, detail="Subscription expired")
-
-    configs = []
-    for cred in sub.credentials:
-        if not cred.is_active:
-            continue
-        decrypted = _decrypt(cred.config_text)
-        if decrypted:
-            configs.append(SubLinkConfig(protocol=cred.proto, uri=decrypted))
-        else:
-            logger.warning(
-                "sub-link: decrypt returned empty for credential %s (proto=%s, sub=%s)",
-                cred.id, cred.proto, sub.id,
-            )
+    # Как и в per-device ветке: отсекаем креды нездоровых нод и логируем пустой
+    # decrypt (общий хелпер).
+    healthy = _healthy_node_ids(db, sub.credentials)
+    configs = _decrypt_configs(sub.credentials, sub=sub, node_filter=healthy or None)
+    if not configs and healthy:
+        configs = _decrypt_configs(sub.credentials, sub=sub)
 
     # Same safety as the per-device branch — see the invariant box
     # above. Empty-200 would wipe the user's cached profile.
@@ -309,6 +438,7 @@ def dynamic_sub_link(token: str, db: Session = Depends(get_db)):
         raise HTTPException(
             status_code=503,
             detail="No active endpoints — provisioning in progress, retry shortly",
+            headers={"Retry-After": _retry_after_sec()},
         )
 
     uris = "\n".join(c.uri for c in configs)
@@ -864,23 +994,34 @@ def get_pending_notifications(
         # rendered in services/admin_notify.notify_node_diagnosis; the bot
         # attaches the ack/mute/follow keyboard from target_kind/target_id.
         "admin_alert_node_diagnosis",
-        # Admin broadcast — кастомная рассылка юзерам через /admin/broadcasts.
-        # Текст готовится на backend-е при create и режется батчами в
-        # run_broadcast_dispatch_tick (см. worker.py). Bot-поллер доставляет
-        # с дополнительной задержкой 0.05s на send, чтобы не упереться
-        # в Telegram rate-limit ~30 msg/sec.
-        "admin_broadcast",
     ]
-    logs = (
-        db.query(models.AuditLog)
-        .filter(
-            models.AuditLog.action.in_(notif_actions),
-            models.AuditLog.actor_type == models.AuditActor.system,
+    # Admin broadcast — массовая рассылка (см. /admin/broadcasts). Держим её в
+    # ОТДЕЛЬНОМ, низкоприоритетном классе: диспетчер наполняет её батчами по
+    # BROADCAST_BATCH_SIZE=50/тик, а поллер сливает 20/тик — при общей очереди с
+    # DESC-сортировкой массовая рассылка топила срочные транзакционные пуши
+    # (config_ready, «истекает завтра», migration_notice, health_ping) в хвост
+    # на десятки минут. Разделяем на priority + bulk и доставляем FIFO (asc):
+    # сперва все срочные (до limit), остаток добиваем broadcast'ом.
+    bulk_actions = ["admin_broadcast"]
+
+    def _fetch(actions: list[str], lim: int) -> list[models.AuditLog]:
+        if lim <= 0:
+            return []
+        return (
+            db.query(models.AuditLog)
+            .filter(
+                models.AuditLog.action.in_(actions),
+                models.AuditLog.actor_type == models.AuditActor.system,
+            )
+            .order_by(models.AuditLog.created_at.asc())  # FIFO — честный порядок
+            .limit(lim)
+            .all()
         )
-        .order_by(models.AuditLog.created_at.desc())
-        .limit(limit)
-        .all()
-    )
+
+    priority_logs = _fetch(notif_actions, limit)
+    # Добиваем свободные слоты массовой рассылкой (не даём ей вытеснить срочные).
+    bulk_logs = _fetch(bulk_actions, limit - len(priority_logs))
+    logs = priority_logs + bulk_logs
 
     results = []
     for log in logs:

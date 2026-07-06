@@ -2,8 +2,10 @@
 //
 // Token lifecycle: obtained from POST /auth using Telegram initData,
 // kept in-memory only (sessionStorage is fine but not necessary — the
-// page lives inside Telegram and is short-lived). On 401 the caller
-// should re-auth via initData.
+// page lives inside Telegram and is short-lived). On 401 the request()
+// wrapper re-auths via initData transparently for ALL calls.
+
+import { getTg } from "./telegram";
 
 export interface Subscription {
   id: number;
@@ -130,34 +132,127 @@ export function setToken(t: string | null) {
   token = t;
 }
 
-async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
+// Эндпоинт авторизации: на нём НЕ пытаемся переавторизоваться на 401,
+// иначе reauth() (который сам дёргает /auth) уходит в рекурсию.
+const AUTH_PATH = "/api/webapp/auth";
+const FETCH_TIMEOUT_MS = 15000;
+
+// Лёгкие breadcrumbs сетевых сбоев. Пользователю НЕ показываются (у него —
+// friendlyError), нужны поддержке, разбирающей «кабинет не грузится»: в
+// консоли webview видно метод/путь/статус/длительность и факт reauth.
+// Префикс [webapp-net] — чтобы грепать в логах webview.
+function netLog(event: string, data?: Record<string, unknown>): void {
+  try {
+    console.warn(`[webapp-net] ${event}`, data ?? "");
+  } catch {
+    // console может отсутствовать в экзотическом webview — диагностика
+    // не должна ронять сам запрос.
+  }
+}
+
+// Голый fetch с таймаутом и feature-detection AbortController.
+//
+// AbortSignal.timeout появился только в Safari 16 / Android WebView ~103.
+// Telegram Mini App крутится в СИСТЕМНОМ WebView устройства (iOS 15,
+// бюджетный Android), где его нет — прямой вызов кидал TypeError синхронно и
+// ронял КАЖДЫЙ запрос, включая стартовый /auth (целая когорта устройств без
+// доступа, как раз частая аудитория VPN). Поэтому таймаут строим через
+// AbortController; если и его нет — деградируем до fetch без таймаута
+// (лучше без ограничения, чем полностью неработающее приложение).
+//
+// На мобильных сетях TCP может висеть минутами без ответа — таймаут бросает
+// "timeout", чтобы сработала ветка NETWORK_HINT в friendlyError вместо
+// вечной «Загрузки…».
+async function rawFetch(path: string, init: RequestInit): Promise<Response> {
   const headers: Record<string, string> = {
     "Content-Type": "application/json",
     ...((init.headers as Record<string, string>) ?? {}),
   };
   if (token) headers["Authorization"] = `Bearer ${token}`;
 
-  // Таймаут на голый fetch: на мобильных сетях (основная среда Mini App)
-  // TCP-соединение может висеть минутами без ответа и без ошибки, оставляя
-  // юзера на вечной «Загрузке…». 15 с → бросаем "timeout", чтобы сработала
-  // ветка NETWORK_HINT в friendlyError и показалась понятная ошибка.
-  let res: Response;
+  const method = (init.method ?? "GET").toUpperCase();
+  const started = Date.now();
+
+  let signal = init.signal ?? null;
+  let timer: ReturnType<typeof setTimeout> | null = null;
+  if (!signal && typeof AbortController !== "undefined") {
+    const controller = new AbortController();
+    signal = controller.signal;
+    timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
+  }
+
   try {
-    res = await fetch(path, {
+    const res = await fetch(path, {
       ...init,
       headers,
-      signal: init.signal ?? AbortSignal.timeout(15000),
+      signal: signal ?? undefined,
     });
+    if (!res.ok) {
+      netLog("http-error", {
+        method,
+        path,
+        status: res.status,
+        ms: Date.now() - started,
+      });
+    }
+    return res;
   } catch (e) {
-    // TimeoutError (от AbortSignal.timeout) и AbortError → сетевой таймаут.
+    // TimeoutError/AbortError (наш таймаут или отмена вызывающим) → "timeout".
     if (
       e instanceof DOMException &&
       (e.name === "TimeoutError" || e.name === "AbortError")
     ) {
+      netLog("timeout", { method, path, ms: Date.now() - started });
       throw new Error("timeout");
     }
+    netLog("network-error", {
+      method,
+      path,
+      ms: Date.now() - started,
+      name: (e as Error)?.name,
+    });
     throw e;
+  } finally {
+    if (timer !== null) clearTimeout(timer);
   }
+}
+
+// Прозрачная переавторизация через Telegram initData. initData живёт весь
+// сеанс Mini App, поэтому протухший токен чиним прозрачно, не заставляя юзера
+// переоткрывать приложение. Раньше это жило ТОЛЬКО в App.tsx для /me, из-за
+// чего мутации (заморозка, добавление устройства, пополнение…) падали сырым
+// «401» при возврате в давно открытый кабинет. Теперь — на уровне общей
+// обёртки, поэтому получают ВСЕ вызовы. С App.tsx не конфликтует: там reauth
+// остаётся страховкой для стартового bootstrap, а рекурсию режет AUTH_PATH.
+async function reauth(): Promise<boolean> {
+  const tg = getTg();
+  if (!tg || !tg.initData) return false;
+  try {
+    const auth = await authWithInitData(tg.initData);
+    setToken(auth.token);
+    netLog("reauth-ok");
+    return true;
+  } catch {
+    netLog("reauth-failed");
+    return false;
+  }
+}
+
+async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
+  let res = await rawFetch(path, init);
+
+  // Токен протух → один раз прозрачно переавторизуемся и повторяем запрос.
+  // Защита от рекурсии: сам /auth не переавторизуем (иначе reauth зациклится).
+  if (
+    (res.status === 401 || res.status === 403) &&
+    path !== AUTH_PATH
+  ) {
+    netLog("reauth-trigger", { path, status: res.status });
+    if (await reauth()) {
+      res = await rawFetch(path, init);
+    }
+  }
+
   if (!res.ok) {
     const text = await res.text();
     throw new Error(`${res.status}: ${text || res.statusText}`);

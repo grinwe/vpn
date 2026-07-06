@@ -49,6 +49,12 @@ def test_collect_all_nodes_parallel_partial_failure(db_session: Session, monkeyp
         return _fake_result()
 
     monkeypatch.setattr(traffic_stats, "collect_node_stats", fake_collect)
+    # Сетевой аудит (finding 4) добавил preflight-загрузку provisioning-ключа
+    # ОДИН раз до старта потоков. В юнит-окружении ключа нет — мокаем загрузку и
+    # os.path.exists, иначе collect_all_active_nodes короткозамыкает в [] ещё до
+    # collect_node_stats и оркестровка (ради которой тест) не проверяется.
+    monkeypatch.setattr(traffic_stats, "_load_provisioning_pkey", lambda p: object())
+    monkeypatch.setattr(traffic_stats.os.path, "exists", lambda p: True)
 
     summaries = traffic_stats.collect_all_active_nodes(db_session, interval_seconds=300)
 
@@ -89,6 +95,10 @@ def test_collect_all_nodes_budget_defers_tail_keeps_partial(db_session: Session,
         return _fake_result(uplink=111, downlink=222, users=1)
 
     monkeypatch.setattr(traffic_stats, "collect_node_stats", fake_collect)
+    # См. коммент выше: мокаем preflight-загрузку ключа, иначе короткое
+    # замыкание в [] до старта параллельного сбора.
+    monkeypatch.setattr(traffic_stats, "_load_provisioning_pkey", lambda p: object())
+    monkeypatch.setattr(traffic_stats.os.path, "exists", lambda p: True)
     monkeypatch.setenv("TRAFFIC_STATS_BUDGET_SEC", "1")
 
     try:

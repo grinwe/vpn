@@ -125,8 +125,17 @@ class ReportFailureResponse(BaseModel):
     # миграции не было (throttled / no_target / inactive — репорт не пишем).
     report_id: int | None = None
     # Action taken — для клиента UX и для отладки. Возможные:
-    # "migrated" / "no_target_available" / "throttled" / "subscription_inactive".
+    # "migrated" / "no_target_available" / "throttled" / "subscription_inactive"
+    # / "deferred" (fail_count ниже порога — мягкий отказ без миграции)
+    # / "error" (непредвиденный сбой миграции — клиент ждёт retry_after_sec).
     action: str
+    # ВАЖНО (audit «action=migrated мгновенно…»): при action="migrated" сама
+    # провизия девайса на новой ноде идёт ФОНОВОЙ ansible-таской. До её
+    # завершения перечитанный /api/sub/{token} вернёт 503 (нет активных
+    # кредов). Поэтому provisioning_pending=True — сигнал клиенту/UX «сервер
+    # меняется, конфиг появится в течение ~retry_after_sec»: НЕ рефетчить сабу
+    # и НЕ показывать ноду как готовую раньше, чем истечёт retry_after_sec.
+    provisioning_pending: bool = False
 
 
 # ── Endpoint ────────────────────────────────────────────────────────────
@@ -197,6 +206,13 @@ def report_failure(
         device_id=device.id,
         fail_count=body.fail_count,
         client_ts=body.ts,
+        # Клиент присылает, какую ноду ОН считает сломанной (diverse-саба:
+        # мог упасть на любой ноде своего набора, а не на sub.node_id).
+        client_node_id=body.current_node_id,
+        # Гейт по fail_count включаем ТОЛЬКО на автоматическом клиентском
+        # пути: единичный транзиент при смене сети (WiFi→LTE) не должен рвать
+        # юзера со здоровой ноды. Ручной админ-триггер гейт не применяет.
+        apply_fail_count_gate=True,
     )
 
 
@@ -397,6 +413,39 @@ def _should_auto_ban(db: Session, user_id: int) -> bool:
     return _auto_ban_query(db, user_id).count() < max_bans
 
 
+def _resolve_reported_node_id(
+    db: Session, device_id: int | None, client_node_id: int | None
+) -> int | None:
+    """Валидация присланного клиентом current_node_id по кредам девайса.
+
+    Diverse-саба (N×M): клиент сам делает client-side failover и может
+    сидеть/падать на ПРОИЗВОЛЬНОЙ ноде своего набора, а не на sub.node_id.
+    Поэтому голос «не работает» надо приписывать той ноде, которую сломанной
+    считает клиент — но только если она реально входит в активные креды
+    ЭТОГО девайса (анти-forge: чужую/левую ноду не эскалируем и не пишем в
+    репорт). Если ноды в наборе нет или клиент её не прислал → None, и caller
+    падёт на sub.node_id (legacy/whole-sub путь).
+    """
+    if client_node_id is None or device_id is None:
+        return None
+    node_ids = {
+        row[0]
+        for row in db.query(models.Credential.node_id)
+        .filter(models.Credential.device_id == device_id)
+        .filter(models.Credential.is_active.is_(True))
+        .filter(models.Credential.node_id.isnot(None))
+        .all()
+    }
+    if client_node_id in node_ids:
+        return client_node_id
+    logger.warning(
+        "client_control: reported current_node_id=%s не входит в активные "
+        "креды девайса %s (%s) — fallback на sub.node_id",
+        client_node_id, device_id, sorted(node_ids),
+    )
+    return None
+
+
 def _do_failover(
     db: Session,
     sub: models.Subscription,
@@ -406,6 +455,8 @@ def _do_failover(
     device_id: int | None = None,
     fail_count: int = 1,
     client_ts: int | None = None,
+    client_node_id: int | None = None,
+    apply_fail_count_gate: bool = False,
 ) -> ReportFailureResponse:
     """Shared body для client/admin триггеров — select target + migrate.
 
@@ -420,6 +471,21 @@ def _do_failover(
             retry_after_sec=600,
             action="subscription_inactive",
         )
+
+    # Гейт подтверждённости сбоя: единичный транзиент при смене сети
+    # (WiFi→LTE, лифт) не должен мигрировать+банить здоровую ноду. Порог —
+    # env FAILOVER_MIN_FAIL_COUNT (дефолт 1 = фактически выкл, т.к. клиент
+    # шлёт fail_count>=1; поднять до 2-3 чтобы требовать серию сбоев). Гейт
+    # активен только на клиентском пути (apply_fail_count_gate); ручной
+    # админ-триггер мигрирует безусловно.
+    if apply_fail_count_gate:
+        min_fail_count = int(os.getenv("FAILOVER_MIN_FAIL_COUNT", "1"))
+        if fail_count < min_fail_count:
+            return ReportFailureResponse(
+                ok=True,
+                retry_after_sec=120,
+                action="deferred",
+            )
 
     recent_migrate_cutoff = utcnow() - timedelta(minutes=5)
     # Троттл по operator_node_reports (reported_at индексирован) вместо
@@ -439,7 +505,13 @@ def _do_failover(
             action="throttled",
         )
 
-    old_node_id = sub.node_id
+    # Нода-виновник для АТРИБУЦИИ (крауд-хелс + OperatorNodeReport.failed_node):
+    # берём присланную клиентом current_node_id, если она валидна по кредам
+    # девайса (diverse-саба), иначе fallback на первичную sub.node_id. NB: сама
+    # миграция и auto-ban внутри migrate_subscription_to_free_node по-прежнему
+    # оперируют sub.node (primary) — перенос бана на реально сбойную diverse-ноду
+    # потребовал бы правок provisioning.choose_node и вынесен отдельно.
+    old_node_id = _resolve_reported_node_id(db, device_id, client_node_id) or sub.node_id
 
     # Анти-«выжигание пула»: снимаем протухшие авто-баны и при потолке
     # банов мигрируем без нового бана (см. NODE_USER_BAN_TTL_HOURS /
@@ -483,15 +555,23 @@ def _do_failover(
             retry_after_sec=900,
             action="no_target_available",
         )
-    except Exception as exc:  # noqa: BLE001
+    except Exception:  # noqa: BLE001
+        # Непредвиденный сбой миграции (БД/ansible). Раньше отдавали HTTP 500 с
+        # сырым текстом исключения — custom-клиент ждёт JSON ReportFailureResponse
+        # и не парсит {"detail": ...}, к тому же наружу утекал внутренний текст.
+        # Ведём себя как ветка no_target: rollback + лог + структурированный
+        # ответ с retry_after, чтобы клиент корректно бэкоффнул, а не спамил.
+        if db.is_active:
+            db.rollback()
         logger.exception(
             "client_control: migrate_subscription_to_free_node failed for sub %s",
             sub.id,
         )
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"migration failed: {exc}",
-        ) from exc
+        return ReportFailureResponse(
+            ok=False,
+            retry_after_sec=600,
+            action="error",
+        )
 
     # Operator-routing P1 (см. docs/operations/operator_routing_roadmap.md):
     # КАЖДЫЙ user-reported failover пишет OperatorNodeReport — зеркало бот-флоу
@@ -556,6 +636,10 @@ def _do_failover(
         task_id=task_id,
         report_id=report_id,
         action="migrated",
+        # Провизия девайса на новой ноде — фоновая ansible-таска; конфиг в
+        # /api/sub появится не сразу. Клиент ждёт retry_after_sec, не рефетчит
+        # раньше и не показывает ноду как «готова».
+        provisioning_pending=True,
     )
 
 

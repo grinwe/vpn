@@ -66,8 +66,16 @@ KNOWN_PROTOCOL_PORTS: list[tuple[str, int]] = [
 XRAY_BIN = "/usr/local/bin/xray"
 SSH_PORT_DEFAULT = 22
 SSH_USER = "root"
-SSH_CONNECT_TIMEOUT = 10
-SSH_COMMAND_TIMEOUT = 15
+# SSH-таймауты сборщика. Держим их в паритете с ssh_bootstrap
+# (connect=15, banner=20, auth=20): на нагруженной/подсвопленной ноде
+# sshd отдаёт баннер/аутентификацию не мгновенно, и прежние 10с на все
+# три фазы давали ложные «collect failed» ровно на тех нодах, что под
+# нагрузкой и интереснее всего для мониторинга. Через env — на случай
+# особо медленных нод.
+SSH_CONNECT_TIMEOUT = int(os.getenv("TRAFFIC_STATS_SSH_CONNECT_TIMEOUT", "15"))
+SSH_BANNER_TIMEOUT = int(os.getenv("TRAFFIC_STATS_SSH_BANNER_TIMEOUT", "20"))
+SSH_AUTH_TIMEOUT = int(os.getenv("TRAFFIC_STATS_SSH_AUTH_TIMEOUT", "20"))
+SSH_COMMAND_TIMEOUT = int(os.getenv("TRAFFIC_STATS_SSH_COMMAND_TIMEOUT", "15"))
 
 # Per-tick бюджеты сборщика (см. collect_all_active_nodes). RQ-джоба
 # tick-traffic-stats имеет job_timeout=120s (queue.py::TICK_TIMEOUTS) —
@@ -78,6 +86,50 @@ TRAFFIC_STATS_BUDGET_SEC_DEFAULT = 100
 # и независимы по нодам; при последовательном обходе недоступная нода
 # стоит 10-30с и хвост флота не успевает опроситься за бюджет.
 TRAFFIC_STATS_SSH_WORKERS_DEFAULT = 8
+# Сколько тиков подряд нода может быть отсеяна по бюджету, прежде чем
+# поднимем отдельный алерт «нода систематически не опрашивается». Без
+# этого стабильно медленная (то есть подозрительная) нода откладывалась
+# бы каждый тик и не давала ни одного сэмпла — молча, в общем warning'е.
+TRAFFIC_STATS_MAX_SKIPS_DEFAULT = 3
+
+# Счётчик подряд идущих отсевов по бюджету, per node_id. Живёт в памяти
+# долгоживущего RQ-воркера между тиками (миграция/схема не нужны):
+# успешный сбор обнуляет счётчик, отсев — инкрементит; по достижении
+# порога поднимается явный алерт. При рестарте воркера обнуляется — это
+# ок, алерт лишь про «систематически», не про единичный пропуск.
+_consecutive_skips: dict[int, int] = {}
+
+
+def _resolve_provisioning_key_path() -> str:
+    """Путь к provisioning-ключу (та же логика, что в collect_node_stats)."""
+    return (
+        os.getenv("ANSIBLE_PRIVATE_KEY_FILE")
+        or os.getenv("PROVISIONING_SSH_KEY")
+        or "/run/secrets/provisioning_key"
+    )
+
+
+def _load_provisioning_pkey(key_path: str):
+    """Загрузить provisioning-ключ, перебирая типы (ed25519/rsa/ecdsa).
+
+    Раньше грузился ТОЛЬКО ``Ed25519Key`` — если оператор когда-либо
+    выдаст provisioning_key как RSA/ECDSA, ``from_private_key_file``
+    бросал бы ``SSHException`` на КАЖДОЙ ноде, и весь пассивный сбор
+    молча умирал по всему флоту (детектор edge-блоков РКН слепнет).
+    Теперь перебираем те же три загрузчика, что и ssh_bootstrap, а при
+    неудаче всех бросаем один внятный ``RuntimeError`` про тип ключа.
+    """
+    import paramiko  # noqa: WPS433 — lazy import keeps it out of API
+
+    for loader in (paramiko.Ed25519Key, paramiko.RSAKey, paramiko.ECDSAKey):
+        try:
+            return loader.from_private_key_file(key_path)
+        except Exception:  # noqa: BLE001 — не тот тип / passphrase → пробуем дальше
+            continue
+    raise RuntimeError(
+        f"provisioning key type unsupported at {key_path} "
+        "(tried ed25519/rsa/ecdsa) — сбор статистики невозможен по всему флоту"
+    )
 
 
 @dataclass
@@ -264,15 +316,14 @@ def collect_node_stats(node) -> NodeStatsResult:
     except ImportError as exc:  # pragma: no cover — paramiko is in requirements.txt
         raise RuntimeError("paramiko not installed in the worker container") from exc
 
-    key_path = (
-        os.getenv("ANSIBLE_PRIVATE_KEY_FILE")
-        or os.getenv("PROVISIONING_SSH_KEY")
-        or "/run/secrets/provisioning_key"
-    )
+    key_path = _resolve_provisioning_key_path()
     if not os.path.exists(key_path):
         raise RuntimeError(f"provisioning ssh key not found at {key_path}")
 
-    pkey = paramiko.Ed25519Key.from_private_key_file(key_path)
+    # Перебор типов ключа (ed25519/rsa/ecdsa) — не глушим сбор по всему
+    # флоту, если provisioning_key окажется не ed25519. См.
+    # _load_provisioning_pkey.
+    pkey = _load_provisioning_pkey(key_path)
 
     client = paramiko.SSHClient()
     client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
@@ -283,8 +334,8 @@ def collect_node_stats(node) -> NodeStatsResult:
             username=SSH_USER,
             pkey=pkey,
             timeout=SSH_CONNECT_TIMEOUT,
-            banner_timeout=SSH_CONNECT_TIMEOUT,
-            auth_timeout=SSH_CONNECT_TIMEOUT,
+            banner_timeout=SSH_BANNER_TIMEOUT,
+            auth_timeout=SSH_AUTH_TIMEOUT,
             allow_agent=False,
             look_for_keys=False,
         )
@@ -292,10 +343,16 @@ def collect_node_stats(node) -> NodeStatsResult:
         result = NodeStatsResult()
         all_users: set[str] = set()
         for proto, port in KNOWN_PROTOCOL_PORTS:
+            # НЕ редиректим stderr в /dev/null: раньше `2>/dev/null` на
+            # удалённой команде делал paramiko-канал stderr всегда пустым,
+            # и любой сбой (xray упал / gRPC-порт залип / нода перегружена)
+            # был неотличим от штатного отсутствия протокола — оба молча
+            # писались как достоверный ноль байт. Теперь stderr доходит и
+            # мы различаем эти случаи.
             cmd = (
                 f"{XRAY_BIN} api statsquery "
                 f"--server=127.0.0.1:{port} "
-                f"--reset 2>/dev/null"
+                f"--reset"
             )
             try:
                 exit_status, stdout, stderr = _ssh_run(client, cmd)
@@ -305,14 +362,25 @@ def collect_node_stats(node) -> NodeStatsResult:
                 continue
 
             if exit_status != 0:
-                # Most common cause: this protocol isn't installed on
-                # the node, so the gRPC port doesn't exist. xray's CLI
-                # exits non-zero with a "connection refused" message.
-                # Don't surface that as a row-level error — just record
-                # an empty ProtocolStats and move on.
                 stats = ProtocolStats()
-                if stderr.strip():
-                    stats.error = stderr.strip().splitlines()[-1][:200]
+                err_tail = (
+                    stderr.strip().splitlines()[-1][:200]
+                    if stderr.strip() else ""
+                )
+                low = err_tail.lower()
+                # «connection refused» / «no such file» = протокол не
+                # установлен на ноде (gRPC-порт отсутствует) → штатно
+                # пустой ProtocolStats БЕЗ error. Любой другой ненулевой
+                # код = реальный сбой xray/gRPC → кладём stderr в error,
+                # чтобы деградация была видна в details._errors, а не
+                # проглатывалась как «нода просто без трафика».
+                is_port_absent = (
+                    "connection refused" in low
+                    or "no such file" in low
+                    or "connection error" in low
+                )
+                if not is_port_absent:
+                    stats.error = err_tail or f"xray statsquery exit {exit_status}"
                 result.per_protocol[proto] = stats
                 continue
 
@@ -716,6 +784,12 @@ def collect_all_active_nodes(session, interval_seconds: int) -> list[dict[str, A
     ``TRAFFIC_STATS_BUDGET_SEC`` (default 100с, job_timeout тика = 120с):
     при исчерпании недособранный хвост нод откладывается до следующего
     тика — тот же паттерн, что в run_node_reachability_tick.
+
+    Ноды сабмитятся в порядке давности последнего успешного сэмпла
+    (давно/ни разу не собранные — первыми), чтобы отсев по бюджету не бил
+    детерминированно по одним и тем же стабильно медленным нодам. Если
+    нода отсеивается ``TRAFFIC_STATS_MAX_SKIPS`` (default 3) тиков подряд,
+    поднимается отдельный error-алерт «систематически не опрашивается».
     """
     from .. import models
 
@@ -735,11 +809,50 @@ def collect_all_active_nodes(session, interval_seconds: int) -> list[dict[str, A
     if not nodes:
         return []
 
+    # Preflight: грузим provisioning-ключ ОДИН раз до старта потоков. Если
+    # тип ключа не поддерживается — раньше это давало N молчаливых «collect
+    # failed» (по одному на ноду) без внятной причины; теперь один явный
+    # алерт про тип ключа, и тик не выглядит «просто медленным».
+    key_path = _resolve_provisioning_key_path()
+    if not os.path.exists(key_path):
+        logger.error(
+            "traffic_stats: provisioning ssh key not found at %s — "
+            "сбор статистики по всему флоту пропущен", key_path,
+        )
+        return []
+    try:
+        _load_provisioning_pkey(key_path)
+    except Exception as exc:  # noqa: BLE001
+        logger.error("traffic_stats: %s", exc)
+        return []
+
     # Снимок атрибутов ДО старта потоков — см. docstring _NodeRef.
     refs = [
         _NodeRef(id=n.id, name=n.name, host=n.host, ssh_port=n.ssh_port)
         for n in nodes
     ]
+
+    # Порядок сабмита = давность последнего успешного сэмпла (давно не
+    # собранные — первыми). Раньше отсев по бюджету бил детерминированно по
+    # хвосту as_completed, то есть по стабильно медленным нодам — а это
+    # ровно перегруженные/полудохлые ноды, которые важнее всего мониторить,
+    # и они не давали НИ ОДНОГО сэмпла тик за тиком. Ротация гарантирует,
+    # что рано или поздно каждую ноду опросят первой.
+    from sqlalchemy import func as _sqlfunc  # noqa: WPS433 — локальный импорт
+    last_seen_rows = (
+        session.query(
+            models.NodeTrafficSample.node_id,
+            _sqlfunc.max(models.NodeTrafficSample.observed_at),
+        )
+        .group_by(models.NodeTrafficSample.node_id)
+        .all()
+    )
+    last_seen = {nid: ts for nid, ts in last_seen_rows}
+    # Ключ: (есть ли сэмпл, время последнего). Ни разу не собранные ноды
+    # (False) идут первыми; среди собранных — по возрастанию времени
+    # (самые старые вперёд). Второй элемент сравнивается только внутри
+    # одной группы, поэтому None и datetime не сталкиваются.
+    refs.sort(key=lambda r: (r.id in last_seen, last_seen.get(r.id)))
 
     budget_s = int(
         os.getenv("TRAFFIC_STATS_BUDGET_SEC", str(TRAFFIC_STATS_BUDGET_SEC_DEFAULT))
@@ -747,6 +860,10 @@ def collect_all_active_nodes(session, interval_seconds: int) -> list[dict[str, A
     workers = max(
         1,
         int(os.getenv("TRAFFIC_STATS_SSH_WORKERS", str(TRAFFIC_STATS_SSH_WORKERS_DEFAULT))),
+    )
+    max_skips = max(
+        1,
+        int(os.getenv("TRAFFIC_STATS_MAX_SKIPS", str(TRAFFIC_STATS_MAX_SKIPS_DEFAULT))),
     )
 
     summaries: list[dict[str, Any]] = []
@@ -783,13 +900,31 @@ def collect_all_active_nodes(session, interval_seconds: int) -> list[dict[str, A
                         session.rollback()
                     continue
                 summaries.append(summary)
+                # Успешно собрали — обнуляем счётчик отсевов ноды.
+                _consecutive_skips.pop(ref.id, None)
         except _futures.TimeoutError:
-            pending = [r.name for f, r in future_to_ref.items() if not f.done()]
+            pending_refs = [r for f, r in future_to_ref.items() if not f.done()]
+            pending = [r.name for r in pending_refs]
             logger.warning(
                 "traffic_stats: wall-clock budget %ss hit, %d node(s) deferred "
                 "to next tick: %s",
                 budget_s, len(pending), pending,
             )
+            # Инкрементим per-node счётчик подряд идущих отсевов. Если нода
+            # отсеивается max_skips тиков подряд — она систематически не
+            # опрашивается (стабильно медленный SSH ⇒ перегруженная/
+            # деградирующая нода). Поднимаем ОТДЕЛЬНЫЙ алерт, а не прячем
+            # это в общем «deferred»-warning'е.
+            for r in pending_refs:
+                n = _consecutive_skips.get(r.id, 0) + 1
+                _consecutive_skips[r.id] = n
+                if n >= max_skips:
+                    logger.error(
+                        "traffic_stats: node %s (%s) отсеяна по бюджету %d "
+                        "тиков подряд — сэмплы не собираются; проверьте "
+                        "доступность/нагрузку SSH ноды",
+                        r.id, r.name, n,
+                    )
     finally:
         # Не ждём зависшие SSH-сессии: нестартовавшие фьючи отменяем,
         # уже бегущие потоки дособерут в фоне и умрут вместе с джобой.

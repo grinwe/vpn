@@ -7,6 +7,7 @@ handling stays uniform across drivers.
 from __future__ import annotations
 
 import logging
+import os
 import time
 
 import requests
@@ -18,6 +19,35 @@ logger = logging.getLogger(__name__)
 API = "https://api.hetzner.cloud/v1"
 POLL_TIMEOUT = 180  # seconds — server should be "running" well within this
 POLL_INTERVAL = 3  # seconds between status polls
+
+# ── Ретрай транзиентных сбоев HTTP-слоя ────────────────────────────────────
+# Hetzner держит rate-limit (~3600/ч плюс всплесковые лимиты). При autoscale-
+# всплеске (node_spawner заказывает несколько нод подряд) или при открытии
+# формы заказа (list_regions/list_plans/list_images подряд) провайдер вернёт
+# 429 — раньше это был мгновенный жёсткий отказ, хотя достаточно было выждать
+# секунды. Ретраим идемпотентные запросы (GET/DELETE) на 429/5xx/сетевых
+# таймаутах с экспоненциальным backoff и уважением Retry-After; неидемпотентный
+# POST-заказ ретраим ТОЛЬКО на 429 (заказ ещё не создан — побочного эффекта
+# нет), но не на 5xx/таймауте, чтобы не задвоить оплату.
+_RETRY_STATUSES = frozenset({429, 500, 502, 503, 504})
+# Число ДОПОЛНИТЕЛЬНЫХ попыток (итого attempts = MAX_RETRIES + 1).
+HTTP_MAX_RETRIES = int(os.getenv("CLOUD_HTTP_MAX_RETRIES", "3"))
+HTTP_BACKOFF_BASE = float(os.getenv("CLOUD_HTTP_BACKOFF_BASE", "1.0"))  # сек
+HTTP_BACKOFF_CAP = float(os.getenv("CLOUD_HTTP_BACKOFF_CAP", "30.0"))  # сек
+
+
+def _retry_after_seconds(resp: requests.Response, attempt: int) -> float:
+    """Пауза перед следующей попыткой: Retry-After (если прислан) либо
+    экспоненциальный backoff. Ограничена HTTP_BACKOFF_CAP."""
+    backoff = min(HTTP_BACKOFF_BASE * (2 ** attempt), HTTP_BACKOFF_CAP)
+    ra = resp.headers.get("Retry-After") if resp is not None else None
+    if ra:
+        try:
+            # Hetzner отдаёт Retry-After в секундах (целое).
+            return min(max(float(ra), 0.0), HTTP_BACKOFF_CAP)
+        except ValueError:
+            pass  # HTTP-date форму игнорируем — падаем на backoff
+    return backoff
 
 
 def _monthly_price(server: dict) -> float | None:
@@ -194,24 +224,71 @@ class HetznerDriver:
         return self._request("GET", path)
 
     def _post(self, path: str, body: dict) -> dict:
-        return self._request("POST", path, json=body)
+        # POST — неидемпотентный заказ: ретраим ТОЛЬКО на 429 (до создания
+        # сервера побочного эффекта ещё нет), но не на 5xx/таймауте.
+        return self._request("POST", path, json=body, idempotent=False)
 
     def _delete(self, path: str) -> dict:
         return self._request("DELETE", path)
 
-    def _request(self, method: str, path: str, **kwargs) -> dict:
-        try:
-            resp = self._session.request(method, f"{API}{path}", timeout=30, **kwargs)
-        except requests.RequestException as exc:
-            raise DriverError(f"Hetzner API request failed: {exc}") from exc
-        if resp.status_code == 204:
-            return {}
-        try:
-            payload = resp.json()
-        except ValueError:
-            payload = {"raw": resp.text}
-        if resp.status_code >= 400:
-            raise DriverError(
-                f"Hetzner API {method} {path} -> {resp.status_code}: {payload}"
+    def _request(
+        self, method: str, path: str, *, idempotent: bool | None = None, **kwargs
+    ) -> dict:
+        # По умолчанию GET/DELETE считаем идемпотентными (можно ретраить и на
+        # 5xx/таймауте), POST — нет (см. _post).
+        if idempotent is None:
+            idempotent = method in ("GET", "DELETE")
+
+        last_err: DriverError | None = None
+        for attempt in range(HTTP_MAX_RETRIES + 1):
+            try:
+                resp = self._session.request(
+                    method, f"{API}{path}", timeout=30, **kwargs
+                )
+            except requests.RequestException as exc:
+                # Сетевой сбой/таймаут: для идемпотентных запросов ретраим,
+                # для POST-заказа — нет (сервер мог успеть создаться).
+                last_err = DriverError(f"Hetzner API request failed: {exc}")
+                if idempotent and attempt < HTTP_MAX_RETRIES:
+                    delay = min(
+                        HTTP_BACKOFF_BASE * (2 ** attempt), HTTP_BACKOFF_CAP
+                    )
+                    logger.warning(
+                        "hetzner: %s %s сетевой сбой (%s), ретрай %d/%d через %.1fс",
+                        method, path, exc, attempt + 1, HTTP_MAX_RETRIES, delay,
+                    )
+                    time.sleep(delay)
+                    continue
+                raise last_err from exc
+
+            # Транзиентный HTTP-код: 429 ретраим всегда (в т.ч. POST — заказ
+            # отклонён, сервер не создан), 5xx — только для идемпотентных.
+            retriable = resp.status_code == 429 or (
+                idempotent and resp.status_code in _RETRY_STATUSES
             )
-        return payload
+            if retriable and attempt < HTTP_MAX_RETRIES:
+                delay = _retry_after_seconds(resp, attempt)
+                logger.warning(
+                    "hetzner: %s %s -> %d, ретрай %d/%d через %.1fс",
+                    method, path, resp.status_code,
+                    attempt + 1, HTTP_MAX_RETRIES, delay,
+                )
+                time.sleep(delay)
+                continue
+
+            if resp.status_code == 204:
+                return {}
+            try:
+                payload = resp.json()
+            except ValueError:
+                payload = {"raw": resp.text}
+            if resp.status_code >= 400:
+                raise DriverError(
+                    f"Hetzner API {method} {path} -> {resp.status_code}: {payload}"
+                )
+            return payload
+
+        # Исчерпали ретраи на сетевом сбое (идемпотентный путь).
+        raise last_err or DriverError(
+            f"Hetzner API {method} {path} failed after {HTTP_MAX_RETRIES + 1} attempts"
+        )

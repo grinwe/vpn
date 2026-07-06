@@ -42,6 +42,7 @@
 | `BOT_USERNAME` | `""` | backend, bot | Username бота (без `@`) для построения t.me/<bot>?start=... в referral flow. Без этого `/api/webapp/referral` возвращает `share_url=None`. |
 | `BACKEND_URL` | `http://localhost:8000` | bot | Куда бот ходит за API. Внутри docker compose — `http://backend:8000`. |
 | `NOTIFICATION_POLL_INTERVAL` | `10` | bot | Интервал (секунды) между опросами `/api/notifications/pending`. `<=0` — отключить поллер. |
+| `NOTIFICATION_BROADCAST_PER_TICK` | `50` | bot | Максимум `admin_broadcast`, отправляемых поллером за один тик. Срочные типы (`config_ready`/`health_ping_request`/`admin_alert_*`) сортируются в начало тика и не режутся; хвост рассылки сверх лимита переносится на следующие тики (защита от head-of-line). |
 
 ## Redis / RQ
 
@@ -93,10 +94,21 @@
 | `TRAFFIC_STATS_INTERVAL` | `300` | worker | `run_traffic_stats_tick` — SSH-сбор xray stats + sharing violations. Phase D `detect_traffic_drops` **отключён 2026-04-15** — теперь только сбор samples. |
 | `TRAFFIC_STATS_BUDGET_SEC` | `100` | worker | Wall-clock-бюджет одного traffic-stats тика. Сэмплы коммитятся по-нодно; при исчерпании бюджета недособранный хвост нод откладывается до следующего тика (job_timeout тика = 120с, бюджет держит запас). |
 | `TRAFFIC_STATS_SSH_WORKERS` | `8` | worker | Параллелизм SSH-сбора в `collect_all_active_nodes` (ThreadPoolExecutor). Записи в БД — только из главного потока. |
+| `TRAFFIC_STATS_MAX_SKIPS` | `3` | worker | Сколько тиков подряд нода может быть отсеяна по бюджету, прежде чем поднимется отдельный error-алерт «систематически не опрашивается». Ноды сабмитятся в порядке давности последнего сэмпла (never-sampled первыми), так что отсев не бьёт всегда по одним и тем же. |
+| `TRAFFIC_STATS_SSH_CONNECT_TIMEOUT` | `15` | worker | SSH connect-таймаут сборщика (`collect_node_stats`). Паритет с `ssh_bootstrap`. |
+| `TRAFFIC_STATS_SSH_BANNER_TIMEOUT` | `20` | worker | SSH banner-таймаут сборщика. Прежние 10с давали ложные «collect failed» на нагруженных нодах. |
+| `TRAFFIC_STATS_SSH_AUTH_TIMEOUT` | `20` | worker | SSH auth-таймаут сборщика. |
+| `TRAFFIC_STATS_SSH_COMMAND_TIMEOUT` | `15` | worker | Таймаут удалённой команды `xray api statsquery` / чтения sharing-violations. |
 | ~~`TRAFFIC_DROP_ENABLED`~~ | ~~`1`~~ | worker | **Inert с 2026-04-15.** Phase D детектор отключён на уровне кода (`worker.run_traffic_stats_tick` не вызывает `detect_traffic_drops`, функция стоит no-op). Переменная оставлена для обратной совместимости env, но не читается. |
 | ~~`TRAFFIC_DROP_MIN_USERS`~~ | ~~`5`~~ | worker | **Inert с 2026-04-15.** При возврате автомиграции пороги нужно пересмотреть — прежние значения ложно-триггерили миграции в idle-окнах. |
 | ~~`TRAFFIC_DROP_CONFIRM_TICKS`~~ | ~~`1`~~ | worker | **Inert с 2026-04-15.** См. `TRAFFIC_DROP_MIN_USERS`. |
 | `NODE_REACHABILITY_STALE_MIN` | `30` | worker | Окно «голодания» reachability-тика (мин): цели без проба дольше этого попадают в гейдж `vpn_reachability_stale_targets` / `summary.stale_targets`. Стабильно >0 — бюджета `NODE_REACHABILITY_BUDGET_SEC` не хватает на весь флот (аудит-фикс #95). |
+| `NODE_VPN_PROBE_PORTS` | *(пусто → из VPNConfig)* | worker | Сетевой аудит #1: reachability-тик при живом SSH дополнительно пробит TCP VPN-порт(ы) ноды — SSH-liveness ≠ VPN-liveness. Пусто = порты берутся из enabled `VPNConfig` ноды (hysteria2/UDP исключается, чтобы не ловить ложный `degraded`). CSV (`443,8443`) — ручной override для всех нод. ЗАКРЫТЫ ВСЕ порты при живом SSH → статус `degraded` + пуш + on-host diagnose. |
+| `NODE_CONTROLLER_ANCHORS` | `1.1.1.1:443,8.8.8.8:443` | worker | Сетевой аудит #3: self-check связности контроллера ПЕРЕД пер-нодовыми пробами. CSV `host:port` внешних якорей. Хоть один ответил → сеть есть. ВСЕ молчат → воркер потерял сеть: тик пропускает пробы (не метит весь флот ложным DOWN) и шлёт один агрегированный алерт. Пусто = проверка отключена. |
+| `NODE_CONTROLLER_ANCHOR_TIMEOUT` | `5` | worker | TCP-таймаут (sec) на якорь в self-check связности контроллера. |
+| `NODE_PROBE_GAP_FACTOR` | `2` | worker | Сетевой аудит #7: если между прошлым и текущим пробом цели дыра > `NODE_REACHABILITY_INTERVAL * factor` (цель выпала в обрезанный бюджетом хвост / тик подвисал), серия DOWN перезапускается, а не эскалируется по дырявому wall-clock. |
+| `NODE_MASS_DOWN_FRACTION` | `0` | worker | Сетевой аудит #3 (доп.): доля DOWN/degraded среди пробитых целей ≥ этого (при `checked >= NODE_MASS_DOWN_MIN`) → индивидуальные алерты подавляются, шлётся один «массовая недоступность». `0` = выключено (основной механизм — `NODE_CONTROLLER_ANCHORS`). |
+| `NODE_MASS_DOWN_MIN` | `5` | worker | Минимум пробитых целей за тик, прежде чем срабатывает mass-down подавление (`NODE_MASS_DOWN_FRACTION`). |
 | `OPS_PLAN_REAPER_INTERVAL` | `300` | worker | `run_ops_plan_reaper_tick` — бэкстоп ops-агента: добивает планы, залипшие в `executing` (воркер умер / джоба убита по `job_timeout`), в `failed` с `execution.phase='crash'`. `0` — отключить (аудит-фикс #120). |
 | `OPS_PLAN_REAPER_GRACE` | `120` | worker | Запас (sec) сверх `OPS_EXECUTE_JOB_TIMEOUT` до реапа executing-плана (ожидание в очереди / clock skew). |
 | `OPS_EXECUTE_JOB_TIMEOUT` | `1800` | worker | Считается таймаутом RQ-джобы `run_ops_plan_execute` для реапера (должен совпадать с `job_timeout` enqueue'а в `api/agent.py`). |
@@ -168,6 +180,9 @@
 | переменная | default | кто читает | описание |
 |---|---|---|---|
 | `SUB_LINK_BASE_URL` | `""` | backend, worker, bot | Base URL sub-links вида `<base>/<sub_token>`. Пусто → sub links disabled, клиенты получают raw URIs. **Зеркалится** в backend и worker, потому что обе стороны пишут `Device.connection_uri`. Указывать на «boring» CDN-домен, не на основной grinwer.online — RKN-блокировка основного не убьёт installed-клиентов. **CDN-фронт обязан отдавать HTTP/1.1**: RKN DPI на мобильных операторах режет H2 stream после TLS-handshake (headers доходят, тело — нет), H1.1 проскакивает. На Cloudflare отключение HTTP/2 требует Pro-плана (Free-план оставляет H2 включённым). Текущий фронт — `grn-ssync.pro` (CF Worker `v8-sub`, проксирует `/<token>` → `https://grinwer.online/api/sub/<token>`). |
+| `SUB_PROFILE_UPDATE_INTERVAL_H` | `2` | backend | Заголовок `profile-update-interval` (часы) в саб-ответе — как часто Hiddify/v2rayNG/HAPP сами перечитывают сабу и через sibling-alias подхватывают новую ноду после failover/миграции. Раньше было захардкожено 6ч (окно устаревания конфига до полусуток). Прод для анти-РКН профиля может ужать до `1` (компромисс свежесть failover ↔ нагрузка read-пути; write-amplification срезается `SUB_FETCH_AUDIT_SAMPLE`). |
+| `SUB_RETRY_AFTER_SEC` | `60` | backend | Значение заголовка `Retry-After` (сек) на транзиентных 503 саб-линка (пустой набор конфигов / `frozen`-подписка). Даёт корректному клиенту машиночитаемый хинт перезапросить сразу после провижининга/разморозки вместо ожидания планового `profile-update-interval`. |
+| `SUB_FILTER_UNHEALTHY_NODES` | `1` | backend | Kill-switch фильтра нездоровых нод при сборке саб-конфига: `0`/`off`/`false` — отдавать креды всех нод как раньше. При включённом (дефолт) — исключать креды нод в `cooldown`/декоммишене/с низким `health_score` (см. `MIN_HEALTHY_SCORE`), чтобы клиент не держал мёртвый эндпоинт в ротации; fallback к полному набору, если фильтр выкинул все креды. |
 
 ## Warm credential pool
 

@@ -47,6 +47,34 @@ def _sample_usernames(sample: models.NodeTrafficSample | None) -> set[str]:
     return out
 
 
+def _healthy_device_count(db: Session, node_id: int, extra: Any = None) -> int:
+    """distinct device_id активных кредов на ноде, но ТОЛЬКО у «живых» девайсов
+    (audit #8). Креды протухших/замороженных подписок и отключённых девайсов
+    ещё могут висеть is_active=True (подметаются асинхронно), а их владельцы
+    трафик не гонят: они раздували бы знаменатель eligible и топили
+    carrying_fraction, маскируя мёртвые подписки под широкий блок ноды. Фильтр
+    один и тот же для eligible и carrying — иначе доля разъедется выше 1.0.
+    «Живой» = подписка status=active И девайс status=active."""
+    q = (
+        db.query(func.count(func.distinct(models.Credential.device_id)))
+        .join(models.Device, models.Credential.device_id == models.Device.id)
+        .join(
+            models.Subscription,
+            models.Device.subscription_id == models.Subscription.id,
+        )
+        .filter(
+            models.Credential.node_id == node_id,
+            models.Credential.is_active.is_(True),
+            models.Credential.device_id.isnot(None),
+            models.Device.status == models.DeviceStatus.active,
+            models.Subscription.status == models.SubscriptionStatus.active,
+        )
+    )
+    if extra is not None:
+        q = q.filter(extra)
+    return int(q.scalar() or 0)
+
+
 def compute_carrying_fractions(db: Session) -> list[dict[str, Any]]:
     """Per-node carrying_fraction по последнему traffic-сэмплу. Read-only."""
     nodes = (
@@ -57,16 +85,7 @@ def compute_carrying_fractions(db: Session) -> list[dict[str, Any]]:
     )
     out: list[dict[str, Any]] = []
     for node in nodes:
-        eligible = (
-            db.query(func.count(func.distinct(models.Credential.device_id)))
-            .filter(
-                models.Credential.node_id == node.id,
-                models.Credential.is_active.is_(True),
-                models.Credential.device_id.isnot(None),
-            )
-            .scalar()
-            or 0
-        )
+        eligible = _healthy_device_count(db, node.id)
         sample = (
             db.query(models.NodeTrafficSample)
             .filter(models.NodeTrafficSample.node_id == node.id)
@@ -90,20 +109,16 @@ def compute_carrying_fractions(db: Session) -> list[dict[str, Any]]:
         )
         usernames = _sample_usernames(sample)
         if usernames:
-            # is_active.is_(True) — иначе девайс с деактивированным кредом, чей
-            # access_username ещё светится в сэмпле, попадает в числитель, но не
-            # в знаменатель (eligible), и carrying_fraction вылезает за 1.0.
-            # С фильтром carrying — строгое подмножество eligible.
-            carrying = (
-                db.query(func.count(func.distinct(models.Credential.device_id)))
-                .filter(
-                    models.Credential.node_id == node.id,
-                    models.Credential.is_active.is_(True),
-                    models.Credential.device_id.isnot(None),
-                    models.Credential.access_username.in_(list(usernames)),
-                )
-                .scalar()
-                or 0
+            # Тот же фильтр «живых» девайсов, что и в eligible (is_active +
+            # активная подписка + активный девайс) — иначе девайс с
+            # деактивированным кредом/мёртвой подпиской, чей access_username ещё
+            # светится в сэмпле, попал бы в числитель, но не в знаменатель, и
+            # carrying_fraction вылез бы за 1.0. С общим фильтром carrying —
+            # строгое подмножество eligible.
+            carrying = _healthy_device_count(
+                db,
+                node.id,
+                extra=models.Credential.access_username.in_(list(usernames)),
             )
         else:
             carrying = 0

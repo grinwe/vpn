@@ -111,6 +111,42 @@ export default function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  // Реакция на восстановление связи и возврат в приложение. VPN-Mini-App живёт
+  // в webview, чей сетевой маршрут рвётся при каждом toggling VPN и смене
+  // Wi-Fi↔LTE, а также когда приложение сворачивают и открывают снова. Без этого
+  // экран стартовой ошибки становился вечным тупиком (сеть уже вернулась, а UI
+  // висит на «Ошибке»), а свёрнутый кабинет показывал устаревший остаток дней.
+  // По событию: если мы в error — перезапускаем bootstrap(); если ready —
+  // тихо дёргаем устойчивый рефреш /me.
+  useEffect(() => {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    // Дебаунс: при частой смене сети во время toggling VPN события online/
+    // visibility сыплются пачками — схлопываем их в один запрос.
+    const trigger = () => {
+      if (timer) clearTimeout(timer);
+      timer = setTimeout(() => {
+        if (status === "error") {
+          void bootstrap();
+        } else if (status === "ready") {
+          fetchMeResilient().then(setMe).catch(() => undefined);
+        }
+      }, 500);
+    };
+    const onVisibility = () => {
+      if (document.visibilityState === "visible") trigger();
+    };
+    window.addEventListener("online", trigger);
+    document.addEventListener("visibilitychange", onVisibility);
+    return () => {
+      if (timer) clearTimeout(timer);
+      window.removeEventListener("online", trigger);
+      document.removeEventListener("visibilitychange", onVisibility);
+    };
+    // status в зависимостях: эффект переподписывается при смене статуса, чтобы
+    // обработчик всегда видел актуальное значение (свежее замыкание).
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [status]);
+
   // Re-fetch /me whenever the user lands back on the home screen — covers
   // the post-checkout case where a fresh subscription should now show up.
   useEffect(() => {

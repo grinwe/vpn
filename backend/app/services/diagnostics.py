@@ -85,15 +85,26 @@ def _probe_ping(host: str, *, count: int = 3, per_reply_timeout_s: int = 2) -> C
     except FileNotFoundError:
         return _check("ping", "skip", message="ping не установлен в контейнере")
     except subprocess.TimeoutExpired:
+        # Нет ответа на ICMP — НЕ 'fail': многие VPS/фаерволы штатно режут
+        # ICMP, при этом хост жив по tcp/ssh. Отсутствие ICMP-ответа
+        # недиагностично, поэтому статус 'warn' (не красный ❌) + флаг
+        # no_reply, чтобы summary/reachability не трактовали это как
+        # доказанный блэкаут (finding #6 сетевого аудита).
         return _check(
-            "ping", "fail", message=f"ping timeout — host не отвечает (>{count * per_reply_timeout_s}s)"
+            "ping", "warn",
+            message=f"нет ответа на ICMP за {count * per_reply_timeout_s}s (возможно, фильтруется) — смотрите tcp/ssh",
+            details={"no_reply": True},
         )
     out = cp.stdout or ""
     loss_m = _PING_LOSS_RE.search(out)
     loss = int(loss_m.group(1)) if loss_m else (0 if cp.returncode == 0 else 100)
     if loss >= 100 or cp.returncode != 0:
+        # 100% лосса — тоже не 'fail' по той же причине: ICMP может быть
+        # фильтрован штатно. Контекстный 'warn' с флагом no_reply.
         return _check(
-            "ping", "fail", message="host не пингуется (100% loss)", details={"raw": out[-400:]}
+            "ping", "warn",
+            message="нет ответа на ICMP (100% loss; возможно, фильтруется) — смотрите tcp/ssh",
+            details={"no_reply": True, "raw": out[-400:]},
         )
     avg_m = _PING_AVG_RE.search(out)
     avg = float(avg_m.group(1)) if avg_m else None
@@ -236,12 +247,18 @@ def run_local_path_probe(
 
     ping = _probe_ping(host)
     result.checks.append(ping)
-    result.ping_ok = ping["status"] in ("ok", "warn")
+    # ping_ok = получен РЕАЛЬНЫЙ ICMP-ответ. Отсутствие ответа теперь имеет
+    # статус 'warn' (ICMP часто фильтруется штатно), но pingable его считать
+    # нельзя — иначе summary соврёт «host пингуется». Флаг no_reply отсекает
+    # такой warn (finding #6 сетевого аудита).
+    result.ping_ok = ping["status"] in ("ok", "warn") and not ping.get("details", {}).get(
+        "no_reply"
+    )
 
     for port in extra_tcp_ports or []:
         result.checks.append(_probe_tcp(host, port)[1])
 
-    _tcp_ok, tcp_ssh_check = _probe_tcp(host, ssh_port, label=f"tcp:{ssh_port} (ssh)")
+    tcp_ssh_ok, tcp_ssh_check = _probe_tcp(host, ssh_port, label=f"tcp:{ssh_port} (ssh)")
     result.checks.append(tcp_ssh_check)
 
     ssh_ok, ssh_check = _probe_ssh(host, ssh_port)
@@ -255,12 +272,24 @@ def run_local_path_probe(
     if not ssh_ok and traceroute_on_fail:
         result.checks.append(_probe_traceroute(host))
 
+    # Summary опирается на факт tcp:ssh/ssh, а НЕ на ICMP: фильтрованный ICMP
+    # сам по себе не доказывает блэкаут. Раньше здесь при закрытом ssh + без
+    # ICMP-ответа выдавалось «host недоступен (ни ping, ни ssh)», что уводило
+    # оператора в ложную «нода полностью отвалилась» на ICMP-фильтрованной
+    # ноде (finding #6 сетевого аудита).
     if ssh_ok:
         result.summary = "host доступен по ssh"
+    elif tcp_ssh_ok:
+        # tcp-порт ssh открыт, но хендшейк/exec не прошёл — проблема в самом
+        # ssh-сервисе/ключе, а не в сетевой доступности хоста.
+        result.summary = "tcp:ssh открыт, но ssh не отвечает (сервис ssh / ключ)"
     elif result.ping_ok:
         result.summary = "host пингуется, но ssh недоступен"
     else:
-        result.summary = "host недоступен (ни ping, ни ssh)"
+        # ssh недоступен И ICMP без ответа. ICMP недиагностичен (мог быть
+        # просто отфильтрован), поэтому не заявляем полный блэкаут — опорный
+        # факт здесь закрытый порт ssh.
+        result.summary = "SSH недоступен (порт ssh закрыт/недоступен); ICMP без ответа (возможно, фильтруется)"
     return result
 
 

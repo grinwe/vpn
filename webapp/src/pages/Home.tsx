@@ -3,7 +3,9 @@ import { createPortal } from "react-dom";
 import QRCode from "qrcode";
 import {
   activateTrial,
+  authWithInitData,
   fetchReferral,
+  setToken,
   MeResponse,
   ReferralInfo,
   Subscription,
@@ -20,6 +22,56 @@ import {
 } from "../api";
 import { navigate } from "../router";
 import { getTg } from "../telegram";
+
+// ── Устойчивая загрузка реф-блока ────────────────────────────────────
+// Раньше реферал тянулся одним fetchReferral().catch(() => undefined) на
+// маунте: один сетевой промах на плохой сети (метро/лифт — основная среда
+// Mini App) — и весь реферальный блок (промокод, ссылка, заработок) не
+// рендерился до полной перезагрузки приложения. Тянем его тем же устойчивым
+// способом, что и /me в App.tsx: ретраи на транзиентных сбоях + разовая
+// прозрачная переавторизация по initData на 401/403.
+const REFERRAL_RETRIES = 2;
+const REFERRAL_RETRY_DELAY_MS = 2000;
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+// Ошибки из api.ts прилетают как Error("401: ...") / Error("Failed to fetch").
+function isReferralAuthError(e: unknown): boolean {
+  return /^(401|403)/.test((e as Error)?.message ?? "");
+}
+
+// Разовая переавторизация через Telegram initData (живёт весь сеанс Mini App).
+async function reauthReferral(): Promise<boolean> {
+  const tg = getTg();
+  if (!tg || !tg.initData) return false;
+  try {
+    const auth = await authWithInitData(tg.initData);
+    setToken(auth.token);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function fetchReferralResilient(): Promise<ReferralInfo> {
+  let lastErr: unknown;
+  for (let attempt = 0; attempt <= REFERRAL_RETRIES; attempt++) {
+    try {
+      return await fetchReferral();
+    } catch (e) {
+      lastErr = e;
+      // Токен протух — переавторизуемся один раз и сразу повторяем без паузы.
+      if (isReferralAuthError(e) && (await reauthReferral())) {
+        try {
+          return await fetchReferral();
+        } catch (e2) {
+          lastErr = e2;
+        }
+      }
+      if (attempt < REFERRAL_RETRIES) await sleep(REFERRAL_RETRY_DELAY_MS);
+    }
+  }
+  throw lastErr;
+}
 
 export default function Home({
   me,
@@ -60,7 +112,36 @@ export default function Home({
   };
 
   useEffect(() => {
-    fetchReferral().then(setReferral).catch(() => undefined);
+    let cancelled = false;
+    const load = () => {
+      fetchReferralResilient()
+        .then((r) => {
+          if (!cancelled) setReferral(r);
+        })
+        .catch(() => undefined);
+    };
+    load();
+    // Пере-запрашиваем реф-блок при возврате в приложение / восстановлении
+    // связи — тем же событием, что и /me в App.tsx. Если первый заход
+    // пришёлся на секундный обрыв, блок подтянется, когда юзер вернётся в
+    // кабинет, а не исчезнет на весь сеанс. Дебаунс: при частой смене сети
+    // (toggling VPN, Wi-Fi↔LTE) события сыплются пачками — схлопываем.
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const trigger = () => {
+      if (timer) clearTimeout(timer);
+      timer = setTimeout(load, 500);
+    };
+    const onVisibility = () => {
+      if (document.visibilityState === "visible") trigger();
+    };
+    window.addEventListener("online", trigger);
+    document.addEventListener("visibilitychange", onVisibility);
+    return () => {
+      cancelled = true;
+      if (timer) clearTimeout(timer);
+      window.removeEventListener("online", trigger);
+      document.removeEventListener("visibilitychange", onVisibility);
+    };
   }, []);
 
   const balanceRub = me.balance.balance_rub;

@@ -47,7 +47,12 @@ env `VDSINA_API_BASE`), `kind=vdsina_ru` → `userapi.vdsina.ru/v1` (мигра�
 .ru и .com — разные аккаунты/токены/балансы; токен доменно-специфичен. Заводи
 отдельный `CloudProvider` на каждый домен. **auth — ГОЛЫЙ `Authorization: <token>` (без Bearer!)**, конверт
 `{status,status_msg,data}` (пустой список = `status:error`+`"No X information"` →
-трактуем как `[]`). Async order→poll как 4vps: `order_server` (POST /server,
+трактуем как `[]`). NB (netfix-аудит #5): offerings дегрейдят в `[]` ТОЛЬКО
+бизнес-ошибку («реально пусто»); транзиентный сетевой/HTTP-сбой (таймаут, 429,
+5xx) поднимает `TransientDriverError` и пробрасывается в роут `/offerings` (502),
+чтобы оператор не принял пустой каталог за отсутствие предложений. Идемпотентные
+GET ретраятся с backoff (`VDSINA_RETRY_ATTEMPTS`/`_BACKOFF`, уважают Retry-After);
+POST/PUT/DELETE не ретраятся (заказ не идемпотентен). Async order→poll как 4vps: `order_server` (POST /server,
 дефисные `server-plan`/`ssh-key`) → `wait_for_ipv4` (poll GET /server/{id} до
 `active`, `data.ip` — **МАССИВ** `[{ip,type}]`). Offerings: `/server-group`+
 `/server-plan/{g}`, `/datacenter`, `/template`. Баланс: `/account.balance.real`.

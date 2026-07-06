@@ -67,6 +67,47 @@ def provisioning_pubkey() -> str | None:
     return None
 
 
+def _provisioning_key_works(host: str, *, port: int = 22) -> bool:
+    """Проба доступа по provisioning-ключу: True, если пускает и команда прошла.
+
+    Нужна, чтобы отличить (а) password-auth отключён после bootstrap'а (ключ
+    реально стоит) от (б) хостер выдал неверный/устаревший root-пароль (ключ НЕ
+    установлен) — оба дают одинаковый ``AuthenticationException`` при парольном
+    входе. Best-effort: любой сбой (ключа нет, сеть, ключ не подошёл) → False."""
+    key_path = os.getenv("ANSIBLE_PRIVATE_KEY_FILE") or os.getenv(
+        "PROVISIONING_SSH_KEY"
+    )
+    if not key_path or not os.path.exists(key_path):
+        return False
+    try:
+        import paramiko
+    except ImportError:
+        return False
+    pkey = None
+    for loader in (paramiko.Ed25519Key, paramiko.RSAKey, paramiko.ECDSAKey):
+        try:
+            pkey = loader.from_private_key_file(key_path)
+            break
+        except Exception:  # noqa: BLE001 — не тот тип ключа → пробуем дальше
+            continue
+    if pkey is None:
+        return False
+    client = paramiko.SSHClient()
+    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    try:
+        client.connect(
+            hostname=host, port=port, username=SSH_USER, pkey=pkey,
+            timeout=15, banner_timeout=20, auth_timeout=20,
+            look_for_keys=False, allow_agent=False,
+        )
+        _in, out, _err = client.exec_command("true", timeout=10)
+        return out.channel.recv_exit_status() == 0
+    except Exception:  # noqa: BLE001 — ключ не подошёл / нода недоступна
+        return False
+    finally:
+        client.close()
+
+
 def ensure_provisioning_key(host: str, password: str, *, port: int = 22) -> bool:
     """Best-effort: зайти на ``host`` по root-паролю и дописать
     provisioning-pubkey в ``~/.ssh/authorized_keys``. Возвращает True, если
@@ -123,11 +164,22 @@ def ensure_provisioning_key(host: str, password: str, *, port: int = 22) -> bool
             logger.warning("key-install cmd rc=%s on %s: %s", rc, host, last_err)
             return False
         except paramiko.AuthenticationException:
-            # Пароль не подошёл → password-auth уже отключён (нода прошла
-            # bootstrap_node) ⇒ ключ уже стоит. Не ретраим, не считаем ошибкой.
-            logger.info(
-                "password auth rejected on %s — assuming provisioning key "
-                "already present", host,
+            # Пароль не подошёл — причина НЕОДНОЗНАЧНА: либо (а) password-auth уже
+            # отключён после bootstrap_node (ключ реально стоит), либо (б) хостер
+            # выдал/сохранил неверный или устаревший root-пароль (ключ НЕ
+            # установлен, ansible упадёт с publickey-denied). Пробуем ключ, чтобы
+            # отличить (а) от (б) и не писать успокаивающий, но ложный лог.
+            if _provisioning_key_works(host, port=port):
+                logger.info(
+                    "password auth rejected on %s, but provisioning key works "
+                    "— key already present (password-auth off)", host,
+                )
+                return True
+            logger.warning(
+                "password auth rejected on %s AND provisioning key does NOT "
+                "work — stale/invalid root password, key NOT installed; "
+                "ansible will likely fail with 'Permission denied (publickey)'",
+                host,
             )
             return False
         except Exception as exc:  # noqa: BLE001 — SSH ещё не поднялся / сеть

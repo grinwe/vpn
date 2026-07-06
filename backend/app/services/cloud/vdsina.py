@@ -11,8 +11,14 @@ API. ВАЖНО: vdsina.com и vdsina.ru — РАЗНЫЕ API-инсталляц
 * Auth: ``Authorization: <token>`` — ГОЛЫЙ токен, БЕЗ "Bearer" (так в офиц. доке;
   у terraform-провайдера ошибочно Bearer — НЕ копировать).
 * Конверт: ``{"status":"ok"|"error","status_msg":str,"data":...}``. ``_call``
-  поднимает ``DriverError`` на ``status != "ok"``; offerings-методы
-  (``list_*``) гасят это в пустой список (форма дегрейдит, как у 4vps).
+  поднимает ``DriverError`` на ``status != "ok"`` (бизнес-ответ, в т.ч. «нет
+  данных») и ``TransientDriverError`` на транзиентном сетевом/HTTP-сбое
+  (таймаут, 429, 5xx). offerings-методы (``list_*``) гасят в ПУСТОЙ список
+  только бизнес-``DriverError`` (реально пусто — форма дегрейдит, как у 4vps),
+  а ``TransientDriverError`` ПРОБРАСЫВАЮТ — иначе оператор видит пустой каталог
+  вместо признака сбоя (роут ``/offerings`` отдаёт 502). Идемпотентные GET
+  ретраятся с backoff (см. ``_call``); POST/PUT/DELETE — НЕ ретраятся (заказ
+  не идемпотентен, ретрай задвоил бы оплаченный сервер).
 * Заказ ``POST /v1/server`` ПРИНИМАЕТ ``ssh-key`` (id ключа) → бокс поднимается
   С НАШИМ ключом, без парольного bootstrap (как hetzner). Если у провайдера ключ
   не задан — АВТО-регистрируем наш provisioning-pubkey на VDSina
@@ -49,6 +55,13 @@ _BASE = os.getenv("VDSINA_API_BASE", "https://userapi.vdsina.com/v1").rstrip("/"
 _TIMEOUT = 30
 _POLL_TIMEOUT = 600
 _POLL_INTERVAL = 8
+# Ретрай транзиентных сбоев ТОЛЬКО на идемпотентных GET (offerings/баланс/поллинг):
+# доп. попыток после первой и базовый (экспоненциальный) backoff в секундах.
+_RETRY_ATTEMPTS = int(os.getenv("VDSINA_RETRY_ATTEMPTS", "2"))
+_RETRY_BACKOFF = float(os.getenv("VDSINA_RETRY_BACKOFF", "0.5"))
+# HTTP-коды, которые считаем транзиентными (сервер занят/лимитирует), а не
+# бизнес-ошибкой запроса. 429 — rate-limit (уважаем Retry-After).
+_RETRY_CODES = {429, 500, 502, 503, 504}
 # Имя, под которым авто-регистрируем наш provisioning-pubkey в VDSina (идемпотентно).
 _KEY_NAME = "vpn-provisioning"
 # VDSina валидирует ``host`` как ДОМЕННОЕ имя (FQDN с реальным TLD), а не
@@ -58,6 +71,22 @@ _KEY_NAME = "vpn-provisioning"
 # для прохождения валидации. Домен override через env (дефолт — RFC-2606
 # example.com: реальный TLD .com проходит валидатор, никуда не резолвится).
 _HOST_DOMAIN = os.getenv("VDSINA_HOST_DOMAIN", "example.com")
+
+
+class TransientDriverError(DriverError):
+    """Транзиентный сетевой/HTTP-сбой VDSina (таймаут, обрыв TCP, 429, 5xx).
+
+    Подкласс ``DriverError``, поэтому все существующие ``except DriverError``
+    ловят его как раньше. Но offerings-методы (``list_*``) отличают его от
+    бизнес-``DriverError`` (реально пустой каталог): транзиентный НЕ глушится в
+    ``[]``, а пробрасывается — оператор в форме заказа увидит «не удалось
+    загрузить каталог» (роут отдаёт 502), а не молчаливо пустые списки.
+    ``retry_after`` — пауза из заголовка Retry-After (429), если провайдер её дал.
+    """
+
+    def __init__(self, *args: Any, retry_after: float | None = None) -> None:
+        super().__init__(*args)
+        self.retry_after = retry_after
 
 
 class VdsinaDriver:
@@ -251,9 +280,12 @@ class VdsinaDriver:
         ]
 
     def list_datacenters(self) -> list[dict]:
-        """GET /v1/datacenter → ``[{id,name,country,active}]``. Ошибка/пусто → []."""
+        """GET /v1/datacenter → ``[{id,name,country,active}]``. Реально пусто → [];
+        транзиентный сбой пробрасываем (роут отдаст 502, не путаем с «пусто»)."""
         try:
             data = self._call("GET", "/datacenter", None)
+        except TransientDriverError:
+            raise  # сетевой/HTTP сбой ≠ пустой каталог — не глушим в []
         except DriverError:
             return []
         out: list[dict] = []
@@ -272,6 +304,8 @@ class VdsinaDriver:
         /v1/server-plan/{groupId}. dedupe по id. ``cost`` — за период ``period``."""
         try:
             groups = self._call("GET", "/server-group", None)
+        except TransientDriverError:
+            raise  # сетевой/HTTP сбой ≠ пустой каталог — не глушим в []
         except DriverError:
             return []
         out: list[dict] = []
@@ -282,6 +316,10 @@ class VdsinaDriver:
                 continue
             try:
                 plans = self._call("GET", f"/server-plan/{gid}", None)
+            except TransientDriverError:
+                # Транзиентный сбой на одной группе → пробрасываем: иначе форма
+                # получит ЧАСТИЧНЫЙ каталог без признака сбоя (хуже, чем 502).
+                raise
             except DriverError:
                 continue
             for p in plans if isinstance(plans, list) else []:
@@ -306,9 +344,12 @@ class VdsinaDriver:
 
     def list_images(self) -> list[dict]:
         """GET /v1/template → ОС-образы ``[{id,name,active,ssh_key}]``. id Ubuntu
-        НЕ константа (зависит от аккаунта) — админ выбирает в форме по имени."""
+        НЕ константа (зависит от аккаунта) — админ выбирает в форме по имени.
+        Реально пусто → []; транзиентный сбой пробрасываем (роут отдаст 502)."""
         try:
             data = self._call("GET", "/template", None)
+        except TransientDriverError:
+            raise  # сетевой/HTTP сбой ≠ пустой каталог — не глушим в []
         except DriverError:
             return []
         out: list[dict] = []
@@ -399,12 +440,48 @@ class VdsinaDriver:
         return _extract_ipv4(last_srv), last_status, last_srv
 
     def _call(self, method: str, path: str, body: dict | None) -> Any:
+        """HTTP-вызов VDSina с ретраем транзиентных сбоев.
+
+        Ретраим ТОЛЬКО идемпотентные GET (offerings/баланс/поллинг): POST/PUT/
+        DELETE не идемпотентны (заказ/reinstall/prolong списывают деньги), их
+        повтор задвоил бы операцию — поэтому одна попытка. Бизнес-``DriverError``
+        (``status != "ok"``) не ретраится: ответ детерминирован.
+        """
+        idempotent = method.upper() == "GET"
+        attempts = (_RETRY_ATTEMPTS + 1) if idempotent else 1
+        last: TransientDriverError | None = None
+        for i in range(attempts):
+            try:
+                return self._request_once(method, path, body)
+            except TransientDriverError as exc:
+                last = exc
+                if i + 1 >= attempts:
+                    break
+                delay = (
+                    exc.retry_after
+                    if exc.retry_after is not None
+                    else _RETRY_BACKOFF * (2 ** i)
+                )
+                logger.warning(
+                    "VDSina %s %s транзиентный сбой (%s) — ретрай %d/%d через %.1fs",
+                    method, path, exc, i + 1, attempts - 1, delay,
+                )
+                time.sleep(delay)
+        assert last is not None  # цикл прерывается только через break по last
+        raise last
+
+    def _request_once(self, method: str, path: str, body: dict | None) -> Any:
+        """Одна HTTP-попытка. Транзиентные сбои → ``TransientDriverError``,
+        бизнес-ошибки (``status != "ok"``) → ``DriverError``."""
         try:
             resp = self._session.request(
                 method, f"{self._base}{path}", json=body, timeout=_TIMEOUT
             )
         except requests.RequestException as exc:
-            raise DriverError(f"VDSina {method} {path} failed: {exc}") from exc
+            # Таймаут/обрыв TCP — транзиентно (ретраибельно на GET).
+            raise TransientDriverError(
+                f"VDSina {method} {path} failed: {exc}"
+            ) from exc
         if resp.status_code == 204:
             return {}
         try:
@@ -413,6 +490,13 @@ class VdsinaDriver:
             payload = None
         if not isinstance(payload, dict):
             if resp.status_code >= 400:
+                # 429/5xx — сервер занят/лимитирует: транзиентно (ретрай GET).
+                # 429 несёт Retry-After — уважаем паузу провайдера.
+                if resp.status_code in _RETRY_CODES:
+                    raise TransientDriverError(
+                        f"VDSina {method} {path} -> {resp.status_code}",
+                        retry_after=_parse_retry_after(resp),
+                    )
                 raise DriverError(f"VDSina {method} {path} -> {resp.status_code}")
             return payload
         if payload.get("status") == "ok":
@@ -439,6 +523,19 @@ def _hostname_fqdn(name: str) -> str:
     label = re.sub(r"[^a-z0-9-]+", "-", (name or "node").lower())
     label = re.sub(r"-{2,}", "-", label).strip("-")[:63].strip("-")
     return f"{label or 'node'}.{_HOST_DOMAIN}"
+
+
+def _parse_retry_after(resp: Any) -> float | None:
+    """Заголовок ``Retry-After`` (секунды) из 429 → пауза перед ретраем.
+    HTTP-date форму не парсим (VDSina отдаёт секунды) — вернём None, тогда
+    ``_call`` использует экспоненциальный backoff."""
+    val = resp.headers.get("Retry-After") if hasattr(resp, "headers") else None
+    if not val:
+        return None
+    try:
+        return max(0.0, float(val))
+    except (TypeError, ValueError):
+        return None
 
 
 def _to_int(v: Any) -> int | None:

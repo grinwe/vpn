@@ -17,13 +17,21 @@ export interface LinkHealthVerdict {
 export function linkHealth(
   l: LinkHealthInput,
   activeUsers?: number,
+  // Опорное «сейчас» в мс. Возраст handshake/observed надо мерить от
+  // серверного времени, а не от локальных часов оператора: перекос часов
+  // браузера (WSL/VM/ноут после сна) инвертирует диагностику — свежий
+  // handshake уезжает в жёлтый/красный, а протухший — в зелёный. Callers
+  // (Exits/Nodes) должны прокидывать server_now, полученный из ответа
+  // backend (поле server_now / заголовок Date). Дефолт Date.now() —
+  // обратная совместимость, пока источник серверного времени не прокинут.
+  nowMs?: number,
 ): LinkHealthVerdict {
   // Светофор для relay↔exit туннеля. Цвет считаем от возраста
   // последнего handshake'а (WG keepalive = 25s, значит healthy peer
   // handshook в последние 3 минуты). SSH-фейл (observed_at stale)
   // рендерится как красный, потому что за >15 min должен был успеть
   // пройти хотя бы один тик.
-  const now = Date.now();
+  const now = nowMs ?? Date.now();
   if (!l.last_observed_at) {
     return {
       color: "bg-slate-600",
@@ -98,6 +106,10 @@ interface HealthDotsProps<L extends LinkHealthInput> {
   // idle (серый), а не обрыв (красный). Не передан (Exits) → старое
   // поведение. Передаётся из Nodes.tsx (n.active_users).
   activeUsers?: number;
+  // Опорное «сейчас» с сервера (мс). Прокидывается в linkHealth(), чтобы
+  // возраст мерялся от серверного времени, а не от часов оператора. Не
+  // передан → Date.now() (обратная совместимость).
+  nowMs?: number;
 }
 
 export function HealthDots<L extends LinkHealthInput>({
@@ -105,6 +117,7 @@ export function HealthDots<L extends LinkHealthInput>({
   peerLabel,
   peerKey,
   activeUsers,
+  nowMs,
 }: HealthDotsProps<L>) {
   // Ряд цветных точек — по одной на relay↔exit линк. Пустой массив →
   // серый дефис (линков нет).
@@ -114,7 +127,7 @@ export function HealthDots<L extends LinkHealthInput>({
   return (
     <div className="flex gap-1 items-center">
       {links.map((l) => {
-        const h = linkHealth(l, activeUsers);
+        const h = linkHealth(l, activeUsers, nowMs);
         return (
           <span
             key={peerKey(l)}

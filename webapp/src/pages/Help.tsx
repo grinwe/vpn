@@ -17,14 +17,18 @@ interface Props {
 
 // Состояния кнопки «у меня прямо сейчас не работает VPN». Используется
 // как priority-сигнал для админов поверх плановых health-ping'ов бота.
-// Клиентский 5-мин cooldown после успешной отправки — сервер повторы
+// Клиентский 5-мин cooldown после терминального исхода — сервер повторы
 // тоже принимает, но нет смысла плодить AuditLog одним тапом.
 // pick_operator — нас переселили на свободную ноду, спрашиваем оператора
 // (operator-routing P1, operator_routing_roadmap.md); operator_done — спасибо.
+// no_target/throttled — переселения НЕ было: честно говорим об этом (синхрон
+// с ботом handlers.py), а не рапортуем ложное «жалоба отправлена». no_target →
+// нет свободной ноды, зовём в поддержку; throttled → недавно уже перекидывали.
 type SelfReportState =
   | "idle"
   | "pending"
-  | "sent"
+  | "no_target"
+  | "throttled"
   | "error"
   | "pick_device"
   | "pick_operator"
@@ -74,21 +78,32 @@ export default function Help({ botUsername, devices = [] }: Props) {
   const applyReportResult = (res: {
     migrated?: boolean;
     report_id?: number | null;
+    // Фактический исход failover с бэка. Пока бэк отдаёт только migrated:bool
+    // (см. needs_decision в аудите network #2) — outcome может отсутствовать;
+    // тогда деградируем в консервативный no_target (зовём в поддержку), но
+    // НИКОГДА не рапортуем ложное «жалоба отправлена, админы смотрят», раз
+    // сервер юзеру не сменили. Когда бэк начнёт слать outcome — throttled
+    // получит свой мягкий текст автоматически (forward-compatible).
+    outcome?: "migrated" | "no_target" | "throttled" | "no_subscription";
   }) => {
     if (res.migrated && res.report_id) {
       // Переселили → спрашиваем оператора (один тап).
       setReportId(res.report_id);
       setSelfReportState("pick_operator");
-    } else {
-      setSelfReportState("sent");
-      setTimeout(() => setSelfReportState("idle"), 5 * 60 * 1000);
+      return;
     }
+    // Переселения НЕ было. Честно разводим исход (синхрон с ботом handlers.py):
+    // throttled → «уже перекидывали, подожди»; всё остальное (no_target /
+    // no_subscription / отсутствие outcome) → зовём в поддержку.
+    setSelfReportState(res.outcome === "throttled" ? "throttled" : "no_target");
+    setTimeout(() => setSelfReportState("idle"), 5 * 60 * 1000);
   };
 
   const handleReportBroken = async () => {
     if (
       selfReportState === "pending" ||
-      selfReportState === "sent" ||
+      selfReportState === "no_target" ||
+      selfReportState === "throttled" ||
       selfReportState === "pick_device" ||
       selfReportState === "pick_operator"
     )
@@ -251,8 +266,10 @@ export default function Help({ botUsername, devices = [] }: Props) {
               {selfReportState === "pending" && "Отправляем..."}
               {selfReportState === "operator_done" &&
                 "✓ Спасибо! Проверяй подключение"}
-              {selfReportState === "sent" &&
-                "✓ Жалоба отправлена — админы смотрят"}
+              {selfReportState === "no_target" &&
+                "Свободного сервера сейчас нет — напиши в поддержку"}
+              {selfReportState === "throttled" &&
+                "Уже перекидывали недавно — дай минуту переподключиться"}
               {selfReportState === "error" &&
                 "Не удалось отправить, попробуй позже"}
               {selfReportState === "idle" &&

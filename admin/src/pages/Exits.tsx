@@ -1725,7 +1725,12 @@ function BatchProgressDrawer({
     // Polling: пока хоть один task в pending/running — раз в 2.5s.
     // Когда все терминалы — refetchInterval=false (стопит polling).
     refetchInterval: (q) => {
-      const sc = q.state.data?.status_counts ?? {};
+      // Если данных ещё нет (первый fetch упал на сетевом блипе), НЕ
+      // выключаем polling: иначе после retry:1 запрос замирает навсегда
+      // и дровер виснет в «Загрузка…». Продолжаем опрашивать — так
+      // поллинг сам восстановится, когда сеть вернётся (ср. Broadcasts.tsx).
+      if (!q.state.data) return 2500;
+      const sc = q.state.data.status_counts ?? {};
       const live = (sc["pending"] ?? 0) + (sc["running"] ?? 0);
       return live > 0 ? 2500 : false;
     },

@@ -32,11 +32,28 @@ Fernet'ит секреты в БД) — отдельной vault-перемен�
 1. Backend validate auth.
 2. Resolve subscription (`subscription_id` для admin / Device by HMAC client_id для клиента).
 3. Если subscription не `active` → response `{action: "subscription_inactive"}`.
-4. Дедуп: за последние 5 мин уже мигрировали этого юзера? → `{action: "throttled"}`.
-5. `provisioning.choose_node`: healthy, active, NOT muted (legacy + diagnostics toggle), NOT в cooldown, NOT current, в том же pool. Если нет → `{action: "no_target_available"}` + audit_log `client_reported_failure_no_target`.
-6. `migrate_subscription_to_new_node(sub, target)` — preserve sub_token, новый ProvisioningTask.
-7. Audit: `action="client_reported_failure"` + metadata (kind, current/target node_id, task_id).
-8. Response: `{ok: true, action: "migrated", target_node_id, target_node_name, task_id}`.
+4. **fail_count-гейт** (только клиентский путь, не admin): если `fail_count <
+   FAILOVER_MIN_FAIL_COUNT` (env, дефолт `1` = фактически выкл) → `{action:
+   "deferred"}` без миграции/бана. Защищает от разрыва со здоровой ноды на
+   единичном транзиенте при смене сети (WiFi→LTE). Клиент бэкоффит и повторяет
+   с накопленным fail_count. Поднять порог до 2-3 чтобы требовать серию сбоев.
+5. Дедуп: за последние 5 мин уже мигрировали этого юзера? → `{action: "throttled"}`.
+6. **Нода-виновник**: присланный клиентом `current_node_id` валидируется по
+   активным кредам девайса (diverse-саба: клиент мог упасть на любой ноде
+   набора) и используется как `failed_node` для крауд-хелса и
+   `OperatorNodeReport`. Не входит в набор / не прислан → fallback на первичную
+   `sub.node_id`.
+7. `provisioning.choose_node`: healthy, active, NOT muted (legacy + diagnostics toggle), NOT в cooldown, NOT current, в том же pool. Если нет → `{action: "no_target_available"}` + audit_log `client_reported_failure_no_target`.
+8. `migrate_subscription_to_new_node(sub, target)` — preserve sub_token, новый ProvisioningTask.
+9. Непредвиденный сбой миграции (БД/ansible) → rollback + `{action: "error",
+   ok: false, retry_after_sec}` (НЕ HTTP 500 с сырым текстом — клиент корректно
+   бэкоффит по структурированной схеме).
+10. Audit: `action="client_reported_failure"` + metadata (kind, current/target node_id, task_id).
+11. Response: `{ok: true, action: "migrated", target_node_id, target_node_name,
+    task_id, provisioning_pending: true}`. `provisioning_pending=true` — сигнал,
+    что провизия девайса на новой ноде идёт ФОНОВОЙ таской: до её завершения
+    `/api/sub/{token}` вернёт 503, поэтому клиент ждёт `retry_after_sec` перед
+    первым рефетчем и не показывает ноду как «готова».
 
 ## Что видит оператор в дашбордах
 
@@ -110,6 +127,8 @@ curl -sS -X POST https://mgmt.grinwer.online/api/admin/client-control/report-for
 | Симптом | Где искать |
 |---|---|
 | `{action: "no_target_available"}` | `SELECT id,name,status,is_active,auto_diagnose_disabled_at FROM vpn_nodes WHERE status='active' AND is_active=true AND auto_diagnose_disabled_at IS NULL;` — есть ли вообще куда мигрировать? |
+| `{action: "deferred"}` | fail_count ниже порога `FAILOVER_MIN_FAIL_COUNT` — миграции нет намеренно (единичный транзиент). Проверить env: `docker compose exec backend env \| grep FAILOVER_MIN_FAIL_COUNT`. Если гейт мешает — снизить порог до 1. |
+| `{action: "error"}` | Непредвиденный сбой миграции (БД/ansible) — `retry_after_sec` в ответе, сырой текст исключения в тело НЕ утекает. Смотреть backend-лог `migrate_subscription_to_free_node failed for sub <id>`. |
 | `401 invalid control-channel secret` | `APP_SECRET_KEY` в backend контейнере **!=** secret на CF Worker'е (рассинхрон при rotation). `docker compose exec worker env \| grep APP_SECRET_KEY` + `wrangler secret list --name control-1`. Push'нуть синхронно через `wrangler secret put` на все 3 Worker'а. |
 | `401 unknown client_id` | Device с этим `client_id_hmac` нет. Миграция 0037 backfill'ит при naличии APP_SECRET_KEY — если env не было при миграции, backfill пропустился. Пересоздать через ручной UPDATE: `SELECT id, sub_token, client_id_hmac FROM devices WHERE client_id_hmac IS NULL AND sub_token IS NOT NULL;` → пересчитать через `compute_client_id_hmac` + UPDATE. |
 | `429 Too Many Requests` | Rate-limit slowapi: 5 reports / 30 мин per client_id. Это by design — клиент дёргает повторно слишком часто. Подождать. |

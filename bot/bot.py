@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import os
 from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
 from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
@@ -29,6 +30,21 @@ _pending_err_last_status: int | None = None
 # и вечного подавления, если ACK так и не пройдёт.
 _sent_unacked: dict[int, float] = {}
 _SENT_UNACKED_TTL = 600.0  # 10 минут
+
+# Голова-очереди (head-of-line): в один тик /pending может вернуть и
+# срочный config_ready (после оплаты), и массовую admin_broadcast на
+# сотни юзеров. Чтобы рассылка не тормозила срочную доставку, срочные
+# типы сортируются в начало тика, а число admin_broadcast за один тик
+# ограничено — хвост сверх лимита вернётся из /pending на следующем
+# тике (запись не ACK-ается, пока не отправлена). Настраивается через env.
+_BROADCAST_PER_TICK = int(os.getenv("NOTIFICATION_BROADCAST_PER_TICK", "50"))
+
+# Реестр фоновых ACK-тасков: notif_id → Task. ACK делаем НЕ блокирующим
+# основной проход (иначе залипший ACK бэкенда добавляет до ~4.5с на
+# каждую запись и держит отправку следующих сообщений). Реестр держит
+# ссылку на таск (иначе GC), а также дедуплицирует: пока ACK для notif_id
+# в полёте, повторный не спавним.
+_ack_tasks: dict[int, asyncio.Task] = {}
 
 
 async def notification_poller(bot: Bot):
@@ -118,6 +134,22 @@ async def notification_poller(bot: Bot):
                     notif_id_inner,
                 )
 
+            def _spawn_ack(notif_id_inner: int) -> None:
+                """Запускает _ack в фоне, не блокируя основной проход.
+
+                Дедуп: если ACK для notif_id уже в полёте — не спавним
+                второй (иначе на каждом тике до подтверждения плодились бы
+                параллельные ACK одной записи). Ссылку на таск держим в
+                _ack_tasks до завершения, чтобы его не собрал GC.
+                """
+                if not notif_id_inner or notif_id_inner in _ack_tasks:
+                    return
+                task = asyncio.create_task(_ack(notif_id_inner))
+                _ack_tasks[notif_id_inner] = task
+                task.add_done_callback(
+                    lambda _t, _nid=notif_id_inner: _ack_tasks.pop(_nid, None)
+                )
+
             # Чистим протухшие записи дедупа: если ACK так и не прошёл за
             # TTL, отпускаем id — лучше редкий дубль, чем вечная блокировка.
             _now_ts = asyncio.get_event_loop().time()
@@ -127,6 +159,17 @@ async def notification_poller(bot: Bot):
             ]:
                 _sent_unacked.pop(_stale_id, None)
 
+            # Приоритизация в пределах тика: срочные типы (config_ready
+            # после оплаты, health_ping_request, admin_alert_*) — вперёд,
+            # массовая admin_broadcast — в хвост. sort стабильный, поэтому
+            # внутри каждой группы порядок backend'а сохраняется. Это
+            # снимает head-of-line: срочный конфиг не ждёт завершения
+            # рассылки, попавшей в тот же ответ /pending.
+            notifications.sort(
+                key=lambda n: 1 if n.get("type") == "admin_broadcast" else 0
+            )
+
+            broadcast_sent = 0
             for notif in notifications:
                 telegram_id = notif.get("telegram_id")
                 text = notif.get("text", "")
@@ -135,13 +178,20 @@ async def notification_poller(bot: Bot):
                     continue
                 # Уже отправлено в Telegram, но ACK ещё не подтверждён —
                 # НЕ слать повторно (иначе дубль у юзера/рассылки), только
-                # до-ACKнуть запись на backend'е.
+                # до-ACKнуть запись на backend'е (в фоне, не блокируя проход).
                 if notif_id and notif_id in _sent_unacked:
-                    await _ack(notif_id)
+                    _spawn_ack(notif_id)
+                    continue
+                notif_type = notif.get("type")
+                # Лимит рассылок на тик: срочные типы уже отсортированы в
+                # начало, поэтому хвост admin_broadcast сверх лимита просто
+                # переносим на следующий тик (запись не ACK-нута → вернётся
+                # из /pending). Так одна большая рассылка не занимает весь
+                # тик и не голодит срочную доставку следующих тиков.
+                if notif_type == "admin_broadcast" and broadcast_sent >= _BROADCAST_PER_TICK:
                     continue
                 try:
                     keyboard = None
-                    notif_type = notif.get("type")
                     if notif_type == "config_ready":
                         keyboard = onboarding_keyboard()
                     elif notif_type == "health_ping_request":
@@ -160,13 +210,16 @@ async def notification_poller(bot: Bot):
                     # запись вернётся на следующем тике, дубля в TG не будет.
                     if notif_id:
                         _sent_unacked[notif_id] = asyncio.get_event_loop().time()
-                    await _ack(notif_id)
+                    # ACK — в фоне: залипший ACK бэкенда не должен держать
+                    # отправку следующих (в т.ч. срочных) уведомлений тика.
+                    _spawn_ack(notif_id)
                     # Для admin_broadcast спим между сообщениями, чтобы не
                     # упереться в Telegram rate-limit ~30 msg/sec. При
-                    # батче в 50 рассылок тик отпустится за ~2.5s. Для
+                    # лимите _BROADCAST_PER_TICK тик отпустится за ~2.5s. Для
                     # остальных типов (config_ready, health_ping_request,
                     # admin_alert_*) задержка не нужна — их мало.
                     if notif_type == "admin_broadcast":
+                        broadcast_sent += 1
                         await asyncio.sleep(0.05)
                 except TelegramForbiddenError:
                     # Юзер заблокировал бота / удалил чат / деактивировал
@@ -180,7 +233,7 @@ async def notification_poller(bot: Bot):
                         "marking notif=%s as delivered",
                         telegram_id, notif_id,
                     )
-                    await _ack(notif_id)
+                    _spawn_ack(notif_id)
                 except TelegramBadRequest as e:
                     # «chat not found», «user not found», «message is too
                     # long» и пр. — все терминальные с точки зрения именно
@@ -189,7 +242,7 @@ async def notification_poller(bot: Bot):
                         "TG bad request for chat=%s: %s, ack notif=%s",
                         telegram_id, e.message, notif_id,
                     )
-                    await _ack(notif_id)
+                    _spawn_ack(notif_id)
                 except Exception:
                     # Сетевые/временные ошибки — НЕ ACK-аем, поллер
                     # попробует снова на следующем тике.

@@ -19,6 +19,11 @@ class _Resp:
     def __init__(self, payload, status_code: int = 200) -> None:
         self._payload = payload
         self.status_code = status_code
+        # Сетевой аудит добавил в _request ретрай на 429/5xx, который читает
+        # Retry-After из resp.headers (_retry_after_seconds). Реальный
+        # requests.Response всегда имеет .headers — моделируем пустой мэппинг
+        # (Retry-After нет → драйвер падает на экспоненциальный backoff).
+        self.headers: dict = {}
 
     def json(self):
         if self._payload is None:

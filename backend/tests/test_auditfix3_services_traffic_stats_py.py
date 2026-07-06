@@ -31,6 +31,17 @@ def _install_fake_paramiko(monkeypatch):
     fake.Ed25519Key = types.SimpleNamespace(
         from_private_key_file=lambda path: object()
     )
+    # Сетевой аудит (finding 4): _load_provisioning_pkey перебирает
+    # (Ed25519Key, RSAKey, ECDSAKey) — само построение этого кортежа читает
+    # все три атрибута модуля, поэтому RSAKey/ECDSAKey обязаны существовать на
+    # фейке, иначе AttributeError ещё до попытки загрузки. Ed25519 подходит
+    # первым, так что эти загрузчики не вызываются.
+    fake.RSAKey = types.SimpleNamespace(
+        from_private_key_file=lambda path: object()
+    )
+    fake.ECDSAKey = types.SimpleNamespace(
+        from_private_key_file=lambda path: object()
+    )
     fake.SSHClient = _FakeClient
     fake.AutoAddPolicy = lambda: object()
     monkeypatch.setitem(sys.modules, "paramiko", fake)

@@ -22,6 +22,7 @@ or other button handlers first and never reach this code.
 import logging
 
 from aiogram import F, Router, types
+from aiogram.exceptions import TelegramForbiddenError
 from aiogram.filters import Command, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -81,31 +82,44 @@ async def forward_to_admin(message: types.Message, state: FSMContext):
         await message.answer("Поддержка временно недоступна.")
         return
     admin_id = ADMIN_IDS[0]
+    delivered = False
     try:
-        # Regular forward so the admin can tap the header and open the
-        # user's profile / see their @username.
-        await message.forward(chat_id=admin_id)
         uname = message.from_user.username
         label = f"@{uname}" if uname else f"id{message.from_user.id}"
         full_name = message.from_user.full_name or ""
         header = f"☝ Запрос в поддержку от {label}"
         if full_name:
             header += f" ({full_name})"
+        # Порядок важен: сперва шлём заголовок с кнопкой «Ответить» —
+        # это «якорь», по которому админ сможет ответить пользователю.
+        # Только после него пересылаем контент. Иначе при сетевом сбое
+        # между вызовами админ получал пересланное сообщение без кнопки
+        # и физически не мог ответить.
         await message.bot.send_message(
             admin_id,
             header,
             reply_markup=_reply_button(message.from_user.id),
         )
+        # Regular forward so the admin can tap the header and open the
+        # user's profile / see their @username.
+        await message.forward(chat_id=admin_id)
+        delivered = True
+    except Exception:
+        logger.exception("support forward failed")
+    finally:
+        await state.clear()
+
+    # Подтверждение юзеру привязано к факту доставки контента админу:
+    # если контент уже дошёл — не показываем «не получилось», иначе юзер
+    # отправит повторно и создаст дубль у админа.
+    if delivered:
         await message.answer(
             "✅ Передали админу. Как только ответит — пришлю сюда же."
         )
-    except Exception:
-        logger.exception("support forward failed")
+    else:
         await message.answer(
             "Не получилось отправить 😔 Попробуй ещё раз через минуту."
         )
-    finally:
-        await state.clear()
 
 
 @support_router.callback_query(F.data.startswith("support_reply:"))
@@ -144,20 +158,39 @@ async def relay_admin_reply(message: types.Message, state: FSMContext):
         await state.clear()
         return
     try:
-        # Header first so the user knows this is the support reply and
-        # not a random notification or promo message.
-        await message.bot.send_message(
-            target_user_id,
-            "💬 Ответ от поддержки:",
-        )
-        # copy_to re-sends the content as if it came from the bot, so
-        # the user never sees the admin's personal account as author.
+        # Сперва гарантированно доставляем сам контент (copy_to
+        # пересобирает его как сообщение от бота, чтобы юзер не видел
+        # личный аккаунт админа). Заголовок-маркер шлём ТОЛЬКО после
+        # успешной доставки — иначе при сбое между двумя вызовами юзер
+        # получал голый «💬 Ответ от поддержки:» без содержимого.
         await message.copy_to(chat_id=target_user_id)
-        await message.answer("✅ Отправлено.")
+    except TelegramForbiddenError:
+        # Юзер заблокировал бота — это не транзиентный сбой, повтор не
+        # поможет; говорим админу прямо, без «возможно».
+        logger.info("support reply blocked by user %s", target_user_id)
+        await message.answer(
+            "Не доставлено: пользователь заблокировал бота."
+        )
+        await state.clear()
+        return
     except Exception:
         logger.exception("support admin reply failed")
         await message.answer(
-            "Не удалось доставить. Возможно, пользователь заблокировал бота."
+            "Не удалось доставить (временный сбой). Попробуй ещё раз."
         )
-    finally:
         await state.clear()
+        return
+
+    # Контент доставлен — маркер «от поддержки» опционален; его сбой не
+    # должен показываться админу как провал доставки и провоцировать
+    # повторную отправку (дубль).
+    try:
+        await message.bot.send_message(target_user_id, "💬 ↑ Ответ от поддержки")
+    except Exception:
+        logger.warning(
+            "support reply marker send failed for %s",
+            target_user_id,
+            exc_info=True,
+        )
+    await message.answer("✅ Отправлено.")
+    await state.clear()

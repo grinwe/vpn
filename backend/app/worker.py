@@ -1973,6 +1973,94 @@ def _incident_auto_close_blocked(target, now) -> bool:
     return cooldown_until is not None and cooldown_until > now
 
 
+def _node_vpn_tcp_ports(node) -> list[int]:
+    """TCP VPN-порты ноды для liveness-пробы сервиса (finding #1 сетевого аудита).
+
+    SSH-доступность ≠ работающий VPN: xray мог упасть/не слушать порт при живом
+    sshd. Берём порты из enabled ``VPNConfig`` ноды, ИСКЛЮЧАЯ hysteria2 (UDP —
+    TCP-проба его не проверяет, иначе hysteria-only нода ложно читалась бы как
+    degraded). ``NODE_VPN_PROBE_PORTS`` (csv) переопределяет список вручную;
+    пустой результат = проверку порта пропускаем (прежнее поведение).
+    """
+    override = os.getenv("NODE_VPN_PROBE_PORTS", "").strip()
+    if override:
+        ports: set[int] = set()
+        for tok in override.split(","):
+            tok = tok.strip()
+            if not tok:
+                continue
+            try:
+                ports.add(int(tok))
+            except ValueError:
+                logger.warning("NODE_VPN_PROBE_PORTS: не число %r — пропускаю", tok)
+        return sorted(ports)
+    ports = set()
+    for cfg in getattr(node, "configs", None) or []:
+        if not getattr(cfg, "is_enabled", True):
+            continue
+        proto = getattr(cfg, "protocol", None)
+        proto_val = getattr(proto, "value", proto)
+        if proto_val == "hysteria2":  # UDP — TCP-пробой не проверяется
+            continue
+        p = getattr(cfg, "port", None)
+        if p:
+            ports.add(int(p))
+    return sorted(ports)
+
+
+def _probe_port_open(probe, port: int) -> bool:
+    """True, если проба зафиксировала TCP-порт открытым (или его не проверяли).
+
+    ``extra_tcp_ports`` кладёт в ``probe.checks`` запись с name ``tcp:{port}``
+    и status ok/fail. Если записи нет (порт не пробовали) — НЕ считаем закрытым,
+    чтобы не поднять ложный degraded.
+    """
+    name = f"tcp:{port}"
+    for c in probe.checks:
+        if c.get("name") == name:
+            return c.get("status") == "ok"
+    return True
+
+
+def _controller_has_network() -> bool:
+    """Есть ли у контроллера (worker) выход в сеть (finding #3 сетевого аудита).
+
+    Перед тем как метить цели недоступными, убеждаемся, что упал не сам
+    аплинк/DNS воркера. Пробуем TCP до внешних якорей ``NODE_CONTROLLER_ANCHORS``
+    (csv host:port, default cloudflare+google:443). Хоть один ответил → сеть
+    есть. ВСЕ молчат → считаем контроллер оффлайн. Пустой список отключает
+    проверку (всегда True) — на случай egress-политики без прямого интернета.
+    """
+    import socket as _socket
+
+    raw = os.getenv("NODE_CONTROLLER_ANCHORS", "1.1.1.1:443,8.8.8.8:443").strip()
+    if not raw:
+        return True
+    anchors: list[tuple[str, int]] = []
+    for item in raw.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        h, sep, p = item.rpartition(":")
+        if sep:
+            try:
+                anchors.append((h, int(p)))
+            except ValueError:
+                continue
+        else:
+            anchors.append((item, 443))
+    if not anchors:
+        return True
+    timeout = float(os.getenv("NODE_CONTROLLER_ANCHOR_TIMEOUT", "5"))
+    for host, port in anchors:
+        try:
+            with _socket.create_connection((host, port), timeout=timeout):
+                return True
+        except OSError:
+            continue
+    return False
+
+
 def run_node_reachability_tick() -> dict:
     """Controller→host reachability for ALL active VPN nodes + WG exits.
 
@@ -1994,7 +2082,7 @@ def run_node_reachability_tick() -> dict:
     from .queue import schedule_tick
     from . import models
     from .services import diagnostics, diagnostics_state
-    from .services.admin_notify import notify_node_diagnosis
+    from .services.admin_notify import notify_admins, notify_node_diagnosis
     from .services.provisioning import ProvisioningOrchestrator
     from .time_utils import utcnow
 
@@ -2078,6 +2166,36 @@ def run_node_reachability_tick() -> dict:
         if summary["reconciled"]:
             session.commit()
 
+        # Finding #3: self-check связности контроллера ДО пер-нодовых пробов.
+        # Если у самого воркера нет выхода в сеть (упал аплинк/DNS/NAT),
+        # ping/tcp/ssh упадут для ВСЕХ целей разом и весь флот уйдёт в ложный
+        # DOWN. Прежде чем метить цели, убеждаемся, что контроллер вообще
+        # видит внешнюю сеть; если нет — один агрегированный алерт и выход.
+        if not _controller_has_network():
+            summary["controller_offline"] = True
+            logger.error(
+                "node_reachability: контроллер не видит внешнюю сеть (все якоря "
+                "недоступны) — пропускаю пер-нодовые пробы, чтобы не пометить "
+                "весь флот ложным DOWN"
+            )
+            try:
+                notify_admins(
+                    session,
+                    kind="controller_offline",
+                    text=(
+                        "⚠️ Монитор доступности потерял выход в сеть (внешние "
+                        "якоря недоступны). Пер-нодовые проверки пропущены, "
+                        "чтобы не поднимать ложные алерты по всему флоту. "
+                        "Проверьте сеть/DNS воркера."
+                    ),
+                    dedup_key={"scope": "reachability"},
+                    window_sec=1800,
+                    autocommit=True,
+                )
+            except Exception:  # noqa: BLE001
+                logger.exception("node_reachability: controller-offline alert failed")
+            return summary
+
         import time as _time
 
         # Per-tick wall-clock budget. Serial ping/ssh per DOWN target costs
@@ -2090,6 +2208,17 @@ def run_node_reachability_tick() -> dict:
         budget_s = _env_int("NODE_REACHABILITY_BUDGET_SEC", 200)
         started = _time.monotonic()
         diagnosed = 0
+        down_count = 0
+        # Finding #7: дыра между пробами > interval*gap_factor означает, что
+        # непрерывного наблюдения не было — серию перезапускаем, а не
+        # эскалируем по дырявому wall-clock.
+        gap_factor = float(os.getenv("NODE_PROBE_GAP_FACTOR", "2"))
+        # Finding #3 (mass-down): доля одновременно упавших целей выше порога →
+        # подавляем индивидуальные алерты (вероятно, сеть контроллера, а не
+        # весь флот сразу). Default 0 = выключено (анкерный self-check выше —
+        # основной механизм).
+        mass_down_fraction = float(os.getenv("NODE_MASS_DOWN_FRACTION", "0"))
+        mass_down_min = _env_int("NODE_MASS_DOWN_MIN", 5)
         for kind, target in targets:
             if _time.monotonic() - started > budget_s:
                 summary["budget_exceeded_after"] = summary["checked"]
@@ -2103,10 +2232,19 @@ def run_node_reachability_tick() -> dict:
             if not host:
                 continue
             summary["checked"] += 1
+            # Finding #7: запоминаем время ПРЕДЫДУЩЕГО проба ДО перезаписи —
+            # нужно, чтобы отличить непрерывную серию DOWN от двух замеров,
+            # разнесённых бюджетной дырой (тогда wall-clock врёт).
+            prev_probe_at = getattr(target, "last_probe_at", None)
+            # Finding #1: при живом SSH дополнительно пробим TCP VPN-порт(ы)
+            # ноды — SSH-liveness ≠ VPN-liveness. Порты берём из enabled
+            # VPNConfig (hysteria2/UDP исключён). У exit-нод (WG/UDP) — пусто.
+            vpn_ports = _node_vpn_tcp_ports(target) if kind == "node" else []
             try:
                 probe = diagnostics.run_local_path_probe(
                     host,
                     ssh_port=getattr(target, "ssh_port", 22) or 22,
+                    extra_tcp_ports=vpn_ports or None,
                     # No traceroute in the sweep — it adds ~29s per DOWN
                     # target. The detailed on-host diagnose task enqueued
                     # below runs the full probe WITH traceroute for /tasks.
@@ -2121,33 +2259,77 @@ def run_node_reachability_tick() -> dict:
             ref = f"{kind}:{target.id}"
 
             if probe.ssh_ok:
+                # Finding #1: SSH жив, но проверяем, слушают ли TCP VPN-порты.
+                # ЗАКРЫТЫ ВСЕ заявленные порты при живом SSH = сервис (xray)
+                # деградировал/упал. Требуем ИМЕННО все закрыты (не любой) —
+                # единичный отключённый листенер не повод для алерта.
+                degraded = bool(vpn_ports) and all(
+                    not _probe_port_open(probe, p) for p in vpn_ports
+                )
+                if not degraded:
+                    target.last_probe_at = now
+                    target.last_probe_status = "ok"
+                    target.unreachable_since = None  # серия прервалась — сброс
+                    # ssh_ok у крауд-заблокированной ноды true КАЖДЫЙ тик (DPI
+                    # блокирует юзеров, не контроллера). Без гварда close_incident
+                    # стирал бы операторский ack/follow немедленно (finding #98).
+                    if not _incident_auto_close_blocked(target, now):
+                        if diagnostics_state.close_incident(target):
+                            summary["recovered"].append(ref)
+                    session.commit()
+                    continue
+                # ── DEGRADED: SSH ok, но VPN-порт(ы) не слушают ──────────
                 target.last_probe_at = now
-                target.last_probe_status = "ok"
-                target.unreachable_since = None  # серия прервалась — сброс
-                # ssh_ok у крауд-заблокированной ноды true КАЖДЫЙ тик (DPI
-                # блокирует юзеров, не контроллера). Без гварда close_incident
-                # стирал бы операторский ack/follow немедленно (finding #98).
-                if not _incident_auto_close_blocked(target, now):
-                    if diagnostics_state.close_incident(target):
-                        summary["recovered"].append(ref)
-                session.commit()
-                continue
+                target.last_probe_status = "degraded"
+                symptom = "vpn_port_down"
+                summary.setdefault("degraded", []).append(ref)
+            else:
+                # ── DOWN ────────────────────────────────────────────────
+                target.last_probe_at = now
+                target.last_probe_status = "unreachable"
+                symptom = "unreachable"
+                summary["down"].append(ref)
 
-            # ── DOWN ────────────────────────────────────────────────────
-            target.last_probe_at = now
-            target.last_probe_status = "unreachable"
-            summary["down"].append(ref)
+            down_count += 1
 
-            # Confirm-окно: первый DOWN только запоминаем (начало серии), не
-            # диагностируем и не алертим. Эскалируем (диагностика + пуш) лишь
-            # когда недоступность держится >= confirm_min — несколько пробов
-            # подряд. Транзиентный 1-2 пропущенных пинга сюда не дотянет →
-            # recovery очистит unreachable_since и серия не накопится.
+            # Confirm-окно: первый DOWN/degraded только запоминаем (начало
+            # серии), не диагностируем и не алертим. Эскалируем (диагностика +
+            # пуш) лишь когда недоступность держится >= confirm_min — несколько
+            # пробов подряд. Транзиентный 1-2 пропущенных пинга сюда не дотянет
+            # → recovery очистит unreachable_since и серия не накопится.
             if getattr(target, "unreachable_since", None) is None:
                 target.unreachable_since = now
+            elif (
+                prev_probe_at is not None
+                and interval > 0
+                and (now - prev_probe_at).total_seconds() > interval * gap_factor
+            ):
+                # Finding #7: между прошлым и этим пробом дыра > interval*factor
+                # (цель выпала в обрезанный бюджетом хвост / тик подвисал).
+                # Непрерывного наблюдения не было — не эскалируем по дырявому
+                # wall-clock, серию начинаем заново.
+                target.unreachable_since = now
+                summary.setdefault("series_reset", []).append(ref)
+                session.commit()
+                continue
             elapsed_min = (now - target.unreachable_since).total_seconds() / 60.0
             if confirm_min > 0 and elapsed_min < confirm_min:
                 summary["suspect"].append(ref)
+                session.commit()
+                continue
+
+            # Finding #3 (mass-down): доля DOWN/degraded среди уже пробитых
+            # целей выше порога → вероятно, сеть у контроллера, а не весь флот
+            # разом. Подавляем индивидуальные пуши/диагностику, шлём один
+            # агрегированный алерт в конце. Default off (fraction=0).
+            if (
+                mass_down_fraction > 0
+                and summary["checked"] >= mass_down_min
+                and down_count / summary["checked"] >= mass_down_fraction
+            ):
+                summary["mass_down_suppressed"] = (
+                    summary.get("mass_down_suppressed", 0) + 1
+                )
                 session.commit()
                 continue
 
@@ -2181,7 +2363,7 @@ def run_node_reachability_tick() -> dict:
                     "node" if kind == "node" else "exit",
                     target.id,
                     "diagnose",
-                    {"auto_triggered": True, "symptom": "unreachable"},
+                    {"auto_triggered": True, "symptom": symptom},
                 )
                 session.commit()
                 orchestrator.run_task_async(
@@ -2191,6 +2373,31 @@ def run_node_reachability_tick() -> dict:
                 logger.exception("node_reachability: diagnose enqueue failed for %s", ref)
                 if session.is_active:
                     session.rollback()
+
+        # Finding #3 (mass-down): если за тик подавили индивидуальные алерты по
+        # массовой недоступности — шлём ОДИН агрегированный сигнал вместо лавины.
+        if summary.get("mass_down_suppressed"):
+            logger.error(
+                "node_reachability: массовая недоступность (%s подавлено из %s "
+                "пробитых) — вероятно, сеть контроллера/аплинка",
+                summary["mass_down_suppressed"], summary["checked"],
+            )
+            try:
+                notify_admins(
+                    session,
+                    kind="reachability_mass_down",
+                    text=(
+                        "⚠️ Монитор: массовая недоступность нод за один тик — "
+                        "индивидуальные алерты подавлены (вероятно, сетевой сбой "
+                        "контроллера/аплинка, а не всех нод сразу). Проверьте "
+                        "сеть воркера."
+                    ),
+                    dedup_key={"scope": "reachability"},
+                    window_sec=1800,
+                    autocommit=True,
+                )
+            except Exception:  # noqa: BLE001
+                logger.exception("node_reachability: mass-down alert failed")
 
         # Метрика самого голодания: сколько целей не пробовано дольше
         # NODE_REACHABILITY_STALE_MIN минут (default 30). Стабильно >0 —

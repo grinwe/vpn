@@ -286,21 +286,63 @@ def _build_vless_ws_cdn_credential(
     return f"vless://{user_id}@{cdn_domain}:{config.port}?{query}#ws-cdn-{node.region}"
 
 
+def _is_ip_host(host: str) -> bool:
+    """True если ``host`` — литеральный IPv4/IPv6-адрес (а не FQDN).
+
+    ACME (Let's Encrypt) не выпускает сертификаты на голый IP, поэтому
+    hysteria2-нода на IP-хосте без явного cert_path обречена на провал
+    ACME-ветки в роли (см. audit netfix #3)."""
+    try:
+        ipaddress.ip_address((host or "").strip())
+        return True
+    except ValueError:
+        return False
+
+
 def _build_hysteria2_credential(
     node: models.VPNNode, config: models.VPNConfig, password: str
 ) -> str:
     """Build a Hysteria2 URI.
 
-    Format: ``hy2://password@host:port?sni=...&insecure=0#tag``
+    Формат (фактически эмитируемый):
+    ``hy2://password@host:port?sni=...[&obfs=...&obfs-password=...]``
+    ``[&insecure=1][&pinSHA256=...]#hy2-<region>``.
+
+    По умолчанию ``insecure``/``pinSHA256`` НЕ эмитятся — клиент строго
+    верифицирует публичную цепочку (нода на ACME-серте, ``insecure=0`` по
+    умолчанию на стороне клиента). Для ноды с self-signed сертификатом
+    оператор кладёт в ``config.settings`` ``insecure=1`` или
+    ``pin_sha256=<fp>``; тогда соответствующий параметр прокидывается в URI,
+    иначе клиент молча падает на верификации сертификата (audit netfix #6).
     """
     settings = config.settings or {}
     sni = config.sni or settings.get("sni", node.host)
     obfs = settings.get("obfs", "")
     obfs_password = settings.get("obfs_password", "")
     params = {"sni": sni}
-    if obfs:
+    # audit netfix #5 — salamander-obfs кладём в URI ТОЛЬКО с непустым паролем.
+    # Частично заданный obfs (тип есть, пароля нет) прежде оставлял в URI голый
+    # ``obfs=salamander`` (obfs-password выкидывался фильтром ``if v``), а сервер
+    # при этом рендерил salamander с пустым ключом → скрамблинг рассинхронен и
+    # коннект не встаёт. Симметрично _collect_site_extra_vars отключает obfs на
+    # сервере при пустом пароле — тогда оба конца без obfs.
+    if obfs and obfs_password:
         params["obfs"] = obfs
         params["obfs-password"] = obfs_password
+    elif obfs and not obfs_password:
+        logger.warning(
+            "hysteria2 config %s on node %s: obfs=%s задан без obfs_password — "
+            "obfs НЕ включаем ни на клиенте, ни на сервере (иначе рассинхрон "
+            "скрамблинга)", config.id, node.id, obfs,
+        )
+    # audit netfix #6 — self-signed путь: без этих настроек клиент требует
+    # валидную публичную цепочку (дефолт — ACME-нода). Опциональные
+    # ``insecure``/``pin_sha256`` из settings разрешают непубличный серт ноды.
+    if settings.get("insecure"):
+        params["insecure"] = "1"
+    pin = settings.get("pin_sha256") or settings.get("pinSHA256")
+    if pin:
+        params["pinSHA256"] = urlquote(str(pin), safe="")
     query = "&".join([f"{k}={v}" for k, v in params.items() if v])
     return f"hy2://{password}@{node.host}:{config.port}?{query}#hy2-{node.region}"
 
@@ -545,12 +587,39 @@ def _collect_site_extra_vars(
 
         # ── Hysteria2 ──
         elif cfg.protocol == models.VPNConfigProtocol.hysteria2:
+            _hy2_obfs = settings.get("obfs", "")
+            _hy2_obfs_pwd = settings.get("obfs_password", "")
+            # audit netfix #5 — obfs включаем на сервере ТОЛЬКО с непустым
+            # паролем (симметрично клиентскому URI): salamander с пустым ключом
+            # на сервере против отсутствия obfs у клиента = коннект не встаёт.
+            if _hy2_obfs and not _hy2_obfs_pwd:
+                logger.warning(
+                    "hysteria2 config %s on node %s: obfs=%s без obfs_password — "
+                    "отключаем obfs на сервере (иначе рассинхрон скрамблинга)",
+                    cfg.id, node.id, _hy2_obfs,
+                )
+                _hy2_obfs = ""
+            _hy2_domain = cfg.sni or node.host
+            _hy2_cert = settings.get("cert_path", "")
+            # audit netfix #3 — при пустом cert_path роль уходит в ACME-ветку, а
+            # Let's Encrypt НЕ выдаёт серт на голый IP (типовой RU-IP-хост) и
+            # отвергает email admin@<IP>. Без валидного FQDN в sni hysteria2
+            # стартует без TLS и клиент не подключается. Полный фикс (self-signed
+            # в шаблоне config.yaml.j2 + валидация FQDN в api/nodes.py) — вне
+            # этого файла; здесь громко сигналим оператору.
+            if not _hy2_cert and _is_ip_host(_hy2_domain):
+                logger.warning(
+                    "hysteria2 config %s on node %s: sni пуст, домен=%s (IP) при "
+                    "пустом cert_path → ACME по IP провалится, нода мертва по "
+                    "hysteria2. Задайте FQDN в sni либо self-signed cert_path.",
+                    cfg.id, node.id, _hy2_domain,
+                )
             extra.update({
                 "hysteria2_port": cfg.port,
-                "hysteria2_domain": cfg.sni or node.host,
-                "hysteria2_obfs": settings.get("obfs", ""),
-                "hysteria2_obfs_password": settings.get("obfs_password", ""),
-                "hysteria2_cert_path": settings.get("cert_path", ""),
+                "hysteria2_domain": _hy2_domain,
+                "hysteria2_obfs": _hy2_obfs,
+                "hysteria2_obfs_password": _hy2_obfs_pwd if _hy2_obfs else "",
+                "hysteria2_cert_path": _hy2_cert,
                 "hysteria2_key_path": settings.get("key_path", ""),
                 "hysteria2_up_mbps": settings.get("up_mbps", 100),
                 "hysteria2_down_mbps": settings.get("down_mbps", 100),
@@ -2872,7 +2941,13 @@ class ProvisioningOrchestrator:
 
             entry: dict[str, Any] = {"proto": cfg.protocol.value, "port": cfg.port}
             if cfg.protocol == models.VPNConfigProtocol.shadowtls_ss:
-                entry["method"] = (cfg.settings or {}).get("method", "chacha20-ietf-poly1305")
+                # audit netfix #7 — единый источник SS-method: shadowtls.SS_METHOD
+                # (тот же метод в клиентском URI и на сервере). Прежний дефолт
+                # 'chacha20-ietf-poly1305' рассинхронил бы креды при включении EIH
+                # multi-user (сервер и URI — 2022-blake3), а длина ключа завязана
+                # на семейство шифра.
+                from . import shadowtls as _stls
+                entry["method"] = (cfg.settings or {}).get("method", _stls.SS_METHOD)
             protocols_payload.append(entry)
 
         if not protocols_payload:
@@ -3735,7 +3810,13 @@ class ProvisioningOrchestrator:
 
             entry: dict[str, Any] = {"proto": cfg.protocol.value, "port": cfg.port}
             if cfg.protocol == models.VPNConfigProtocol.shadowtls_ss:
-                entry["method"] = (cfg.settings or {}).get("method", "chacha20-ietf-poly1305")
+                # audit netfix #7 — единый источник SS-method: shadowtls.SS_METHOD
+                # (тот же метод в клиентском URI и на сервере). Прежний дефолт
+                # 'chacha20-ietf-poly1305' рассинхронил бы креды при включении EIH
+                # multi-user (сервер и URI — 2022-blake3), а длина ключа завязана
+                # на семейство шифра.
+                from . import shadowtls as _stls
+                entry["method"] = (cfg.settings or {}).get("method", _stls.SS_METHOD)
             protocols_payload.append(entry)
 
         if not protocols_payload:
@@ -4160,7 +4241,24 @@ class ProvisioningOrchestrator:
         after = {
             c.node_id for c in device.credentials if c.is_active and c.node_id
         }
-        return len(after - before)
+        added = len(after - before)
+        # audit netfix #1 — revoke уже закоммичен (строка выше), а при пустом
+        # warm-пуле _maybe_attach_diverse возвращает 0 добранных: набор молча
+        # ужимается ниже DIVERSE_SUB_NODES. У юзера меньше запасных нод для
+        # client-side failover, а единственный прежний сигнал — added==0 в теле
+        # admin-API. Логируем громко, чтобы оператор увидел деградацию набора и
+        # доспавнил/добрал вручную. (Пометка degraded в ответе swap_device_node —
+        # в subscriptions.py, вне владения этого файла.)
+        n_target = int(os.getenv("DIVERSE_SUB_NODES", "1") or "1")
+        live_nodes = len(after)
+        if added == 0 and live_nodes < n_target:
+            logger.warning(
+                "swap_node_out: device %s (sub %s) — добор дал 0 нод, живой "
+                "набор=%d < DIVERSE_SUB_NODES=%d (пустой warm-пул?). Клиенту "
+                "меньше запасных нод для failover; нужен ручной досбор/спавн.",
+                device.id, sub.id, live_nodes, n_target,
+            )
+        return added
 
     def failover_device(
         self, device: models.Device,

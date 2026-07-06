@@ -41,6 +41,11 @@ const PAGE_SIZE = 50;
 // (backend/app/api/users.py) — "all" means "no filter", not "empty".
 type BannedFilter = "all" | "active" | "banned";
 
+// Человекочитаемый текст сетевой ошибки для показа в существующем слоте UI.
+function errText(e: unknown): string {
+  return e instanceof Error ? e.message : String(e);
+}
+
 export default function Users() {
   const qc = useQueryClient();
   const [search, setSearch] = useState("");
@@ -91,7 +96,13 @@ export default function Users() {
     fetchNextPage,
     hasNextPage,
     isFetchingNextPage,
+    isFetchNextPageError,
     isLoading,
+    // error/isError раньше не читались: при падении /users список молча
+    // рендерил пустую таблицу — оператор принимал упавший backend за
+    // «юзеров нет». Теперь показываем текст ошибки вместо пустого списка.
+    isError,
+    error,
   } = useInfiniteQuery({
     queryKey: ["users", { search: debouncedSearch, banned }],
     initialPageParam: 0,
@@ -119,7 +130,15 @@ export default function Users() {
   // корректно отражает реальность, а не показывает застывший снапшот.
   const selected = users.find((u) => u.id === selectedId) ?? null;
 
-  const { data: subs } = useQuery<SubscriptionOut[]>({
+  const {
+    data: subs,
+    // Раньше состояние сайдбара определялось только по `subs === undefined`:
+    // при ошибке запроса data остаётся undefined и панель висела в вечном
+    // «Загрузка…». Теперь различаем loading / error / empty.
+    isLoading: subsLoading,
+    isError: subsError,
+    error: subsErrObj,
+  } = useQuery<SubscriptionOut[]>({
     queryKey: ["user-subs", selectedId],
     queryFn: () => api.get(`/users/${selectedId}`),
     enabled: selectedId !== null,
@@ -810,6 +829,14 @@ export default function Users() {
         </div>
         {isLoading ? (
           <div>Загрузка…</div>
+        ) : isError ? (
+          // Сетевой сбой /users показываем в том же слоте, где рендерился
+          // «Загрузка…», а не пустой таблицей — иначе «Загружено: 0» неотличимо
+          // от реального отсутствия юзеров. Кнопку повтора не добавляем:
+          // react-query сам перезапросит при фокусе окна / восстановлении сети.
+          <div className="text-red-400 text-sm">
+            Не удалось загрузить список пользователей: {errText(error)}
+          </div>
         ) : (
           <>
             <table className="w-full text-sm">
@@ -907,6 +934,13 @@ export default function Users() {
                 >
                   {isFetchingNextPage ? "Загружаем…" : "Загрузить ещё"}
                 </button>
+              )}
+              {/* Ошибку подгрузки следующей страницы раньше проглатывали молча —
+                  показываем её рядом с кнопкой (повторный клик перезапросит). */}
+              {isFetchNextPageError && (
+                <span className="text-red-400">
+                  не удалось подгрузить — нажми «Загрузить ещё» ещё раз
+                </span>
               )}
             </div>
           </>
@@ -1079,9 +1113,16 @@ export default function Users() {
 
             <div className="pt-2 border-t border-slate-700">
               <div className="font-semibold mb-1">Подписки</div>
-              {subs === undefined ? (
+              {subsLoading ? (
                 <div className="text-slate-400">Загрузка…</div>
-              ) : subs.length === 0 ? (
+              ) : subsError ? (
+                // Ошибка загрузки деталей юзера — показываем текст в том же
+                // слоте, где висел «Загрузка…», размыкая вечный спиннер.
+                // react-query перезапросит при фокусе окна / reconnect.
+                <div className="text-red-400">
+                  Не удалось загрузить подписки: {errText(subsErrObj)}
+                </div>
+              ) : !subs || subs.length === 0 ? (
                 <div className="text-slate-400">Нет активных</div>
               ) : (
                 <ul className="space-y-2">

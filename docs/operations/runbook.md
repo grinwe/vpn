@@ -238,6 +238,7 @@ FROM vpn_nodes WHERE id = <X>;
 - `is_active=false` — кто-то нажал в SPA.
 - `status='error'` — был fail при bootstrap или `destroy_node`. **Из `error` автомата нет**, см. `infrastructure/nodes.md`.
 - `health_score < MIN_HEALTHY_SCORE` — probe'ы упали. Смотреть `health_probes` таблицу по `node_id`.
+- `blocked_regions` непустой ИЛИ probe-смерть (общий success-rate ниже порога при достаточной выборке) — probe-риги детектят DPI-блок, который SSH-тик не видит. Авто-миграция отключена (2026-04-15), но теперь на такой сигнал уходит **админ-пуш** (`node_region_blocked` / `node_probe_death`), дедуп-окно `ADMIN_ALERT_BLOCKED_WINDOW_SEC` (default 1800с), подавляется mute по ноде. Решение о переселении — ручное (мигрировать через admin SPA). Пуш идёт только с автоматического (probe-driven) пути; ручной пересчёт из админки не алертит.
 - `cooldown_until > now` — временный lock. Обычно проходит сам через 5–15 минут.
 - `status='draining'` — нода помечена для вывода из пула (автоматика выпилена 2026-04-17; статус меняется руками). Новые subs сюда не едут, старые надо мигрировать через admin SPA. Вернуть в пул: `UPDATE vpn_nodes SET status='active' WHERE id=<X>;`.
 

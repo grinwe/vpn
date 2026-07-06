@@ -65,6 +65,14 @@ _SESSION: aiohttp.ClientSession | None = None
 _HTTP_TIMEOUT = aiohttp.ClientTimeout(total=10)
 _RETRIES = 2
 
+# Короткий per-attempt таймаут для ретраящихся запросов (по умолчанию — GET).
+# Без него 3 попытки по total=10с давали пользователю ~30с тишины при лежащем
+# бэкенде. Плюс общий дедлайн на всю _fetch_json, чтобы суммарное ожидание было
+# ограничено ~10-12с, а не множилось на число ретраев.
+_RETRY_ATTEMPT_TIMEOUT_S = float(os.getenv("BOT_RETRY_ATTEMPT_TIMEOUT_S", "4"))
+_RETRY_CONNECT_TIMEOUT_S = float(os.getenv("BOT_RETRY_CONNECT_TIMEOUT_S", "2"))
+_FETCH_DEADLINE_S = float(os.getenv("BOT_FETCH_DEADLINE_S", "12"))
+
 
 async def get_session() -> aiohttp.ClientSession:
     global _SESSION
@@ -108,10 +116,28 @@ async def _fetch_json(method: str, url: str, *, retry: bool | None = None, **kwa
     POST можно явно передать retry=True.
     """
     session = await get_session()
-    do_retry = (method.upper() == "GET") if retry is None else retry
+    is_get = method.upper() == "GET"
+    do_retry = is_get if retry is None else retry
     last_exc: Exception | None = None
+    loop = asyncio.get_event_loop()
+    deadline = loop.time() + _FETCH_DEADLINE_S
+    # Per-attempt таймаут. Если caller передал timeout явно (напр. /start даёт
+    # register 3с) — уважаем его. Иначе для идемпотентного GET ставим короткий
+    # таймаут, чтобы N ретраев не растянулись на ~30с. Не-GET без явного timeout
+    # оставляем на общем _HTTP_TIMEOUT сессии (одна попытка, дублей не плодим).
+    attempt_timeout = kwargs.pop("timeout", None)
+    if attempt_timeout is None and is_get:
+        attempt_timeout = aiohttp.ClientTimeout(
+            total=_RETRY_ATTEMPT_TIMEOUT_S, connect=_RETRY_CONNECT_TIMEOUT_S
+        )
     for attempt in range(_RETRIES + 1):
+        # Общий дедлайн исчерпан — не начинаем новую попытку (быстрый честный
+        # ответ «недоступно» вместо трёх полных таймаутов подряд).
+        if attempt > 0 and loop.time() >= deadline:
+            break
         try:
+            if attempt_timeout is not None:
+                kwargs["timeout"] = attempt_timeout
             async with session.request(method, url, **kwargs) as resp:
                 text = await resp.text()
                 try:
@@ -153,6 +179,29 @@ def _spawn(coro) -> asyncio.Task:
     _BG_TASKS.add(task)
     task.add_done_callback(_BG_TASKS.discard)
     return task
+
+
+# /start шлёт register best-effort и НЕ должен держать приветствие: даём ему
+# короткий таймаут, чтобы новый юзер (часто с рекламы — первое впечатление) не
+# смотрел до 10с в пустоту при подтормаживающем бэкенде.
+_REGISTER_TIMEOUT_S = float(os.getenv("BOT_REGISTER_TIMEOUT_S", "3"))
+
+
+async def _register_retry_bg(user_id: int, payload: dict) -> None:
+    """Фоновая до-регистрация, если /start не дождался быстрого register.
+
+    register = get-or-create (повтор безопасен). Цель — не потерять рекламную
+    метку/реферал (source/referral_code) при медленном бэкенде: быстрый 3с
+    таймаут мог оборваться раньше, чем метка доехала."""
+    try:
+        await _fetch_json(
+            "POST",
+            f"{BACKEND_URL}/api/users/register",
+            json=payload,
+            headers=_admin_headers(user_id),
+        )
+    except Exception:  # noqa: BLE001
+        pass
 
 
 def _admin_headers(actor_id: int) -> dict[str, str]:
@@ -313,9 +362,15 @@ async def cmd_start(message: types.Message, state: FSMContext):
             f"{BACKEND_URL}/api/users/register",
             json=register_payload,
             headers=_admin_headers(message.from_user.id),
+            timeout=aiohttp.ClientTimeout(total=_REGISTER_TIMEOUT_S),
         )
         is_new = bool(data and data.get("created"))
         trial_available = bool(data and data.get("trial_available"))
+        # Быстрый таймаут мог оборваться раньше, чем метка/реферал доехали до
+        # бэка. Если не достучались, но атрибуция была — до-регистрируем в фоне
+        # полным таймаутом, чтобы не потерять источник конверсии.
+        if _status == 0 and (referral_code or source):
+            _spawn(_register_retry_bg(message.from_user.id, register_payload))
     except Exception:
         pass
 
@@ -895,6 +950,13 @@ async def self_report_vpn_broken(message: types.Message) -> None:
         )
         return
     if status_code != 200 or not isinstance(data, dict):
+        # 4xx/5xx/0 здесь = сбой контракта или недоступность бэка. _fetch_json
+        # логирует только >=500 и 0, поэтому 4xx (напр. протухший telegram_id,
+        # рассинхрон) иначе исчезал бы без следа — логируем с контекстом.
+        logger.warning(
+            "self_report devices-by-telegram failed: tg_id=%s status=%s data=%.300s",
+            tg_id, status_code, data,
+        )
         await message.answer(
             "Не получилось обработать — попробуй ещё раз через минуту."
         )
@@ -954,6 +1016,12 @@ async def _do_device_failover(
         )
         return None
     if status_code != 200 or not isinstance(data, dict):
+        # Персистентный 4xx (баг контракта/рассинхрон устройств) иначе гнал бы
+        # юзера в бесконечный «попробуй через минуту» без единой строки в логах.
+        logger.warning(
+            "report-broken-device failed: tg_id=%s device_id=%s status=%s data=%.300s",
+            tg_id, device_id, status_code, data,
+        )
         await bot.send_message(
             chat_id, "Не получилось обработать — попробуй ещё раз через минуту."
         )
@@ -1012,6 +1080,10 @@ async def _do_whole_sub_failover(bot, chat_id: int, tg_id: int) -> None:
         )
         return
     if status_code != 200 or not isinstance(data, dict):
+        logger.warning(
+            "report-broken (whole-sub) failed: tg_id=%s status=%s data=%.300s",
+            tg_id, status_code, data,
+        )
         await bot.send_message(
             chat_id, "Не получилось обработать — попробуй ещё раз через минуту."
         )
@@ -1667,6 +1739,27 @@ async def cmd_balance(message: types.Message):
 
 # ── /referral — реферальная ссылка ──
 
+# username бота неизменен в рамках процесса — кэшируем, чтобы не дёргать
+# Telegram get_me на каждый реферальный запрос.
+_bot_username: str | None = None
+
+
+async def _get_bot_username(bot) -> str | None:
+    """username бота (кэш). None → краткий сетевой блип к Telegram; вызывающий
+    решает, как деградировать, вместо того чтобы ронять весь ответ в глобальный
+    on_dispatch_error (юзер бы увидел generic-ошибку при уже полученном коде)."""
+    global _bot_username
+    if _bot_username:
+        return _bot_username
+    try:
+        me = await bot.get_me()
+    except Exception:  # noqa: BLE001
+        logger.warning("get_me failed while building referral link", exc_info=True)
+        return None
+    _bot_username = me.username
+    return _bot_username
+
+
 async def _send_referral(msg: types.Message, bot, user_id: int) -> None:
     """Единый флоу выдачи реферальной ссылки (общий для команды и inline-кнопки
     приветствия). Раньше был скопирован в cmd_referral и go_referral 1-в-1 —
@@ -1686,8 +1779,17 @@ async def _send_referral(msg: types.Message, bot, user_id: int) -> None:
 
     code = data.get("code", "")
     uses = data.get("uses", 0)
-    bot_info = await bot.get_me()
-    ref_link = f"https://t.me/{bot_info.username}?start=ref_{code}"
+    username = await _get_bot_username(bot)
+    if not username:
+        # Сетевой блип к Telegram: код у нас есть, ссылку собрать не смогли —
+        # отдаём код текстом, чтобы юзер не остался ни с чем.
+        await msg.answer(
+            f"🎁 Твой реферальный код: <code>ref_{html.escape(str(code))}</code>\n"
+            "Готовую ссылку собрать не вышло — попробуй ещё раз через минуту.",
+            parse_mode="HTML",
+        )
+        return
+    ref_link = f"https://t.me/{username}?start=ref_{code}"
 
     # Stage 4: реферал теперь через денежный бонус, не через дни.
     # Сумма берётся из бэкенда (REFERRAL_BONUS_KOPECKS, дефолт 50 ₽).
@@ -2124,6 +2226,13 @@ def _render_ops_plan(result: dict) -> str:
 
 _OPS_EXEC_TERMINAL = {"executed", "partial", "failed", "expired", "cancelled"}
 
+# Поллинг статуса исполнения: после N подряд сетевых провалов считаем связь с
+# бэком потерянной и честно сообщаем «статус неизвестен», а не врём «executing».
+# Per-poll таймаут снижен с 15с — 15с для короткого статус-GET много, из-за
+# него недоступность выявлялась слишком медленно.
+_OPS_POLL_MAX_CONSEC_FAIL = int(os.getenv("OPS_POLL_MAX_CONSEC_FAIL", "3"))
+_OPS_POLL_TIMEOUT_S = float(os.getenv("OPS_POLL_TIMEOUT_S", "8"))
+
 
 def _ops_exec_keyboard(payload: dict) -> "types.InlineKeyboardMarkup | None":
     """Кнопка «Исполнить» под планом — если он выполним и есть шаги."""
@@ -2195,6 +2304,7 @@ def _render_ops_exec(payload: dict) -> str:
 async def _poll_ops_exec(session, plan_id: int, actor_id: int, *, tries: int = 20, delay: float = 3.0) -> dict:
     """Поллим статус плана, пока не терминальный. Возвращает последний снимок."""
     last: dict = {"status": "executing", "plan_id": plan_id}
+    consecutive_failures = 0
     for _ in range(tries):
         await asyncio.sleep(delay)
         try:
@@ -2202,14 +2312,25 @@ async def _poll_ops_exec(session, plan_id: int, actor_id: int, *, tries: int = 2
                 "GET",
                 f"{BACKEND_URL}/api/agent/ops/plan/{plan_id}",
                 headers=_admin_headers(actor_id),
-                timeout=aiohttp.ClientTimeout(total=15),
+                timeout=aiohttp.ClientTimeout(total=_OPS_POLL_TIMEOUT_S),
             ) as resp:
+                # Любой ответ = бэк достижим, сбрасываем счётчик недоступности.
+                consecutive_failures = 0
                 if resp.status == 200:
                     last = await resp.json()
                     if str(last.get("status")) in _OPS_EXEC_TERMINAL:
                         return last
         except (aiohttp.ClientError, asyncio.TimeoutError):
-            # Таймаут одной итерации поллинга — не повод падать, просто ждём дальше.
+            # Сетевая ошибка/таймаут одной итерации. Копим подряд идущие: пока
+            # их мало — ждём дальше (транзиент), при пороге — выходим с явным
+            # маркером «связь потеряна, статус неизвестен».
+            consecutive_failures += 1
+            if consecutive_failures >= _OPS_POLL_MAX_CONSEC_FAIL:
+                logger.warning(
+                    "ops-exec poll: backend unreachable %s times, plan_id=%s",
+                    consecutive_failures, plan_id,
+                )
+                return {"status": "unreachable", "plan_id": plan_id}
             continue
     return last
 
@@ -2378,6 +2499,15 @@ async def ops_exec_go(callback_query: types.CallbackQuery) -> None:
 
     await launching.edit_text("🚀 Запущено, жду результат заказа…")
     result = await _poll_ops_exec(session, int(plan_id), actor_id)
+    if result.get("status") == "unreachable":
+        # Бэк был недоступен весь поллинг — НЕ показываем оптимистичное
+        # «executing/проверь через минуту»: статус реально неизвестен.
+        await launching.edit_text(
+            "⚠️ Не удалось получить статус исполнения — бэкенд недоступен. "
+            "Статус неизвестен: проверь ноды и план вручную (/ops) ПРЕЖДЕ чем "
+            "запускать повторно, чтобы не задвоить заказ."
+        )
+        return
     try:
         await launching.edit_text(
             _render_ops_exec(result), parse_mode="HTML", disable_web_page_preview=True
