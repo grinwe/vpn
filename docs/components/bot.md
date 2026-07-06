@@ -23,7 +23,10 @@ bot/
 dp = Dispatcher(storage=MemoryStorage())
 dp.include_router(support_router)  # FIRST — чтобы FSM-стейт перехватывал раньше
 dp.include_router(router)
+dp.errors.register(on_dispatch_error)  # глобальная страховка от падений хендлеров
 ```
+
+Глобальный errors-хендлер `on_dispatch_error` (`bot/bot.py`) логирует стектрейс любого необработанного исключения и best-effort отвечает пользователю: для callback — `callback_query.answer(...)` (гасит спиннер на кнопке), для message — короткое «Произошла ошибка, попробуйте позже». Сам ответ обёрнут в try/except, чтобы обработчик ошибок не падал вторично.
 
 `MemoryStorage` — осознанный выбор: single-instance бот, нет нужды в Redis storage. Переход на multi-instance потребует RedisStorage (комментарий `bot.py:75-77`).
 
@@ -67,7 +70,7 @@ dp.include_router(router)
 
 - общим keep-alive session (`_SESSION`);
 - таймаутом `total=10s` (`_HTTP_TIMEOUT`);
-- ретраями `_RETRIES=2` на `aiohttp.ClientError` и `5xx` с бэкоффом `0.3 * (attempt + 1)`;
+- ретраями `_RETRIES=2` на `aiohttp.ClientError`, `asyncio.TimeoutError` (total-таймаут aiohttp — не подкласс `ClientError`) и `5xx` с бэкоффом `0.3 * (attempt + 1)`;
 - возвратом `(status_code, payload)` тупла, с деградацией на `(0, {"message": "backend unreachable"})` вместо исключения — поэтому хэндлеры всегда могут отдать пользователю адекватный текст, даже если backend упал.
 
 ### 2. Админские команды
@@ -91,8 +94,8 @@ Telegram Stars — единственный способ принять опла
 
 При `BOT_WEBHOOK_PORT > 0` бот переходит из polling в aiohttp-сервер на внутреннем порте. Backend регистрируется как Telegram webhook (`setWebhook`) и:
 
-- `pre_checkout_query` (XTR) — backend отвечает OK через Bot API напрямую
-- `successful_payment` (XTR) — backend вызывает `_mark_invoice_paid_core` напрямую
+- `pre_checkout_query` (XTR) — backend валидирует инвойс (существует, pending, сумма в Stars совпадает) и отвечает ok/ok=False через Bot API (аудит #2)
+- `successful_payment` (XTR) — backend вызывает `_mark_invoice_paid_core` напрямую; при сбое — error-лог + алерт админам `stars_payment_failed`, на 5xx вебхук отвечает не-200 для ретрая Telegram (аудит #209)
 - Все остальные update'ы — forward в бот через `BOT_INTERNAL_WEBHOOK_URL`
 
 Stars-хэндлеры в `handlers.py` в webhook-режиме не вызываются (backend перехватывает payment-update'ы до пересылки боту). Хэндлеры остаются в коде для backward compat с polling-режимом.

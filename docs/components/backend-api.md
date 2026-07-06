@@ -16,7 +16,7 @@ app.include_router(webapp_router)  # api_webapp       — Mini App
 На старте (`main.py:18`) прогоняются alembic-миграции, затем `reset_stuck_tasks()` подбирает `ProvisioningTask.status=running|pending` с прошлой жизни процесса и перепихивает их в очередь. Это даёт корректный recovery после жёсткого рестарта, но двойной запуск idempotent ansible-playbook'а — плата за простоту (см. `components/worker.md`).
 
 Middleware порядок:
-1. SlowAPI rate limiter (`rate_limit.py`: `get_remote_address`, `memory://`, default `300/minute; 60/second`).
+1. SlowAPI rate limiter (`rate_limit.py`: кастомный `rate_limit_key`, default `300/minute; 60/second`, storage `SLOWAPI_STORAGE_URI` → `REDIS_URL` → `memory://`). Ключ — реальный клиентский IP: за доверенным прокси (private-сети докера либо `RATE_LIMIT_TRUSTED_PROXIES`) берётся `X-Real-IP` (fallback — последний элемент `X-Forwarded-For`, дописанный nginx), с недоверенных адресов заголовки игнорируются. Запросы с валидным `X-Admin-Token` (бот, админка) освобождены от per-IP лимитов (уникальный ключ на запрос), кроме `/api/agent/*` — там «потолок на источник» намеренный.
 2. CORS — включается только если задан `CORS_ALLOWED_ORIGINS` (comma-separated).
 3. Кастомный `add_metrics` — пишет `vpn_requests_total` / `vpn_requests_errors_total` в Prometheus, используя **matched route template** (`/api/users/{user_id}`), чтобы cardinality не взрывалась на каждом id (`main.py:92-104`).
 
@@ -171,7 +171,7 @@ def dynamic_sub_link(token: str, db: Session = Depends(get_db)):
 2. `reprovision_subscription` / `provision_subscription` / `create_device_for_subscription` создают **новый** `Device` с новым `sub_token`, **никогда** не мутируют `sub_token` уже существующего. Три генератора — три единственные точки записи `sub_token`.
 3. `dynamic_sub_link` в `api_extensions.py` алиасит нерабочий device (статус ≠ active или все creds неактивны) на живого соседа по той же `Subscription`. Без этого — тот же 404.
 
-Любая попытка «почистить старые revoked devices», «переиспользовать sub_token при миграции», «упростить alias-блок» — сначала читать этот раздел. Тесты, которые подтверждают инвариант, живут в `backend/tests/test_balance.py` (`original_token` фикстура).
+Любая попытка «почистить старые revoked devices», «переиспользовать sub_token при миграции», «упростить alias-блок» — сначала читать этот раздел. Тесты, которые подтверждают инвариант, живут в `backend/tests/test_balance.py` (`original_token` фикстура) и `backend/tests/test_auditfix_api_extensions_py.py` (per-device ветка целиком: happy-path по токену девайса, alias отозванного на живого соседа + `aliased_to_device_id` в AuditLog, выбор самого свежего соседа в цепочке A→B→C, 503 вместо пустого 200).
 
 > ⚠️ Audit-лог на каждый анонимный опрос + дефолтный nginx access_log (`infrastructure/deployment.md`) = деанон-timeline. См. audit/...
 

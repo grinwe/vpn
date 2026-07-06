@@ -33,6 +33,24 @@
   changed_when: "'установлен:' in xray_core_fetch.stdout"
   failed_when: xray_core_fetch.rc != 0
 
+# Свежий бинарь сам по себе не подхватывается: хэндлеры протокольных ролей
+# рестартуют сервисы только при изменении config.json/юнита, а страховочный
+# force-restart — только если сервис inactive. Поэтому после реальной
+# установки (условие = changed_when задачи выше) рестартуем все активные
+# xray-юниты прямо здесь. Двойной рестарт от хэндлеров ниже по прогону
+# безопасен (~100ms downtime).
+- name: Restart running xray services after core update
+  ansible.builtin.shell: |
+    for svc in xray xray-ws-cdn xray-xhttp; do
+      if systemctl is-active --quiet "${svc}" 2>/dev/null; then
+        systemctl restart "${svc}"
+      fi
+    done
+  args:
+    executable: /bin/bash
+  changed_when: true
+  when: "'установлен:' in xray_core_fetch.stdout"
+
 - name: Install xray.service systemd unit
   ansible.builtin.copy:
     src: xray.service

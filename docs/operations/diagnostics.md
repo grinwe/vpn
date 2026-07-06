@@ -228,6 +228,17 @@ DISTINCT подписки, пожаловавшиеся на ноду за ок�
 открывается diagnose-инцидент + enqueue диагностики + говорящий
 admin-push. Идемпотентно: уже cooled-нода повторно не охлаждается. Так
 ноды само-ранжируются по реальным юзер-сигналам, а не только по нашему ssh.
+Голосуют ВСЕ user-driven каналы: webapp/control-channel (`_do_failover`)
+**и бот-флоу operator-routing** (`report-broken` / `report-broken-device` —
+их audit-метаданные пишут `current_node_id`, ключ окна подсчёта, и после
+миграции зовут ту же эскалацию).
+
+Авто-баны `NodeUserBan` при этом не вечные: перед каждым user-driven
+failover'ом протухшие авто-баны юзера снимаются (TTL, env
+`NODE_USER_BAN_TTL_HOURS=48`; ручные админ-баны не трогаются), а при
+`NODE_USER_BAN_MAX_PER_USER=3` свежих авто-банах миграция идёт **без**
+бана старой ноды — юзер с проблемой на своей стороне (оператор/локальный
+RKN) не выжигает себе весь пул нод в вечный `no_target`.
 
 `choose_node` теперь исключает и disable-флагнутые ноды
 (`auto_diagnose_disabled_at` / `diagnostics_disabled_at`) — централизованно
@@ -241,7 +252,8 @@ admin-push. Идемпотентно: уже cooled-нода повторно н
 `DIAGNOSE_SAFETY_RECAP_HOURS=12`, `ADMIN_ALERT_DIAGNOSIS_WINDOW_SEC=1800`,
 `NODE_INCIDENT_RECONCILE_MAX_AGE_MIN=30` (бэкстоп авто-закрытия, см. раздел 2026-06-21).
 Краудсорс: `NODE_FAILURE_REPORT_WINDOW_MIN=60`, `NODE_FAILURE_BAN_THRESHOLD=4`,
-`NODE_FAILURE_COOLDOWN_HOURS=2`.
+`NODE_FAILURE_COOLDOWN_HOURS=2`. Авто-баны: `NODE_USER_BAN_TTL_HOURS=48`
+(0 = TTL выключен), `NODE_USER_BAN_MAX_PER_USER=3` (0 = потолок выключен).
 
 ### Код overhaul'а
 
@@ -316,7 +328,13 @@ ok`, SSH свежий, WG зелёный) — тот же симптом, что
 `if probe.ssh_ok:` зовёт `close_incident` немедленно на первом удачном пробе
 (`worker.py`). До этой ветки можно НЕ дойти:
 * тик обрезан wall-clock бюджетом (`NODE_REACHABILITY_BUDGET_SEC`) — хвост
-  списка целей в этот цикл не пробивается, рекавери-проб пропущен;
+  списка целей в этот цикл не пробивается, рекавери-проб пропущен. С
+  аудит-фикса #95 (2026-07) хвост больше не голодает *систематически*:
+  цели обходятся по `last_probe_at` ASC NULLS FIRST (самые давно не
+  пробованные — первыми), так что обрезанный хвост идёт первым в следующем
+  тике; само голодание видно в гейдже `vpn_reachability_stale_targets`
+  (целей без проба дольше `NODE_REACHABILITY_STALE_MIN`, default 30 мин).
+  Разовый пропуск рекавери-проба в конкретном тике всё ещё возможен;
 * инцидент открыт **крауд-путём** (`client_control.py`, ≥4 жалобы за час) на
   SSH-здоровой ноде — `last_probe_status` и так `ok`, ssh_ok-ветке нечего
   закрывать, рассинхрон крауд-инцидента и проба никто не сводит;

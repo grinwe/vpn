@@ -80,7 +80,9 @@ user pays → TG шлёт successful_payment → bot handler
 user pays → TG шлёт update на /tg-webhook (backend напрямую)
      → backend проверяет secret_token header
      → если successful_payment (XTR): _mark_invoice_paid_core
-     → если pre_checkout_query (XTR): answerPreCheckoutQuery(ok=True) через Bot API
+       (сбой = error-лог + алерт админам stars_payment_failed; 5xx → не-200, Telegram ретраит — аудит #209)
+     → если pre_checkout_query (XTR): валидация инвойса (существует, pending,
+       сумма в Stars совпадает) → answerPreCheckoutQuery(ok|ok=False) — аудит #2
      → иначе: forward в bot через BOT_INTERNAL_WEBHOOK_URL
 ```
 
@@ -117,7 +119,7 @@ SBP_<SLUG>_PAID_STATUSES         ← default "paid,success,succeeded"
 - Дальше ищется `payload.invoice_id` или `payload.order_id`, **один** из них обязан совпадать с тем, что мы клали на create.
 - Маппинг статусов: `paid_statuses → "paid"`, `{failed, canceled, cancelled, declined} → "failed"`, `{expired, timeout} → "expired"`, остальное → `"other"`.
 
-«Mock aggregator» в тестах использует именно этот driver — `tests/test_payment_providers.py` гоняет generic_sbp с поддельными env'ами.
+«Mock aggregator» в тестах использует именно этот driver — `tests/test_payment_providers.py` гоняет generic_sbp с поддельными env'ами. Сквозной конвейер «webhook → `_mark_invoice_paid_core` → подписка/баланс» покрыт интеграционно в `tests/test_auditfix_api_invoices_py.py` (аудит #186): реальные POST на `/api/payments/webhook/sbp:*` с HMAC-подписью тела, идемпотентность повторной доставки, mark_paid, topup + реферальный бонус, ветки ошибок 400/401/404.
 
 ## `/api/invoices/{id}/checkout` — создание инвойса
 
@@ -125,9 +127,10 @@ SBP_<SLUG>_PAID_STATUSES         ← default "paid,success,succeeded"
 
 1. Найти `Invoice`, проверить `status == pending`.
 2. `provider = get_provider(body.provider or None)` — `None` означает «выбери из пула».
-3. `provider.create_invoice(invoice_id, amount, currency, return_url)`.
-4. **Перед** ответом клиенту создать `Payment(status=pending, provider=provider.name, external_id=provider_invoice.external_id)`. Это — то, что webhook потом найдёт по `(invoice_id, provider)`.
-5. `db.commit()`, вернуть `pay_url`.
+3. Конвертация валюты (#108): RUB-счёт приводится к валюте провайдера **до** `create_invoice` — для `telegram_stars` через `_rub_to_stars` (курс `WEBAPP_STARS_PER_RUB`, тот же, что в WebApp), для `cryptobot` через `CRYPTOBOT_RUB_PER_USDT` (не задан → 503, счёт не создаётся). SBP и уже сконвертированные счета (XTR/USDT) проходят как есть. `Payment`-строка при этом хранится в валюте `Invoice` (RUB).
+4. `provider.create_invoice(invoice_id, amount, currency, return_url)`.
+5. **Перед** ответом клиенту создать `Payment(status=pending, provider=provider.name, external_id=provider_invoice.external_id)`. Это — то, что webhook потом найдёт по `(invoice_id, provider)`.
+6. `db.commit()`, вернуть `pay_url`.
 
 `return_url` передаётся только в CryptoBot и только как `paid_btn_url` (кнопка «Return to bot» после оплаты). Stars игнорирует, SBP — тоже, потому что его UX мы не контролируем.
 
@@ -135,7 +138,7 @@ SBP_<SLUG>_PAID_STATUSES         ← default "paid,success,succeeded"
 
 ## `/api/payments/webhook/{provider_name}` — приём callback'а
 
-`backend/app/api.py:2639-2697`. Единственный unauthenticated route в admin-surface'е (по FastAPI):
+`backend/app/api.py:2639-2697`. Единственный unauthenticated route в admin-surface'е (по FastAPI). Эндпоинт `async`, но вся работа с БД (запрос `Payment` + `_mark_invoice_paid_core` с `with_for_update`) уходит в threadpool через `asyncio.to_thread` (#199) — иначе row-lock на инвойсе замораживал бы event loop всего процесса:
 
 ```
 POST /api/payments/webhook/cryptobot

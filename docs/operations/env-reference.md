@@ -28,6 +28,7 @@
 | `LOG_LEVEL` | `INFO` | backend, worker | DEBUG/INFO/WARNING. DEBUG очень шумный на prod. |
 | `LOG_FORMAT` | `json` | backend, worker | `json` — structured JSON (для prod/log aggregators). `console` — human-readable (для local dev). Оба включают `request_id`. |
 | `SLOWAPI_STORAGE_URI` | auto (`REDIS_URL` → `memory://`) | backend | Slowapi backend. Если не задан, подхватывает `REDIS_URL` (rate limits shared через Redis). Явное `memory://` — только для offline dev. |
+| `RATE_LIMIT_TRUSTED_PROXIES` | loopback + private-сети (docker) | backend | CSV из CIDR: с каких peer-адресов rate-limiter верит `X-Real-IP`/`X-Forwarded-For` (см. `rate_limit.py`). Дефолт покрывает nginx в docker-сети. |
 | `CORS_ALLOWED_ORIGINS` | `""` | backend | Comma-separated list. Пусто → webapp на том же origin (same nginx), CORS не нужен. |
 
 ## Telegram Bot
@@ -80,9 +81,15 @@
 | `PENDING_RESCUE_AGE` | `60` | worker | Минимальный возраст (sec) pending-задачи, чтобы её подхватил rescue-tick. Меньше этого — считается «только что создана, ещё не RQ'нулась». |
 | `ANSIBLE_PLAYBOOK_TIMEOUT` | `300` | backend, worker | subprocess-таймаут (sec) на один `ansible-playbook` run. При регулярно-медленных нодах (package installs, slow SSH) можно поднять, иначе revoke/apply ловят `TimeoutExpired` и таска становится failed. |
 | `TRAFFIC_STATS_INTERVAL` | `300` | worker | `run_traffic_stats_tick` — SSH-сбор xray stats + sharing violations. Phase D `detect_traffic_drops` **отключён 2026-04-15** — теперь только сбор samples. |
+| `TRAFFIC_STATS_BUDGET_SEC` | `100` | worker | Wall-clock-бюджет одного traffic-stats тика. Сэмплы коммитятся по-нодно; при исчерпании бюджета недособранный хвост нод откладывается до следующего тика (job_timeout тика = 120с, бюджет держит запас). |
+| `TRAFFIC_STATS_SSH_WORKERS` | `8` | worker | Параллелизм SSH-сбора в `collect_all_active_nodes` (ThreadPoolExecutor). Записи в БД — только из главного потока. |
 | ~~`TRAFFIC_DROP_ENABLED`~~ | ~~`1`~~ | worker | **Inert с 2026-04-15.** Phase D детектор отключён на уровне кода (`worker.run_traffic_stats_tick` не вызывает `detect_traffic_drops`, функция стоит no-op). Переменная оставлена для обратной совместимости env, но не читается. |
 | ~~`TRAFFIC_DROP_MIN_USERS`~~ | ~~`5`~~ | worker | **Inert с 2026-04-15.** При возврате автомиграции пороги нужно пересмотреть — прежние значения ложно-триггерили миграции в idle-окнах. |
 | ~~`TRAFFIC_DROP_CONFIRM_TICKS`~~ | ~~`1`~~ | worker | **Inert с 2026-04-15.** См. `TRAFFIC_DROP_MIN_USERS`. |
+| `NODE_REACHABILITY_STALE_MIN` | `30` | worker | Окно «голодания» reachability-тика (мин): цели без проба дольше этого попадают в гейдж `vpn_reachability_stale_targets` / `summary.stale_targets`. Стабильно >0 — бюджета `NODE_REACHABILITY_BUDGET_SEC` не хватает на весь флот (аудит-фикс #95). |
+| `OPS_PLAN_REAPER_INTERVAL` | `300` | worker | `run_ops_plan_reaper_tick` — бэкстоп ops-агента: добивает планы, залипшие в `executing` (воркер умер / джоба убита по `job_timeout`), в `failed` с `execution.phase='crash'`. `0` — отключить (аудит-фикс #120). |
+| `OPS_PLAN_REAPER_GRACE` | `120` | worker | Запас (sec) сверх `OPS_EXECUTE_JOB_TIMEOUT` до реапа executing-плана (ожидание в очереди / clock skew). |
+| `OPS_EXECUTE_JOB_TIMEOUT` | `1800` | worker | Считается таймаутом RQ-джобы `run_ops_plan_execute` для реапера (должен совпадать с `job_timeout` enqueue'а в `api/agent.py`). |
 
 ## Balance billing / trial
 
@@ -123,6 +130,7 @@
 | `PAYMENT_PROVIDER` | `cryptobot` | backend, bot | Single-provider mode (legacy). Если `PAYMENT_PROVIDERS` задан — игнорируется. |
 | `PAYMENT_PROVIDERS` | `""` | backend, bot | Comma-separated список провайдеров. Backend при checkout'е выбирает `random.choice(list)`. |
 | `CRYPTOBOT_TOKEN` | `""` | backend | Bearer token к CryptoBot API. HMAC webhook-сигнатура считается от `sha256(token)` как ключа. |
+| `CRYPTOBOT_RUB_PER_USDT` | `0` | backend | Курс ₽ за 1 USDT для конвертации RUB-счетов в `/checkout` (аудит #108). `0`/не задан = RUB-счёт через cryptobot отклоняется с 503 (защита от выставления рублей как USDT 1:1). Сумма округляется вверх до цента. |
 | `TELEGRAM_STARS_WEBHOOK_SECRET` | `""` | backend, bot | **Deprecated** (#62). Shared secret для legacy polling-режима. Заменён на `TELEGRAM_WEBHOOK_SECRET_TOKEN`. |
 | `TELEGRAM_WEBHOOK_SECRET_TOKEN` | `""` | backend | Secret для native Telegram webhook (`setWebhook`). Backend проверяет `X-Telegram-Bot-Api-Secret-Token` header на каждом update. |
 | `TELEGRAM_WEBHOOK_URL` | `""` | backend | Публичный URL для `/tg-webhook` (напр. `https://grinwer.online/tg-webhook`). Если пусто — webhook не регистрируется. |

@@ -669,6 +669,35 @@ export default function Nodes() {
     setTrackedOps(loadTrackedOps());
   }
 
+  // Один общий поллинг задач на ВСЕ баннеры прогресса. Раньше каждый
+  // OperationProgressBanner поднимал свой useQuery с уникальным ключом и
+  // безусловным refetchInterval=3с — N баннеров давали N параллельных
+  // запросов по 500 задач (с полными ansible-логами в result) часами,
+  // даже когда всё давно завершилось. Теперь запрос один, и интервал
+  // отключается, когда все отслеживаемые задачи в терминальном статусе
+  // (тот же приём, что в BatchProgressDrawer в Exits.tsx).
+  const trackedTasksQuery = useQuery<ProvisioningTaskOut[]>({
+    queryKey: ["provisioning-tasks", "tracked-ops"],
+    queryFn: () => api.get("/provisioning/tasks?limit=500"),
+    enabled: trackedOps.length > 0,
+    retry: false,
+    refetchInterval: (q) => {
+      if (q.state.error) return false;
+      const tasks = q.state.data;
+      if (!tasks) return 3_000;
+      const statusById = new Map(tasks.map((t) => [t.id, t.status]));
+      // Задача «живая», пока она pending/running или ещё не попала в
+      // окно последних 500 (воркер не успел её создать/подхватить).
+      const live = trackedOps.some((op) =>
+        op.taskIds.some((id) => {
+          const st = statusById.get(id);
+          return st === undefined || st === "pending" || st === "running";
+        }),
+      );
+      return live ? 3_000 : false;
+    },
+  });
+
   const setActive = useMutation({
     mutationFn: ({ id, is_active }: { id: number; is_active: boolean }) =>
       api.post<VPNNodeOut>(`/nodes/${id}/active`, { is_active }),
@@ -1294,6 +1323,7 @@ export default function Nodes() {
         <OperationProgressBanner
           key={`${op.kind}-${op.nodeId}-${op.startedAt}`}
           op={op}
+          tasks={trackedTasksQuery.data}
           onDismiss={() => removeOp(op)}
         />
       ))}
@@ -3823,20 +3853,17 @@ const KIND_LABELS: Record<string, string> = {
 
 function OperationProgressBanner({
   op,
+  tasks,
   onDismiss,
 }: {
   op: TrackedOp;
+  // Данные общего поллинга со страницы (один запрос на все баннеры),
+  // см. trackedTasksQuery в NodesPage.
+  tasks: ProvisioningTaskOut[] | undefined;
   onDismiss: () => void;
 }) {
-  const { data } = useQuery<ProvisioningTaskOut[]>({
-    queryKey: ["provisioning-tasks", "tracked-op", op.kind, op.nodeId, op.startedAt],
-    queryFn: () => api.get("/provisioning/tasks?limit=500"),
-    refetchInterval: 3_000,
-    retry: false,
-  });
-
   const idSet = new Set(op.taskIds);
-  const related = (data ?? []).filter((t) => idSet.has(t.id));
+  const related = (tasks ?? []).filter((t) => idSet.has(t.id));
   const seen = new Set(related.map((t) => t.id));
   const missing = op.taskIds.filter((id) => !seen.has(id));
 

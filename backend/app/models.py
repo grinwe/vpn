@@ -8,6 +8,7 @@ from sqlalchemy import (
     DateTime,
     Enum,
     ForeignKey,
+    Index,
     Integer,
     Numeric,
     String,
@@ -996,6 +997,17 @@ class ApiToken(Base):
 
 class AuditLog(Base):
     __tablename__ = "audit_logs"
+    # #127 — audit_logs это не только журнал, но и hot-path: поллер
+    # уведомлений бота (GET /api/notifications/pending) фильтрует по
+    # action + actor_type и сортирует по created_at DESC, worker-тики и
+    # админ-дашборды фильтруют по action/created_at. Без индексов каждый
+    # такой запрос — seq scan неограниченно растущей таблицы (broadcast
+    # пишет строку на каждого получателя). DESC в индексе не нужен:
+    # btree Postgres читается и в обратную сторону.
+    __table_args__ = (
+        Index("ix_audit_logs_action_created_at", "action", "created_at"),
+        Index("ix_audit_logs_created_at", "created_at"),
+    )
 
     id = Column(Integer, primary_key=True)
     actor = Column(String, nullable=False)

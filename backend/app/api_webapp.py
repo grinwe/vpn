@@ -894,6 +894,73 @@ def webapp_activate_trial(
     )
 
 
+# ── Хелперы prorated-рефанда для single-sub активации ───────────────
+# Живут здесь (а не в services/balance.py), потому что нужны только
+# webapp-флоу «купить план поверх действующей подписки». Расчёт — тот
+# же, что в balance.change_plan: floor(price * remaining / duration).
+
+def _prorated_sub_refund_kopecks(sub: models.Subscription) -> int:
+    """Остаток по подписке в копейках (0, если возвращать нечего).
+
+    remaining_days капится duration_days плана, чтобы «удлинённый»
+    expires_at (freeze добавляет FREEZE_DAYS) не дал рефанд больше
+    цены плана.
+    """
+    import math
+
+    from .services import balance as balance_svc
+
+    plan = sub.plan
+    if plan is None:
+        return 0
+    price = balance_svc.plan_price_kopecks(plan)
+    now = utcnow_aware()
+    if price <= 0 or not sub.expires_at or sub.expires_at <= now:
+        return 0
+    total_days = plan.duration_days or 1
+    remaining_days = (sub.expires_at - now).total_seconds() / 86400
+    remaining_days = min(max(remaining_days, 0.0), float(total_days))
+    return int(math.floor(price * remaining_days / total_days))
+
+
+def _refund_subscription_remainder(
+    db: Session,
+    sub: models.Subscription,
+    *,
+    reference: str,
+    note: str | None = None,
+) -> int:
+    """Кредитует prorated-остаток подписки в кошелёк (kind=refund).
+
+    Возвращает сумму в копейках (0 — если рефандить нечего). Пишет
+    через balance._record_tx, который только flush-ит без commit —
+    коммит на вызывающем, поэтому блок «refund + charge» в
+    webapp_activate остаётся атомарным.
+    """
+    from .services import balance as balance_svc
+
+    user = balance_svc._lock_user(db, sub.user_id)
+    # Под блокировкой перечитываем подписку: параллельный запрос мог
+    # уже рефанднуть и заблокировать её — второй рефанд не пишем.
+    db.refresh(sub)
+    if sub.status not in (
+        models.SubscriptionStatus.active,
+        models.SubscriptionStatus.frozen,
+    ):
+        return 0
+    refund = _prorated_sub_refund_kopecks(sub)
+    if refund <= 0:
+        return 0
+    balance_svc._record_tx(
+        db, user,
+        amount_kopecks=refund,
+        kind=models.BalanceTxKind.refund,
+        reference=reference,
+        note=note,
+    )
+    return refund
+
+
 class ActivateResponse(BaseModel):
     subscription_id: int
     sub_token: str | None
@@ -959,6 +1026,14 @@ def webapp_activate(
             status_code=400, detail="Plan has no price configured"
         )
 
+    # Гонка двойной активации (двойной тап / ретрай сети): весь блок
+    # «проверить existing_subs → провижининг → списание» — read-then-act.
+    # Берём FOR UPDATE-блокировку на строку users ДО проверки, чтобы
+    # параллельный запрос ждал здесь и увидел уже созданную подписку
+    # (получит 400 «Already on plan»), а не активировал вторую и не
+    # списал деньги дважды. refresh заодно перечитывает баланс.
+    db.refresh(user, with_for_update=True)
+
     # Single-sub invariant: every active/frozen sub must be terminated
     # before the new one goes live. We look across *any* plan (not
     # just "different plan") so the 400 below fires for same-plan
@@ -988,7 +1063,7 @@ def webapp_activate(
     # a ₽300 refund pending on their old sub can still switch to a
     # ₽250 plan.
     refund_estimate = sum(
-        balance_svc.prorated_sub_refund_kopecks(s) for s in existing_subs
+        _prorated_sub_refund_kopecks(s) for s in existing_subs
     )
     projected_balance = (user.balance_kopecks or 0) + refund_estimate
     if projected_balance < plan_price:
@@ -1020,7 +1095,7 @@ def webapp_activate(
     try:
         for old in existing_subs:
             old_name = old.plan.name if old.plan else "?"
-            refunded_total += balance_svc.refund_subscription_remainder(
+            refunded_total += _refund_subscription_remainder(
                 db, old,
                 reference=f"switch:{sub.id}:{old.id}",
                 note=f"switch {old_name} -> {plan.name}",
@@ -1147,6 +1222,13 @@ def webapp_change_plan(
 ):
     """Switch plan with proration: refund remaining old, charge full new."""
     from .services import balance as balance_svc
+
+    # Та же защита от гонки, что в webapp_activate: блокируем строку
+    # users до чтения подписки, чтобы два параллельных change_plan не
+    # прошли оба преflight и не списали/рефанднули дважды. Второй
+    # запрос дождётся коммита первого и получит 400 «Already on this
+    # plan» по свежему plan_id.
+    db.refresh(user, with_for_update=True)
 
     sub = db.get(models.Subscription, subscription_id)
     if not sub or sub.user_id != user.id:

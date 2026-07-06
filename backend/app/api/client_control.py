@@ -322,6 +322,70 @@ def _escalate_node_failure_reports(db: Session, node_id: int) -> None:
     db.commit()
 
 
+# ── Авто-баны NodeUserBan: TTL + потолок (анти-«выжигание пула») ────────
+#
+# У NodeUserBan нет expires_at в схеме, поэтому протухание реализовано
+# on-access: перед каждым user-driven failover'ом снимаем старые АВТО-баны
+# юзера (created_by = client_control / admin_panel / user:*; ручные
+# админ-баны не трогаем). Плюс потолок: при NODE_USER_BAN_MAX_PER_USER
+# свежих авто-банов миграция идёт БЕЗ бана старой ноды — добросовестный
+# юзер с проблемой на своей стороне (оператор/локальный RKN) не выжигает
+# себе весь пул нод навсегда (choose_node исключает забаненные → вечный
+# no_target).
+
+# created_by авто-банов из user-driven путей этого модуля. Бот пишет
+# f"user:{telegram_id}" — ловим его LIKE-паттерном отдельно.
+_AUTO_BAN_SOURCES = ("client_control", "admin_panel")
+
+
+def _auto_ban_query(db: Session, user_id: int):
+    """Query авто-банов юзера (ручные админ-баны сюда не попадают)."""
+    from sqlalchemy import or_
+
+    return (
+        db.query(models.NodeUserBan)
+        .filter(models.NodeUserBan.user_id == user_id)
+        .filter(
+            or_(
+                models.NodeUserBan.created_by.in_(_AUTO_BAN_SOURCES),
+                models.NodeUserBan.created_by.like("user:%"),
+            )
+        )
+    )
+
+
+def _prune_stale_auto_bans(db: Session, user_id: int) -> int:
+    """Снять протухшие авто-баны юзера (TTL env NODE_USER_BAN_TTL_HOURS).
+
+    Best-effort и идемпотентно; 0/отрицательный TTL = отключено. Возвращает
+    число снятых банов.
+    """
+    from datetime import timedelta
+
+    ttl_h = int(os.getenv("NODE_USER_BAN_TTL_HOURS", "48"))
+    if ttl_h <= 0:
+        return 0
+    cutoff = utcnow() - timedelta(hours=ttl_h)
+    stale = (
+        _auto_ban_query(db, user_id)
+        .filter(models.NodeUserBan.created_at < cutoff)
+        .all()
+    )
+    for ban in stale:
+        db.delete(ban)
+    if stale:
+        db.commit()
+    return len(stale)
+
+
+def _should_auto_ban(db: Session, user_id: int) -> bool:
+    """Потолок авто-банов: достигнут → мигрируем без бана старой ноды."""
+    max_bans = int(os.getenv("NODE_USER_BAN_MAX_PER_USER", "3"))
+    if max_bans <= 0:  # 0/отрицательное = потолок выключен
+        return True
+    return _auto_ban_query(db, user_id).count() < max_bans
+
+
 def _do_failover(
     db: Session,
     sub: models.Subscription,
@@ -363,6 +427,14 @@ def _do_failover(
         )
 
     old_node_id = sub.node_id
+
+    # Анти-«выжигание пула»: снимаем протухшие авто-баны и при потолке
+    # банов мигрируем без нового бана (см. NODE_USER_BAN_TTL_HOURS /
+    # NODE_USER_BAN_MAX_PER_USER выше).
+    if sub.user_id:
+        _prune_stale_auto_bans(db, sub.user_id)
+    auto_ban = _should_auto_ban(db, sub.user_id) if sub.user_id else True
+
     orchestrator = ProvisioningOrchestrator(db)
     try:
         # Тот же путь, что админская «обновить подписку» (migrate-auto):
@@ -371,7 +443,9 @@ def _do_failover(
         # sub_token и АВТО-БАНИТ старую ноду для юзера (NodeUserBan) — чтобы
         # auto-pick больше не вернул его на проблемную ноду.
         new_node, new_device, task, banned_old = (
-            orchestrator.migrate_subscription_to_free_node(sub, banned_by=actor)
+            orchestrator.migrate_subscription_to_free_node(
+                sub, banned_by=actor, auto_ban_old_node=auto_ban
+            )
         )
         task_id = task.id if task else None
     except RuntimeError:
@@ -614,11 +688,18 @@ def report_broken_by_telegram(
         return ReportBrokenResponse(action="no_subscription")
 
     old_node = sub.node
+
+    # Анти-«выжигание пула»: протухшие авто-баны снимаем, при потолке —
+    # мигрируем без нового бана (NODE_USER_BAN_TTL_HOURS / _MAX_PER_USER).
+    _prune_stale_auto_bans(db, user.id)
+    auto_ban = _should_auto_ban(db, user.id)
+
     orchestrator = ProvisioningOrchestrator(db)
     try:
         new_node, device, task, _banned = (
             orchestrator.migrate_subscription_to_free_node(
                 sub,
+                auto_ban_old_node=auto_ban,
                 ban_reason="user reported VPN broken (operator-routing)",
                 banned_by=f"user:{user.telegram_id}",
             )
@@ -651,11 +732,24 @@ def report_broken_by_telegram(
         metadata={
             "report_id": report.id,
             "failed_node_id": old_node.id,
+            # Дублируем под ключом current_node_id — по нему крауд-счётчик
+            # (_escalate_node_failure_reports) фильтрует окно репортов, иначе
+            # бот-жалобы не участвуют в пороге NODE_FAILURE_BAN_THRESHOLD.
+            "current_node_id": old_node.id,
             "target_node_id": new_node.id,
             "source": "bot_vpn_broken",
         },
         actor_type=models.AuditActor.user,
     )
+    # Краудсорс здоровья ноды: бот-репорты голосуют наравне с
+    # webapp/control-channel (_do_failover). Best-effort — не ломаем flow.
+    try:
+        _escalate_node_failure_reports(db, old_node.id)
+    except Exception:  # noqa: BLE001
+        logger.exception(
+            "report-broken: crowd-health escalation failed for node %s",
+            old_node.id,
+        )
     return ReportBrokenResponse(
         action="migrated",
         report_id=report.id,
@@ -776,6 +870,10 @@ def report_broken_device_by_telegram(
     if sub is None or sub.plan is None:
         return ReportBrokenResponse(action="no_subscription")
 
+    # failover_device сам НЕ банит, но исключает уже забаненные юзером ноды —
+    # снимаем протухшие авто-баны, чтобы пул для выбора не сужался навсегда.
+    _prune_stale_auto_bans(db, user.id)
+
     orchestrator = ProvisioningOrchestrator(db)
     try:
         target, new_device, task, old_primary = orchestrator.failover_device(device)
@@ -813,6 +911,9 @@ def report_broken_device_by_telegram(
         metadata={
             "report_id": report.id,
             "failed_node_id": old_primary,
+            # current_node_id — ключ, по которому крауд-счётчик
+            # (_escalate_node_failure_reports) собирает окно репортов.
+            "current_node_id": old_primary,
             "target_node_id": target.id,
             "device_id": new_device.id,
             "scope": "device",
@@ -820,6 +921,15 @@ def report_broken_device_by_telegram(
         },
         actor_type=models.AuditActor.user,
     )
+    # Краудсорс здоровья ноды — как в whole-sub пути. Best-effort.
+    if old_primary:
+        try:
+            _escalate_node_failure_reports(db, old_primary)
+        except Exception:  # noqa: BLE001
+            logger.exception(
+                "report-broken-device: crowd-health escalation failed for node %s",
+                old_primary,
+            )
     return ReportBrokenResponse(
         action="migrated",
         report_id=report.id,

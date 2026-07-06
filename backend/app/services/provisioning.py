@@ -1610,7 +1610,30 @@ class ProvisioningOrchestrator:
                 self.db.commit()
                 return
         else:
-            device.status = models.DeviceStatus.failed
+            # Провал revoke-таски НЕ должен «воскрешать» списанный девайс.
+            # revoke_device уже перевёл его в disabled ДО запуска ansible
+            # (терминальное состояние по инварианту саб-линка), а failed НЕ
+            # входит в фильтры списанных (везде notin_(revoked, disabled)) —
+            # даунгрейд в failed делал бы девайс снова «живым»: фантом в
+            # active_device_count (ложный 'Device limit reached'), в ЛК и в
+            # live-снапшотах миграции. Сценарий типовой: background-revoke
+            # на мёртвой ноде при failover/migrate гарантированно фейлится.
+            # Оставляем disabled/revoked как есть; таска остаётся failed
+            # для ручного повтора.
+            if task.action == "revoke" or device.status in (
+                models.DeviceStatus.disabled,
+                models.DeviceStatus.revoked,
+            ):
+                logger.warning(
+                    "%s task %s failed but device %s stays %s "
+                    "(retired device is never downgraded to failed)",
+                    task.action,
+                    task.id,
+                    device.id,
+                    device.status.value,
+                )
+            else:
+                device.status = models.DeviceStatus.failed
         device.updated_at = utcnow()
         self.db.add(device)
         self.db.commit()
@@ -2726,6 +2749,13 @@ class ProvisioningOrchestrator:
 
         from . import warm_pool
 
+        # SAVEPOINT (begin_nested) вместо отката ВСЕЙ сессии в except ниже:
+        # в warm-пути provision_subscription подписка/девайс/synthetic-таска
+        # к моменту вызова только flush'нуты, но не закоммичены — общий
+        # self.db.rollback() стирал их из БД, а API возвращал id уже
+        # несуществующих строк («фантомный» успех). При сбое добора
+        # откатываем ТОЛЬКО savepoint; работа вызывающего кода остаётся.
+        nested = self.db.begin_nested()
         try:
             # Ноды, на которых у device УЖЕ есть активный credential.
             # ИДЕМПОТЕНТНО: добираем до n_total РАЗНЫХ нод суммарно, а не +N-1 на
@@ -2747,6 +2777,7 @@ class ProvisioningOrchestrator:
                 existing = {primary_node.id}
             need = n_total - len(existing)
             if need <= 0:
+                nested.commit()  # ничего не добирали — освобождаем savepoint
                 return
             # Из выбора исключаем: что уже есть, primary, и явные exclude (swap'нутая
             # битая нода — чтобы не добрать её же обратно).
@@ -2807,6 +2838,8 @@ class ProvisioningOrchestrator:
                 pass
             fallback_attached = attached - geo_attached  # добор без нового региона
             if attached:
+                # commit() коммитит внешнюю транзакцию целиком (savepoint
+                # при этом освобождается) — байт-в-байт прежнее поведение.
                 self.db.commit()
                 logger.info(
                     "diverse-sub: device %s topped up by %d node(s) toward %d "
@@ -2822,12 +2855,18 @@ class ProvisioningOrchestrator:
                         "(warm-пул беден на гео-ширину; гео-диверсность вырождена) (sub %s)",
                         device.id, fallback_attached, subscription.id,
                     )
+            else:
+                nested.commit()  # добора не вышло, писать нечего — release savepoint
         except Exception:  # noqa: BLE001 — бонус, не должен ронять provisioning
             logger.exception(
                 "diverse-sub attach failed for sub %s (primary intact)", subscription.id
             )
             try:
-                self.db.rollback()
+                # Откат ТОЛЬКО до savepoint — flush'нутые строки вызывающего
+                # кода (подписка/девайс/таска warm-пути) остаются в сессии.
+                # После flush-ошибки savepoint деактивирован, но rollback()
+                # по нему — штатный путь сброса сессии к внешней транзакции.
+                nested.rollback()
             except Exception:  # noqa: BLE001
                 pass
 

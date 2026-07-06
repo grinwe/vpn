@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query
 from pydantic import BaseModel, Field
+from sqlalchemy import func
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -47,8 +48,14 @@ def _sub_sharing_blocked(db: Session, sub: models.Subscription) -> bool:
     latest block is more recent than the latest unblock mentioning that email;
     if yes for any one email — the sub is blocked.
 
-    Runs per-sub per-request and does 2N queries (N = live device emails,
-    usually ≤3). Admin pages aren't hot path — simpler beats batched here.
+    Хелпер сидит не только в админке, но и на горячем пути вебаппа
+    (``_subscriptions_for_user`` ← ``api_webapp``), а audit_logs —
+    append-only и без индексов под эти фильтры, так что каждый запрос —
+    seq scan всей таблицы. Поэтому вместо 2 запросов на каждый email
+    делаем ОДИН агрегирующий запрос на все email подписки сразу; в
+    типичном случае (блоков не было) на этом и заканчиваем. Запрос по
+    unblock-событиям выполняется только для тех email, у которых
+    реально есть block — это редкий случай.
     """
     emails = [
         d.access_username for d in sub.devices
@@ -58,21 +65,20 @@ def _sub_sharing_blocked(db: Session, sub: models.Subscription) -> bool:
     ]
     if not emails:
         return False
-    for email in emails:
-        # Latest sharing_block event for this specific email. The block
-        # audit stores the email in extra->>'email' (single email per row,
-        # written by traffic_stats when the enforcer fires).
-        last_block = (
-            db.query(models.AuditLog.created_at)
-            .filter(
-                models.AuditLog.action == "sharing_block",
-                models.AuditLog.extra["email"].astext == email,
-            )
-            .order_by(models.AuditLog.created_at.desc())
-            .first()
+    # Последний sharing_block по каждому email одним запросом. Блок-аудит
+    # хранит email в extra->>'email' (одна строка = один email, пишет
+    # traffic_stats при срабатывании энфорсера).
+    block_email = models.AuditLog.extra["email"].astext
+    block_rows = (
+        db.query(block_email, func.max(models.AuditLog.created_at))
+        .filter(
+            models.AuditLog.action == "sharing_block",
+            block_email.in_(emails),
         )
-        if not last_block:
-            continue
+        .group_by(block_email)
+        .all()
+    )
+    for email, last_block_at in block_rows:
         # Latest sharing_unblock event that included this email. Unblocks
         # are batched per-subscription and store the emails list under
         # extra->'emails' (JSONB array). The `?` JSONB op asks
@@ -86,7 +92,7 @@ def _sub_sharing_blocked(db: Session, sub: models.Subscription) -> bool:
             .order_by(models.AuditLog.created_at.desc())
             .first()
         )
-        if last_unblock is None or last_unblock[0] < last_block[0]:
+        if last_unblock is None or last_unblock[0] < last_block_at:
             return True
     return False
 

@@ -185,9 +185,17 @@ class FourVpsDriver:
 
     def get_balance(self) -> float | None:
         """GET /api/userBalance → data.userBalance. Единицы — как у 4vps
-        (в копейках; price тарифов — в рублях). Возвращаем сырое число."""
+        (в копейках; price тарифов — в рублях). Возвращаем сырое число.
+
+        НЕ через _to_float: тот схлопывает 0 в None (``float(v) or None``),
+        а баланс 0.00 — валидное значение. При None cloud-billing воркер
+        пропускает провайдера — low-balance алерт молчал бы ровно когда
+        деньги кончились (та же ловушка описана в vdsina.get_balance)."""
         data = self._call("GET", "/userBalance", {})
-        return _to_float((data or {}).get("userBalance"))
+        try:
+            return float((data or {}).get("userBalance"))
+        except (TypeError, ValueError):
+            return None
 
     def set_autoprolong(self, external_id: str, enabled: bool = True) -> bool:
         """Включить/выключить авто-продление. 4vps `/action/autoprolong` —

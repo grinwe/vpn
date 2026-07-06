@@ -4,6 +4,7 @@ from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
 from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
 from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.types import ErrorEvent
 from .config import BOT_TOKEN, BACKEND_URL, ADMIN_API_TOKEN, NOTIFICATION_POLL_INTERVAL, BOT_WEBHOOK_PORT
 from .handlers import close_session, router, get_session, onboarding_keyboard, health_ping_keyboard, node_diagnosis_keyboard
 from .keyboards import DEFAULT_COMMANDS
@@ -119,6 +120,36 @@ async def notification_poller(bot: Bot):
             logger.exception("Notification poller error")
 
 
+async def on_dispatch_error(event: ErrorEvent) -> None:
+    """Глобальная страховка от необработанных исключений в хендлерах.
+
+    Без неё юзер при падении хендлера остаётся ни с чем: для message —
+    «бот молчит», для callback — кнопка крутит спиннер ~30 секунд,
+    потому что callback_query.answer() так и не был вызван. Здесь
+    логируем стектрейс и best-effort отвечаем пользователю.
+    """
+    logger.exception(
+        "Unhandled error while processing update %s",
+        getattr(event.update, "update_id", None),
+        exc_info=event.exception,
+    )
+    # Ответ юзеру оборачиваем в try/except, чтобы обработчик ошибок
+    # не упал вторично (например, TelegramForbiddenError, если юзер
+    # заблокировал бота, или протухший callback_query).
+    try:
+        if event.update.callback_query:
+            # Гасим спиннер на кнопке коротким тостом.
+            await event.update.callback_query.answer(
+                "Что-то пошло не так, попробуйте ещё раз позже"
+            )
+        elif event.update.message:
+            await event.update.message.answer(
+                "Произошла ошибка, попробуйте позже."
+            )
+    except Exception:  # noqa: BLE001
+        logger.exception("Failed to notify user about handler error")
+
+
 async def main():
     logging.basicConfig(level="INFO")
     bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
@@ -137,6 +168,9 @@ async def main():
     # or other button handlers before reaching the support relay.
     dp.include_router(support_router)
     dp.include_router(router)
+    # Глобальный errors-хендлер: ловит всё, что не поймали сами
+    # хендлеры (таймауты бэкенда, KeyError на неожиданном JSON и пр.).
+    dp.errors.register(on_dispatch_error)
 
     # Register the slash-command menu so the "/" button appears next to
     # the text input. Telegram caches this list client-side, so one call

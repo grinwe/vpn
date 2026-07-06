@@ -235,7 +235,7 @@ export default function Home({
       )}
 
       {showSetup && createPortal(<SetupSheet onClose={() => setShowSetup(false)} />, document.body)}
-      {topupOpen && createPortal(<TopupModal onClose={() => setTopupOpen(false)} />, document.body)}
+      {topupOpen && createPortal(<TopupModal onClose={() => setTopupOpen(false)} onRefresh={onRefresh} />, document.body)}
     </div>
   );
 }
@@ -630,7 +630,13 @@ function SetupSheet({ onClose }: { onClose: () => void }) {
 
 const TOPUP_PRESETS = [10000, 30000, 60000, 150000]; // kopecks: 100/300/600/1500 ₽
 
-function TopupModal({ onClose }: { onClose: () => void }) {
+function TopupModal({
+  onClose,
+  onRefresh,
+}: {
+  onClose: () => void;
+  onRefresh: () => void;
+}) {
   const [busy, setBusy] = useState(false);
   const [customRub, setCustomRub] = useState<string>("");
 
@@ -647,9 +653,13 @@ function TopupModal({ onClose }: { onClose: () => void }) {
         setBusy(false);
         if (status === "paid") {
           tg.HapticFeedback?.notificationOccurred("success");
-          // Give the backend a tick to mark the invoice paid, then
-          // close so /me reloads via Home's refresh.
-          setTimeout(onClose, 500);
+          // Даём бэкенду тик, чтобы пометить инвойс оплаченным, затем
+          // явно перезапрашиваем /me (App сам не перезагрузит: route
+          // не меняется) и закрываем модалку — баланс на экране обновится.
+          setTimeout(() => {
+            onRefresh();
+            onClose();
+          }, 500);
         } else if (status === "failed") {
           tg.HapticFeedback?.notificationOccurred("error");
           alert("Оплата не прошла. Попробуй ещё раз.");

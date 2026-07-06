@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { fetchInvoiceStatus, InvoiceStatusResponse } from "../api";
+import { friendlyError } from "../errors";
 import { navigate } from "../router";
 
 // 2-second poll. The slow leg is Ansible (multi-protocol provision on
@@ -8,6 +9,9 @@ import { navigate } from "../router";
 // to /status in the bot. Faster polling buys nothing, slower frustrates.
 const POLL_INTERVAL_MS = 2000;
 const MAX_POLL_MS = 180_000;
+// Транзиентные сетевые ошибки (смена Wi-Fi→LTE, короткий 502) не должны
+// быть терминальными: показываем «Ошибка» только после N фейлов подряд.
+const MAX_CONSECUTIVE_ERRORS = 5;
 
 type Stage = "paid" | "provisioning" | "ready" | "stuck" | "error";
 
@@ -19,6 +23,7 @@ export default function CheckoutPending({ invoiceId }: { invoiceId: number }) {
   useEffect(() => {
     let cancelled = false;
     let timer: number | null = null;
+    let consecutiveErrors = 0;
 
     async function tick() {
       if (cancelled) return;
@@ -26,11 +31,26 @@ export default function CheckoutPending({ invoiceId }: { invoiceId: number }) {
       try {
         data = await fetchInvoiceStatus(invoiceId);
       } catch (e) {
-        setError((e as Error).message);
+        if (cancelled) return;
+        consecutiveErrors += 1;
+        if (
+          consecutiveErrors < MAX_CONSECUTIVE_ERRORS &&
+          Date.now() - startedAt.current <= MAX_POLL_MS
+        ) {
+          // Одиночный сетевой чих — продолжаем поллинг, не меняя stage.
+          timer = window.setTimeout(tick, POLL_INTERVAL_MS);
+          return;
+        }
+        setError(
+          friendlyError((e as Error).message, {
+            fallback: "проверить статус оплаты",
+          }),
+        );
         setStage("error");
         return;
       }
       if (cancelled) return;
+      consecutiveErrors = 0;
 
       if (data.has_credentials && data.subscription_active) {
         setStage("ready");

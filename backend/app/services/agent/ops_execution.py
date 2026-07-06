@@ -29,6 +29,8 @@ import hashlib
 import json
 import logging
 import os
+import threading
+import time
 from typing import Any
 
 from sqlalchemy import func
@@ -289,6 +291,59 @@ def _max_spend_rub() -> float:
     return float(os.getenv("OPS_MAX_SPEND_RUB", "5000"))
 
 
+def _finalize_wait_s() -> float:
+    """Бюджет ожидания фоновой достройки нод (сек). Должен быть МЕНЬШЕ
+    job_timeout энкьюера (1800с, см. api/agent.py), чтобы осталось время
+    записать результат в ops_plan.execution."""
+    return max(0.0, _env_num("OPS_FINALIZE_WAIT_SEC", "1500", float))
+
+
+def _new_finalize_threads(
+    before: set[threading.Thread],
+) -> list[threading.Thread]:
+    """Потоки ``_finalize_spawn``, стартовавшие после снапшота ``before``.
+
+    ``spawn_node_async`` уводит долгую достройку (poll IP до 600с → host →
+    SSH-wait → bootstrap-таска) в daemon-поток и НЕ возвращает его — ловим
+    поток диффом ``threading.enumerate()``. Фильтр по имени (py3.10+ кладёт
+    имя target-функции в ``Thread.name``); fallback — любые новые
+    daemon-потоки (если схема имён Thread изменится)."""
+    new = [t for t in threading.enumerate() if t not in before and t.is_alive()]
+    named = [t for t in new if "_finalize_spawn" in (t.name or "")]
+    return named or [t for t in new if t.daemon]
+
+
+def _wait_spawn_finalize(
+    watch: list[tuple[int, list[int], list[threading.Thread]]],
+) -> list[dict[str, Any]]:
+    """Дождаться daemon-потоков достройки нод ПЕРЕД возвратом из RQ-джобы.
+
+    execute_plan гоняется в RQ work-horse, который завершает процесс сразу
+    после возврата джобы — daemon-потоки ``_finalize_spawn`` при этом
+    убиваются посреди ожидания IP, и оплаченная нода навсегда зависает в
+    ``registering`` с placeholder-host (bootstrap не стартует). Поэтому в
+    RQ-контексте достройку ЯВНО дожидаемся здесь (общий дедлайн
+    ``OPS_FINALIZE_WAIT_SEC``; сами потоки идут параллельно). Bootstrap'у
+    переживать выход не нужно — он энкьюится отдельной RQ-джобой
+    (``run_task_async`` → ``enqueue_task``).
+
+    ``watch`` — [(index шага, созданные node-id, потоки)]. Возвращает шаги,
+    чьи потоки НЕ успели в дедлайн (их ноды рискуют остаться в registering)."""
+    if not watch:
+        return []
+    deadline = time.monotonic() + _finalize_wait_s()
+    pending: list[dict[str, Any]] = []
+    for index, node_ids, threads in watch:
+        for t in threads:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            t.join(remaining)
+        if any(t.is_alive() for t in threads):
+            pending.append({"index": index, "node_ids": node_ids})
+    return pending
+
+
 def _preflight(db: Session, validated: dict[str, Any]) -> dict[str, Any]:
     """Сетевой pre-flight для order-шагов: регион/тариф по ЖИВЫМ offerings +
     cost = цена×count + проверка баланса провайдера + общий spend-cap.
@@ -453,6 +508,9 @@ def execute_plan(db: Session, ops_plan: models.OpsPlan) -> dict[str, Any]:
 
     results: list[dict[str, Any]] = []
     failed = False
+    # Потоки фоновой достройки (см. _wait_spawn_finalize): их надо дождаться
+    # до возврата из RQ-джобы, иначе work-horse убьёт их вместе с процессом.
+    finalize_watch: list[tuple[int, list[int], list[threading.Thread]]] = []
     for s in validated["steps"]:
         kind = s["kind"]
         if kind not in _SUPPORTED_EXEC_KINDS:
@@ -463,7 +521,13 @@ def execute_plan(db: Session, ops_plan: models.OpsPlan) -> dict[str, Any]:
             continue
         # _exec_order_node возвращает (created, error): created сохраняем ВСЕГДА,
         # даже при сбое на середине — иначе оплаченные серверы теряются из отчёта.
+        threads_before = set(threading.enumerate())
         created, err = _exec_order_node(db, s, ops_plan.id)
+        spawn_threads = _new_finalize_threads(threads_before)
+        if spawn_threads:
+            # Даже при err потоки уже заказанных нод шага дожидаемся — сервер
+            # оплачен, достройка должна дойти до конца.
+            finalize_watch.append((s["index"], created, spawn_threads))
         entry = {
             "index": s["index"], "kind": kind,
             "created_node_ids": created,
@@ -479,20 +543,40 @@ def execute_plan(db: Session, ops_plan: models.OpsPlan) -> dict[str, Any]:
         entry["status"] = "done"
         results.append(entry)
 
+    # Дожидаемся достройки заказанных нод ДО возврата (fix: daemon-поток
+    # _finalize_spawn умирал вместе с RQ work-horse → нода вечно в registering
+    # с placeholder-host, деньги списаны, bootstrap не стартовал).
+    finalize_pending = _wait_spawn_finalize(finalize_watch)
+    if finalize_pending:
+        logger.warning(
+            "ops plan %s: достройка не подтверждена в OPS_FINALIZE_WAIT_SEC для "
+            "шагов %s — ноды %s могут остаться в registering (проверь руками)",
+            ops_plan.id,
+            [p["index"] for p in finalize_pending],
+            [p["node_ids"] for p in finalize_pending],
+        )
+
     done_count = sum(1 for r in results if r["status"] == "done")
     if failed:
         status = "failed"
     elif done_count == 0:
         status = "partial"  # ничего реально не исполнено (всё skipped вне MVP)
+    elif finalize_pending:
+        # Заказ прошёл, но достройка не подтверждена в дедлайн — честный
+        # partial, чтобы оператор не увидел «executed» по зависшим нодам.
+        status = "partial"
     else:
         status = "executed"  # исполнимая часть прошла; skipped помечены в execution
     ops_plan.status = status
-    ops_plan.execution = {
+    execution: dict[str, Any] = {
         "phase": "done",
         "total_cost": pre["total_cost"],
         "skipped": sum(1 for r in results if r["status"] == "skipped"),
         "steps": results,
     }
+    if finalize_pending:
+        execution["finalize_pending"] = finalize_pending
+    ops_plan.execution = execution
     db.commit()
     return {
         "status": status,

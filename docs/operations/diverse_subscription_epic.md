@@ -49,7 +49,11 @@
 - **`provisioning._maybe_attach_diverse`**: после выдачи primary-ноды дотягивает к тому
   же `Device` **тёплые бандлы** (warm-pool, уже провижинены — без лишних ansible) с
   до `N-1` РАЗНООБРАЗНЫХ нод (разные регионы, `choose_node` с exclude). Ноды без
-  тёплого бандла пропускаются (best-effort, degrade).
+  тёплого бандла пропускаются (best-effort, degrade). Добор изолирован в SAVEPOINT
+  (`begin_nested`): при сбое откатывается только он — flush'нутые, но ещё не
+  закоммиченные подписка/девайс warm-пути `provision_subscription` целы (раньше
+  общий `rollback()` стирал их → «фантомный» успех API). Регрессия:
+  `backend/tests/test_auditfix_provisioning_py.py`.
 - **Полностью аддитивно + за флагом `DIVERSE_SUB_NODES` (default `1` = текущее
   однонодовое поведение, инертно).** Прод не меняется на деплое; включается выставлением
   `deploy_app_stack_diverse_sub_nodes: 3` (флоу «3 ноды × N протоколов»).

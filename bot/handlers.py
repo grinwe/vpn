@@ -114,7 +114,10 @@ async def _fetch_json(method: str, url: str, **kwargs):
                     await asyncio.sleep(0.3 * (attempt + 1))
                     continue
                 return resp.status, payload
-        except aiohttp.ClientError as exc:
+        except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+            # asyncio.TimeoutError — общий ClientTimeout(total=...) aiohttp;
+            # он НЕ подкласс ClientError, но должен идти тем же путём
+            # «ретрай → status=0», иначе таймаут бэкенда роняет хендлер.
             last_exc = exc
             if attempt < _RETRIES:
                 await asyncio.sleep(0.3 * (attempt + 1))
@@ -1490,33 +1493,30 @@ async def toggle_notification_pref(callback_query: types.CallbackQuery):
 
 # ── /balance — текущий баланс и runway ──
 
-@router.message(F.text == BTN_TOPUP)
-@router.message(F.text == "Баланс")
-@router.message(Command("balance"))
-async def cmd_balance(message: types.Message):
-    """Show balance + days remaining + a deep-link into the WebApp.
+async def _send_balance(target: types.Message, telegram_id: int) -> None:
+    """Показать баланс пользователю telegram_id, отвечая в чат target.
 
-    Stage 4: this is the primary "how much money do I have" surface
-    outside the WebApp. Topup happens through the WebApp because Stars
-    invoice flow is much smoother there than via inline buttons.
+    Вынесено из cmd_balance, чтобы инлайн-кнопка «💳 Пополнить» (go_topup)
+    могла переиспользовать логику: у callback message.from_user — это бот,
+    а мутировать frozen-модель aiogram нельзя.
     """
     try:
         status_code, data = await _fetch_json(
             "GET",
-            f"{BACKEND_URL}/api/users/by_telegram/{message.from_user.id}/balance",
-            headers=_admin_headers(message.from_user.id),
+            f"{BACKEND_URL}/api/users/by_telegram/{telegram_id}/balance",
+            headers=_admin_headers(telegram_id),
         )
     except aiohttp.ClientError:
-        await message.answer("Бэкенд недоступен.")
+        await target.answer("Бэкенд недоступен.")
         return
 
     if status_code == 404:
-        await message.answer(
+        await target.answer(
             "У вас ещё нет аккаунта — нажмите /start, потом выберите тариф."
         )
         return
     if status_code != 200 or not data:
-        await message.answer("Не удалось получить баланс. Попробуйте позже.")
+        await target.answer("Не удалось получить баланс. Попробуйте позже.")
         return
 
     balance_rub = data.get("balance_rub", 0)
@@ -1555,11 +1555,24 @@ async def cmd_balance(message: types.Message):
         lines.append("Нет активных подписок. Нажмите /plans, чтобы выбрать тариф.")
 
     webapp_kb = webapp_inline_keyboard()
-    await message.answer(
+    await target.answer(
         "\n".join(lines),
         parse_mode="HTML",
         reply_markup=webapp_kb,
     )
+
+
+@router.message(F.text == BTN_TOPUP)
+@router.message(F.text == "Баланс")
+@router.message(Command("balance"))
+async def cmd_balance(message: types.Message):
+    """Show balance + days remaining + a deep-link into the WebApp.
+
+    Stage 4: this is the primary "how much money do I have" surface
+    outside the WebApp. Topup happens through the WebApp because Stars
+    invoice flow is much smoother there than via inline buttons.
+    """
+    await _send_balance(message, message.from_user.id)
 
 
 # ── /referral — реферальная ссылка ──
@@ -1882,10 +1895,10 @@ async def go_plans(callback_query: types.CallbackQuery):
 async def go_topup(callback_query: types.CallbackQuery):
     """Inline shortcut to /balance (shows balance + topup link)."""
     await callback_query.answer()
-    # Reuse cmd_balance but with the correct from_user
-    msg = callback_query.message
-    msg.from_user = callback_query.from_user
-    await cmd_balance(msg)
+    # НЕ мутируем callback_query.message: модели aiogram 3 frozen,
+    # присваивание from_user кидает ValidationError. Вместо этого зовём
+    # общий хелпер с правильным telegram_id инициатора.
+    await _send_balance(callback_query.message, callback_query.from_user.id)
 
 
 @router.callback_query(F.data == "go:referral")
@@ -2100,7 +2113,8 @@ async def _poll_ops_exec(session, plan_id: int, actor_id: int, *, tries: int = 2
                     last = await resp.json()
                     if str(last.get("status")) in _OPS_EXEC_TERMINAL:
                         return last
-        except aiohttp.ClientError:
+        except (aiohttp.ClientError, asyncio.TimeoutError):
+            # Таймаут одной итерации поллинга — не повод падать, просто ждём дальше.
             continue
     return last
 
@@ -2245,6 +2259,12 @@ async def ops_exec_go(callback_query: types.CallbackQuery) -> None:
                 data = await resp.json()
             except Exception:  # noqa: BLE001
                 data = {"message": await resp.text()}
+    except asyncio.TimeoutError:
+        # Как в ops_plan: total-таймаут кидает asyncio.TimeoutError, не ClientError.
+        await launching.edit_text(
+            "Бэкенд не ответил за 30с — статус запуска неизвестен. Проверь план через /ops."
+        )
+        return
     except aiohttp.ClientError as exc:
         await launching.edit_text(f"Бэкенд недоступен: {html.escape(str(exc))}")
         return

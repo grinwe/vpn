@@ -954,6 +954,11 @@ def create_config(
     # запускает ansible — реально дотолкает протокол на ноду только
     # bootstrap (через _handle_task_outcome → resync_node_clients).
     orchestrator.backfill_credentials_for_new_config(node, config)
+    # Backfill внутри делает только flush — коммитим сразу и безусловно,
+    # иначе при defer_bootstrap=true сессия закрывается в get_db без
+    # commit и backfill-креды молча откатываются (батч-сценарий «несколько
+    # конфигов + один bootstrap в конце» терял их).
+    db.commit()
     if not defer_bootstrap:
         task, _created = orchestrator.create_or_coalesce_node_bootstrap(
             node, {"pool_id": node.pool_id, "config_change": True}
@@ -1883,18 +1888,25 @@ def delete_node(
     )
 
     actor, actor_type = _resolve_admin_actor(admin_actor)
-    _audit(
-        db,
-        actor,
-        "node_deleted",
-        "vpn_node",
-        node.id,
-        actor_type=actor_type,
-        metadata={
-            "warm_credentials_deleted": warm_deleted,
-            "bound_credentials_detached": bound_detached,
-            "devices_detached": devices_detached,
-        },
+    # Audit-строку собираем ВРУЧНУЮ (не через _audit): _audit коммитит сам,
+    # а ранний commit делает detach/удаление кредов необратимыми — при
+    # последующем IntegrityError на db.delete(node) админ получал 409
+    # «fk_blocked», но креды подписок уже были деактивированы/отвязаны.
+    # Всё удаление должно быть одной транзакцией: единственный commit — ниже,
+    # после db.delete(node); rollback в except откатывает и detach, и audit.
+    db.add(
+        models.AuditLog(
+            actor=actor,
+            action="node_deleted",
+            target_type="vpn_node",
+            target_id=node.id,
+            extra={
+                "warm_credentials_deleted": warm_deleted,
+                "bound_credentials_detached": bound_detached,
+                "devices_detached": devices_detached,
+            },
+            actor_type=actor_type,
+        )
     )
     # WS+CDN: release each ws-cdn config's CF DNS record before the ORM
     # cascade drops the rows — else the proxied A-record (origin IP in the

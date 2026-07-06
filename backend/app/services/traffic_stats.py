@@ -49,6 +49,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+from concurrent import futures as _futures
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -67,6 +68,31 @@ SSH_PORT_DEFAULT = 22
 SSH_USER = "root"
 SSH_CONNECT_TIMEOUT = 10
 SSH_COMMAND_TIMEOUT = 15
+
+# Per-tick бюджеты сборщика (см. collect_all_active_nodes). RQ-джоба
+# tick-traffic-stats имеет job_timeout=120s (queue.py::TICK_TIMEOUTS) —
+# wall-clock-бюджет держим ниже с запасом, чтобы тик успел вернуть уже
+# собранные сэмплы вместо того, чтобы быть убитым kill-horse'ом.
+TRAFFIC_STATS_BUDGET_SEC_DEFAULT = 100
+# Сколько SSH-сессий держать параллельно. paramiko-вызовы блокирующие
+# и независимы по нодам; при последовательном обходе недоступная нода
+# стоит 10-30с и хвост флота не успевает опроситься за бюджет.
+TRAFFIC_STATS_SSH_WORKERS_DEFAULT = 8
+
+
+@dataclass
+class _NodeRef:
+    """Снимок атрибутов ноды для SSH-потоков.
+
+    Per-node commit в ``collect_all_active_nodes`` экспайрит ORM-объекты
+    (expire_on_commit), и обращение к ним из воркер-потоков дёрнуло бы
+    сессию не из главного потока. Поэтому всё нужное копируем заранее.
+    """
+
+    id: int
+    name: str
+    host: str
+    ssh_port: int | None
 
 
 @dataclass
@@ -347,8 +373,6 @@ def collect_and_persist(session, node, interval_seconds: int) -> dict[str, Any] 
     detected since the last tick, writing them as AuditLog rows for
     admin visibility.
     """
-    from .. import models  # local import to avoid circular dep with services/__init__
-
     try:
         result = collect_node_stats(node)
     except Exception as exc:  # noqa: BLE001
@@ -357,6 +381,19 @@ def collect_and_persist(session, node, interval_seconds: int) -> dict[str, Any] 
             node.id, node.name, exc,
         )
         return None
+
+    return _persist_node_result(session, node, result, interval_seconds)
+
+
+def _persist_node_result(session, node, result: NodeStatsResult, interval_seconds: int) -> dict[str, Any]:
+    """Записать уже собранный ``NodeStatsResult`` одной ноды в сессию.
+
+    Вынесено из ``collect_and_persist``, чтобы параллельный сборщик
+    (``collect_all_active_nodes``) мог собирать по SSH в потоках, а все
+    записи в сессию делать строго из главного потока. ``node`` — ORM-нода
+    либо ``_NodeRef`` (используются только ``.id`` и ``.name``).
+    """
+    from .. import models  # local import to avoid circular dep with services/__init__
 
     sample = models.NodeTrafficSample(
         node_id=node.id,
@@ -659,6 +696,15 @@ def collect_all_active_nodes(session, interval_seconds: int) -> list[dict[str, A
     Skips nodes in ``registering`` (xray not yet up) and ``disabled``
     (no stats to read). Draining nodes are still collected because they
     keep serving subs until the migration tick clears them.
+
+    Сбор параллельный (ThreadPoolExecutor, ``TRAFFIC_STATS_SSH_WORKERS``,
+    default 8): SSH-вызовы блокирующие и независимы по нодам, а записи в
+    сессию делаются только из главного потока. Каждый успешно собранный
+    сэмпл коммитится сразу (per-node commit) — если тик убьют по
+    job_timeout, частичный прогресс не теряется. Wall-clock-бюджет
+    ``TRAFFIC_STATS_BUDGET_SEC`` (default 100с, job_timeout тика = 120с):
+    при исчерпании недособранный хвост нод откладывается до следующего
+    тика — тот же паттерн, что в run_node_reachability_tick.
     """
     from .. import models
 
@@ -675,12 +721,66 @@ def collect_all_active_nodes(session, interval_seconds: int) -> list[dict[str, A
         )
         .all()
     )
+    if not nodes:
+        return []
+
+    # Снимок атрибутов ДО старта потоков — см. docstring _NodeRef.
+    refs = [
+        _NodeRef(id=n.id, name=n.name, host=n.host, ssh_port=n.ssh_port)
+        for n in nodes
+    ]
+
+    budget_s = int(
+        os.getenv("TRAFFIC_STATS_BUDGET_SEC", str(TRAFFIC_STATS_BUDGET_SEC_DEFAULT))
+    )
+    workers = max(
+        1,
+        int(os.getenv("TRAFFIC_STATS_SSH_WORKERS", str(TRAFFIC_STATS_SSH_WORKERS_DEFAULT))),
+    )
 
     summaries: list[dict[str, Any]] = []
-    for node in nodes:
-        summary = collect_and_persist(session, node, interval_seconds)
-        if summary is not None:
-            summaries.append(summary)
-    if summaries:
-        session.commit()
+    executor = _futures.ThreadPoolExecutor(
+        max_workers=min(workers, len(refs)),
+        thread_name_prefix="traffic-stats-ssh",
+    )
+    try:
+        future_to_ref = {
+            executor.submit(collect_node_stats, ref): ref for ref in refs
+        }
+        try:
+            for fut in _futures.as_completed(future_to_ref, timeout=budget_s):
+                ref = future_to_ref[fut]
+                try:
+                    result = fut.result()
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        "traffic_stats: collect failed for node %s (%s): %s",
+                        ref.id, ref.name, exc,
+                    )
+                    continue
+                try:
+                    summary = _persist_node_result(session, ref, result, interval_seconds)
+                    # Per-node commit: kill по job_timeout не теряет уже
+                    # собранные сэмплы этого тика.
+                    session.commit()
+                except Exception:  # noqa: BLE001
+                    logger.exception(
+                        "traffic_stats: persist failed for node %s (%s)",
+                        ref.id, ref.name,
+                    )
+                    if session.is_active:
+                        session.rollback()
+                    continue
+                summaries.append(summary)
+        except _futures.TimeoutError:
+            pending = [r.name for f, r in future_to_ref.items() if not f.done()]
+            logger.warning(
+                "traffic_stats: wall-clock budget %ss hit, %d node(s) deferred "
+                "to next tick: %s",
+                budget_s, len(pending), pending,
+            )
+    finally:
+        # Не ждём зависшие SSH-сессии: нестартовавшие фьючи отменяем,
+        # уже бегущие потоки дособерут в фоне и умрут вместе с джобой.
+        executor.shutdown(wait=False, cancel_futures=True)
     return summaries

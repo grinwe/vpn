@@ -208,7 +208,7 @@ all:
 
 - `apply` success → `device.status = active`, все `device.credentials.is_active = True`, `revoked_at = None`.
 - `revoke` success → `device.status = revoked`, `cred.is_active = False`, `cred.revoked_at = now()`. **Строка Device сохраняется** — её `sub_token` продолжает резолвиться в `/api/sub/{token}` через alias на живого соседа (см. **Sub-link invariant** в `components/backend-api.md`). До 2026-04-15 здесь стоял `db.delete(device)`, что ломало все сохранённые Hiddify/v2rayN URL при каждой миграции.
-- Сбой любой → `device.status = failed`.
+- Сбой `apply` → `device.status = failed`. **Исключение:** сбой `revoke`-таски (или сбой любой таски, когда девайс уже `disabled`/`revoked`) статус **не трогает** — списание терминально, даунгрейд в `failed` «воскрешал» бы девайс в лимите устройств (`active_device_count`), в ЛК и в live-снапшотах миграции. Типовой кейс — background-revoke на мёртвой ноде при failover/migrate. Таска остаётся `failed` для ручного retry. Регрессии: `backend/tests/test_auditfix_provisioning_py.py`.
 
 ### Bot notification hook
 
@@ -298,6 +298,8 @@ else:
 - ~~**Phase D `detect_traffic_drops`**~~ — автомиграция по traffic-drop **отключена 2026-04-15** (детектор триггерился на обычные idle-окна). `detect_traffic_drops` возвращает no-op, вызов в `worker.run_traffic_stats_tick` закомментирован.
 
 Флаг `exclude_same_region` опционален (default `False`), так что существующие call-site'ы не меняют поведения.
+
+**Отказоустойчивость sub_token (audit-fix id96, 2026-07):** отзыв старых девайсов выполняется только ПОСЛЕ успешного репровижена всех девайсов сабки на целевой ноде (при сбое живые девайсы старой ноды остаются нетронутыми — ретрай миграции возможен). Если `reprovision_subscription` падает посреди пачки, компенсирующий блок возвращает не перенесённые `sub_token`/`client_id_hmac` на исходные строки `Device` — `/api/sub/{token}` продолжает резолвиться, инвариант «sub_token никогда не мутируется» сохраняется. Тест: `backend/tests/test_auditfix_services_health_py.py`.
 
 Возвращает dict со следующими полями:
 

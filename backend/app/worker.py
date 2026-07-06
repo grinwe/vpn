@@ -60,6 +60,14 @@ RECONCILE_OLDEST_OVERDUE = Gauge(
     "Age (s) of the oldest overdue (due_at<=now) pending-reconcile node",
 )
 
+# Reachability-тик: сколько целей (nodes+exits) не пробовано дольше
+# NODE_REACHABILITY_STALE_MIN минут. >0 на стабильном флоте — сигнал, что
+# wall-clock бюджета тика не хватает на всех (голодание хвоста).
+REACHABILITY_STALE_TARGETS = Gauge(
+    "vpn_reachability_stale_targets",
+    "Reachability targets not probed for longer than the staleness window",
+)
+
 # Cloud billing gauges — set each cloud-billing tick.
 PROVIDER_BALANCE = Gauge(
     "vpn_cloud_provider_balance",
@@ -478,6 +486,35 @@ def run_renewal_check() -> dict:
         )
         for sub in overdue:
             if sub.auto_renew:
+                # Битая строка (план удалён): renew_subscription кидал бы
+                # RuntimeError на каждом тике. Не экспайрим платящего юзера —
+                # алертим админа (с суточным дедупом) и ждём ручного разбора.
+                if sub.plan is None:
+                    logger.error(
+                        "renewal_check: sub=%s auto_renew=ON без плана — "
+                        "продление невозможно, нужен ручной разбор", sub.id
+                    )
+                    try:
+                        from .services.admin_notify import notify_admins
+                        notify_admins(
+                            session,
+                            kind="renewal_broken_sub",
+                            text=(
+                                f"⚠️ Подписка #{sub.id} (auto_renew=ON) без "
+                                f"плана — авто-продление невозможно, нужен "
+                                f"ручной разбор."
+                            ),
+                            dedup_key={"subscription_id": sub.id},
+                            window_sec=86400,
+                            autocommit=True,
+                        )
+                    except Exception:  # noqa: BLE001
+                        logger.exception(
+                            "renewal_check: broken-sub alert failed sub=%s",
+                            sub.id,
+                        )
+                    stats["errors"] += 1
+                    continue
                 try:
                     if balance_svc.renew_subscription(session, sub):
                         stats["renewed"] = stats.get("renewed", 0) + 1
@@ -488,6 +525,12 @@ def run_renewal_check() -> dict:
                     )
                     if session.is_active:
                         session.rollback()
+                    stats["errors"] += 1
+                    # Транзиентный сбой (обрыв БД, deadlock) — НЕ повод
+                    # экспайрить оплаченную подписку: пропускаем, следующий
+                    # тик повторит попытку. Экспайр только при явном
+                    # «недостаточно средств» (renew_subscription вернул False).
+                    continue
             sub.status = models.SubscriptionStatus.expired
             session.add(sub)
             stats["expired"] += 1
@@ -1700,6 +1743,17 @@ def run_node_reachability_tick() -> dict:
         ):
             targets.append(("exit", e))
 
+        # Анти-голодание: обходим цели в порядке «дольше всех не пробовалась»
+        # (last_probe_at ASC, NULLS FIRST). Раньше порядок был фиксированный
+        # (все node, потом все exit): несколько лежащих нод в начале списка
+        # съедали весь wall-clock бюджет (~30с таймаутов каждая), и хвост —
+        # в первую очередь exit-ноды — не пробовался ВООБЩЕ, пока длится
+        # отказ. Сортировка по давности проба сама ротирует порядок между
+        # тиками: обрезанный бюджетом хвост становится самым «голодным» и
+        # идёт первым в следующем тике.
+        from datetime import datetime as _datetime, timedelta as _timedelta
+        targets.sort(key=lambda kt: kt[1].last_probe_at or _datetime.min)
+
         # Бэкстоп-реконсиляция: закрыть инциденты, оставшиеся открытыми на уже
         # здоровых целях (last_probe_status=='ok', серии падений нет). Покрывает
         # пропуски штатного закрытия на ssh_ok — обрезанный бюджетом хвост,
@@ -1825,6 +1879,20 @@ def run_node_reachability_tick() -> dict:
                 logger.exception("node_reachability: diagnose enqueue failed for %s", ref)
                 if session.is_active:
                     session.rollback()
+
+        # Метрика самого голодания: сколько целей не пробовано дольше
+        # NODE_REACHABILITY_STALE_MIN минут (default 30). Стабильно >0 —
+        # бюджета тика не хватает на весь флот, пора его поднимать или
+        # ускорять пробы. Цели без host не считаем — их тик не пробует.
+        stale_min = float(os.getenv("NODE_REACHABILITY_STALE_MIN", "30"))
+        stale_cutoff = utcnow() - _timedelta(minutes=stale_min)
+        stale = sum(
+            1 for _k, t in targets
+            if getattr(t, "host", None)
+            and (t.last_probe_at is None or t.last_probe_at < stale_cutoff)
+        )
+        summary["stale_targets"] = stale
+        REACHABILITY_STALE_TARGETS.set(stale)
     except Exception:  # noqa: BLE001
         logger.exception("node_reachability: tick failed")
         if session.is_active:
@@ -2228,6 +2296,55 @@ def dlq_exception_handler(job, exc_type, exc_value, tb):  # noqa: ARG001
     return True  # let RQ continue its normal failure flow
 
 
+def _fail_stuck_ops_plan(plan_id: int, reason: str, *, phase: str = "crash") -> bool:
+    """Страховка: условный UPDATE executing→failed для ops-плана.
+
+    Открывает СВЕЖУЮ сессию (рабочая после исключения может быть в
+    неопределённом состоянии) и переводит план в failed ТОЛЬКО если он всё
+    ещё в executing — терминальные статусы, выставленные ``execute_plan``
+    (expired / failed с деталями фазы), не затираются. Без этого любое
+    исключение вне OpsExecError оставляло план в executing навсегда:
+    эндпоинт армит план ДО постановки джобы и принимает только proposed,
+    так что подтверждённый оператором план было не перезапустить.
+    Возвращает True, если статус реально флипнули.
+    """
+    from sqlalchemy import update as sa_update
+
+    from . import models
+    from .db import SessionLocal
+    from .time_utils import utcnow
+
+    session = SessionLocal()
+    try:
+        flipped = session.execute(
+            sa_update(models.OpsPlan)
+            .where(
+                models.OpsPlan.id == plan_id,
+                models.OpsPlan.status == "executing",
+            )
+            .values(
+                status="failed",
+                execution={
+                    "phase": phase,
+                    "reason": reason[:500],
+                    "failed_at": utcnow().isoformat(),
+                },
+            )
+        ).rowcount
+        session.commit()
+        if flipped:
+            logger.warning(
+                "ops plan %s: помечен failed (phase=%s) — застрял в executing",
+                plan_id, phase,
+            )
+        return bool(flipped)
+    except Exception:  # noqa: BLE001
+        logger.exception("ops plan %s: не смог пометить план failed", plan_id)
+        return False
+    finally:
+        session.close()
+
+
 def run_ops_plan_execute(plan_id: int) -> dict:
     """RQ-джоба: исполнить сохранённый ops-план (Phase 3, за флагом
     OPS_EXECUTE_ENABLED). Эндпоинт ``/api/agent/ops/execute`` армит план
@@ -2247,12 +2364,135 @@ def run_ops_plan_execute(plan_id: int) -> dict:
         return {"ok": True, **result}
     except OpsExecError as exc:
         logger.warning("ops plan %s execution rejected/failed: %s", plan_id, exc)
+        # execute_plan сам выставляет терминальный статус на путях
+        # integrity/validate/preflight/TTL, но ветка «исполнение выключено
+        # (OPS_EXECUTE_ENABLED=0)» оставляла план в executing — добиваем.
+        # Условный UPDATE не тронет уже выставленные failed/expired.
+        _fail_stuck_ops_plan(plan_id, str(exc), phase="rejected")
         return {"ok": False, "error": str(exc)}
     except Exception as exc:  # noqa: BLE001
         logger.exception("ops plan %s execution crashed", plan_id)
+        # Иначе план навсегда завис бы в executing (ретрай через эндпоинт
+        # закрыт: он принимает только status=proposed).
+        _fail_stuck_ops_plan(plan_id, f"{type(exc).__name__}: {exc}")
         return {"ok": False, "error": str(exc)}
     finally:
         session.close()
+
+
+def run_ops_plan_reaper_tick() -> dict:
+    """Бэкстоп по возрасту: добить ops-планы, залипшие в executing.
+
+    In-job страховка (``_fail_stuck_ops_plan``) не спасает, когда процесса
+    уже нет: воркер перезапустился/упал по OOM или RQ убил джобу по
+    job_timeout=1800 — план остаётся в executing навсегда, а эндпоинт
+    повторное исполнение запрещает (принимает только proposed).
+
+    Момент арминга берём из AuditLog(action='agent_ops_execute_armed') —
+    эндпоинт пишет его одной транзакцией с армом; отдельной колонки
+    executing_since нет, и миграцию ради бэкстопа не заводим. Fallback —
+    expires_at (арм всегда РАНЬШЕ протухания, значит оценка консервативна),
+    затем created_at. Планы, армленные раньше чем job_timeout+grace назад,
+    переводятся в failed (phase='crash') условным UPDATE'ом — с ещё живой
+    джобой не гоняемся. Self-reschedules; OPS_PLAN_REAPER_INTERVAL=0 — off.
+    """
+    from datetime import timedelta
+
+    from sqlalchemy import update as sa_update
+
+    from . import models
+    from .db import SessionLocal
+    from .queue import schedule_tick
+    from .time_utils import utcnow
+
+    # Reschedule в начале — см. run_pending_rescue_tick.
+    interval = int(os.getenv("OPS_PLAN_REAPER_INTERVAL", "300"))
+    if interval > 0:
+        try:
+            schedule_tick(
+                "app.worker.run_ops_plan_reaper_tick",
+                interval,
+                tick_id="tick-ops-plan-reaper",
+                replace=True,
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("ops_plan_reaper: failed to re-enqueue tick (at start)")
+
+    # job_timeout джобы run_ops_plan_execute (см. api/agent.py, 1800с) +
+    # запас на ожидание в очереди/clock skew.
+    job_timeout = int(os.getenv("OPS_EXECUTE_JOB_TIMEOUT", "1800"))
+    grace = int(os.getenv("OPS_PLAN_REAPER_GRACE", "120"))
+    summary: dict = {"checked": 0, "reaped": []}
+    session = SessionLocal()
+    try:
+        cutoff = utcnow() - timedelta(seconds=job_timeout + grace)
+        stuck = (
+            session.query(models.OpsPlan)
+            .filter(models.OpsPlan.status == "executing")
+            .all()
+        )
+        summary["checked"] = len(stuck)
+        for plan in stuck:
+            armed_log = (
+                session.query(models.AuditLog)
+                .filter(
+                    models.AuditLog.action == "agent_ops_execute_armed",
+                    models.AuditLog.target_type == "ops_plan",
+                    models.AuditLog.target_id == plan.id,
+                )
+                .order_by(models.AuditLog.created_at.desc())
+                .first()
+            )
+            armed_at = (
+                armed_log.created_at if armed_log is not None
+                else (plan.expires_at or plan.created_at)
+            )
+            if armed_at is None or armed_at > cutoff:
+                continue  # ещё может легитимно исполняться — ждём
+            reason = (
+                f"executing дольше {job_timeout + grace}с с момента арма "
+                f"({armed_at.isoformat()}) — воркер умер или джоба убита "
+                f"по job_timeout; что успело заказаться — проверь по нодам "
+                f"с notes='ops-agent plan #{plan.id}'"
+            )
+            flipped = session.execute(
+                sa_update(models.OpsPlan)
+                .where(
+                    models.OpsPlan.id == plan.id,
+                    models.OpsPlan.status == "executing",
+                )
+                .values(
+                    status="failed",
+                    execution={
+                        "phase": "crash",
+                        "reason": reason,
+                        "failed_at": utcnow().isoformat(),
+                    },
+                )
+            ).rowcount
+            if not flipped:
+                continue
+            session.add(
+                models.AuditLog(
+                    actor="ops-plan-reaper",
+                    actor_type=models.AuditActor.system,
+                    action="agent_ops_execute_reaped",
+                    target_type="ops_plan",
+                    target_id=plan.id,
+                    extra={"armed_at": armed_at.isoformat(), "reason": reason},
+                )
+            )
+            summary["reaped"].append(plan.id)
+            logger.warning("ops_plan_reaper: план %s → failed (%s)", plan.id, reason)
+        session.commit()
+    except Exception:  # noqa: BLE001
+        logger.exception("ops_plan_reaper: tick failed")
+        if session.is_active:
+            session.rollback()
+    finally:
+        session.close()
+
+    return summary
 
 
 def main() -> None:
@@ -2570,6 +2810,24 @@ def main() -> None:
             )
         except Exception:  # noqa: BLE001
             logger.exception("Failed to schedule broadcast dispatch tick")
+
+    # Бэкстоп залипших ops-планов: executing старше job_timeout+grace →
+    # failed (воркер умер / джоба убита по таймауту). См. run_ops_plan_reaper_tick.
+    ops_reaper_interval = int(os.getenv("OPS_PLAN_REAPER_INTERVAL", "300"))
+    if do_bootstrap and ops_reaper_interval > 0:
+        try:
+            schedule_tick(
+                "app.worker.run_ops_plan_reaper_tick",
+                min(ops_reaper_interval, 120),
+                tick_id="tick-ops-plan-reaper",
+                replace=True,
+            )
+            logger.info(
+                "Ops-plan reaper tick bootstrapped: first run in %ss (interval=%ss)",
+                min(ops_reaper_interval, 120), ops_reaper_interval,
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("Failed to schedule ops-plan reaper tick")
 
     worker = Worker(
         queues_to_listen,

@@ -112,6 +112,13 @@ fleet-тулы строит план, но НИЧЕГО не исполняет.
    - [x] **order_node → `spawn_node_async`** (тот же путь, что кнопка «Заказать
          ноду», не raw driver). Остальные kind'ы исполнитель пока ЯВНО пропускает
          (skipped) — непротестированные destructive-пути не стреляют.
+   - [x] **Ожидание достройки в RQ-джобе** (audit-fix #119): `execute_plan`
+         ЯВНО дожидается daemon-потоков `_finalize_spawn` перед возвратом
+         (бюджет `OPS_FINALIZE_WAIT_SEC`, дефолт 1500с < job_timeout 1800с) —
+         иначе RQ work-horse завершал процесс сразу после джобы и убивал
+         достройку: оплаченная нода вечно висела в `registering` с
+         placeholder-host. Не успели в бюджет → статус плана `partial` +
+         `execution.finalize_pending` (ноды проверить руками).
    - [ ] **destroy/reinstall/migrate/tunnel** — отдельными ревьюируемыми проходами.
 6. **destructive ≠ costly.**
    - [x] **Server-derive tier + инвариант** «нельзя `destroy`/`reinstall` ноду с
@@ -121,7 +128,16 @@ fleet-тулы строит план, но НИЧЕГО не исполняет.
    - [x] **Идемпотентность:** атомарный арм (proposed→executing условным UPDATE) +
          детерминированный `job_id` + отказ от терминальных статусов. Stop-on-first-
          failure; created-id оплаченных нод сохраняются даже при сбое на середине.
-   - [ ] **Авто-recovery** застрявших `executing` (sweep/reaper) — НЕ начато (manual reset).
+   - [x] **Авто-recovery** застрявших `executing` (аудит-фикс #120, 2026-07):
+         (а) generic-except в `run_ops_plan_execute` помечает план `failed`
+         (`execution.phase='crash'`, свежая сессия, условный UPDATE — терминальные
+         статусы от `execute_plan` не затираются); (б) реапер-тик
+         `run_ops_plan_reaper_tick` (`OPS_PLAN_REAPER_INTERVAL=300`, 0=off) добивает
+         `executing` старше `OPS_EXECUTE_JOB_TIMEOUT(1800) + OPS_PLAN_REAPER_GRACE(120)`
+         с момента арма (берётся из AuditLog `agent_ops_execute_armed`; fallback —
+         `expires_at`/`created_at`), пишет AuditLog `agent_ops_execute_reaped`.
+         Повторное исполнение failed-планов эндпоинт по-прежнему запрещает — план
+         строится заново.
 
 Плюс: **data-fence** в системном промпте (тул-вывод = ДАННЫЕ, не инструкции) +
 слугификация `region` перед сохранением (mirror `validate_node_name`).
@@ -142,7 +158,8 @@ fleet-тулы строит план, но НИЧЕГО не исполняет.
   env-капов (set-but-empty не обнуляет cap молча).
 
 **Известные ограничения (приняты для MVP):** только `order_node` исполняется;
-застрявший `executing` чинится вручную (нет reaper); баланс-TOCTOU между pre-flight
+~~застрявший `executing` чинится вручную (нет reaper)~~ (закрыто аудит-фиксом #120:
+crash-страховка + `run_ops_plan_reaper_tick`); баланс-TOCTOU между pre-flight
 и заказом ограничен провайдерским отказом при заказе + spend-cap; `image` валидирует
 драйвер (битый → провайдер отклоняет заказ до списания); нет глобального
 кумулятивного fleet-cost кэпа (только per-execution).
@@ -160,8 +177,9 @@ callbacks `opsx`/`opsxgo`/`opsxno`. Все шаги под `_is_admin`.
 - **Включение:** `OPS_EXECUTE_ENABLED=1` (через ansible) — deliberate go-live,
   только после проверки на стейдже/одной ноде. Пока OFF → кнопка отвечает
   «Исполнение выключено».
-- (за рамками MVP) destructive-kind'ы, scoped-токен+`actor=agent`, reaper
-  застрявших `executing`, data-fence/слугификация `region`.
+- (за рамками MVP) destructive-kind'ы, scoped-токен+`actor=agent`,
+  data-fence/слугификация `region`. (Reaper застрявших `executing` уже
+  приземлён — аудит-фикс #120.)
 
 ## Решения (2026-06-17, с оператором)
 

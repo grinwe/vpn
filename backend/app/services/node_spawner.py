@@ -22,8 +22,10 @@ import secrets
 import socket
 import threading
 import time
+from datetime import timedelta
 
 from sqlalchemy import func
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from .. import models
@@ -403,6 +405,41 @@ def spawn_node(
     image = image or provider.default_image or "ubuntu-22.04"
     ssh_key_ids = ssh_key_ids if ssh_key_ids is not None else (provider.ssh_key_ids or [])
 
+    # #69 — фиксируем намерение покупки в БД ДО списания денег. Строка VPNNode
+    # (placeholder host, is_active=False) коммитится ПЕРЕД create_server: любой
+    # сбой в окне после оплаты (упавшая валидация IP, обрыв соединения с БД,
+    # убитая по таймауту RQ-джоба посреди поллинга create_server) больше не
+    # оставляет оплаченный сервер-сироту — след остаётся в vpn_nodes, застрявшую
+    # строку подберёт sweep_stuck_spawns. Занятость имени проверяем тоже ДО
+    # оплаты: name unique=True, и IntegrityError ПОСЛЕ create_server терял бы
+    # уже оплаченный сервер.
+    if db.query(models.VPNNode).filter(models.VPNNode.name == name).first():
+        raise NodeSpawnError(f"node name {name!r} is already taken")
+
+    node = models.VPNNode(
+        name=name,
+        region=_display_region(driver, region),
+        host=SPAWN_PLACEHOLDER_HOST,  # реальный IP появится после create_server
+        status=models.VPNNodeStatus.registering,
+        is_active=False,  # вне choose_node, пока сервер не заказан и нет IP
+        pool_id=pool_id,
+        provider_id=provider.id,
+        provider_region=region,
+        provider_plan=plan,
+        notes=notes,
+        health_score=100,
+        last_health_check_at=utcnow(),
+    )
+    db.add(node)
+    try:
+        db.commit()
+    except IntegrityError as exc:
+        # Гонка по unique-имени (два спавна взяли одинаковый NN из
+        # _auto_node_name). Денег ещё не потратили — безопасно отказать.
+        db.rollback()
+        raise NodeSpawnError(f"node name {name!r} is already taken") from exc
+    db.refresh(node)
+
     logger.info("Spawning node %s via %s in %s", name, provider.name, region)
     try:
         server = driver.create_server(
@@ -415,41 +452,45 @@ def spawn_node(
         )
     except DriverError as exc:
         logger.exception("Failed to spawn node via %s", provider.name)
+        # Сервер мог быть оплачен до сбоя (например, buyServer прошёл, а
+        # поллинг IP упал) — строку не удаляем, а помечаем error, чтобы
+        # оператор проверил панель хостера.
+        _mark_spawn_error(db, node, reason=f"create_server failed: {exc}")
         raise NodeSpawnError(str(exc)) from exc
+
+    # #69 — привязываем external_id отдельным коротким коммитом СРАЗУ после
+    # ответа драйвера, ДО валидации host: оплаченный сервер отслеживается,
+    # даже если дальше что-то упадёт.
+    node.provider_external_id = server.external_id
+    node.provider_region = server.region
+    node.provider_plan = server.plan
+    node.monthly_cost = server.monthly_cost
+    # Хостеры без инъекции SSH-ключа (4vps) отдают рут-пароль при заказе —
+    # храним зашифрованным для SSH-bootstrap'а (см. эпик, Фаза 1.5).
+    if server.root_password:
+        node.provider_root_password_enc = encrypt(server.root_password)
+    node.updated_at = utcnow()
+    db.add(node)
+    db.commit()
 
     # #55 — host+port re-validation once the cloud driver returns.
     # ``server.ipv4`` should always be a real IPv4 string, but any
     # future driver that returns a malformed value (or we add IPv6
     # support and forget to update one path) will still be caught
-    # before the row is committed or the inventory is rendered.
+    # before the host is committed or the inventory is rendered.
     try:
         validate_node_identity_fields(name, server.ipv4, 22)
     except InvalidNodeIdentity as exc:
+        # #69 — не бросаем без следа: нода уходит в error с сохранённым
+        # external_id (оператор может снести её через destroy_node).
+        _mark_spawn_error(db, node, reason=f"driver returned invalid host: {exc}")
         raise NodeSpawnError(
             f"cloud driver {provider.name} returned invalid host: {exc}"
         ) from exc
 
-    node = models.VPNNode(
-        name=name,
-        region=_display_region(driver, region),
-        host=server.ipv4,
-        status=models.VPNNodeStatus.registering,
-        is_active=True,
-        pool_id=pool_id,
-        provider_id=provider.id,
-        provider_external_id=server.external_id,
-        provider_region=server.region,
-        provider_plan=server.plan,
-        monthly_cost=server.monthly_cost,
-        # Хостеры без инъекции SSH-ключа (4vps) отдают рут-пароль при заказе —
-        # храним зашифрованным для SSH-bootstrap'а (см. эпик, Фаза 1.5).
-        provider_root_password_enc=(
-            encrypt(server.root_password) if server.root_password else None
-        ),
-        notes=notes,
-        health_score=100,
-        last_health_check_at=utcnow(),
-    )
+    node.host = server.ipv4
+    node.is_active = True  # реальный IP есть → нода доступна для choose_node
+    node.updated_at = utcnow()
     db.add(node)
     db.commit()
     db.refresh(node)
@@ -505,13 +546,15 @@ def spawn_node_async(
     VPS ДО создания строки ``VPNNode``, и убитый запрос оставлял осиротевший,
     неотслеживаемый сервер (каждый ретрай — ещё один заказ).
 
-    Здесь СИНХРОННО выполняем только быстрый ``order_server`` (buyServer,
-    ~секунды) и сразу фиксируем ``VPNNode`` (placeholder host,
-    ``is_active=False``, ``provider_external_id``) — сервер привязан к строке с
-    момента заказа, сирот нет. Долгий поллинг IP + bootstrap уходят в фоновый
-    daemon-поток (:func:`_finalize_spawn`). Нода становится ``is_active=True``
-    (видимой для ``choose_node``) только когда проставлен реальный IP — до этого
-    юзеры на неё не назначаются (placeholder не попадает в credentials).
+    Здесь СИНХРОННО выполняем: сначала фиксируем строку ``VPNNode``
+    (placeholder host, ``is_active=False``) — #69: намерение покупки в БД ДО
+    оплаты, — затем быстрый ``order_server`` (buyServer, ~секунды) и сразу
+    отдельным коротким коммитом привязываем ``provider_external_id`` — сервер
+    привязан к строке с момента заказа, сирот нет. Долгий поллинг IP +
+    bootstrap уходят в фоновый daemon-поток (:func:`_finalize_spawn`). Нода
+    становится ``is_active=True`` (видимой для ``choose_node``) только когда
+    проставлен реальный IP — до этого юзеры на неё не назначаются (placeholder
+    не попадает в credentials).
 
     Драйверы без ``order_server`` (hetzner/vultr/…): здесь строка создаётся без
     ``external_id``, а полный (блокирующий) ``create_server`` уходит целиком в
@@ -531,10 +574,40 @@ def spawn_node_async(
     image = image or provider.default_image or "ubuntu-22.04"
     ssh_key_ids = ssh_key_ids if ssh_key_ids is not None else (provider.ssh_key_ids or [])
 
+    # #69 — как в spawn_node: строка-намерение коммитится ДО оплаты, занятость
+    # имени проверяем до заказа (name unique=True — раньше гонка по авто-имени
+    # роняла commit УЖЕ ПОСЛЕ оплаченного order_server, теряя external_id).
+    if db.query(models.VPNNode).filter(models.VPNNode.name == name).first():
+        raise NodeSpawnError(f"node name {name!r} is already taken")
+
+    node = models.VPNNode(
+        name=name,
+        region=_display_region(driver, region),
+        host=SPAWN_PLACEHOLDER_HOST,  # реальный IP проставит _finalize_spawn
+        status=models.VPNNodeStatus.registering,
+        is_active=False,  # вне choose_node, пока нет настоящего IP
+        pool_id=pool_id,
+        provider_id=provider.id,
+        provider_region=region,
+        provider_plan=plan,
+        notes=notes,
+        health_score=100,
+        last_health_check_at=utcnow(),
+    )
+    db.add(node)
+    try:
+        db.commit()
+    except IntegrityError as exc:
+        # Гонка по unique-имени — денег ещё не потратили, безопасно отказать.
+        db.rollback()
+        raise NodeSpawnError(f"node name {name!r} is already taken") from exc
+    db.refresh(node)
+
     external_id: str | None = None
     root_password: str | None = None
-    # Быстрый заказ — фиксируем external_id ДО создания строки, чтобы оплаченный
-    # сервер сразу был привязан. Capability-проверка: 4vps умеет order_server.
+    # Быстрый заказ (buyServer, ~секунды) — external_id привязывается отдельным
+    # коротким коммитом сразу после ответа драйвера. Capability-проверка: 4vps
+    # умеет order_server.
     if hasattr(driver, "order_server"):
         logger.info("Ordering node %s via %s in %s", name, provider.name, region)
         try:
@@ -548,29 +621,17 @@ def spawn_node_async(
             )
         except DriverError as exc:
             logger.exception("Failed to order node via %s", provider.name)
+            # Заказ мог пройти на стороне хостера до сбоя — оставляем след
+            # в error, оператору: проверить панель хостера.
+            _mark_spawn_error(db, node, reason=f"order_server failed: {exc}")
             raise NodeSpawnError(str(exc)) from exc
-
-    node = models.VPNNode(
-        name=name,
-        region=_display_region(driver, region),
-        host=SPAWN_PLACEHOLDER_HOST,  # реальный IP проставит _finalize_spawn
-        status=models.VPNNodeStatus.registering,
-        is_active=False,  # вне choose_node, пока нет настоящего IP
-        pool_id=pool_id,
-        provider_id=provider.id,
-        provider_external_id=external_id,
-        provider_region=region,
-        provider_plan=plan,
-        provider_root_password_enc=(
-            encrypt(root_password) if root_password else None
-        ),
-        notes=notes,
-        health_score=100,
-        last_health_check_at=utcnow(),
-    )
-    db.add(node)
-    db.commit()
-    db.refresh(node)
+        node.provider_external_id = external_id
+        if root_password:
+            node.provider_root_password_enc = encrypt(root_password)
+        node.updated_at = utcnow()
+        db.add(node)
+        db.commit()
+        db.refresh(node)
 
     # Reality-config можно создать сразу — он node-scoped и не требует host
     # (host вшивается в credentials позже, при выдаче). Нода уже несёт целевой
@@ -595,11 +656,17 @@ def spawn_node_async(
     return node
 
 
-def _mark_spawn_error(session: Session, node: models.VPNNode) -> None:
+def _mark_spawn_error(
+    session: Session, node: models.VPNNode, reason: str | None = None
+) -> None:
     """Пометить ноду error+inactive (заказ не достроился). external_id уже в
-    строке → оператор может снести/переустановить, сирот не остаётся."""
+    строке → оператор может снести/переустановить, сирот не остаётся.
+    ``reason`` дописывается в notes — оператору видно, на чём упал спавн."""
     node.status = models.VPNNodeStatus.error
     node.is_active = False
+    if reason:
+        stamp = f"[spawn-error {utcnow().isoformat()}] {reason}"
+        node.notes = f"{node.notes}\n{stamp}" if node.notes else stamp
     node.updated_at = utcnow()
     session.add(node)
     session.commit()
@@ -994,11 +1061,17 @@ def spawn_exit_async(
     return exit_node
 
 
-def _mark_exit_error(session: Session, exit_node: models.WGExitNode) -> None:
+def _mark_exit_error(
+    session: Session, exit_node: models.WGExitNode, reason: str | None = None
+) -> None:
     """Пометить exit error+inactive (заказ не достроился). external_id уже в
-    строке → оператор может снести/переустановить, сирот нет."""
+    строке → оператор может снести/переустановить, сирот нет.
+    ``reason`` дописывается в notes (зеркалит :func:`_mark_spawn_error`)."""
     exit_node.status = models.WGExitNodeStatus.error
     exit_node.is_active = False
+    if reason:
+        stamp = f"[spawn-error {utcnow().isoformat()}] {reason}"
+        exit_node.notes = f"{exit_node.notes}\n{stamp}" if exit_node.notes else stamp
     exit_node.updated_at = utcnow()
     session.add(exit_node)
     session.commit()
@@ -1101,3 +1174,179 @@ def _finalize_exit_spawn(
             session.rollback()
     finally:
         session.close()
+
+
+# ---------------------------------------------------------------------------
+# #70 — подбор спавнов, застрявших из-за смерти daemon-потока финализации
+# ---------------------------------------------------------------------------
+
+
+def _spawn_stuck_threshold_min() -> int:
+    """Возраст (мин) registering-ноды с placeholder-host, после которого она
+    считается застрявшей. Должен быть больше worst-case финализации:
+    wait_for_ipv4 (до 600s у 4vps) + ожидание SSH (NODE_SSH_WAIT_TIMEOUT,
+    дефолт 480s) ≈ 18 мин → дефолт 30."""
+    return int(os.getenv("NODE_SPAWN_STUCK_MINUTES", "30"))
+
+
+def sweep_stuck_spawns(db: Session) -> dict[str, int]:
+    """Подбирает ноды/exit'ы, застрявшие в ``registering`` с placeholder-host.
+
+    Достройка спавна (:func:`_finalize_spawn` / :func:`_finalize_exit_spawn`)
+    крутится в daemon-потоке процесса backend — рестарт/деплой контейнера
+    убивает поток молча, и оплаченный сервер навсегда остаётся невидимым
+    (status=registering, host=0.0.0.0, is_active=False), при этом продолжая
+    списывать деньги у хостера. Эту функцию нужно звать периодическим тиком
+    воркера (или на startup backend'а):
+
+      * есть ``provider_external_id`` и драйвер умеет ``wait_for_ipv4`` —
+        перезапускаем финализацию (шаги идемпотентны: wait_for_ipv4 — чистое
+        чтение состояния заказа, bootstrap ставится через create_or_coalesce);
+      * иначе повторный заказ невозможен без риска двойной оплаты — помечаем
+        error с пометкой в notes (оператору: проверить панель хостера).
+
+    Возвращает счётчики для метрик тика.
+    """
+    threshold = utcnow() - timedelta(minutes=_spawn_stuck_threshold_min())
+    out = {
+        "relay_resumed": 0, "relay_errored": 0,
+        "exit_resumed": 0, "exit_errored": 0,
+    }
+
+    def _driver_for(provider_id: int | None):
+        provider = (
+            db.get(models.CloudProvider, provider_id) if provider_id else None
+        )
+        if not provider:
+            return None, None
+        try:
+            return provider, get_driver(provider)
+        except DriverError:
+            logger.exception(
+                "sweep_stuck_spawns: driver init failed for provider %s",
+                provider_id,
+            )
+            return provider, None
+
+    # ── Relay-ноды (VPNNode) ────────────────────────────────────────────
+    stuck_nodes = (
+        db.query(models.VPNNode)
+        .filter(
+            models.VPNNode.status == models.VPNNodeStatus.registering,
+            models.VPNNode.host == SPAWN_PLACEHOLDER_HOST,
+            models.VPNNode.updated_at < threshold,
+        )
+        .all()
+    )
+    for node in stuck_nodes:
+        provider, driver = _driver_for(node.provider_id)
+        if (
+            node.provider_external_id
+            and driver is not None
+            and hasattr(driver, "wait_for_ipv4")
+        ):
+            # Отодвигаем updated_at ДО запуска потока — следующий тик не
+            # должен запустить вторую финализацию параллельно этой.
+            node.updated_at = utcnow()
+            db.add(node)
+            db.commit()
+            logger.warning(
+                "sweep_stuck_spawns: resuming stuck spawn for node %s (%s)",
+                node.id, node.name,
+            )
+            threading.Thread(
+                target=_finalize_spawn,
+                args=(node.id,),
+                kwargs={
+                    # kwargs нужны только create_server-ветке; при наличии
+                    # external_id+wait_for_ipv4 она недостижима (нового
+                    # заказа/двойной оплаты не будет).
+                    "name": node.name,
+                    "region": node.provider_region or node.region,
+                    "plan": node.provider_plan or "",
+                    "image": (
+                        (provider.default_image if provider else None)
+                        or "ubuntu-22.04"
+                    ),
+                    "ssh_key_ids": (
+                        list(provider.ssh_key_ids or []) if provider else None
+                    ),
+                    "user_data": None,
+                    "reality_sni": None,
+                    "reality_dest": None,
+                },
+                daemon=True,
+            ).start()
+            out["relay_resumed"] += 1
+        else:
+            logger.error(
+                "sweep_stuck_spawns: node %s (%s) застряла в registering без "
+                "возобновляемого заказа (external_id=%r) — помечаю error; "
+                "проверьте панель хостера вручную",
+                node.id, node.name, node.provider_external_id,
+            )
+            _mark_spawn_error(
+                db, node,
+                reason="spawn застрял в registering (поток финализации умер); "
+                "повторный заказ небезопасен — проверьте панель хостера",
+            )
+            out["relay_errored"] += 1
+
+    # ── Exit-ноды (WGExitNode) — зеркало relay-ветки ────────────────────
+    stuck_exits = (
+        db.query(models.WGExitNode)
+        .filter(
+            models.WGExitNode.status == models.WGExitNodeStatus.registering,
+            models.WGExitNode.host == SPAWN_PLACEHOLDER_HOST,
+            models.WGExitNode.updated_at < threshold,
+        )
+        .all()
+    )
+    for exit_node in stuck_exits:
+        provider, driver = _driver_for(exit_node.provider_id)
+        if (
+            exit_node.provider_external_id
+            and driver is not None
+            and hasattr(driver, "wait_for_ipv4")
+        ):
+            exit_node.updated_at = utcnow()
+            db.add(exit_node)
+            db.commit()
+            logger.warning(
+                "sweep_stuck_spawns: resuming stuck spawn for exit %s (%s)",
+                exit_node.id, exit_node.name,
+            )
+            threading.Thread(
+                target=_finalize_exit_spawn,
+                args=(exit_node.id,),
+                kwargs={
+                    "name": exit_node.name,
+                    "region": exit_node.provider_region or exit_node.region,
+                    "plan": "",
+                    "image": (
+                        (provider.default_image if provider else None)
+                        or "ubuntu-22.04"
+                    ),
+                    "ssh_key_ids": (
+                        list(provider.ssh_key_ids or []) if provider else None
+                    ),
+                    "user_data": None,
+                },
+                daemon=True,
+            ).start()
+            out["exit_resumed"] += 1
+        else:
+            logger.error(
+                "sweep_stuck_spawns: exit %s (%s) застрял в registering без "
+                "возобновляемого заказа (external_id=%r) — помечаю error; "
+                "проверьте панель хостера вручную",
+                exit_node.id, exit_node.name, exit_node.provider_external_id,
+            )
+            _mark_exit_error(
+                db, exit_node,
+                reason="spawn застрял в registering (поток финализации умер); "
+                "повторный заказ небезопасен — проверьте панель хостера",
+            )
+            out["exit_errored"] += 1
+
+    return out

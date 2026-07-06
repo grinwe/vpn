@@ -143,6 +143,7 @@ class NodeUserBan(Base):
 - Заполняется авто-миграцией: «Обновить подписку» (`POST /api/subscriptions/{id}/migrate-auto` → `ProvisioningOrchestrator.migrate_subscription_to_free_node`) выбирает свободный сервер пула, исключая текущую ноду **и** ноды из бан-листа юзера (через `choose_node(exclude_node_ids=...)`), мигрирует с сохранением `sub_token`, и **банит старую ноду** (`created_by=actor`, `reason="auto: …"`), чтобы повторное «обновление» не вернуло юзера обратно.
 - Ручное управление: `GET /api/users/{id}/node-bans`, `POST /api/users/{id}/node-bans` (`{node_id, reason}`, идемпотентно по паре), `DELETE /api/users/{id}/node-bans/{node_id}` (разбан). В admin SPA (Users.tsx) — панель «Бан-лист нод» с разбаном + кнопка «🔄 обновить подписку» в строке активной подписки. Аудит: `node_user_banned` / `node_user_unbanned` / `subscription_migrated`.
 - Бан per-**USER**, а не per-subscription: у юзера может быть несколько подписок, бан ноды распространяется на все. Миграция 0038.
+- У авто-банов есть **TTL и потолок** (без колонки в схеме — on-access prune в `api/client_control.py`): перед каждым user-driven failover'ом протухшие авто-баны (`created_by` = `client_control` / `admin_panel` / `user:*`) старше `NODE_USER_BAN_TTL_HOURS` (48) удаляются, а при `NODE_USER_BAN_MAX_PER_USER` (3) свежих авто-банах миграция идёт без бана старой ноды — юзер тапами «VPN не работает» не выжигает себе пул нод навсегда. Ручные админ-баны prune не трогает.
 
 ### `vpn_configs`
 
@@ -409,6 +410,8 @@ class AuditLog(Base):
 **Важно**: column на диске называется `metadata` (чтобы не конфликтовать с SQLAlchemy reserved `Base.metadata`), в Python-модели — `extra`. См. `models.py:526`.
 
 Особенность: тот же audit log используется как «очередь уведомлений боту» — воркер пишет строки с `action in ('renewal_reminder', 'config_ready', 'migration_notice', …)`, бот опрашивает их через `/api/notifications/pending` (`backend/app/api_extensions.py:359`) и помечает delivered добавлением `:delivered` в `action`.
+
+Из-за этой hot-path роли на таблице объявлены индексы `ix_audit_logs_action_created_at (action, created_at)` (под поллер уведомлений и worker-тики, фильтрующие по `action`) и `ix_audit_logs_created_at (created_at)` (под дашборды/выборки по времени). DESC-вариант не нужен — btree читается в обе стороны.
 
 **Health-ping actions** (источник данных для админ-дашборда `/health-pings`):
 

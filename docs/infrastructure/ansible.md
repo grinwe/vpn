@@ -75,6 +75,9 @@ upstream'а, у нас есть свой mini-mirror на web-host'е (`nl-web` 
 [refresh-assets.sh](../../infra/ansible/roles/mgmt_mirror/files/refresh-assets.sh).
 Bump xray — два места: тут + `xray_core_version` в
 [roles/xray_core/defaults/main.yml](../../infra/ansible/roles/xray_core/defaults/main.yml).
+При реальной установке новой версии роль `xray_core` сама рестартует активные
+сервисы (`xray`, `xray-ws-cdn`, `xray-xhttp`) — новый бинарь применяется сразу,
+ручной рестарт после бампа не нужен.
 
 ### Как ноды его находят
 
@@ -259,6 +262,8 @@ username, uuid, password, protocols: [{proto, port[, method]}], state: present|a
 ```
 
 Playbook циклит `protocols` и для каждого вызывает правильный скрипт. Идемпотентен: `add` → уже есть → skip, `del` → отсутствует → skip.
+
+Если manage-скрипт запрошенного протокола отсутствует на ноде (нода не bootstrap'нута под протокол), при `state=present` playbook **падает** с сообщением `node is not bootstrapped for <proto>` — раньше задача молча скипалась и backend считал девайс успешно провижнутым (аудит #174). При `state=absent` отсутствие скрипта по-прежнему skip: revoke на пустой ноде — норма.
 
 **Forward-compat тонкость для ShadowTLS+SS.** Сейчас `manage_vpn_user.sh` — no-op логгер (один SS password на ноду, multi-user ещё не заведён на SS2022 EIH). Но скрипт жёстко требует 4 позиционных аргумента, и ansible `command:` silently drops empty-string args. Чтобы на revoke (без password'а) счётчик аргументов не сбивался, в playbook явно передаётся литерал `'x'`:
 
