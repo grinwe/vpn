@@ -112,40 +112,42 @@ def _prepare_database() -> Iterator[None]:
         conn.execute(text("CREATE SCHEMA public"))
 
     run_migrations()
+
+    # Одноразовая очистка сид-данных (находка 198): миграция 0007_seed_plans
+    # делает INSERT в plans при upgrade. Чистим их ЗДЕСЬ, один раз после
+    # прогона миграций, чтобы самый первый тест сессии стартовал с пустой БД
+    # — а не платить за это двойным TRUNCATE в каждом из ~700 тестов (это
+    # удваивало время сьюта). Дальше чистоту держит per-test TRUNCATE после
+    # каждого теста (см. _clean_tables). Тесты, которым нужны планы, создают
+    # их сами через factories.make_plan.
+    _truncate_all_tables()
     yield
 
 
-# ---------------------------------------------------------------------------
-# Function-scoped: truncate all tables around each test.
-# ---------------------------------------------------------------------------
-@pytest.fixture(autouse=True)
-def _clean_tables() -> Iterator[None]:
+def _truncate_all_tables() -> None:
+    """TRUNCATE всех прикладных таблиц с RESTART IDENTITY (детерминированные PK)."""
     from sqlalchemy import text
 
     from app.db import Base, engine
 
-    def _truncate() -> None:
-        table_names = [t.name for t in reversed(Base.metadata.sorted_tables)]
-        if not table_names:
-            return
-        quoted = ", ".join(f'"{name}"' for name in table_names)
-        with engine.begin() as conn:
-            # RESTART IDENTITY so primary keys are deterministic across tests.
-            conn.execute(text(f"TRUNCATE {quoted} RESTART IDENTITY CASCADE"))
+    table_names = [t.name for t in reversed(Base.metadata.sorted_tables)]
+    if not table_names:
+        return
+    quoted = ", ".join(f'"{name}"' for name in table_names)
+    with engine.begin() as conn:
+        conn.execute(text(f"TRUNCATE {quoted} RESTART IDENTITY CASCADE"))
 
-    # Чистим ДО теста (находка 198): раньше TRUNCATE стоял только после yield,
-    # поэтому самый первый тест сессии видел сид-планы из миграции
-    # 0007_seed_plans (INSERT в plans при upgrade), а все последующие — уже
-    # пустую таблицу. Это скрытая зависимость от порядка прогона: добавление
-    # нового test-файла «раньше по алфавиту» молча меняло окружение чужого
-    # теста (например, _trial_plan берёт самый дешёвый видимый 30-дневный
-    # план). Гарантируем, что КАЖДЫЙ тест стартует с пустой БД, а сид-данные
-    # тесты создают сами через factories.make_plan.
-    _truncate()
+
+# ---------------------------------------------------------------------------
+# Function-scoped: truncate all tables after each test.
+# ---------------------------------------------------------------------------
+@pytest.fixture(autouse=True)
+def _clean_tables() -> Iterator[None]:
+    # Чистим ПОСЛЕ теста: сид-данные уже сняты один раз в _prepare_database,
+    # поэтому каждый тест (включая первый) стартует с пустой БД без двойного
+    # TRUNCATE на каждый тест. Тесты создают нужные данные через factories.
     yield
-    # И после — чтобы не оставлять мусор для внешних наблюдателей/следующей
-    # сессии, гоняющей без пересоздания схемы.
-    _truncate()
+    _truncate_all_tables()
 
 
 # ---------------------------------------------------------------------------
