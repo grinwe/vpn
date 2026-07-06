@@ -55,6 +55,8 @@ Backend прогоняет `alembic upgrade head` на старте (`main.py:18
 | `run_autoscale_tick`       | `AUTOSCALE_INTERVAL=300`     | Проходит по server_pools, решает по utilization, спавнит новые ноды |
 | `run_renewal_check`        | `RENEWAL_CHECK_INTERVAL=300` | Expire-ит подписки, инициирует renewal reminders, hard-revoke после grace. Для `auto_renew=ON` сначала пробует `balance.renew_subscription`; expire — ТОЛЬКО на явное «недостаточно средств» (renew вернул False). Исключение в renew (обрыв БД, deadlock) — skip до следующего тика, подписка без плана — admin-алерт `renewal_broken_sub` с суточным дедупом (аудит-фикс #59) |
 | `run_warm_pool_check`      | `WARM_POOL_CHECK_INTERVAL=120` | Топит warm pool на каждой активной ноде до `WARM_POOL_TARGET` |
+| `run_warm_pool_revoke_tick` | `WARM_POOL_REVOKE_INTERVAL=300` | Стадия 2 отзыва warm-пула (аудит-фикс #71): драйвер `warm_pool.run_warm_pool_revoke_sweep` — физически снимает `pool_state=revoked` бандлы с нод (`state=absent`) батчем `WARM_POOL_REVOKE_BATCH_PER_TICK=5` и удаляет строки. Без него revoked-identity (юзер-отвязанные + брошенные `invalidate_node_warm_pool`) копятся в конфиге xray и revoked-строками в БД вечно. Back-off после `WARM_POOL_REVOKE_MAX_ATTEMPTS=5` провалов. Gated на `WARM_POOL_ENABLED` |
+| `run_retention_tick`       | `RETENTION_INTERVAL=86400` | Очистка безлимитно растущих таблиц (аудит-фикс #247): удаляет из `audit_logs` строки `action='subscription_fetch'` и `*:delivered` старше `AUDIT_LOG_RETENTION_DAYS=90`, из `node_traffic_samples` — старше `TRAFFIC_SAMPLE_RETENTION_DAYS=30`. Батчами `RETENTION_DELETE_BATCH=10000` (id IN (SELECT … LIMIT), коммит после каждого) до потолка `RETENTION_MAX_BATCHES=200`/таблицу/тик, чтобы не держать долгий лок. Прочие audit-события (провижининг, действия админов, DLQ) не трогаются. `*_DAYS=0` выключает конкретную таблицу |
 | `run_balance_charge_tick`  | `BALANCE_CHARGE_INTERVAL=3600` | Renew balance-подписок, expire auto_renew=False, auto-unfreeze, clawback trial |
 | `run_traffic_stats_tick`   | `TRAFFIC_STATS_INTERVAL=300` | SSH на каждую active/draining ноду (параллельно, `TRAFFIC_STATS_SSH_WORKERS=8`; per-node commit; wall-clock-бюджет `TRAFFIC_STATS_BUDGET_SEC=100` — недособранный хвост уходит в следующий тик), читает xray stats + sharing violations → `node_traffic_samples` + `AuditLog`. Per-protocol breakdown в `details` содержит список `access_username` (а не просто count) — админка читает последний sample через `GET /api/nodes/{id}/users`. После persist вызывается Phase D `detect_traffic_drops()` — пассивный детектор ТСПУ-блокировок (gated через `TRAFFIC_DROP_ENABLED=1`) |
 | `run_pending_rescue_tick`  | `PENDING_RESCUE_INTERVAL=60` | Сканирует `ProvisioningTask.status=pending` старше `PENDING_RESCUE_AGE` секунд и re-enqueue'ит через `enqueue_task`. Дедуп по `job_id=provision-<task_id>` — если задача уже в RQ, это no-op. Закрывает дыру, когда `run_task_async` закоммитил row, но `enqueue_task` упал (транзиентный Redis hiccup, serialization issue) — до этого фикса такие задачи висели в pending до следующего рестарта бэкенда (`reset_stuck_tasks` в main.py срабатывает только на boot). Метрика: `vpn_provisioning_pending_rescue_total` инкрементится на каждый rescue |
@@ -163,6 +165,8 @@ return summary
 | `run_relay_link_health_tick` | `tick-relay-link-health` |
 | `run_node_reachability_tick` | `tick-node-reachability` |
 | `run_ops_plan_reaper_tick`   | `tick-ops-plan-reaper`   |
+| `run_warm_pool_revoke_tick`  | `tick-warm-pool-revoke`  |
+| `run_retention_tick`         | `tick-retention`         |
 
 `run_node_reachability_tick` (diagnostics overhaul, env `NODE_REACHABILITY_INTERVAL=300`) — единственный владелец node/exit down-детекта: пробит ВСЕ active ноды + exit'ы staged-пробой (ping/ssh), на падении открывает инцидент (`services/diagnostics_state.should_diagnose` = одна диагностика на инцидент), шлёт говорящий пуш и enqueue'ит on-host диагноз; на recovery закрывает инцидент. Анти-голодание (аудит-фикс #95): цели обходятся в порядке `last_probe_at` ASC NULLS FIRST (самые давно не пробованные первыми), поэтому хвост, обрезанный wall-clock бюджетом `NODE_REACHABILITY_BUDGET_SEC`, идёт первым в следующем тике; гейдж `vpn_reachability_stale_targets` (+`summary.stale_targets`) показывает число целей без проба дольше `NODE_REACHABILITY_STALE_MIN` (30 мин) — стабильно >0 значит бюджета не хватает на флот. Подробнее — `docs/operations/diagnostics.md` § Overhaul.
 
@@ -319,7 +323,10 @@ Fallback на Redis **не залипает**: `queue.get_redis` кешируе�
   + пишет `WORKER_REPLICAS=N` в `.env` (чтобы пережило plain `docker compose up`).
   Docker-команда исполняется **на хосте**, так что даже scale-DOWN, убивающий
   этот же worker, доходит до конца.
-- API коротко (≤30с) ждёт результат job'а → отдаёт `applied/failed/enqueued`.
+- API коротко (окно `OPS_SCALE_WAIT_SECONDS`, дефолт 5с) ждёт результат job'а →
+  отдаёт `applied/failed/enqueued`. Окно узкое намеренно: sleep-поллинг держит
+  поток threadpool'а и DB-сессию запроса, а виджет и так дотягивает счётчик
+  собственным поллингом → не дождались = `enqueued`.
 
 Параметры (env воркера; дефолты под текущий prod): `MGMT_HOST` (иначе резолв
 из inventory `db_host→mgmt-1`), `MGMT_USER` (root), `MGMT_STACK_DIR`

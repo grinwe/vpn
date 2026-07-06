@@ -11,14 +11,22 @@ containment `@>`). Если match — пропускаем. Проверка и�
 получателю: достаточно того, что один админ в окне уже получил push —
 серия для остальных админов в том же окне не создаётся, иначе 3 админа
 × 50 юзеров = 150 пушей на один инцидент.
+
+Дедуп check-then-insert сериализуется между процессами (uvicorn-воркеры
++ RQ-воркеры) через `pg_advisory_xact_lock` по hash(action+needle) перед
+SELECT: иначе в burst-сценарии (массовое падение нод) два конкурентных
+события с одним needle оба прошли бы проверку и создали дубли серий.
+Лок снимается автоматически на commit/rollback транзакции (Postgres-only).
 """
 from __future__ import annotations
 
+import json
 import logging
 import os
 from datetime import timedelta
 from typing import Any
 
+from sqlalchemy import text as sql_text
 from sqlalchemy.orm import Session
 
 from .. import models
@@ -99,6 +107,20 @@ def notify_admins(
 
     cutoff = utcnow() - timedelta(seconds=window)
     needle: dict[str, Any] = {"kind": kind, **dedup_key}
+
+    # #125 — check-then-insert дедупа гонится между процессами (uvicorn-
+    # воркеры + RQ-воркеры): два события с одним needle в burst-сценарии
+    # оба пройдут SELECT и оба создадут серии. Берём xact-advisory-lock по
+    # hash(action_name + needle) ДО проверки — так конкурентные вставки
+    # одного needle сериализуются, а лок сам снимется на commit/rollback.
+    # Только для Postgres (в тестах/проде — pg); на прочих диалектах молча
+    # пропускаем, дедуп остаётся best-effort.
+    if db.bind is not None and db.bind.dialect.name == "postgresql":
+        lock_needle = action_name + json.dumps(needle, sort_keys=True)
+        db.execute(
+            sql_text("SELECT pg_advisory_xact_lock(hashtextextended(:n, 0))"),
+            {"n": lock_needle},
+        )
 
     # JSONB containment: `AuditLog.extra @> needle`. SQLAlchemy JSONB-
     # comparator.contains() → "@>". Любое соответствие в окне — серию

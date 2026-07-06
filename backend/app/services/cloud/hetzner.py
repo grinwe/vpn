@@ -21,14 +21,27 @@ POLL_INTERVAL = 3  # seconds between status polls
 
 
 def _monthly_price(server: dict) -> float | None:
-    """Месячная цена из server_type.prices (gross). None — если не распарсилась."""
+    """Месячная цена из server_type.prices (gross). None — если не распарсилась.
+
+    У Hetzner ``prices`` — массив ПО ЛОКАЦИЯМ, и цена одного и того же типа
+    сервера различается между локациями (напр. ashburn vs fsn1). Берём элемент
+    с ``location`` == фактическая локация сервера (``datacenter.location.name``),
+    а не произвольный первый — иначе в monthly_cost попадёт чужая цифра.
+    """
     try:
+        prices = (server.get("server_type") or {}).get("prices") or []
+        if not prices:
+            return None
+        # Фактическая локация размещения сервера (из ответа API по этому серверу).
+        loc = (
+            ((server.get("datacenter") or {}).get("location") or {}).get("name")
+        )
+        price = next(
+            (p for p in prices if p.get("location") == loc),
+            prices[0],  # страховка: формат сменился или локация не совпала
+        )
         return float(
-            (server.get("server_type") or {})
-            .get("prices", [{}])[0]
-            .get("price_monthly", {})
-            .get("gross")
-            or 0
+            (price.get("price_monthly") or {}).get("gross") or 0
         ) or None
     except Exception:  # noqa: BLE001
         return None

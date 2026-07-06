@@ -166,6 +166,19 @@ def _probe_ssh(host: str, ssh_port: int) -> tuple[bool, Check]:
             pass
 
 
+def _resolve_host_ips(host: str) -> set[str]:
+    """Все IP (v4/v6) для ``host`` через ``getaddrinfo``.
+
+    Пустой set при ошибке резолва. Если ``host`` уже IP-литерал —
+    ``getaddrinfo`` вернёт его же, так что вызывающий получит {host}.
+    """
+    try:
+        infos = socket.getaddrinfo(host, None)
+    except (socket.gaierror, OSError):
+        return set()
+    return {info[4][0] for info in infos}
+
+
 def _probe_traceroute(host: str, *, max_hops: int = 12, wait_s: int = 2) -> Check:
     cmd = ["traceroute", "-n", "-m", str(max_hops), "-w", str(wait_s), host]
     try:
@@ -183,11 +196,26 @@ def _probe_traceroute(host: str, *, max_hops: int = 12, wait_s: int = 2) -> Chec
         m = re.match(r"\s*(\d+)", ln)
         if m:
             last_responding = int(m.group(1))
-    reached = bool(hop_lines) and host in hop_lines[-1]
+    # host у нод — как правило FQDN, а вывод traceroute с ``-n`` числовой:
+    # доменное имя в последнем hop'е не встретится НИКОГДА, и сравнение
+    # ``host in hop`` давало ложное «трасса НЕ доходит» на любой доменной
+    # ноде (finding #103). Сравниваем по резолвнутым IP; при провале резолва
+    # деградируем в старое строковое сравнение и помечаем это в message.
+    target_ips = _resolve_host_ips(host)
+    resolve_failed = not target_ips
+    last_hop = hop_lines[-1] if hop_lines else ""
+    if not hop_lines:
+        reached = False
+    elif target_ips:
+        reached = any(ip in last_hop for ip in target_ips)
+    else:
+        reached = host in last_hop
     status = "info" if reached else "warn"
     msg = f"{len(hop_lines)} hops, последний отвечающий — hop {last_responding}"
     if not reached:
         msg += "; трасса НЕ доходит до host"
+        if resolve_failed:
+            msg += " (резолв имени не удался — сравнение по строке)"
     return _check("traceroute", status, message=msg, details={"raw": out[-800:]})
 
 

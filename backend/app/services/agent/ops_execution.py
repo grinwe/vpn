@@ -485,6 +485,15 @@ def _exec_order_node(
             db.rollback()
         except Exception:  # noqa: BLE001 — rollback не должен маскировать исходную ошибку
             logger.warning("ops: rollback после сбоя заказа не удался", exc_info=True)
+        # Полный трейсбек — во внутренний лог (денежная операция с частичными
+        # эффектами: часть нод уже оплачена; для драйверных багов вроде KeyError
+        # в парсинге ответа API без стектрейса причину не восстановить).
+        # В результат плана уходит только redact-строка для UI.
+        logger.exception(
+            "ops execute: node order failed after %d created (plan #%s)",
+            len(created),
+            plan_id,
+        )
         return created, _runtime.redact(f"{type(exc).__name__}: {exc}")
     return created, None
 

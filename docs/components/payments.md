@@ -134,7 +134,7 @@ SBP_<SLUG>_PAID_STATUSES         ← default "paid,success,succeeded"
 
 `return_url` передаётся только в CryptoBot и только как `paid_btn_url` (кнопка «Return to bot» после оплаты). Stars игнорирует, SBP — тоже, потому что его UX мы не контролируем.
 
-Особенность: **один invoice может получить несколько Payment-строк**. Если пользователь дважды нажал checkout, каждый вызов создаст свой `Payment` с новым `external_id`. Старые — остаются `pending`. Webhook с конкретным `external_id` попадёт в правильную строку, потому что ищется `order_by(Payment.id.desc()).first()` и `provider == event.provider` (см. ниже).
+Особенность: **один invoice может получить несколько Payment-строк**. Если пользователь дважды нажал checkout, каждый вызов создаст свой `Payment` с новым `external_id` (id счёта на стороне провайдера). Webhook помечает `paid` именно ту строку, которую реально оплатили: среди `pending`-строк по `(invoice_id, provider)` ищется та, чей `external_id` совпал с provider invoice id из события (извлекается из `event.raw`, т.к. `event.external_id` — это НАШ внутренний invoice id), с фолбэком на последнюю `pending`, а если pending-строк нет — на последнюю любую (#117, см. ниже).
 
 ## `/api/payments/webhook/{provider_name}` — приём callback'а
 
@@ -176,9 +176,12 @@ POST /api/payments/webhook/sbp:robokassa
              notify_admins + HTTPException 409, счёт остаётся pending
                │
                ▼
-       pending_payment = SELECT p FROM payments
-             WHERE invoice_id=? AND provider=?
-             ORDER BY id DESC LIMIT 1
+       pending_payment = SELECT p FROM payments             (#117)
+             WHERE invoice_id=? AND provider=? AND status='pending'
+             ORDER BY id DESC
+             → предпочесть p.external_id == provider_invoice_id(event.raw)
+             → иначе последнюю pending
+             → иначе (нет pending) последнюю любую
                │
                ▼
        _mark_invoice_paid_core(
@@ -293,7 +296,7 @@ bot/handlers.py                                   │
 ## ⚠️ Неясные места
 
 - **Random rotation без веса.** `pick_provider_name` — чистый `random.choice`. Нельзя настроить «80% CryptoBot, 20% SBP», нельзя выключить провайдер для конкретного плана, нельзя упасть обратно на резерв при сбое. Если CryptoBot лёг — `/checkout` будет рандомно успех/502 пока оператор не поправит `.env`.
-- **`Payment.external_id` не уникален.** Схема позволяет два `Payment` с одним `(provider, external_id)` для одного `Invoice` — если кто-то дважды нажал checkout. Webhook найдёт последний по `ORDER BY id DESC` — старшие `Payment`-ы так и останутся `pending` навсегда. Чистильщика нет.
+- **Дубли `Payment` при двойном checkout.** Один `Invoice` может получить несколько `Payment`-строк (каждый checkout создаёт свою с уникальным provider `external_id`). Webhook помечает `paid` ту строку, чей `external_id` совпал с provider invoice id из события (#117), поэтому сверка с провайдером сходится; но неоплаченные дубли так и остаются `pending` навсегда — отдельного чистильщика нет.
 - **Webhook rate-limit 30/min** (`api.py:2640`) — общий на все провайдеры. Если CryptoBot начнёт агрессивно ретраить, он съест budget SBP'шных уведомлений. Индивидуальных лимитов нет.
 - **Generic SBP template mode.** `PAY_URL_TEMPLATE` — чистый `str.format`, без проверки, что полученный URL вообще валиден для HTTP. Опечатка в env → пользователь получит битую ссылку без ошибки на стороне backend'а.
 - **`verify_webhook` у Stars принимает любой currency только через ручную проверку.** `raise` срабатывает только если `sp.currency != "XTR"` — а если поле отсутствует, используется fallback `"XTR"` (`telegram_stars.py:114`). Это нужно, потому что forward от бота иногда не содержит currency, но делает провайдер чуть слепее, чем хотелось бы.

@@ -13,6 +13,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query
+from pydantic import BaseModel, StrictBool
 from sqlalchemy import func, or_
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
@@ -728,10 +729,18 @@ def enable_node_auto_diagnose(
     return {"node_id": node.id, "auto_diagnose_disabled_at": None}
 
 
+class NodeActiveIn(BaseModel):
+    # StrictBool (не bool): без него FastAPI-парс dict давал bool("false")==True,
+    # т.е. curl-скрипт с {"is_active": "false"} НЕВЕРНО включал ноду и заодно
+    # сбрасывал cooldown_until/suspect_since/blocked_regions. StrictBool
+    # принимает только JSON true/false, строку/число отвергает 422-ой.
+    is_active: StrictBool
+
+
 @router.post("/nodes/{node_id}/active", response_model=schemas.VPNNodeOut)
 def set_node_active(
     node_id: int,
-    body: dict,
+    payload: NodeActiveIn,
     db: Session = Depends(get_db),
     admin_token: str = Depends(require_admin),
     admin_actor: str | None = Header(default=None, alias=ADMIN_ACTOR_HEADER),
@@ -755,9 +764,7 @@ def set_node_active(
     node = db.get(models.VPNNode, node_id)
     if not node:
         raise HTTPException(404, "Node not found")
-    if "is_active" not in body:
-        raise HTTPException(400, "is_active required")
-    next_active = bool(body["is_active"])
+    next_active = payload.is_active
     cleared: list[str] = []
     if next_active:
         if node.cooldown_until is not None:
@@ -787,10 +794,16 @@ def set_node_active(
 _ALLOWED_STATUS_OVERRIDES = {"active", "error", "disabled"}
 
 
+class NodeStatusIn(BaseModel):
+    # str-схема вместо сырого dict: гарантирует, что status пришёл строкой
+    # (bool/число/список → 422), дальше явный whitelist по значению.
+    status: str
+
+
 @router.patch("/nodes/{node_id}/status", response_model=schemas.VPNNodeOut)
 def set_node_status(
     node_id: int,
-    body: dict,
+    payload: NodeStatusIn,
     db: Session = Depends(get_db),
     admin_token: str = Depends(require_admin),
     admin_actor: str | None = Header(default=None, alias=ADMIN_ACTOR_HEADER),
@@ -808,7 +821,7 @@ def set_node_status(
     node = db.get(models.VPNNode, node_id)
     if not node:
         raise HTTPException(404, "Node not found")
-    raw = body.get("status")
+    raw = payload.status
     if not raw or raw not in _ALLOWED_STATUS_OVERRIDES:
         raise HTTPException(
             400,

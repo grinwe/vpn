@@ -45,7 +45,17 @@ QUEUE_NAME = os.getenv("RQ_QUEUE", "vpn-provisioning")
 # на QUEUE_NAME без scheduler'а. RQScheduler держит lock per-queue,
 # дублей ticks между двумя процессами не будет.
 TICKS_QUEUE_NAME = os.getenv("RQ_TICKS_QUEUE", "vpn-ticks")
-DEFAULT_JOB_TIMEOUT = int(os.getenv("RQ_JOB_TIMEOUT", "900"))  # seconds
+# audit #48 — job_timeout ДОЛЖЕН быть заметно больше самого долгого ansible-
+# таймаута, иначе RQ убивает джобу сигналом РАНЬШЕ, чем завершится плейбук:
+# оставленный ansible-процесс продолжает конфигурить ноду сиротой, а Retry
+# запускает ВТОРОЙ прогон на ту же ноду параллельно с недобитым. Самый долгий
+# прогон — site.yml (провижининг ноды) с timeout=900с (см.
+# provisioning._execute_task), плюс джоба тратит время ДО run_playbook: ожидание
+# _ansible_semaphore (до 3 параллельных прогонов → соседи могут держать слот
+# минуты) и ssh-key bootstrap по паролю. Дефолт = 900(site) + 900(запас на
+# очередь/семафор/пост-обработку) = 1800с. Меняешь site.yml timeout — подними и
+# это (инвариант: RQ_JOB_TIMEOUT > max(playbook timeout) + запас).
+DEFAULT_JOB_TIMEOUT = int(os.getenv("RQ_JOB_TIMEOUT", "1800"))  # seconds
 # RQ keeps failed jobs in a dead-letter-ish "failed" registry; we keep them
 # around for a week so ops can inspect them.
 FAILED_TTL = int(os.getenv("RQ_FAILED_TTL", "604800"))

@@ -955,6 +955,173 @@ def run_warm_pool_check() -> dict:
     return summary
 
 
+def run_warm_pool_revoke_tick() -> dict:
+    """Стадия 2 отзыва warm-пула — физически снять revoked-бандлы с нод.
+
+    Драйвер для ``warm_pool.run_warm_pool_revoke_sweep``: находит уникальные
+    ``(node_id, access_username)`` в ``pool_state=revoked`` (и юзер-отвязанные,
+    и брошенные ``invalidate_node_warm_pool``) и гоняет ``state=absent`` по
+    каждому, батчем ``WARM_POOL_REVOKE_BATCH_PER_TICK``. Без этого тика
+    revoked-identity копятся вечно и в конфиге xray (лишние клиенты), и
+    revoked-строками в БД (finding #71). Sweep сам делает back-off после
+    ``WARM_POOL_REVOKE_MAX_ATTEMPTS`` провалов, чтобы не молотить мёртвую ноду.
+
+    Self-reschedules через ``WARM_POOL_REVOKE_INTERVAL`` (default 300s).
+    Disabled при 0 или ``WARM_POOL_ENABLED=0``.
+    """
+    from .db import SessionLocal
+    from .queue import schedule_tick
+    from .services import warm_pool
+
+    # Reschedule в начале — см. run_pending_rescue_tick. Sweep ходит по
+    # нодам ansible'ом и может зависнуть на SSH, поэтому reschedule ДО работы.
+    interval = _env_int("WARM_POOL_REVOKE_INTERVAL", 300)
+    if interval > 0:
+        try:
+            schedule_tick(
+                "app.worker.run_warm_pool_revoke_tick",
+                interval,
+                tick_id="tick-warm-pool-revoke",
+                replace=True,
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("warm_pool_revoke: failed to re-enqueue tick (at start)")
+
+    session = SessionLocal()
+    summary: dict = {}
+    try:
+        summary = warm_pool.run_warm_pool_revoke_sweep(session)
+    except Exception:  # noqa: BLE001
+        logger.exception("warm_pool_revoke: sweep failed")
+        # Ре-бросаем — см. run_renewal_check: падение тика уходит в failed → /ops.
+        raise
+    finally:
+        session.close()
+
+    return summary
+
+
+def run_retention_tick() -> dict:
+    """Периодическая очистка безлимитно растущих таблиц (finding #247).
+
+    Две таблицы пишутся в горячих путях и растут без потолка:
+      * ``audit_logs`` — ``subscription_fetch`` на каждый фетч сабы (клиенты
+        рефрешат ссылку каждые ~6ч) + ``*:delivered`` маркеры доставки
+        уведомлений (дедуп по ним живёт лишь в узком окне продлений/триала);
+      * ``node_traffic_samples`` — по строке на ноду каждые 5 мин с тяжёлым
+        JSONB (детекторам нужны лишь последние тики/часы).
+
+    Чистим строки старше N дней БАТЧАМИ (``id IN (SELECT id … LIMIT batch)``,
+    коммит после каждого батча), чтобы не держать долгий лок на таблице.
+    Прочие audit-события (провижининг, действия админов, DLQ и т.п.) НЕ
+    трогаем — только высокочастотный шум. Индексы на ``created_at`` /
+    ``observed_at`` (миграции 0019/0056) делают выборку батча дешёвой.
+
+    Env:
+      RETENTION_INTERVAL               default 86400 (раз в сутки), 0 = off
+      AUDIT_LOG_RETENTION_DAYS         default 90, 0 = не чистить audit_logs
+      TRAFFIC_SAMPLE_RETENTION_DAYS    default 30, 0 = не чистить сэмплы
+      RETENTION_DELETE_BATCH           default 10000 (строк на батч)
+      RETENTION_MAX_BATCHES            default 200 (потолок батчей/таблицу/тик)
+    Self-reschedules.
+    """
+    from datetime import timedelta
+
+    from sqlalchemy import or_
+
+    from . import models
+    from .db import SessionLocal
+    from .queue import schedule_tick
+    from .time_utils import utcnow
+
+    # Reschedule в начале — см. run_pending_rescue_tick.
+    interval = _env_int("RETENTION_INTERVAL", 86400)
+    if interval > 0:
+        try:
+            schedule_tick(
+                "app.worker.run_retention_tick",
+                interval,
+                tick_id="tick-retention",
+                replace=True,
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("retention: failed to re-enqueue tick (at start)")
+
+    audit_days = _env_int("AUDIT_LOG_RETENTION_DAYS", 90)
+    traffic_days = _env_int("TRAFFIC_SAMPLE_RETENTION_DAYS", 30)
+    batch = max(1, _env_int("RETENTION_DELETE_BATCH", 10000))
+    max_batches = max(1, _env_int("RETENTION_MAX_BATCHES", 200))
+    now = utcnow()
+    summary = {"audit_deleted": 0, "traffic_deleted": 0}
+
+    session = SessionLocal()
+    try:
+        def _bulk_delete_by_ids(model, ids) -> int:
+            return (
+                session.query(model)
+                .filter(model.id.in_(ids))
+                .delete(synchronize_session=False)
+            )
+
+        # ── audit_logs: subscription_fetch + *:delivered старше N дней ──
+        if audit_days > 0:
+            cutoff = now - timedelta(days=audit_days)
+            cond = or_(
+                models.AuditLog.action == "subscription_fetch",
+                models.AuditLog.action.like("%:delivered"),
+            )
+            for _ in range(max_batches):
+                ids = [
+                    row[0]
+                    for row in session.query(models.AuditLog.id)
+                    .filter(models.AuditLog.created_at < cutoff)
+                    .filter(cond)
+                    .limit(batch)
+                    .all()
+                ]
+                if not ids:
+                    break
+                summary["audit_deleted"] += _bulk_delete_by_ids(models.AuditLog, ids)
+                session.commit()
+                if len(ids) < batch:
+                    break
+
+        # ── node_traffic_samples старше N дней (весь флот) ──
+        if traffic_days > 0:
+            cutoff = now - timedelta(days=traffic_days)
+            for _ in range(max_batches):
+                ids = [
+                    row[0]
+                    for row in session.query(models.NodeTrafficSample.id)
+                    .filter(models.NodeTrafficSample.observed_at < cutoff)
+                    .limit(batch)
+                    .all()
+                ]
+                if not ids:
+                    break
+                summary["traffic_deleted"] += _bulk_delete_by_ids(
+                    models.NodeTrafficSample, ids
+                )
+                session.commit()
+                if len(ids) < batch:
+                    break
+    except Exception:  # noqa: BLE001
+        logger.exception("retention: tick failed")
+        if session.is_active:
+            session.rollback()
+        # Ре-бросаем — см. run_renewal_check: падение тика уходит в failed → /ops.
+        raise
+    finally:
+        session.close()
+
+    if summary["audit_deleted"] or summary["traffic_deleted"]:
+        logger.info(
+            "retention: удалено audit_logs=%s node_traffic_samples=%s",
+            summary["audit_deleted"], summary["traffic_deleted"],
+        )
+    return summary
+
+
 _LOW_BALANCE_THRESHOLD_DAYS = _env_int("LOW_BALANCE_WARN_DAYS", 3)
 
 
@@ -1774,6 +1941,38 @@ def run_relay_link_health_tick() -> dict:
     return summary
 
 
+def _incident_auto_close_blocked(target, now) -> bool:
+    """True → инцидент НЕЛЬЗЯ автозакрывать по ssh_ok/реконсайлу (finding #98).
+
+    ``close_incident`` обнуляет ``diagnose_acked_at`` и ``diagnose_follow_mode``.
+    Для двух случаев это стирает значимое состояние и делает кнопки крауд-пуша
+    нефункциональными:
+
+      * оператор явно взял инцидент в работу — ``ack`` (``diagnose_acked_at``
+        свежее открытия) или ``follow`` (``diagnose_follow_mode=='exponential'``);
+      * крауд-инцидент: нода выведена из пула по жалобам юзеров
+        (``cooldown_until`` в будущем). SSH к такой ноде здоров КАЖДЫЙ тик —
+        юзеров блокирует DPI/РКН, а не контроллера, — поэтому ssh_ok-ветка без
+        этого гварда закрывала бы крауд-инцидент немедленно, стирая нажатый
+        оператором ack/follow, и порог заново пушил бы после cooldown, как
+        будто оператор ничего не жал.
+
+    Ручной close (кнопка оператора) идёт мимо этого гварда — оператор всегда
+    может закрыть инцидент сам. ``cooldown_until`` есть только у ``VPNNode``;
+    у ``WGExitNode`` его нет — ``getattr`` вернёт None и ветка не сработает.
+    """
+    incident_open = getattr(target, "diagnose_incident_open_at", None)
+    if incident_open is None:
+        return False
+    acked = getattr(target, "diagnose_acked_at", None)
+    if acked is not None and acked >= incident_open:
+        return True
+    if getattr(target, "diagnose_follow_mode", None) == "exponential":
+        return True
+    cooldown_until = getattr(target, "cooldown_until", None)
+    return cooldown_until is not None and cooldown_until > now
+
+
 def run_node_reachability_tick() -> dict:
     """Controller→host reachability for ALL active VPN nodes + WG exits.
 
@@ -1868,6 +2067,10 @@ def run_node_reachability_tick() -> dict:
         recon_now = utcnow()
         recon_max_age = float(os.getenv("NODE_INCIDENT_RECONCILE_MAX_AGE_MIN", "30"))
         for kind, target in targets:
+            # Крауд-инцидент / взятый оператором в работу не реконсилим:
+            # close стёр бы ack/follow (finding #98). Оператор закрывает вручную.
+            if _incident_auto_close_blocked(target, recon_now):
+                continue
             if diagnostics_state.reconcile_healthy_incident(
                 target, now=recon_now, max_age_min=recon_max_age
             ):
@@ -1921,8 +2124,12 @@ def run_node_reachability_tick() -> dict:
                 target.last_probe_at = now
                 target.last_probe_status = "ok"
                 target.unreachable_since = None  # серия прервалась — сброс
-                if diagnostics_state.close_incident(target):
-                    summary["recovered"].append(ref)
+                # ssh_ok у крауд-заблокированной ноды true КАЖДЫЙ тик (DPI
+                # блокирует юзеров, не контроллера). Без гварда close_incident
+                # стирал бы операторский ack/follow немедленно (finding #98).
+                if not _incident_auto_close_blocked(target, now):
+                    if diagnostics_state.close_incident(target):
+                        summary["recovered"].append(ref)
                 session.commit()
                 continue
 
@@ -2838,6 +3045,25 @@ def main() -> None:
         except Exception:  # noqa: BLE001
             logger.exception("Failed to schedule warm pool check")
 
+    # Warm-pool revoke sweep (stage 2) — физически снимает revoked-бандлы с
+    # нод, иначе брошенные identity копятся в xray-конфиге и revoked-строками
+    # в БД (finding #71). Интервал WARM_POOL_REVOKE_INTERVAL (default 300s).
+    warm_revoke_interval = _env_int("WARM_POOL_REVOKE_INTERVAL", 300)
+    if do_bootstrap and warm_revoke_interval > 0 and warm_enabled:
+        try:
+            schedule_tick(
+                "app.worker.run_warm_pool_revoke_tick",
+                min(warm_revoke_interval, 60),
+                tick_id="tick-warm-pool-revoke",
+                replace=True,
+            )
+            logger.info(
+                "Warm pool revoke sweep bootstrapped: first run in 60s (interval=%ss)",
+                warm_revoke_interval,
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("Failed to schedule warm pool revoke sweep")
+
     # Schedule balance charge tick (default: hourly). Stage 4 — drives
     # daily-billing ticks for balance subscriptions and auto-unfreezes
     # paused ones whose frozen_until has lapsed.
@@ -2975,6 +3201,24 @@ def main() -> None:
             )
         except Exception:  # noqa: BLE001
             logger.exception("Failed to schedule ops-plan reaper tick")
+
+    # Retention — очистка безлимитно растущих audit_logs / node_traffic_samples
+    # (finding #247). Раз в сутки по умолчанию; RETENTION_INTERVAL=0 → off.
+    retention_interval = _env_int("RETENTION_INTERVAL", 86400)
+    if do_bootstrap and retention_interval > 0:
+        try:
+            schedule_tick(
+                "app.worker.run_retention_tick",
+                min(retention_interval, 300),
+                tick_id="tick-retention",
+                replace=True,
+            )
+            logger.info(
+                "Retention tick bootstrapped: first run in %ss (interval=%ss)",
+                min(retention_interval, 300), retention_interval,
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("Failed to schedule retention tick")
 
     worker = Worker(
         queues_to_listen,

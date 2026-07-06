@@ -147,7 +147,6 @@ class VPNConfigUpdate(BaseModel):
     fallback: str | None = None
     settings: dict[str, Any] | None = None
     is_enabled: bool | None = None
-    protocol: str | None = None
     # Optional — if sent, backend verifies it matches the existing
     # protocol (defensive; the UI passes it for readability).
     protocol: str | None = None
@@ -733,7 +732,9 @@ class HealthProbeIn(BaseModel):
     details: dict[str, Any] | None = None
 
 
-class NodeTrafficSample(BaseModel):
+# Переименовано из NodeTrafficSample: имя коллизировало с ORM-моделью
+# models.NodeTrafficSample (снапшот xray-статистики ноды) при разной семантике.
+class NodeTrafficReportSample(BaseModel):
     access_username: str = Field(..., description="Device.access_username the counter belongs to")
     uplink_bytes: int = Field(..., ge=0)
     downlink_bytes: int = Field(..., ge=0)
@@ -746,7 +747,7 @@ class NodeTrafficReport(BaseModel):
         ge=1,
         description="Length of the accounting window the samples cover, for diagnostics only",
     )
-    samples: List[NodeTrafficSample]
+    samples: List[NodeTrafficReportSample]
 
 
 class NodeTrafficSubscriptionResult(BaseModel):

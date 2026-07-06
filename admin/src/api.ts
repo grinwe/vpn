@@ -31,21 +31,46 @@ export class ApiError extends Error {
   }
 }
 
+// Дефолтный таймаут запроса. 60с покрывает синхронные тяжёлые эндпоинты
+// (migrate/bootstrap упираются в ansible/SSH), но не даёт мутации висеть в
+// isPending вечно, если бэкенд/прокси залипли — иначе кнопка остаётся
+// задизейбленной без сообщения. Переопределяется через 4-й аргумент api.*.
+const DEFAULT_TIMEOUT_MS = 60_000;
+
 async function request<T>(
   method: string,
   path: string,
-  body?: unknown
+  body?: unknown,
+  timeoutMs: number = DEFAULT_TIMEOUT_MS,
 ): Promise<T> {
   const headers: Record<string, string> = {};
   const token = getToken();
   if (token) headers["X-Admin-Token"] = token;
   if (body !== undefined) headers["Content-Type"] = "application/json";
 
-  const res = await fetch(`/api${path}`, {
-    method,
-    headers,
-    body: body === undefined ? undefined : JSON.stringify(body),
-  });
+  let res: Response;
+  try {
+    res = await fetch(`/api${path}`, {
+      method,
+      headers,
+      body: body === undefined ? undefined : JSON.stringify(body),
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+  } catch (e) {
+    // Сюда попадают ТОЛЬКО сетевые сбои и аборт по таймауту — HTTP-статусы
+    // 4xx/5xx fetch не реджектит, они разбираются ниже по res.ok. status=0
+    // сигналит «до бэкенда не дошло», чтобы UI не путал это с ответом сервера.
+    if (e instanceof DOMException && e.name === "TimeoutError") {
+      throw new ApiError(
+        0,
+        `таймаут запроса — бэкенд не ответил за ${Math.round(timeoutMs / 1000)}с`,
+      );
+    }
+    if (e instanceof TypeError) {
+      throw new ApiError(0, "сеть недоступна / бэкенд не отвечает");
+    }
+    throw e;
+  }
 
   if (!res.ok) {
     let message = res.statusText;
@@ -68,12 +93,20 @@ async function request<T>(
   return (await res.json()) as T;
 }
 
+// Опциональный timeoutMs — для заведомо долгих вызовов (напр. синхронный
+// bootstrap/reinstall). undefined → DEFAULT_TIMEOUT_MS (default-параметр
+// request срабатывает именно на undefined).
 export const api = {
-  get: <T>(path: string) => request<T>("GET", path),
-  post: <T>(path: string, body?: unknown) => request<T>("POST", path, body),
-  put: <T>(path: string, body?: unknown) => request<T>("PUT", path, body),
-  patch: <T>(path: string, body?: unknown) => request<T>("PATCH", path, body),
-  del: <T>(path: string) => request<T>("DELETE", path),
+  get: <T>(path: string, timeoutMs?: number) =>
+    request<T>("GET", path, undefined, timeoutMs),
+  post: <T>(path: string, body?: unknown, timeoutMs?: number) =>
+    request<T>("POST", path, body, timeoutMs),
+  put: <T>(path: string, body?: unknown, timeoutMs?: number) =>
+    request<T>("PUT", path, body, timeoutMs),
+  patch: <T>(path: string, body?: unknown, timeoutMs?: number) =>
+    request<T>("PATCH", path, body, timeoutMs),
+  del: <T>(path: string, timeoutMs?: number) =>
+    request<T>("DELETE", path, undefined, timeoutMs),
 };
 
 // ---- Types mirrored from backend/app/schemas.py ----

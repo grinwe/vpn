@@ -26,6 +26,30 @@ from .invoices import _mark_invoice_paid_core
 router = APIRouter()
 
 
+def _provider_invoice_id_from_event(event) -> str | None:
+    """Достать id счёта НА СТОРОНЕ провайдера из сырого события (аудит #117).
+
+    Внимание: ``event.external_id`` у всех драйверов — это НАШ внутренний
+    invoice id (round-trip через ``payload``), а в ``Payment.external_id``
+    лежит id счёта, выданный провайдером. При двойном checkout по одному
+    счёту создаётся несколько Payment-строк с разными provider external_id,
+    поэтому по ``event.external_id`` нужную строку не отличить. Ищем
+    provider invoice id в известных местах ``raw`` (best-effort): если не
+    нашли — вызывающий откатывается на «последнюю pending».
+    """
+    raw = getattr(event, "raw", None)
+    if not isinstance(raw, dict):
+        return None
+    # cryptobot: {"update_type": ..., "payload": {"invoice_id": <id провайдера>,
+    #             "payload": "<наш invoice id>"}}
+    inner = raw.get("payload")
+    if isinstance(inner, dict):
+        pid = inner.get("invoice_id")
+        if pid:
+            return str(pid)
+    return None
+
+
 def _norm_currency(currency: str | None) -> str:
     """Нормализовать код валюты для сравнения (аудит #111).
 
@@ -323,15 +347,35 @@ async def payment_webhook(
                     )
 
         # Lock the invoice row and mark a Payment as paid if we have one.
-        pending_payment = (
-            db.query(models.Payment)
-            .filter(
-                models.Payment.invoice_id == invoice_id,
-                models.Payment.provider == provider.name,
-            )
-            .order_by(models.Payment.id.desc())
-            .first()
+        # #117: при двойном checkout по одному счёту существует несколько
+        # Payment-строк (каждая со своим provider external_id). Раньше брали
+        # просто последнюю по id — и paid мог получить НЕ та строка, которую
+        # реально оплатили, из-за чего сверка с провайдером по external_id
+        # расходилась. Теперь выбираем аккуратно:
+        #   1) среди pending-строк — ту, чей external_id совпал с provider
+        #      invoice id из события (если его удаётся извлечь из raw);
+        #   2) иначе — последнюю pending;
+        #   3) иначе (ретрай уже обработанного вебхука, pending-строк нет) —
+        #      последнюю любую, сохраняя прежнее поведение.
+        base_q = db.query(models.Payment).filter(
+            models.Payment.invoice_id == invoice_id,
+            models.Payment.provider == provider.name,
         )
+        pending_payments = (
+            base_q.filter(models.Payment.status == models.PaymentStatus.pending)
+            .order_by(models.Payment.id.desc())
+            .all()
+        )
+        prov_ext_id = _provider_invoice_id_from_event(event)
+        pending_payment = None
+        if prov_ext_id:
+            pending_payment = next(
+                (p for p in pending_payments if p.external_id == prov_ext_id), None
+            )
+        if pending_payment is None:
+            pending_payment = pending_payments[0] if pending_payments else None
+        if pending_payment is None:
+            pending_payment = base_q.order_by(models.Payment.id.desc()).first()
         payment_id = pending_payment.id if pending_payment else None
 
         result = _mark_invoice_paid_core(

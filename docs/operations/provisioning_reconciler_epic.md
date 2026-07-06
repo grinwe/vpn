@@ -67,10 +67,15 @@ generation сошёлся) — UI истории/прогресса живёт.
 - **Acceptance:** можно отменить pending (мгновенно) и running (SIGTERM, ≤5с).
 
 ### Phase 2 — Debounce window ✅ (flag-gated)
-- `node.reconcile_due_at`; edit ставит `due_at = now + Ns` вместо мгновенного
-  запуска; тик подбирает «созревшие». Burst коллапсит сам. `defer_bootstrap`
-  становится не нужен.
-- **Acceptance:** 10 правок за 3с → один прогон через ~Ns после последней.
+- `node.reconcile_due_at`; edit ставит `due_at = LEAST(coalesce(due_at, target),
+  target)`, где `target = now + Ns` — вместо мгновенного запуска; тик подбирает
+  «созревшие». Burst коллапсит сам. `defer_bootstrap` становится не нужен.
+- **Cap на debounce (audit #57):** `LEAST` сохраняет ПЕРВЫЙ вооружённый дедлайн —
+  без него поток правок чаще, чем раз в N секунд (bulk-скрипт, зацикленная
+  автоматика), отодвигал `due_at` вперёд бесконечно, и нода не сходилась вообще.
+  `desired_generation` при этом бампается на каждую правку (коалесинг цел).
+- **Acceptance:** 10 правок за 3с → один прогон через ~Ns после ПЕРВОЙ (не
+  последней) правки; поток правок не может отложить reconcile бесконечно.
 
 ### Phase 3 — Desired-state generations (сам reconciler) ✅ (flag-gated)
 - `VPNNode.desired_generation` / `reconciled_generation` / `reconcile_due_at`.

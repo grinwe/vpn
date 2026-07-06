@@ -227,7 +227,14 @@ def list_broadcasts(
 ):
     q = db.query(models.Broadcast)
     if status:
-        q = q.filter(models.Broadcast.status == status)
+        # Колонка status — native Postgres ENUM broadcast_status, поэтому
+        # сравнение с невалидной строкой упало бы в драйвере (500). Конвертируем
+        # в BroadcastStatus и отдаём 400 на мусорное значение — как list_invoices.
+        try:
+            broadcast_status = models.BroadcastStatus(status)
+        except ValueError as exc:  # noqa: BLE001
+            raise HTTPException(status_code=400, detail="Invalid status") from exc
+        q = q.filter(models.Broadcast.status == broadcast_status)
     total = q.count()
     rows = (
         q.order_by(models.Broadcast.created_at.desc())

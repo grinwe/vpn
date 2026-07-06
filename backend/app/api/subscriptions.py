@@ -166,6 +166,13 @@ def bulk_regenerate_sublink(
                 # run. Roll back its partial state so the session is clean
                 # for the next sub, and surface it for the operator.
                 db.rollback()
+                # str(exc) в ответе эфемерен — трейсбек в лог, иначе разбор
+                # «почему не перегенерировалось» упрётся в невоспроизводимость.
+                logger.exception(
+                    "bulk-regenerate-sublink: user %s sub %s failed",
+                    user.id,
+                    sub.id,
+                )
                 failed.append(
                     {"user_id": user.id, "subscription_id": sub.id, "error": str(exc)}
                 )
@@ -282,6 +289,12 @@ def bulk_rebuild_config(
                 n = orchestrator.rebuild_subscription_config_text(sub)
             except Exception as exc:  # noqa: BLE001
                 db.rollback()
+                # Трейсбек в лог — str(exc) в ответе не переживёт закрытия админки.
+                logger.exception(
+                    "bulk-rebuild-config: user %s sub %s failed",
+                    user.id,
+                    sub.id,
+                )
                 failed.append(
                     {"user_id": user.id, "subscription_id": sub.id, "error": str(exc)}
                 )
@@ -366,6 +379,13 @@ def bulk_migrate_auto(
                 # a DB/transient error on one sub must not abort the run.
                 # Roll back so the session is clean for the next sub.
                 db.rollback()
+                # Трейсбек в лог: str(exc) без него часто не даёт понять место
+                # падения (напр. SQLAlchemy-ошибка), а ответ API эфемерен.
+                logger.exception(
+                    "bulk-migrate-auto: user %s sub %s failed",
+                    user.id,
+                    sub.id,
+                )
                 failed.append(
                     {"user_id": user.id, "subscription_id": sub.id, "error": str(exc)}
                 )

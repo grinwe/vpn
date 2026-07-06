@@ -33,7 +33,7 @@ Fernet'ит секреты в БД) — отдельной vault-перемен�
 2. Resolve subscription (`subscription_id` для admin / Device by HMAC client_id для клиента).
 3. Если subscription не `active` → response `{action: "subscription_inactive"}`.
 4. Дедуп: за последние 5 мин уже мигрировали этого юзера? → `{action: "throttled"}`.
-5. `select_target_node`: healthy, active, NOT muted, NOT current, в том же pool. Если нет → `{action: "no_target_available"}` + audit_log `client_reported_failure_no_target`.
+5. `provisioning.choose_node`: healthy, active, NOT muted (legacy + diagnostics toggle), NOT в cooldown, NOT current, в том же pool. Если нет → `{action: "no_target_available"}` + audit_log `client_reported_failure_no_target`.
 6. `migrate_subscription_to_new_node(sub, target)` — preserve sub_token, новый ProvisioningTask.
 7. Audit: `action="client_reported_failure"` + metadata (kind, current/target node_id, task_id).
 8. Response: `{ok: true, action: "migrated", target_node_id, target_node_name, task_id}`.

@@ -312,6 +312,10 @@ function SubscriptionCard({
   }
 
   async function handleToggleAutoRenew() {
+    // Игнорируем клики, пока запрос в полёте: автопродление — денежная
+    // настройка, а быстрый двойной тап отправил бы два POST с одинаковым
+    // newValue (пропсы обновятся только после onRefresh) и тумблер бы скакал.
+    if (busy) return;
     const newValue = !extra?.auto_renew;
     if (!newValue && !confirm("Отключить автопродление? Подписка будет активна до конца оплаченного периода."))
       return;
@@ -455,7 +459,9 @@ function SubscriptionCard({
       {/* Auto-renew toggle */}
       {extra && !isFrozen && (
         <div
-          className="mt-3 flex items-center justify-between cursor-pointer"
+          className={`mt-3 flex items-center justify-between cursor-pointer ${
+            busy ? "opacity-50 pointer-events-none" : ""
+          }`}
           onClick={handleToggleAutoRenew}
         >
           <span className="text-sm">Автопродление</span>

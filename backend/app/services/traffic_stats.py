@@ -333,9 +333,20 @@ def collect_node_stats(node) -> NodeStatsResult:
         # install_sharing_enforcer/tasks/main.yml.
         if os.getenv("SHARING_ENFORCEMENT_ENABLED", "0") == "1":
             try:
+                # Атомарный забор лога: rename в уникальное имя (в пределах
+                # одной ФС rename(2) атомарен), затем читаем уже
+                # переименованный файл и удаляем его. Прежний
+                # `cat && truncate -s 0` терял события, дописанные энфорсером
+                # между cat и truncate. После mv энфорсер пересоздаёт
+                # оригинальный путь при следующей записи — гонка сужается до
+                # одного write, попавшего между read()+rename ядра, что
+                # практически недостижимо. $$ = PID удалённого shell'а,
+                # $RANDOM защищает от коллизии перекрывающихся тиков.
                 viol_cmd = (
-                    "cat /var/log/xray/sharing_violations.jsonl 2>/dev/null "
-                    "&& truncate -s 0 /var/log/xray/sharing_violations.jsonl 2>/dev/null"
+                    "f=/var/log/xray/sharing_violations.jsonl; "
+                    't=$f.reading.$$.$RANDOM; '
+                    'mv "$f" "$t" 2>/dev/null && cat "$t"; '
+                    'rm -f "$t" 2>/dev/null'
                 )
                 v_rc, v_out, _ = _ssh_run(client, viol_cmd)
                 if v_rc == 0 and v_out.strip():

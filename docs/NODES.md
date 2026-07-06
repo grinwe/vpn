@@ -117,6 +117,8 @@ Probe-agent ([probes/](../probes)) бежит из нескольких реги
    - Создаёт `ProvisioningTask(target_type=node, action=resync_vless, payload={clients: [{username, uuid}]})`, запускает `playbooks/resync_node.yml`.
    - Resync-таски **не флипают** `node.status` в `_handle_task_outcome` — ранний return по `task.action == "resync_vless"`, иначе upscale/bootstrap transition мог бы сломаться.
 
+3. **hysteria2 после reinstall (audit #78).** Auto-resync выше покрывает только vless-семейство. Пер-юзерные `hysteria2`-учётки (auth=userpass) после `reinstall_node` (диск стёрт) на ноду сами не возвращаются. Поэтому на **reinstall-bootstrap'е** (`task.payload.reinstall`) `_handle_task_outcome` дополнительно зовёт `resync_node_hysteria2_clients(node)`: для каждой активной hy2-учётки на ноде создаёт `device/apply`-таску с `protocols=[hysteria2]` и тем же паролем (парсится из URI) — `provision_device.yml` восстанавливает пользователя через `manage_hy2_user.sh add`, не трогая vless. Флаг `RESTORE_HY2_AFTER_REINSTALL=0` отключает (fallback — восстановить вручную по warning-логу `_warn_lost_hysteria2_users`). ShadowTLS сюда не входит: node-wide пароль восстанавливает сам `site.yml`. Warm-пул hy2-бандлы не покрываются (pool-miss, не user-facing).
+
 Операторский flow при подозрении на drift (ручная правка конфига, restore из бэкапа, половинчатый bootstrap, клиенты ловят `invalid request user id`):
 1. Нажать **resync** в Admin UI `/admin/nodes` (либо `curl -X POST /api/nodes/{id}/resync`).
 2. Смотреть прогресс в `/admin/tasks` (фильтр `target=node, action=resync_vless`). Успех → все UUID из БД снова в `config.json` на ноде.

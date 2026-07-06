@@ -116,7 +116,7 @@ def _prepare_database() -> Iterator[None]:
 
 
 # ---------------------------------------------------------------------------
-# Function-scoped: truncate all tables between tests.
+# Function-scoped: truncate all tables around each test.
 # ---------------------------------------------------------------------------
 @pytest.fixture(autouse=True)
 def _clean_tables() -> Iterator[None]:
@@ -124,15 +124,28 @@ def _clean_tables() -> Iterator[None]:
 
     from app.db import Base, engine
 
-    yield
+    def _truncate() -> None:
+        table_names = [t.name for t in reversed(Base.metadata.sorted_tables)]
+        if not table_names:
+            return
+        quoted = ", ".join(f'"{name}"' for name in table_names)
+        with engine.begin() as conn:
+            # RESTART IDENTITY so primary keys are deterministic across tests.
+            conn.execute(text(f"TRUNCATE {quoted} RESTART IDENTITY CASCADE"))
 
-    table_names = [t.name for t in reversed(Base.metadata.sorted_tables)]
-    if not table_names:
-        return
-    quoted = ", ".join(f'"{name}"' for name in table_names)
-    with engine.begin() as conn:
-        # RESTART IDENTITY so primary keys are deterministic across tests.
-        conn.execute(text(f"TRUNCATE {quoted} RESTART IDENTITY CASCADE"))
+    # Чистим ДО теста (находка 198): раньше TRUNCATE стоял только после yield,
+    # поэтому самый первый тест сессии видел сид-планы из миграции
+    # 0007_seed_plans (INSERT в plans при upgrade), а все последующие — уже
+    # пустую таблицу. Это скрытая зависимость от порядка прогона: добавление
+    # нового test-файла «раньше по алфавиту» молча меняло окружение чужого
+    # теста (например, _trial_plan берёт самый дешёвый видимый 30-дневный
+    # план). Гарантируем, что КАЖДЫЙ тест стартует с пустой БД, а сид-данные
+    # тесты создают сами через factories.make_plan.
+    _truncate()
+    yield
+    # И после — чтобы не оставлять мусор для внешних наблюдателей/следующей
+    # сессии, гоняющей без пересоздания схемы.
+    _truncate()
 
 
 # ---------------------------------------------------------------------------

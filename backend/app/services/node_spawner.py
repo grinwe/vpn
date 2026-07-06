@@ -301,7 +301,17 @@ def ensure_reality_config(
     public_key, private_key = generate_reality_keypair()
     short_id = generate_short_id()
     sni_value = sni or pick_reality_sni(db, node.region)
-    dest_value = dest or f"{sni_value}:443"
+    # audit #81 — REALITY_DEST env-ручка раньше читалась в DEFAULT_REALITY_DEST,
+    # но нигде не применялась (dest всегда уходил на sni:443) — обманчивый конфиг-
+    # контракт. Теперь при активном REALITY_SNI-override (dev/test форсит единый
+    # SNI) honor и REALITY_DEST: dest = DEFAULT_REALITY_DEST. Явный аргумент dest
+    # имеет приоритет; в проде (без env-override) поведение прежнее — sni:443.
+    if dest:
+        dest_value = dest
+    elif _REALITY_SNI_ENV_OVERRIDE:
+        dest_value = DEFAULT_REALITY_DEST
+    else:
+        dest_value = f"{sni_value}:443"
     cfg = models.VPNConfig(
         node_id=node.id,
         name=f"{node.name}-vless-reality",
@@ -1016,15 +1026,16 @@ def reinstall_node(
     sub-токены) и так валидны — нода вернётся той же.
 
     Reinstall стирает диск — пер-юзерных учёток на ноде не остаётся. После
-    успешного bootstrap авто-resync (``resync_node_clients``) возвращает их,
-    но покрывает ТОЛЬКО vless-семейство (reality/xhttp/ws_cdn). Пер-юзерные
-    hysteria2-учётки (auth=userpass) после reinstall на ноду НЕ возвращаются
-    (#78) — их владельцы молча теряют доступ (ссылка в подписке жива, сервер про
-    них не знает). ShadowTLS НЕ затронут: там общий node-wide пароль из
-    VPNConfig.settings, который site.yml восстанавливает сам. Ниже логируем
-    warning со списком затронутых hysteria2-пользователей, чтобы оператор
-    переспровижинил их вручную. Полный фикс — расширить ``resync_node_clients``
-    на hysteria2 (см. note аудита #78).
+    успешного bootstrap авто-resync возвращает их: vless-семейство
+    (reality/xhttp/ws_cdn) через ``resync_node_clients``, а пер-юзерные
+    hysteria2-учётки (auth=userpass) — через ``resync_node_hysteria2_clients``,
+    который бэкенд запускает в ``_handle_task_outcome`` на reinstall-bootstrap'е
+    (#78, флаг RESTORE_HY2_AFTER_REINSTALL, safe-default=вкл). ShadowTLS НЕ
+    затронут: там общий node-wide пароль из VPNConfig.settings, который site.yml
+    восстанавливает сам. Ниже всё равно логируем warning со списком hysteria2-
+    пользователей — если авто-restore частично не сработает (нет пароля/битая
+    строка), оператор увидит, кого переспровижинить вручную. Warm-пул hy2-
+    бандлы авто-restore не покрывает (pool-miss, не user-facing).
 
     Провайдер обязан уметь ``reinstall_server`` (capability-проверка через
     hasattr; напр. 4vps умеет, manual — нет)."""

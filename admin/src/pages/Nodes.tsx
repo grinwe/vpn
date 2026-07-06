@@ -2810,8 +2810,11 @@ function NodeConfigs({ nodeId, nodeHost }: { nodeId: number; nodeHost: string })
             {data.map((c) => {
               const isEditing = editingId === c.id;
               return (
-                <>
-                  <tr key={c.id} className="border-t border-slate-800">
+                // key на внешнем Fragment — иначе анонимный <> не принимает
+                // key и React рендерит список без ключей (audit #172): при
+                // удалении конфига раскрытая форма редактирования «переезжает».
+                <Fragment key={c.id}>
+                  <tr className="border-t border-slate-800">
                     <td className="py-1 font-mono">{c.name}</td>
                     <td className="font-mono text-slate-300">{c.protocol}</td>
                     <td className="font-mono">{c.port}</td>
@@ -2838,7 +2841,7 @@ function NodeConfigs({ nodeId, nodeHost }: { nodeId: number; nodeHost: string })
                     </td>
                   </tr>
                   {isEditing && (
-                    <tr key={`${c.id}-edit`} className="border-t border-slate-800 bg-slate-950/60">
+                    <tr className="border-t border-slate-800 bg-slate-950/60">
                       <td colSpan={6} className="p-2">
                         <EditConfigForm
                           nodeId={nodeId}
@@ -2848,7 +2851,7 @@ function NodeConfigs({ nodeId, nodeHost }: { nodeId: number; nodeHost: string })
                       </td>
                     </tr>
                   )}
-                </>
+                </Fragment>
               );
             })}
           </tbody>

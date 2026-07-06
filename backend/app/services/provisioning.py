@@ -107,11 +107,19 @@ def choose_node(
     ):
         if _disabled_col is not None:
             query = query.filter(_disabled_col.is_(None))
-    query = query.filter(
-        models.VPNNode.status.in_(
-            [models.VPNNodeStatus.active, models.VPNNodeStatus.registering]
-        )
-    )
+    # audit #72 — НЕ выдаём новых юзеров на ноду в статусе registering: у
+    # свежеспавненной ноды is_active=True выставляется сразу по получению IP
+    # (см. node_spawner.spawn_node / _finalize_spawn), но site.yml на ней ещё
+    # идёт (до 15 мин: xray, certbot). Холодный provision_device.yml на такой
+    # ноде падает («нет xray/manage-скриптов»), а warm-пул пуст — юзер получает
+    # деградированный онбординг ровно в час пик (автоскейл спавнит под наплыв
+    # покупок). Гейт: нода участвует в выборке ТОЛЬКО после успешного
+    # bootstrap'а, который переводит registering→active в _handle_task_outcome.
+    # Флаг CHOOSE_NODE_INCLUDE_REGISTERING=1 возвращает старое поведение.
+    _selectable_statuses = [models.VPNNodeStatus.active]
+    if os.getenv("CHOOSE_NODE_INCLUDE_REGISTERING", "0") == "1":
+        _selectable_statuses.append(models.VPNNodeStatus.registering)
+    query = query.filter(models.VPNNode.status.in_(_selectable_statuses))
     query = query.filter(
         (models.VPNNode.health_score.is_(None))
         | (models.VPNNode.health_score >= MIN_HEALTHY_SCORE)
@@ -795,6 +803,33 @@ _VLESS_FAMILY_PROTOS: frozenset[str] = frozenset({
 })
 
 
+def _maybe_inject_ssh_key(
+    host: str, password_enc: str | None, port: int | None, *, label: str
+) -> None:
+    """audit #245 — best-effort инъекция нашего provisioning-ключа по root-
+    паролю ПЕРЕД ansible-прогоном на cloud-нодах без инъекции ключа (4vps).
+    Иначе ansible не зайдёт (Permission denied (publickey,password)).
+    Идемпотентно: после первого bootstrap'а password-auth отключается →
+    повторная попытка просто отвалится (ключ уже стоит). НИКОГДА не валит
+    bootstrap. Вынесено из :meth:`_execute_task` (был дословный дубль для node
+    и exit — парные правки при смене порта/таймаута/условия).
+
+    ``label`` — для лога («node 42» / «exit 7»)."""
+    if not password_enc:
+        return
+    from ..security import decrypt
+    from .ssh_bootstrap import ensure_provisioning_key
+    try:
+        ensure_provisioning_key(
+            host, decrypt(password_enc) or "", port=port or 22
+        )
+    except Exception:  # noqa: BLE001
+        logger.exception(
+            "provisioning-key bootstrap failed for %s "
+            "(continuing — ansible will retry)", label,
+        )
+
+
 def _node_has_vless_family(node: models.VPNNode) -> bool:
     """True iff the node serves at least one vless-family protocol.
 
@@ -875,6 +910,27 @@ def _device_vless_uuid(device: models.Device) -> str | None:
     return None
 
 
+def _extract_hy2_password(
+    config_text_enc: str, *, cred_id: int | None = None
+) -> str | None:
+    """audit #78 — вытащить пер-юзерный hysteria2-пароль из зашифрованного
+    credential-блоба. Строки хранятся как ``hy2://<password>@host:port?...``
+    (см. :func:`_build_hysteria2_credential`); отдельной колонки под пароль
+    нет, поэтому restore-путь парсит его обратно. Пароль — token_urlsafe
+    (без ``@``/``/``), спец-энкодинга нет. ``None`` если decrypt/parse не
+    удался (одна битая строка не должна ронять весь батч)."""
+    try:
+        uri = decrypt(config_text_enc)
+    except Exception:  # noqa: BLE001
+        logger.warning("hy2-password: decrypt failed for credential %s", cred_id)
+        return None
+    match = re.match(r"^hy2://([^@/]+)@", uri)
+    if not match:
+        logger.warning("hy2-password: regexp mismatch for credential %s", cred_id)
+        return None
+    return match.group(1)
+
+
 class ProvisioningOrchestrator:
     """Coordinates provisioning tasks and Ansible execution."""
 
@@ -916,14 +972,24 @@ class ProvisioningOrchestrator:
         desired_generation+1 в SQL) — без гонок read-modify-write."""
         if delay_s is None:
             delay_s = float(os.getenv("RECONCILE_DEBOUNCE_S", "5"))
+        # audit #57 — debounce БЕЗ верхней границы: безусловная перезапись
+        # due_at = now + debounce отодвигала дедлайн бесконечно при потоке
+        # правок чаще, чем раз в debounce (bulk-скрипт, зацикленная автоматика)
+        # — нода не сходилась вообще, пока burst не прекратится. LEAST + coalesce
+        # сохраняет ПЕРВЫЙ вооружённый дедлайн: последующие правки в burst'е его
+        # НЕ отодвигают (а тик всё равно коалесит их одним прогоном по
+        # desired_generation). desired_generation по-прежнему бампаем всегда.
+        target = utcnow() + timedelta(seconds=delay_s)
         self.db.query(models.VPNNode).filter(
             models.VPNNode.id == node.id
         ).update(
             {
                 models.VPNNode.desired_generation:
                     models.VPNNode.desired_generation + 1,
-                models.VPNNode.reconcile_due_at:
-                    utcnow() + timedelta(seconds=delay_s),
+                models.VPNNode.reconcile_due_at: func.least(
+                    func.coalesce(models.VPNNode.reconcile_due_at, target),
+                    target,
+                ),
             },
             synchronize_session=False,
         )
@@ -1521,6 +1587,21 @@ class ProvisioningOrchestrator:
                             "Auto-resync after site.yml failed for node %s",
                             node.id,
                         )
+                # audit #78 — после REINSTALL (диск стёрт) пер-юзерные hysteria2-
+                # учётки теряются: vless-resync их не покрывает. Восстанавливаем
+                # только на reinstall-bootstrap'е (payload.reinstall) — на рутинном
+                # прогоне hy2 на ноде уже есть, лишние ansible-раны не нужны.
+                # Флаг RESTORE_HY2_AFTER_REINSTALL=0 отключает (safe-default = вкл).
+                if (task.payload or {}).get("reinstall") and os.getenv(
+                    "RESTORE_HY2_AFTER_REINSTALL", "1"
+                ) == "1":
+                    try:
+                        self.resync_node_hysteria2_clients(node)
+                    except Exception:  # noqa: BLE001
+                        logger.exception(
+                            "hy2-resync after reinstall failed for node %s",
+                            node.id,
+                        )
             else:
                 # Don't downgrade an already-active node's status on a
                 # transient rerun failure — existing users need to stay
@@ -1816,25 +1897,12 @@ class ProvisioningOrchestrator:
                     result = self._run_node_diagnose(task, node, payload)
                 else:
                     # Cloud-ноды без инъекции SSH-ключа (4vps): кладём наш
-                    # provisioning-ключ по root-паролю ПЕРЕД site.yml, иначе
-                    # ansible не зайдёт (Permission denied (publickey,password)).
-                    # Best-effort + идемпотентно; после первого bootstrap'а
-                    # password-auth отключается → повторная попытка просто
-                    # отвалится (ключ уже стоит). Никогда не валит bootstrap.
-                    if node.provider_root_password_enc:
-                        from ..security import decrypt
-                        from .ssh_bootstrap import ensure_provisioning_key
-                        try:
-                            ensure_provisioning_key(
-                                node.host,
-                                decrypt(node.provider_root_password_enc) or "",
-                                port=node.ssh_port or 22,
-                            )
-                        except Exception:  # noqa: BLE001
-                            logger.exception(
-                                "provisioning-key bootstrap failed for node %s "
-                                "(continuing — ansible will retry)", node.id,
-                            )
+                    # provisioning-ключ по root-паролю ПЕРЕД site.yml (см.
+                    # _maybe_inject_ssh_key — best-effort + идемпотентно).
+                    _maybe_inject_ssh_key(
+                        node.host, node.provider_root_password_enc,
+                        node.ssh_port, label=f"node {node.id}",
+                    )
                     site_vars = _collect_site_extra_vars(self.db, node)
                     node_name = node.name
                     # audit #54: снапшот БД собран (node/site_vars/inventory уже
@@ -1877,23 +1945,13 @@ class ProvisioningOrchestrator:
                     result = self._run_exit_diagnose(task, exit_node, payload)
                 else:
                     # Cloud exit без инъекции ключа (4vps): кладём provisioning-
-                    # ключ по root-паролю ПЕРЕД bootstrap_exit (как у нод).
-                    # Best-effort + идемпотентно. SSH-готовность уже дождал
+                    # ключ по root-паролю ПЕРЕД bootstrap_exit (как у нод, см.
+                    # _maybe_inject_ssh_key). SSH-готовность уже дождал
                     # _finalize_exit_spawn в backend'е, так что коннект быстрый.
-                    if exit_node.provider_root_password_enc:
-                        from ..security import decrypt
-                        from .ssh_bootstrap import ensure_provisioning_key
-                        try:
-                            ensure_provisioning_key(
-                                exit_node.host,
-                                decrypt(exit_node.provider_root_password_enc) or "",
-                                port=exit_node.ssh_port or 22,
-                            )
-                        except Exception:  # noqa: BLE001
-                            logger.exception(
-                                "provisioning-key bootstrap failed for exit %s "
-                                "(continuing — ansible will retry)", exit_node.id,
-                            )
+                    _maybe_inject_ssh_key(
+                        exit_node.host, exit_node.provider_root_password_enc,
+                        exit_node.ssh_port, label=f"exit {exit_node.id}",
+                    )
                     exit_name = exit_node.name
                     # audit #54: снапшот собран — отдаём соединение из пула
                     # на время bootstrap_exit (до 600с), см. site.yml-ветку.
@@ -1985,18 +2043,23 @@ class ProvisioningOrchestrator:
         # to the result object (via _run_relay_link_diagnose / SimpleNamespace).
         # Surface it as `checks` field on the task.result JSON so the admin UI
         # can render OK/FAIL cards instead of the raw stdout blob.
-        payload: dict[str, Any] = {
+        # audit #245 — отдельное имя result_payload: выше по функции `payload`
+        # означал task.payload (extra_vars для ansible). Переиспользование того
+        # же имени под РЕЗУЛЬТАТ прогона молча подсовывало бы данные результата
+        # тому, кто в хвосте функции обращается к payload в уверенности, что это
+        # payload задачи (типы совпадают — dict, ошибки нет).
+        result_payload: dict[str, Any] = {
             "stdout": result.stdout,
             "stderr": result.stderr,
             "returncode": result.returncode,
         }
         diagnose_checks = getattr(result, "checks", None)
         if diagnose_checks is not None:
-            payload["checks"] = diagnose_checks
+            result_payload["checks"] = diagnose_checks
         diagnose_meta = getattr(result, "diagnose_meta", None)
         if diagnose_meta is not None:
-            payload["diagnose_meta"] = diagnose_meta
-        return payload
+            result_payload["diagnose_meta"] = diagnose_meta
+        return result_payload
 
     # ── relay_tunnel apply (attach/detach) ─────────────────────────────
     def _run_relay_tunnel_apply(
@@ -3393,6 +3456,95 @@ class ProvisioningOrchestrator:
         self.db.commit()
         self.run_task_async(task, node=node)
         return task
+
+    def resync_node_hysteria2_clients(
+        self, node: models.VPNNode
+    ) -> list[models.ProvisioningTask]:
+        """audit #78 — восстановить пер-юзерные hysteria2-учётки на ноде.
+
+        :meth:`resync_node_clients` покрывает только vless-семейство; hysteria2
+        (per-user auth = userpass) после стирания диска на reinstall на ноду НЕ
+        возвращается — владельцы hy2-ссылки молча теряют доступ (ссылка в
+        подписке жива, сервер про них не знает). ShadowTLS сюда НЕ входит: там
+        общий node-wide пароль из ``VPNConfig.settings``, который site.yml
+        восстанавливает сам.
+
+        Каждую активную hy2-учётку пере-провижиним отдельной ``device/apply``-
+        таской через ``provision_device.yml`` с ``protocols=[hysteria2]`` —
+        тот же playbook и ``manage_hy2_user.sh``, что и при первичной выдаче.
+        Playbook добавляет ТОЛЬКО перечисленные протоколы (branch gated
+        ``item.proto == 'hysteria2'``), vless НЕ трогает. Пароль тот же, что в
+        существующей ссылке (парсим из URI) → сохранённый клиент продолжает
+        работать. Идемпотентно (``manage_hy2_user.sh add`` дедупит по имени).
+
+        Warm-пул hy2-бандлы (без device_id) сюда не входят: их «потеря» — это
+        pool-miss (не user-facing outage), тёплый пул дольёт их сам.
+
+        Возвращает список созданных задач (пусто — hy2-пользователей нет).
+        """
+        hy2 = models.VPNConfigProtocol.hysteria2.value
+        # Только назначенные (через активную подписку на ноде) hy2-учётки с
+        # привязанным device — provision_device.yml apply адресуется по device.
+        rows = (
+            self.db.query(models.Credential, models.Device)
+            .join(
+                models.Subscription,
+                models.Subscription.id == models.Credential.subscription_id,
+            )
+            .join(
+                models.Device,
+                models.Device.id == models.Credential.device_id,
+            )
+            .filter(
+                models.Subscription.node_id == node.id,
+                models.Subscription.status == models.SubscriptionStatus.active,
+                models.Credential.proto == hy2,
+                models.Credential.is_active.is_(True),
+                models.Device.status == models.DeviceStatus.active,
+            )
+            .all()
+        )
+        tasks: list[models.ProvisioningTask] = []
+        for cred, device in rows:
+            username = cred.access_username or device.access_username
+            password = _extract_hy2_password(cred.config_text, cred_id=cred.id)
+            if not username or not password:
+                logger.warning(
+                    "hy2-resync: skip credential %s (no username/password)",
+                    cred.id,
+                )
+                continue
+            hy2_cfg = self.db.get(models.VPNConfig, cred.config_id)
+            if hy2_cfg is None:
+                logger.warning(
+                    "hy2-resync: credential %s has no VPNConfig — skip", cred.id
+                )
+                continue
+            task_payload: dict[str, Any] = {
+                "username": username,
+                # uuid не нужен hy2-ветке playbook'а, но общий контракт
+                # provision_device.yml его принимает — отдаём существующий
+                # vless-UUID девайса (или пустой, если vless нет).
+                "uuid": _device_vless_uuid(device) or "",
+                "password": password,
+                "protocols": [{"proto": hy2, "port": hy2_cfg.port}],
+                "state": "present",
+            }
+            exit_iface = resolve_exit_interface(self.db, node.id, cred.exit_id)
+            if exit_iface:
+                task_payload["exit_interface"] = exit_iface
+            tasks.append(
+                self.create_task("device", device.id, "apply", task_payload)
+            )
+        if tasks:
+            self.db.commit()
+            for task in tasks:
+                self.run_task_async(task, node=node)
+            logger.info(
+                "hy2-resync: node %s — восстанавливаю %d пер-юзерных "
+                "hysteria2-учёток", node.id, len(tasks),
+            )
+        return tasks
 
     def reprovision_subscription(
         self,

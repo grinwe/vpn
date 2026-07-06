@@ -10,8 +10,8 @@ from __future__ import annotations
 
 from datetime import timedelta
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Request
-from sqlalchemy.orm import Session
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request
+from sqlalchemy.orm import Session, joinedload
 
 from .. import models, schemas
 from ..auth import optional_admin as optional_admin_token
@@ -340,11 +340,18 @@ def create_invoice(
 @router.get("/invoices", response_model=list[schemas.InvoiceListItem])
 def list_invoices(
     status: str | None = None,
-    limit: int = 10,
+    limit: int = Query(default=10, ge=1, le=200),
+    offset: int = Query(default=0, ge=0),
     db: Session = Depends(get_db),
     admin_token: str = Depends(require_admin),
 ):
-    query = db.query(models.Invoice).order_by(models.Invoice.created_at.desc())
+    # eager-load user/plan: карточка списка читает user.telegram_id и
+    # plan.name на каждую строку — без joinedload это N+1 lazy-load.
+    query = (
+        db.query(models.Invoice)
+        .options(joinedload(models.Invoice.user), joinedload(models.Invoice.plan))
+        .order_by(models.Invoice.created_at.desc())
+    )
     if status:
         try:
             invoice_status = models.InvoiceStatus(status)
@@ -352,7 +359,7 @@ def list_invoices(
             raise HTTPException(status_code=400, detail="Invalid status") from exc
         query = query.filter(models.Invoice.status == invoice_status)
 
-    invoices = query.limit(limit).all()
+    invoices = query.offset(offset).limit(limit).all()
     result: list[schemas.InvoiceListItem] = []
     for inv in invoices:
         result.append(

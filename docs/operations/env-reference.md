@@ -51,7 +51,7 @@
 | `REDIS_URL` | — | backend, worker | Обычно `redis://:${REDIS_PASSWORD}@redis:6379/0`. |
 | `QUEUE_BACKEND` | `""` | backend, worker | `"rq"` — использовать RQ очередь. Любое другое значение переключает провижининг в in-process thread'ы (только dev/test). |
 | `RQ_QUEUE` | `vpn-provisioning` | backend, worker | Имя RQ queue. |
-| `RQ_JOB_TIMEOUT` | `900` | worker | Hard-kill per job. Должен быть длиннее самого медленного playbook'а (bootstrap ~5 мин). Subprocess-таймаут ansible'а отдельный — см. `MAX_CONCURRENT_ANSIBLE`. |
+| `RQ_JOB_TIMEOUT` | `1800` | worker | Hard-kill per job. **Инвариант (audit #48): строго больше самого медленного playbook-таймаута + запас на очередь/семафор/пост-обработку.** Самый долгий — `site.yml` (timeout=900с). Если job_timeout ≤ 900, RQ убивает джобу РАНЬШЕ конца плейбука → ansible-сирота продолжает конфигурить ноду, а Retry запускает второй параллельный прогон. Меняешь `site.yml` timeout — подними и это. Subprocess-таймаут ansible'а отдельный — см. `MAX_CONCURRENT_ANSIBLE`. |
 | `RQ_FAILED_TTL` | `604800` | worker | Сколько держать job'ы в failed registry (7 дней). |
 | `RQ_RESULT_TTL` | `86400` | worker | Сколько держать результаты успешных job'ов (1 день). |
 
@@ -65,6 +65,8 @@
 | `MAX_CONCURRENT_ANSIBLE` | `3` | worker | Размер `_ansible_semaphore` в `ProvisioningOrchestrator`. Каждый процесс ansible ест ~200MB. Отдельный от warm-pool семафора. **PER-PROCESS, не глобальный кап** (audit #200): при нескольких RQ-воркерах реальный параллелизм ansible = `WORKER_REPLICAS`, а не это число. |
 | `ALLOW_INPROCESS_PROVISIONING` | `""` | backend | Dev escape-hatch: `"1"` → backend выполняет ansible сам, без RQ. **Не** включать в prod — блокирует HTTP request'ы. |
 | `MIN_HEALTHY_SCORE` | `50` | backend, worker | Минимальный `health_score` ноды для попадания в `choose_node` / `_eligible_nodes`. |
+| `CHOOSE_NODE_INCLUDE_REGISTERING` | `0` | backend, worker | audit #72. По умолчанию `choose_node` НЕ выдаёт юзеров на ноду в статусе `registering` (bootstrap ещё идёт → холодный provision падает). `"1"` возвращает старое поведение (registering участвует в выборке). |
+| `RESTORE_HY2_AFTER_REINSTALL` | `1` | worker | audit #78. После reinstall (диск стёрт) бэкенд авто-восстанавливает пер-юзерные hysteria2-учётки через `resync_node_hysteria2_clients` (device/apply-таски). `"0"` отключает (оператор восстанавливает вручную по warning-логу). |
 
 ## Worker ticks
 
@@ -77,7 +79,13 @@
 | `RENEWAL_WINDOW_LIMIT` | `2000` | worker | Верхняя граница подписок, обрабатываемых `run_renewal_check` за один тик в каждом окне напоминаний (ORDER BY `expires_at` ASC, хвост — следующим тиком). Не даёт тику упереться в `job_timeout` на тысячах истекающих. |
 | `BALANCE_CHARGE_INTERVAL` | `3600` | worker | `charge_subscriptions` — hourly tick, burns daily_rate × devices из `prepaid_kopecks`. Плюс trial-expiry фаза. |
 | `LOW_BALANCE_WARN_DAYS` | `3` | worker | Триггерит `low_balance_warning` notification, когда runway (balance / daily_rate) < этого. |
-| `WARM_POOL_CHECK_INTERVAL` | `120` | worker | `run_warm_pool_check` — тик warmer'а (ensure_pool + revoke GC). |
+| `WARM_POOL_CHECK_INTERVAL` | `120` | worker | `run_warm_pool_check` — тик warmer'а (`ensure_pool`, топит пул). Стадия 2 отзыва вынесена в отдельный тик `run_warm_pool_revoke_tick`. |
+| `WARM_POOL_REVOKE_INTERVAL` | `300` | worker | `run_warm_pool_revoke_tick` — стадия 2 отзыва warm-пула: `run_warm_pool_revoke_sweep` физически снимает `revoked`-бандлы с нод и удаляет строки (аудит-фикс #71). Gated на `WARM_POOL_ENABLED`. `0` — отключить. |
+| `RETENTION_INTERVAL` | `86400` | worker | `run_retention_tick` — раз в сутки чистит `audit_logs` (`subscription_fetch`/`*:delivered`) и `node_traffic_samples` старше N дней (аудит-фикс #247). `0` — отключить. |
+| `AUDIT_LOG_RETENTION_DAYS` | `90` | worker | Порог (дни) для удаления `subscription_fetch` + `*:delivered` из `audit_logs`. `0` — не чистить audit_logs. Прочие action'ы не трогаются. |
+| `TRAFFIC_SAMPLE_RETENTION_DAYS` | `30` | worker | Порог (дни) для удаления `node_traffic_samples`. `0` — не чистить. Детекторам/агрегатам нужны лишь последние тики. |
+| `RETENTION_DELETE_BATCH` | `10000` | worker | Размер батча удаления retention-тика (id IN (SELECT … LIMIT), коммит после каждого — короткие локи). |
+| `RETENTION_MAX_BATCHES` | `200` | worker | Потолок батчей на таблицу за один retention-тик. Остаток донесётся следующим прогоном. |
 | `AUTOSCALE_INTERVAL` | `0` / `300` | worker | `run_autoscale_check`. `0` — отключить. `.env.example` ставит `300`. |
 | `PENDING_RESCUE_INTERVAL` | `60` | worker | `run_pending_rescue_tick` — re-enqueue `ProvisioningTask.status=pending` старше `PENDING_RESCUE_AGE`. Закрывает дыру, когда `enqueue_task` упал на Redis-hiccup'е и строка осталась без job'а. `0` отключает. |
 | `PENDING_RESCUE_AGE` | `60` | worker | Минимальный возраст (sec) pending-задачи, чтобы её подхватил rescue-tick. Меньше этого — считается «только что создана, ещё не RQ'нулась». |
@@ -122,7 +130,7 @@
 | переменная | default | кто читает | описание |
 |---|---|---|---|
 | `REALITY_SNI` | _empty_ → pool rotation | backend, worker | «Borrowed» SNI в Reality handshake. Пустое значение включает выбор из `REALITY_DEST_POOL` (`www.yandex.ru`, `vk.ru`, `mail.ru`, `rutube.ru`, `lenta.ru`) — наименее используемый домен per-node. Задайте явное значение только чтобы форснуть один SNI для всех новых нод (dev/test). |
-| `REALITY_DEST` | `<sni>:443` | backend, worker | Куда Reality проксирует трафик не-VPN клиента. Если не задан — автоматически выводится из выбранного SNI. |
+| `REALITY_DEST` | `<sni>:443` | backend, worker | Куда Reality проксирует трафик не-VPN клиента. **Применяется ТОЛЬКО когда задан `REALITY_SNI` (dev/test override)** — в проде (ротация SNI по пулу) dest всегда выводится из выбранного per-node SNI как `<sni>:443` (audit #81: раньше ручка читалась, но нигде не применялась). |
 | `REALITY_PORT` | `443` | backend, worker | Порт inbound'а. Менять только если конфликт с другим сервисом на :443. |
 
 ## Платёжные провайдеры
@@ -170,6 +178,9 @@
 | `WARM_POOL_BATCH_PER_TICK` | `3` | worker | Максимум новых warm'ов за одну тику на одну ноду. Чтобы свежая нода не получила 10 последовательных ansible-runs. |
 | `WARM_POOL_MAX_CONCURRENT` | `2` | worker | Размер `_warmer_semaphore`. Отдельный от `_ansible_semaphore` ProvisioningOrchestrator'а. Process-local. |
 | `WARM_POOL_CHECK_INTERVAL` | `120` | worker | Тик warmer'а (см. секцию «Worker ticks»). |
+| `WARM_POOL_REVOKE_INTERVAL` | `300` | worker | Интервал стадии 2 отзыва (`run_warm_pool_revoke_tick`, см. секцию «Worker ticks»). |
+| `WARM_POOL_REVOKE_BATCH_PER_TICK` | `5` | worker | Сколько `revoked`-бандлов снимает с нод один revoke-sweep (по одному ansible-run на бандл). |
+| `WARM_POOL_REVOKE_MAX_ATTEMPTS` | `5` | worker | После стольких подряд провалов физического отзыва бандл откладывается (лог + ручной разбор), чтобы не молотить мёртвую ноду вечно. Process-local счётчик, сбрасывается на рестарте воркера. |
 
 ## Cold-path provisioning throttle
 

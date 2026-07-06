@@ -173,14 +173,20 @@ class BillmgrDriver:
                     f"(возможен orphan)"
                 ) from exc
         # 2) найти услугу по domain + дождаться active с IP (старые тёзки — known_ids).
-        service_id, ipv4, cost, elem = self._wait_active(name, known_ids)
+        #    last_exc — последняя сглоченная в поллинге ошибка API (каптча/креды):
+        #    добавляем её в финальные сообщения, чтобы не искать «пропавшую» услугу.
+        service_id, ipv4, cost, elem, last_exc = self._wait_active(name, known_ids)
         if not service_id:
             # заказ СПИСАЛ баланс, но услуга не появилась в func=vds — снести нечем.
             logger.error(
                 "billmgr: заказ %s на %s СПИСАЛ баланс, но услуга не найдена в "
-                "func=vds — проверь панель ВРУЧНУЮ (возможен orphan)", name, self._base,
+                "func=vds — проверь панель ВРУЧНУЮ (возможен orphan)%s", name, self._base,
+                f" [последняя ошибка API: {last_exc}]" if last_exc else "",
             )
-            raise DriverError(f"billmgr order {name} charged but service not found")
+            reason = f" (последняя ошибка API: {last_exc})" if last_exc else ""
+            raise DriverError(
+                f"billmgr order {name} charged but service not found{reason}"
+            )
         if not ipv4:
             # услуга есть, но не поднялась (timeout / unpaid low-balance) → сносим
             # оплаченный залипший заказ, чтобы ретраи не плодили сирот.
@@ -189,9 +195,10 @@ class BillmgrDriver:
                 "заказ (orphan-guard)", service_id, name, _POLL_TIMEOUT,
             )
             self._safe_destroy(service_id)
+            reason = f" (последняя ошибка API: {last_exc})" if last_exc else ""
             raise DriverError(
                 f"billmgr service {service_id} ({name}) got no IPv4 within "
-                f"{_POLL_TIMEOUT}s — destroyed"
+                f"{_POLL_TIMEOUT}s — destroyed{reason}"
             )
         # 3) поставить ИЗВЕСТНЫЙ root-пароль (услуга active → changepassword надёжен).
         #    Не вышло после ретраев → no-key нода без пароля бесполезна → сносим.
@@ -367,9 +374,10 @@ class BillmgrDriver:
 
     def _wait_active(
         self, name: str, known_ids: set[str] | None = None
-    ) -> tuple[str, str, float | None, dict]:
+    ) -> tuple[str, str, float | None, dict, DriverError | None]:
         """Поллим func=vds, пока услуга с ``domain==name`` не станет active+IP.
-        Возвращаем ``(service_id, ipv4, monthly_cost, elem)``. item_status/id/ip
+        Возвращаем ``(service_id, ipv4, monthly_cost, elem, last_exc)``, где
+        ``last_exc`` — последняя сглоченная ошибка API (или None). item_status/id/ip
         могут быть $-обёрнуты → всё через _scalar/_extract_ip. ``known_ids`` —
         услуги-тёзки, существовавшие ДО заказа: их deleted-статус НЕ терминален
         (иначе старая снесённая тёзка перехватит ожидание новой услуги)."""
@@ -377,10 +385,23 @@ class BillmgrDriver:
         deadline = time.time() + _POLL_TIMEOUT
         last_id = ""
         last_elem: dict = {}
+        last_exc: DriverError | None = None
+        err_count = 0
         while time.time() < deadline:
             try:
                 doc = self._call("vds")
-            except DriverError:
+            except DriverError as exc:
+                # НЕ глотаем молча: персистентная ошибка API (каптча на DC-IP,
+                # протухшие креды) иначе крутится все 900с, а потом всплывает
+                # вводящим в заблуждение «service not found». Логируем throttled
+                # (раз в 5 итераций) и запоминаем для финального сообщения.
+                last_exc = exc
+                if err_count % 5 == 0:
+                    logger.warning(
+                        "billmgr: поллинг услуги %s — ошибка API, продолжаю ждать: %s",
+                        name, exc,
+                    )
+                err_count += 1
                 time.sleep(_POLL_INTERVAL)
                 continue
             elem = _find_by_domain(doc, name)
@@ -390,14 +411,17 @@ class BillmgrDriver:
                 ipv4 = _extract_ip(elem)
                 status = str(_scalar(elem.get("item_status")) or "")
                 if ipv4 and status == _ST_ACTIVE:
-                    return last_id, ipv4, _to_float(elem.get("cost")), elem
+                    return last_id, ipv4, _to_float(elem.get("cost")), elem, None
                 if status == _ST_DELETED and last_id not in known_ids:
                     # deleted терминально ТОЛЬКО для НОВОЙ услуги (не старой тёзки):
                     # дальше ждать смысла нет (вернём без ip → orphan-guard). Старую
                     # снесённую тёзку пропускаем и ждём появления новой услуги.
-                    return last_id, "", _to_float(elem.get("cost")), elem
+                    return last_id, "", _to_float(elem.get("cost")), elem, last_exc
             time.sleep(_POLL_INTERVAL)
-        return last_id, _extract_ip(last_elem), _to_float(last_elem.get("cost")), last_elem
+        return (
+            last_id, _extract_ip(last_elem), _to_float(last_elem.get("cost")),
+            last_elem, last_exc,
+        )
 
     def _call(self, func: str, *, timeout: float | None = None, **params: Any) -> dict:
         """POST к ``<base>/billmgr?func=<func>`` с authinfo + out=json. Возвращает

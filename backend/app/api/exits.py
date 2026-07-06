@@ -260,6 +260,36 @@ def _peers_count(db: Session, exit_id: int) -> int:
     )
 
 
+def _run_task_best_effort(
+    orchestrator: ProvisioningOrchestrator,
+    task: models.ProvisioningTask,
+) -> bool:
+    """Enqueue таски в RQ, не роняя запрос при недоступной очереди.
+
+    ``run_task_async`` кидает RuntimeError, если Redis недоступен и
+    ``ALLOW_INPROCESS_PROVISIONING`` выключен. В одиночных операциях
+    (attach/detach/create/reconnect/diagnose/…) БД уже закоммичена и
+    task лежит в ``pending`` — его подберёт pending-rescue-tick. Раньше
+    тут летел 500 ПОСЛЕ успешного изменения БД: админ считал операцию
+    проваленной, ретраил и ловил 409 (dup attach) или 404 (detach), что
+    путало ещё сильнее. Теперь логируем и возвращаем ``False`` (task в
+    pending), как это давно делают batch-эндпоинты.
+
+    Returns ``True`` если задача передана воркеру сразу, ``False`` если
+    осталась в pending до rescue-tick'а.
+    """
+    try:
+        orchestrator.run_task_async(task)
+        return True
+    except Exception:  # noqa: BLE001
+        logger.exception(
+            "run_task_async failed for task %s — "
+            "pending-rescue-tick should pick it up",
+            task.id,
+        )
+        return False
+
+
 @router.get("/exits", response_model=list[schemas.WGExitNodeOut])
 def list_exits(
     db: Session = Depends(get_db),
@@ -335,7 +365,9 @@ def create_exit(
     orchestrator = ProvisioningOrchestrator(db)
     task = orchestrator.create_task("exit", exit_node.id, "bootstrap", {})
     db.commit()
-    orchestrator.run_task_async(task)
+    # Best-effort enqueue: exit уже создан в БД, task в pending —
+    # rescue-tick подхватит, если Redis лежит. Не роняем 200 в 500.
+    _run_task_best_effort(orchestrator, task)
 
     return _to_out(exit_node, peers_count=0)
 
@@ -560,7 +592,7 @@ def rebootstrap_exit(
         "exit", exit_node.id, "bootstrap", {"rerun": True}
     )
     db.commit()
-    orchestrator.run_task_async(task)
+    enqueued = _run_task_best_effort(orchestrator, task)
     actor, actor_type = _resolve_admin_actor(admin_actor)
     _audit(
         db,
@@ -571,7 +603,9 @@ def rebootstrap_exit(
         actor_type=actor_type,
         metadata={"task_id": task.id},
     )
-    return {"exit_id": exit_node.id, "task_id": task.id}
+    # task_enqueued=false → задача в pending, её подберёт rescue-tick;
+    # админка не считает операцию проваленной.
+    return {"exit_id": exit_node.id, "task_id": task.id, "task_enqueued": enqueued}
 
 
 @router.post("/exits/{exit_id}/reboot")
@@ -623,7 +657,7 @@ def diagnose_exit(
     orchestrator = ProvisioningOrchestrator(db)
     task = orchestrator.create_task("exit", exit_node.id, "diagnose", {})
     db.commit()
-    orchestrator.run_task_async(task)
+    enqueued = _run_task_best_effort(orchestrator, task)
     actor, actor_type = _resolve_admin_actor(admin_actor)
     _audit(
         db,
@@ -634,7 +668,7 @@ def diagnose_exit(
         actor_type=actor_type,
         metadata={"task_id": task.id},
     )
-    return {"exit_id": exit_node.id, "task_id": task.id}
+    return {"exit_id": exit_node.id, "task_id": task.id, "task_enqueued": enqueued}
 
 
 @router.get("/exits/{exit_id}/links", response_model=list[schemas.RelayExitLinkOut])
@@ -779,7 +813,10 @@ def attach_relay(
         {"exit_id": exit_node.id, "link_id": link.id},
     )
     db.commit()
-    orchestrator.run_task_async(task)
+    # Best-effort: link уже создан, task в pending — rescue-tick подхватит
+    # при недоступном Redis. Иначе 500 после успешного attach → админ
+    # ретраит и ловит 409 (dup). См. _run_task_best_effort.
+    _run_task_best_effort(orchestrator, task)
 
     return _link_to_out(link)
 
@@ -1188,6 +1225,7 @@ def detach_relay(
     # down + unpatches Xray. If the relay row is gone (rare — FK cascades
     # drop the link first), skip — there's no target to reconfigure.
     task_id: int | None = None
+    enqueued: bool | None = None
     if relay is not None:
         orchestrator = ProvisioningOrchestrator(db)
         task = orchestrator.create_task(
@@ -1198,7 +1236,9 @@ def detach_relay(
         )
         db.commit()
         task_id = task.id
-        orchestrator.run_task_async(task)
+        # Best-effort: link уже удалён — task в pending подхватит
+        # rescue-tick, иначе 500 после detach → админ ретраит и ловит 404.
+        enqueued = _run_task_best_effort(orchestrator, task)
 
     return {
         "exit_id": exit_id,
@@ -1207,6 +1247,8 @@ def detach_relay(
         # task_id lets the admin UI link to /tasks?id=N so the admin
         # sees the ansible run instead of wondering if anything happened.
         "task_id": task_id,
+        # task_enqueued=false → task в pending, подхватит rescue-tick.
+        "task_enqueued": enqueued,
         # Сколько осиротевших creds переписали и как распределили —
         # админка показывает это в alert'е после detach'а.
         "credentials": migration_summary,
@@ -1412,11 +1454,13 @@ def reconnect_relay_link(
         actor_type=actor_type,
     )
     db.commit()
-    orchestrator.run_task_async(task)
+    enqueued = _run_task_best_effort(orchestrator, task)
     return {
         "exit_id": exit_id,
         "relay_node_id": relay_node_id,
         "task_id": task.id,
+        # task_enqueued=false → task в pending, подхватит rescue-tick.
+        "task_enqueued": enqueued,
     }
 
 
@@ -1474,7 +1518,7 @@ def diagnose_relay_link(
         "relay_tunnel", relay.id, "diagnose", task_payload,
     )
     db.commit()
-    orchestrator.run_task_async(task)
+    enqueued = _run_task_best_effort(orchestrator, task)
     actor, actor_type = _resolve_admin_actor(admin_actor)
     _audit(
         db, actor, "relay_link_diagnose", "relay_exit_link", link.id,
@@ -1489,6 +1533,8 @@ def diagnose_relay_link(
         "relay_node_id": relay.id,
         "exit_id": link.exit_id,
         "task_id": task.id,
+        # task_enqueued=false → task в pending, подхватит rescue-tick.
+        "task_enqueued": enqueued,
     }
 
 
@@ -1699,7 +1745,10 @@ def evacuate_exit_to(
             },
         )
         db.commit()
-        orchestrator.run_task_async(task)
+        # Best-effort: creds уже переписаны и закоммичены; при недоступном
+        # Redis task остаётся в pending (rescue-tick подхватит), не роняем
+        # эвакуацию в 500 на середине цикла с частично переселёнными сабами.
+        _run_task_best_effort(orchestrator, task)
         task_ids.append(task.id)
         migrated.extend(sub_ids)
 

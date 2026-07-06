@@ -8,6 +8,7 @@ API docs: https://www.vultr.com/api/
 """
 from __future__ import annotations
 
+import ipaddress
 import logging
 import time
 
@@ -19,6 +20,23 @@ logger = logging.getLogger(__name__)
 
 API = "https://api.vultr.com/v2"
 POLL_TIMEOUT = 240  # Vultr is a bit slower to reach "active" than Hetzner
+
+
+def _is_public_ipv4(ip: str | None) -> bool:
+    """Публичный (маршрутизируемый) IPv4? Отсекаем пустое, 0.0.0.0 и RFC1918.
+
+    Vultr отдаёт ``internal_ip`` (приватный VPC-адрес 10.x/172.x) и, пока
+    инстанс поднимается, ``main_ip`` может быть ещё пуст или ``0.0.0.0``.
+    Приватный адрес в ``node.host`` = нода-зомби: спавн формально успешен,
+    а Ansible и клиенты ходят на недостижимый IP.
+    """
+    if not ip or ip == "0.0.0.0":
+        return False
+    try:
+        addr = ipaddress.IPv4Address(ip)
+    except ValueError:
+        return False
+    return not (addr.is_private or addr.is_loopback or addr.is_link_local or addr.is_reserved)
 
 
 class VultrDriver:
@@ -74,10 +92,14 @@ class VultrDriver:
             raise DriverError(f"Vultr did not return instance id: {data}")
 
         instance = self._wait_running(instance_id)
-        ipv4 = instance.get("main_ip") or instance.get("internal_ip")
+        # Только публичный main_ip: internal_ip у Vultr — приватный VPC-адрес,
+        # он бы прошёл validate_node_identity_fields и уехал в node.host.
+        ipv4 = instance.get("main_ip")
         ipv6 = instance.get("v6_main_ip") or None
-        if not ipv4 or ipv4 == "0.0.0.0":
-            raise DriverError(f"Vultr instance {instance_id} has no public IPv4")
+        if not _is_public_ipv4(ipv4):
+            raise DriverError(
+                f"Vultr instance {instance_id} has no public IPv4 (got {ipv4!r})"
+            )
 
         price = None
         try:
@@ -112,16 +134,19 @@ class VultrDriver:
             last = data.get("instance") or {}
             # Vultr reports two stages: ``status`` (active/pending) and
             # ``server_status`` (ok/installingbooting/none). Wait for
-            # both — otherwise SSH races boot.
-            if last.get("status") == "active" and last.get("server_status") in (
-                "ok",
-                "installed",
+            # both — otherwise SSH races boot. Также ждём публичный main_ip:
+            # он присваивается не мгновенно, а без него ipv4 бесполезен.
+            if (
+                last.get("status") == "active"
+                and last.get("server_status") in ("ok", "installed")
+                and _is_public_ipv4(last.get("main_ip"))
             ):
                 return last
             time.sleep(4)
         raise DriverError(
             f"Vultr instance {instance_id} did not reach active state within {POLL_TIMEOUT}s; "
-            f"last status: {last.get('status')}/{last.get('server_status')}"
+            f"last status: {last.get('status')}/{last.get('server_status')}, "
+            f"main_ip: {last.get('main_ip')!r}"
         )
 
     def _get(self, path: str) -> dict:

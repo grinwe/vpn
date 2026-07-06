@@ -305,6 +305,7 @@ def scale_workers(
     ждём результат для синхронного фидбэка. Требует ≥1 живого воркера,
     который подхватит job (для бампа вверх это всегда так).
     """
+    import os
     import time
 
     queue = get_queue()
@@ -331,8 +332,14 @@ def scale_workers(
         ) from exc
 
     # Коротко ждём результат (скейл — секунды). Не дождались → enqueued,
-    # счётчик воркеров в виджете подтянется поллингом.
-    deadline = time.monotonic() + 30
+    # счётчик воркеров в виджете подтянется поллингом. Держим окно узким,
+    # чтобы не занимать надолго поток threadpool'а и DB-сессию запроса
+    # (env-кноб OPS_SCALE_WAIT_SECONDS, по умолчанию 5с).
+    try:
+        wait_seconds = float(os.getenv("OPS_SCALE_WAIT_SECONDS", "5"))
+    except ValueError:
+        wait_seconds = 5.0
+    deadline = time.monotonic() + wait_seconds
     while time.monotonic() < deadline:
         status = job.get_status(refresh=True)
         if status == "finished":
@@ -359,5 +366,5 @@ def scale_workers(
     return schemas.WorkerScaleOut(
         replicas=n,
         status="enqueued",
-        detail="job запущен, счётчик обновится через ~20с",
+        detail="job запущен, счётчик обновится поллингом виджета",
     )

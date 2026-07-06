@@ -20,6 +20,16 @@ _PENDING_ERR_LOG_INTERVAL = 60.0
 _pending_err_last_log = 0.0
 _pending_err_last_status: int | None = None
 
+# Дедуп доставки (at-least-once → эффективно at-most-once для юзера).
+# notif_id → ts успешной отправки в Telegram, по которой ещё НЕ прошёл
+# ACK на backend. Пока ACK не подтверждён, запись остаётся в /pending и
+# вернётся на следующем тике — но повторно слать её в Telegram нельзя,
+# иначе при мигающем backend'е юзер (а для admin_broadcast — вся
+# рассылка) получит серию дублей. TTL-очистка страхует от вечного роста
+# и вечного подавления, если ACK так и не пройдёт.
+_sent_unacked: dict[int, float] = {}
+_SENT_UNACKED_TTL = 600.0  # 10 минут
+
 
 async def notification_poller(bot: Bot):
     """Background task: poll backend for pending notifications and deliver them.
@@ -73,25 +83,61 @@ async def notification_poller(bot: Bot):
 
             async def _ack(notif_id_inner: int) -> None:
                 """ACK helper: помечает запись в audit_logs как `:delivered`,
-                чтобы /pending её больше не возвращал. Best-effort — сетевой
-                сбой здесь не должен валить весь поллер.
+                чтобы /pending её больше не возвращал. Ретраим до 3 раз с
+                backoff: если ACK не пройдёт, запись останется в /pending и
+                на следующем тике вернётся снова, но id держится в
+                _sent_unacked, поэтому повторно в Telegram не уйдёт. При
+                успешном ACK снимаем id с дедупа.
                 """
                 if not notif_id_inner:
                     return
-                try:
-                    async with session.post(
-                        f"{BACKEND_URL}/api/notifications/{notif_id_inner}/ack",
-                        headers=headers,
-                    ):
-                        pass
-                except Exception:  # noqa: BLE001
-                    logger.exception("ACK failed for notif=%s", notif_id_inner)
+                for attempt in range(3):
+                    try:
+                        async with session.post(
+                            f"{BACKEND_URL}/api/notifications/{notif_id_inner}/ack",
+                            headers=headers,
+                            timeout=__import__("aiohttp").ClientTimeout(total=5),
+                        ) as ack_resp:
+                            if ack_resp.status == 200:
+                                _sent_unacked.pop(notif_id_inner, None)
+                                return
+                            # не-200 (401/500) — временная рассинхронизация,
+                            # ретраим ниже
+                    except Exception:  # noqa: BLE001
+                        logger.exception(
+                            "ACK failed for notif=%s (attempt %d/3)",
+                            notif_id_inner, attempt + 1,
+                        )
+                    if attempt < 2:
+                        await asyncio.sleep(0.5 * (attempt + 1))
+                # Все попытки исчерпаны — id остаётся в _sent_unacked, чтобы
+                # не переотправить сообщение; следующий тик до-ACKнет его.
+                logger.warning(
+                    "ACK not confirmed for notif=%s after 3 attempts; "
+                    "will retry next tick (no re-send)",
+                    notif_id_inner,
+                )
+
+            # Чистим протухшие записи дедупа: если ACK так и не прошёл за
+            # TTL, отпускаем id — лучше редкий дубль, чем вечная блокировка.
+            _now_ts = asyncio.get_event_loop().time()
+            for _stale_id in [
+                _nid for _nid, _ts in _sent_unacked.items()
+                if _now_ts - _ts > _SENT_UNACKED_TTL
+            ]:
+                _sent_unacked.pop(_stale_id, None)
 
             for notif in notifications:
                 telegram_id = notif.get("telegram_id")
                 text = notif.get("text", "")
                 notif_id = notif.get("id")
                 if not telegram_id or not text:
+                    continue
+                # Уже отправлено в Telegram, но ACK ещё не подтверждён —
+                # НЕ слать повторно (иначе дубль у юзера/рассылки), только
+                # до-ACKнуть запись на backend'е.
+                if notif_id and notif_id in _sent_unacked:
+                    await _ack(notif_id)
                     continue
                 try:
                     keyboard = None
@@ -110,6 +156,10 @@ async def notification_poller(bot: Bot):
                         parse_mode="HTML",
                         reply_markup=keyboard,
                     )
+                    # Помечаем как отправленное ДО ACK: если ACK упадёт и
+                    # запись вернётся на следующем тике, дубля в TG не будет.
+                    if notif_id:
+                        _sent_unacked[notif_id] = asyncio.get_event_loop().time()
                     await _ack(notif_id)
                     # Для admin_broadcast спим между сообщениями, чтобы не
                     # упереться в Telegram rate-limit ~30 msg/sec. При

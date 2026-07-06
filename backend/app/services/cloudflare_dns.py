@@ -25,6 +25,7 @@ from __future__ import annotations
 import logging
 import os
 import secrets
+import time
 
 import requests
 
@@ -33,6 +34,12 @@ logger = logging.getLogger(__name__)
 _API_BASE = "https://api.cloudflare.com/client/v4"
 _TIMEOUT = 10
 
+# delete_record: транзиентную ошибку (5xx / сетевой таймаут) ретраим, прежде
+# чем сдаться — иначе один CF-хиккап навсегда оставляет A-запись в зоне
+# (вызывающий код к этому моменту уже стёр record_id).
+_DELETE_RETRIES = 2
+_DELETE_RETRY_PAUSE = 0.5
+
 # Zone ids are stable for the process lifetime — resolve once PER zone.
 # Multi-zone now: ws-cdn and xhttp can live on different front domains
 # (e.g. ws→wgse.info, xhttp→grwr.ink), so cache is keyed by domain.
@@ -40,7 +47,16 @@ _zone_id_cache: dict[str, str] = {}
 
 
 class CloudflareError(RuntimeError):
-    """CF API call failed or the integration is not configured."""
+    """CF API call failed or the integration is not configured.
+
+    ``status_code`` — HTTP-статус ответа CF (или ``None`` для сетевой
+    ошибки/таймаута), нужен чтобы отличить 404 (запись уже удалена → тихий
+    no-op) от остальных ошибок (5xx / протухший токен → ретрай / эскалация).
+    """
+
+    def __init__(self, *args, status_code: int | None = None) -> None:
+        super().__init__(*args)
+        self.status_code = status_code
 
 
 def front_domain() -> str:
@@ -85,7 +101,10 @@ def _request(method: str, path: str, **kwargs) -> dict:
         body = {}
     if not resp.ok or not body.get("success", False):
         errors = body.get("errors") or resp.text
-        raise CloudflareError(f"CF API {method} {path} → {resp.status_code}: {errors}")
+        raise CloudflareError(
+            f"CF API {method} {path} → {resp.status_code}: {errors}",
+            status_code=resp.status_code,
+        )
     return body
 
 
@@ -148,16 +167,52 @@ def create_node_record(
     return {"subdomain": fqdn, "record_id": record_id, "front_domain": domain}
 
 
+def _is_record_gone(exc: CloudflareError) -> bool:
+    """True если ошибка CF означает «записи уже нет» → удаление идемпотентно.
+
+    Признаки: HTTP 404 либо код ошибки CF 81044 (``Record does not exist``,
+    иногда приходит не с 404-статусом)."""
+    if getattr(exc, "status_code", None) == 404:
+        return True
+    return "81044" in str(exc)
+
+
 def delete_record(record_id: str, *, domain: str | None = None) -> None:
     """Delete a DNS record in ``domain``'s zone. Idempotent — a missing
-    record (404) is a no-op. ``domain`` must match the zone the record was
-    created in (stored as ``cf_front_domain``)."""
+    record (404 / CF-код 81044) is a no-op. ``domain`` must match the zone the
+    record was created in (stored as ``cf_front_domain``).
+
+    Транзиентные ошибки (5xx / сетевой таймаут / протухший токен) ретраятся
+    ``_DELETE_RETRIES`` раз с паузой. Если запись так и не удалилась и это НЕ
+    404 — логируем ERROR (не warning): вызывающий код сейчас сотрёт record_id,
+    так что стейл-запись должна всплыть в алертах и её дочистят руками.
+    Не пробрасываем исключение осознанно — часть вызовов идёт в цикле по
+    ``node.configs`` при удалении ноды (nodes.py), и raise оборвал бы весь
+    teardown на первом же CF-хиккапе."""
     if not record_id:
         return
-    try:
-        _request("DELETE", f"/zones/{_get_zone_id(domain)}/dns_records/{record_id}")
-        logger.info("cf_dns: deleted record %s", record_id)
-    except CloudflareError as exc:
-        # Already gone / not-found → fine. Anything else: log, don't block
-        # the config-delete path on a CF hiccup.
-        logger.warning("cf_dns: delete record %s failed (ignored): %s", record_id, exc)
+    last_exc: CloudflareError | None = None
+    for attempt in range(_DELETE_RETRIES + 1):
+        try:
+            _request(
+                "DELETE", f"/zones/{_get_zone_id(domain)}/dns_records/{record_id}"
+            )
+            logger.info("cf_dns: deleted record %s", record_id)
+            return
+        except CloudflareError as exc:
+            if _is_record_gone(exc):
+                # Записи уже нет → удаление успешно (идемпотентность).
+                logger.info(
+                    "cf_dns: record %s already gone (404) — no-op", record_id
+                )
+                return
+            last_exc = exc
+            if attempt < _DELETE_RETRIES:
+                time.sleep(_DELETE_RETRY_PAUSE)
+    logger.error(
+        "cf_dns: delete record %s FAILED after %d attempts (non-404) — "
+        "record may be left STALE in the zone, needs manual cleanup: %s",
+        record_id,
+        _DELETE_RETRIES + 1,
+        last_exc,
+    )

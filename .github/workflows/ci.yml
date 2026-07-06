@@ -2,7 +2,17 @@ name: CI
 
 on:
   pull_request:
+  # push гоняем только на основных ветках: коммиты в feature-ветку с
+  # открытым PR уже покрыты триггером pull_request, дублировать пайплайн
+  # (pytest+postgres, 4 docker build, ansible-lint) на каждый push смысла нет.
   push:
+    branches: [main, dev]
+
+# Отменяем устаревшие прогоны при серии пушей/пушей-в-PR: живым остаётся
+# только последний коммит на данной ветке/PR, старые сборки не доезжают впустую.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   lint-test:
@@ -39,7 +49,7 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -r backend/requirements.txt -r backend/requirements-dev.txt ruff ansible ansible-lint
+          pip install -r backend/requirements.txt -r backend/requirements-dev.txt pytest-cov ruff ansible ansible-lint
       - name: Static analysis
         run: |
           ruff check backend bot probes
@@ -50,8 +60,12 @@ jobs:
         run: |
           python -m compileall backend bot probes
       - name: Integration tests (pytest + real postgres)
+        # --cov даёт видимость покрытия (term-missing показывает непокрытые
+        # строки прямо в логе). Жёсткий порог --cov-fail-under пока НЕ ставим:
+        # baseline снимаем с этого прогона и поднимаем планку по мере закрытия
+        # дыр (worker.py, api_webapp.py), чтобы CI не покраснел разом.
         run: |
-          cd backend && python -m pytest -v tests/
+          cd backend && python -m pytest -v --cov=app --cov-report=term-missing tests/
       - name: Build backend image
         run: docker build backend --tag backend:ci
       - name: Build worker image
