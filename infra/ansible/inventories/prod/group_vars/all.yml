@@ -15,4 +15,4 @@
 #
 # Чтобы отключить mirror на отдельной ноде — задать
 # `xray_mirror_url: ""` в host_vars/<имя>.yml.
-xray_mirror_url: "http://185.242.87.250:8090"
+xray_mirror_url: "http://194.76.146.166:8090"
