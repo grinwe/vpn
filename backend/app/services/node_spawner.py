@@ -1034,8 +1034,11 @@ def reinstall_node(
     затронут: там общий node-wide пароль из VPNConfig.settings, который site.yml
     восстанавливает сам. Ниже всё равно логируем warning со списком hysteria2-
     пользователей — если авто-restore частично не сработает (нет пароля/битая
-    строка), оператор увидит, кого переспровижинить вручную. Warm-пул hy2-
-    бандлы авто-restore не покрывает (pool-miss, не user-facing).
+    строка), оператор увидит, кого переспровижинить вручную. Warm-пул ноды
+    ИНВАЛИДИРУЕТСЯ целиком (audit #78, хвост): его строки остались бы
+    ``pool_state=warm`` в БД при стёртых с диска учётках, и DB-only
+    ``try_assign_bundle`` позже выдал бы юзеру бандл с мёртвым hy2-легом.
+    Revoked-строки подчистит revoke-sweep, свежие бандлы наминтит refill-тик.
 
     Провайдер обязан уметь ``reinstall_server`` (capability-проверка через
     hasattr; напр. 4vps умеет, manual — нет)."""
@@ -1063,6 +1066,15 @@ def reinstall_node(
         driver.reinstall_server(node.provider_external_id, img, password=password)
     except DriverError as exc:
         raise NodeSpawnError(str(exc)) from exc
+
+    # audit #78 (хвост): диск стёрт → warm-бандлы ноды больше не существуют
+    # на боксе, но строки в БД остались pool_state=warm — DB-only
+    # try_assign_bundle выдал бы юзеру бандл с мёртвым hy2-легом (vless-леги
+    # resync восстановит, hy2 warm — нет). Инвалидируем ПОСЛЕ успешного
+    # reinstall_server: упавший API-вызов диск не трогает, пул ещё валиден.
+    from .warm_pool import invalidate_node_warm_pool
+
+    invalidate_node_warm_pool(db, node.id, reason="node reinstall — диск стёрт")
 
     # Свежая ОС → нода ещё не настроена. Сохраняем новый пароль и возвращаем в
     # registering. Bootstrap НЕ пинаем сразу — нода уходит в ребут на несколько
@@ -1382,15 +1394,19 @@ def _spawn_stuck_threshold_min() -> int:
     return int(os.getenv("NODE_SPAWN_STUCK_MINUTES", "30"))
 
 
-def sweep_stuck_spawns(db: Session) -> dict[str, int]:
+def sweep_stuck_spawns(
+    db: Session,
+    *,
+    enqueue=None,
+) -> dict[str, int]:
     """Подбирает ноды/exit'ы, застрявшие в ``registering`` с placeholder-host.
 
     Достройка спавна (:func:`_finalize_spawn` / :func:`_finalize_exit_spawn`)
     крутится в daemon-потоке процесса backend — рестарт/деплой контейнера
     убивает поток молча, и оплаченный сервер навсегда остаётся невидимым
     (status=registering, host=0.0.0.0, is_active=False), при этом продолжая
-    списывать деньги у хостера. Эту функцию нужно звать периодическим тиком
-    воркера (или на startup backend'а):
+    списывать деньги у хостера. Эту функцию зовёт периодический
+    ``run_spawn_sweep_tick`` воркера (finding #70):
 
       * есть ``provider_external_id`` и драйвер умеет ``wait_for_ipv4`` —
         перезапускаем финализацию (шаги идемпотентны: wait_for_ipv4 — чистое
@@ -1398,12 +1414,20 @@ def sweep_stuck_spawns(db: Session) -> dict[str, int]:
       * иначе повторный заказ невозможен без риска двойной оплаты — помечаем
         error с пометкой в notes (оператору: проверить панель хостера).
 
+    ``enqueue`` — колбэк ``(kind, entity_id) -> job_id | None``
+    (``queue.enqueue_spawn_finalize``). Обязателен при вызове из worker-тика:
+    RQ work-horse завершает процесс сразу после return тика и убил бы
+    daemon-поток на середине wait_for_ipv4 — достройка должна ехать отдельной
+    персистентной RQ-джобой. Без колбэка (вызов из долгоживущего backend'а,
+    напр. на startup) финализация стартует потоком, как в spawn_node_async.
+
     Возвращает счётчики для метрик тика.
     """
     threshold = utcnow() - timedelta(minutes=_spawn_stuck_threshold_min())
     out = {
         "relay_resumed": 0, "relay_errored": 0,
         "exit_resumed": 0, "exit_errored": 0,
+        "enqueue_failed": 0,
     }
 
     def _driver_for(provider_id: int | None):
@@ -1438,38 +1462,46 @@ def sweep_stuck_spawns(db: Session) -> dict[str, int]:
             and driver is not None
             and hasattr(driver, "wait_for_ipv4")
         ):
-            # Отодвигаем updated_at ДО запуска потока — следующий тик не
-            # должен запустить вторую финализацию параллельно этой.
+            if enqueue is not None and enqueue("node", node.id) is None:
+                # Очередь недоступна — updated_at НЕ двигаем: нода останется
+                # «застрявшей», и следующий тик попробует enqueue снова.
+                out["enqueue_failed"] += 1
+                continue
+            # Отодвигаем updated_at ДО запуска достройки — следующий тик не
+            # должен запустить вторую финализацию параллельно этой (в
+            # queue-режиме от дублей страхует ещё и детерминированный job_id).
             node.updated_at = utcnow()
             db.add(node)
             db.commit()
             logger.warning(
-                "sweep_stuck_spawns: resuming stuck spawn for node %s (%s)",
+                "sweep_stuck_spawns: resuming stuck spawn for node %s (%s)%s",
                 node.id, node.name,
+                " via RQ job" if enqueue is not None else "",
             )
-            threading.Thread(
-                target=_finalize_spawn,
-                args=(node.id,),
-                kwargs={
-                    # kwargs нужны только create_server-ветке; при наличии
-                    # external_id+wait_for_ipv4 она недостижима (нового
-                    # заказа/двойной оплаты не будет).
-                    "name": node.name,
-                    "region": node.provider_region or node.region,
-                    "plan": node.provider_plan or "",
-                    "image": (
-                        (provider.default_image if provider else None)
-                        or "ubuntu-22.04"
-                    ),
-                    "ssh_key_ids": (
-                        list(provider.ssh_key_ids or []) if provider else None
-                    ),
-                    "user_data": None,
-                    "reality_sni": None,
-                    "reality_dest": None,
-                },
-                daemon=True,
-            ).start()
+            if enqueue is None:
+                threading.Thread(
+                    target=_finalize_spawn,
+                    args=(node.id,),
+                    kwargs={
+                        # kwargs нужны только create_server-ветке; при наличии
+                        # external_id+wait_for_ipv4 она недостижима (нового
+                        # заказа/двойной оплаты не будет).
+                        "name": node.name,
+                        "region": node.provider_region or node.region,
+                        "plan": node.provider_plan or "",
+                        "image": (
+                            (provider.default_image if provider else None)
+                            or "ubuntu-22.04"
+                        ),
+                        "ssh_key_ids": (
+                            list(provider.ssh_key_ids or []) if provider else None
+                        ),
+                        "user_data": None,
+                        "reality_sni": None,
+                        "reality_dest": None,
+                    },
+                    daemon=True,
+                ).start()
             out["relay_resumed"] += 1
         else:
             logger.error(
@@ -1502,31 +1534,36 @@ def sweep_stuck_spawns(db: Session) -> dict[str, int]:
             and driver is not None
             and hasattr(driver, "wait_for_ipv4")
         ):
+            if enqueue is not None and enqueue("exit", exit_node.id) is None:
+                out["enqueue_failed"] += 1
+                continue
             exit_node.updated_at = utcnow()
             db.add(exit_node)
             db.commit()
             logger.warning(
-                "sweep_stuck_spawns: resuming stuck spawn for exit %s (%s)",
+                "sweep_stuck_spawns: resuming stuck spawn for exit %s (%s)%s",
                 exit_node.id, exit_node.name,
+                " via RQ job" if enqueue is not None else "",
             )
-            threading.Thread(
-                target=_finalize_exit_spawn,
-                args=(exit_node.id,),
-                kwargs={
-                    "name": exit_node.name,
-                    "region": exit_node.provider_region or exit_node.region,
-                    "plan": "",
-                    "image": (
-                        (provider.default_image if provider else None)
-                        or "ubuntu-22.04"
-                    ),
-                    "ssh_key_ids": (
-                        list(provider.ssh_key_ids or []) if provider else None
-                    ),
-                    "user_data": None,
-                },
-                daemon=True,
-            ).start()
+            if enqueue is None:
+                threading.Thread(
+                    target=_finalize_exit_spawn,
+                    args=(exit_node.id,),
+                    kwargs={
+                        "name": exit_node.name,
+                        "region": exit_node.provider_region or exit_node.region,
+                        "plan": "",
+                        "image": (
+                            (provider.default_image if provider else None)
+                            or "ubuntu-22.04"
+                        ),
+                        "ssh_key_ids": (
+                            list(provider.ssh_key_ids or []) if provider else None
+                        ),
+                        "user_data": None,
+                    },
+                    daemon=True,
+                ).start()
             out["exit_resumed"] += 1
         else:
             logger.error(
@@ -1543,3 +1580,73 @@ def sweep_stuck_spawns(db: Session) -> dict[str, int]:
             out["exit_errored"] += 1
 
     return out
+
+
+def resume_stuck_spawn(kind: str, entity_id: int) -> dict:
+    """Синхронная достройка ОДНОГО застрявшего спавна — тело RQ-джобы
+    ``app.worker.run_spawn_finalize`` (finding #70).
+
+    В отличие от потока из ``spawn_node_async``, живёт в RQ work-horse
+    провижининг-очереди: переживает деплой backend'а, виден в failed-registry
+    при краше. Guard идемпотентности: если нода уже финализирована (host
+    проставлен / статус не registering) или заказ невозобновляем — no-op;
+    повторный запуск джобы безопасен.
+
+    Долгая часть (``wait_for_ipv4`` + bootstrap) выполняется ВНЕ короткой
+    guard-сессии — не держим connection из пула на минуты ожидания IP.
+    """
+    model = models.VPNNode if kind == "node" else models.WGExitNode
+    kwargs: dict | None = None
+    db = SessionLocal()
+    try:
+        entity = db.get(model, entity_id)
+        if entity is None:
+            return {"resumed": False, "reason": "not_found"}
+        if (
+            entity.status.value != "registering"
+            or entity.host != SPAWN_PLACEHOLDER_HOST
+        ):
+            # Уже финализирована (гонка sweep/дубль джобы) — no-op.
+            return {"resumed": False, "reason": "already_finalized"}
+        provider = (
+            db.get(models.CloudProvider, entity.provider_id)
+            if entity.provider_id else None
+        )
+        if not entity.provider_external_id or provider is None:
+            return {"resumed": False, "reason": "not_resumable"}
+        try:
+            driver = get_driver(provider)
+        except DriverError:
+            logger.exception(
+                "resume_stuck_spawn: driver init failed for %s %s",
+                kind, entity_id,
+            )
+            return {"resumed": False, "reason": "driver_error"}
+        if not hasattr(driver, "wait_for_ipv4"):
+            return {"resumed": False, "reason": "not_resumable"}
+        # kwargs нужны только недостижимой create_server-ветке финализации
+        # (см. sweep_stuck_spawns) — собираем их из тех же полей.
+        kwargs = {
+            "name": entity.name,
+            "region": entity.provider_region or entity.region,
+            "plan": (getattr(entity, "provider_plan", None) or "")
+            if kind == "node" else "",
+            "image": provider.default_image or "ubuntu-22.04",
+            "ssh_key_ids": list(provider.ssh_key_ids or []) or None,
+            "user_data": None,
+        }
+        if kind == "node":
+            kwargs["reality_sni"] = None
+            kwargs["reality_dest"] = None
+    finally:
+        db.close()
+
+    logger.warning(
+        "resume_stuck_spawn: finalizing stuck %s %s synchronously",
+        kind, entity_id,
+    )
+    if kind == "node":
+        _finalize_spawn(entity_id, **kwargs)
+    else:
+        _finalize_exit_spawn(entity_id, **kwargs)
+    return {"resumed": True, "reason": "finalized"}

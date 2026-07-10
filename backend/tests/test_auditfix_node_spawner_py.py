@@ -377,6 +377,7 @@ def test_sweep_skips_fresh_registering_nodes(
     assert out == {
         "relay_resumed": 0, "relay_errored": 0,
         "exit_resumed": 0, "exit_errored": 0,
+        "enqueue_failed": 0,
     }
     assert _DummyThread.started == []
     db_session.refresh(node)

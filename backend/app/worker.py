@@ -1001,6 +1001,65 @@ def run_warm_pool_revoke_tick() -> dict:
     return summary
 
 
+def run_spawn_sweep_tick() -> dict:
+    """Подбор спавнов, застрявших в ``registering`` (finding #70).
+
+    Достройка спавна исторически жила в daemon-потоке backend'а — рестарт
+    контейнера убивал её молча, и оплаченный сервер навсегда оставался
+    невидимым (registering + placeholder-host), продолжая списывать деньги у
+    хостера. Тик зовёт ``node_spawner.sweep_stuck_spawns``, который для каждой
+    застрявшей ноды/exit'а ставит персистентную RQ-джобу
+    ``run_spawn_finalize`` на провижининг-очередь (поток из тика не годится:
+    work-horse завершается сразу после return и убил бы достройку).
+
+    Self-reschedules через ``NODE_SPAWN_SWEEP_INTERVAL`` (default 600s).
+    Disabled при 0. Порог «застрял» — ``NODE_SPAWN_STUCK_MINUTES`` (30).
+    """
+    from .db import SessionLocal
+    from .queue import enqueue_spawn_finalize, schedule_tick
+    from .services import node_spawner
+
+    interval = _env_int("NODE_SPAWN_SWEEP_INTERVAL", 600)
+    if interval > 0:
+        try:
+            schedule_tick(
+                "app.worker.run_spawn_sweep_tick",
+                interval,
+                tick_id="tick-spawn-sweep",
+                replace=True,
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("spawn_sweep: failed to re-enqueue tick (at start)")
+
+    session = SessionLocal()
+    summary: dict = {}
+    try:
+        summary = node_spawner.sweep_stuck_spawns(
+            session, enqueue=enqueue_spawn_finalize
+        )
+    except Exception:  # noqa: BLE001
+        logger.exception("spawn_sweep: sweep failed")
+        # Ре-бросаем — см. run_renewal_check: падение тика уходит в failed → /ops.
+        raise
+    finally:
+        session.close()
+
+    return summary
+
+
+def run_spawn_finalize(kind: str, entity_id: int) -> dict:
+    """RQ-джоба достройки одного застрявшего спавна (finding #70).
+
+    Ставится ``queue.enqueue_spawn_finalize`` из spawn-sweep-тика; сама
+    достройка (wait_for_ipv4 + host + coalesced bootstrap) — в
+    ``node_spawner.resume_stuck_spawn``. Идёт на провижининг-очереди (не
+    тиковой): может ждать IP минуты и не должна голодать короткие тики.
+    """
+    from .services import node_spawner
+
+    return node_spawner.resume_stuck_spawn(kind, entity_id)
+
+
 def run_retention_tick() -> dict:
     """Периодическая очистка безлимитно растущих таблиц (finding #247).
 
@@ -2258,6 +2317,16 @@ def run_node_reachability_tick() -> dict:
             now = utcnow()
             ref = f"{kind}:{target.id}"
 
+            # net-audit #97: ssh-стадия НЕ выполнялась (нет paramiko или
+            # ssh-ключа на контроллере) — проба недиагностична. Не трогаем
+            # last_probe_status/unreachable_since: конфиг-ошибка контроллера
+            # не должна класть весь флот в ложный DOWN со штормом пушей.
+            # last_probe_at тоже не двигаем — stale_targets-метрика честно
+            # покажет, что флот фактически не мониторится.
+            if probe.ssh_skipped and not probe.ssh_ok:
+                summary.setdefault("ssh_skipped", []).append(ref)
+                continue
+
             if probe.ssh_ok:
                 # Finding #1: SSH жив, но проверяем, слушают ли TCP VPN-порты.
                 # ЗАКРЫТЫ ВСЕ заявленные порты при живом SSH = сервис (xray)
@@ -2398,6 +2467,35 @@ def run_node_reachability_tick() -> dict:
                 )
             except Exception:  # noqa: BLE001
                 logger.exception("node_reachability: mass-down alert failed")
+
+        # net-audit #97: ssh-пробы скипались по конфиг-ошибке контроллера —
+        # доступность флота фактически НЕ проверяется. Один агрегированный
+        # алерт с дедупом вместо тихого «всё ок» (статусы не обновляются, а
+        # значит и down-детект, и recovery заморожены до починки окружения).
+        if summary.get("ssh_skipped"):
+            logger.error(
+                "node_reachability: ssh-проба пропущена для %s целей (нет "
+                "paramiko или ssh-ключа на контроллере) — статусы нод не "
+                "обновляются, мониторинг слеп",
+                len(summary["ssh_skipped"]),
+            )
+            try:
+                notify_admins(
+                    session,
+                    kind="reachability_ssh_skipped",
+                    text=(
+                        "⚠️ Монитор доступности не может выполнить ssh-пробу "
+                        "(paramiko или ssh-ключ недоступны на контроллере). "
+                        "Статусы нод/exit'ов не обновляются — down-детект и "
+                        "recovery заморожены. Проверьте окружение воркера "
+                        "(ANSIBLE_PRIVATE_KEY_FILE / paramiko)."
+                    ),
+                    dedup_key={"scope": "reachability-ssh-skipped"},
+                    window_sec=1800,
+                    autocommit=True,
+                )
+            except Exception:  # noqa: BLE001
+                logger.exception("node_reachability: ssh-skipped alert failed")
 
         # Метрика самого голодания: сколько целей не пробовано дольше
         # NODE_REACHABILITY_STALE_MIN минут (default 30). Стабильно >0 —
@@ -3270,6 +3368,25 @@ def main() -> None:
             )
         except Exception:  # noqa: BLE001
             logger.exception("Failed to schedule warm pool revoke sweep")
+
+    # Spawn-sweep — подбор спавнов, застрявших в registering после рестарта
+    # backend'а (daemon-поток финализации умер). Достройку ставит персистентной
+    # RQ-джобой на провижининг-очередь (finding #70). Default 600s, 0=off.
+    spawn_sweep_interval = _env_int("NODE_SPAWN_SWEEP_INTERVAL", 600)
+    if do_bootstrap and spawn_sweep_interval > 0:
+        try:
+            schedule_tick(
+                "app.worker.run_spawn_sweep_tick",
+                min(spawn_sweep_interval, 120),
+                tick_id="tick-spawn-sweep",
+                replace=True,
+            )
+            logger.info(
+                "Spawn sweep bootstrapped: first run in 120s (interval=%ss)",
+                spawn_sweep_interval,
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("Failed to schedule spawn sweep")
 
     # Schedule balance charge tick (default: hourly). Stage 4 — drives
     # daily-billing ticks for balance subscriptions and auto-unfreezes

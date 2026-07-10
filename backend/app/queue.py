@@ -225,6 +225,78 @@ def enqueue_task(task_id: int, node_id: int | None) -> str | None:
         return None
 
 
+def enqueue_spawn_finalize(kind: str, entity_id: int) -> str | None:
+    """Enqueue достройку застрявшего спавна (finding #70, spawn-sweep-тик).
+
+    Финализация спавна (wait_for_ipv4 + host + bootstrap) исторически жила в
+    daemon-потоке backend'а и умирала при рестарте. Sweep-тик воркера находит
+    застрявшие ноды, но НЕ может достраивать их потоком у себя: RQ work-horse
+    завершает процесс сразу после return тика, убивая daemon-потоки. Поэтому
+    достройка едет отдельной RQ-джобой на провижининг-очередь (персистентно:
+    краш воркера → джоба видна в failed, а следующий sweep через
+    NODE_SPAWN_STUCK_MINUTES переоткроет её заново).
+
+    Дедуп по детерминированному job_id — повторный sweep при ещё живой
+    джобе схлопывается в no-op. Возвращает job id или ``None`` при
+    недоступной очереди (вызывающий НЕ должен фолбэчиться в поток — просто
+    подождёт следующего тика).
+    """
+    queue = get_queue()
+    if queue is None:
+        logger.warning(
+            "enqueue_spawn_finalize: RQ queue unavailable — %s %s remains stuck "
+            "until the next sweep tick",
+            kind, entity_id,
+        )
+        return None
+    try:
+        from rq.job import Job
+        from rq.exceptions import NoSuchJobError
+        from rq.registry import StartedJobRegistry
+
+        job_id = f"spawn-finalize-{kind}-{entity_id}"
+        # Зомби-«started» без живого воркера → failed (см. enqueue_task).
+        try:
+            StartedJobRegistry(queue=queue).cleanup()
+        except Exception:  # noqa: BLE001
+            logger.debug("StartedJobRegistry.cleanup() failed (non-fatal)", exc_info=True)
+        try:
+            existing = Job.fetch(job_id, connection=queue.connection)
+            if existing.get_status(refresh=True) in {"queued", "started", "deferred", "scheduled"}:
+                return existing.id
+            existing.delete()
+        except NoSuchJobError:
+            pass
+        except Exception:  # noqa: BLE001
+            logger.warning(
+                "enqueue_spawn_finalize: corrupted job %s — purging + re-enqueuing",
+                job_id, exc_info=True,
+            )
+            try:
+                queue.connection.delete(f"rq:job:{job_id}")
+            except Exception:  # noqa: BLE001
+                logger.debug("enqueue_spawn_finalize: raw key purge failed", exc_info=True)
+
+        # Без Retry: финализация не идемпотентна на ретраях по времени (двойной
+        # wait_for_ipv4 безвреден, но бессмыслен) — восстановление после краша
+        # обеспечивает сам sweep-тик, который переоткроет застрявшую ноду.
+        job = queue.enqueue(
+            "app.worker.run_spawn_finalize",
+            kind,
+            entity_id,
+            job_timeout=DEFAULT_JOB_TIMEOUT,
+            failure_ttl=FAILED_TTL,
+            result_ttl=RESULT_TTL,
+            job_id=job_id,
+        )
+        return job.id
+    except Exception:  # noqa: BLE001
+        logger.exception(
+            "enqueue_spawn_finalize failed for %s %s", kind, entity_id
+        )
+        return None
+
+
 def cancel_task_job(task_id: int) -> bool:
     """Best-effort снять ещё НЕ стартовавшую provisioning RQ-джобу, чтобы
     worker её не подхватил. True если джоба найдена в очереди и снята. No-op
@@ -274,6 +346,7 @@ TICK_IDS = {
     "app.worker.run_operator_report_watch_tick": "tick-operator-report-watch",
     "app.worker.run_reconcile_tick": "tick-reconcile",
     "app.worker.run_cloud_billing_tick": "tick-cloud-billing",
+    "app.worker.run_spawn_sweep_tick": "tick-spawn-sweep",
 }
 
 # Per-tick hard timeouts. Без них зависшая SSH (traffic-stats,
@@ -303,6 +376,8 @@ TICK_TIMEOUTS = {
     "tick-reconcile": 60,
     # HTTP к API провайдеров (balance) — несколько провайдеров последовательно.
     "tick-cloud-billing": 120,
+    # DB-only + enqueue RQ-джоб (сама достройка едет на провижининг-очереди).
+    "tick-spawn-sweep": 60,
 }
 
 

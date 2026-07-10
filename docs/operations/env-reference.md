@@ -85,6 +85,7 @@
 | `RETENTION_INTERVAL` | `86400` | worker | `run_retention_tick` — раз в сутки чистит `audit_logs` (`subscription_fetch`/`*:delivered`) и `node_traffic_samples` старше N дней (аудит-фикс #247). `0` — отключить. |
 | `AUDIT_LOG_RETENTION_DAYS` | `90` | worker | Порог (дни) для удаления `subscription_fetch` + `*:delivered` из `audit_logs`. `0` — не чистить audit_logs. Прочие action'ы не трогаются. |
 | `TRAFFIC_SAMPLE_RETENTION_DAYS` | `30` | worker | Порог (дни) для удаления `node_traffic_samples`. `0` — не чистить. Детекторам/агрегатам нужны лишь последние тики. |
+| `NODE_SPAWN_SWEEP_INTERVAL` | `600` | worker | `run_spawn_sweep_tick` — подбор спавнов, застрявших в `registering` (аудит-фикс #70): достройка уходит персистентной RQ-джобой `run_spawn_finalize` на провижининг-очередь. Порог «застрял» — `NODE_SPAWN_STUCK_MINUTES` (30). `0` — отключить. |
 | `RETENTION_DELETE_BATCH` | `10000` | worker | Размер батча удаления retention-тика (id IN (SELECT … LIMIT), коммит после каждого — короткие локи). |
 | `RETENTION_MAX_BATCHES` | `200` | worker | Потолок батчей на таблицу за один retention-тик. Остаток донесётся следующим прогоном. |
 | `AUTOSCALE_INTERVAL` | `0` / `300` | worker | `run_autoscale_check`. `0` — отключить. `.env.example` ставит `300`. |
