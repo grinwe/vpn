@@ -82,6 +82,19 @@ dp.errors.register(on_dispatch_error)  # глобальная страховка
 
 Доступ гейтится через `_is_admin(user_id) = user_id in ADMIN_IDS` (`handlers.py:51`). `ADMIN_IDS` приходит из env (comma-separated), парсится в `bot/config.py`. Это проверка **на уровне Telegram user id**, не через отдельный auth на backend'е — backend всё равно принимает запросы по единому `ADMIN_API_TOKEN`.
 
+### 2.5. Выбор способа оплаты (Stage 9b)
+
+При заполненном `PAYMENT_PROVIDER_CHOICES` (2+ имён провайдеров,
+`bot/config.py`) покупка (`plan:`-callback) и продление (`/renew`) после
+создания счёта показывают меню способов оплаты вместо немедленного
+checkout'а с `PAYMENT_PROVIDER`. Callback `payvia:{new|ren}:{invoice_id}:{provider}`
+делает checkout выбранным провайдером и подставляет pay-кнопку (`edit_reply_markup`),
+сохраняя callback-кнопки (способы + автопродление) — неудавшийся способ можно
+сменить, каждый выбор создаёт свою Payment-строку, вебхук пометит оплаченную
+(#117). Подписи кнопок — `_PROVIDER_LABELS` в `handlers.py`; неизвестное имя
+показывается как есть. Пустой/одиночный `PAYMENT_PROVIDER_CHOICES` — старое
+поведение без меню. Детали провайдеров — `components/payments.md`.
+
 ### 3. Stars-платёжный поток
 
 Telegram Stars — единственный способ принять оплату *внутри* TG, без внешнего pay_url.

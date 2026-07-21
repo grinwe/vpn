@@ -52,6 +52,18 @@ services:
       PAYMENT_PROVIDERS: ${PAYMENT_PROVIDERS:-}
       CRYPTOBOT_TOKEN: ${CRYPTOBOT_TOKEN:-}
       TELEGRAM_STARS_WEBHOOK_SECRET: ${TELEGRAM_STARS_WEBHOOK_SECRET:-}
+      # Stage 9b — карты РФ/СБП: lava.top (offerId продукта с «Ценой по
+      # запросу через API») и Tribute Shop API. docs/PLAN_LAVA_TOP.md.
+      LAVA_TOP_API_KEY: ${LAVA_TOP_API_KEY:-}
+      LAVA_TOP_OFFER_ID: ${LAVA_TOP_OFFER_ID:-}
+      LAVA_TOP_WEBHOOK_SECRET: ${LAVA_TOP_WEBHOOK_SECRET:-}
+      LAVA_TOP_EMAIL_DOMAIN: ${LAVA_TOP_EMAIL_DOMAIN:-}
+      # Пусто → драйвер бьёт в прод-URL по умолчанию; override для теста/стейджа.
+      LAVA_TOP_API_BASE: ${LAVA_TOP_API_BASE:-}
+      TRIBUTE_API_KEY: ${TRIBUTE_API_KEY:-}
+      TRIBUTE_ORDER_TITLE: ${TRIBUTE_ORDER_TITLE:-}
+      TRIBUTE_ORDER_DESCRIPTION: ${TRIBUTE_ORDER_DESCRIPTION:-}
+      TRIBUTE_API_BASE: ${TRIBUTE_API_BASE:-}
       # #62 — native Telegram webhook mode. When set, the backend
       # registers itself as the Bot API webhook receiver on startup
       # and processes Stars payments directly — no shared secret.
@@ -320,6 +332,9 @@ services:
       # picks one provider per checkout (random). Falls back to
       # PAYMENT_PROVIDER above when unset.
       PAYMENT_PROVIDERS: ${PAYMENT_PROVIDERS:-}
+      # Stage 9b — меню выбора способа оплаты в боте (comma-separated
+      # имена провайдеров). Пусто/одно имя = старое поведение.
+      PAYMENT_PROVIDER_CHOICES: ${PAYMENT_PROVIDER_CHOICES:-}
       TELEGRAM_STARS_WEBHOOK_SECRET: ${TELEGRAM_STARS_WEBHOOK_SECRET:-}
       SUB_LINK_BASE_URL: ${SUB_LINK_BASE_URL:-}
       WEBAPP_BASE_URL: ${WEBAPP_BASE_URL:-}

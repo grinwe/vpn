@@ -42,11 +42,16 @@ def _provider_invoice_id_from_event(event) -> str | None:
         return None
     # cryptobot: {"update_type": ..., "payload": {"invoice_id": <id провайдера>,
     #             "payload": "<наш invoice id>"}}
+    # tribute:   {"name": "shop_order", "payload": {"uuid": <uuid заказа>, ...}}
     inner = raw.get("payload")
     if isinstance(inner, dict):
-        pid = inner.get("invoice_id")
+        pid = inner.get("invoice_id") or inner.get("uuid")
         if pid:
             return str(pid)
+    # lava_top: {"eventType": ..., "contractId": <uuid контракта>, ...}
+    pid = raw.get("contractId")
+    if pid:
+        return str(pid)
     return None
 
 
@@ -150,6 +155,12 @@ def checkout_invoice(
     invoice = db.get(models.Invoice, invoice_id)
     if not invoice:
         raise HTTPException(status_code=404, detail="Invoice not found")
+    # Ownership guard: бот передаёт telegram_id вызывающего, т.к. invoice_id
+    # в новом меню оплаты приходит из подделываемой callback_data. Без
+    # совпадения владельца — 403 (IDOR: чужой pending-счёт не чекаутится).
+    req_tg = body.telegram_id if body else None
+    if req_tg and (invoice.user is None or invoice.user.telegram_id != req_tg):
+        raise HTTPException(status_code=403, detail="Invoice does not belong to this user")
     if invoice.status != models.InvoiceStatus.pending:
         raise HTTPException(status_code=400, detail="Invoice is not in pending state")
 
@@ -377,6 +388,43 @@ async def payment_webhook(
         if pending_payment is None:
             pending_payment = base_q.order_by(models.Payment.id.desc()).first()
         payment_id = pending_payment.id if pending_payment else None
+
+        # Детект двойной оплаты: счёт уже paid, но пришёл НОВЫЙ платёж
+        # (свежая pending-строка — обычно другой способ из меню Stage 9b,
+        # оплаченный вторым). _mark_invoice_paid_core молча зачтёт его без
+        # повторного провижининга — деньги списаны дважды за один счёт,
+        # поэтому зовём оператора на возврат. Ретрай того же вебхука сюда не
+        # попадает: он матчит уже-paid строку (не pending) → case 3.
+        if (
+            invoice.status == models.InvoiceStatus.paid
+            and pending_payment is not None
+            and pending_payment.status == models.PaymentStatus.pending
+        ):
+            from ..services.admin_notify import notify_admins
+
+            logger.warning(
+                "webhook %s invoice %d: платёж по уже оплаченному счёту "
+                "(payment #%s) — вероятна двойная оплата, нужен возврат",
+                provider.name,
+                invoice_id,
+                payment_id,
+            )
+            notify_admins(
+                db,
+                kind="payment_double_paid",
+                text=(
+                    f"⚠️ Двойная оплата счёта #{invoice_id}: пришёл платёж "
+                    f"{provider.name} по уже оплаченному счёту. Проверьте и "
+                    f"верните лишнее."
+                ),
+                dedup_key={"invoice_id": invoice_id, "payment_id": payment_id},
+                extra={
+                    "invoice_id": invoice_id,
+                    "provider": provider.name,
+                    "payment_id": payment_id,
+                },
+                autocommit=True,
+            )
 
         result = _mark_invoice_paid_core(
             db,

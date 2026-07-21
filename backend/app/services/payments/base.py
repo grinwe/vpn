@@ -116,4 +116,15 @@ def get_provider(name: str | None = None) -> PaymentProvider:
         token, secret = _load_from_env()
         return TelegramStarsProvider(bot_token=token, webhook_secret=secret)
 
+    # Stage 9b: карточные/СБП провайдеры (docs/PLAN_LAVA_TOP.md).
+    if name == "lava_top":
+        from .lava_top import LavaTopProvider, load_lava_top_env
+
+        return LavaTopProvider(**load_lava_top_env())
+
+    if name == "tribute":
+        from .tribute import TributeProvider, load_tribute_env
+
+        return TributeProvider(**load_tribute_env())
+
     raise ProviderError(f"Unknown payment provider: {name}")

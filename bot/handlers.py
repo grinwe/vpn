@@ -16,9 +16,38 @@ from .config import (
     ADMIN_IDS,
     BACKEND_URL,
     PAYMENT_PROVIDER,
+    PAYMENT_PROVIDER_CHOICES,
     SUB_LINK_BASE_URL,
     TELEGRAM_STARS_WEBHOOK_SECRET,
 )
+
+# Stage 9b — человекочитаемые подписи кнопок выбора способа оплаты.
+# Неизвестное имя провайдера показывается как есть (кнопка всё равно
+# работает: имя уходит в checkout verbatim).
+_PROVIDER_LABELS = {
+    "telegram_stars": "⭐ Telegram Stars",
+    "stars": "⭐ Telegram Stars",
+    "lava_top": "💳 Карта РФ / СБП",
+    "tribute": "💳 Карта (Tribute)",
+    "cryptobot": "🪙 Крипта (USDT)",
+}
+
+
+def _provider_label(name: str) -> str:
+    return _PROVIDER_LABELS.get(name, name)
+
+
+def _payment_method_rows(invoice_id: int, kind: str) -> list[list[types.InlineKeyboardButton]]:
+    """Ряды inline-кнопок выбора способа оплаты (kind: new|ren)."""
+    return [
+        [
+            types.InlineKeyboardButton(
+                text=_provider_label(p),
+                callback_data=f"payvia:{kind}:{invoice_id}:{p}",
+            )
+        ]
+        for p in PAYMENT_PROVIDER_CHOICES
+    ]
 
 
 def _build_sub_url(sub_token: str | None) -> str | None:
@@ -503,11 +532,29 @@ async def create_invoice(callback_query: types.CallbackQuery):
         await callback_query.answer("Ошибка при создании счета", show_alert=True)
         return
 
+    # Stage 9b: при нескольких настроенных способах оплаты сначала даём
+    # выбор — checkout произойдёт в payvia-callback'е выбранным провайдером.
+    if len(PAYMENT_PROVIDER_CHOICES) >= 2:
+        keyboard = types.InlineKeyboardMarkup(
+            inline_keyboard=_payment_method_rows(invoice["id"], "new")
+        )
+        await callback_query.message.answer(
+            f"Счёт #{invoice['id']} на {invoice.get('amount')} {invoice.get('currency', '')}.\n"
+            "Выберите способ оплаты ⬇️ Конфиг придёт автоматически после "
+            "подтверждения оплаты.",
+            reply_markup=keyboard,
+        )
+        await callback_query.answer()
+        return
+
     try:
         co_status, checkout = await _fetch_json(
             "POST",
             f"{BACKEND_URL}/api/invoices/{invoice['id']}/checkout",
-            json={"provider": PAYMENT_PROVIDER},
+            json={
+                "provider": PAYMENT_PROVIDER,
+                "telegram_id": str(callback_query.from_user.id),
+            },
         )
     except aiohttp.ClientError:
         co_status, checkout = 0, None
@@ -529,6 +576,82 @@ async def create_invoice(callback_query: types.CallbackQuery):
         "Нажмите кнопку ниже для оплаты. Конфиг придёт автоматически после подтверждения.",
         reply_markup=keyboard,
     )
+    await callback_query.answer()
+
+
+@router.callback_query(F.data.startswith("payvia:"))
+async def choose_payment_method(callback_query: types.CallbackQuery):
+    """Stage 9b: юзер выбрал способ оплаты — делаем checkout этим провайдером.
+
+    Кнопки способов остаются в клавиатуре: если оплата одним способом не
+    прошла (антифрод карточного агрегатора и т.п.), юзер выбирает другой —
+    каждый выбор создаёт свою Payment-строку, вебхук пометит оплаченную
+    (#117). Заменяется только pay-кнопка (единственная с url).
+    """
+    try:
+        _, kind, invoice_id_raw, provider = callback_query.data.split(":", maxsplit=3)
+        invoice_id = int(invoice_id_raw)
+    except ValueError:
+        await callback_query.answer("Некорректный запрос", show_alert=True)
+        return
+
+    # callback_data подделываема кастомным клиентом (Telegram не сверяет её
+    # с реальной клавиатурой): принимаем только провайдера из настроенного
+    # меню, а бэкенд дополнительно сверяет владельца счёта по telegram_id.
+    if provider not in PAYMENT_PROVIDER_CHOICES:
+        await callback_query.answer("Неизвестный способ оплаты", show_alert=True)
+        return
+
+    try:
+        co_status, checkout = await _fetch_json(
+            "POST",
+            f"{BACKEND_URL}/api/invoices/{invoice_id}/checkout",
+            json={
+                "provider": provider,
+                "telegram_id": str(callback_query.from_user.id),
+            },
+        )
+    except aiohttp.ClientError:
+        co_status, checkout = 0, None
+
+    pay_url = (checkout or {}).get("pay_url")
+    if co_status != 200 or not pay_url:
+        await callback_query.answer(
+            "Этот способ временно недоступен — попробуйте другой.", show_alert=True
+        )
+        return
+
+    btn_text = "Оплатить продление" if kind == "ren" else "Оплатить"
+    pay_row = [
+        types.InlineKeyboardButton(
+            text=f"{btn_text} · {_provider_label(provider)}", url=pay_url
+        )
+    ]
+    link_text = f"Ссылка на оплату ({_provider_label(provider)}):\n{pay_url}"
+
+    msg = callback_query.message
+    # Сообщение старше 48ч приходит как InaccessibleMessage (нет
+    # reply_markup / edit_reply_markup) — редактировать нельзя. Шлём
+    # ссылку новым сообщением в тот же чат (в ЛС chat.id == from_user.id).
+    if not isinstance(msg, types.Message):
+        chat_id = getattr(getattr(msg, "chat", None), "id", None) or callback_query.from_user.id
+        await callback_query.bot.send_message(
+            chat_id=chat_id,
+            text=link_text,
+            reply_markup=types.InlineKeyboardMarkup(inline_keyboard=[pay_row]),
+        )
+        await callback_query.answer()
+        return
+
+    old_rows = msg.reply_markup.inline_keyboard if msg.reply_markup else []
+    kept = [row for row in old_rows if not any(btn.url for btn in row)]
+    keyboard = types.InlineKeyboardMarkup(inline_keyboard=[pay_row] + kept)
+    try:
+        await msg.edit_reply_markup(reply_markup=keyboard)
+    except TelegramBadRequest:
+        # message is not modified (повторный тап тем же способом) либо
+        # сообщение слишком старое для edit — шлём ссылку новым сообщением.
+        await msg.answer(link_text)
     await callback_query.answer()
 
 
@@ -770,11 +893,33 @@ async def cmd_renew(message: types.Message):
         await message.answer("Не удалось создать счет на продление.")
         return
 
+    # Stage 9b: несколько способов оплаты — сначала выбор, checkout в
+    # payvia-callback'е. Кнопка автопродления остаётся в той же клавиатуре
+    # (payvia сохраняет callback-кнопки при подстановке pay-ссылки).
+    if len(PAYMENT_PROVIDER_CHOICES) >= 2:
+        rows = _payment_method_rows(invoice["id"], "ren")
+        rows.append(
+            [types.InlineKeyboardButton(
+                text="Включить автопродление",
+                callback_data=f"auto_renew:{sub['id']}",
+            )]
+        )
+        await message.answer(
+            f"💳 Продление подписки #{sub['id']}\n"
+            f"Сумма: {invoice.get('amount')} {invoice.get('currency', '')}\n\n"
+            "Выберите способ оплаты ⬇️ Или включите автопродление.",
+            reply_markup=types.InlineKeyboardMarkup(inline_keyboard=rows),
+        )
+        return
+
     try:
         co_status, checkout = await _fetch_json(
             "POST",
             f"{BACKEND_URL}/api/invoices/{invoice['id']}/checkout",
-            json={"provider": PAYMENT_PROVIDER},
+            json={
+                "provider": PAYMENT_PROVIDER,
+                "telegram_id": str(message.from_user.id),
+            },
         )
     except aiohttp.ClientError:
         co_status, checkout = 0, None

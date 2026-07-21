@@ -11,6 +11,16 @@ ADMIN_API_TOKEN = os.getenv("ADMIN_API_TOKEN")
 PAYMENT_PROVIDER = os.getenv("PAYMENT_PROVIDER", "cryptobot")
 TELEGRAM_STARS_WEBHOOK_SECRET = os.getenv("TELEGRAM_STARS_WEBHOOK_SECRET", "")
 
+# Stage 9b — способы оплаты на выбор юзера (comma-separated имена
+# провайдеров backend'а, например "telegram_stars,lava_top,tribute").
+# Пусто или одно имя — меню не показывается, работает старое поведение
+# с PAYMENT_PROVIDER выше.
+PAYMENT_PROVIDER_CHOICES = [
+    p.strip().lower()
+    for p in os.getenv("PAYMENT_PROVIDER_CHOICES", "").split(",")
+    if p.strip()
+]
+
 # Dynamic subscription link base URL (e.g. https://vpn.example.com/sub/)
 SUB_LINK_BASE_URL = os.getenv("SUB_LINK_BASE_URL", "")
 

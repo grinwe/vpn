@@ -47,8 +47,24 @@ deploy_app_stack_force_recreate: false
 # Optional (leave empty string to disable the corresponding feature):
 #   deploy_app_stack_telegram_stars_webhook_secret
 #   deploy_app_stack_payment_provider        (default: "cryptobot")
+#   deploy_app_stack_payment_provider_choices (Stage 9b: меню способов
+#       оплаты в боте, например "telegram_stars,lava_top,tribute")
+#   deploy_app_stack_lava_top_*              (Stage 9b: lava.top —
+#       api_key/offer_id/webhook_secret из vault, email_domain открытый)
+#   deploy_app_stack_tribute_*               (Stage 9b: Tribute —
+#       api_key из vault; order_title/description опциональны)
 deploy_app_stack_payment_provider: "cryptobot"
 deploy_app_stack_telegram_stars_webhook_secret: ""
+deploy_app_stack_payment_provider_choices: ""
+deploy_app_stack_lava_top_api_key: ""
+deploy_app_stack_lava_top_offer_id: ""
+deploy_app_stack_lava_top_webhook_secret: ""
+deploy_app_stack_lava_top_email_domain: ""
+deploy_app_stack_lava_top_api_base: ""
+deploy_app_stack_tribute_api_key: ""
+deploy_app_stack_tribute_order_title: ""
+deploy_app_stack_tribute_order_description: ""
+deploy_app_stack_tribute_api_base: ""
 
 # Admin SPA base path. Default "admin" keeps the legacy /admin/ URL;
 # override via vault_admin_secret_path in group_vars/web/vault.yml to

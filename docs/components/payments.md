@@ -121,6 +121,28 @@ SBP_<SLUG>_PAID_STATUSES         ← default "paid,success,succeeded"
 
 «Mock aggregator» в тестах использует именно этот driver — `tests/test_payment_providers.py` гоняет generic_sbp с поддельными env'ами. Сквозной конвейер «webhook → `_mark_invoice_paid_core` → подписка/баланс» покрыт интеграционно в `tests/test_auditfix_api_invoices_py.py` (аудит #186): реальные POST на `/api/payments/webhook/sbp:*` с HMAC-подписью тела, идемпотентность повторной доставки, mark_paid, topup + реферальный бонус, ветки ошибок 400/401/404.
 
+### Lava.top (`lava_top.py`, Stage 9b)
+
+Карты РФ (МИР/Visa/MC) + СБП через lava.top (LAVALANE LTD). Полный
+контекст выбора и рисков — `docs/PLAN_LAVA_TOP.md`.
+
+- `create_invoice`: POST `{LAVA_TOP_API_BASE}/api/v3/invoice`, auth-заголовок `X-Api-Key`. Динамическая сумма работает только у продукта с включённым в кабинете режимом «Цена по запросу через API» (`LAVA_TOP_OFFER_ID`); лимиты платформы 50–1 000 000 ₽. Metadata-поля у платформы нет — наш `invoice_id` едет в `clientUtm.utm_content`, а обязательный email покупателя синтезируется как `inv{invoice_id}@{LAVA_TOP_EMAIL_DOMAIN}`. Из ответа: `id` (contractId) → `external_id`, `paymentUrl` → `pay_url`.
+- `verify_webhook`: HMAC у платформы **нет** — она шлёт наш статический секрет `LAVA_TOP_WEBHOOK_SECRET` в заголовке `X-Api-Key` (настраивается в кабинете при добавлении вебхука, тип «API key»). `paid` = `eventType=payment.success` **и** `status ∈ {completed, subscription-active}`; `payment.failed`/`subscription.recurring.payment.failed` → `failed`; остальное → `other`. Событие без `clientUtm.utm_content` (покупка не из нашего backend'а) — warning + `other`/`external_id="0"`, чтобы платформа не ретраила вечно (до 20 попыток).
+- Env-цепочка: `LAVA_TOP_API_KEY`/`_OFFER_ID`/`_WEBHOOK_SECRET` из vault (`vault_lava_top_*`), `LAVA_TOP_EMAIL_DOMAIN` — открытый (default: домен фронта).
+
+### Tribute (`tribute.py`, Stage 9b)
+
+Tribute Shop API (tribute.tg, TRBT Limited): карты (браузерная ссылка), СБП, Stars.
+
+- `create_invoice`: POST `{TRIBUTE_API_BASE}/shop/orders`, заголовок `Api-Key`. Сумма — **int в копейках/центах** (драйвер конвертирует из рублёвого float). `title`/`description` обязательны у платформы — берутся нейтральные строки из `TRIBUTE_ORDER_TITLE`/`_DESCRIPTION` (дефолт «Пополнение баланса», Stage 9d-нейтральность), описание счёта не пересылается. `customerId` = наш `invoice_id` (round-trip), `uuid` заказа → `external_id`. `pay_url` = `paymentUrl` (браузер; приоритетнее `webappPaymentUrl` — карты за цифровые услуги внутри Telegram нарушают Stars-only правило Bot ToS §6.2).
+- `verify_webhook`: заголовок `trbt-signature` = HMAC-SHA256 сырого тела, ключ — сам `TRIBUTE_API_KEY` (отдельного секрета нет). Кодировка в доке не зафиксирована — принимаются hex и base64. `paid` = **только** событие `shop_order` со `status=paid`; промежуточный `shop_order_payment_received` («фиат получен, ждём финала») намеренно → `other`; `shop_order_payment_failed`/`_cancelled`/`_refunded` → `failed`. Событие без `customerId` — warning + `other`/`"0"` (заказ не из нашего backend'а).
+
+Оба драйвера рублёвые: `_convert_for_provider` пропускает их суммы без конвертации, сверка суммы вебхука работает из коробки. `_provider_invoice_id_from_event` понимает их raw (lava: `contractId` на верхнем уровне; tribute: `payload.uuid`). Юнит-тесты — `tests/test_payments_lava_top.py` (оба драйвера: построение запроса, подписи/секреты, маппинг событий, get_provider-диспатч).
+
+### Выбор способа оплаты в боте (Stage 9b)
+
+`PAYMENT_PROVIDER_CHOICES` (env бота, comma-separated имена провайдеров): при 2+ значениях бот после создания счёта показывает меню способов («⭐ Telegram Stars / 💳 Карта РФ / СБП / …»), checkout происходит в callback'е `payvia:{kind}:{invoice_id}:{provider}` выбранным провайдером. Кнопки способов остаются в клавиатуре после выдачи pay-ссылки — неудавшийся способ (антифрод агрегатора) можно сменить, каждый выбор создаёт свою Payment-строку (#117 матчит оплаченную). Пусто/одно имя — старое поведение (`PAYMENT_PROVIDER` без меню).
+
 ## `/api/invoices/{id}/checkout` — создание инвойса
 
 `backend/app/api.py:2578-2636`. Минимальный путь:

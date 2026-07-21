@@ -126,6 +126,41 @@ def test_checkout_converts_rub_to_stars(client, db_session, monkeypatch):
     assert payment.currency == "RUB"
 
 
+def test_checkout_ownership_guard_rejects_foreign_telegram_id(client, db_session, monkeypatch):
+    # Stage 9b IDOR-фикс: если передан telegram_id, счёт должен принадлежать
+    # этому пользователю — иначе 403 и до провайдера не доходим.
+    monkeypatch.setenv("WEBAPP_STARS_PER_RUB", "0.67")
+    fake = _FakeProvider("telegram_stars")
+    monkeypatch.setattr("app.api.payments.get_provider", lambda name=None: fake)
+
+    owner = make_user(db_session, telegram_id="owner-1")
+    invoice = _make_invoice(db_session, owner, amount=150.0, currency="RUB")
+
+    # Чужой telegram_id → 403.
+    resp = client.post(
+        f"/api/invoices/{invoice.id}/checkout",
+        json={"provider": "telegram_stars", "telegram_id": "attacker-2"},
+    )
+    assert resp.status_code == 403, resp.text
+    assert fake.create_calls == []
+
+    # Свой telegram_id → проходит.
+    resp = client.post(
+        f"/api/invoices/{invoice.id}/checkout",
+        json={"provider": "telegram_stars", "telegram_id": "owner-1"},
+    )
+    assert resp.status_code == 200, resp.text
+    assert len(fake.create_calls) == 1
+
+    # Без telegram_id — обратная совместимость (webapp/legacy): не блокируем.
+    invoice2 = _make_invoice(db_session, owner, amount=150.0, currency="RUB")
+    resp = client.post(
+        f"/api/invoices/{invoice2.id}/checkout",
+        json={"provider": "telegram_stars"},
+    )
+    assert resp.status_code == 200, resp.text
+
+
 def test_checkout_cryptobot_without_rate_returns_503(client, db_session, monkeypatch):
     monkeypatch.delenv("CRYPTOBOT_RUB_PER_USDT", raising=False)
     fake = _FakeProvider("cryptobot")

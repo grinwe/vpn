@@ -152,6 +152,16 @@
 |---|---|---|---|
 | `PAYMENT_PROVIDER` | `cryptobot` | backend, bot | Single-provider mode (legacy). Если `PAYMENT_PROVIDERS` задан — игнорируется. |
 | `PAYMENT_PROVIDERS` | `""` | backend, bot | Comma-separated список провайдеров. Backend при checkout'е выбирает `random.choice(list)`. |
+| `PAYMENT_PROVIDER_CHOICES` | `""` | bot | Stage 9b: меню выбора способа оплаты в боте (comma-separated имена, напр. `telegram_stars,lava_top,tribute`). При 2+ значениях бот показывает кнопки способов и делает checkout выбранным провайдером; пусто/одно имя — старое поведение с `PAYMENT_PROVIDER`. |
+| `LAVA_TOP_API_KEY` | `""` | backend | API-ключ lava.top (кабинет → Интеграции → Public API), заголовок `X-Api-Key`. |
+| `LAVA_TOP_OFFER_ID` | `""` | backend | UUID цены продукта с включённой «Ценой по запросу через API» — только у такого продукта работает произвольная сумма (лимиты 50–1 000 000 ₽). |
+| `LAVA_TOP_WEBHOOK_SECRET` | `""` | backend | Наш статический секрет вебхука (≤80 символов): дублируется в кабинете lava.top при настройке вебхука (тип «API key»), приходит в заголовке `X-Api-Key`. HMAC у платформы нет. |
+| `LAVA_TOP_EMAIL_DOMAIN` | `""` | backend | Домен синтетических email покупателей (`inv<invoice_id>@домен`) — email обязателен в API lava.top. |
+| `LAVA_TOP_API_BASE` | `https://gate.lava.top` | backend | Переопределение базового URL (тесты/стейджинг). |
+| `TRIBUTE_API_KEY` | `""` | backend | API-ключ Tribute (дашборд → Settings → API Keys), заголовок `Api-Key`. Им же подписываются вебхуки (`trbt-signature` = HMAC-SHA256 тела). |
+| `TRIBUTE_ORDER_TITLE` | `Пополнение баланса` | backend | Нейтральный title заказа в Tribute (обязателен у платформы, Stage 9d-нейтральность). |
+| `TRIBUTE_ORDER_DESCRIPTION` | `Пополнение баланса личного кабинета` | backend | Нейтральный description заказа. |
+| `TRIBUTE_API_BASE` | `https://tribute.tg/api/v1` | backend | Переопределение базового URL (тесты). |
 | `CRYPTOBOT_TOKEN` | `""` | backend | Bearer token к CryptoBot API. HMAC webhook-сигнатура считается от `sha256(token)` как ключа. |
 | `CRYPTOBOT_RUB_PER_USDT` | `0` | backend | Курс ₽ за 1 USDT для конвертации RUB-счетов в `/checkout` (аудит #108). `0`/не задан = RUB-счёт через cryptobot отклоняется с 503 (защита от выставления рублей как USDT 1:1). Сумма округляется вверх до цента. |
 | `TELEGRAM_STARS_WEBHOOK_SECRET` | `""` | backend, bot | **Deprecated** (#62). Shared secret для legacy polling-режима. Заменён на `TELEGRAM_WEBHOOK_SECRET_TOKEN`. |
@@ -220,6 +230,7 @@ Sliding-window лимит на `ProvisioningOrchestrator.provision_subscription`
 | `FREEZE_DAYS` | backend, worker |
 | `MIN_TOPUP_KOPECKS`, `EXTRA_DEVICE_KOPECKS_PER_MONTH`, `REFERRAL_BONUS_KOPECKS` | backend, worker |
 | `PAYMENT_PROVIDER`, `PAYMENT_PROVIDERS` | backend, bot |
+| `PAYMENT_PROVIDER_CHOICES` | bot (но каждое имя из списка должно быть сконфигурировано на backend'е: `LAVA_TOP_*`/`TRIBUTE_*`/и т.д., иначе кнопка даст «способ временно недоступен») |
 | `TELEGRAM_STARS_WEBHOOK_SECRET` | backend, bot (только в legacy polling-режиме; в webhook-режиме не нужна) |
 
 ## Обязательные vs опциональные

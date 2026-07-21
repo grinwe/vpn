@@ -51,6 +51,17 @@ deploy_app_stack_admin_ids: "{{ vault_admin_ids | default('') }}"
 deploy_app_stack_telegram_stars_webhook_secret: "{{ vault_telegram_stars_webhook_secret | default('') }}"
 deploy_app_stack_webapp_jwt_secret: "{{ vault_webapp_jwt_secret | default('') }}"
 
+# Stage 9b — карты РФ/СБП: lava.top + Tribute (docs/PLAN_LAVA_TOP.md).
+# Секреты в vault.yml; email_domain и меню способов оплаты — открытые.
+# Меню в боте включается заполнением choices (например
+# "telegram_stars,lava_top,tribute,cryptobot"); пусто = старое поведение.
+deploy_app_stack_payment_provider_choices: ""
+deploy_app_stack_lava_top_api_key: "{{ vault_lava_top_api_key | default('') }}"
+deploy_app_stack_lava_top_offer_id: "{{ vault_lava_top_offer_id | default('') }}"
+deploy_app_stack_lava_top_webhook_secret: "{{ vault_lava_top_webhook_secret | default('') }}"
+deploy_app_stack_lava_top_email_domain: "{{ deploy_web_frontend_domain }}"
+deploy_app_stack_tribute_api_key: "{{ vault_tribute_api_key | default('') }}"
+
 # #62 — native Telegram webhook mode (replaces shared-secret forwarding).
 # Reuses vault_telegram_stars_webhook_secret for both legacy and native webhook.
 deploy_app_stack_telegram_webhook_secret_token: "{{ vault_telegram_stars_webhook_secret | default('') }}"

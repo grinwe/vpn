@@ -45,6 +45,26 @@ vault_telegram_stars_webhook_secret: ""
 # Rotating invalidates all active webapp sessions.
 vault_webapp_jwt_secret: ""
 
+# ── Stage 9b — карты РФ/СБП: lava.top + Tribute (docs/PLAN_LAVA_TOP.md) ──
+# В проде эти четыре переменные живут в ОТДЕЛЬНОМ зашифрованном файле
+# group_vars/web/vault_payments.yml (ansible мержит все *.yml группы) —
+# основной vault.yml для их добавления перешифровывать не пришлось.
+# lava.top: ключ из кабинета (Интеграции → Public API); offerId — UUID
+# цены продукта с включённой «Ценой по запросу через API»; webhook_secret —
+# наш собственный секрет (≤80 символов), продублированный в кабинете
+# lava.top при настройке вебхука (тип авторизации «API key», URL
+# https://<домен>/api/payments/webhook/lava_top).
+# Generate secret: python -c 'import secrets; print(secrets.token_urlsafe(48))'
+vault_lava_top_api_key: ""
+vault_lava_top_offer_id: ""
+vault_lava_top_webhook_secret: ""
+
+# Tribute (tribute.tg): ключ из дашборда (Settings → API Keys). Подпись
+# вебхука — HMAC-SHA256 этим же ключом (заголовок trbt-signature),
+# отдельный секрет не нужен. Webhook URL в дашборде:
+# https://<домен>/api/payments/webhook/tribute
+vault_tribute_api_key: ""
+
 # Cloudflare API token, Zone → DNS → Edit (NOT a Global API Key). Used by
 # certbot-dns-cloudflare for the DNS-01 ACME challenge AND by the backend
 # to mint ws-cdn front records — so scope it to BOTH the grinwer.online

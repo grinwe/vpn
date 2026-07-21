@@ -713,6 +713,14 @@ class InvoicePaidOut(InvoiceListItem):
 class InvoiceCheckoutRequest(BaseModel):
     provider: str | None = Field(default=None, description="Payment provider name; defaults to server default")
     return_url: str | None = None
+    telegram_id: str | None = Field(
+        default=None,
+        description=(
+            "If set, the backend verifies the invoice belongs to this Telegram "
+            "user before checkout — the bot passes the caller's id so a forged "
+            "callback_data can't check out another user's invoice."
+        ),
+    )
 
 
 class InvoiceCheckoutOut(BaseModel):
