@@ -234,12 +234,29 @@ def run_pending_rescue_tick() -> dict:
             logger.exception("pending_rescue: failed to re-enqueue tick (at start)")
 
     age = _env_int("PENDING_RESCUE_AGE", 60)
+    # Escalation tiers for tasks the plain re-enqueue can't rescue:
+    #   force_age  — a normal enqueue keeps deduping against a ZOMBIE `started`
+    #     job (worker SIGKILLed mid-run) so it never re-dispatches; past this
+    #     age we purge the job key first (enqueue_task(force=True)). A DB row
+    #     still `pending` means no worker owns it, so the purge can't kill a
+    #     live run. This is what un-wedges a stuck `bootstrap` (its row holds
+    #     uq_active_node_bootstrap, blocking the reconciler until it clears).
+    #   abandon_age — stuck this long is unrecoverable AND re-running ancient
+    #     work (e.g. a 2-month-old relay apply) is riskier than dropping it;
+    #     mark terminal so slots free and the reconciler recreates only what a
+    #     dirty node still needs.
+    force_age = _env_int("PENDING_RESCUE_FORCE_AGE", 1800)
+    abandon_age = _env_int("PENDING_RESCUE_ABANDON_AGE", 86400)
     rescued = 0
     scanned = 0
+    abandoned = 0
 
     session = SessionLocal()
     try:
-        cutoff = utcnow() - timedelta(seconds=age)
+        now = utcnow()
+        cutoff = now - timedelta(seconds=age)
+        force_cutoff = now - timedelta(seconds=force_age)
+        abandon_cutoff = now - timedelta(seconds=abandon_age)
         pending = (
             session.query(models.ProvisioningTask)
             .filter(
@@ -252,7 +269,17 @@ def run_pending_rescue_tick() -> dict:
         scanned = len(pending)
         for task in pending:
             try:
-                job_id = enqueue_task(task.id, None)
+                if task.created_at < abandon_cutoff:
+                    task.status = models.ProvisioningTaskStatus.failed
+                    task.finished_at = now
+                    task.error_message = (
+                        "abandoned by pending-rescue: stuck pending past "
+                        "PENDING_RESCUE_ABANDON_AGE (unrecoverable RQ job)"
+                    )
+                    abandoned += 1
+                    continue
+                _force = task.created_at < force_cutoff
+                job_id = enqueue_task(task.id, None, force=_force)
                 if job_id:
                     rescued += 1
                     PENDING_RESCUE.inc()
@@ -260,16 +287,19 @@ def run_pending_rescue_tick() -> dict:
                 logger.exception(
                     "pending_rescue: failed to re-enqueue task %s", task.id
                 )
+        if abandoned:
+            session.commit()
     finally:
         session.close()
 
-    if rescued:
+    if rescued or abandoned:
         logger.warning(
-            "pending_rescue: re-enqueued %s/%s stalled pending task(s)",
-            rescued, scanned,
+            "pending_rescue: re-enqueued %s/%s stalled pending task(s), "
+            "abandoned %s",
+            rescued, scanned, abandoned,
         )
 
-    return {"scanned": scanned, "rescued": rescued}
+    return {"scanned": scanned, "rescued": rescued, "abandoned": abandoned}
 
 
 def run_lava_reconcile_tick() -> dict:

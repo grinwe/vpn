@@ -142,11 +142,20 @@ def get_ticks_queue() -> "Queue | None":
     return _queue_by_name(TICKS_QUEUE_NAME)
 
 
-def enqueue_task(task_id: int, node_id: int | None) -> str | None:
+def enqueue_task(task_id: int, node_id: int | None, *, force: bool = False) -> str | None:
     """Enqueue a provisioning task execution.
 
     Returns the RQ job id on success or ``None`` if the queue is unavailable
     (caller must then execute the task inline).
+
+    ``force=True`` purges the deterministic job key BEFORE the dedup check, so
+    a **zombie** ``started`` job (worker SIGKILLed mid-run — RQ leaves the job
+    id locked in ``started`` and ``StartedJobRegistry.cleanup`` doesn't always
+    reclaim it) can't silently swallow the re-enqueue. Only pending-rescue's
+    escalation tier passes this, and only for tasks stuck well past any
+    legitimate in-flight window (a DB row still ``pending`` means no worker has
+    claimed it, so purging its job can't kill a live run). See
+    ``run_pending_rescue_tick``.
     """
     queue = get_queue()
     if queue is None:
@@ -167,6 +176,19 @@ def enqueue_task(task_id: int, node_id: int | None) -> str | None:
         from rq.registry import StartedJobRegistry
 
         job_id = f"provision-{task_id}"
+        if force:
+            # Escalation path: drop any existing job record (zombie `started`,
+            # stale queued, corrupted hash) so the dedup below always falls
+            # through to a fresh enqueue. Safe only because the caller has
+            # established the task is stuck (DB still `pending`, well past any
+            # in-flight window) — see the docstring.
+            try:
+                queue.connection.delete(f"rq:job:{job_id}")
+            except Exception:  # noqa: BLE001
+                logger.debug(
+                    "enqueue_task(force): raw key purge failed for %s", job_id,
+                    exc_info=True,
+                )
         # Reclaim zombie `started` jobs before the dedupe check below.
         # When a worker is SIGKILLed (OOM, container drop) mid-job, RQ
         # leaves the job in `started` state with the deterministic id

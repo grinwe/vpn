@@ -26,4 +26,13 @@ bandwidth:
 # Auth via password file — managed by manage_hy2_user.sh
 auth:
   type: userpass
-  userpass: {}
+  userpass:
+    # Sentinel-заглушка: hysteria2 FATAL'ит (exit 1 → краш-луп) на пустом
+    # userpass, а этот шаблон рендерит userpass с нуля на КАЖДОМ bootstrap
+    # (hy2-роль, в отличие от vless, не делает slurp+re-inject). Нода с
+    # включённым hy2, но без назначенных юзеров (свежий hy2-конфиг до того как
+    # diverse-sub раздаст девайсы) иначе уходит в вечный краш-луп. Держим один
+    # заглушечный юзер со случайным 32-символьным паролем: клиенту НЕ выдаётся,
+    # угадать нельзя (=реальный секрет), реальных юзеров manage_hy2_user.sh
+    # дописывает рядом (setdefault по userpass; заглушку del не трогает).
+    __sentinel__: "{{ lookup('password', '/dev/null chars=ascii_letters,digits length=32') }}"
