@@ -6,12 +6,13 @@
     # Protocol roles: always included so they can clean up removed
     # protocols.  Each role handles its own gating internally and
     # stops+disables its services when the config vars are absent.
-    # ShadowTLS deprecated (0.2) / Hysteria2 deprecated (0.3): protocols
-    # are dead, no new configs are provisioned.  Left commented out for
-    # a release cycle before full deletion — uncomment if a legacy node
-    # needs cleanup.
+    # ShadowTLS deprecated (0.2) — мёртв, no new configs.
+    # Hysteria2 РЕАНИМИРОВАН 2026-07-22: UDP/QUIC переживает ТСПУ в жёстких
+    # регионах (Центральный ФО режет TCP-Reality), где VLESS не работает.
+    # См. docs/operations/regional_blocking_diag_2026_07.md. Роль сама no-op'ит
+    # на нодах без hysteria2_port, так что безопасна для всего флота.
     # - install_shadowtls_stack
-    # - install_hysteria2
+    - install_hysteria2
     - install_vless_reality
     - install_vless_xhttp
     # ws_cdn ПОСЛЕ xhttp: оба делят nginx :443, и ws_cdn гоняет `nginx -t`

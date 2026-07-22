@@ -1656,19 +1656,25 @@ class ProvisioningOrchestrator:
                             "Auto-resync after site.yml failed for node %s",
                             node.id,
                         )
-                # audit #78 — после REINSTALL (диск стёрт) пер-юзерные hysteria2-
-                # учётки теряются: vless-resync их не покрывает. Восстанавливаем
-                # только на reinstall-bootstrap'е (payload.reinstall) — на рутинном
-                # прогоне hy2 на ноде уже есть, лишние ansible-раны не нужны.
+                # audit #78 — config.yaml.j2 рендерит `userpass: {}` на КАЖДОМ
+                # site.yml (hy2-роль, в отличие от vless, не делает slurp+re-inject),
+                # поэтому пер-юзерные hysteria2-учётки стираются с диска не только
+                # на reinstall, а на ЛЮБОМ bootstrap'е ноды с hy2. Восстанавливаем
+                # после каждого прогона, если у ноды есть enabled hy2-конфиг
+                # (на нодах без hy2 — no-op, лишних ansible-ранов нет).
                 # Флаг RESTORE_HY2_AFTER_REINSTALL=0 отключает (safe-default = вкл).
-                if (task.payload or {}).get("reinstall") and os.getenv(
-                    "RESTORE_HY2_AFTER_REINSTALL", "1"
-                ) == "1":
+                _node_has_hy2 = any(
+                    c.protocol == models.VPNConfigProtocol.hysteria2 and c.is_enabled
+                    for c in (node.configs or [])
+                )
+                if os.getenv("RESTORE_HY2_AFTER_REINSTALL", "1") == "1" and (
+                    (task.payload or {}).get("reinstall") or _node_has_hy2
+                ):
                     try:
                         self.resync_node_hysteria2_clients(node)
                     except Exception:  # noqa: BLE001
                         logger.exception(
-                            "hy2-resync after reinstall failed for node %s",
+                            "hy2-resync after bootstrap failed for node %s",
                             node.id,
                         )
             else:

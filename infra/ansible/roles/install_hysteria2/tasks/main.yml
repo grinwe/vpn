@@ -27,6 +27,32 @@
     fail_msg: >-
       install_hysteria2 requires hysteria2_port and hysteria2_domain.
 
+# hy2 — UDP/QUIC. bootstrap_node открывает только tcp 22/80/443, поэтому
+# UDP-порт hy2 надо открыть здесь, иначе на RU-хостах с restrictive INPUT
+# нода «здорова», а hy2 недоступен снаружи (и health-check это не заметит —
+# vpn_health_ports покрывает только TCP). Стиль/персист — как в bootstrap_node.
+- name: Ensure iptables ACCEPT for Hysteria2 UDP port at top of INPUT
+  ansible.builtin.iptables:
+    chain: INPUT
+    protocol: udp
+    destination_port: "{{ hysteria2_port | int }}"
+    jump: ACCEPT
+    action: insert
+    state: present
+  failed_when: false
+
+- name: Persist iptables rules across reboots (netfilter-persistent)
+  ansible.builtin.command: netfilter-persistent save
+  changed_when: false
+  failed_when: false
+
+- name: Ensure ufw allows Hysteria2 UDP port (no-op on inactive ufw)
+  community.general.ufw:
+    rule: allow
+    port: "{{ hysteria2_port | int }}"
+    proto: udp
+  failed_when: false
+
 - name: Install Hysteria2 from upstream
   shell: |
     set -euo pipefail
