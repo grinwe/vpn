@@ -116,6 +116,12 @@ Req: `{ amount_kopecks, provider="telegram_stars" }`.
 
 Создаётся `Invoice(kind="topup", plan_id=NULL)` — эта pair «без плана + kind=topup» — та самая, которую хук в [api/invoices.py:132](../backend/app/api/invoices.py#L132) распознаёт и кладёт в баланс вместо провижининга, плюс тригерит referrer payout при первом топапе (см. [TRIAL_SYSTEM.md](TRIAL_SYSTEM.md#stage-3)).
 
+**Выбор способа оплаты (Stage 9b).** `provider` — произвольный (бэкенд диспатчит через `get_provider`), фронт передаёт выбранный юзером. UI-флоу: сначала сумма, затем «Чем платить?» — `⭐ Telegram Stars` или `💳 Карта РФ / СБП` (`lava_top`). Две механики оплаты различаются:
+- **Stars** → `pay_url` это `t.me/$slug`, открывается нативно `tg.openInvoice(url, callback)` с мгновенным колбэком `paid/failed/cancelled`.
+- **Карта (`lava_top`)** → `pay_url` это внешняя платёжная страница, открывается `tg.openLink` (хелпер `openExternalUrl` в [telegram.ts](../webapp/src/telegram.ts), фолбэк `window.open`). Колбэка нет → зачисление ловится поллингом [`pollBalanceIncrease`](../webapp/src/api.ts) (~90с: 30×3с, сравнивает `/me` баланс с baseline). Baseline берётся свежим `fetchMe` с фолбэком на текущее значение (не сентинел — иначе поллинг никогда не подтвердит; не устаревшее — иначе быстрый повторный топап даст ложное «зачислено»).
+
+Живёт в `TopupModal` ([Home.tsx](../webapp/src/pages/Home.tsx)) и `TopupHintSheet` ([Plans.tsx](../webapp/src/pages/Plans.tsx), всплывает на 402). Обе модалки закрываемы во время карточного ожидания (иначе залипали бы на 90с); закрытие **отменяет** фоновый поллинг/колбэк текущего платежа через токен поколения (`pollGenRef`/`payGenRef` — инкрементится на закрытии и на новом платеже, `pollBalanceIncrease` проверяет `shouldStop`, продолжения после `await` гвардятся `gen !== myGen`). Деньги при этом всё равно зачислит вебхук на бэке — баланс появится при следующем `/me`. Бэкенд для карты править не пришлось — `webapp_topup`/`webapp_checkout` уже принимали любой `provider` и отдавали `pay_url`.
+
 ### `POST /api/webapp/trial/activate`
 
 Без тела — user_id из JWT. Thin wrapper над [services.trial.activate_trial()](../backend/app/services/trial.py) (admin-token версия в `api_extensions.py` шарит ту же функцию, чтобы логика не дрейфовала).

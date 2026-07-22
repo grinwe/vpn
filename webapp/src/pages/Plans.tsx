@@ -7,11 +7,12 @@ import {
   createTopup,
   fetchMe,
   fetchPlans,
+  pollBalanceIncrease,
   MeResponse,
   WebAppPlan,
 } from "../api";
 import { navigate } from "../router";
-import { getTg } from "../telegram";
+import { getTg, openExternalUrl } from "../telegram";
 
 type Period = "month" | "year";
 
@@ -233,9 +234,15 @@ export default function Plans({ onActivated, subLinkBase, me, changeSubscription
       topupTimerRef.current = null;
     }
   };
+  // Токен поколения платежа: закрытие шторки / новый платёж инкрементят его,
+  // отменяя отвязанный карточный поллинг (~90с живёт вне шторки), чтобы он не
+  // дёргал onActivated/showToast/setTopupState постфактум.
+  const payGenRef = useRef(0);
   // Закрытие шторки пополнения: всегда снимает занятость и таймер, чтобы
-  // шторка не могла залипнуть навсегда.
+  // шторка не могла залипнуть навсегда; инкремент payGenRef гасит фоновый
+  // поллинг закрытого платежа.
   function closeTopupHint() {
+    payGenRef.current++;
     clearTopupTimer();
     setTopupState(null);
     setTopupHint(null);
@@ -243,7 +250,7 @@ export default function Plans({ onActivated, subLinkBase, me, changeSubscription
   // Снимаем страховочный таймер при размонтировании страницы.
   useEffect(() => () => clearTopupTimer(), []);
 
-  async function payTopup(amountKopecks: number) {
+  async function payTopup(amountKopecks: number, provider: string) {
     const tg = getTg();
     if (!tg) {
       showToast("Открой эту страницу в Telegram");
@@ -251,20 +258,59 @@ export default function Plans({ onActivated, subLinkBase, me, changeSubscription
     }
     // Защита от повторного тапа: пока платёж в работе, не создаём новый инвойс.
     if (topupState) return;
+    const myGen = ++payGenRef.current;
     setTopupState("paying");
-    // Баланс до пополнения — точка отсчёта для ожидания зачисления.
-    const baseline = me.balance.balance_kopecks;
+    // Баланс до пополнения — точка отсчёта для ожидания зачисления. Свежий
+    // /me с фолбэком на проп, чтобы быстрый повторный топап не сравнивал с
+    // устаревшим (меньшим) балансом и не дал ложное «зачислено».
+    let baseline = me.balance.balance_kopecks;
     try {
-      const res = await createTopup(amountKopecks, "telegram_stars");
+      baseline = (await fetchMe()).balance.balance_kopecks;
+    } catch {
+      /* /me не ответил — используем проп-baseline */
+    }
+    try {
+      const res = await createTopup(amountKopecks, provider);
+      // Шторку могли закрыть во время await (fetchMe/createTopup) — closeTopupHint
+      // уже сбросил topupState в null; не перезаписываем его «crediting»/«paying»
+      // и не открываем платёжку, иначе состояние залипло бы и заблокировало
+      // будущие топапы (`if(topupState)return`).
+      if (payGenRef.current !== myGen) return;
+      if (provider !== "telegram_stars") {
+        // Карта: внешняя страница без callback — открываем и поллим баланс,
+        // пока вебхук lava_top не зачислит (карта дольше Stars).
+        openExternalUrl(tg, res.pay_url);
+        setTopupState("crediting");
+        const credited = await pollBalanceIncrease(baseline, {
+          attempts: 30,
+          delayMs: 3000,
+          shouldStop: () => payGenRef.current !== myGen,
+        });
+        // Платёж отменён (шторка закрыта / начат новый) — молча выходим.
+        if (payGenRef.current !== myGen) return;
+        setTopupState(null);
+        if (credited) {
+          tg.HapticFeedback?.notificationOccurred("success");
+          setTopupHint(null);
+          onActivated();
+        } else {
+          showToast(
+            "Оплата пока не подтвердилась. Если вы оплатили — баланс обновится в течение минуты.",
+          );
+        }
+        return;
+      }
       tg.openInvoice(res.pay_url, (status) => {
         // Callback пришёл — страховочный таймер больше не нужен.
         clearTopupTimer();
+        if (payGenRef.current !== myGen) return; // платёж отменён/закрыт
         if (status === "paid") {
           tg.HapticFeedback?.notificationOccurred("success");
           // Не полагаемся на мгновенный refetch: ждём фактического зачисления,
           // затем закрываем подсказку и обновляем /me.
           setTopupState("crediting");
           waitForBalance(baseline).finally(() => {
+            if (payGenRef.current !== myGen) return;
             setTopupState(null);
             setTopupHint(null);
             onActivated();
@@ -284,10 +330,12 @@ export default function Plans({ onActivated, subLinkBase, me, changeSubscription
       clearTopupTimer();
       topupTimerRef.current = setTimeout(() => {
         topupTimerRef.current = null;
+        if (payGenRef.current !== myGen) return;
         setTopupState((prev) => (prev === "paying" ? null : prev));
       }, TOPUP_CALLBACK_TIMEOUT_MS);
     } catch (e) {
       clearTopupTimer();
+      if (payGenRef.current !== myGen) return;
       setTopupState(null);
       showToast(friendlyActivateError((e as Error).message));
     }
@@ -362,7 +410,7 @@ export default function Plans({ onActivated, subLinkBase, me, changeSubscription
           suggested={topupHint.suggested}
           busy={topupState !== null}
           crediting={topupState === "crediting"}
-          onPay={(kop) => payTopup(kop)}
+          onPay={(kop, provider) => payTopup(kop, provider)}
           onClose={closeTopupHint}
         />,
         document.body,
@@ -518,16 +566,17 @@ function TopupHintSheet({
   suggested: number;
   busy: boolean;
   crediting: boolean;
-  onPay: (kop: number) => void;
+  onPay: (kop: number, provider: string) => void;
   onClose: () => void;
 }) {
   return (
     <div
       className="fixed inset-0 bg-black/60 flex items-end justify-center"
-      // Закрытие блокируем только на короткой фазе зачисления ("crediting").
-      // На "paying" оставляем выход открытым: если окно оплаты закрыли свайпом
-      // и callback не пришёл, шторка не должна залипнуть незакрываемой.
-      onClick={crediting ? undefined : onClose}
+      // Шторка всегда закрываема (карточный поллинг длится ~90с — блокировать
+      // выход на это время нельзя). Закрытие отменяет фоновый поллинг/колбэк
+      // текущего платежа (payGenRef в payTopup), но деньги всё равно зачислит
+      // вебхук на бэке — баланс появится при следующем /me.
+      onClick={onClose}
     >
       <div
         className="bg-tg-bg rounded-t-3xl border-t border-white/10 p-6 max-w-xl w-full"
@@ -535,18 +584,35 @@ function TopupHintSheet({
       >
         <h2 className="text-lg font-semibold mb-2">Не хватает баланса</h2>
         <p className="text-tg-hint text-sm mb-4">
-          Чтобы активировать этот тариф, нужно пополнить баланс. Рекомендуем{" "}
+          Чтобы активировать этот тариф, нужно пополнить баланс на{" "}
           {(suggested / 100).toFixed(0)} ₽ — этого хватит примерно на месяц.
         </p>
-        <button onClick={() => onPay(suggested)} disabled={busy} className="btn-primary w-full">
-          {crediting ? "Зачисляем…" : `Пополнить на ${(suggested / 100).toFixed(0)} ₽`}
-        </button>
+        {crediting ? (
+          <button disabled className="btn-primary w-full">Ждём подтверждение оплаты…</button>
+        ) : (
+          <>
+            <p className="text-tg-hint text-sm mb-2">Чем платить?</p>
+            <button
+              onClick={() => onPay(suggested, "telegram_stars")}
+              disabled={busy}
+              className="btn-ghost w-full mb-2"
+            >
+              ⭐ Telegram Stars
+            </button>
+            <button
+              onClick={() => onPay(suggested, "lava_top")}
+              disabled={busy}
+              className="btn-primary w-full"
+            >
+              💳 Карта РФ / СБП
+            </button>
+          </>
+        )}
         <button
           onClick={onClose}
-          disabled={crediting}
           className="w-full mt-2 py-2 text-tg-hint text-sm"
         >
-          Отмена
+          {crediting ? "Свернуть" : "Отмена"}
         </button>
       </div>
     </div>

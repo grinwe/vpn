@@ -334,6 +334,34 @@ export async function createTopup(amountKopecks: number, provider = "telegram_st
   });
 }
 
+// Поллит /me, пока баланс не превысит baseline (платёж зачислён вебхуком),
+// либо пока не выйдут попытки. Нужно для внешних платёжных страниц (карта
+// lava_top), у которых — в отличие от Telegram Stars openInvoice — нет
+// синхронного callback. Возвращает true, если зачисление поймано.
+export async function pollBalanceIncrease(
+  baselineKopecks: number,
+  {
+    attempts,
+    delayMs,
+    shouldStop,
+  }: { attempts: number; delayMs: number; shouldStop?: () => boolean },
+): Promise<boolean> {
+  for (let i = 0; i < attempts; i++) {
+    await new Promise((r) => setTimeout(r, delayMs));
+    // Отмена: вызывающий закрыл модалку/начал новый платёж — прекращаем,
+    // чтобы отвязанный поллинг не дёргал UI-побочки постфактум.
+    if (shouldStop?.()) return false;
+    try {
+      const fresh = await fetchMe();
+      if (fresh.balance.balance_kopecks > baselineKopecks) return true;
+    } catch {
+      // Сетевой сбой при поллинге не критичен — пробуем ещё; источник
+      // истины всё равно вебхук на бэке, баланс появится при следующем /me.
+    }
+  }
+  return false;
+}
+
 export interface ActivateResponse {
   subscription_id: number;
   sub_token: string | null;

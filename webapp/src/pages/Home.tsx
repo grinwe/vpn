@@ -15,13 +15,15 @@ import {
   renameDevice,
   removeDevice,
   createTopup,
+  fetchMe,
+  pollBalanceIncrease,
   cancelSubscription,
   freezeSubscription,
   unfreezeSubscription,
   toggleAutoRenew,
 } from "../api";
 import { navigate } from "../router";
-import { getTg } from "../telegram";
+import { getTg, openExternalUrl } from "../telegram";
 
 // ── Устойчивая загрузка реф-блока ────────────────────────────────────
 // Раньше реферал тянулся одним fetchReferral().catch(() => undefined) на
@@ -316,7 +318,7 @@ export default function Home({
       )}
 
       {showSetup && createPortal(<SetupSheet onClose={() => setShowSetup(false)} />, document.body)}
-      {topupOpen && createPortal(<TopupModal onClose={() => setTopupOpen(false)} onRefresh={onRefresh} />, document.body)}
+      {topupOpen && createPortal(<TopupModal onClose={() => setTopupOpen(false)} onRefresh={onRefresh} baselineKopecks={me.balance.balance_kopecks} />, document.body)}
     </div>
   );
 }
@@ -720,14 +722,35 @@ const TOPUP_PRESETS = [10000, 30000, 60000, 150000]; // kopecks: 100/300/600/150
 function TopupModal({
   onClose,
   onRefresh,
+  baselineKopecks,
 }: {
   onClose: () => void;
   onRefresh: () => void;
+  // Баланс на момент открытия модалки — точка отсчёта для поллинга карты
+  // (передаётся из Home, чтобы не зависеть от отдельного fetchMe).
+  baselineKopecks: number;
 }) {
   const [busy, setBusy] = useState(false);
   const [customRub, setCustomRub] = useState<string>("");
+  // Выбранная сумма в копейках: null → шаг ввода суммы; число → шаг «чем
+  // платить». Сначала сумма, затем способ оплаты.
+  const [amount, setAmount] = useState<number | null>(null);
+  // Карта отдаёт внешнюю страницу без callback → после её открытия ждём
+  // зачисление поллингом баланса.
+  const [waiting, setWaiting] = useState(false);
+  const [waitTimedOut, setWaitTimedOut] = useState(false);
+  // Модалку можно закрыть во время ожидания — гвардим setState после unmount
+  // (poll живёт ~90с, юзер мог уже закрыть).
+  const mountedRef = useRef(true);
+  useEffect(() => () => { mountedRef.current = false; }, []);
+  // Токен поколения поллинга: закрытие/повторная проверка инкрементят его,
+  // отменяя отвязанный поллинг, чтобы он не дёргал UI постфактум.
+  const pollGenRef = useRef(0);
+  // Baseline, реально использованный для текущего платежа (чтобы «Проверить
+  // ещё раз» сравнивал с той же точкой отсчёта, а не с уже зачисленным).
+  const baselineUsedRef = useRef(0);
 
-  async function pay(amountKopecks: number) {
+  async function payStars(amountKopecks: number) {
     const tg = getTg();
     if (!tg) {
       alert("Открой эту страницу в Telegram");
@@ -737,75 +760,191 @@ function TopupModal({
     try {
       const res = await createTopup(amountKopecks, "telegram_stars");
       tg.openInvoice(res.pay_url, (status) => {
-        setBusy(false);
+        if (mountedRef.current) setBusy(false);
         if (status === "paid") {
           tg.HapticFeedback?.notificationOccurred("success");
           // Даём бэкенду тик, чтобы пометить инвойс оплаченным, затем
           // явно перезапрашиваем /me (App сам не перезагрузит: route
           // не меняется) и закрываем модалку — баланс на экране обновится.
+          // onClose гвардим mountedRef: callback старого (закрытого) инстанса
+          // не должен закрыть заново открытую модалку.
           setTimeout(() => {
             onRefresh();
-            onClose();
+            if (mountedRef.current) onClose();
           }, 500);
         } else if (status === "failed") {
           tg.HapticFeedback?.notificationOccurred("error");
-          alert("Оплата не прошла. Попробуй ещё раз.");
+          if (mountedRef.current) alert("Оплата не прошла. Попробуй ещё раз.");
         }
       });
     } catch (e) {
+      if (mountedRef.current) setBusy(false);
+      alert(`Не удалось создать счёт: ${(e as Error).message}`);
+    }
+  }
+
+  // Поллинг зачисления после открытия внешней карточной страницы.
+  async function pollCredit() {
+    const myGen = ++pollGenRef.current;
+    setWaitTimedOut(false);
+    setWaiting(true);
+    // ~90 c: карта дольше Stars (редирект, ввод карты, 3DS).
+    const credited = await pollBalanceIncrease(baselineUsedRef.current, {
+      attempts: 30,
+      delayMs: 3000,
+      shouldStop: () => pollGenRef.current !== myGen || !mountedRef.current,
+    });
+    // Поллинг мог быть отменён (закрытие/новый платёж) — не трогаем UI.
+    if (pollGenRef.current !== myGen) return;
+    if (credited) {
+      getTg()?.HapticFeedback?.notificationOccurred("success");
+      onRefresh(); // App-level, безопасно даже если модалку уже закрыли
+      if (mountedRef.current) onClose();
+      return;
+    }
+    if (mountedRef.current) {
+      setWaiting(false);
+      setWaitTimedOut(true);
+    }
+  }
+
+  async function payCard(amountKopecks: number) {
+    const tg = getTg();
+    setBusy(true);
+    try {
+      // Свежий baseline с фолбэком на проп при сбое /me — без недостижимого
+      // сентинела (иначе поллинг никогда не подтвердил бы) и без устаревшего
+      // значения (иначе быстрый повторный топап дал бы ложное «зачислено»).
+      let baseline = baselineKopecks;
+      try {
+        baseline = (await fetchMe()).balance.balance_kopecks;
+      } catch {
+        /* /me не ответил — используем проп-baseline (реальное число) */
+      }
+      baselineUsedRef.current = baseline;
+      const res = await createTopup(amountKopecks, "lava_top");
+      // Модалку могли закрыть во время await — не открываем внешнюю страницу
+      // и не стартуем поллинг постфактум.
+      if (!mountedRef.current) return;
+      openExternalUrl(tg, res.pay_url);
       setBusy(false);
+      await pollCredit();
+    } catch (e) {
+      if (mountedRef.current) {
+        setBusy(false);
+        setWaiting(false);
+      }
       alert(`Не удалось создать счёт: ${(e as Error).message}`);
     }
   }
 
   return (
-    <div className="fixed inset-0 bg-black/60 flex items-end justify-center z-50 animate-fadeIn" onClick={onClose}>
+    <div
+      className="fixed inset-0 bg-black/60 flex items-end justify-center z-50 animate-fadeIn"
+      onClick={onClose}
+    >
       <div
         className="bg-tg-bg rounded-t-3xl border-t border-white/10 p-6 max-w-xl w-full max-h-[80vh] overflow-y-auto animate-slideUp"
         onClick={(e) => e.stopPropagation()}
       >
-        <h2 className="text-lg font-semibold mb-3">Пополнение баланса</h2>
-        <div className="grid grid-cols-2 gap-2 mb-4">
-          {TOPUP_PRESETS.map((kop) => (
-            <button
-              key={kop}
-              disabled={busy}
-              onClick={() => pay(kop)}
-              className="btn-ghost"
-            >
-              {(kop / 100).toFixed(0)} ₽
+        {waiting ? (
+          <div className="text-center py-4">
+            <h2 className="text-lg font-semibold mb-2">Ждём подтверждение оплаты…</h2>
+            <p className="text-tg-hint text-sm mb-4">
+              Оплатите на открывшейся странице. Баланс обновится автоматически
+              после подтверждения.
+            </p>
+            <button onClick={onClose} className="w-full py-2 text-tg-hint text-sm">
+              Закрыть
             </button>
-          ))}
-        </div>
-        <div className="flex gap-2">
-          <input
-            type="number"
-            min={100}
-            placeholder="Своя сумма, ₽"
-            value={customRub}
-            onChange={(e) => setCustomRub(e.target.value)}
-            className="flex-1 rounded-xl border border-white/10 bg-white/[0.04] px-4 py-3 text-tg-text placeholder:text-tg-hint outline-none focus:border-[var(--accent-from)] transition-colors"
-          />
-          <button
-            disabled={busy || !customRub || Number(customRub) < 100}
-            // Округляем до целых копеек: ввод «100.1»/«100.505» иначе
-            // ушёл бы на бэкенд как float и упал бы на int-валидации (422).
-            onClick={() => pay(Math.round(Number(customRub) * 100))}
-            className="btn-primary"
-          >
-            Оплатить
-          </button>
-        </div>
-        {customRub && Number(customRub) > 0 && Number(customRub) < 100 && (
-          <div className="text-red-400 text-xs mt-1">Минимальная сумма пополнения — 100 ₽</div>
+          </div>
+        ) : waitTimedOut ? (
+          <div className="py-2">
+            <h2 className="text-lg font-semibold mb-2">Оплата пока не подтвердилась</h2>
+            <p className="text-tg-hint text-sm mb-4">
+              Если вы оплатили — баланс появится в течение минуты. Можно
+              проверить ещё раз.
+            </p>
+            <button onClick={pollCredit} className="btn-primary w-full">
+              Проверить ещё раз
+            </button>
+            <button onClick={onClose} className="w-full mt-2 py-2 text-tg-hint text-sm">
+              Закрыть
+            </button>
+          </div>
+        ) : amount === null ? (
+          <>
+            <h2 className="text-lg font-semibold mb-3">Пополнение баланса</h2>
+            <div className="grid grid-cols-2 gap-2 mb-4">
+              {TOPUP_PRESETS.map((kop) => (
+                <button
+                  key={kop}
+                  disabled={busy}
+                  onClick={() => setAmount(kop)}
+                  className="btn-ghost"
+                >
+                  {(kop / 100).toFixed(0)} ₽
+                </button>
+              ))}
+            </div>
+            <div className="flex gap-2">
+              <input
+                type="number"
+                min={100}
+                placeholder="Своя сумма, ₽"
+                value={customRub}
+                onChange={(e) => setCustomRub(e.target.value)}
+                className="flex-1 rounded-xl border border-white/10 bg-white/[0.04] px-4 py-3 text-tg-text placeholder:text-tg-hint outline-none focus:border-[var(--accent-from)] transition-colors"
+              />
+              <button
+                disabled={!customRub || Number(customRub) < 100}
+                // Округляем до целых копеек: ввод «100.1»/«100.505» иначе
+                // ушёл бы на бэкенд как float и упал бы на int-валидации (422).
+                onClick={() => setAmount(Math.round(Number(customRub) * 100))}
+                className="btn-primary"
+              >
+                Далее
+              </button>
+            </div>
+            {customRub && Number(customRub) > 0 && Number(customRub) < 100 && (
+              <div className="text-red-400 text-xs mt-1">Минимальная сумма пополнения — 100 ₽</div>
+            )}
+            <button
+              onClick={onClose}
+              className="w-full mt-4 py-2 text-tg-hint text-sm"
+            >
+              Отмена
+            </button>
+          </>
+        ) : (
+          <>
+            <h2 className="text-lg font-semibold mb-1">Чем платить?</h2>
+            <p className="text-tg-hint text-sm mb-4">
+              Пополнение на {(amount / 100).toFixed(0)} ₽
+            </p>
+            <button
+              disabled={busy}
+              onClick={() => payStars(amount)}
+              className="btn-ghost w-full mb-2"
+            >
+              ⭐ Telegram Stars
+            </button>
+            <button
+              disabled={busy}
+              onClick={() => payCard(amount)}
+              className="btn-primary w-full"
+            >
+              💳 Карта РФ / СБП
+            </button>
+            <button
+              onClick={() => setAmount(null)}
+              disabled={busy}
+              className="w-full mt-4 py-2 text-tg-hint text-sm"
+            >
+              ← Назад
+            </button>
+          </>
         )}
-        <button
-          onClick={onClose}
-          disabled={busy}
-          className="w-full mt-4 py-2 text-tg-hint text-sm"
-        >
-          Отмена
-        </button>
       </div>
     </div>
   );
