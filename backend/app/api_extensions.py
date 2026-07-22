@@ -228,6 +228,35 @@ def _healthy_node_ids(db: Session, creds) -> set[int]:
     return {n.id for n in rows if _node_serviceable(n, now)}
 
 
+# Эмодзи по протоколу для display-name эндпоинта в клиенте. Различает протокол
+# ВИЗУАЛЬНО без техножаргона (юзеру не нужны слова Reality/XHTTP — с autoconnect
+# lowestdelay HAPP сам выбирает рабочий). cred.proto — строка с дефисами.
+_PROTO_EMOJI = {
+    "vless-reality": "🛡️",
+    "vless-xhttp": "🌐",
+    "vless-ws-cdn": "☁️",
+    "hysteria2": "🚀",
+    "shadowtls": "🔒",
+}
+_DEFAULT_PROTO_EMOJI = "⚡"
+
+
+def _relabel_uri(uri: str, proto: str, index: int) -> str:
+    """Переписываем #fragment (display-name в клиенте) на нейтральное
+    «{эмодзи} V8 сервер N».
+
+    Зачем: имя ноды НЕ должно палить страну (юзеры возмущаются «VPN в РФ» —
+    СОРМ/приватность) и НЕ должно быть техножаргоном (Reality/XHTTP). Эмодзи
+    различает протокол, ``index`` — сквозной номер в подписке. RAW UTF-8 (как
+    исходный ``#reality-Russia``), НЕ percent-энкодим: часть клиентов кажет
+    %XX буквально. Делается на ОТДАЧЕ сабы (не запекается в cred.config_text) →
+    смена стиля/эмодзи не требует bulk-rebuild, только рефреш сабы у клиента.
+    """
+    emoji = _PROTO_EMOJI.get(proto, _DEFAULT_PROTO_EMOJI)
+    base = uri.split("#", 1)[0]
+    return f"{base}#{emoji} V8 сервер {index}"
+
+
 def _decrypt_configs(creds, *, sub, device_id=None, node_filter=None):
     """Собирает ``SubLinkConfig`` из АКТИВНЫХ кредов, расшифровывая config_text.
 
@@ -249,7 +278,10 @@ def _decrypt_configs(creds, *, sub, device_id=None, node_filter=None):
             continue
         decrypted = _decrypt(cred.config_text)
         if decrypted:
-            out.append(SubLinkConfig(protocol=cred.proto, uri=decrypted))
+            out.append(SubLinkConfig(
+                protocol=cred.proto,
+                uri=_relabel_uri(decrypted, cred.proto, len(out) + 1),
+            ))
         else:
             logger.warning(
                 "sub-link: decrypt returned empty for credential %s "

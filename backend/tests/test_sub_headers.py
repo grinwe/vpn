@@ -85,3 +85,20 @@ def test_fallback_url_when_configured(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("SUB_LINK_FALLBACK_BASE_URL", "https://backup.example/")
     h = _h(_Sub(None), token="tok123")
     assert h["fallback-url"] == "https://backup.example/tok123"
+
+
+def test_relabel_uri_emoji_index_and_no_country() -> None:
+    """#fragment → «{эмодзи-протокола} V8 сервер N»: эмодзи по протоколу,
+    сквозной номер, БЕЗ страны/жаргона, старый фрагмент затирается."""
+    r = api_extensions._relabel_uri
+    assert r("vless://x@h:443?p=1#reality-Russia", "vless-reality", 1) == \
+        "vless://x@h:443?p=1#🛡️ V8 сервер 1"
+    assert r("hy2://x@h:443?obfs=s#hy2-Russia", "hysteria2", 3) == \
+        "hy2://x@h:443?obfs=s#🚀 V8 сервер 3"
+    assert r("v://y#xhttp-Russia", "vless-xhttp", 2) == "v://y#🌐 V8 сервер 2"
+    # неизвестный протокол → дефолтный эмодзи; страна/протокол не протекают
+    got = r("x://y#z", "weird", 7)
+    assert got == "x://y#⚡ V8 сервер 7"
+    assert "Russia" not in got and "weird" not in got
+    # URI без исходного фрагмента → просто добавляем
+    assert r("vless://x@h:443", "vless-ws-cdn", 5) == "vless://x@h:443#☁️ V8 сервер 5"
