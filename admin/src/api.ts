@@ -560,6 +560,10 @@ export interface VPNNodeOut {
   is_active: boolean;
   health_score: number;
   active_users: number;
+  // assigned_users — сколько разных юзеров держат активный cred на ноде
+  // (diverse-sub-корректно, детерминированный DB-join; не протухает как
+  // active_users из traffic-сэмпла). «Сколько людей на ноде сидит».
+  assigned_users: number;
   blocked_regions: string[];
   cooldown_until: string | null;
   suspect_since: string | null;

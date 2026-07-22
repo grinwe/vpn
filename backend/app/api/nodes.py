@@ -450,6 +450,35 @@ def list_nodes(
         )
         active_users_by_node = {nid: au for nid, au in au_rows}
 
+    # assigned_users — сколько РАЗНЫХ юзеров держат активный cred на ноде.
+    # diverse-sub-корректно (по Credential.node_id → девайс считается на КАЖДОЙ
+    # своей ноде, в отличие от Subscription.node_id=primary в choose_node).
+    # Детерминированный DB-join: всегда доступен, НЕ протухает как active_users
+    # из traffic-сэмпла (тот мёртв если stats-тик стоит). Один GROUP BY.
+    assigned_users_by_node: dict[int, int] = {}
+    if node_ids:
+        assigned_rows = (
+            db.query(
+                models.Credential.node_id,
+                func.count(func.distinct(models.Subscription.user_id)),
+            )
+            .join(models.Device, models.Credential.device_id == models.Device.id)
+            .join(
+                models.Subscription,
+                models.Device.subscription_id == models.Subscription.id,
+            )
+            .filter(
+                models.Credential.node_id.in_(node_ids),
+                models.Credential.is_active.is_(True),
+                models.Credential.device_id.isnot(None),
+                models.Device.status == models.DeviceStatus.active,
+                models.Subscription.status == models.SubscriptionStatus.active,
+            )
+            .group_by(models.Credential.node_id)
+            .all()
+        )
+        assigned_users_by_node = {nid: cnt for nid, cnt in assigned_rows}
+
     def _to_out(n: models.VPNNode) -> schemas.VPNNodeOut:
         out = schemas.VPNNodeOut.from_orm(n)
         out.exit_links = [
@@ -464,6 +493,7 @@ def list_nodes(
         ]
         out.last_ssh_at = last_ssh_by_node.get(n.id)
         out.active_users = active_users_by_node.get(n.id, 0)
+        out.assigned_users = assigned_users_by_node.get(n.id, 0)
         # Reconciler-видимость: нода помечена dirty (desired бампнут правкой),
         # но прогон ещё отложен на тик. reconcile_due_at уже подтянут from_orm.
         out.reconcile_pending = n.desired_generation > n.reconciled_generation

@@ -285,6 +285,12 @@ class VPNNodeOut(VPNNodeCreate):
     # handshake → серый) от реального обрыва (юзеры есть, а handshake протух →
     # красный). Дефолт 0; кроме list_nodes другие call-сайты не проставляют.
     active_users: int = 0
+    # assigned_users — сколько РАЗНЫХ юзеров держат активный cred на ноде
+    # (diverse-sub-корректно, по Credential.node_id). В отличие от active_users
+    # (живой счёт из traffic-сэмпла, протухает без stats-тика) это
+    # детерминированный DB-join — «сколько людей на ноде сидит». Ставится в
+    # list_nodes; прочие call-сайты не проставляют (дефолт 0).
+    assigned_users: int = 0
     # Reconciler-видимость: desired_generation > reconciled_generation, т.е.
     # ноде нужен прогон, но он отложен на reconcile-тик (defer-модель). Без
     # этого флага операторское действие при включённом RECONCILER_ENABLED

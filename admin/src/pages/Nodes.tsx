@@ -1354,6 +1354,7 @@ export default function Nodes() {
             <th>Статус</th>
             <th>Health</th>
             <th>WG</th>
+            <th>Юзеры</th>
             <th>Активна</th>
             <th>SSH · обновлено</th>
             <th></th>
@@ -1461,6 +1462,18 @@ export default function Nodes() {
                       peerKey={(l) => `${l.exit_id}-${l.wg_interface_name}`}
                       activeUsers={n.active_users}
                     />
+                  </td>
+                  <td
+                    title="Назначено юзеров (держат активный cred на ноде, diverse-корректно) · зелёным — онлайн в последнем traffic-замере"
+                  >
+                    <span className="font-semibold text-slate-200">
+                      {n.assigned_users}
+                    </span>
+                    {n.active_users > 0 && (
+                      <span className="ml-1 text-[10px] text-emerald-400">
+                        ● {n.active_users}
+                      </span>
+                    )}
                   </td>
                   <td>
                     <span className="inline-flex items-center gap-1">
