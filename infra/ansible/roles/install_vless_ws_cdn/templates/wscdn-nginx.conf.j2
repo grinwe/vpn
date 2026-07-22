@@ -43,8 +43,14 @@ server {
     # лишний h2-ALPN на origin'е — повод для RKN-DPI (h2 на CF-плече и убивал
     # ws; см. project_cf_ws_cdn_dead). xhttp свой http2 оставляет — там
     # stream-up может требовать h2 end-to-end.
+{% if reality_stream_unify | default(false) %}
+    # 443-унификация: за nginx-stream ssl_preread на :443, TLS-терминация на loopback:8443.
+    listen 127.0.0.1:8443 ssl;
+    listen [::1]:8443 ssl;
+{% else %}
     listen {{ vless_ws_cdn_port | default(443) }} ssl;
     listen [::]:{{ vless_ws_cdn_port | default(443) }} ssl;
+{% endif %}
     server_name {{ vless_ws_cdn_domain }};
 
     ssl_certificate     {{ _ws_cdn_cert_path }};

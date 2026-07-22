@@ -1,0 +1,18 @@
+# V8 443-unify (nginx stream ssl_preread). Публичный :443 роутит по SNI БЕЗ
+# дешифровки: reality-dest → reality xray (loopback), всё остальное → nginx-http
+# (xhttp/ws-cdn на loopback:8443). Reality получает СЫРОЙ ClientHello (preread
+# только подсматривает SNI) → мимикрия под dest цела. Убирает DPI-tell «reality
+# на нестандартном порту» (9443). hy2 (UDP:443) не задет — stream тут TCP.
+map $ssl_preread_server_name $v8_reality_up {
+    {{ vless_reality_sni }}                                127.0.0.1:{{ vless_reality_port | int }};
+    {{ vless_reality_sni | regex_replace('^www\\.', '') }} 127.0.0.1:{{ vless_reality_port | int }};
+    default                                                127.0.0.1:{{ vless_reality_http_loopback_port | default(8443) | int }};
+}
+
+server {
+    listen 443;
+    listen [::]:443;
+    ssl_preread on;
+    proxy_pass $v8_reality_up;
+    proxy_timeout 300s;
+}

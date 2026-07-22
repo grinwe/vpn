@@ -563,6 +563,13 @@ def _collect_site_extra_vars(
                 "vless_reality_short_id": settings.get("short_id", ""),
                 "vless_reality_port": cfg.port,
                 "vless_reality_sni": cfg.sni or "",
+                # reality_stream_unify — нода за nginx-stream ssl_preread (443-
+                # унификация): reality слушает loopback:port, клиент на :443,
+                # stream роутит по SNI. Сигнал — public_port на reality-конфиге
+                # (ставится при унификации). Пусто → обычный режим (reality на
+                # своём порту публично).
+                "reality_stream_unify": bool(settings.get("public_port")),
+                "vless_reality_http_loopback_port": 8443,
                 "vless_reality_dest": settings.get("dest") or cfg.fallback or "",
             })
             health_ports.append(cfg.port)
