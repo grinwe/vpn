@@ -739,6 +739,9 @@ function TopupModal({
   // зачисление поллингом баланса.
   const [waiting, setWaiting] = useState(false);
   const [waitTimedOut, setWaitTimedOut] = useState(false);
+  // Успех карточной оплаты: lava не редиректит обратно в Mini App, поэтому
+  // показываем явное «баланс пополнен», а не молча закрываем модалку.
+  const [success, setSuccess] = useState(false);
   // Модалку можно закрыть во время ожидания — гвардим setState после unmount
   // (poll живёт ~90с, юзер мог уже закрыть).
   const mountedRef = useRef(true);
@@ -798,8 +801,13 @@ function TopupModal({
     if (pollGenRef.current !== myGen) return;
     if (credited) {
       getTg()?.HapticFeedback?.notificationOccurred("success");
-      onRefresh(); // App-level, безопасно даже если модалку уже закрыли
-      if (mountedRef.current) onClose();
+      onRefresh(); // App-level: баланс на экране обновится под модалкой
+      // Не закрываем молча — lava не вернёт юзера в приложение, поэтому
+      // показываем явный экран успеха (он же обновит фон балансом).
+      if (mountedRef.current) {
+        setWaiting(false);
+        setSuccess(true);
+      }
       return;
     }
     if (mountedRef.current) {
@@ -847,7 +855,18 @@ function TopupModal({
         className="bg-tg-bg rounded-t-3xl border-t border-white/10 p-6 max-w-xl w-full max-h-[80vh] overflow-y-auto animate-slideUp"
         onClick={(e) => e.stopPropagation()}
       >
-        {waiting ? (
+        {success ? (
+          <div className="text-center py-4">
+            <h2 className="text-lg font-semibold mb-2">✅ Баланс пополнен</h2>
+            <p className="text-tg-hint text-sm mb-4">
+              {amount != null ? `Зачислено ${(amount / 100).toFixed(0)} ₽. ` : ""}
+              Спасибо!
+            </p>
+            <button onClick={onClose} className="btn-primary w-full">
+              Готово
+            </button>
+          </div>
+        ) : waiting ? (
           <div className="text-center py-4">
             <h2 className="text-lg font-semibold mb-2">Ждём подтверждение оплаты…</h2>
             <p className="text-tg-hint text-sm mb-4">
@@ -918,7 +937,7 @@ function TopupModal({
           </>
         ) : (
           <>
-            <h2 className="text-lg font-semibold mb-1">Чем платить?</h2>
+            <h2 className="text-lg font-semibold mb-1">Выберите способ оплаты</h2>
             <p className="text-tg-hint text-sm mb-4">
               Пополнение на {(amount / 100).toFixed(0)} ₽
             </p>
@@ -934,7 +953,7 @@ function TopupModal({
               onClick={() => payCard(amount)}
               className="btn-primary w-full"
             >
-              💳 Карта РФ / СБП
+              💳 Карта РФ
             </button>
             <button
               onClick={() => setAmount(null)}

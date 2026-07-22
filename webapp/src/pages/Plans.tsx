@@ -591,7 +591,7 @@ function TopupHintSheet({
           <button disabled className="btn-primary w-full">Ждём подтверждение оплаты…</button>
         ) : (
           <>
-            <p className="text-tg-hint text-sm mb-2">Чем платить?</p>
+            <p className="text-tg-hint text-sm mb-2">Выберите способ оплаты</p>
             <button
               onClick={() => onPay(suggested, "telegram_stars")}
               disabled={busy}
@@ -604,7 +604,7 @@ function TopupHintSheet({
               disabled={busy}
               className="btn-primary w-full"
             >
-              💳 Карта РФ / СБП
+              💳 Карта РФ
             </button>
           </>
         )}

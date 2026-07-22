@@ -27,7 +27,7 @@ from .config import (
 _PROVIDER_LABELS = {
     "telegram_stars": "⭐ Telegram Stars",
     "stars": "⭐ Telegram Stars",
-    "lava_top": "💳 Карта РФ / СБП",
+    "lava_top": "💳 Карта РФ",
     "tribute": "💳 Карта (Tribute)",
     "cryptobot": "🪙 Крипта (USDT)",
 }
