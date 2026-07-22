@@ -65,7 +65,12 @@ from .vless import (
 # для reality), 2026-06-17. Фолбэк (неизвестный регион / старые ноды) — РУ-пул
 # (релеи в основном РУ). dest = <sni>:443 — меняешь sni, меняй вместе.
 REALITY_DEST_POOLS: dict[str, tuple[str, ...]] = {
-    "ru": ("www.yandex.ru", "vk.ru", "mail.ru", "rutube.ru", "lenta.ru"),
+    # 2026-07-22: ротация RU-пула на свежие домены — старые (yandex/vk/mail.ru/
+    # rutube/lenta) могли попасть в DPI-сигнатуру Центрального ФО (Яр/Тула, см.
+    # docs/operations/regional_blocking_diag_2026_07.md). Набор пере-верифицирован
+    # TLS1.3+HTTP/2 с РУ-ноды; dzen отпал (HTTP/1.1), госсайты исключены.
+    # [0] = DEFAULT_REALITY_SNI.
+    "ru": ("www.ozon.ru", "ya.ru", "www.wildberries.ru", "www.kinopoisk.ru", "www.avito.ru", "www.rbc.ru", "www.yandex.ru"),
     "de": ("www.bmw.de", "www.mercedes-benz.com", "www.zalando.de"),
     "nl": ("www.bol.com", "www.philips.com", "www.adyen.com"),
     "fr": ("www.louisvuitton.com", "www.decathlon.fr", "www.sncf-connect.com"),
@@ -255,11 +260,32 @@ def pick_reality_sni(db: Session, region: str | None = None) -> str:
     домену не клало весь флот. Env ``REALITY_SNI`` форсит один SNI (dev/test)."""
     if _REALITY_SNI_ENV_OVERRIDE:
         return _REALITY_SNI_ENV_OVERRIDE
-    pool = (
-        REALITY_DEST_POOLS.get(_country_cc(region), REALITY_DEST_POOL)
-        if region else REALITY_DEST_POOL
-    )
-    used: dict[str, int] = dict(
+    cc = _country_cc(region) if region else None
+    pool = REALITY_DEST_POOLS.get(cc, REALITY_DEST_POOL) if cc else REALITY_DEST_POOL
+
+    if cc:
+        # #1-b (anti-RKN): used считаем ПО СТРАНЕ ноды (join VPNNode), а не
+        # глобально, и сначала отдаём SNI, ещё НЕ занятые в этом cc. Иначе при
+        # >3 параллельных TLS-хендшейках к одному SNI из одного региона (diverse-
+        # саб) можно словить «сибирскую» 120s-деградацию РКН. См.
+        # docs/operations/anti_rkn_upgrades_plan.md #1-b.
+        rows = (
+            db.query(models.VPNConfig.sni, models.VPNNode.region)
+            .join(models.VPNNode, models.VPNConfig.node_id == models.VPNNode.id)
+            .filter(
+                models.VPNConfig.protocol == models.VPNConfigProtocol.vless_reality
+            )
+            .all()
+        )
+        used: dict[str, int] = {}
+        for sni, node_region in rows:
+            if _country_cc(node_region) == cc:
+                used[sni] = used.get(sni, 0) + 1
+        free = [s for s in pool if s not in used]
+        return min(free or pool, key=lambda s: used.get(s, 0))
+
+    # Неизвестный регион → глобальный least-used (прежнее поведение).
+    used = dict(
         db.query(models.VPNConfig.sni, func.count(models.VPNConfig.id))
         .filter(models.VPNConfig.protocol == models.VPNConfigProtocol.vless_reality)
         .group_by(models.VPNConfig.sni)

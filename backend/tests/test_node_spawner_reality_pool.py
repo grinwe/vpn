@@ -78,5 +78,17 @@ def test_ensure_reality_config_idempotent_preserves_sni(db_session) -> None:
 def test_reality_dest_pool_has_expected_ru_hosts() -> None:
     """Smoke: пул не пустой, все хосты выглядят как RU-ASN домены."""
     assert len(node_spawner.REALITY_DEST_POOL) >= 3
-    assert "www.yandex.ru" in node_spawner.REALITY_DEST_POOL
-    assert "vk.ru" in node_spawner.REALITY_DEST_POOL
+    # Все — RU-домены; свежий набор после ротации 2026-07-22.
+    assert all(h.endswith(".ru") for h in node_spawner.REALITY_DEST_POOL)
+    assert "www.ozon.ru" in node_spawner.REALITY_DEST_POOL
+
+
+def test_pick_reality_sni_region_distinct(db_session) -> None:
+    """#1-b: в пределах одной страны pick избегает уже занятых там SNI."""
+    pool = node_spawner.REALITY_DEST_POOLS["ru"]
+    for i in range(2):
+        n = make_node(db_session, name=f"ru-n{i}", region="Russia", host=f"203.0.113.{80 + i}")
+        make_config(db_session, n, name=f"c{i}", sni=pool[i])
+    pick = node_spawner.pick_reality_sni(db_session, region="Russia")
+    assert pick not in (pool[0], pool[1])  # выбрал не занятый в RU SNI
+    assert pick in pool
