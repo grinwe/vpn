@@ -62,15 +62,18 @@ class SubLinkResponse(BaseModel):
 def _autoconnect_enabled(sub: models.Subscription, device) -> bool:
     """Включать ли HAPP-autoconnect для этой сабы/девайса (Phase B-гейт).
 
-    ``SUB_HAPP_AUTOCONNECT``: ""/"0"/"off" → никому; "all"/"on"/"1" → всем; иначе —
-    CSV ``user_id`` (обкатка на одном юзере, как diverse-backfill).
+    ``SUB_HAPP_AUTOCONNECT``: ""/"0"/"off" → никому; "all"/"on"/"true"/"yes" → всем;
+    иначе — CSV ``user_id`` (обкатка на одном юзере, как diverse-backfill).
+    NB: ``"1"`` — это ЮЗЕР 1, НЕ булево «вкл» (коллизия: user_id=1 совпал бы со
+    старым булевым "1" → обкатка на user 1 молча включалась бы ВСЕМ). Для «всем»
+    используй "all"/"on".
     ``SUB_HAPP_AUTOCONNECT_SINCE`` (опц. ISO-метка): доп.фильтр «только НОВЫЕ девайсы»
     — включаем лишь для девайсов с ``created_at >= метки`` (тест без путаницы со
     старыми/primary девайсами). Если метка задана, а девайса нет (legacy саб-токен)
     — не включаем.
     """
     ac = (os.getenv("SUB_HAPP_AUTOCONNECT") or "").strip().lower()
-    if ac in ("all", "on", "1", "true"):
+    if ac in ("all", "on", "true", "yes"):
         on = True
     elif ac and ac not in ("0", "off", "false"):
         ids = {x.strip() for x in ac.split(",") if x.strip()}

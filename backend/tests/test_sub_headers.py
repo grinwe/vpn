@@ -55,6 +55,15 @@ def test_per_user_csv(monkeypatch: pytest.MonkeyPatch) -> None:
     assert "subscription-autoconnect" not in _h(_Sub(None, user_id=99))
 
 
+def test_bare_one_is_user_id_not_all(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Коллизия-регресс: "1" = ЮЗЕР 1, НЕ булево «всем». Иначе обкатка на
+    user 1 молча включала бы autoconnect всему проду (реально случилось
+    2026-07-22 при тест-деплое)."""
+    monkeypatch.setenv("SUB_HAPP_AUTOCONNECT", "1")
+    assert "subscription-autoconnect" in _h(_Sub(None, user_id=1))
+    assert "subscription-autoconnect" not in _h(_Sub(None, user_id=2))
+
+
 def test_since_gates_to_new_devices(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("SUB_HAPP_AUTOCONNECT", "1")
     monkeypatch.setenv("SUB_HAPP_AUTOCONNECT_SINCE", _SINCE)
