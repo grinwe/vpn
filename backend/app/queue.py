@@ -370,6 +370,7 @@ TICK_IDS = {
     "app.worker.run_cloud_billing_tick": "tick-cloud-billing",
     "app.worker.run_spawn_sweep_tick": "tick-spawn-sweep",
     "app.worker.run_lava_reconcile_tick": "tick-lava-reconcile",
+    "app.worker.run_cert_renewal_tick": "tick-cert-renewal",
 }
 
 # Per-tick hard timeouts. Без них зависшая SSH (traffic-stats,
@@ -403,6 +404,9 @@ TICK_TIMEOUTS = {
     "tick-spawn-sweep": 60,
     # HTTP GET к lava /api/v2/invoices + DB-зачисление pending-счетов.
     "tick-lava-reconcile": 60,
+    # Внешние TLS-хендшейки ко ВСЕМ xhttp/ws-cdn доменам (проба cert-expiry) +
+    # enqueue renew near-expiry нодам. Network-bound, как node-reachability.
+    "tick-cert-renewal": 240,
 }
 
 

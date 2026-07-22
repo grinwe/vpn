@@ -479,6 +479,32 @@ def list_nodes(
         )
         assigned_users_by_node = {nid: cnt for nid, cnt in assigned_rows}
 
+    # cert_expires_at — ближайшее (min) истечение LE-серта среди xhttp/ws-cdn
+    # конфигов ноды. Пишет cert-renewal-тик в config.settings.cert_expires_at
+    # (ISO, внешняя TLS-проба). ISO сортируется лексикографически=хронологически
+    # → func.min по тексту = самый ранний. Для cert-бейджа в админке.
+    cert_expires_by_node: dict[int, datetime] = {}
+    if node_ids:
+        ce_rows = (
+            db.query(
+                models.VPNConfig.node_id,
+                func.min(models.VPNConfig.settings["cert_expires_at"].astext),
+            )
+            .filter(
+                models.VPNConfig.node_id.in_(node_ids),
+                models.VPNConfig.settings["cert_expires_at"].astext.isnot(None),
+            )
+            .group_by(models.VPNConfig.node_id)
+            .all()
+        )
+        for nid, ce in ce_rows:
+            if not ce:
+                continue
+            try:
+                cert_expires_by_node[nid] = datetime.fromisoformat(ce)
+            except ValueError:
+                continue
+
     def _to_out(n: models.VPNNode) -> schemas.VPNNodeOut:
         out = schemas.VPNNodeOut.from_orm(n)
         out.exit_links = [
@@ -494,6 +520,7 @@ def list_nodes(
         out.last_ssh_at = last_ssh_by_node.get(n.id)
         out.active_users = active_users_by_node.get(n.id, 0)
         out.assigned_users = assigned_users_by_node.get(n.id, 0)
+        out.cert_expires_at = cert_expires_by_node.get(n.id)
         # Reconciler-видимость: нода помечена dirty (desired бампнут правкой),
         # но прогон ещё отложен на тик. reconcile_due_at уже подтянут from_orm.
         out.reconcile_pending = n.desired_generation > n.reconciled_generation
@@ -689,6 +716,41 @@ def diagnose_node(
         node.id,
         actor_type=actor_type,
         metadata={"task_id": task.id},
+    )
+    return {"node_id": node.id, "task_id": task.id}
+
+
+@router.post("/nodes/{node_id}/renew-certs")
+def renew_node_certs_route(
+    node_id: int,
+    db: Session = Depends(get_db),
+    admin_token: str = Depends(require_admin),
+    admin_actor: str | None = Header(default=None, alias=ADMIN_ACTOR_HEADER),
+):
+    """Ручной re-issue LE-сертов ноды (certbot webroot force-renewal + reload
+    nginx), без полного site.yml. Дополняет авто-renewal cert-renewal-тика
+    (за CERT_RENEWAL_DAYS до истечения). NB: НЕ путать с ``/nodes/{id}/renew``
+    — тот продлевает облачную аренду VPS. 400, если у ноды нет LE-серт-конфигов
+    (xhttp/ws-cdn с sni без cert_path)."""
+    node = db.get(models.VPNNode, node_id)
+    if not node:
+        raise HTTPException(status_code=404, detail="Node not found")
+    orchestrator = ProvisioningOrchestrator(db)
+    task = orchestrator.renew_node_certs(node)
+    if task is None or not (task.payload or {}).get("domains"):
+        raise HTTPException(
+            status_code=400,
+            detail="Node has no Let's Encrypt cert configs (xhttp/ws-cdn) to renew",
+        )
+    actor, actor_type = _resolve_admin_actor(admin_actor)
+    _audit(
+        db,
+        actor,
+        "node_renew_certs",
+        "vpn_node",
+        node.id,
+        actor_type=actor_type,
+        metadata={"task_id": task.id, "domains": (task.payload or {}).get("domains")},
     )
     return {"node_id": node.id, "task_id": task.id}
 

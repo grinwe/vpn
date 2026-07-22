@@ -403,6 +403,132 @@ def run_lava_reconcile_tick() -> dict:
     return {"checked": checked, "credited": credited}
 
 
+def _probe_cert_notafter(host: str, port: int, server_name: str, timeout: float = 8.0):
+    """Внешний TLS-хендшейк → notAfter серта (naive-UTC datetime) или None.
+
+    Читаем РОВНО то, что видит клиент: nginx после certbot-renew продолжает
+    отдавать протухший in-memory серт до reload, поэтому node-side чтение
+    /etc/letsencrypt соврало бы «свежо». verify_mode=CERT_NONE + разбор DER
+    через cryptography — нужен notAfter ДАЖЕ у невалидного/mismatch серта
+    (getpeercert() при CERT_NONE отдаёт пусто, поэтому binary_form+DER)."""
+    import socket
+    import ssl
+
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    try:
+        with socket.create_connection((host, port), timeout=timeout) as sock:
+            with ctx.wrap_socket(sock, server_hostname=server_name) as ssock:
+                der = ssock.getpeercert(binary_form=True)
+    except Exception:  # noqa: BLE001
+        return None
+    if not der:
+        return None
+    try:
+        from cryptography import x509
+
+        cert = x509.load_der_x509_certificate(der)
+        exp = getattr(cert, "not_valid_after", None)
+        if exp is None:
+            return None
+        # cryptography отдаёт naive-UTC (или aware в новых версиях) — нормализуем.
+        if exp.tzinfo is not None:
+            from datetime import timezone as _tz
+
+            exp = exp.astimezone(_tz.utc).replace(tzinfo=None)
+        return exp
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def run_cert_renewal_tick() -> dict:
+    """Проба TLS-expiry LE-серт-конфигов (xhttp/ws-cdn) + авто-renewal за
+    ``CERT_RENEWAL_DAYS`` до истечения. Читаем серт ВНЕШНИМ хендшейком (ground
+    truth — см. _probe_cert_notafter), пишем expiry в
+    ``config.settings.cert_expires_at`` (для админки), near-expiry ноды отдаём
+    ``orchestrator.renew_node_certs`` (cap ``CERT_RENEWAL_MAX_PER_TICK``, чтобы
+    fleet-wide истечение не задогпайлило ansible). Предотвращает fleet-wide
+    cert-пожар (инцидент 2026-07-22). ``CERT_RENEWAL_INTERVAL=0`` выключает."""
+    from datetime import timedelta
+
+    from .db import SessionLocal
+    from . import models
+    from .services.provisioning import ProvisioningOrchestrator
+    from .time_utils import utcnow
+
+    interval = _env_int("CERT_RENEWAL_INTERVAL", 86400)
+    if interval > 0:
+        try:
+            schedule_tick(
+                "app.worker.run_cert_renewal_tick",
+                min(interval, 300),
+                tick_id="tick-cert-renewal",
+                replace=True,
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("cert-renewal: failed to reschedule tick")
+
+    days = _env_int("CERT_RENEWAL_DAYS", 21)
+    max_renew = max(1, _env_int("CERT_RENEWAL_MAX_PER_TICK", 6))
+    probed = 0
+    near = 0
+    renewed = 0
+    session = SessionLocal()
+    try:
+        now = utcnow()
+        cutoff = now + timedelta(days=days)
+        configs = (
+            session.query(models.VPNConfig)
+            .join(models.VPNNode, models.VPNNode.id == models.VPNConfig.node_id)
+            .filter(
+                models.VPNConfig.protocol.in_(
+                    (
+                        models.VPNConfigProtocol.vless_xhttp,
+                        models.VPNConfigProtocol.vless_ws_cdn,
+                    )
+                ),
+                models.VPNConfig.is_enabled.is_(True),
+                models.VPNConfig.sni.isnot(None),
+                models.VPNNode.status == models.VPNNodeStatus.active,
+            )
+            .all()
+        )
+        near_nodes: dict[int, models.VPNNode] = {}
+        for cfg in configs:
+            # CF Origin-CA (cert_path задан) — не через LE, certbot не при делах.
+            if (cfg.settings or {}).get("cert_path"):
+                continue
+            node = cfg.node
+            exp = _probe_cert_notafter(node.host, cfg.port or 443, cfg.sni)
+            if exp is None:
+                continue
+            probed += 1
+            # JSONB in-place не детектится SQLAlchemy → новый dict.
+            cfg.settings = {**(cfg.settings or {}), "cert_expires_at": exp.isoformat()}
+            if exp <= cutoff:
+                near += 1
+                near_nodes[node.id] = node
+        session.commit()
+
+        orch = ProvisioningOrchestrator(session)
+        for node in list(near_nodes.values())[:max_renew]:
+            try:
+                orch.renew_node_certs(node)
+                renewed += 1
+            except Exception:  # noqa: BLE001
+                logger.exception("cert-renewal: renew failed for node %s", node.id)
+    finally:
+        session.close()
+
+    if near or renewed:
+        logger.warning(
+            "cert-renewal: probed=%s near_expiry(<%sd)=%s renewed_nodes=%s",
+            probed, days, near, renewed,
+        )
+    return {"probed": probed, "near_expiry": near, "renewed_nodes": renewed}
+
+
 def run_operator_report_watch_tick() -> dict:
     """Periodic — resolve operator-routing reports by observed reconnect.
 
@@ -3433,6 +3559,25 @@ def main() -> None:
             )
         except Exception:  # noqa: BLE001
             logger.exception("Failed to schedule reconcile tick")
+
+    # Cert-renewal tick — внешняя проба TLS-expiry xhttp/ws-cdn + авто-renew LE
+    # за CERT_RENEWAL_DAYS до истечения (предотвращает fleet-wide cert-пожар,
+    # 2026-07-22). Дефолт раз в сутки; первый прогон ≤5 мин после старта.
+    cert_renewal_interval = _env_int("CERT_RENEWAL_INTERVAL", 86400)
+    if do_bootstrap and cert_renewal_interval > 0:
+        try:
+            schedule_tick(
+                "app.worker.run_cert_renewal_tick",
+                min(cert_renewal_interval, 300),
+                tick_id="tick-cert-renewal",
+                replace=True,
+            )
+            logger.info(
+                "Cert-renewal tick bootstrapped: first run in %ss (interval=%ss)",
+                min(cert_renewal_interval, 300), cert_renewal_interval,
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("Failed to schedule cert-renewal tick")
 
     # Schedule autoscale tick
     autoscale_interval = _env_int("AUTOSCALE_INTERVAL", 0)

@@ -564,6 +564,9 @@ export interface VPNNodeOut {
   // (diverse-sub-корректно, детерминированный DB-join; не протухает как
   // active_users из traffic-сэмпла). «Сколько людей на ноде сидит».
   assigned_users: number;
+  // cert_expires_at — ближайшее истечение LE-серта (xhttp/ws-cdn) ноды.
+  // Пишет cert-renewal-тик (внешняя TLS-проба). null = нет сертов/не пробовано.
+  cert_expires_at: string | null;
   blocked_regions: string[];
   cooldown_until: string | null;
   suspect_since: string | null;
@@ -775,6 +778,18 @@ export function renewNode(
 ): Promise<{ node_id: number; renewed: boolean }> {
   return api.post<{ node_id: number; renewed: boolean }>(
     `/nodes/${nodeId}/renew`,
+    {},
+  );
+}
+
+// Ручной re-issue LE-сертов ноды (certbot webroot force-renewal + reload
+// nginx). НЕ путать с renewNode (облачная аренда VPS). Дополняет авто-renewal
+// cert-renewal-тика. 400 если у ноды нет LE-серт-конфигов.
+export function renewNodeCerts(
+  nodeId: number,
+): Promise<{ node_id: number; task_id: number }> {
+  return api.post<{ node_id: number; task_id: number }>(
+    `/nodes/${nodeId}/renew-certs`,
     {},
   );
 }

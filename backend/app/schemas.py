@@ -291,6 +291,10 @@ class VPNNodeOut(VPNNodeCreate):
     # детерминированный DB-join — «сколько людей на ноде сидит». Ставится в
     # list_nodes; прочие call-сайты не проставляют (дефолт 0).
     assigned_users: int = 0
+    # cert_expires_at — ближайшее истечение LE-серта (xhttp/ws-cdn) ноды,
+    # min из config.settings.cert_expires_at (пишет cert-renewal-тик внешней
+    # TLS-пробой). None = сертов нет / ещё не пробовано. Для cert-бейджа.
+    cert_expires_at: UTCDateTime | None = None
     # Reconciler-видимость: desired_generation > reconciled_generation, т.е.
     # ноде нужен прогон, но он отложен на reconcile-тик (defer-модель). Без
     # этого флага операторское действие при включённом RECONCILER_ENABLED

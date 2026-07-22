@@ -32,6 +32,7 @@ import {
   spawnNode,
   reinstallNode,
   renewNode,
+  renewNodeCerts,
   updateNode,
   listPools,
   VPNNodeUpdateIn,
@@ -126,6 +127,30 @@ function HealthBadge({ score, blocked }: { score: number | null; blocked: string
           {blocked.length} blocked
         </span>
       )}
+    </span>
+  );
+}
+
+// Cert-бейдж: дней до истечения LE-серта (min по xhttp/ws-cdn конфигам ноды).
+// Пишет cert-renewal-тик внешней TLS-пробой. Пороги: >21д зелёный, 7-21д
+// жёлтый, <7д красный (тик авто-обновляет за CERT_RENEWAL_DAYS=21 до истечения,
+// так что красный = что-то мешает renewal → чинить). «—» = нет LE-сертов/не
+// пробовано.
+function CertBadge({ expiresAt }: { expiresAt: string | null }) {
+  if (!expiresAt)
+    return (
+      <span className="text-slate-600" title="LE-серт не пробован / нет xhttp·ws-cdn">
+        —
+      </span>
+    );
+  const days = Math.floor((new Date(expiresAt).getTime() - Date.now()) / 86400000);
+  const color = days > 21 ? "bg-emerald-700" : days >= 7 ? "bg-yellow-700" : "bg-red-700";
+  return (
+    <span
+      className={`text-xs px-1.5 py-0.5 rounded font-mono ${color}`}
+      title={`LE-серт истекает ${new Date(expiresAt).toLocaleString()}`}
+    >
+      {days}д
     </span>
   );
 }
@@ -1097,6 +1122,17 @@ export default function Nodes() {
     onError: (e: Error) => alert(`Не удалось запустить диагностику: ${e.message}`),
   });
 
+  const renewCerts = useMutation({
+    mutationFn: (id: number) => renewNodeCerts(id),
+    onSuccess: (res) => {
+      qc.invalidateQueries({ queryKey: ["provisioning-tasks"] });
+      qc.invalidateQueries({ queryKey: ["nodes"] });
+      alert(`Re-issue LE-сертов запущен (task #${res.task_id})`);
+    },
+    onError: (e: Error) =>
+      alert(`Не удалось запустить обновление сертов: ${e.message}`),
+  });
+
   const refreshRealityDest = useMutation({
     mutationFn: (args: {
       node_id: number;
@@ -1355,6 +1391,7 @@ export default function Nodes() {
             <th>Health</th>
             <th>WG</th>
             <th>Юзеры</th>
+            <th>Cert</th>
             <th>Активна</th>
             <th>SSH · обновлено</th>
             <th></th>
@@ -1474,6 +1511,9 @@ export default function Nodes() {
                         ● {n.active_users}
                       </span>
                     )}
+                  </td>
+                  <td>
+                    <CertBadge expiresAt={n.cert_expires_at} />
                   </td>
                   <td>
                     <span className="inline-flex items-center gap-1">
@@ -1649,6 +1689,22 @@ export default function Nodes() {
                         className="text-xs px-2 py-1 rounded bg-teal-700 hover:bg-teal-600 disabled:opacity-50"
                       >
                         диагностика
+                      </button>
+                      <button
+                        disabled={renewCerts.isPending}
+                        onClick={() => {
+                          if (
+                            confirm(
+                              `Перевыпустить LE-серты на «${n.name}» ` +
+                                `(certbot webroot force-renewal + reload nginx)?`,
+                            )
+                          )
+                            renewCerts.mutate(n.id);
+                        }}
+                        className="text-xs px-2 py-1 rounded bg-sky-700 hover:bg-sky-600 disabled:opacity-50"
+                        title="Ручной re-issue LE-сертов (xhttp/ws-cdn). Дополняет авто-renewal cert-тика."
+                      >
+                        обновить серты
                       </button>
                       <NodeMuteToggle
                         nodeId={n.id}

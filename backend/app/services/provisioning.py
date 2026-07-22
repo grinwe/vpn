@@ -1985,6 +1985,21 @@ class ProvisioningOrchestrator:
                     # short-circuit to a skip-checklist instead of burning an
                     # ansible UNREACHABLE. The helper owns its own inventory.
                     result = self._run_node_diagnose(task, node, payload)
+                elif task.action == "renew_certs":
+                    # Точечный re-issue LE-сертов (certbot webroot force-renewal
+                    # + reload nginx) без полного site.yml. Триггерят: cert-
+                    # renewal-тик (за CERT_RENEWAL_DAYS до истечения) и ручная
+                    # кнопка POST /nodes/{id}/renew-certs. Предотвращает fleet-
+                    # wide cert-пожар (инцидент 2026-07-22). Домены — в payload.
+                    result = run_playbook(
+                        "playbooks/renew_certs.yml",
+                        inventory,
+                        limit=node.name,
+                        extra_vars={
+                            "cert_domains": (payload or {}).get("domains") or [],
+                        },
+                        timeout=300,
+                    )
                 else:
                     # Cloud-ноды без инъекции SSH-ключа (4vps): кладём наш
                     # provisioning-ключ по root-паролю ПЕРЕД site.yml (см.
@@ -3549,6 +3564,39 @@ class ProvisioningOrchestrator:
                 ],
             },
         )
+        self.db.commit()
+        self.run_task_async(task, node=node)
+        return task
+
+    def renew_node_certs(
+        self, node: models.VPNNode
+    ) -> models.ProvisioningTask | None:
+        """Enqueue точечный re-issue LE-сертов ноды (action=``renew_certs`` →
+        ``playbooks/renew_certs.yml``: certbot webroot force-renewal + reload
+        nginx), без полного site.yml. Зовут cert-renewal-тик (за
+        ``CERT_RENEWAL_DAYS`` до истечения) и ручная кнопка
+        ``POST /nodes/{id}/renew-certs``. Предотвращает fleet-wide cert-пожар
+        (2026-07-22). Домены = xhttp/ws-cdn конфиги с непустым ``sni`` БЕЗ
+        ``cert_path`` (CF Origin-CA идёт не через LE — их не renew'им)."""
+        domains = sorted(
+            {
+                cfg.sni
+                for cfg in (node.configs or [])
+                if cfg.is_enabled
+                and cfg.sni
+                and cfg.protocol
+                in (
+                    models.VPNConfigProtocol.vless_xhttp,
+                    models.VPNConfigProtocol.vless_ws_cdn,
+                )
+                and not (cfg.settings or {}).get("cert_path")
+            }
+        )
+        if not domains:
+            # Нет LE-серт-доменов (напр. чистый reality-нода или всё на CF
+            # Origin-CA) — нечего renew'ить, таску не плодим.
+            return None
+        task = self.create_task("node", node.id, "renew_certs", {"domains": domains})
         self.db.commit()
         self.run_task_async(task, node=node)
         return task
