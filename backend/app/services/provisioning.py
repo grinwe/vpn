@@ -257,7 +257,12 @@ def _build_vless_reality_credential(
         "type": "tcp",
     }
     query = "&".join([f"{k}={v}" for k, v in params.items() if v])
-    return f"vless://{user_id}@{node.host}:{config.port}?{query}#reality-{node.region}"
+    # public_port — публичный порт клиента, если он ОТЛИЧАЕТСЯ от xray-listen
+    # (config.port). Нужен при 443-унификации: xray-reality слушает loopback
+    # (config.port=9443) за nginx-stream ssl_preread, а клиент коннектится на
+    # :443 (stream роутит по SNI). Пусто → config.port (обычный не-унифиц. режим).
+    port = (config.settings or {}).get("public_port") or config.port
+    return f"vless://{user_id}@{node.host}:{port}?{query}#reality-{node.region}"
 
 
 def _build_vless_ws_cdn_credential(
