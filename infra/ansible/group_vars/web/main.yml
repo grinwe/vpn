@@ -55,7 +55,9 @@ deploy_app_stack_webapp_jwt_secret: "{{ vault_webapp_jwt_secret | default('') }}
 # Секреты в vault.yml; email_domain и меню способов оплаты — открытые.
 # Меню в боте включается заполнением choices (например
 # "telegram_stars,lava_top,tribute,cryptobot"); пусто = старое поведение.
-deploy_app_stack_payment_provider_choices: ""
+# 2026-07-22: запуск со Stars + карта РФ (lava.top). Tribute добавится
+# сюда, когда будет создан магазин (сейчас shop-not-found).
+deploy_app_stack_payment_provider_choices: "telegram_stars,lava_top"
 deploy_app_stack_lava_top_api_key: "{{ vault_lava_top_api_key | default('') }}"
 deploy_app_stack_lava_top_offer_id: "{{ vault_lava_top_offer_id | default('') }}"
 deploy_app_stack_lava_top_webhook_secret: "{{ vault_lava_top_webhook_secret | default('') }}"
