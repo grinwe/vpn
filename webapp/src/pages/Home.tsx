@@ -3,6 +3,8 @@ import { createPortal } from "react-dom";
 import QRCode from "qrcode";
 import {
   activateTrial,
+  activateSubscription,
+  fetchPlans,
   authWithInitData,
   fetchReferral,
   setToken,
@@ -98,9 +100,28 @@ export default function Home({
     if (trialActivating) return;
     setTrialActivating(true);
     try {
-      await activateTrial();
-      // Refresh /me so the banner disappears and the new balance
-      // (including the +50₽ referral bonus if any) shows up.
+      await activateTrial(); // зачисляет бонус на баланс
+      // Сразу тратим бонус на подписку и провижн — «Забрать месяц» = рабочий
+      // VPN, а не деньги на балансе (иначе большинство застревает на бонусе:
+      // триал даёт только баланс, и второй шаг «активировать план» неочевиден).
+      // Бонус размерен ровно под самый дешёвый 30-дневный план (_trial_plan),
+      // а мы активируем ровно его (самый дешёвый месячный) — баланса хватает.
+      try {
+        const plans = await fetchPlans();
+        const cheapestMonthly = plans
+          .filter((p) => p.period === "month")
+          .sort((a, b) => a.price_rub - b.price_rub)[0];
+        if (cheapestMonthly) {
+          await activateSubscription(cheapestMonthly.id);
+          getTg()?.HapticFeedback?.notificationOccurred("success");
+        }
+      } catch (actErr) {
+        // Бонус уже на балансе, но авто-активация не прошла (редкий сбой
+        // провижининга/сети) — не блокируем: юзер увидит баланс и активирует
+        // подписку вручную из тарифов. Хуже, чем сейчас, не становится.
+        console.warn("trial auto-activate failed", actErr);
+      }
+      // Refresh /me: баннер исчезнет, появятся активная подписка + баланс.
       onRefresh();
     } catch (err) {
       // 409 = already activated by another tab/device in the
@@ -187,15 +208,15 @@ export default function Home({
           <div className="text-tg-hint text-xs uppercase tracking-wide">Подарок</div>
           <div className="text-lg font-semibold mt-1">🎁 Забери пробный месяц</div>
           <div className="text-sm text-tg-hint mt-1">
-            Кладём <b>{trialAmountRub.toFixed(0)} ₽</b> тебе на баланс — хватит на
-            месяц подписки Solo. Без карты, без автосписаний.
+            Дарим <b>месяц Solo</b> бесплатно — VPN заработает <b>сразу</b>, без
+            карты и автосписаний. Настроить устройство — минута.
           </div>
           <button
             className="btn-primary w-full mt-3"
             disabled={trialActivating}
             onClick={handleActivateTrial}
           >
-            {trialActivating ? "Активируем…" : "Активировать месяц"}
+            {trialActivating ? "Включаем VPN…" : "Активировать бесплатно"}
           </button>
         </section>
       )}
