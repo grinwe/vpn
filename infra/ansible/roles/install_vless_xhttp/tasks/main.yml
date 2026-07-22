@@ -228,6 +228,29 @@
         _xhttp_cert_path: /etc/letsencrypt/live/{{ vless_xhttp_domain }}/fullchain.pem
         _xhttp_key_path: /etc/letsencrypt/live/{{ vless_xhttp_domain }}/privkey.pem
 
+    # Self-heal (инцидент 2026-07-22, docs/operations/xhttp cert-expiry):
+    # старые ноды выпускались с --standalone, их renewal-.conf биндит :80 и
+    # ВСЕГДА падает при `certbot renew` (там nginx) → серты тихо истекали
+    # (клиент ловит CERT_DATE_INVALID → рвёт TLS → падает на Reality → DPI
+    # режет в жёстких регионах). Мигрируем .conf на webroot (тот же, что
+    # первичная выдача): force-renewal перезаписывает authenticator=webroot.
+    # Идемпотентно — на webroot-.conf grep не сматчит.
+    - name: Migrate legacy standalone renewal config to webroot (self-heal)
+      ansible.builtin.shell: |
+        set -e
+        conf=/etc/letsencrypt/renewal/{{ vless_xhttp_domain }}.conf
+        if [ -f "$conf" ] && grep -q 'authenticator = standalone' "$conf"; then
+          certbot certonly --webroot -w /var/www/acme-challenge \
+            -d {{ vless_xhttp_domain }} --force-renewal --non-interactive \
+            --agree-tos --email {{ vless_xhttp_acme_email | default('admin@' + vless_xhttp_domain) }}
+          systemctl reload nginx || true
+          echo MIGRATED
+        else
+          echo NOCHANGE
+        fi
+      register: _xhttp_cert_migrate
+      changed_when: "'MIGRATED' in _xhttp_cert_migrate.stdout"
+
 - name: Set cert paths from variables (if provided)
   when: (vless_xhttp_cert_path | default('')) != ''
   set_fact:
