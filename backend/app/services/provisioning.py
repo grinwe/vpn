@@ -343,6 +343,16 @@ def _build_hysteria2_credential(
     pin = settings.get("pin_sha256") or settings.get("pinSHA256")
     if pin:
         params["pinSHA256"] = urlquote(str(pin), safe="")
+    # Port-hopping: клиент прыгает по UDP-диапазону портов, нода DNAT'ит весь
+    # диапазон на :443 (config.port). Обход ТСПУ-троттлинга по ФИКС-порту (если
+    # душат по порту — хоппинг обходит; если душат весь UDP/QUIC — не спасёт).
+    # Формат ``mport=start-end`` (sing-box/HAPP share-link); клиент, не знающий
+    # mport, просто коннектится на config.port (:443) — регресса нет. Пусто =
+    # обычный одно-портовый hy2. Диапазон задаётся в settings.port_hopping_range
+    # и симметрично разворачивается в DNAT ролью install_hysteria2.
+    hop = str(settings.get("port_hopping_range") or "").strip()
+    if hop:
+        params["mport"] = hop
     query = "&".join([f"{k}={v}" for k, v in params.items() if v])
     return f"hy2://{password}@{node.host}:{config.port}?{query}#hy2-{node.region}"
 
@@ -623,6 +633,11 @@ def _collect_site_extra_vars(
                 "hysteria2_key_path": settings.get("key_path", ""),
                 "hysteria2_up_mbps": settings.get("up_mbps", 100),
                 "hysteria2_down_mbps": settings.get("down_mbps", 100),
+                # Port-hopping: диапазон UDP-портов ("start-end"), которые роль
+                # DNAT'ит на hysteria2_port. Симметрично mport в клиентском URI
+                # (_build_hysteria2_credential). Пусто = одно-портовый hy2.
+                "hysteria2_port_hopping_range": settings.get(
+                    "port_hopping_range", ""),
             })
             # NB: Hysteria2 is UDP — ansible's wait_for module only does
             # TCP, so we intentionally skip adding it to vpn_health_ports.

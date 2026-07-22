@@ -41,6 +41,26 @@
     state: present
   failed_when: false
 
+# Port-hopping: клиент шлёт UDP на случайные порты диапазона, мы DNAT'им весь
+# диапазон на hysteria2_port (:443, где реально слушает hysteria). Обход
+# ТСПУ-троттлинга по фикс-порту. Диапазон "start-end" (из config.settings.
+# port_hopping_range) → iptables хочет "start:end". DNAT в PREROUTING правит
+# dport ДО INPUT-фильтра, поэтому существующего ACCEPT на :443 достаточно —
+# отдельно диапазон в INPUT открывать не надо. Пусто = обычный одно-портовый hy2.
+- name: Ensure Hysteria2 port-hopping DNAT (range → hysteria2_port)
+  ansible.builtin.iptables:
+    table: nat
+    chain: PREROUTING
+    protocol: udp
+    destination_port: "{{ hysteria2_port_hopping_range | replace('-', ':') }}"
+    jump: DNAT
+    to_destination: ":{{ hysteria2_port | int }}"
+    comment: hy2-port-hopping
+    action: append
+    state: present
+  when: hysteria2_port_hopping_range | default('') | length > 0
+  failed_when: false
+
 - name: Persist iptables rules across reboots (netfilter-persistent)
   ansible.builtin.command: netfilter-persistent save
   changed_when: false

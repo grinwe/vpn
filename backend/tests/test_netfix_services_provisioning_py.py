@@ -59,6 +59,19 @@ def test_hy2_no_insecure_by_default() -> None:
     assert "pinSHA256" not in q
 
 
+def test_hy2_mport_emitted_when_range_set() -> None:
+    """port_hopping_range → mport в URI (обход ТСПУ по фикс-порту)."""
+    q = _query(_build_hysteria2_credential(
+        _node(), _config({"port_hopping_range": "20000-40000"}), "pw"))
+    assert q.get("mport") == ["20000-40000"]
+
+
+def test_hy2_no_mport_by_default() -> None:
+    """Без port_hopping_range mport не эмитится (обычный одно-портовый hy2)."""
+    assert "mport" not in _query(
+        _build_hysteria2_credential(_node(), _config(), "pw"))
+
+
 def test_hy2_self_signed_settings_emitted() -> None:
     """insecure/pin_sha256 из settings прокидываются в URI (self-signed нода)."""
     uri = _build_hysteria2_credential(
