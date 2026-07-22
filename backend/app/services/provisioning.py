@@ -4567,13 +4567,15 @@ class ProvisioningOrchestrator:
         live), so a plain DB fix to a ``VPNConfig`` field (e.g. xhttp
         ``sni``/``port`` restored after DR) never reaches installed
         clients until the baked URI is rebuilt. This walks the sub's live
-        devices and rewrites every vless-family credential URI (reality /
-        xhttp / ws-cdn) using the SAME UUID (pulled back out of the
-        existing blob) against the now-corrected ``cred.config`` on the
-        subscription's node — so the user's existing link silently starts
-        returning the fixed URI on the next client refresh. Password-based
-        protocols (shadowtls / hysteria2) carry no sni/port-derived URI
-        and are left untouched.
+        devices and rewrites every vless-family AND hysteria2 credential URI
+        (reality / xhttp / ws-cdn / hy2) using the SAME per-user secret (UUID
+        for vless, password for hy2 — pulled back out of the existing blob)
+        against the now-corrected ``cred.config`` on the subscription's node —
+        so the user's existing link silently starts returning the fixed URI on
+        the next client refresh. hysteria2 IS rebuilt: its URI embeds sni+obfs,
+        so a config.sni change (e.g. grinwer→wgse repoint) must re-mint it
+        (иначе сталый sni → cert-mismatch → hy2 таймаутит). ShadowTLS carries a
+        node-wide password with no per-user sni/port-derived URI → untouched.
 
         Returns the number of credentials whose ``config_text`` changed.
         Raises ``RuntimeError`` if the sub is not active or has no node.
@@ -4586,10 +4588,21 @@ class ProvisioningOrchestrator:
         if node is None:
             raise RuntimeError("subscription has no node — cannot rebuild")
 
+        # (builder, secret-extractor). hysteria2 ВКЛЮЧЁН: его URI тоже несёт
+        # sni (+obfs), поэтому при смене config.sni (напр. репойнт grinwer→wgse)
+        # без ре-минта клиент получает сталый sni → cert-mismatch → hy2 таймаутит
+        # (реально словили на канарейке 2026-07-22). Секрет hy2 — password (не
+        # UUID), поэтому пара с extractor'ом. shadowtls исключён осознанно:
+        # node-wide пароль, per-user sni-производной URI нет.
         builders = {
-            models.VPNConfigProtocol.vless_reality: _build_vless_reality_credential,
-            models.VPNConfigProtocol.vless_xhttp: _build_vless_xhttp_credential,
-            models.VPNConfigProtocol.vless_ws_cdn: _build_vless_ws_cdn_credential,
+            models.VPNConfigProtocol.vless_reality: (
+                _build_vless_reality_credential, _extract_vless_uuid),
+            models.VPNConfigProtocol.vless_xhttp: (
+                _build_vless_xhttp_credential, _extract_vless_uuid),
+            models.VPNConfigProtocol.vless_ws_cdn: (
+                _build_vless_ws_cdn_credential, _extract_vless_uuid),
+            models.VPNConfigProtocol.hysteria2: (
+                _build_hysteria2_credential, _extract_hy2_password),
         }
         rebuilt = 0
         for device in subscription.devices:
@@ -4604,13 +4617,14 @@ class ProvisioningOrchestrator:
                 cfg = cred.config
                 if cfg is None:
                     continue
-                builder = builders.get(cfg.protocol)
-                if builder is None:
-                    continue  # shadowtls / hysteria2 — nothing sni/port-derived
-                user_uuid = _extract_vless_uuid(cred.config_text, cred_id=cred.id)
-                if not user_uuid:
-                    continue  # can't rebuild without the existing UUID
-                cred.config_text = encrypt(builder(node, cfg, user_uuid))
+                pair = builders.get(cfg.protocol)
+                if pair is None:
+                    continue  # shadowtls — node-wide, no per-user sni-derived URI
+                builder, extract = pair
+                secret = extract(cred.config_text, cred_id=cred.id)
+                if not secret:
+                    continue  # can't rebuild without the existing UUID/password
+                cred.config_text = encrypt(builder(node, cfg, secret))
                 rebuilt += 1
         self.db.commit()
         return rebuilt
