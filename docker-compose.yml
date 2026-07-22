@@ -88,6 +88,14 @@ services:
       WARM_POOL_ENABLED: ${WARM_POOL_ENABLED:-1}
       # Diverse N×M subscription (Phase A): N nodes per sub (1 = current single-node).
       DIVERSE_SUB_NODES: ${DIVERSE_SUB_NODES:-1}
+      # Phase B — HAPP auto-connect (lowestdelay-on-reconnect) sub-headers.
+      # Read ONLY by api_extensions._autoconnect_enabled (backend serves /sub).
+      # Без этих строк .env-значение не доезжало до контейнера → autoconnect
+      # был молча off, хотя group_var=all с 2026-06-13 (891d3ef). fallback-url —
+      # запасной домен источника сабы (дормант, пока env не задан).
+      SUB_HAPP_AUTOCONNECT: ${SUB_HAPP_AUTOCONNECT:-off}
+      SUB_HAPP_AUTOCONNECT_SINCE: ${SUB_HAPP_AUTOCONNECT_SINCE:-}
+      SUB_LINK_FALLBACK_BASE_URL: ${SUB_LINK_FALLBACK_BASE_URL:-}
       # Stage 4 — balance billing. Backend reads these for the
       # WebApp endpoints (freeze caps, min topup, referral bonus).
       FREEZE_DAYS: ${FREEZE_DAYS:-14}
