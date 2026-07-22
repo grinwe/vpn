@@ -604,7 +604,7 @@ function TopupHintSheet({
               disabled={busy}
               className="btn-primary w-full"
             >
-              💳 Карта РФ
+              💳 Карта РФ / СБП
             </button>
           </>
         )}

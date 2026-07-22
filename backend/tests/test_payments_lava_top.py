@@ -104,6 +104,21 @@ def test_lava_top_create_invoice_happy_path() -> None:
     assert body["amount"] == 299.0
     # round-trip нашего invoice_id — единственный сквозной канал.
     assert body["clientUtm"] == {"utm_content": "42"}
+    # По умолчанию paymentProvider не задан (дефолт lava) в этом фикстуре.
+    assert "paymentProvider" not in body
+
+
+def test_lava_top_create_sends_payment_provider_for_sbp() -> None:
+    # PAY2ME даёт карту+СБП; paymentMethod НЕ шлём (пусть агрегатор
+    # предложит выбор на своей странице → одна кнопка «Карта РФ / СБП»).
+    prov = _lava(payment_provider="pay2me")
+    prov._session = _FakeSession(  # type: ignore[assignment]
+        _FakeResponse({"id": "c1", "paymentUrl": "https://p"}, status_code=201)
+    )
+    prov.create_invoice(invoice_id=7, amount=100.0, currency="RUB")
+    body = prov._session.last_call["json"]  # type: ignore[attr-defined]
+    assert body["paymentProvider"] == "PAY2ME"  # нормализован к upper
+    assert "paymentMethod" not in body
 
 
 def test_lava_top_create_invoice_rur_alias_and_bad_currency() -> None:

@@ -61,6 +61,8 @@ deploy_app_stack_lava_top_offer_id: ""
 deploy_app_stack_lava_top_webhook_secret: ""
 deploy_app_stack_lava_top_email_domain: ""
 deploy_app_stack_lava_top_api_base: ""
+# Эквайрер lava: PAY2ME = карта+СБП; пусто = дефолт SMART_GLOCAL (карта).
+deploy_app_stack_lava_top_payment_provider: "PAY2ME"
 # Авто-сверка карточных платежей lava (вебхук-независимо). Воркер раз в N
 # секунд опрашивает /api/v2/invoices и зачисляет pending-счета. 0 = выкл.
 deploy_app_stack_lava_top_reconcile_interval: 60

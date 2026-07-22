@@ -953,7 +953,7 @@ function TopupModal({
               onClick={() => payCard(amount)}
               className="btn-primary w-full"
             >
-              💳 Карта РФ
+              💳 Карта РФ / СБП
             </button>
             <button
               onClick={() => setAmount(null)}

@@ -48,12 +48,17 @@ class LavaTopProvider:
         webhook_secret: str,
         email_domain: str,
         api_base: str | None = None,
+        payment_provider: str | None = None,
     ) -> None:
         self._api_key = api_key
         self._offer_id = offer_id
         self._webhook_secret = webhook_secret
         self._email_domain = email_domain
         self._api_base = (api_base or DEFAULT_API_BASE).rstrip("/")
+        # paymentProvider у lava выбирает эквайрера. SMART_GLOCAL (дефолт
+        # платформы) — только карта; PAY2ME — агрегатор с картой И СБП на
+        # одной странице виджета. Пусто → не шлём (дефолт lava = карта).
+        self._payment_provider = (payment_provider or "").strip().upper() or None
         self._session = requests.Session()
 
     # ---------- create ----------
@@ -84,6 +89,10 @@ class LavaTopProvider:
             "amount": round(float(amount), 2),
             "clientUtm": {"utm_content": str(invoice_id)},
         }
+        if self._payment_provider:
+            # paymentMethod намеренно НЕ шлём: без него агрегатор (PAY2ME)
+            # даёт выбрать карту или СБП на своей странице → одна кнопка.
+            body["paymentProvider"] = self._payment_provider
         try:
             resp = self._session.post(
                 f"{self._api_base}/api/v3/invoice",
@@ -246,4 +255,10 @@ def load_lava_top_env() -> dict:
         raise ProviderError(
             f"lava_top provider requires env vars: {', '.join(missing)}"
         )
-    return {**values, "api_base": os.getenv("LAVA_TOP_API_BASE")}
+    return {
+        **values,
+        "api_base": os.getenv("LAVA_TOP_API_BASE"),
+        # По умолчанию PAY2ME — карта + СБП на одной странице виджета.
+        # Задать пустым, чтобы вернуться к дефолту lava (SMART_GLOCAL, карта).
+        "payment_provider": os.getenv("LAVA_TOP_PAYMENT_PROVIDER", "PAY2ME"),
+    }
