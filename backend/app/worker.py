@@ -272,6 +272,107 @@ def run_pending_rescue_tick() -> dict:
     return {"scanned": scanned, "rescued": rescued}
 
 
+def run_lava_reconcile_tick() -> dict:
+    """Webhook-independent reconcile для карточных платежей lava.top.
+
+    Доставка вебхуков lava — best-effort (до 20 ретраев по докам; в проде
+    наблюдалось, что POST не приходит вовсе — счёт остаётся pending, деньги
+    у клиента списаны). Этот тик раз в ``LAVA_TOP_RECONCILE_INTERVAL`` секунд
+    опрашивает ``GET /api/v2/invoices`` и зачисляет любой pending-счёт, чья
+    продажа у lava уже COMPLETED (матч по ``clientUtm.utm_content`` = наш
+    invoice_id). Идемпотентно: уже-paid счета пропускаются, а если вебхук
+    всё-таки долетит — ``_mark_invoice_paid_core`` дедупит по
+    ``reference=invoice:{id}``. No-op пока lava_top не сконфигурирован.
+    """
+    from .db import SessionLocal
+    from . import models
+    from .queue import schedule_tick
+    from .services.payments import ProviderError, get_provider
+    from .api.invoices import _mark_invoice_paid_core
+
+    # Перепланируем ДО работы (как остальные тики), чтобы падение тела не
+    # оборвало периодику.
+    interval = _env_int("LAVA_TOP_RECONCILE_INTERVAL", 60)
+    if interval > 0:
+        try:
+            schedule_tick(
+                "app.worker.run_lava_reconcile_tick",
+                interval,
+                tick_id="tick-lava-reconcile",
+                replace=True,
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("lava_reconcile: failed to re-enqueue tick (at start)")
+
+    if not os.getenv("LAVA_TOP_API_KEY"):
+        return {"skipped": "not_configured"}
+    try:
+        provider = get_provider("lava_top")
+    except ProviderError:
+        return {"skipped": "not_configured"}
+
+    try:
+        sales = provider.list_recent_invoices()
+    except ProviderError as exc:
+        logger.warning("lava_reconcile: list invoices failed: %s", exc)
+        return {"error": "list_failed"}
+
+    checked = 0
+    credited = 0
+    session = SessionLocal()
+    try:
+        for sale in sales:
+            if not sale.get("completed") or not sale.get("invoice_id"):
+                continue
+            inv_id = sale["invoice_id"]
+            invoice = session.get(models.Invoice, inv_id)
+            if invoice is None or invoice.status != models.InvoiceStatus.pending:
+                continue
+            checked += 1
+            # Сверка суммы (RUB↔RUB, как в webhook): продажа lava должна
+            # покрывать сумму счёта — иначе не зачисляем (частичная оплата).
+            sale_amount = sale.get("amount")
+            if sale_amount is not None and float(sale_amount) + 0.01 < float(invoice.amount):
+                logger.warning(
+                    "lava_reconcile: invoice %s underpaid (lava=%s, invoice=%s) — skip",
+                    inv_id, sale_amount, invoice.amount,
+                )
+                continue
+            # Помечаем ту же pending Payment-строку, что создал webapp_topup
+            # (provider=lava_top), чтобы её external_id/статус сошлись.
+            pending_payment = (
+                session.query(models.Payment)
+                .filter(
+                    models.Payment.invoice_id == inv_id,
+                    models.Payment.provider == "lava_top",
+                    models.Payment.status == models.PaymentStatus.pending,
+                )
+                .order_by(models.Payment.id.desc())
+                .first()
+            )
+            payment_id = pending_payment.id if pending_payment else None
+            try:
+                _mark_invoice_paid_core(
+                    session,
+                    inv_id,
+                    actor="lava_top:reconcile",
+                    actor_type=models.AuditActor.system,
+                    payment_id=payment_id,
+                )
+                credited += 1
+                logger.warning(
+                    "lava_reconcile: credited invoice %s from lava sale %s (webhook missed)",
+                    inv_id, sale.get("contract_id"),
+                )
+            except Exception:  # noqa: BLE001
+                session.rollback()
+                logger.exception("lava_reconcile: failed to credit invoice %s", inv_id)
+    finally:
+        session.close()
+
+    return {"checked": checked, "credited": credited}
+
+
 def run_operator_report_watch_tick() -> dict:
     """Periodic — resolve operator-routing reports by observed reconnect.
 
@@ -3245,6 +3346,26 @@ def main() -> None:
             )
         except Exception:  # noqa: BLE001
             logger.exception("Failed to schedule pending-rescue tick")
+
+    # Schedule lava.top reconcile (webhook-independent credit of card
+    # payments). lava's webhook delivery is best-effort and was observed
+    # missing in prod; this tick polls GET /api/v2/invoices and credits any
+    # pending invoice whose lava sale is COMPLETED. No-op без LAVA_TOP_API_KEY.
+    lava_reconcile_interval = _env_int("LAVA_TOP_RECONCILE_INTERVAL", 60)
+    if do_bootstrap and lava_reconcile_interval > 0:
+        try:
+            schedule_tick(
+                "app.worker.run_lava_reconcile_tick",
+                min(lava_reconcile_interval, 30),
+                tick_id="tick-lava-reconcile",
+                replace=True,
+            )
+            logger.info(
+                "Lava reconcile tick bootstrapped: first run in 30s (interval=%ss)",
+                lava_reconcile_interval,
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("Failed to schedule lava reconcile tick")
 
     # Schedule operator-report watcher (Phase 1 operator-aware routing) —
     # resolves «VPN не работает» reports by observed reconnect. Default 5 min.

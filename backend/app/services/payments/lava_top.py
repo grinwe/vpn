@@ -111,6 +111,53 @@ class LavaTopProvider:
             raw=data,
         )
 
+    # ---------- reconcile (webhook-independent) ----------
+
+    def list_recent_invoices(self) -> list[dict]:
+        """GET /api/v2/invoices — недавние продажи для авто-сверки.
+
+        Вебхуки lava негарантированы (до 20 ретраев по докам; в проде
+        наблюдалось, что POST не приходит вовсе). Этот метод отдаёт список
+        продаж, чтобы воркер мог зачислить pending-счета, чей платёж у lava
+        уже COMPLETED. Нормализует к списку dict'ов:
+        ``{invoice_id: int|None, amount: float|None, currency, contract_id, completed: bool}``.
+        ``invoice_id`` берётся из ``clientUtm.utm_content`` (наш round-trip).
+        """
+        try:
+            resp = self._session.get(
+                f"{self._api_base}/api/v2/invoices",
+                headers={"X-Api-Key": self._api_key},
+                timeout=15,
+            )
+        except requests.RequestException as exc:
+            raise ProviderError(f"lava_top: list invoices failed: {exc}") from exc
+        try:
+            data = resp.json()
+        except ValueError:
+            raise ProviderError(f"lava_top: non-JSON invoices response: {resp.text[:200]}")
+        if resp.status_code >= 400:
+            raise ProviderError(f"lava_top: invoices HTTP {resp.status_code}: {data}")
+
+        out: list[dict] = []
+        for item in (data.get("items") or []):
+            if not isinstance(item, dict):
+                continue
+            utm = item.get("clientUtm")
+            raw_id = utm.get("utm_content") if isinstance(utm, dict) else None
+            invoice_id = int(raw_id) if raw_id and str(raw_id).isdigit() else None
+            receipt = item.get("receipt") if isinstance(item.get("receipt"), dict) else {}
+            amount = receipt.get("amount")
+            out.append(
+                {
+                    "invoice_id": invoice_id,
+                    "amount": float(amount) if isinstance(amount, (int, float)) else None,
+                    "currency": receipt.get("currency"),
+                    "contract_id": item.get("id"),
+                    "completed": str(item.get("status") or "").upper() == "COMPLETED",
+                }
+            )
+        return out
+
     # ---------- webhook ----------
 
     def verify_webhook(self, body: bytes, headers: dict[str, str]) -> WebhookEvent:

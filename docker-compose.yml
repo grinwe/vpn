@@ -185,6 +185,15 @@ services:
       # Self-heal for stuck pending provisioning tasks.
       PENDING_RESCUE_INTERVAL: ${PENDING_RESCUE_INTERVAL:-60}
       PENDING_RESCUE_AGE: ${PENDING_RESCUE_AGE:-60}
+      # Stage 9b — авто-сверка карточных платежей lava.top (вебхук-независимо).
+      # Тику нужен доступ к API lava (те же LAVA_TOP_* что у backend), т.к. он
+      # зовёт get_provider("lava_top") и опрашивает /api/v2/invoices.
+      LAVA_TOP_RECONCILE_INTERVAL: ${LAVA_TOP_RECONCILE_INTERVAL:-60}
+      LAVA_TOP_API_KEY: ${LAVA_TOP_API_KEY:-}
+      LAVA_TOP_OFFER_ID: ${LAVA_TOP_OFFER_ID:-}
+      LAVA_TOP_WEBHOOK_SECRET: ${LAVA_TOP_WEBHOOK_SECRET:-}
+      LAVA_TOP_EMAIL_DOMAIN: ${LAVA_TOP_EMAIL_DOMAIN:-}
+      LAVA_TOP_API_BASE: ${LAVA_TOP_API_BASE:-}
       ANSIBLE_PLAYBOOK_TIMEOUT: ${ANSIBLE_PLAYBOOK_TIMEOUT:-300}
       RENEWAL_CHECK_INTERVAL: ${RENEWAL_CHECK_INTERVAL:-300}
       RENEWAL_GRACE_HOURS: ${RENEWAL_GRACE_HOURS:-24}

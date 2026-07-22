@@ -347,6 +347,7 @@ TICK_IDS = {
     "app.worker.run_reconcile_tick": "tick-reconcile",
     "app.worker.run_cloud_billing_tick": "tick-cloud-billing",
     "app.worker.run_spawn_sweep_tick": "tick-spawn-sweep",
+    "app.worker.run_lava_reconcile_tick": "tick-lava-reconcile",
 }
 
 # Per-tick hard timeouts. Без них зависшая SSH (traffic-stats,
@@ -378,6 +379,8 @@ TICK_TIMEOUTS = {
     "tick-cloud-billing": 120,
     # DB-only + enqueue RQ-джоб (сама достройка едет на провижининг-очереди).
     "tick-spawn-sweep": 60,
+    # HTTP GET к lava /api/v2/invoices + DB-зачисление pending-счетов.
+    "tick-lava-reconcile": 60,
 }
 
 

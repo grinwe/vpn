@@ -61,6 +61,9 @@ deploy_app_stack_lava_top_offer_id: ""
 deploy_app_stack_lava_top_webhook_secret: ""
 deploy_app_stack_lava_top_email_domain: ""
 deploy_app_stack_lava_top_api_base: ""
+# Авто-сверка карточных платежей lava (вебхук-независимо). Воркер раз в N
+# секунд опрашивает /api/v2/invoices и зачисляет pending-счета. 0 = выкл.
+deploy_app_stack_lava_top_reconcile_interval: 60
 deploy_app_stack_tribute_api_key: ""
 deploy_app_stack_tribute_order_title: ""
 deploy_app_stack_tribute_order_description: ""

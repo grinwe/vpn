@@ -42,6 +42,10 @@ class _FakeSession:
         }
         return self.response
 
+    def get(self, url: str, headers: dict | None = None, timeout: int | None = None):
+        self.last_call = {"url": url, "headers": headers or {}, "timeout": timeout}
+        return self.response
+
 
 def _lava(**overrides):
     from app.services.payments.lava_top import LavaTopProvider
@@ -125,6 +129,66 @@ def test_lava_top_create_invoice_http_error_and_missing_fields() -> None:
     prov._session = _FakeSession(_FakeResponse({"status": "new"}, status_code=201))  # type: ignore[assignment]
     with pytest.raises(ProviderError, match="missing id/paymentUrl"):
         prov.create_invoice(invoice_id=1, amount=100.0, currency="RUB")
+
+
+# ===========================================================================
+# lava.top — reconcile (list_recent_invoices)
+# ===========================================================================
+
+
+def test_lava_top_list_recent_invoices_normalizes() -> None:
+    prov = _lava()
+    prov._session = _FakeSession(  # type: ignore[assignment]
+        _FakeResponse(
+            {
+                "items": [
+                    {
+                        "id": "9ac65b2c-7fbc-4672-a27a-abd1b96fbaac",
+                        "status": "COMPLETED",
+                        "receipt": {"amount": 100.0, "currency": "RUB"},
+                        "clientUtm": {"utm_content": "48"},
+                    },
+                    {
+                        "id": "in-progress-1",
+                        "status": "IN_PROGRESS",
+                        "receipt": {"amount": 50.0, "currency": "RUB"},
+                        "clientUtm": {"utm_content": "49"},
+                    },
+                    {
+                        "id": "no-utm",
+                        "status": "COMPLETED",
+                        "receipt": {"amount": 200.0, "currency": "RUB"},
+                        "clientUtm": None,
+                    },
+                ],
+                "total": 3,
+            }
+        )
+    )
+    rows = prov.list_recent_invoices()
+    assert prov._session.last_call["url"].endswith("/api/v2/invoices")  # type: ignore[attr-defined]
+    assert prov._session.last_call["headers"]["X-Api-Key"] == "key"  # type: ignore[attr-defined]
+
+    completed = rows[0]
+    assert completed["invoice_id"] == 48
+    assert completed["amount"] == 100.0
+    assert completed["currency"] == "RUB"
+    assert completed["contract_id"] == "9ac65b2c-7fbc-4672-a27a-abd1b96fbaac"
+    assert completed["completed"] is True
+
+    # Не-COMPLETED и без utm — попадают в список, но с флагами, по которым
+    # тик их отфильтрует (completed=False / invoice_id=None).
+    assert rows[1]["completed"] is False
+    assert rows[2]["invoice_id"] is None
+
+
+def test_lava_top_list_recent_invoices_http_error() -> None:
+    prov = _lava()
+    prov._session = _FakeSession(  # type: ignore[assignment]
+        _FakeResponse({"error": "unauthorized"}, status_code=401)
+    )
+    with pytest.raises(ProviderError, match="invoices HTTP 401"):
+        prov.list_recent_invoices()
 
 
 # ===========================================================================

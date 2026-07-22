@@ -157,7 +157,8 @@
 | `LAVA_TOP_OFFER_ID` | `""` | backend | UUID цены продукта с включённой «Ценой по запросу через API» — только у такого продукта работает произвольная сумма (лимиты 50–1 000 000 ₽). |
 | `LAVA_TOP_WEBHOOK_SECRET` | `""` | backend | Наш статический секрет вебхука (≤80 символов): дублируется в кабинете lava.top при настройке вебхука (тип «API key»), приходит в заголовке `X-Api-Key`. HMAC у платформы нет. |
 | `LAVA_TOP_EMAIL_DOMAIN` | `""` | backend | Домен синтетических email покупателей (`inv<invoice_id>@домен`) — email обязателен в API lava.top. |
-| `LAVA_TOP_API_BASE` | `https://gate.lava.top` | backend | Переопределение базового URL (тесты/стейджинг). |
+| `LAVA_TOP_API_BASE` | `https://gate.lava.top` | backend, worker | Переопределение базового URL (тесты/стейджинг). |
+| `LAVA_TOP_RECONCILE_INTERVAL` | `60` | worker | Авто-сверка карточных платежей (вебхук-независимо): воркер раз в N сек опрашивает lava `GET /api/v2/invoices` и зачисляет pending-счета с COMPLETED-продажей (матч по `clientUtm.utm_content`). Страховка на случай, когда вебхук lava не долетает (best-effort доставка). `0` = выключить. Воркеру нужны и `LAVA_TOP_API_KEY`/`_OFFER_ID`/`_WEBHOOK_SECRET`/`_EMAIL_DOMAIN` (прокинуты в worker-env). |
 | `TRIBUTE_API_KEY` | `""` | backend | API-ключ Tribute (дашборд → Settings → API Keys), заголовок `Api-Key`. Им же подписываются вебхуки (`trbt-signature` = HMAC-SHA256 тела). |
 | `TRIBUTE_ORDER_TITLE` | `Пополнение баланса` | backend | Нейтральный title заказа в Tribute (обязателен у платформы, Stage 9d-нейтральность). |
 | `TRIBUTE_ORDER_DESCRIPTION` | `Пополнение баланса личного кабинета` | backend | Нейтральный description заказа. |
