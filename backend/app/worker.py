@@ -529,6 +529,183 @@ def run_cert_renewal_tick() -> dict:
     return {"probed": probed, "near_expiry": near, "renewed_nodes": renewed}
 
 
+def _probe_reality_dest_ok(host: str, port: int, server_name: str, timeout: float = 8.0) -> bool:
+    """True, если dest годен как Reality-цель: TLS 1.3 + ALPN h2.
+
+    Reality зеркалит handshake dest'а; если dest перестал отдавать TLS1.3/h2
+    (легаси-домены деградируют — lenta/mail/rutube 2026-07), зеркалирование
+    падает («target sent incorrect server hello») и Reality МЁРТВ. Проба —
+    свойство самого dest'а (глобальное), поэтому из воркера репрезентативна.
+    Эквивалент ``openssl s_client -tls1_3 -alpn h2``."""
+    import socket
+    import ssl
+
+    ctx = ssl.create_default_context()
+    try:
+        ctx.minimum_version = ssl.TLSVersion.TLSv1_3
+    except (ValueError, AttributeError):
+        pass
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    try:
+        ctx.set_alpn_protocols(["h2"])
+    except NotImplementedError:
+        pass
+    try:
+        with socket.create_connection((host, port), timeout=timeout) as sock:
+            with ctx.wrap_socket(sock, server_hostname=server_name) as ssock:
+                return ssock.version() == "TLSv1.3" and ssock.selected_alpn_protocol() == "h2"
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def run_reality_dest_health_tick() -> dict:
+    """Проба Reality-dest'ов на TLS1.3+h2 + авто-ротация битых на живой из пула.
+
+    Легаси reality-dest'ы (заданы до ротации пула) со временем перестают
+    отдавать h2 → Reality молча МЁРТВ на ноде (инцидент 2026-07-23: lenta/mail/
+    rutube). Тик раз в сутки пробит dest каждого активного reality-конфига,
+    пишет здоровье в ``config.settings`` (dest_healthy/dest_checked_at/
+    dest_fail_count). Битый ``REALITY_DEST_FAIL_THRESHOLD`` (2) раза ПОДРЯД →
+    авто-ротация: pick_reality_sni выбирает кандидата, проба подтверждает его
+    годность, конфиг+xml-render обновляются (bootstrap) + client-URI регенятся
+    (rebuild_subscription_config_text). Cap ``REALITY_DEST_MAX_ROTATE_PER_TICK``.
+    ``REALITY_DEST_HEALTH_INTERVAL=0`` выключает; ``REALITY_DEST_AUTO_ROTATE=0``
+    оставляет только детект+алерт (без мутаций)."""
+    from sqlalchemy.orm.attributes import flag_modified
+
+    from .db import SessionLocal
+    from . import models
+    from .services.node_spawner import pick_reality_sni
+    from .services.provisioning import ProvisioningOrchestrator
+    from .services.warm_pool import invalidate_node_warm_pool
+    from .time_utils import utcnow
+
+    interval = _env_int("REALITY_DEST_HEALTH_INTERVAL", 86400)
+    if interval > 0:
+        try:
+            schedule_tick(
+                "app.worker.run_reality_dest_health_tick",
+                min(interval, 300),
+                tick_id="tick-reality-dest-health",
+                replace=True,
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("reality-dest-health: failed to reschedule tick")
+
+    threshold = max(1, _env_int("REALITY_DEST_FAIL_THRESHOLD", 2))
+    auto_rotate = os.getenv("REALITY_DEST_AUTO_ROTATE", "1") not in ("0", "off", "false")
+    max_rotate = max(0, _env_int("REALITY_DEST_MAX_ROTATE_PER_TICK", 3))
+    probed = 0
+    broken = 0
+    rotated = 0
+    session = SessionLocal()
+    try:
+        now = utcnow()
+        cfgs = (
+            session.query(models.VPNConfig)
+            .join(models.VPNNode, models.VPNNode.id == models.VPNConfig.node_id)
+            .filter(
+                models.VPNConfig.protocol == models.VPNConfigProtocol.vless_reality,
+                models.VPNConfig.is_enabled.is_(True),
+                models.VPNConfig.sni.isnot(None),
+                models.VPNNode.status == models.VPNNodeStatus.active,
+            )
+            .all()
+        )
+        to_rotate: list[tuple[models.VPNNode, models.VPNConfig]] = []
+        for cfg in cfgs:
+            dest = (cfg.settings or {}).get("dest") or cfg.fallback or f"{cfg.sni}:443"
+            host, _, port_s = dest.partition(":")
+            port = int(port_s) if port_s.isdigit() else 443
+            ok = _probe_reality_dest_ok(host, port, host)
+            probed += 1
+            settings = dict(cfg.settings or {})
+            settings["dest_checked_at"] = now.isoformat()
+            settings["dest_healthy"] = ok
+            fails = 0 if ok else int(settings.get("dest_fail_count") or 0) + 1
+            settings["dest_fail_count"] = fails
+            cfg.settings = settings
+            flag_modified(cfg, "settings")
+            if not ok:
+                broken += 1
+                logger.warning(
+                    "reality-dest-health: node %s dest %s BROKEN (no TLS1.3/h2), "
+                    "fail #%s", cfg.node_id, dest, fails,
+                )
+                if fails >= threshold and auto_rotate:
+                    to_rotate.append((cfg.node, cfg))
+        session.commit()
+
+        orch = ProvisioningOrchestrator(session)
+        for node, cfg in to_rotate[:max_rotate]:
+            try:
+                new_sni = pick_reality_sni(session, node.region)
+                if not new_sni or new_sni == cfg.sni:
+                    continue
+                # НЕ ротируем на непроверенный dest (иначе битый→битый).
+                if not _probe_reality_dest_ok(new_sni, 443, new_sni):
+                    logger.warning(
+                        "reality-dest-health: candidate %s for node %s also "
+                        "not TLS1.3/h2 — skip rotate", new_sni, node.id,
+                    )
+                    continue
+                cfg.sni = new_sni
+                cfg.fallback = f"{new_sni}:443"
+                cfg.settings = {
+                    **(cfg.settings or {}),
+                    "dest": f"{new_sni}:443",
+                    "dest_healthy": True,
+                    "dest_fail_count": 0,
+                }
+                flag_modified(cfg, "settings")
+                invalidate_node_warm_pool(
+                    session, node.id, reason="dest-health auto-rotate")
+                session.commit()
+                task, created = orch.create_or_coalesce_node_bootstrap(
+                    node,
+                    {"pool_id": node.pool_id, "rerun": True, "reason": "dest-health"},
+                    defer_to_reconciler=False,
+                )
+                session.commit()
+                if created:
+                    orch.run_task_async(task, node=node)
+                subs = (
+                    session.query(models.Subscription)
+                    .filter(
+                        models.Subscription.node_id == node.id,
+                        models.Subscription.status
+                        == models.SubscriptionStatus.active,
+                    )
+                    .all()
+                )
+                for sub in subs:
+                    try:
+                        orch.rebuild_subscription_config_text(sub)
+                    except Exception:  # noqa: BLE001
+                        logger.exception(
+                            "dest-health: rebuild failed sub %s", sub.id)
+                session.commit()
+                rotated += 1
+                logger.warning(
+                    "reality-dest-health: node %s AUTO-ROTATED dest → %s",
+                    node.id, new_sni,
+                )
+            except Exception:  # noqa: BLE001
+                logger.exception(
+                    "reality-dest-health: rotate failed for node %s", node.id)
+                session.rollback()
+    finally:
+        session.close()
+
+    if broken or rotated:
+        logger.warning(
+            "reality-dest-health: probed=%s broken=%s auto_rotated=%s",
+            probed, broken, rotated,
+        )
+    return {"probed": probed, "broken": broken, "rotated": rotated}
+
+
 def run_operator_report_watch_tick() -> dict:
     """Periodic — resolve operator-routing reports by observed reconnect.
 
@@ -3578,6 +3755,26 @@ def main() -> None:
             )
         except Exception:  # noqa: BLE001
             logger.exception("Failed to schedule cert-renewal tick")
+
+    # Reality-dest health tick — пробит reality-dest'ы на TLS1.3+h2 и авто-
+    # ротирует битые (легаси-домены деградируют → Reality молча мёртв,
+    # инцидент 2026-07-23). Дефолт раз в сутки; первый прогон ≤5 мин.
+    reality_dest_interval = _env_int("REALITY_DEST_HEALTH_INTERVAL", 86400)
+    if do_bootstrap and reality_dest_interval > 0:
+        try:
+            schedule_tick(
+                "app.worker.run_reality_dest_health_tick",
+                min(reality_dest_interval, 300),
+                tick_id="tick-reality-dest-health",
+                replace=True,
+            )
+            logger.info(
+                "Reality-dest health tick bootstrapped: first run in %ss "
+                "(interval=%ss)", min(reality_dest_interval, 300),
+                reality_dest_interval,
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("Failed to schedule reality-dest health tick")
 
     # Schedule autoscale tick
     autoscale_interval = _env_int("AUTOSCALE_INTERVAL", 0)

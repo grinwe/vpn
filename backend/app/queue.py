@@ -371,6 +371,7 @@ TICK_IDS = {
     "app.worker.run_spawn_sweep_tick": "tick-spawn-sweep",
     "app.worker.run_lava_reconcile_tick": "tick-lava-reconcile",
     "app.worker.run_cert_renewal_tick": "tick-cert-renewal",
+    "app.worker.run_reality_dest_health_tick": "tick-reality-dest-health",
 }
 
 # Per-tick hard timeouts. Без них зависшая SSH (traffic-stats,
@@ -407,6 +408,8 @@ TICK_TIMEOUTS = {
     # Внешние TLS-хендшейки ко ВСЕМ xhttp/ws-cdn доменам (проба cert-expiry) +
     # enqueue renew near-expiry нодам. Network-bound, как node-reachability.
     "tick-cert-renewal": 240,
+    # TLS1.3+h2-пробы ко всем reality-dest'ам + авто-ротация битых. Network-bound.
+    "tick-reality-dest-health": 240,
 }
 
 
