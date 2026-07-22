@@ -2,4 +2,4 @@
 # Pin xray-core version. Bump'аем отдельным коммитом этой роли вместе
 # с release-notes upstream'а, потом прокатываем resync. Pin защищает
 # от внезапного breaking change (xray иногда меняет CLI/conf-format).
-xray_core_version: "v25.6.8"
+xray_core_version: "v26.3.27"
