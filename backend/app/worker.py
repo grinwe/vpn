@@ -570,8 +570,16 @@ def run_reality_dest_health_tick() -> dict:
     авто-ротация: pick_reality_sni выбирает кандидата, проба подтверждает его
     годность, конфиг+xml-render обновляются (bootstrap) + client-URI регенятся
     (rebuild_subscription_config_text). Cap ``REALITY_DEST_MAX_ROTATE_PER_TICK``.
-    ``REALITY_DEST_HEALTH_INTERVAL=0`` выключает; ``REALITY_DEST_AUTO_ROTATE=0``
-    оставляет только детект+алерт (без мутаций)."""
+    ``REALITY_DEST_HEALTH_INTERVAL=0`` выключает тик целиком.
+
+    ⚠️ ``REALITY_DEST_AUTO_ROTATE`` ДЕФОЛТ **off** (только детект+алерт): воркер
+    пробит из своей локации (nl-web, NL), а geo-чувствительные dest'ы (гос-сайты
+    типа gosuslugi.ru) из-за границы отдают иначе → false-positive, хотя с самой
+    RU-ноды (где Reality реально зеркалит) dest жив. Безопасная авто-ротация
+    требует пробы С НОДЫ (TODO). Пока: тик флагует dest_healthy/dest_fail_count,
+    оператор смотрит и перепойнчивает вручную (POST /nodes/{id}/refresh-reality-
+    dest). ``REALITY_DEST_AUTO_ROTATE=1`` включает авто-ротацию (для не-geo
+    dest'ов / после node-пробы)."""
     from sqlalchemy.orm.attributes import flag_modified
 
     from .db import SessionLocal
@@ -594,7 +602,9 @@ def run_reality_dest_health_tick() -> dict:
             logger.exception("reality-dest-health: failed to reschedule tick")
 
     threshold = max(1, _env_int("REALITY_DEST_FAIL_THRESHOLD", 2))
-    auto_rotate = os.getenv("REALITY_DEST_AUTO_ROTATE", "1") not in ("0", "off", "false")
+    # Дефолт off — воркер пробит из NL, geo-dest'ы (gosuslugi) false-positive'ят
+    # (см. docstring). Безопасно включать только для не-geo dest'ов / node-пробы.
+    auto_rotate = os.getenv("REALITY_DEST_AUTO_ROTATE", "0") in ("1", "on", "true")
     max_rotate = max(0, _env_int("REALITY_DEST_MAX_ROTATE_PER_TICK", 3))
     probed = 0
     broken = 0
