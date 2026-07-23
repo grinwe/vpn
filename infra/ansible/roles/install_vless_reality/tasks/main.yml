@@ -78,6 +78,10 @@
   ansible.builtin.find:
     paths: /etc/nginx/modules-enabled
     patterns: "*mod-stream*.conf"
+    # file_type: any — libnginx-mod-stream кладёт 50-mod-stream.conf СИМЛИНКОМ на
+    # modules-available; find по дефолту матчит только обычные файлы → пропустил бы
+    # симлинк и ложно свалил assert ниже (модуль есть, а preflight «не нашёл»).
+    file_type: any
   register: _reality_stream_mod_files
   when: reality_stream_unify | default(false)
 
