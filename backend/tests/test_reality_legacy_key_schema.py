@@ -45,3 +45,14 @@ def test_reality_new_encrypted_private_key(db_session):
                   private_key_enc=encrypt("NEW-ENCRYPTED-KEY"))
     ev = _collect_site_extra_vars(db_session, node)
     assert ev.get("vless_reality_private_key") == "NEW-ENCRYPTED-KEY", ev
+
+
+def test_reality_legacy_dest_in_camo_dest(db_session):
+    """Легаси-ноды хранят reality dest в camo_dest (host:port), не в dest.
+    Без fallback reality-роль падает на assert `vless_reality_dest length>0`."""
+    node = make_node(db_session, name="legacy-dest-node", host="10.0.0.11")
+    cfg = make_config(db_session, node, protocol=models.VPNConfigProtocol.vless_reality)
+    _set_settings(db_session, cfg, private_key="K", private_key_enc=None,
+                  dest=None, camo_dest="vk.ru:443")
+    ev = _collect_site_extra_vars(db_session, node)
+    assert ev.get("vless_reality_dest") == "vk.ru:443", ev

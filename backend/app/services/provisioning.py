@@ -577,7 +577,12 @@ def _collect_site_extra_vars(
                 # своём порту публично).
                 "reality_stream_unify": bool(settings.get("public_port")),
                 "vless_reality_http_loopback_port": 8443,
-                "vless_reality_dest": settings.get("dest") or cfg.fallback or "",
+                # dest: новая схема — settings.dest; легаси-ноды (ufo-ru-01/02/03)
+                # хранят его в camo_dest (host:port). Без fallback reality-роль
+                # падает на assert `vless_reality_dest length > 0` при бутстрапе.
+                "vless_reality_dest": (
+                    settings.get("dest") or settings.get("camo_dest") or cfg.fallback or ""
+                ),
             })
             health_ports.append(cfg.port)
 
