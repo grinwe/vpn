@@ -2886,7 +2886,11 @@ function NodeConfigs({ nodeId, nodeHost }: { nodeId: number; nodeHost: string })
                   <tr className="border-t border-slate-800">
                     <td className="py-1 font-mono">{c.name}</td>
                     <td className="font-mono text-slate-300">{c.protocol}</td>
-                    <td className="font-mono">{c.port}</td>
+                    <td className="font-mono">
+                      {c.settings?.public_port
+                        ? `${String(c.settings.public_port)} (xray ${c.port})`
+                        : c.port}
+                    </td>
                     <td className="font-mono text-slate-400">{c.sni ?? "—"}</td>
                     <td>{c.is_enabled ? "✓" : "✕"}</td>
                     <td className="text-right space-x-1">
