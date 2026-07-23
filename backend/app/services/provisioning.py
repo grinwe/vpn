@@ -4690,7 +4690,7 @@ class ProvisioningOrchestrator:
                 if cred.pool_state == models.CredentialPoolState.revoked:
                     continue
                 cfg = cred.config
-                if cfg is None:
+                if cfg is None or cfg.node is None:
                     continue
                 pair = builders.get(cfg.protocol)
                 if pair is None:
@@ -4699,7 +4699,13 @@ class ProvisioningOrchestrator:
                 secret = extract(cred.config_text, cred_id=cred.id)
                 if not secret:
                     continue  # can't rebuild without the existing UUID/password
-                cred.config_text = encrypt(builder(node, cfg, secret))
+                # Строим по ноде САМОГО кредо (cfg.node), а НЕ subscription.node:
+                # диверсная (N×M) подписка держит креды на РАЗНЫХ нодах. Общий
+                # subscription.node запекал IP primary-ноды во ВСЕ reality/hy2 URI
+                # (xhttp уцелевал — он доменный, IP-аргумент игнорит) → эндпоинты
+                # кредов на не-primary нодах указывали не туда = «reality н/д» у
+                # диверсных юзеров. cfg.node — нода, которой этот cred реально принадлежит.
+                cred.config_text = encrypt(builder(cfg.node, cfg, secret))
                 rebuilt += 1
         self.db.commit()
         return rebuilt
