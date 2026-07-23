@@ -33,12 +33,33 @@
   CI не гонялся. `git push origin dev --tags` до старта флот-раскатки.
 
 ## Текущее покрытие (на 2026-07-23)
-- Унифицировано: **dc-ru-01** + **ufo-ru-01** (канарейка-комбо пройдена: unify+xray26+ws-cdn,
-  внешне зелено). ⚠️ Обеим U делали БЕЗ инвалидации warm-пула → дёрнуть
-  `invalidate_node_warm_pool(db, id)` ретроспективно (warm-бандлы могут держать :9443).
-- ws-cdn ЕСТЬ: 4vds-dk, 4vds-ru, vsin-nl, vsin-ru, ufo-ru-01. НЕТ: aeza, dc, tw, ufo-02/03.
-- Легаси-схема ключа (нужен keypair-чек перед бутстрапом): **ufo-ru-02/03** (ufo-01, aeza — уже сделаны).
+- Унифицировано: **dc-ru-01** + **ufo-ru-01** + **4vds-ru-01** (3/10; все внешне зелено,
+  reality:443 / xhttp:443 / ws:443 / 9443-closed). 4vds-ru-01 — combo-батч-3, прошёл за
+  один прогон ПОСЛЕ фиксов ниже (task 2641). ⚠️ dc/ufo-01 U делали БЕЗ инвалидации
+  warm-пула → дёрнуть `invalidate_node_warm_pool(db, id)` ретроспективно.
+- ws-cdn ЕСТЬ: 4vds-dk, 4vds-ru✅, vsin-nl, vsin-ru, ufo-ru-01. НЕТ: aeza, dc, tw, ufo-02/03.
+- Остаток батч-3 (combo, ws есть): vsin-ru (4 юзера), vsin-nl (9), 4vds-dk (9).
+- Легаси-схема ключа (keypair-чек перед бутстрапом): **ufo-ru-02/03** (ufo-01, aeza — сделаны).
 - xray: часть на 26.3.27, часть на 25.6.8 (апгрейд по бутстрапу).
+
+## 🔴 ИНЦИДЕНТ-УРОК 4vds-ru-01 (первый заход лёг — читать!)
+Первый unify combo-ноды 4vds-ru-01 положил её ЦЕЛИКОМ: unify-роль вставляла блок
+`stream{}` в nginx.conf, даже когда `libnginx-mod-stream` не установился (стояло
+`failed_when: false` → сбой замаскирован) → nginx `unknown directive "stream"` → nginx
+down, reality на loopback, **dpkg заклинило** (nginx half-configured) → даже откат падал
+на `bootstrap_node: Install base packages`. Расклинка — вручную: снять stream-блок
+(`/etc/nginx/stream.d/reality-unify.conf` + blockinfile-маркер `V8-443-UNIFY-STREAM`),
+`dpkg --configure -a`, `systemctl restart nginx`, затем non-unify bootstrap.
+**ЗАКРЫТО фиксами (2026-07-23, задеплоено):**
+- `install_vless_reality` PREFLIGHT: ставит+ПРОВЕРЯЕТ stream-модуль (assert на
+  `modules-enabled/*mod-stream*.conf`, `file_type: any` т.к. это СИМЛИНК) ДО того как
+  reality уедет на loopback, с retries, ГРОМКО. Не встал → падаем до правки reality,
+  нода жива. (коммиты 341e7c5 + 3cb2667.)
+- `install_vless_xhttp`: guarded pre-cert reload (combo-unify).
+⇒ ПЕРЕД unify combo-ноды: preflight сам гарантирует модуль, НО убедись, что xhttp/ws
+LE-серты ЕСТЬ на диске (иначе pre-cert путь; на 4vds-ru xhttp-серт отсутствовал и всплыл
+второй reload). Пре-инсталл модуля вручную (`apt install libnginx-mod-stream` + чек
+симлинка) — хороший де-риск.
 
 ---
 
