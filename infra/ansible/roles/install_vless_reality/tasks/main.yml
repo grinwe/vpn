@@ -56,6 +56,40 @@
     state: present
     update_cache: yes
 
+# 443-унификация PREFLIGHT — модуль nginx-stream ОБЯЗАН стоять ДО того, как reality
+# уедет на loopback и в nginx.conf вставится stream{}. Инцидент 4vds-ru-01
+# (2026-07-23): apt-install модуля падал молча (failed_when:false), блок stream{}
+# вставлялся всё равно → nginx 'unknown directive "stream"' → nginx down + reality
+# на loopback + dpkg заклинен. Ставим ЗДЕСЬ (до config.json/xray-рестарта), с
+# ретраями и ГРОМКО: не встал модуль → падаем ДО правки reality, нода остаётся живой.
+- name: 443-unify preflight — install nginx stream module (loud, retried)
+  ansible.builtin.apt:
+    name: libnginx-mod-stream
+    state: present
+    update_cache: true
+    cache_valid_time: 3600
+  register: _reality_stream_mod
+  until: _reality_stream_mod is succeeded
+  retries: 3
+  delay: 5
+  when: reality_stream_unify | default(false)
+
+- name: 443-unify preflight — locate stream module load config
+  ansible.builtin.find:
+    paths: /etc/nginx/modules-enabled
+    patterns: "*mod-stream*.conf"
+  register: _reality_stream_mod_files
+  when: reality_stream_unify | default(false)
+
+- name: 443-unify preflight — fail early if stream module not enabled
+  ansible.builtin.assert:
+    that: _reality_stream_mod_files.matched | int > 0
+    fail_msg: >-
+      libnginx-mod-stream не подключён в /etc/nginx/modules-enabled — вставлять
+      stream{} в nginx.conf нельзя (nginx упадёт с 'unknown directive stream').
+      Проверь apt/репозиторий на ноде и повтори бутстрап. Reality не тронут.
+  when: reality_stream_unify | default(false)
+
 # geoip.dat нужен до первого рендера config.json: routing rule
 # `ip: ["geoip:ru", "geoip:private"]` без файла данных не резолвится,
 # xray падает со "failed to load geoip" на старте. Установка + weekly
@@ -224,15 +258,9 @@
 # Reality слушает loopback (config.json listen=127.0.0.1), nginx stream на :443
 # роутит по SNI: reality-dest → reality loopback, else → nginx-http loopback:8443
 # (xhttp/ws-cdn vhost'ы уходят на 8443 в своих ролях). Убирает DPI-tell 9443.
-- name: Install nginx stream module for 443-unify
-  ansible.builtin.apt:
-    name: libnginx-mod-stream
-    state: present
-    update_cache: true
-    cache_valid_time: 3600
-  when: reality_stream_unify | default(false)
-  failed_when: false
-
+# NB: модуль nginx-stream уже поставлен+проверен в PREFLIGHT выше (до config.json),
+# поэтому здесь сразу рендерим stream-роутер — блок ниже не вставится с невалидным
+# nginx.conf, т.к. без модуля play упал бы на preflight-ассерте.
 - name: Ensure /etc/nginx/stream.d dir (443-unify)
   ansible.builtin.file:
     path: /etc/nginx/stream.d

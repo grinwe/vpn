@@ -207,10 +207,19 @@
         enabled: yes
       when: not _xhttp_le_cert.stat.exists
 
-    - name: Reload nginx to pick up pre-cert vhost
-      systemd:
-        name: nginx
-        state: reloaded
+    - name: Reload nginx to pick up pre-cert vhost (guarded)
+      # На combo-unify первом проходе stream:443 (reality) конфликтует с ещё не
+      # переехавшим wscdn:443 → reload падал бы жёстко (reality застревал на
+      # loopback). Толерируем ТОЛЬКО на combo-unify: acme-challenge на :80 (stream
+      # :443 его не трогает), а ws-cdn-роль ниже доведёт nginx до консистентности.
+      # Вне combo-unify фейл reload остаётся ГРОМКИМ.
+      ansible.builtin.shell: nginx -t && systemctl reload nginx
+      register: _xhttp_precert_reload
+      changed_when: false
+      failed_when: >-
+        _xhttp_precert_reload.rc != 0
+        and not (reality_stream_unify | default(false)
+                 and (vless_ws_cdn_domain | default('')) | length > 0)
       when: not _xhttp_le_cert.stat.exists
 
     - name: Issue certificate via webroot challenge
