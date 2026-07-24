@@ -127,6 +127,73 @@ def test_autoscale_counts_zero_when_only_revoked_devices(
     assert autoscale._active_subs_on_nodes(db_session, [node]) == 0
 
 
+def _diverse_cred(
+    db: Session, node: models.VPNNode, device: models.Device, username: str
+) -> models.Credential:
+    c = models.Credential(
+        node_id=node.id,
+        device_id=device.id,
+        is_active=True,
+        proto="vless-reality",
+        config_text="enc-uri",
+        access_username=username,
+        pool_state=models.CredentialPoolState.assigned,
+    )
+    db.add(c)
+    db.commit()
+    db.refresh(c)
+    return c
+
+
+def test_choose_node_sees_diverse_creds(db_session: Session) -> None:
+    """Нода без primary-подписок, но с diverse-кредом — НЕ пустая.
+
+    Регресс на диверс-слепоту балансировщика: N×M кладёт креды на другие
+    ноды, не меняя Subscription.node_id, и старая метрика считала такие
+    ноды пустыми (см. docs/NODES.md «Балансировка новых юзеров»)."""
+    plan = make_plan(db_session, max_devices=3)
+    primary = make_node(db_session, name="prim", host="198.51.100.77", max_users=10)
+    diverse = make_node(db_session, name="divr", host="198.51.100.78", max_users=1)
+    user = make_user(db_session)
+    sub = make_subscription(db_session, user, plan, primary)
+    cfg = make_config(db_session, primary)
+    dev = make_device(db_session, sub, cfg, access_username="d1")
+    _diverse_cred(db_session, diverse, dev, "d1@divr")
+
+    # diverse-нода забита своим diverse-кредом (1/1) → выбор обязан упасть
+    # на primary (1/10); старая метрика видела diverse пустой и брала её.
+    picked = choose_node(db_session, plan)
+    assert picked.id == primary.id
+
+
+def test_diverse_device_counts_once_per_node(db_session: Session) -> None:
+    """Primary-девайс с кредом на СВОЕЙ же ноде не задваивается (union-дедуп)."""
+    plan = make_plan(db_session, max_devices=3)
+    node = make_node(db_session, name="dedup", host="198.51.100.79", max_users=3)
+    user = make_user(db_session)
+    sub = make_subscription(db_session, user, plan, node)
+    cfg = make_config(db_session, node)
+    dev = make_device(db_session, sub, cfg, access_username="d1")
+    _diverse_cred(db_session, node, dev, "d1@own")
+
+    assert autoscale._active_subs_on_nodes(db_session, [node]) == 1
+
+
+def test_autoscale_counts_diverse_creds(db_session: Session) -> None:
+    """Утилизация пула видит diverse-креды чужих (по primary) подписок."""
+    plan = make_plan(db_session, max_devices=3)
+    primary = make_node(db_session, name="prim-2", host="198.51.100.80", max_users=10)
+    diverse = make_node(db_session, name="divr-2", host="198.51.100.81", max_users=10)
+    user = make_user(db_session)
+    sub = make_subscription(db_session, user, plan, primary)
+    cfg = make_config(db_session, primary)
+    dev = make_device(db_session, sub, cfg, access_username="d2")
+    _diverse_cred(db_session, diverse, dev, "d2@divr")
+
+    # На diverse-ноде нет ни одной primary-подписки, но слот занят.
+    assert autoscale._active_subs_on_nodes(db_session, [diverse]) == 1
+
+
 def test_choose_node_picks_least_loaded_by_devices(db_session: Session) -> None:
     """Two healthy nodes, one has 1 device, one has 2 → pick the
     lighter one."""

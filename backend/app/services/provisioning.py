@@ -59,6 +59,75 @@ MIN_HEALTHY_SCORE = int(os.getenv("MIN_HEALTHY_SCORE", "50"))
 
 # ── Node selection ────────────────────────────────────────────────────
 
+def active_device_node_pairs(db: Session):
+    """(node_id, device_id)-пары «живой девайс занимает слот на ноде».
+
+    Девайс занимает слот на ноде двумя путями (union дедупит повторы):
+
+    * **primary** — нода его подписки (``Subscription.node_id``). Считает и
+      девайсы, у которых креды ещё не созданы (окно cold-path провижининга),
+      поэтому конкурентные покупки не сваливаются на одну ноду.
+    * **cred** — активный ``Credential`` на ноде (``Credential.node_id``).
+      Делает видимой diverse-нагрузку: N×M-подписка кладёт креды на другие
+      ноды, НЕ меняя ``Subscription.node_id``, и без этой ноги балансировщик
+      считал diverse-популярные ноды пустыми и сажал на них новых юзеров
+      (см. docs/NODES.md «Балансировка новых юзеров»).
+
+    «Живой девайс» = не revoked/disabled при активной подписке — тот же
+    фильтр, что исторически был в choose_node (Stage 7).
+    """
+    live_device = models.Device.status.notin_(
+        [models.DeviceStatus.revoked, models.DeviceStatus.disabled]
+    )
+    primary = (
+        db.query(
+            models.Subscription.node_id.label("node_id"),
+            models.Device.id.label("device_id"),
+        )
+        .join(models.Device, models.Device.subscription_id == models.Subscription.id)
+        .filter(
+            models.Subscription.status == models.SubscriptionStatus.active,
+            models.Subscription.node_id.isnot(None),
+            live_device,
+        )
+    )
+    by_cred = (
+        db.query(
+            models.Credential.node_id.label("node_id"),
+            models.Device.id.label("device_id"),
+        )
+        .join(models.Device, models.Device.id == models.Credential.device_id)
+        .join(
+            models.Subscription,
+            models.Subscription.id == models.Device.subscription_id,
+        )
+        .filter(
+            models.Credential.is_active.is_(True),
+            models.Credential.node_id.isnot(None),
+            models.Subscription.status == models.SubscriptionStatus.active,
+            live_device,
+        )
+    )
+    return primary.union(by_cred)
+
+
+def node_device_load(db: Session, node_ids: list[int]) -> int:
+    """Суммарное число занятых слотов (см. active_device_node_pairs) на нодах.
+
+    Diverse-девайс, сидящий кредами на двух нодах из списка, считается на
+    каждой — он реально занимает слот на обеих."""
+    if not node_ids:
+        return 0
+    pairs = active_device_node_pairs(db).subquery()
+    return int(
+        db.query(func.count())
+        .select_from(pairs)
+        .filter(pairs.c.node_id.in_(node_ids))
+        .scalar()
+        or 0
+    )
+
+
 def choose_node(
     db: Session,
     plan: models.Plan,
@@ -130,22 +199,19 @@ def choose_node(
     # vs. a Solo sub with 1 device, so ``max_users`` must be the device
     # ceiling (the column name is historical). Devices in revoked /
     # disabled state don't consume node resources and are excluded.
-    active_device_count = func.count(models.Device.id).label("active_devices")
+    #
+    # Diverse-aware: слот занимают и primary-девайсы подписки, и девайсы,
+    # держащие на ноде активный diverse-кред (active_device_node_pairs) —
+    # иначе ноды, популярные как diverse-добавки (например единственная нода
+    # региона), выглядят пустыми и стягивают всех новых юзеров. Второй ключ
+    # сортировки — random(): без него при равной нагрузке implementation-
+    # defined порядок Postgres стабильно отдаёт одну и ту же ноду.
+    pairs_sq = active_device_node_pairs(db).subquery()
+    active_device_count = func.count(pairs_sq.c.device_id).label("active_devices")
     rows = (
-        query.outerjoin(
-            models.Subscription,
-            (models.Subscription.node_id == models.VPNNode.id)
-            & (models.Subscription.status == models.SubscriptionStatus.active),
-        )
-        .outerjoin(
-            models.Device,
-            (models.Device.subscription_id == models.Subscription.id)
-            & (models.Device.status.notin_(
-                [models.DeviceStatus.revoked, models.DeviceStatus.disabled]
-            )),
-        )
+        query.outerjoin(pairs_sq, pairs_sq.c.node_id == models.VPNNode.id)
         .group_by(models.VPNNode.id)
-        .order_by(active_device_count.asc())
+        .order_by(active_device_count.asc(), func.random())
         .with_entities(models.VPNNode, active_device_count)
         .all()
     )
@@ -162,22 +228,10 @@ def choose_node(
         if locked is None:
             continue
         if locked.max_users is not None:
-            live_devices = (
-                db.query(func.count(models.Device.id))
-                .join(
-                    models.Subscription,
-                    models.Subscription.id == models.Device.subscription_id,
-                )
-                .filter(
-                    models.Subscription.node_id == locked.id,
-                    models.Subscription.status == models.SubscriptionStatus.active,
-                    models.Device.status.notin_(
-                        [models.DeviceStatus.revoked, models.DeviceStatus.disabled]
-                    ),
-                )
-                .scalar()
-                or 0
-            )
+            # Та же diverse-aware метрика, что и в сортировке выше, — иначе
+            # проверка под локом «не видела» бы часть нагрузки и пропускала
+            # ноду за потолок.
+            live_devices = node_device_load(db, [locked.id])
             if live_devices >= locked.max_users:
                 continue
         return locked

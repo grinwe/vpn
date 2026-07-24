@@ -71,6 +71,34 @@ return configs[0]
 
 Env vars — см. [README.md](../README.md#environment-variables).
 
+## Балансировка новых юзеров и её диагностика
+
+Ноду для новой подписки выбирает единственный селектор `choose_node`
+([provisioning.py](../backend/app/services/provisioning.py)): least-loaded по
+числу **занятых слотов** (`active_device_node_pairs` — union двух ног: живые
+девайсы активных подписок по `Subscription.node_id` **плюс** девайсы с активным
+diverse-кредом на ноде по `Credential.node_id`), с гейтами is_active / pool
+плана / cooldown / мьюты диагностики / status=active / health_score ≥ 50 и
+потолком `max_users` (в слотах-девайсах). При равной нагрузке — случайный
+tie-break. Ту же метрику использует автоскейлер (`_active_subs_on_nodes`).
+Ребаланса нет: назначение sticky, миграции только событийные.
+
+История: до 2026-07 нагрузка считалась только по primary-ноде подписки —
+diverse-популярные ноды (единственные в своём регионе foreign) выглядели
+пустыми и стягивали новых юзеров; админ-колонка «Юзеры» при этом считала по
+кредам, и цифры «админка vs балансировщик» расходились в разы.
+
+Диагностика (read-only, три распределения рядом — primary/assigned/carrying,
+ghost-девайсы, причины исключения ноды из выбора, топ подписок по девайсам):
+
+```bash
+cd infra/ansible
+ansible-playbook playbooks/node_balance_report.yml --vault-password-file ~/.vpn_vault_pass
+```
+
+Плейбук: [playbooks/node_balance_report.yml](../infra/ansible/playbooks/node_balance_report.yml),
+скрипт: [playbooks/files/node_balance_report.py](../infra/ansible/playbooks/files/node_balance_report.py).
+
 ## Health monitoring
 
 Probe-agent ([probes/](../probes)) бежит из нескольких регионов каждые 5 минут и пишет в `health_probes`. Backend агрегирует в `VPNNode.health_score` (0-100).
