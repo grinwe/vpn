@@ -1019,6 +1019,20 @@ def create_config(
             handshake_domain=payload.sni or None,
             name=payload.name or None,
         )
+    # Hysteria2: если админ не передал готовый obfs_password (= "авто"-режим),
+    # генерим транспортные дефолты (obfs+пароль, mbps, port-hopping) и
+    # переиспользуем LE-серт xhttp/ws-cdn домена ноды. Полный settings с
+    # obfs_password → ручной режим (else-ветка, как передал оператор).
+    elif protocol == models.VPNConfigProtocol.hysteria2 and not (
+        payload.settings or {}
+    ).get("obfs_password"):
+        from ..services.node_spawner import ensure_hysteria2_config
+        config = ensure_hysteria2_config(
+            db, node,
+            port=payload.port or None,
+            sni=payload.sni or None,
+            name=payload.name or None,
+        )
     else:
         config = models.VPNConfig(
             node_id=node.id,

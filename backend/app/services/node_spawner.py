@@ -92,6 +92,15 @@ DEFAULT_REALITY_DEST = os.getenv("REALITY_DEST", f"{DEFAULT_REALITY_SNI}:443")
 DEFAULT_REALITY_PORT = int(os.getenv("REALITY_PORT", "443"))
 _REALITY_SNI_ENV_OVERRIDE: str | None = os.getenv("REALITY_SNI") or None
 
+# Hysteria2 (UDP/QUIC) defaults — used by ``ensure_hysteria2_config``.
+DEFAULT_HYSTERIA2_PORT = int(os.getenv("HYSTERIA2_PORT", "443"))
+DEFAULT_HYSTERIA2_MBPS = int(os.getenv("HYSTERIA2_MBPS", "200"))
+# Port-hopping: клиент прыгает по UDP-диапазону, роль ставит iptables DNAT
+# range→hysteria2_port. Пусто = одно-портовый hy2 на самом порту.
+DEFAULT_HYSTERIA2_PORT_HOPPING_RANGE = os.getenv(
+    "HYSTERIA2_PORT_HOPPING_RANGE", "20000-40000"
+)
+
 logger = logging.getLogger(__name__)
 
 
@@ -400,6 +409,105 @@ def ensure_shadowtls_config(
             "ss_password_enc": encrypt(ss_password),
             "shadowtls_password_enc": encrypt(stls_password),
         },
+        is_enabled=True,
+    )
+    db.add(cfg)
+    db.commit()
+    db.refresh(cfg)
+    return cfg
+
+
+def ensure_hysteria2_config(
+    db: Session,
+    node: models.VPNNode,
+    *,
+    port: int | None = None,
+    sni: str | None = None,
+    name: str | None = None,
+) -> models.VPNConfig:
+    """Create a Hysteria2 (UDP/QUIC) VPNConfig for ``node`` if it has none yet.
+
+    Unlike reality/shadowtls, hysteria2 has NO config-level secret — auth is
+    **per-user** (each Credential carries its own password, pushed to the
+    node's ``auth.userpass`` via ``manage_hy2_user.sh``). So this helper only
+    fills the server-side transport defaults: salamander obfs (auto-generated
+    password, kept as a *pair* — obfs без obfs_password рассинхронит скрамблинг),
+    bandwidth caps, UDP port-hopping range, and — crucially — the TLS cert.
+
+    **Cert reuse (design choice).** The role's empty-``cert_path`` branch falls
+    back to hysteria's *built-in* ACME, which binds :80/:443 TCP for the
+    challenge — that collides with nginx on our unified combo nodes → ACME
+    fails. Rather than mint a fresh ``*.wgse`` domain and bolt certbot onto the
+    hy2 role, we REUSE the node's existing xhttp (or ws-cdn) Let's Encrypt cert:
+    point ``cert_path``/``key_path`` at it and set ``sni`` to that same domain.
+    The cert is already issued + auto-renewed by the xhttp/ws-cdn role's
+    certbot, hysteria serves QUIC/TLS for that domain on UDP, and the client
+    verifies a real LE chain (no ``insecure``/pin needed). No new domain, no new
+    cert, no ACME↔nginx port clash.
+
+    If the node has no cert-bearing vless-front (xhttp/ws-cdn) config, cert_path
+    is left empty → hysteria's own ACME (only viable on nodes WITHOUT nginx on
+    :80/:443); we log a loud warning so the operator notices.
+    """
+    existing = (
+        db.query(models.VPNConfig)
+        .filter(
+            models.VPNConfig.node_id == node.id,
+            models.VPNConfig.protocol == models.VPNConfigProtocol.hysteria2,
+        )
+        .first()
+    )
+    if existing is not None:
+        return existing
+
+    # Reuse an existing LE cert-bearing front domain (xhttp preferred, then
+    # ws-cdn). Both carry a real Let's Encrypt cert issued+renewed by their
+    # role's certbot on this node; hy2 borrows it for its QUIC/TLS terminus.
+    cert_domain = sni
+    if not cert_domain:
+        for proto in (
+            models.VPNConfigProtocol.vless_xhttp,
+            models.VPNConfigProtocol.vless_ws_cdn,
+        ):
+            front = next(
+                (
+                    c
+                    for c in node.configs
+                    if c.protocol == proto and c.is_enabled and c.sni
+                ),
+                None,
+            )
+            if front is not None:
+                cert_domain = front.sni
+                break
+
+    settings: dict[str, object] = {
+        "obfs": "salamander",
+        "obfs_password": secrets.token_urlsafe(16),
+        "up_mbps": DEFAULT_HYSTERIA2_MBPS,
+        "down_mbps": DEFAULT_HYSTERIA2_MBPS,
+        "port_hopping_range": DEFAULT_HYSTERIA2_PORT_HOPPING_RANGE,
+    }
+    if cert_domain:
+        settings["cert_path"] = f"/etc/letsencrypt/live/{cert_domain}/fullchain.pem"
+        settings["key_path"] = f"/etc/letsencrypt/live/{cert_domain}/privkey.pem"
+    else:
+        logger.warning(
+            "ensure_hysteria2_config: node %s has no cert-bearing xhttp/ws-cdn "
+            "front — cert_path left empty (hysteria built-in ACME will fail if "
+            "nginx owns :80/:443)",
+            node.id,
+        )
+
+    cfg = models.VPNConfig(
+        node_id=node.id,
+        name=name or f"{node.name}-hysteria2",
+        protocol=models.VPNConfigProtocol.hysteria2,
+        port=port or DEFAULT_HYSTERIA2_PORT,
+        sni=cert_domain or "",
+        public_key=None,
+        fallback=None,
+        settings=settings,
         is_enabled=True,
     )
     db.add(cfg)

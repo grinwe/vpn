@@ -3406,7 +3406,8 @@ class ProvisioningOrchestrator:
             )
             return 0
 
-        devices = (
+        # Home devices — subscriptions whose primary node IS this one.
+        home_devices = (
             self.db.query(models.Device)
             .join(
                 models.Subscription,
@@ -3421,6 +3422,38 @@ class ProvisioningOrchestrator:
             )
             .all()
         )
+        # Diverse devices — homed on ANOTHER node but already carrying an active
+        # credential on THIS node (the diverse-sub spread). Keyed by
+        # Credential.node_id, not Subscription.node_id. Without them a protocol
+        # added AFTER diversification reaches only home users: the node serves
+        # it, but diverse holders never get the leg (их саб не содержит cred для
+        # него). Пуш новых кредов на ноду делает расширенный resync_node_clients.
+        diverse_devices = (
+            self.db.query(models.Device)
+            .join(
+                models.Credential,
+                models.Credential.device_id == models.Device.id,
+            )
+            .join(
+                models.Subscription,
+                models.Subscription.id == models.Device.subscription_id,
+            )
+            .filter(
+                models.Credential.node_id == node.id,
+                models.Credential.is_active.is_(True),
+                models.Subscription.status == models.SubscriptionStatus.active,
+                models.Device.status.in_(
+                    (models.DeviceStatus.active, models.DeviceStatus.pending)
+                ),
+            )
+            .distinct()
+            .all()
+        )
+        # Union, dedup by id.
+        _devices_by_id: dict[int, models.Device] = {d.id: d for d in home_devices}
+        for d in diverse_devices:
+            _devices_by_id.setdefault(d.id, d)
+        devices = list(_devices_by_id.values())
 
         created = 0
         for device in devices:
@@ -3441,11 +3474,26 @@ class ProvisioningOrchestrator:
 
             if proto.value in _VLESS_FAMILY_PROTOS:
                 user_uuid: str | None = None
+                # Prefer a vless cred ALREADY on THIS node — diverse devices
+                # carry a different UUID per node (each node's warm bundle had
+                # its own), and the new cred must match the UUID this node's
+                # xray already knows for the device, иначе config_text в /sub
+                # разойдётся с тем, что реально на ноде.
                 for cred in device.credentials:
-                    if cred.proto in _VLESS_FAMILY_PROTOS:
+                    if (
+                        cred.proto in _VLESS_FAMILY_PROTOS
+                        and cred.node_id == node.id
+                    ):
                         user_uuid = _extract_vless_uuid(cred.config_text, cred_id=cred.id)
                         if user_uuid:
                             break
+                # Fallback: any vless cred (home device — один узел, один UUID).
+                if not user_uuid:
+                    for cred in device.credentials:
+                        if cred.proto in _VLESS_FAMILY_PROTOS:
+                            user_uuid = _extract_vless_uuid(cred.config_text, cred_id=cred.id)
+                            if user_uuid:
+                                break
                 if not user_uuid:
                     user_uuid = str(uuid.uuid4())
 
@@ -3586,6 +3634,40 @@ class ProvisioningOrchestrator:
             .all()
         )
 
+        # ── 3. Diverse assigned credentials (homed elsewhere) ──────────
+        #
+        # Creds bound to a device via Credential.node_id but whose
+        # Subscription lives on ANOTHER node — the diverse-sub spread.
+        # assigned_rows (Subscription.node_id == this) misses them and
+        # warm_rows (pool_state == warm) misses them too, so they fall in
+        # the gap between the two queries and are NEVER (re)pushed here.
+        # A protocol added AFTER the diverse assignment (e.g. ws-cdn
+        # backfilled by Credential.node_id) would then live in the DB but
+        # never reach xray's inbound → user's client can't connect on it.
+        # ``seen`` dedups any overlap with assigned/warm rows by (proto,
+        # username), so this is purely additive.
+        diverse_rows = (
+            self.db.query(models.Credential, models.Device)
+            .outerjoin(
+                models.Device,
+                models.Device.id == models.Credential.device_id,
+            )
+            .join(
+                models.Subscription,
+                models.Subscription.id == models.Credential.subscription_id,
+            )
+            .filter(
+                models.Credential.node_id == node.id,
+                models.Subscription.node_id != node.id,
+                models.Subscription.status == models.SubscriptionStatus.active,
+                models.Credential.pool_state
+                == models.CredentialPoolState.assigned,
+                models.Credential.is_active.is_(True),
+                models.Credential.proto.in_(_VLESS_FAMILY_PROTOS),
+            )
+            .all()
+        )
+
         # Accumulate per-protocol client lists. Dedup by (proto, username)
         # because manage_vless_*_user.sh keys on email; the same user
         # showing up twice is harmless but wasteful.
@@ -3630,6 +3712,13 @@ class ProvisioningOrchestrator:
 
         for cred in warm_rows:
             _emit(cred, cred.access_username)
+
+        for cred, device in diverse_rows:
+            username = (
+                cred.access_username
+                or (device.access_username if device else None)
+            )
+            _emit(cred, username)
 
         total = sum(len(v) for v in clients_by_proto.values())
         if total == 0:
