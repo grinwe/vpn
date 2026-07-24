@@ -11,6 +11,9 @@
 #
 - hosts: vpn_nodes
   become: yes
+  # Как в resync_node.yml: фактов play не использует (только stat/command/
+  # debug), а full setup — это +5-10s на каждый прогон при частых вызовах.
+  gather_facts: false
   vars:
     state: present
     protocols: "{{ [ {'proto': config_proto | default('shadowtls+shadowsocks'),

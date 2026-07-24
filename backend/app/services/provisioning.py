@@ -1708,11 +1708,11 @@ class ProvisioningOrchestrator:
             node = self.db.get(models.VPNNode, task.target_id)
             if not node:
                 return
-            # Resync tasks are a post-site.yml helper — they neither
-            # promote a registering node nor demote an already-active
-            # one, so bypass the status transitions entirely. Errors are
-            # visible via the task row.
-            if task.action == "resync_vless":
+            # Resync tasks (vless-батч и hy2-батч) are a post-site.yml
+            # helper — they neither promote a registering node nor demote
+            # an already-active one, so bypass the status transitions
+            # entirely. Errors are visible via the task row.
+            if task.action in ("resync_vless", "resync_hy2"):
                 return
             # Diagnose is READ-ONLY (staged probe + read-only on-host play).
             # A FAILED probe of a temporarily-unreachable node must NOT zero
@@ -2053,6 +2053,17 @@ class ProvisioningOrchestrator:
                     # by resync_node_clients().
                     result = run_playbook(
                         "playbooks/resync_node.yml",
+                        inventory,
+                        limit=node.name,
+                        extra_vars=payload,
+                    )
+                elif task.action == "resync_hy2":
+                    # Батч-восстановление hy2-учёток (см.
+                    # resync_node_hysteria2_clients): один прогон
+                    # resync_node_hy2.yml со списком clients вместо веера
+                    # device/apply-тасок по одной на учётку.
+                    result = run_playbook(
+                        "playbooks/resync_node_hy2.yml",
                         inventory,
                         limit=node.name,
                         extra_vars=payload,
@@ -3691,20 +3702,26 @@ class ProvisioningOrchestrator:
         общий node-wide пароль из ``VPNConfig.settings``, который site.yml
         восстанавливает сам.
 
-        Каждую активную hy2-учётку пере-провижиним отдельной ``device/apply``-
-        таской через ``provision_device.yml`` с ``protocols=[hysteria2]`` —
-        тот же playbook и ``manage_hy2_user.sh``, что и при первичной выдаче.
-        Playbook добавляет ТОЛЬКО перечисленные протоколы (branch gated
-        ``item.proto == 'hysteria2'``), vless НЕ трогает. Пароль тот же, что в
-        существующей ссылке (парсим из URI) → сохранённый клиент продолжает
-        работать. Идемпотентно (``manage_hy2_user.sh add`` дедупит по имени).
+        Батч: ОДНА node-таска ``resync_hy2`` со списком всех клиентов ноды —
+        ``playbooks/resync_node_hy2.yml`` добавляет их одним прогоном через
+        ``manage_hy2_user.sh`` (NO_RESTART=1 на каждого + один рестарт
+        hysteria-server в конце), зеркально vless-батчу
+        :meth:`resync_node_clients`. Пароль тот же, что в существующей ссылке
+        (парсим из URI) → сохранённый клиент продолжает работать.
+        Идемпотентно (``manage_hy2_user.sh add`` дедупит по имени).
+
+        До 2026-07 здесь был цикл device/apply-тасок по одной на учётку:
+        bootstrap ноды с N девайсами порождал веер из N прогонов
+        provision_device.yml, а повторные bootstrap-успехи (reconcile-тик,
+        rerun) плодили дубли без коалесинга.
 
         Warm-пул hy2-бандлы (без device_id) сюда не входят: warm-пул ноды
         целиком инвалидируется в ``reinstall_node`` (иначе его строки остались
         бы ``warm`` в БД при стёртых учётках, и ``try_assign_bundle`` позже
         выдал бы бандл с мёртвым hy2-легом) — refill-тик наминтит свежие.
 
-        Возвращает список созданных задач (пусто — hy2-пользователей нет).
+        Возвращает список из 0..1 созданных задач (пусто — hy2-пользователей
+        нет); ``list`` сохранён ради прежнего контракта вызова.
         """
         hy2 = models.VPNConfigProtocol.hysteria2.value
         # Только назначенные (через активную подписку на ноде) hy2-учётки с
@@ -3728,7 +3745,7 @@ class ProvisioningOrchestrator:
             )
             .all()
         )
-        tasks: list[models.ProvisioningTask] = []
+        clients: dict[str, str] = {}
         for cred, device in rows:
             username = cred.access_username or device.access_username
             password = _extract_hy2_password(cred.config_text, cred_id=cred.id)
@@ -3738,37 +3755,30 @@ class ProvisioningOrchestrator:
                     cred.id,
                 )
                 continue
-            hy2_cfg = self.db.get(models.VPNConfig, cred.config_id)
-            if hy2_cfg is None:
-                logger.warning(
-                    "hy2-resync: credential %s has no VPNConfig — skip", cred.id
-                )
-                continue
-            task_payload: dict[str, Any] = {
-                "username": username,
-                # uuid не нужен hy2-ветке playbook'а, но общий контракт
-                # provision_device.yml его принимает — отдаём существующий
-                # vless-UUID девайса (или пустой, если vless нет).
-                "uuid": _device_vless_uuid(device) or "",
-                "password": password,
-                "protocols": [{"proto": hy2, "port": hy2_cfg.port}],
-                "state": "present",
-            }
-            exit_iface = resolve_exit_interface(self.db, node.id, cred.exit_id)
-            if exit_iface:
-                task_payload["exit_interface"] = exit_iface
-            tasks.append(
-                self.create_task("device", device.id, "apply", task_payload)
-            )
-        if tasks:
-            self.db.commit()
-            for task in tasks:
-                self.run_task_async(task, node=node)
-            logger.info(
-                "hy2-resync: node %s — восстанавливаю %d пер-юзерных "
-                "hysteria2-учёток", node.id, len(tasks),
-            )
-        return tasks
+            # Дедуп по username: девайс с несколькими активными hy2-кредами
+            # (несколько hy2-конфигов ноды) даёт одну запись — в userpass
+            # hysteria ключ один на юзера.
+            clients[username] = password
+        if not clients:
+            return []
+        task = self.create_task(
+            "node",
+            node.id,
+            "resync_hy2",
+            {
+                "clients": [
+                    {"username": u, "password": p}
+                    for u, p in sorted(clients.items())
+                ]
+            },
+        )
+        self.db.commit()
+        self.run_task_async(task, node=node)
+        logger.info(
+            "hy2-resync: node %s — %d учёток одной батч-таской resync_hy2",
+            node.id, len(clients),
+        )
+        return [task]
 
     def reprovision_subscription(
         self,

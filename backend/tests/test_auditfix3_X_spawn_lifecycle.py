@@ -146,8 +146,8 @@ def _make_hy2_credential(
 
 
 def test_resync_hysteria2_restores_assigned_users(db_session: Session) -> None:
-    """resync_node_hysteria2_clients создаёт device/apply-таску с hy2-протоколом
-    и тем же паролем, что в существующей ссылке."""
+    """resync_node_hysteria2_clients создаёт ОДНУ батч-таску node/resync_hy2
+    со списком клиентов и теми же паролями, что в существующих ссылках."""
     from tests.factories import make_device
 
     node = make_node(db_session, name="hy2-node", host="198.51.100.144")
@@ -164,15 +164,42 @@ def test_resync_hysteria2_restores_assigned_users(db_session: Session) -> None:
 
     assert len(tasks) == 1
     task = tasks[0]
-    assert task.target_type == "device"
-    assert task.target_id == device.id
-    assert task.action == "apply"
-    assert task.payload["state"] == "present"
-    assert task.payload["password"] == password
-    protos = task.payload["protocols"]
-    assert len(protos) == 1
-    assert protos[0]["proto"] == models.VPNConfigProtocol.hysteria2.value
-    assert protos[0]["port"] == 8443
+    assert task.target_type == "node"
+    assert task.target_id == node.id
+    assert task.action == "resync_hy2"
+    assert task.payload["clients"] == [
+        {"username": "hy2-user", "password": password}
+    ]
+
+
+def test_resync_hysteria2_batches_and_dedupes(db_session: Session) -> None:
+    """Несколько девайсов и дубль-креды одного юзера → всё равно ОДНА
+    батч-таска, по одной записи на username (до 2026-07 тут был веер
+    device/apply-тасок по таске на каждый (Credential, Device)-ряд)."""
+    from tests.factories import make_device
+
+    node = make_node(db_session, name="hy2-batch", host="198.51.100.146")
+    user = make_user(db_session)
+    plan = make_plan(db_session, max_devices=3)
+    sub = make_subscription(db_session, user, plan, node)
+    cfg = make_config(db_session, node)
+    dev_a = make_device(db_session, sub, cfg, access_username="hy2-a")
+    dev_b = make_device(db_session, sub, cfg, access_username="hy2-b")
+    _make_hy2_credential(db_session, node, sub, dev_a, "pw-a")
+    # второй активный hy2-кред того же девайса (другой hy2-конфиг/порт) —
+    # раньше давал вторую таску, теперь схлопывается в одну запись
+    _make_hy2_credential(db_session, node, sub, dev_a, "pw-a", port=9443)
+    _make_hy2_credential(db_session, node, sub, dev_b, "pw-b")
+
+    orch = ProvisioningOrchestrator(db_session)
+    tasks = orch.resync_node_hysteria2_clients(node)
+
+    assert len(tasks) == 1
+    clients = tasks[0].payload["clients"]
+    assert clients == [
+        {"username": "hy2-a", "password": "pw-a"},
+        {"username": "hy2-b", "password": "pw-b"},
+    ]
 
 
 def test_resync_hysteria2_noop_without_hy2_users(db_session: Session) -> None:
