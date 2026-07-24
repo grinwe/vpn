@@ -12,8 +12,10 @@ from app.security import decrypt, encrypt
 from app.services.node_spawner import ensure_hysteria2_config
 from app.services.provisioning import (
     ProvisioningOrchestrator,
+    _build_hysteria2_credential,
     _build_vless_reality_credential,
     _build_vless_ws_cdn_credential,
+    _extract_hy2_password,
     _extract_vless_uuid,
 )
 from tests import factories
@@ -157,3 +159,65 @@ def test_resync_includes_diverse_assigned_cred(db_session):
     assert any(
         c["uuid"] == known_uuid and c["username"] == "ursync" for c in ws_clients
     )
+
+
+def test_resync_hy2_includes_diverse_assigned(db_session):
+    """resync_node_hysteria2_clients must push a diverse assigned hy2 cred
+    (Credential.node_id == this node, Subscription.node_id != this node) into the
+    node's userpass. The home-only query missed it → diverse holders got a /sub
+    hy2 leg the node never authenticates (the regression this fix closes)."""
+    node_a = factories.make_node(db_session, name="hy2rs-a", host="10.0.1.5")
+    node_b = factories.make_node(db_session, name="hy2rs-b", host="10.0.1.6")
+    hy2_a = factories.make_config(
+        db_session, node_a, name="hy2-a",
+        protocol=models.VPNConfigProtocol.hysteria2, sni="hy2.example.info",
+    )
+    user = factories.make_user(db_session, telegram_id="tg-hy2rs")
+    plan = factories.make_plan(db_session)
+    sub = factories.make_subscription(db_session, user, plan, node_b)  # homed on B
+    device = factories.make_device(db_session, sub, hy2_a, access_username="uhy2")
+
+    known_pw = "SbXwKnownHy2Pw12"
+    hy2_text = _build_hysteria2_credential(node_a, hy2_a, known_pw)
+    assert _extract_hy2_password(hy2_text) == known_pw  # sanity: round-trips
+    db_session.add(models.Credential(
+        subscription_id=sub.id, device_id=device.id, config_id=hy2_a.id,
+        node_id=node_a.id, proto=models.VPNConfigProtocol.hysteria2.value,
+        config_text=encrypt(hy2_text), access_username="uhy2", is_active=True,
+    ))  # pool_state defaults to assigned
+    db_session.commit()
+
+    orch = ProvisioningOrchestrator(db_session)
+    tasks = orch.resync_node_hysteria2_clients(node_a)
+
+    assert len(tasks) == 1
+    clients = tasks[0].payload["clients"]
+    assert any(
+        c["username"] == "uhy2" and c["password"] == known_pw for c in clients
+    )
+
+
+def test_ensure_hysteria2_config_prefers_le_front(db_session):
+    """When the node's xhttp front is CF Origin-CA (settings.cert_path set → cert
+    at /etc/nginx/ssl, not /etc/letsencrypt), the helper must skip it and reuse
+    the ws-cdn LE cert instead of building a nonexistent LE path."""
+    node = factories.make_node(db_session, name="hy2-le", host="203.0.113.20")
+    # CF-origin xhttp: cert_path present → NOT a Let's Encrypt path.
+    xhttp = factories.make_config(
+        db_session, node, name="xhttp-cforigin",
+        protocol=models.VPNConfigProtocol.vless_xhttp, sni="cforigin.example.info",
+    )
+    xhttp.settings = {**(xhttp.settings or {}), "cert_path": "/etc/nginx/ssl/xhttp-origin.crt"}
+    db_session.commit()
+    # ws-cdn: always DNS-only LE.
+    factories.make_config(
+        db_session, node, name="ws-le",
+        protocol=models.VPNConfigProtocol.vless_ws_cdn, sni="wsle.example.info",
+    )
+    db_session.refresh(node)
+
+    cfg = ensure_hysteria2_config(db_session, node)
+
+    # Picked the ws-cdn LE domain, not the CF-origin xhttp.
+    assert cfg.sni == "wsle.example.info"
+    assert cfg.settings["cert_path"] == "/etc/letsencrypt/live/wsle.example.info/fullchain.pem"

@@ -3813,8 +3813,8 @@ class ProvisioningOrchestrator:
         нет); ``list`` сохранён ради прежнего контракта вызова.
         """
         hy2 = models.VPNConfigProtocol.hysteria2.value
-        # Только назначенные (через активную подписку на ноде) hy2-учётки с
-        # привязанным device — provision_device.yml apply адресуется по device.
+        # Home hy2-учётки — активная подписка ПРОПИСАНА (Subscription.node_id) на
+        # этой ноде, с привязанным device.
         rows = (
             self.db.query(models.Credential, models.Device)
             .join(
@@ -3834,8 +3834,34 @@ class ProvisioningOrchestrator:
             )
             .all()
         )
+        # Diverse hy2-учётки — homed на ДРУГОЙ ноде, но hy2-кред живёт на ЭТОЙ
+        # (Credential.node_id). Симметрично diverse-ветке resync_node_clients:
+        # без неё диверс-бэкфилл создаёт диверс-юзеру hy2-кред (виден в его /sub),
+        # но его пароль никогда не попадает в auth.userpass ноды → ссылка молча
+        # падает на auth. Дедуп по username ниже делает это аддитивным.
+        diverse_rows = (
+            self.db.query(models.Credential, models.Device)
+            .join(
+                models.Subscription,
+                models.Subscription.id == models.Credential.subscription_id,
+            )
+            .join(
+                models.Device,
+                models.Device.id == models.Credential.device_id,
+            )
+            .filter(
+                models.Credential.node_id == node.id,
+                models.Subscription.node_id != node.id,
+                models.Subscription.status == models.SubscriptionStatus.active,
+                models.Credential.pool_state == models.CredentialPoolState.assigned,
+                models.Credential.proto == hy2,
+                models.Credential.is_active.is_(True),
+                models.Device.status == models.DeviceStatus.active,
+            )
+            .all()
+        )
         clients: dict[str, str] = {}
-        for cred, device in rows:
+        for cred, device in [*rows, *diverse_rows]:
             username = cred.access_username or device.access_username
             password = _extract_hy2_password(cred.config_text, cred_id=cred.id)
             if not username or not password:

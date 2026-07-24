@@ -474,6 +474,16 @@ def ensure_hysteria2_config(
                     c
                     for c in node.configs
                     if c.protocol == proto and c.is_enabled and c.sni
+                    # Skip a CF Origin-CA xhttp front: a non-empty cert_path means
+                    # its cert lives at /etc/nginx/ssl/xhttp-origin.crt, NOT under
+                    # /etc/letsencrypt/live/ — the hy2 cert_path we derive below
+                    # would point at a nonexistent LE file and hysteria wouldn't
+                    # start. ws-cdn is always DNS-only LE (never has cert_path),
+                    # so the loop falls through to it.
+                    and not (
+                        proto == models.VPNConfigProtocol.vless_xhttp
+                        and (c.settings or {}).get("cert_path")
+                    )
                 ),
                 None,
             )
