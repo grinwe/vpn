@@ -179,6 +179,33 @@ def test_hy2_uri_carries_username_and_password(db_session):
     assert userinfo == "user-7-9:pw123"
 
 
+def test_warm_pool_hy2_bundle_carries_username(db_session):
+    """Warm-пул строит креды СВОИМ путём (warm_pool._build_credential_text), в
+    обход provisioning-веток — и именно оттуда бандл достаётся новому юзеру
+    целиком готовым. Если здесь останется голый пароль, каждый НОВЫЙ клиент
+    получит нерабочий hy2, даже когда все выданные креды уже починены
+    (ровно это и обнаружилось в проде 2026-07-25 после ре-минта assigned)."""
+    from urllib.parse import urlsplit
+
+    from app import models
+    from app.services.warm_pool import _build_credential_text
+
+    from .factories import make_config
+
+    node = make_node(db_session, name="hy2-warm", host="203.0.113.80")
+    cfg = make_config(
+        db_session, node, name="hy2",
+        protocol=models.VPNConfigProtocol.hysteria2, sni="warm.example.info",
+    )
+
+    uri = _build_credential_text(
+        node, cfg, "warm-99-deadbeef", "warmPass1", "00000000-0000-0000-0000-000000000000"
+    )
+
+    userinfo = urlsplit(uri).netloc.split("@")[0]
+    assert userinfo == "warm-99-deadbeef:warmPass1", uri
+
+
 def test_rebuild_remints_legacy_hy2_uri_with_username(db_session):
     """Легаси-креды в БД лежат в старом формате. Ре-минт обязан дошить
     username из access_username, НЕ трогая пароль (он уже лежит на ноде под
