@@ -876,6 +876,13 @@ async def cmd_config(message: types.Message):
 async def onboarding_instruction(callback_query: types.CallbackQuery):
     platform = callback_query.data.split(":", maxsplit=1)[1]
     text = ONBOARDING_INSTRUCTIONS.get(platform, "Инструкция не найдена.")
+    # E3.2 — момент первого подключения единственный, где эта подсказка нужна:
+    # кнопка «🆘 VPN не работает» реально переносит устройство на другой сервер,
+    # но юзер об этом не знает и при первой неудаче просто уходит.
+    text += (
+        "\n\n<i>Не подключается? Нажми «🆘 VPN не работает» — перенесём "
+        "тебя на другой сервер.</i>"
+    )
     await callback_query.message.answer(text, parse_mode="HTML")
     await callback_query.answer()
 

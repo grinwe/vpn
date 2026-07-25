@@ -159,18 +159,32 @@ export default function App() {
     fetchMeResilient().then(setMe).catch(() => undefined);
   }, [route.name, status]);
 
+  // E2.8 — скелет вместо слова «Загрузка…»: запрос ретраится до ~45 с на
+  // плохой сети, и всё это время экран выглядел мёртвым.
   if (status === "loading")
     return (
       <Centered>
-        <div className="card animate-pulse text-tg-hint">Загрузка…</div>
+        <div className="w-full max-w-sm space-y-3">
+          <div className="card animate-pulse h-24" />
+          <div className="card animate-pulse h-16" />
+          <div className="text-tg-hint text-xs text-center">Загружаем кабинет…</div>
+        </div>
       </Centered>
     );
+  // E2.5 — раньше это был терминальный экран без единого тапа: юзер мог только
+  // закрыть приложение (автоповтор случался лишь по событиям online/visibility).
   if (status === "error")
     return (
       <Centered>
-        <div className="card border-red-500/40 text-red-200">
-          <div className="font-semibold mb-1">Ошибка</div>
+        <div className="card border-red-500/40 text-red-200 max-w-sm">
+          <div className="font-semibold mb-1">Не удалось загрузить кабинет</div>
           <div className="text-tg-hint text-sm">{error}</div>
+          <button className="btn-primary w-full mt-4" onClick={() => bootstrap()}>
+            Повторить
+          </button>
+          <div className="text-tg-hint text-xs mt-3">
+            Если не помогает — напиши в поддержку в чате бота.
+          </div>
         </div>
       </Centered>
     );

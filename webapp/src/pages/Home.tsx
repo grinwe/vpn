@@ -88,6 +88,12 @@ export default function Home({
   const [referral, setReferral] = useState<ReferralInfo | null>(null);
   const [showSetup, setShowSetup] = useState(false);
   const [trialActivating, setTrialActivating] = useState(false);
+  // E2.2/E2.3: результат активации подарка должен быть ВИДЕН. Раньше баннер
+  // просто исчезал, баланс снова показывал 0 ₽, и юзер не понимал, выдали ему
+  // VPN или нет; а провал уходил в console.warn — «тапнул, ничего не
+  // произошло, ушёл».
+  const [trialDone, setTrialDone] = useState<{ subToken: string | null } | null>(null);
+  const [trialError, setTrialError] = useState<string | null>(null);
 
   // Trial is retroactive: any user whose trial_activated_at is still
   // NULL sees the banner, including "old" users who registered before
@@ -99,6 +105,7 @@ export default function Home({
   const handleActivateTrial = async () => {
     if (trialActivating) return;
     setTrialActivating(true);
+    setTrialError(null);
     try {
       await activateTrial(); // зачисляет бонус на баланс
       // Сразу тратим бонус на подписку и провижн — «Забрать месяц» = рабочий
@@ -123,21 +130,33 @@ export default function Home({
           .filter((p) => p.period === "month")
           .sort((a, b) => a.price_rub - b.price_rub)[0];
         if (cheapestMonthly) {
-          await activateSubscription(cheapestMonthly.id);
+          const res = await activateSubscription(cheapestMonthly.id);
           getTg()?.HapticFeedback?.notificationOccurred("success");
+          // Ссылка приходит прямо в ответе — показываем экран «Готово» без
+          // лишнего запроса и без ожидания рефреша /me.
+          setTrialDone({ subToken: res.sub_token ?? null });
         }
       } catch (actErr) {
-        // Бонус уже на балансе, но авто-активация не прошла (редкий сбой
-        // провижининга/сети) — не блокируем: юзер увидит баланс и активирует
-        // подписку вручную из тарифов. Хуже, чем сейчас, не становится.
+        // Бонус на балансе, но подписка не активировалась (нет свободных нод,
+        // таймаут провижининга). Молчать здесь нельзя: для юзера это выглядит
+        // как «нажал и ничего не случилось».
         console.warn("trial auto-activate failed", actErr);
+        setTrialError(
+          "Бонус зачислен, но VPN не выдался — попробуй ещё раз. " +
+            "Если не выйдет, напиши в поддержку из раздела «Помощь».",
+        );
       }
       // Refresh /me: баннер исчезнет, появятся активная подписка + баланс.
       onRefresh();
     } catch (err) {
-      // 409 = already activated by another tab/device in the
-      // meantime. Either way, just refresh — /me will tell the
-      // truth and the banner will hide itself.
+      // 409 = подарок уже забран (другая вкладка/устройство) — это не ошибка,
+      // просто обновляем состояние. Остальное — показываем юзеру.
+      const status = (err as { status?: number } | null)?.status;
+      if (status !== 409) {
+        setTrialError(
+          "Не получилось забрать подарок. Проверь связь и попробуй ещё раз.",
+        );
+      }
       console.warn("trial activate failed", err);
       onRefresh();
     } finally {
@@ -213,28 +232,59 @@ export default function Home({
         </div>
       )}
 
-      {/* ── Free trial banner ── */}
+      {/* ── Free trial banner (E2.1: главный элемент первого экрана) ──
+          Раньше самым крупным блоком была карточка баланса «0 ₽» с кнопкой
+          «Пополнить» — просьба занести денег до того, как показана польза. */}
       {trialAvailable && trialAmountRub > 0 && (
-        <section className="card mb-4 border border-[var(--accent-from)]/40">
+        <section className="card-hero mb-4">
           <div className="text-tg-hint text-xs uppercase tracking-wide">Подарок</div>
-          <div className="text-lg font-semibold mt-1">🎁 Забери пробный месяц</div>
-          <div className="text-sm text-tg-hint mt-1">
-            Дарим <b>месяц Solo</b> бесплатно — VPN заработает <b>сразу</b>, без
-            карты и автосписаний. Настроить устройство — минута.
+          <div className="text-2xl font-bold mt-1">🎁 Забери бесплатный месяц</div>
+          <div className="text-sm text-tg-hint mt-2">
+            Карта не нужна. Один тап — и получишь ссылку с инструкцией,
+            как подключиться.
           </div>
           <button
-            className="btn-primary w-full mt-3"
+            className="btn-primary w-full mt-4 py-3 text-base"
             disabled={trialActivating}
             onClick={handleActivateTrial}
           >
             {trialActivating ? "Включаем VPN…" : "Активировать бесплатно"}
           </button>
+          {trialError && (
+            <div className="mt-3 text-sm bg-red-900/40 ring-1 ring-red-500 rounded-lg p-2 text-red-100">
+              {trialError}
+              <button
+                className="underline ml-1"
+                onClick={handleActivateTrial}
+                disabled={trialActivating}
+              >
+                Попробовать снова
+              </button>
+            </div>
+          )}
         </section>
       )}
 
+      {trialDone && (
+        <TrialSuccess
+          subToken={trialDone.subToken}
+          subLinkBase={me.sub_link_base_url}
+          onClose={() => {
+            setTrialDone(null);
+            onRefresh();
+          }}
+        />
+      )}
+
       {/* ── Balance card ── */}
+      {/* Пока подписок нет, баланс — не главное: показываем его обычной
+          карточкой, чтобы не спорить за внимание с подарком (E2.1). */}
       <section className="mb-4">
-        <div className={`card-hero ${lowBalance ? "card-danger" : ""}`}>
+        <div
+          className={`${me.subscriptions.length === 0 ? "card" : "card-hero"} ${
+            lowBalance ? "card-danger" : ""
+          }`}
+        >
           <div className="text-tg-hint text-xs uppercase tracking-wide">Баланс</div>
           <div className="text-4xl font-bold mt-1 tracking-tight">
             {balanceRub.toFixed(0)} <span className="text-2xl text-tg-hint">₽</span>
@@ -260,8 +310,20 @@ export default function Home({
       <section className="space-y-3 mb-6">
         <h2 className="text-sm uppercase tracking-wide text-tg-hint">Мои подписки</h2>
         {me.subscriptions.length === 0 ? (
-          <div className="card text-tg-hint text-sm">
-            У вас пока нет подписок. Активируйте тариф ниже.
+          <div className="card text-sm">
+            <div className="text-tg-hint">
+              {trialAvailable
+                ? "Подписки пока нет — забери бесплатный месяц выше."
+                : "Подписки пока нет."}
+            </div>
+            {!trialAvailable && (
+              <button
+                className="btn-primary w-full mt-3"
+                onClick={() => navigate({ name: "plans" })}
+              >
+                Выбрать тариф
+              </button>
+            )}
           </div>
         ) : (
           me.subscriptions.map((s) => (
@@ -296,7 +358,9 @@ export default function Home({
 
 
       {/* ── Referral block ── */}
-      {referral && referral.code && (
+      {/* E2.7: не просим приводить друзей у того, кто сам ещё не пользовался
+          сервисом — на первом экране это расфокусирует и выглядит как шум. */}
+      {referral && referral.code && me.subscriptions.length > 0 && (
         <section className="card mt-6">
           <div className="text-tg-hint text-xs uppercase tracking-wide">
             Пригласи друга
@@ -712,6 +776,113 @@ const SETUP_PLATFORMS = [
     text: "1. Скачайте Hiddify с hiddify.com\n2. Скопируйте ссылку конфига из раздела «Устройства»\n3. Добавьте профиль из буфера обмена\n4. Подключитесь",
   },
 ];
+
+
+/** Ссылки на клиенты под платформу юзера (E2.4).
+ *
+ * Раньше инструкция говорила «установите v2rayNG из Google Play» без единой
+ * ссылки: человек должен был выйти из Telegram, найти приложение по названию и
+ * вернуться — самый длинный разрыв между «получил ссылку» и «работает VPN».
+ */
+const CLIENT_LINKS: { label: string; url: string }[] = [
+  { label: "App Store", url: "https://apps.apple.com/app/happ-proxy-utility/id6504287215" },
+  { label: "Google Play", url: "https://play.google.com/store/apps/details?id=com.happproxy" },
+];
+
+/** Экран «Готово» после активации подарка (E2.2 + E2.4 + E3.1).
+ *
+ * У платного пути такой экран есть (Plans.ActivatedScreen), у бесплатного не
+ * было: баннер исчезал, баланс снова показывал 0 ₽, и юзер не понимал, что VPN
+ * уже выдан и что ссылку нужно вставить в отдельное приложение.
+ */
+function TrialSuccess({
+  subToken,
+  subLinkBase,
+  onClose,
+}: {
+  subToken: string | null;
+  subLinkBase: string;
+  onClose: () => void;
+}) {
+  const [copied, setCopied] = useState(false);
+  const subUrl = subToken
+    ? subLinkBase
+      ? `${subLinkBase}/${subToken}`
+      : `${window.location.origin}/api/sub/${subToken}`
+    : null;
+
+  return createPortal(
+    <div className="fixed inset-0 z-50 bg-black/70 flex items-end sm:items-center justify-center p-4">
+      <div className="card w-full max-w-md">
+        <div className="text-center">
+          <div className="text-4xl mb-2">✅</div>
+          <h2 className="text-xl font-semibold">Готово, VPN активен</h2>
+        </div>
+
+        {subUrl && (
+          <div className="mt-4">
+            <div className="text-xs uppercase tracking-wide text-tg-hint mb-1">
+              Твоя ссылка
+            </div>
+            <div className="text-xs break-all bg-tg-secondaryBg rounded-lg p-2 ring-1 ring-tg-hint/30">
+              {subUrl}
+            </div>
+            <button
+              className="btn-primary w-full mt-2"
+              onClick={async () => {
+                try {
+                  await navigator.clipboard.writeText(subUrl);
+                  setCopied(true);
+                  getTg()?.HapticFeedback?.impactOccurred("light");
+                  setTimeout(() => setCopied(false), 2000);
+                } catch (err) {
+                  console.warn("clipboard copy failed", err);
+                }
+              }}
+            >
+              {copied ? "Скопировано ✓" : "📋 Скопировать ссылку"}
+            </button>
+          </div>
+        )}
+
+        <div className="mt-4 text-sm">
+          <div className="font-semibold mb-2">Как подключиться</div>
+          <ol className="space-y-2 text-tg-hint">
+            <li>
+              1. Установи HAPP:{" "}
+              {CLIENT_LINKS.map((c, i) => (
+                <span key={c.url}>
+                  {i > 0 && " · "}
+                  <button
+                    className="underline text-tg-text"
+                    onClick={() => openExternalUrl(getTg(), c.url)}
+                  >
+                    {c.label}
+                  </button>
+                </span>
+              ))}
+            </li>
+            <li>2. Вставь ссылку в приложение</li>
+            <li>3. Нажми «Подключиться»</li>
+          </ol>
+        </div>
+
+        {/* E3.1 — продаём «Помощь» ровно там, где она нужна: в момент первого
+            подключения. В приветствии это читалось бы как «у нас часто не
+            работает», здесь — как забота. Кнопка реально переносит устройство
+            на другой сервер. */}
+        <div className="mt-4 text-xs text-tg-hint">
+          Не подключается? Нажми <b>«Помощь»</b> — перенесём тебя на другой сервер.
+        </div>
+
+        <button className="btn-ghost w-full mt-4" onClick={onClose}>
+          Понятно
+        </button>
+      </div>
+    </div>,
+    document.body,
+  );
+}
 
 function SetupSheet({ onClose }: { onClose: () => void }) {
   const [open, setOpen] = useState<number | null>(null);

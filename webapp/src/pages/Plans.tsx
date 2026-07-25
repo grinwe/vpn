@@ -155,12 +155,24 @@ export default function Plans({ onActivated, subLinkBase, me, changeSubscription
     };
   }, []);
 
+  // E2.5 — ранний return подменял всю страницу вместе с шапкой: юзер, поймавший
+  // секундный обрыв на шаге выбора тарифа, оказывался в тупике без «назад» и
+  // без «повторить».
   if (error)
     return (
       <Centered>
-        <div className="card border-red-500/40 text-red-200">
-          <div className="font-semibold">Ошибка загрузки тарифов</div>
+        <div className="card border-red-500/40 text-red-200 max-w-sm">
+          <div className="font-semibold">Не удалось загрузить тарифы</div>
           <div className="text-tg-hint text-sm mt-1">{error}</div>
+          <button className="btn-primary w-full mt-4" onClick={() => void loadPlans.current()}>
+            Повторить
+          </button>
+          <button
+            className="btn-ghost w-full mt-2"
+            onClick={() => navigate({ name: "home" })}
+          >
+            ← В кабинет
+          </button>
         </div>
       </Centered>
     );
@@ -291,8 +303,18 @@ export default function Plans({ onActivated, subLinkBase, me, changeSubscription
         setTopupState(null);
         if (credited) {
           tg.HapticFeedback?.notificationOccurred("success");
+          // E2.6 — раньше юзер возвращался с оплаты и видел тот же список
+          // тарифов без единого слова: деньги списаны, VPN нет, надо было
+          // догадаться нажать «Активировать» второй раз. planId, ради которого
+          // открывали шторку, уже лежит в topupHint — активируем сами.
+          const pending = topupHint;
           setTopupHint(null);
-          onActivated();
+          const plan = pending && plans?.find((p) => p.id === pending.planId);
+          if (plan) {
+            void activate(plan);
+          } else {
+            onActivated();
+          }
         } else {
           showToast(
             "Оплата пока не подтвердилась. Если вы оплатили — баланс обновится в течение минуты.",
