@@ -25,13 +25,22 @@ BTN_HELP = "❓ Помощь"
 BTN_VPN_BROKEN = "🆘 VPN не работает"
 
 
-def start_keyboard() -> types.ReplyKeyboardMarkup:
-    """Always-on reply keyboard at the bottom of the chat."""
+def start_keyboard(*, has_devices: bool = True) -> types.ReplyKeyboardMarkup:
+    """Always-on reply keyboard at the bottom of the chat.
+
+    ``has_devices=False`` прячет «🆘 VPN не работает» (роадмап E3.3): чинить
+    юзеру нечего, а кнопка вела в тупик «У тебя нет активной подписки.
+    Оформить — /buy» — команды ``/buy`` в боте не существует. Заодно это
+    убирает с первого экрана новичка один из трёх «поломочных» элементов.
+    """
+    last_row = [types.KeyboardButton(text=BTN_HELP)]
+    if has_devices:
+        last_row.append(types.KeyboardButton(text=BTN_VPN_BROKEN))
     return types.ReplyKeyboardMarkup(
         keyboard=[
             [types.KeyboardButton(text=BTN_MAIN_MENU), types.KeyboardButton(text=BTN_BUY)],
             [types.KeyboardButton(text=BTN_TOPUP), types.KeyboardButton(text=BTN_INVITE)],
-            [types.KeyboardButton(text=BTN_HELP), types.KeyboardButton(text=BTN_VPN_BROKEN)],
+            last_row,
         ],
         resize_keyboard=True,
     )
@@ -126,22 +135,45 @@ def webapp_inline_keyboard() -> types.InlineKeyboardMarkup | None:
     )
 
 
-def welcome_action_keyboard() -> types.InlineKeyboardMarkup:
-    """Rich inline action menu under the /start welcome message.
+def welcome_action_keyboard(
+    *, trial_available: bool = False, is_new: bool = False
+) -> types.InlineKeyboardMarkup:
+    """Inline-меню под приветствием.
 
-    Mirrors the competitor layout (hitvpnbot): big WebApp button on top,
-    then quick actions — "проблема с ЛК" (reuses help:cabinet callback),
-    "помощь" and "пригласить друга". The WebApp row is only added when
-    WEBAPP_BASE_URL is HTTPS; in dev we fall back to just the actions.
+    Онбординг-роадмап E1.1/E1.5. Раньше здесь всегда висели 6 кнопок, и вместе
+    с нижней reply-клавиатурой первый экран давал 12 кликабельных вариантов без
+    единого выделенного — при том что 75% новых юзеров уходили, не сделав
+    ничего. Теперь у новичка с неотобранным подарком ОДНА главная кнопка
+    (забрать месяц), а «поломочные» пункты («Проблема с ЛК») ему не
+    показываются: до первого действия они читаются как «тут всё ломается».
+
+    Возвращающийся юзер видит прежний набор — он уже знает продукт, и урезать
+    ему навигацию незачем.
     """
     rows: list[list[types.InlineKeyboardButton]] = []
-    if WEBAPP_BASE_URL.startswith("https://"):
+    has_webapp = WEBAPP_BASE_URL.startswith("https://")
+    onboarding = trial_available and has_webapp
+
+    if has_webapp:
         rows.append([
             types.InlineKeyboardButton(
-                text="🔐 Открыть личный кабинет",
+                # Подарок должен быть НАЗВАН на кнопке: раньше он жил одной
+                # строкой в тексте, а кнопка называлась «Открыть личный
+                # кабинет» — связь между офером и действием юзер должен был
+                # додумать сам.
+                text="🎁 Забрать бесплатный месяц" if onboarding
+                else "🔐 Открыть личный кабинет",
                 web_app=types.WebAppInfo(url=WEBAPP_BASE_URL),
             )
         ])
+    if onboarding:
+        # Один экран — одно действие. Тарифы оставляем вторым, ненавязчивым
+        # рядом: кому подарок не нужен, тот всё равно найдёт цены.
+        rows.append([
+            types.InlineKeyboardButton(text="💎 Тарифы", callback_data="go:plans"),
+        ])
+        return types.InlineKeyboardMarkup(inline_keyboard=rows)
+
     rows.append([
         types.InlineKeyboardButton(
             text="💎 Подписка", callback_data="go:plans"
@@ -150,14 +182,14 @@ def welcome_action_keyboard() -> types.InlineKeyboardMarkup:
             text="💳 Пополнить", callback_data="go:topup"
         ),
     ])
-    rows.append([
-        types.InlineKeyboardButton(
+    help_row = [
+        types.InlineKeyboardButton(text="🆘 Помощь", callback_data="go:help"),
+    ]
+    if not is_new:
+        help_row.insert(0, types.InlineKeyboardButton(
             text="❓ Проблема с ЛК", callback_data="help:cabinet"
-        ),
-        types.InlineKeyboardButton(
-            text="🆘 Помощь", callback_data="go:help"
-        ),
-    ])
+        ))
+    rows.append(help_row)
     rows.append([
         types.InlineKeyboardButton(
             text="🤝 Пригласить друга", callback_data="go:referral"

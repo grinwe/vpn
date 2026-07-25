@@ -125,6 +125,10 @@ def _install_stubs(monkeypatch):
         ADMIN_IDS=set(),
         BACKEND_URL="http://backend",
         PAYMENT_PROVIDER="stub",
+        # Stage 9b (61217f7) добавил этот импорт в handlers.py, а стаб не
+        # обновили — тест валился ImportError'ом на СБОРЕ, т.е. падал весь
+        # bot-срез в CI. Держим стаб в синхроне со списком импортов handlers.
+        PAYMENT_PROVIDER_CHOICES=(),
         SUB_LINK_BASE_URL="",
         TELEGRAM_STARS_WEBHOOK_SECRET="secret",
     )
@@ -136,6 +140,7 @@ def _install_stubs(monkeypatch):
         BTN_MAIN_MENU="Меню",
         BTN_TOPUP="Пополнить",
         BTN_VPN_BROKEN="VPN не работает",
+        WEBAPP_BASE_URL="",
         help_back_keyboard=_kb,
         help_keyboard=_kb,
         onboarding_keyboard=_kb,

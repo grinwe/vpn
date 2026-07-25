@@ -21,6 +21,7 @@ from .config import (
     TELEGRAM_STARS_WEBHOOK_SECRET,
 )
 from .keyboards import (
+    WEBAPP_BASE_URL,
     BTN_BUY,
     BTN_HELP,
     BTN_INVITE,
@@ -318,23 +319,64 @@ ONBOARDING_INSTRUCTIONS = {
 
 # ── /start ──
 
-_TRIAL_LINE = "🎁 Первый месяц — в подарок. Забери в личном кабинете.\n\n"
+_TRIAL_LINE = (
+    "🎁 Первый месяц — бесплатно, карта не нужна.\n"
+    "Один тап в кабинете: получишь ссылку и инструкцию, как подключиться.\n\n"
+)
+
+
+async def _fetch_user_flags(telegram_id: int) -> tuple[bool, bool]:
+    """``(trial_available, has_devices)`` для юзера — общий хелпер входных экранов.
+
+    Нужен там, где приветствие/тарифы рисуются НЕ из ``/start`` (главное меню,
+    список тарифов): раньше эти экраны хардкодили ``trial_available=False`` и
+    подарок из них пропадал. Регистрация идемпотентна, поэтому переиспользуем
+    её же эндпоинт вместо отдельного read-API.
+
+    Fail-safe в сторону новичка (как в ``cmd_start``): не достучались — считаем,
+    что подарок ещё доступен. Показать оффер лишний раз безопасно, бэкенд
+    валидирует его при активации; не показать — потерять юзера.
+    """
+    try:
+        _status, data = await _fetch_json(
+            "POST",
+            f"{BACKEND_URL}/api/users/register",
+            json={"telegram_id": str(telegram_id)},
+            headers=_admin_headers(telegram_id),
+            timeout=aiohttp.ClientTimeout(total=_REGISTER_TIMEOUT_S),
+        )
+        if data:
+            return bool(data.get("trial_available")), bool(data.get("has_devices"))
+    except Exception:  # noqa: BLE001
+        logger.warning("_fetch_user_flags: бэкенд недоступен, показываем оффер")
+    return True, False
 
 
 def format_welcome(name: str, is_new: bool, trial_available: bool) -> str:
-    if is_new:
+    """Приветствие. Тексты согласованы в роадмапе (E1.1/E1.1a).
+
+    Описание продукта показываем и новичку, и тому, кто ещё не забрал подарок:
+    человек, вернувшийся через месяц, продукт всё равно не помнит, а «Рад снова
+    видеть» без единого аргумента — пустой экран.
+    """
+    if is_new or trial_available:
         body = (
             f"👋 Привет, {name}!\n\n"
             "🚀 Быстрый VPN без танцев с настройками:\n"
             "• Работает там, где другие отвалились — обход блокировок на уровне протокола\n"
             "• Оплата прямо в Telegram, без карт и регистраций\n"
-            "• Один тариф — до 5 устройств одновременно\n"
+            # E1.1a: было «Один тариф — до 5 устройств одновременно», а в проде
+            # шесть тарифов и 5 устройств только у Pro. Юзер читал «плачу один
+            # раз — получаю 5», потом видел прайс и терял доверие ровно на шаге
+            # принятия решения.
+            "• До 5 устройств одновременно — на тарифе Pro\n"
             "• Поддержка отвечает в чате, не роботом\n\n"
         )
     else:
         body = f"👋 Рад снова видеть, {name}!\n\n"
     if trial_available:
         body += _TRIAL_LINE
+        return body.rstrip("\n")
     body += "Выбери действие ниже 👇"
     return body
 
@@ -382,8 +424,15 @@ async def cmd_start(message: types.Message, state: FSMContext):
     if source:
         register_payload["source"] = source
 
-    is_new = False
-    trial_available = False
+    # E1.2 — fail-safe в сторону НОВИЧКА. Регистрация синхронная с таймаутом
+    # 3 с и без ретраев; при любом сбое флаги оставались False, и человек с
+    # рекламы видел «Рад снова видеть» без описания продукта и без подарка —
+    # он не мог знать, что это сбой, и уходил. Дефолты трактуем как «скорее
+    # всего новый»: показать подарок лишний раз безопасно (бэкенд всё равно
+    # валидирует его при активации), а не показать — потерять юзера.
+    is_new = True
+    trial_available = True
+    has_devices = False
     try:
         _status, data = await _fetch_json(
             "POST",
@@ -392,15 +441,17 @@ async def cmd_start(message: types.Message, state: FSMContext):
             headers=_admin_headers(message.from_user.id),
             timeout=aiohttp.ClientTimeout(total=_REGISTER_TIMEOUT_S),
         )
-        is_new = bool(data and data.get("created"))
-        trial_available = bool(data and data.get("trial_available"))
+        if data:
+            is_new = bool(data.get("created"))
+            trial_available = bool(data.get("trial_available"))
+            has_devices = bool(data.get("has_devices"))
         # Быстрый таймаут мог оборваться раньше, чем метка/реферал доехали до
         # бэка. Если не достучались, но атрибуция была — до-регистрируем в фоне
         # полным таймаутом, чтобы не потерять источник конверсии.
         if _status == 0 and (referral_code or source):
             _spawn(_register_retry_bg(message.from_user.id, register_payload))
     except Exception:
-        pass
+        logger.warning("cmd_start: register failed, показываем welcome как новичку")
 
     first_name = message.from_user.first_name or "друг"
     welcome = format_welcome(first_name, is_new, trial_available)
@@ -410,13 +461,16 @@ async def cmd_start(message: types.Message, state: FSMContext):
     #   2) Tiny nudge + persistent reply keyboard (always at the bottom,
     #      for both new and returning users — returning users complained
     #      the bottom buttons disappeared).
-    await message.answer(welcome, reply_markup=welcome_action_keyboard())
-    hint = (
-        "⌨️ Кнопки внизу всегда под рукой. Если что-то сломалось — жми /help."
-        if is_new
-        else "⌨️ Кнопки внизу всегда под рукой."
+    await message.answer(
+        welcome,
+        reply_markup=welcome_action_keyboard(
+            trial_available=trial_available, is_new=is_new
+        ),
     )
-    await message.answer(hint, reply_markup=start_keyboard())
+    # E1.5: новичку не сообщаем про поломки до того, как он что-то получил —
+    # «если что-то сломалось» на первом экране читается как «тут всё ломается».
+    hint = "⌨️ Кнопки внизу всегда под рукой."
+    await message.answer(hint, reply_markup=start_keyboard(has_devices=has_devices))
 
 
 # ── /plans ──
@@ -451,7 +505,22 @@ async def list_plans(message: types.Message):
         key=lambda p: p.get("max_devices") or 0,
     )
 
-    lines: list[str] = [
+    # E1.4 — оффер ПЕРЕД прайсом. «💎 Подписка» продублирована в инлайн- и
+    # нижней клавиатуре, поэтому на прайс попадает половина новичков — и до
+    # этого фикса видела просьбу заплатить без единого упоминания подарка,
+    # который ей уже пообещали на первом экране.
+    trial_available, _has_devices = await _fetch_user_flags(message.from_user.id)
+
+    lines: list[str] = []
+    if trial_available:
+        lines += [
+            "🎁 <b>Сначала — бесплатный месяц.</b>",
+            "Он уже ждёт в личном кабинете: один тап, карта не нужна.",
+            "",
+            "Ниже — тарифы, если захочешь больше устройств или сразу на год.",
+            "",
+        ]
+    lines += [
         "<b>Все тарифы дают одно и то же:</b>",
         "• безлимитный трафик",
         "• автоматическое переключение между протоколами",
@@ -491,6 +560,13 @@ async def list_plans(message: types.Message):
     rows.append(
         [types.InlineKeyboardButton(text="🤔 Какой выбрать?", callback_data="plans:help")]
     )
+    if trial_available and WEBAPP_BASE_URL.startswith("https://"):
+        # Кнопка подарка ПЕРВОЙ строкой клавиатуры — иначе оффер остаётся
+        # текстом, а тапабельны только платные варианты.
+        rows.insert(0, [types.InlineKeyboardButton(
+            text="🎁 Забрать бесплатный месяц",
+            web_app=types.WebAppInfo(url=WEBAPP_BASE_URL),
+        )])
     keyboard = types.InlineKeyboardMarkup(inline_keyboard=rows)
     await message.answer("\n".join(lines), reply_markup=keyboard)
 
@@ -1108,7 +1184,14 @@ async def self_report_vpn_broken(message: types.Message) -> None:
 
     devices = data.get("devices") or []
     if not devices:
-        await message.answer("У тебя нет активной подписки. Оформить — /buy.")
+        # E1.3: команды /buy в боте нет (ни хендлера, ни в списке команд) —
+        # раньше человек, который уже жалуется на проблему, упирался в тупик.
+        await message.answer(
+            "У тебя нет активной подписки — чинить пока нечего.",
+            reply_markup=types.InlineKeyboardMarkup(inline_keyboard=[[
+                types.InlineKeyboardButton(text="💎 Выбрать тариф", callback_data="go:plans"),
+            ]]),
+        )
         return
 
     if len(devices) > 1:
@@ -1257,7 +1340,13 @@ async def _do_whole_sub_failover(bot, chat_id: int, tg_id: int) -> None:
             "Если не помогло за 10 минут — /help.",
         )
     elif action == "no_subscription":
-        await bot.send_message(chat_id, "У тебя нет активной подписки. Оформить — /buy.")
+        await bot.send_message(
+            chat_id,
+            "У тебя нет активной подписки — чинить пока нечего.",
+            reply_markup=types.InlineKeyboardMarkup(inline_keyboard=[[
+                types.InlineKeyboardButton(text="💎 Выбрать тариф", callback_data="go:plans"),
+            ]]),
+        )
     else:  # no_target / user_not_found / прочее
         await bot.send_message(
             chat_id,
@@ -2239,11 +2328,18 @@ async def go_start(callback_query: types.CallbackQuery):
     """«🏠 Главное меню» из любого inline-меню — шорткат на /start."""
     await callback_query.answer()
     first_name = callback_query.from_user.first_name or "друг"
-    welcome = format_welcome(first_name, is_new=False, trial_available=False)
-    await callback_query.message.answer(welcome, reply_markup=welcome_action_keyboard())
+    # E1.6: раньше флаги были захардкожены False — вернувшись в главное меню,
+    # юзер терял строку про подарок, хотя подарок не забран. Оффер, который то
+    # есть, то нет, читается как «предложение истекло».
+    trial_available, has_devices = await _fetch_user_flags(callback_query.from_user.id)
+    welcome = format_welcome(first_name, is_new=False, trial_available=trial_available)
+    await callback_query.message.answer(
+        welcome,
+        reply_markup=welcome_action_keyboard(trial_available=trial_available),
+    )
     await callback_query.message.answer(
         "⌨️ Кнопки внизу всегда под рукой.",
-        reply_markup=start_keyboard(),
+        reply_markup=start_keyboard(has_devices=has_devices),
     )
 
 

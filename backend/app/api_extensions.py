@@ -661,6 +661,20 @@ def register_user(
         # activated their trial yet — works retroactively for users
         # who registered before this column existed.
         "trial_available": user.trial_activated_at is None,
+        # Онбординг-роадмап E3.3: бот прячет кнопку «🆘 VPN не работает» у
+        # тех, кому нечего чинить. Раньше она висела у всех с первого экрана
+        # и вела в тупик «У тебя нет активной подписки. Оформить — /buy»
+        # (команды /buy не существует). Считаем по живым девайсам, а не по
+        # подписке: чинить можно только выданное устройство.
+        "has_devices": (
+            db.query(models.Device.id)
+            .filter(
+                models.Device.user_id == user.id,
+                models.Device.status == models.DeviceStatus.active,
+            )
+            .first()
+            is not None
+        ),
     }
 
 
