@@ -442,6 +442,177 @@ def test_checkout_requires_ownership_proof_for_anonymous_caller(client, db_sessi
     assert db_session.get(models.Invoice, inv.id).status == models.InvoiceStatus.pending
 
 
+# ── P1: ресинк не должен утаскивать креды соседних нод ───────────────────
+
+
+def _diverse_setup(db_session, proto, uri_builder):
+    """Юзер с домашней нодой A и диверс-кредом на ноде B (одна подписка,
+    один device → ОДИН access_username, разные секреты)."""
+    from app import models
+    from app.security import encrypt
+
+    from .factories import make_config, make_device
+
+    node_a = make_node(db_session, name="diverse-a", host="203.0.113.10")
+    node_b = make_node(db_session, name="diverse-b", host="203.0.113.11")
+    cfg_a = make_config(db_session, node_a, name=f"{proto}-a", protocol=proto)
+    cfg_b = make_config(db_session, node_b, name=f"{proto}-b", protocol=proto)
+    user = make_user(db_session, telegram_id=f"tg-div-{proto.value}")
+    plan = make_plan(db_session, name=f"plan-div-{proto.value}")
+    sub = make_subscription(db_session, user, plan, node_a)  # homed on A
+    device = make_device(db_session, sub, cfg_a, access_username="user-div-1")
+    for node, cfg, secret in ((node_a, cfg_a, "AAA"), (node_b, cfg_b, "BBB")):
+        db_session.add(models.Credential(
+            subscription_id=sub.id, device_id=device.id, config_id=cfg.id,
+            node_id=node.id, proto=proto.value,
+            config_text=encrypt(uri_builder(node, cfg, secret)),
+            access_username="user-div-1", is_active=True,
+        ))
+    db_session.commit()
+    return node_a, node_b
+
+
+def test_hy2_resync_does_not_push_neighbour_password(db_session):
+    """Находка #11 (high): «домашняя» выборка фильтровалась только по
+    Subscription.node_id, поэтому в ресинк ноды A попадал hy2-кред той же
+    подписки, физически живущий на ноде B. Дедуп last-wins по username мог
+    записать на A пароль соседней ноды — hy2 тихо переставал пускать."""
+    from app import models
+    from app.services.provisioning import (
+        ProvisioningOrchestrator,
+        _build_hysteria2_credential,
+        _hy2_auth,
+    )
+
+    node_a, node_b = _diverse_setup(
+        db_session,
+        models.VPNConfigProtocol.hysteria2,
+        lambda node, cfg, secret: _build_hysteria2_credential(
+            node, cfg, _hy2_auth("user-div-1", secret)
+        ),
+    )
+
+    orch = ProvisioningOrchestrator(db_session)
+    tasks = orch.resync_node_hysteria2_clients(node_a)
+
+    assert len(tasks) == 1
+    clients = tasks[0].payload["clients"]
+    assert clients == [{"username": "user-div-1", "password": "AAA"}], clients
+
+
+def test_vless_resync_does_not_push_neighbour_uuid(db_session):
+    """Та же болезнь в resync_node_clients: UUID кредо соседней ноды уезжал
+    на эту и мог вытеснить настоящий при дедупе по (proto, username)."""
+    import uuid as uuid_mod
+
+    from app import models
+    from app.services.provisioning import (
+        ProvisioningOrchestrator,
+        _build_vless_reality_credential,
+    )
+
+    uuid_a = str(uuid_mod.uuid4())
+    uuid_b = str(uuid_mod.uuid4())
+    secrets_by_node: dict[str, str] = {"AAA": uuid_a, "BBB": uuid_b}
+    node_a, _node_b = _diverse_setup(
+        db_session,
+        models.VPNConfigProtocol.vless_reality,
+        lambda node, cfg, secret: _build_vless_reality_credential(
+            node, cfg, secrets_by_node[secret]
+        ),
+    )
+
+    orch = ProvisioningOrchestrator(db_session)
+    task = orch.resync_node_clients(node_a)
+
+    assert task is not None
+    pushed = task.payload["clients_by_proto"][
+        models.VPNConfigProtocol.vless_reality.value
+    ]
+    assert [c["uuid"] for c in pushed] == [uuid_a], pushed
+
+
+def test_renew_certs_failure_does_not_zero_health_score(db_session):
+    """Находка #12 (high): renew_certs не был в bypass-списке, поэтому провал
+    точечного certbot обнулял health_score живой ноды, а успех промоутил её и
+    запускал полный ресинк с рестартом hysteria-server."""
+    from app import models
+    from app.services.provisioning import ProvisioningOrchestrator
+
+    node = make_node(db_session, name="cert-node", host="203.0.113.12")
+    node.status = models.VPNNodeStatus.active
+    node.health_score = 100
+    db_session.commit()
+
+    orch = ProvisioningOrchestrator(db_session)
+    task = orch.create_task("node", node.id, "renew_certs", {})
+    db_session.commit()
+
+    orch._handle_task_outcome(task, success=False)
+
+    db_session.expire_all()
+    fresh = db_session.get(models.VPNNode, node.id)
+    assert fresh.health_score == 100
+    assert fresh.status == models.VPNNodeStatus.active
+
+
+def test_enqueue_force_purges_job_id_from_queue_list(monkeypatch):
+    """Находка #14 (high): force-путь удалял только ключ rq:job:<id>, а id
+    оставался в списке очереди — enqueue с тем же job_id клал его второй раз,
+    и таска выполнялась дважды."""
+    calls: list[tuple[str, object]] = []
+
+    class _FakeConn:
+        def delete(self, key):
+            calls.append(("delete", key))
+
+        def lrem(self, key, count, value):
+            calls.append(("lrem", (key, count, value)))
+
+    class _FakeRegistry:
+        def __init__(self, *a, **kw):
+            pass
+
+        def remove(self, job_id):
+            calls.append(("registry_remove", job_id))
+
+        def cleanup(self):
+            pass
+
+    class _FakeQueue:
+        key = "rq:queue:vpn-provisioning"
+        connection = _FakeConn()
+        failed_job_registry = _FakeRegistry()
+        scheduled_job_registry = _FakeRegistry()
+        deferred_job_registry = _FakeRegistry()
+
+        def enqueue(self, *a, **kw):
+            calls.append(("enqueue", kw.get("job_id")))
+
+            class _Job:
+                id = kw.get("job_id")
+
+            return _Job()
+
+    monkeypatch.setattr(q, "get_queue", lambda: _FakeQueue())
+    monkeypatch.setattr("rq.registry.StartedJobRegistry", _FakeRegistry)
+
+    class _NoSuchJob(Exception):
+        pass
+
+    monkeypatch.setattr("rq.job.Job.fetch", staticmethod(
+        lambda *a, **kw: (_ for _ in ()).throw(_NoSuchJob())
+    ))
+    monkeypatch.setattr("rq.exceptions.NoSuchJobError", _NoSuchJob)
+
+    q.enqueue_task(4242, node_id=1, force=True)
+
+    ops = [c[0] for c in calls]
+    assert "lrem" in ops, f"id не снят из FIFO очереди: {calls}"
+    lrem_args = next(c[1] for c in calls if c[0] == "lrem")
+    assert lrem_args == ("rq:queue:vpn-provisioning", 0, "provision-4242")
+
+
 def test_cert_renewal_tick_disabled_by_zero_interval(monkeypatch):
     """CERT_RENEWAL_INTERVAL=0 — задокументированный kill-switch: тик не
     перепланирует себя и затухает."""

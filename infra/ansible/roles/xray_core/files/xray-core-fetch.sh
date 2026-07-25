@@ -5,7 +5,14 @@
 # на ru-cloud-web-02 при upstream install-release.sh).
 #
 # Использование:
-#   xray-core-fetch.sh <version>   # version = git-tag, e.g. v25.6.8
+#   xray-core-fetch.sh <version> [sha256]   # version = git-tag, e.g. v25.6.8
+#
+# sha256 — ожидаемая контрольная сумма Xray-linux-<arch>.zip, ЗАКОММИЧЕННАЯ в
+# роли (roles/xray_core/defaults/main.yml). Качать .dgst по той же цепочке
+# бессмысленно: кто подменит zip, подменит и хеш рядом с ним. Без неё бинарь,
+# приезжающий через сторонний реверс-прокси (ghproxy.com) и ставящийся в
+# /usr/local/bin/xray под root на ВЕСЬ флот, не проверяется ничем, кроме
+# «размер > 1 МБ» (аудит 2026-07-25).
 #
 # Цепочка качания zip'а с release-asset'ом:
 #   1. ghproxy.com → github       (RU reverse-proxy для release downloads)
@@ -20,7 +27,8 @@
 
 set -u
 
-VERSION="${1:?usage: $0 <xray-core version, e.g. v25.6.8>}"
+VERSION="${1:?usage: $0 <xray-core version, e.g. v25.6.8> [sha256]}"
+EXPECT_SHA256="${2:-}"
 ARCH="64"  # amd64 — единственный таргет наших VPS
 ZIP=/tmp/xray-core.zip
 UNPACK=/tmp/xray-core-unpack
@@ -61,6 +69,22 @@ for url in "${URLS[@]}"; do
             echo "  ✗ подозрительно мал ($size байт), пропускаю"
             rm -f "$ZIP"
             continue
+        fi
+
+        # Целостность: единственная защита от подмены бинаря по дороге
+        # (ghproxy.com — сторонний реверс-прокси, mgmt-mirror — наш, но тоже
+        # промежуточное звено). Несовпадение = пробуем следующий источник, а не
+        # ставим «что дали».
+        if [ -n "$EXPECT_SHA256" ]; then
+            got_sha=$(sha256sum "$ZIP" 2>/dev/null | awk '{print $1}')
+            if [ "$got_sha" != "$EXPECT_SHA256" ]; then
+                echo "  ✗ sha256 не совпал (получено ${got_sha:-?}, ожидалось $EXPECT_SHA256) — источник отброшен" >&2
+                rm -f "$ZIP"
+                continue
+            fi
+            echo "  ✓ sha256 совпал"
+        else
+            echo "  ⚠ sha256 не задан — целостность НЕ проверена (задай xray_core_sha256 в роли)" >&2
         fi
 
         # Unpack + install. install-release.sh upstream'а делает ровно

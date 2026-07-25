@@ -1744,7 +1744,12 @@ class ProvisioningOrchestrator:
             # helper — they neither promote a registering node nor demote
             # an already-active one, so bypass the status transitions
             # entirely. Errors are visible via the task row.
-            if task.action in ("resync_vless", "resync_hy2"):
+            # renew_certs — такой же точечный пост-хелпер (certbot + reload
+            # nginx). Его исход НИЧЕГО не говорит о способности ноды нести
+            # трафик: провал re-issue одного домена обнулял health_score живой
+            # ноды, а успех промоутил её в active и запускал полный vless+hy2
+            # ресинк с рестартом hysteria-server (аудит 2026-07-25).
+            if task.action in ("resync_vless", "resync_hy2", "renew_certs"):
                 return
             # Diagnose is READ-ONLY (staged probe + read-only on-host play).
             # A FAILED probe of a temporarily-unreachable node must NOT zero
@@ -3635,6 +3640,13 @@ class ProvisioningOrchestrator:
         # credentials (pre-stage-2.5, and still the default for legacy
         # subs) have Credential.node_id=NULL and would silently get
         # filtered out. Going via the subscription side catches both.
+        #
+        # НО ограничиваем узлом самого кредо: у диверсной (N×M) подписки часть
+        # кредов физически живёт на ДРУГИХ нодах, и без этого фильтра их UUID
+        # уезжали на ЭТУ ноду, а дедуп по (proto, username) мог выкинуть
+        # настоящий кред узла в пользу чужого — клиент переставал подключаться
+        # к своей же ноде (аудит 2026-07-25). NULL оставляем: ради cold-path
+        # легаси-кредов запрос и шёл через Subscription.
         assigned_rows = (
             self.db.query(models.Credential, models.Device)
             .join(
@@ -3650,6 +3662,15 @@ class ProvisioningOrchestrator:
                 models.Subscription.status == models.SubscriptionStatus.active,
                 models.Credential.proto.in_(_VLESS_FAMILY_PROTOS),
                 models.Credential.is_active.is_(True),
+                or_(
+                    models.Credential.node_id == node.id,
+                    models.Credential.node_id.is_(None),
+                ),
+            )
+            # Детерминированный порядок: «свой» кред (node_id == node.id)
+            # выигрывает дедуп у легаси-строки с NULL, а не как ляжет heap.
+            .order_by(
+                models.Credential.node_id.is_(None), models.Credential.id
             )
             .all()
         )
@@ -3853,6 +3874,12 @@ class ProvisioningOrchestrator:
         hy2 = models.VPNConfigProtocol.hysteria2.value
         # Home hy2-учётки — активная подписка ПРОПИСАНА (Subscription.node_id) на
         # этой ноде, с привязанным device.
+        #
+        # Фильтр по Credential.node_id обязателен (аудит 2026-07-25): у девайса
+        # с диверсной сабой hy2-креды лежат на РАЗНЫХ нодах под ОДНИМ
+        # access_username, а дедуп ниже — last-wins по username. Без фильтра на
+        # ноду мог уехать пароль СОСЕДНЕЙ ноды, и hy2 у юзера тихо переставал
+        # пускать. NULL сохраняем ради cold-path легаси-кредов.
         rows = (
             self.db.query(models.Credential, models.Device)
             .join(
@@ -3869,6 +3896,15 @@ class ProvisioningOrchestrator:
                 models.Credential.proto == hy2,
                 models.Credential.is_active.is_(True),
                 models.Device.status == models.DeviceStatus.active,
+                or_(
+                    models.Credential.node_id == node.id,
+                    models.Credential.node_id.is_(None),
+                ),
+            )
+            # Детерминированный порядок для last-wins-дедупа: кред, реально
+            # принадлежащий этой ноде, записывается ПОСЛЕДНИМ и побеждает.
+            .order_by(
+                models.Credential.node_id.is_(None).desc(), models.Credential.id
             )
             .all()
         )

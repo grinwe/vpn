@@ -182,6 +182,48 @@ def enqueue_task(task_id: int, node_id: int | None, *, force: bool = False) -> s
             # through to a fresh enqueue. Safe only because the caller has
             # established the task is stuck (DB still `pending`, well past any
             # in-flight window) — see the docstring.
+            #
+            # Сырого `DEL rq:job:<id>` НЕДОСТАТОЧНО: id остаётся лежать в списке
+            # очереди (`rq:queue:<name>`) и в регистрах, а `queue.enqueue(...,
+            # job_id=job_id)` ниже кладёт его туда ВТОРОЙ раз — воркер снимает
+            # обе копии и выполняет одну и ту же provisioning-таску дважды
+            # (возможно параллельно). Штатный путь ниже зовёт `existing.delete()`,
+            # который делает ровно это — вычищает id отовсюду; здесь
+            # воспроизводим тот же эффект вручную (аудит 2026-07-25).
+            try:
+                # count=0 — снять ВСЕ вхождения; Queue.remove() делает lrem(..,1,..)
+                # и убрал бы только первое.
+                queue.connection.lrem(queue.key, 0, job_id)
+            except Exception:  # noqa: BLE001
+                logger.debug(
+                    "enqueue_task(force): FIFO purge failed for %s", job_id,
+                    exc_info=True,
+                )
+            # Регистры достаём защищённо: набор свойств у Queue отличается
+            # между версиями RQ, и отсутствующий атрибут не должен ронять
+            # эскалацию (иначе rescue-тик перестанет расшивать зомби вовсе).
+            for _reg_name in (
+                "failed_job_registry",
+                "scheduled_job_registry",
+                "deferred_job_registry",
+            ):
+                _registry = getattr(queue, _reg_name, None)
+                if _registry is None:
+                    continue
+                try:
+                    _registry.remove(job_id)
+                except Exception:  # noqa: BLE001
+                    logger.debug(
+                        "enqueue_task(force): registry purge failed for %s (%s)",
+                        job_id, _reg_name, exc_info=True,
+                    )
+            try:
+                StartedJobRegistry(queue=queue).remove(job_id)
+            except Exception:  # noqa: BLE001
+                logger.debug(
+                    "enqueue_task(force): started-registry purge failed for %s",
+                    job_id, exc_info=True,
+                )
             try:
                 queue.connection.delete(f"rq:job:{job_id}")
             except Exception:  # noqa: BLE001
