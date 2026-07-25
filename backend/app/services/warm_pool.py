@@ -158,6 +158,7 @@ def _build_credential_text(
         _build_vless_reality_credential,
         _build_vless_ws_cdn_credential,
         _build_vless_xhttp_credential,
+        _hy2_auth,
     )
 
     if cfg.protocol == models.VPNConfigProtocol.shadowtls_ss:
@@ -169,7 +170,8 @@ def _build_credential_text(
     if cfg.protocol == models.VPNConfigProtocol.vless_xhttp:
         return _build_vless_xhttp_credential(node, cfg, user_uuid)
     if cfg.protocol == models.VPNConfigProtocol.hysteria2:
-        return _build_hysteria2_credential(node, cfg, password)
+        # Пара username:password — нода на auth.type: userpass матчит именно её.
+        return _build_hysteria2_credential(node, cfg, _hy2_auth(username, password))
     logger.warning("warm_pool: unsupported protocol %s on node %s", cfg.protocol, node.id)
     return None
 

@@ -37,15 +37,17 @@ import os
 from datetime import datetime
 from typing import Any
 
-logger = logging.getLogger(__name__)
-
 # Reuse constants/policy из traffic_stats, чтобы не дублировать.
+# (traffic_stats нас не импортирует — цикла нет, поэтому импорт на месте,
+# а не в теле функции.)
 from .traffic_stats import (
     SSH_PORT_DEFAULT,
     SSH_USER,
     SSH_CONNECT_TIMEOUT,
     _ssh_run,
 )
+
+logger = logging.getLogger(__name__)
 
 WG_DUMP_CMD = "wg show all dump"
 

@@ -73,10 +73,18 @@ def _mark_invoice_paid_core(
     (which does its own auth via HMAC signature, not admin token) can reuse
     the exact same "flip invoice to paid → provision subscription" logic.
     """
+    # populate_existing ОБЯЗАТЕЛЕН: вызывающие (lava-reconcile-тик, вебхук,
+    # telegram_webhook) уже подгрузили этот же Invoice в ту же сессию, и без
+    # него SQLAlchemy вернёт объект из identity-map — с атрибутами, прочитанными
+    # ДО взятия row-lock. Тогда проверки `status == paid` / `subscription_id`
+    # внутри критической секции смотрят на устаревшее состояние, и два
+    # параллельных зачисления (вебхук + сверка) могут оба увидеть pending
+    # (аудит 2026-07-25). Тот же приём уже применён в api/traffic.py.
     invoice = (
         db.query(models.Invoice)
         .filter(models.Invoice.id == invoice_id)
         .with_for_update()
+        .execution_options(populate_existing=True)
         .first()
     )
     if not invoice:

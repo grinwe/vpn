@@ -358,14 +358,45 @@ def _is_ip_host(host: str) -> bool:
         return False
 
 
+def _hy2_auth(username: str, password: str) -> str:
+    """Auth-строка hysteria2 в формате сервера: ``username:password``.
+
+    Нода сконфигурирована ``auth.type: userpass`` с картой
+    ``username → password`` (``install_hysteria2/templates/config.yaml.j2`` +
+    ``manage_hy2_user.sh``), а hysteria2 делит присланную клиентом auth-строку
+    по ПЕРВОМУ двоеточию. Голый пароль в userinfo (как было до 2026-07-25)
+    сервер отвергает: пары «имя → пароль» для него не существует.
+    """
+    return f"{username}:{password}"
+
+
+def _split_hy2_auth(auth: str) -> tuple[str | None, str]:
+    """Разобрать auth-строку hy2-URI обратно в ``(username, password)``.
+
+    Легаси-креды (выпущенные до 2026-07-25) несут в userinfo только пароль —
+    для них username неизвестен и возвращается ``None``, а вызывающий берёт
+    его из ``Credential.access_username``/``Device.access_username``.
+    """
+    user, sep, password = auth.partition(":")
+    if not sep:
+        return None, auth
+    return user, password
+
+
 def _build_hysteria2_credential(
-    node: models.VPNNode, config: models.VPNConfig, password: str
+    node: models.VPNNode, config: models.VPNConfig, auth: str
 ) -> str:
     """Build a Hysteria2 URI.
 
     Формат (фактически эмитируемый):
-    ``hy2://password@host:port?sni=...[&obfs=...&obfs-password=...]``
+    ``hy2://username:password@host:port?sni=...[&obfs=...&obfs-password=...]``
     ``[&insecure=1][&pinSHA256=...]#hy2-<region>``.
+
+    ``auth`` — auth-строка целиком (см. :func:`_hy2_auth`), а не голый пароль:
+    сервер на ``auth.type: userpass`` матчит именно пару. Легаси-значение без
+    двоеточия принимается как есть (такой URI не заработает, но и не сломает
+    ре-минт — :func:`rebuild_subscription_config_text` дошивает username из
+    ``access_username``).
 
     По умолчанию ``insecure``/``pinSHA256`` НЕ эмитятся — клиент строго
     верифицирует публичную цепочку (нода на ACME-серте, ``insecure=0`` по
@@ -413,7 +444,7 @@ def _build_hysteria2_credential(
     if hop:
         params["mport"] = hop
     query = "&".join([f"{k}={v}" for k, v in params.items() if v])
-    return f"hy2://{password}@{node.host}:{config.port}?{query}#hy2-{node.region}"
+    return f"hy2://{auth}@{node.host}:{config.port}?{query}#hy2-{node.region}"
 
 
 def _build_vless_xhttp_credential(
@@ -1072,23 +1103,24 @@ def _device_vless_uuid(device: models.Device) -> str | None:
     return None
 
 
-def _extract_hy2_password(
+def _extract_hy2_auth(
     config_text_enc: str, *, cred_id: int | None = None
 ) -> str | None:
-    """audit #78 — вытащить пер-юзерный hysteria2-пароль из зашифрованного
-    credential-блоба. Строки хранятся как ``hy2://<password>@host:port?...``
-    (см. :func:`_build_hysteria2_credential`); отдельной колонки под пароль
-    нет, поэтому restore-путь парсит его обратно. Пароль — token_urlsafe
-    (без ``@``/``/``), спец-энкодинга нет. ``None`` если decrypt/parse не
-    удался (одна битая строка не должна ронять весь батч)."""
+    """audit #78 — вытащить hysteria2 auth-строку из зашифрованного
+    credential-блоба. Строки хранятся как ``hy2://<username>:<password>@host``
+    (легаси — ``hy2://<password>@host``, см. :func:`_build_hysteria2_credential`);
+    отдельных колонок под них нет, поэтому restore/resync-путь парсит обратно.
+    Username и пароль — ``user-<uid>-<sid>`` и token_urlsafe (без ``@``/``/``),
+    спец-энкодинга нет. Разбор на пару — :func:`_split_hy2_auth`. ``None`` если
+    decrypt/parse не удался (одна битая строка не должна ронять весь батч)."""
     try:
         uri = decrypt(config_text_enc)
     except Exception:  # noqa: BLE001
-        logger.warning("hy2-password: decrypt failed for credential %s", cred_id)
+        logger.warning("hy2-auth: decrypt failed for credential %s", cred_id)
         return None
     match = re.match(r"^hy2://([^@/]+)@", uri)
     if not match:
-        logger.warning("hy2-password: regexp mismatch for credential %s", cred_id)
+        logger.warning("hy2-auth: regexp mismatch for credential %s", cred_id)
         return None
     return match.group(1)
 
@@ -1712,7 +1744,12 @@ class ProvisioningOrchestrator:
             # helper — they neither promote a registering node nor demote
             # an already-active one, so bypass the status transitions
             # entirely. Errors are visible via the task row.
-            if task.action in ("resync_vless", "resync_hy2"):
+            # renew_certs — такой же точечный пост-хелпер (certbot + reload
+            # nginx). Его исход НИЧЕГО не говорит о способности ноды нести
+            # трафик: провал re-issue одного домена обнулял health_score живой
+            # ноды, а успех промоутил её в active и запускал полный vless+hy2
+            # ресинк с рестартом hysteria-server (аудит 2026-07-25).
+            if task.action in ("resync_vless", "resync_hy2", "renew_certs"):
                 return
             # Diagnose is READ-ONLY (staged probe + read-only on-host play).
             # A FAILED probe of a temporarily-unreachable node must NOT zero
@@ -3045,7 +3082,10 @@ class ProvisioningOrchestrator:
             elif cfg.protocol == models.VPNConfigProtocol.vless_xhttp:
                 cred_text = _build_vless_xhttp_credential(node, cfg, str(user_uuid))
             elif cfg.protocol == models.VPNConfigProtocol.hysteria2:
-                cred_text = _build_hysteria2_credential(node, cfg, password)
+                # auth-строка целиком: сервер на userpass матчит пару, не пароль.
+                cred_text = _build_hysteria2_credential(
+                    node, cfg, _hy2_auth(username, password)
+                )
             else:
                 logger.warning("Skipping unsupported protocol %s on node %s", cfg.protocol, node.id)
                 continue
@@ -3514,8 +3554,11 @@ class ProvisioningOrchestrator:
                     node, new_config, username, secrets.token_urlsafe(12)
                 )
             else:
+                # Бэкфилл hy2 на девайс: пароль новый, username — девайсовый
+                # (нода ключует userpass именно по нему, и resync потом заберёт
+                # пару прямо из этого URI).
                 cred_text = _build_hysteria2_credential(
-                    node, new_config, secrets.token_urlsafe(12)
+                    node, new_config, _hy2_auth(username, secrets.token_urlsafe(12))
                 )
 
             # G.4: reuse the exit_id of an existing sibling credential on
@@ -3597,6 +3640,13 @@ class ProvisioningOrchestrator:
         # credentials (pre-stage-2.5, and still the default for legacy
         # subs) have Credential.node_id=NULL and would silently get
         # filtered out. Going via the subscription side catches both.
+        #
+        # НО ограничиваем узлом самого кредо: у диверсной (N×M) подписки часть
+        # кредов физически живёт на ДРУГИХ нодах, и без этого фильтра их UUID
+        # уезжали на ЭТУ ноду, а дедуп по (proto, username) мог выкинуть
+        # настоящий кред узла в пользу чужого — клиент переставал подключаться
+        # к своей же ноде (аудит 2026-07-25). NULL оставляем: ради cold-path
+        # легаси-кредов запрос и шёл через Subscription.
         assigned_rows = (
             self.db.query(models.Credential, models.Device)
             .join(
@@ -3612,6 +3662,15 @@ class ProvisioningOrchestrator:
                 models.Subscription.status == models.SubscriptionStatus.active,
                 models.Credential.proto.in_(_VLESS_FAMILY_PROTOS),
                 models.Credential.is_active.is_(True),
+                or_(
+                    models.Credential.node_id == node.id,
+                    models.Credential.node_id.is_(None),
+                ),
+            )
+            # Детерминированный порядок: «свой» кред (node_id == node.id)
+            # выигрывает дедуп у легаси-строки с NULL, а не как ляжет heap.
+            .order_by(
+                models.Credential.node_id.is_(None), models.Credential.id
             )
             .all()
         )
@@ -3815,6 +3874,12 @@ class ProvisioningOrchestrator:
         hy2 = models.VPNConfigProtocol.hysteria2.value
         # Home hy2-учётки — активная подписка ПРОПИСАНА (Subscription.node_id) на
         # этой ноде, с привязанным device.
+        #
+        # Фильтр по Credential.node_id обязателен (аудит 2026-07-25): у девайса
+        # с диверсной сабой hy2-креды лежат на РАЗНЫХ нодах под ОДНИМ
+        # access_username, а дедуп ниже — last-wins по username. Без фильтра на
+        # ноду мог уехать пароль СОСЕДНЕЙ ноды, и hy2 у юзера тихо переставал
+        # пускать. NULL сохраняем ради cold-path легаси-кредов.
         rows = (
             self.db.query(models.Credential, models.Device)
             .join(
@@ -3831,6 +3896,15 @@ class ProvisioningOrchestrator:
                 models.Credential.proto == hy2,
                 models.Credential.is_active.is_(True),
                 models.Device.status == models.DeviceStatus.active,
+                or_(
+                    models.Credential.node_id == node.id,
+                    models.Credential.node_id.is_(None),
+                ),
+            )
+            # Детерминированный порядок для last-wins-дедупа: кред, реально
+            # принадлежащий этой ноде, записывается ПОСЛЕДНИМ и побеждает.
+            .order_by(
+                models.Credential.node_id.is_(None).desc(), models.Credential.id
             )
             .all()
         )
@@ -3862,8 +3936,13 @@ class ProvisioningOrchestrator:
         )
         clients: dict[str, str] = {}
         for cred, device in [*rows, *diverse_rows]:
-            username = cred.access_username or device.access_username
-            password = _extract_hy2_password(cred.config_text, cred_id=cred.id)
+            auth = _extract_hy2_auth(cred.config_text, cred_id=cred.id)
+            # Авторитет — то, что реально лежит в клиентской ссылке: на ноду
+            # обязана уехать ТА ЖЕ пара, иначе auth не сойдётся. Легаси-кред
+            # (без username в userinfo) отдаёт None → берём access_username,
+            # как и раньше.
+            uri_username, password = _split_hy2_auth(auth) if auth else (None, "")
+            username = uri_username or cred.access_username or device.access_username
             if not username or not password:
                 logger.warning(
                     "hy2-resync: skip credential %s (no username/password)",
@@ -4063,7 +4142,10 @@ class ProvisioningOrchestrator:
             elif cfg.protocol == models.VPNConfigProtocol.vless_xhttp:
                 cred_text = _build_vless_xhttp_credential(node, cfg, str(user_uuid))
             elif cfg.protocol == models.VPNConfigProtocol.hysteria2:
-                cred_text = _build_hysteria2_credential(node, cfg, password)
+                # auth-строка целиком: сервер на userpass матчит пару, не пароль.
+                cred_text = _build_hysteria2_credential(
+                    node, cfg, _hy2_auth(username, password)
+                )
             else:
                 logger.warning("Skipping unsupported protocol %s on node %s", cfg.protocol, node.id)
                 continue
@@ -4868,7 +4950,7 @@ class ProvisioningOrchestrator:
             models.VPNConfigProtocol.vless_ws_cdn: (
                 _build_vless_ws_cdn_credential, _extract_vless_uuid),
             models.VPNConfigProtocol.hysteria2: (
-                _build_hysteria2_credential, _extract_hy2_password),
+                _build_hysteria2_credential, _extract_hy2_auth),
         }
         rebuilt = 0
         for device in subscription.devices:
@@ -4890,6 +4972,18 @@ class ProvisioningOrchestrator:
                 secret = extract(cred.config_text, cred_id=cred.id)
                 if not secret:
                     continue  # can't rebuild without the existing UUID/password
+                if cfg.protocol == models.VPNConfigProtocol.hysteria2:
+                    # Ре-минт легаси-кредов: до 2026-07-25 в userinfo клали
+                    # ГОЛЫЙ пароль, а нода ждёт пару username:password — такие
+                    # ссылки не проходили auth вообще. Пароль на ноде уже лежит
+                    # под access_username, поэтому дошиваем имя, не трогая сам
+                    # пароль (иначе разъедемся с userpass на ноде).
+                    uri_username, password = _split_hy2_auth(secret)
+                    if uri_username is None:
+                        username = cred.access_username or device.access_username
+                        if not username:
+                            continue  # некому дошить имя — оставляем как есть
+                        secret = _hy2_auth(username, password)
                 # Строим по ноде САМОГО кредо (cfg.node), а НЕ subscription.node:
                 # диверсная (N×M) подписка держит креды на РАЗНЫХ нодах. Общий
                 # subscription.node запекал IP primary-ноды во ВСЕ reality/hy2 URI

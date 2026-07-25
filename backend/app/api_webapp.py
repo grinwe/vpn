@@ -229,6 +229,14 @@ class BalanceInfo(BaseModel):
     # change in the Plan table auto-propagates without a deploy.
     trial_available: bool
     trial_amount_kopecks: int
+    # Можно ли ПОТРАТИТЬ триальный бонус на автоматическую активацию плана
+    # сразу после claim'а. False, если у юзера уже есть живая (active/frozen)
+    # подписка: ``/subscriptions/activate`` — это НЕ «докупить», а «сменить
+    # тариф» в single-sub модели (отзывает все живые подписки + ревокает
+    # девайсы + проратный возврат), поэтому авто-активация из триал-баннера
+    # снесла бы действующую подписку без подтверждения (аудит 2026-07-25).
+    # Бонус на баланс при этом зачисляется всегда — он пойдёт на продление.
+    trial_autoactivate_allowed: bool
 
 
 class DeviceSummary(BaseModel):
@@ -454,6 +462,12 @@ def webapp_me(
     from .services import trial as trial_svc
     trial_available = user.trial_activated_at is None
     trial_amount = trial_svc.trial_amount_kopecks(db) if trial_available else 0
+    # Живая подписка блокирует ТОЛЬКО авто-активацию плана из триал-баннера,
+    # не сам claim бонуса (см. BalanceInfo.trial_autoactivate_allowed).
+    # ``subs`` выше уже отфильтрован от blocked/expired, но статус проверяем
+    # явно: список — это то, что видит кабинет, а нам нужен именно факт
+    # «есть подписка, которую activate снесёт».
+    has_live_sub = any(s.status in ("active", "frozen") for s in subs)
 
     balance = BalanceInfo(
         balance_kopecks=balance_kopecks,
@@ -462,6 +476,7 @@ def webapp_me(
         has_active_balance_sub=any(e.plan_price_kopecks > 0 for e in extras),
         trial_available=trial_available,
         trial_amount_kopecks=trial_amount,
+        trial_autoactivate_allowed=trial_available and not has_live_sub,
     )
     user_out = schemas.UserOut(
         id=user.id,

@@ -134,6 +134,7 @@ WHERE trial_expires_at IS NOT NULL
 
 - `GET /api/webapp/me` возвращает `balance.trial_available: bool` и `balance.trial_amount_kopecks: int` ([api_webapp.py:229](../backend/app/api_webapp.py#L229)).
 - [webapp/src/pages/Home.tsx](../webapp/src/pages/Home.tsx) показывает карточку «🎁 Забери пробный месяц» iff `trial_available`. Тап → `POST /api/webapp/trial/activate` → refresh `/me` → баннер скрывается.
+- После claim'а бонус **автоматически тратится** на самый дешёвый месячный план (фикс воронки, `18c1d26`) — но только при `balance.trial_autoactivate_allowed=true`, т.е. когда живой подписки нет. У юзера с действующей подпиской авто-активация пропускается: `/subscriptions/activate` — это смена тарифа, он бы отозвал текущую подписку и ревокнул девайсы без подтверждения (аудит 2026-07-25, находка #1).
 - На 409 — тост «Триал уже активирован», `/me` всё равно рефрешится.
 
 ## Bot integration

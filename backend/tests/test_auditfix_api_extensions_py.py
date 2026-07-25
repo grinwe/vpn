@@ -74,7 +74,15 @@ def _setup(db):
 
 
 def _body(resp) -> str:
-    return base64.b64decode(resp.text).decode()
+    """Тело саб-ответа с ОТРЕЗАННЫМИ #fragment'ами.
+
+    С 2026-07 каждый URI несёт нейтральное имя эндпоинта («{эмодзи} V8 сервер N»,
+    коммит 75769ca) — тесты этого файла проверяют, КАКИЕ креды отданы, а не как
+    они подписаны, поэтому сравнивать удобнее без хвоста. Сам формат имени
+    покрыт в test_sub_headers.py.
+    """
+    text = base64.b64decode(resp.text).decode()
+    return "\n".join(line.split("#", 1)[0] for line in text.splitlines())
 
 
 def test_per_device_token_returns_only_that_device(client, db_session):

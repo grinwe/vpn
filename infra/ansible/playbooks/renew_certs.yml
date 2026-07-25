@@ -5,27 +5,41 @@
 # Предотвращает fleet-wide cert-пожар (инцидент 2026-07-22): истёкший LE-серт →
 # клиент рвёт TLS на xhttp → падает на Reality → DPI режет.
 #
-# cert_domains — список доменов (xhttp/ws-cdn sni). Webroot force-renewal
-# (НЕ --standalone: nginx держит :80) + ОБЯЗАТЕЛЬНЫЙ reload nginx — иначе nginx
-# продолжает отдавать протухший in-memory серт даже при свежем fullchain.pem
-# на диске. Резилиентно: падение одного домена не рвёт остальные; play падает
-# только если провалились ВСЕ.
+# cert_domains — список доменов (xhttp/ws-cdn sni). Webroot (НЕ --standalone:
+# nginx держит :80) + ОБЯЗАТЕЛЬНЫЙ reload nginx — иначе nginx продолжает отдавать
+# протухший in-memory серт даже при свежем fullchain.pem на диске.
+#
+# --force-renewal НЕ ставим по умолчанию (аудит 2026-07-25): у Let's Encrypt
+# лимит «5 дубликатов сертификата в неделю на один набор доменов», а force
+# выпускает новый серт КАЖДЫЙ раз, даже когда на диске лежит свежий. Нода, у
+# которой re-issue не помогает (битый webroot, отвалившийся DNS), при суточном
+# тике сожгла бы лимит за неделю и лишила себя возможности перевыпуститься,
+# когда причину починят. Без force certbot сам обновляет серт при <30 днях до
+# истечения — а тик дёргает нас на пороге CERT_RENEWAL_DAYS=21, т.е. всегда
+# внутри окна. Форс остаётся ручной ручкой: -e cert_force_renewal=true.
+#
+# Резилиентно: падение одного домена не рвёт остальные; play падает только если
+# провалились ВСЕ. Домены, которые НЕ обновились, перечислены в отдельной
+# задаче-предупреждении — молчаливый частичный успех прятал «одна нода
+# зацикливается на одном нечинибельном домене».
 - hosts: all
   become: true
   gather_facts: false
   vars:
     cert_domains: []
+    cert_force_renewal: false
   tasks:
     - name: Require cert_domains
       ansible.builtin.fail:
         msg: renew_certs.yml requires a non-empty cert_domains list
       when: cert_domains | length == 0
 
-    - name: Re-issue each LE cert via webroot force-renewal
+    - name: Re-issue each LE cert via webroot
       ansible.builtin.command: >-
         certbot certonly --webroot -w /var/www/acme-challenge
-        -d {{ item }} --force-renewal --non-interactive --agree-tos
+        -d {{ item }} --non-interactive --agree-tos
         --email admin@{{ item }}
+        {{ '--force-renewal' if cert_force_renewal | bool else '--keep-until-expiring' }}
       loop: "{{ cert_domains }}"
       register: _renew
       changed_when: _renew.rc == 0
@@ -36,6 +50,18 @@
         name: nginx
         state: reloaded
       failed_when: false
+
+    - name: Warn about domains certbot could not renew
+      ansible.builtin.debug:
+        msg: >-
+          certbot failed for: {{ _failed_domains | join(', ') }}
+          — нода останется на старом серте по этим доменам, разбирать вручную
+          (webroot /var/www/acme-challenge, DNS, rate-limit LE).
+      vars:
+        _failed_domains: >-
+          {{ _renew.results | rejectattr('rc', 'equalto', 0)
+             | map(attribute='item') | list }}
+      when: _renew.results | rejectattr('rc', 'equalto', 0) | list | length > 0
 
     - name: Fail if certbot errored for every domain
       ansible.builtin.fail:

@@ -46,7 +46,8 @@ Res ([MeResponse](../backend/app/api_webapp.py#L232)):
     "min_days_remaining": int | null,
     "has_active_balance_sub": bool,
     "trial_available": bool,
-    "trial_amount_kopecks": int
+    "trial_amount_kopecks": int,
+    "trial_autoactivate_allowed": bool
   },
   "subscription_extras": [SubscriptionWebAppExtra...],
   "sub_link_base_url": string
@@ -57,6 +58,7 @@ Res ([MeResponse](../backend/app/api_webapp.py#L232)):
 
 - **`min_days_remaining`** — *минимум* по всем active balance-subs, не среднее. Это то, что отображается в header card — юзер должен видеть когда кончится его **самая ранняя** подписка, не усреднённую оптимистичную оценку.
 - **`trial_available`** — `user.trial_activated_at IS NULL`. `trial_amount_kopecks` читается каждый запрос из БД (cheapest visible 30-day plan price × 100), поэтому изменение цены через `/admin/plans` автоматически подхватывается без деплоя. Если в БД нет ни одного visible 30-day плана — `trial_amount_kopecks=0` и баннер не рендерится (см. [TRIAL_SYSTEM.md](TRIAL_SYSTEM.md)).
+- **`trial_autoactivate_allowed`** — `trial_available AND` у юзера нет живой (`active`/`frozen`) подписки. Только при `true` webapp имеет право после claim'а бонуса сразу вызвать `POST /subscriptions/activate`: этот эндпоинт в single-sub модели **меняет тариф** (отзывает все живые подписки, ревокает девайсы, делает проратный возврат), поэтому тихая авто-активация у юзера с действующей подпиской снесла бы её без подтверждения (аудит 2026-07-25). Бонус на баланс зачисляется в обоих случаях.
 - **`subscription_extras[].plan_price_kopecks`** — цена плана на **один период** (месяц/год) как в `Plan.price`. Это то, что списывается при каждом renewal из кошелька (плюс опционально extra-device surcharge, см. ниже).
 - **`subscription_extras[].bundled_devices`** — `plan.max_devices` (сколько девайсов «бесплатно» идёт с тарифом).
 - **`subscription_extras[].extra_device_slots`** — платные слоты сверх бандла, **хранятся на `Subscription.extra_device_slots`** (миграция `0018_extra_device_slots`). Bumps +1 на каждом успешном add-device с платой, обнуляется только при смене тарифа или отмене. Явно **не** декрементится при remove-device — именно это чинит баг «удалил → следующий renewal дешевле», и пользовательский UI в `Home.tsx` об этом предупреждает в confirm'е.

@@ -15,8 +15,9 @@ from app.services.provisioning import (
     _build_hysteria2_credential,
     _build_vless_reality_credential,
     _build_vless_ws_cdn_credential,
-    _extract_hy2_password,
+    _extract_hy2_auth,
     _extract_vless_uuid,
+    _hy2_auth,
 )
 from tests import factories
 
@@ -178,8 +179,10 @@ def test_resync_hy2_includes_diverse_assigned(db_session):
     device = factories.make_device(db_session, sub, hy2_a, access_username="uhy2")
 
     known_pw = "SbXwKnownHy2Pw12"
-    hy2_text = _build_hysteria2_credential(node_a, hy2_a, known_pw)
-    assert _extract_hy2_password(hy2_text) == known_pw  # sanity: round-trips
+    hy2_text = _build_hysteria2_credential(node_a, hy2_a, _hy2_auth("uhy2", known_pw))
+    # sanity: round-trips как ПАРА — сервер на auth.type: userpass матчит её,
+    # а не голый пароль (аудит 2026-07-25).
+    assert _extract_hy2_auth(hy2_text) == f"uhy2:{known_pw}"
     db_session.add(models.Credential(
         subscription_id=sub.id, device_id=device.id, config_id=hy2_a.id,
         node_id=node_a.id, proto=models.VPNConfigProtocol.hysteria2.value,

@@ -28,7 +28,10 @@
     mode: '0755'
 
 - name: Install / refresh xray-core ({{ xray_core_version }})
-  ansible.builtin.command: /usr/local/bin/xray-core-fetch.sh {{ xray_core_version }}
+  ansible.builtin.command: >-
+    /usr/local/bin/xray-core-fetch.sh
+    {{ xray_core_version }}
+    {{ xray_core_sha256 | default('') }}
   register: xray_core_fetch
   changed_when: "'установлен:' in xray_core_fetch.stdout"
   failed_when: xray_core_fetch.rc != 0

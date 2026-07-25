@@ -115,6 +115,14 @@
 | `OPS_PLAN_REAPER_INTERVAL` | `300` | worker | `run_ops_plan_reaper_tick` — бэкстоп ops-агента: добивает планы, залипшие в `executing` (воркер умер / джоба убита по `job_timeout`), в `failed` с `execution.phase='crash'`. `0` — отключить (аудит-фикс #120). |
 | `OPS_PLAN_REAPER_GRACE` | `120` | worker | Запас (sec) сверх `OPS_EXECUTE_JOB_TIMEOUT` до реапа executing-плана (ожидание в очереди / clock skew). |
 | `OPS_EXECUTE_JOB_TIMEOUT` | `1800` | worker | Считается таймаутом RQ-джобы `run_ops_plan_execute` для реапера (должен совпадать с `job_timeout` enqueue'а в `api/agent.py`). |
+| `CERT_RENEWAL_INTERVAL` | `86400` | worker | `run_cert_renewal_tick` — внешняя проба TLS-expiry xhttp/ws-cdn + авто-renew LE за `CERT_RENEWAL_DAYS` до истечения (предотвращает fleet-wide cert-пожар 2026-07-22). Первый прогон после рестарта воркера — через ≤5 мин, дальше ровно этот интервал. `0` — отключить. |
+| `CERT_RENEWAL_DAYS` | `21` | worker | Порог «серт скоро истечёт» (дни до notAfter), при котором нода уходит в `renew_certs`. Держать < 30, иначе certbot откажется обновлять (`--keep-until-expiring`). |
+| `CERT_RENEWAL_MAX_PER_TICK` | `6` | worker | Cap нод на один тик, чтобы fleet-wide истечение не задогпайлило ansible. Остаток доедет следующим прогоном. |
+| `REALITY_DEST_HEALTH_INTERVAL` | `86400` | worker | `run_reality_dest_health_tick` — проба Reality-dest'ов на TLS1.3+h2 (деградировавший dest = молча мёртвый Reality, инцидент 2026-07-23). Пишет `dest_healthy`/`dest_fail_count` в `VPNConfig.settings`. `0` — отключить. |
+| `REALITY_DEST_FAIL_THRESHOLD` | `2` | worker | Сколько тиков ПОДРЯД dest должен быть битым, прежде чем он считается сломанным (и, при включённой авто-ротации, ротируется). При суточном интервале это двое суток. |
+| `REALITY_DEST_AUTO_ROTATE` | `0` | worker | Авто-ротация битого dest'а на живой из пула. Дефолт **off**: воркер пробит из NL, а geo-чувствительные dest'ы (гос-сайты) из-за границы отдают иначе → false-positive. Безопасно включать только для не-geo dest'ов или после пробы С НОДЫ. Оператор ротирует руками через `POST /nodes/{id}/refresh-reality-dest`. |
+| `REALITY_DEST_MAX_ROTATE_PER_TICK` | `3` | worker | Cap авто-ротаций за тик (действует только при `REALITY_DEST_AUTO_ROTATE=1`). |
+| `RESTORE_HY2_AFTER_REINSTALL` | `1` | backend | После полного bootstrap'а ноды перезалить hy2-учётки (роль `install_hysteria2` рендерит `auth.userpass` с нуля). Safe-default = вкл; `0` отключает. С 2026-07-25 роль ещё и сама сохраняет существующие учётки (slurp+re-inject), так что это второй пояс, а не единственный. |
 
 ## Balance billing / trial
 

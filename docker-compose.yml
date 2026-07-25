@@ -196,6 +196,27 @@ services:
       # Self-heal for stuck pending provisioning tasks.
       PENDING_RESCUE_INTERVAL: ${PENDING_RESCUE_INTERVAL:-60}
       PENDING_RESCUE_AGE: ${PENDING_RESCUE_AGE:-60}
+      # Эскалация rescue-тика: force-ре-энкью зомби-джоба и отказ от древних
+      # тасок. Без проброса дефолты кода недостижимы снаружи — «прикрутить
+      # пороги в проде» было нечем (аудит 2026-07-25).
+      PENDING_RESCUE_FORCE_AGE: ${PENDING_RESCUE_FORCE_AGE:-1800}
+      PENDING_RESCUE_ABANDON_AGE: ${PENDING_RESCUE_ABANDON_AGE:-86400}
+      # Cert-renewal тик: внешняя проба TLS-expiry xhttp/ws-cdn + авто-renew LE
+      # (против fleet-wide cert-пожара 2026-07-22). 0 = выключить.
+      CERT_RENEWAL_INTERVAL: ${CERT_RENEWAL_INTERVAL:-86400}
+      CERT_RENEWAL_DAYS: ${CERT_RENEWAL_DAYS:-21}
+      CERT_RENEWAL_MAX_PER_TICK: ${CERT_RENEWAL_MAX_PER_TICK:-6}
+      # Reality-dest health: детект деградировавших dest'ов (TLS1.3+h2).
+      # AUTO_ROTATE по умолчанию ВЫКЛ — воркер пробит из NL, geo-dest'ы
+      # false-positive'ят; это главный kill-switch фичи, и он обязан быть
+      # доступен без правки кода.
+      REALITY_DEST_HEALTH_INTERVAL: ${REALITY_DEST_HEALTH_INTERVAL:-86400}
+      REALITY_DEST_FAIL_THRESHOLD: ${REALITY_DEST_FAIL_THRESHOLD:-2}
+      REALITY_DEST_AUTO_ROTATE: ${REALITY_DEST_AUTO_ROTATE:-0}
+      REALITY_DEST_MAX_ROTATE_PER_TICK: ${REALITY_DEST_MAX_ROTATE_PER_TICK:-3}
+      # Восстановление hy2-учёток после reinstall (роль рендерит userpass
+      # заново). Safe-default = вкл.
+      RESTORE_HY2_AFTER_REINSTALL: ${RESTORE_HY2_AFTER_REINSTALL:-1}
       # Stage 9b — авто-сверка карточных платежей lava.top (вебхук-независимо).
       # Тику нужен доступ к API lava (те же LAVA_TOP_* что у backend), т.к. он
       # зовёт get_provider("lava_top") и опрашивает /api/v2/invoices.

@@ -158,8 +158,23 @@ def checkout_invoice(
     # Ownership guard: бот передаёт telegram_id вызывающего, т.к. invoice_id
     # в новом меню оплаты приходит из подделываемой callback_data. Без
     # совпадения владельца — 403 (IDOR: чужой pending-счёт не чекаутится).
+    #
+    # Guard ОБЯЗАТЕЛЕН для не-админов: эндпоинт анонимный, и пока проверка
+    # висела на `if req_tg`, она снималась простым отсутствием поля в теле —
+    # то есть защищала только честного клиента (аудит 2026-07-25). Админ
+    # (валидный X-Admin-Token) по-прежнему чекаутит любой счёт.
     req_tg = body.telegram_id if body else None
-    if req_tg and (invoice.user is None or invoice.user.telegram_id != req_tg):
+    if admin_token is None:
+        if not req_tg:
+            raise HTTPException(
+                status_code=403,
+                detail="telegram_id is required for non-admin checkout",
+            )
+        if invoice.user is None or invoice.user.telegram_id != req_tg:
+            raise HTTPException(
+                status_code=403, detail="Invoice does not belong to this user"
+            )
+    elif req_tg and (invoice.user is None or invoice.user.telegram_id != req_tg):
         raise HTTPException(status_code=403, detail="Invoice does not belong to this user")
     if invoice.status != models.InvoiceStatus.pending:
         raise HTTPException(status_code=400, detail="Invoice is not in pending state")
@@ -284,7 +299,29 @@ async def payment_webhook(
         if invoice is None:
             raise HTTPException(status_code=404, detail="Invoice not found")
 
-        if event.amount is not None:
+        if event.amount is None:
+            # Сумму провайдер не прислал / не распарсили — это «сверить нечем».
+            # Зачисляем (подпись валидна, счёт наш), но ГРОМКО: раньше эта ветка
+            # была немой, и любой сбой парсинга суммы бесшумно снимал главную
+            # проверку денежного пути (аудит 2026-07-25).
+            from ..services.admin_notify import notify_admins
+
+            logger.warning(
+                "webhook %s invoice %d: сумма отсутствует — зачисляем БЕЗ сверки суммы",
+                provider.name, invoice_id,
+            )
+            notify_admins(
+                db,
+                kind="payment_amount_unverified",
+                text=(
+                    f"⚠️ Вебхук {provider.name} по счёту #{invoice_id} пришёл без "
+                    f"суммы — счёт зачислен БЕЗ сверки. Проверить вручную."
+                ),
+                dedup_key={"invoice_id": invoice_id},
+                extra={"invoice_id": invoice_id, "provider": provider.name},
+                autocommit=True,
+            )
+        else:
             try:
                 expected_amount, expected_currency = _convert_for_provider(
                     float(invoice.amount), invoice.currency, provider.name
