@@ -20,7 +20,8 @@
 
 | переменная | default | кто читает | описание |
 |---|---|---|---|
-| `APP_SECRET_KEY` | — | backend, worker | Fernet key для шифрования credentials at rest (`security.encrypt/decrypt`). **Ротация без re-encrypt-миграции = все зашифрованные поля нечитаемы.** Ансибл-роль требует `length >= 16`. |
+| `APP_SECRET_KEY` | — | backend, worker | Fernet key для шифрования credentials at rest (`security.encrypt/decrypt`). **Обязателен: без него backend и worker НЕ СТАРТУЮТ** (аудит 2026-07-25 — раньше был тихий fallback на plaintext, и одна потерянная переменная означала запись секретов в БД открытым текстом при внешне рабочем сервисе). **Ротация без re-encrypt-миграции = все зашифрованные поля нечитаемы.** Ансибл-роль требует `length >= 16`. |
+| `ALLOW_PLAINTEXT_SECRETS` | *(пусто)* | backend, worker | Явная форточка для локальной разработки: `1` разрешает работать без `APP_SECRET_KEY`, записывая секреты открытым текстом (с warning). В проде НЕ ставить. |
 | `ADMIN_API_TOKEN` | — | backend, worker, bot | Shared secret для `X-Admin-Token` header. Используется SPA, ботом и scrape'ом Prometheus. Роль требует `length >= 20`. |
 | `ADMIN_ACTOR_HEADER` | `X-Admin-Actor` | backend | Имя header'а, откуда backend читает self-declared actor id для `AuditLog.actor`. Менять незачем. |
 | `WEBAPP_JWT_SECRET` | — | backend | HMAC-ключ hand-rolled JWT сессии Telegram Mini App. Ротация = все открытые WebApp-сессии форсят re-handshake через initData. Роль требует `length >= 32`. |

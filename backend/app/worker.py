@@ -3790,8 +3790,13 @@ def main() -> None:
     # воркера цепочка рвалась — админ видел "последний SSH 600 мин"
     # и должен был кликать кнопку заново.
     from .queue import schedule_tick
+    from .security import assert_secrets_configured
 
     configure_logging()
+    # Без APP_SECRET_KEY воркер не имеет права стартовать: он и провижинит, и
+    # ре-минтит креды, т.е. писал бы секреты в БД открытым текстом (аудит
+    # 2026-07-25). Локально форточка — ALLOW_PLAINTEXT_SECRETS=1.
+    assert_secrets_configured()
     try:
         from redis import Redis
         from rq import Queue, Worker

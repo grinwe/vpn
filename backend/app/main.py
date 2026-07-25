@@ -193,6 +193,19 @@ app.include_router(tg_webhook_router)
 
 
 @app.on_event("startup")
+def _startup_assert_secrets_configured():
+    """Падаем на старте, если нет APP_SECRET_KEY (аудит 2026-07-25).
+
+    Раньше отсутствие ключа означало тихую запись секретов в БД открытым
+    текстом — контейнер поднимался, эндпоинты отвечали, и заметить мисконфиг
+    было нечем, кроме одной warning-строки в логе.
+    """
+    from .security import assert_secrets_configured
+
+    assert_secrets_configured()
+
+
+@app.on_event("startup")
 def _startup_register_telegram_webhook():
     register_webhook()
 

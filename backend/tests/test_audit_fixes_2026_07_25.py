@@ -284,6 +284,59 @@ def test_hy2_resync_pushes_pair_from_uri(db_session):
     assert clients == [{"username": "user-rs-1", "password": "rsPass9"}]
 
 
+# ── Sec-1: без APP_SECRET_KEY процесс не стартует ────────────────────────
+
+
+def test_missing_secret_key_raises_instead_of_plaintext(monkeypatch):
+    """Отсутствие ключа раньше означало ТИХУЮ запись секретов открытым текстом:
+    контейнер поднимался, всё «работало», а в БД ложился plaintext (так в проде
+    осело 28 кредов). Теперь — отказ работать."""
+    from app import security
+
+    monkeypatch.delenv("APP_SECRET_KEY", raising=False)
+    monkeypatch.delenv("ALLOW_PLAINTEXT_SECRETS", raising=False)
+    security._cipher.cache_clear()
+    try:
+        with pytest.raises(RuntimeError, match="APP_SECRET_KEY"):
+            security.assert_secrets_configured()
+        with pytest.raises(RuntimeError, match="APP_SECRET_KEY"):
+            security.encrypt("secret-value")
+    finally:
+        security._cipher.cache_clear()
+
+
+def test_plaintext_allowed_only_with_explicit_optin(monkeypatch):
+    """Локальная разработка не должна ломаться — но «форточка» обязана быть
+    явной и осознанной, а не молчаливым дефолтом."""
+    from app import security
+
+    monkeypatch.delenv("APP_SECRET_KEY", raising=False)
+    monkeypatch.setenv("ALLOW_PLAINTEXT_SECRETS", "1")
+    security._cipher.cache_clear()
+    try:
+        security.assert_secrets_configured()  # не бросает
+        assert security.encrypt("secret-value") == "secret-value"
+    finally:
+        security._cipher.cache_clear()
+
+
+def test_encryption_roundtrip_with_key(monkeypatch):
+    """С ключом значение реально шифруется (префикс enc:v1:) и читается назад."""
+    from app import security
+
+    monkeypatch.setenv("APP_SECRET_KEY", "unit-test-key")
+    security._cipher.cache_clear()
+    try:
+        blob = security.encrypt("secret-value")
+        assert blob.startswith("enc:v1:")
+        assert security.decrypt(blob) == "secret-value"
+        # легаси-plaintext всё ещё читается как есть — иначе старые строки
+        # в БД стали бы нечитаемыми до завершения миграции
+        assert security.decrypt("vless://legacy") == "vless://legacy"
+    finally:
+        security._cipher.cache_clear()
+
+
 # ── P1: денежный путь (сверка lava, идемпотентность, IDOR) ───────────────
 
 
