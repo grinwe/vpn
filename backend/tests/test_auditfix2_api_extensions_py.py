@@ -71,7 +71,9 @@ def test_default_env_writes_subscription_fetch(client, db_session, monkeypatch):
 
     resp = client.get(f"/api/sub/{dev.sub_token}", headers={})
     assert resp.status_code == 200
-    assert base64.b64decode(resp.text).decode().strip() == "vless://node-default"
+    # URI несёт нейтральное имя эндпоинта (#«{эмодзи} V8 сервер N»,
+    # 75769ca) — здесь важен сам кред, имя проверяется в test_sub_headers.
+    assert base64.b64decode(resp.text).decode().strip().split("#")[0] == "vless://node-default"
     assert _fetch_count(db_session, dev.id) == 1
 
 
@@ -86,5 +88,7 @@ def test_sampling_skips_subscription_fetch(client, db_session, monkeypatch):
     resp = client.get(f"/api/sub/{dev.sub_token}", headers={})
     assert resp.status_code == 200
     # Клиент всё равно получает рабочий конфиг — сэмплируется только телеметрия.
-    assert base64.b64decode(resp.text).decode().strip() == "vless://node-sampled"
+    # URI несёт нейтральное имя эндпоинта (#«{эмодзи} V8 сервер N»,
+    # 75769ca) — здесь важен сам кред, имя проверяется в test_sub_headers.
+    assert base64.b64decode(resp.text).decode().strip().split("#")[0] == "vless://node-sampled"
     assert _fetch_count(db_session, dev.id) == 0
