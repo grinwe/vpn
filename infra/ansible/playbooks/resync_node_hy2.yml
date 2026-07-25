@@ -38,24 +38,44 @@
         - hy2_manage_script.stat.exists
         - clients | length > 0
 
-    # failed_when: false — падение ОДНОГО клиента не должно отменять финальный
-    # рестарт: без рестарта hysteria-server продолжает работать со старым
-    # in-memory userpass, т.е. на ноде не применились и все успешные добавления
-    # тоже (аудит 2026-07-25). Разбор провалов — задачей ниже.
-    - name: Resync hysteria2 clients
-      command: >-
-        /usr/local/sbin/manage_hy2_user.sh add {{ item.username }} {{ item.password }}
-      environment:
-        NO_RESTART: "1"
-      loop: "{{ clients }}"
-      loop_control:
-        label: "{{ item.username }}"
+    # Батч вместо цикла: каждый клиент раньше стоил отдельного SSH-раунда и
+    # отдельной перезаписи config.yaml, из-за чего время росло линейно и при
+    # ~740 учётках упёрлось бы в ANSIBLE_PLAYBOOK_TIMEOUT=300 (аудит
+    # 2026-07-25). Теперь один вызов на всю ноду.
+    - name: Push bulk client applier
+      ansible.builtin.copy:
+        src: "{{ playbook_dir }}/files/bulk_apply_clients.py"
+        dest: /usr/local/sbin/bulk_apply_clients.py
+        mode: "0750"
+      when:
+        - hy2_manage_script.stat.exists
+        - clients | length > 0
+
+    - name: Write hy2 client list (пароли — 0600, файл удаляется ниже)
+      ansible.builtin.copy:
+        content: "{{ clients | to_json }}"
+        dest: /run/resync-hy2.json
+        mode: "0600"
       no_log: true
+      when:
+        - hy2_manage_script.stat.exists
+        - clients | length > 0
+
+    - name: Resync hysteria2 clients (batch)
+      ansible.builtin.command: >-
+        /usr/local/sbin/bulk_apply_clients.py --kind hy2
+        --clients /run/resync-hy2.json
       register: _hy2_add
+      changed_when: "'применено клиентов' in _hy2_add.stdout"
       failed_when: false
       when:
         - hy2_manage_script.stat.exists
         - clients | length > 0
+
+    - name: Drop hy2 client list
+      ansible.builtin.file:
+        path: /run/resync-hy2.json
+        state: absent
 
     - name: Restart hysteria-server after resync
       systemd:
@@ -65,15 +85,16 @@
         - hy2_manage_script.stat.exists
         - clients | length > 0
 
-    # Диагностика ПОСЛЕ рестарта: сервис уже подхватил всё, что добавилось.
-    # no_log выше скрывает пароли, поэтому считаем только количество.
-    - name: Fail if any hysteria2 client could not be added
+    # Диагностика ПОСЛЕ рестарта: сервис уже подхватил всё, что применилось.
+    # Батч атомарен (конфиг пишется целиком либо не пишется), поэтому провал —
+    # это «ни одна учётка не доехала», а не частичный успех.
+    - name: Fail if the hy2 batch could not be applied
       ansible.builtin.fail:
         msg: >-
-          manage_hy2_user.sh add провалился для
-          {{ _hy2_add.results | rejectattr('rc', 'equalto', 0) | list | length }}
-          из {{ clients | length }} учёток — эти юзеры останутся без hy2.
+          bulk_apply_clients.py --kind hy2 провалился (rc={{ _hy2_add.rc }}):
+          {{ (_hy2_add.stderr | default('')) [:300] }}
+          — все {{ clients | length }} учёток остались без применения.
       when:
         - hy2_manage_script.stat.exists
         - clients | length > 0
-        - _hy2_add.results | default([]) | rejectattr('rc', 'equalto', 0) | list | length > 0
+        - _hy2_add.rc | default(0) != 0
