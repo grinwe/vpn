@@ -640,17 +640,23 @@ def _collect_site_extra_vars(
         # ── VLESS Reality ──
         elif cfg.protocol == models.VPNConfigProtocol.vless_reality:
             # Схема ключа: новая — private_key_enc (Fernet-шифр); старая (легаси-
-            # ноды ufo-ru-01/02/03, aeza) — private_key ПЛЕЙНТЕКСТОМ в settings.
+            # ноды ufo-ru-01/02/03, aeza) — private_key в поле `private_key`.
             # Читаем ОБЕ, иначе на легаси-нодах reality-роль скипается (нет ключа в
             # extra_vars → "Skip role when VLESS Reality is not configured") →
             # config.json НЕ перерендеривается: смена dest/SNI и 443-унификация
             # молча не применяются, нода висит на старом конфиге.
+            # Обе ветки идут через decrypt: миграция легаси-секретов (223dd71)
+            # зашифровала значение ПРЯМО в поле `private_key`, а не переложила в
+            # `private_key_enc`. Без decrypt на этой ветке в config.json уезжает
+            # строка `enc:v1:...` → `xray -test` падает "invalid privateKey" и
+            # бутстрап легаси-ноды валится (aeza-ru-01, ufo-ru-02 — таски
+            # 2773/2774). decrypt() на незашифрованном значении — no-op.
             priv_enc = settings.get("private_key_enc")
             priv_plain = settings.get("private_key")
             if not (priv_enc or priv_plain) or not cfg.public_key:
                 continue
             extra.update({
-                "vless_reality_private_key": decrypt(priv_enc) if priv_enc else priv_plain,
+                "vless_reality_private_key": decrypt(priv_enc or priv_plain),
                 "vless_reality_public_key": cfg.public_key,
                 "vless_reality_short_id": settings.get("short_id", ""),
                 "vless_reality_port": cfg.port,

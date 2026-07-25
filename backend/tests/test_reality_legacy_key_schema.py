@@ -47,6 +47,18 @@ def test_reality_new_encrypted_private_key(db_session):
     assert ev.get("vless_reality_private_key") == "NEW-ENCRYPTED-KEY", ev
 
 
+def test_reality_legacy_key_encrypted_in_place(db_session):
+    """Миграция легаси-секретов (223dd71) зашифровала ключ ПРЯМО в поле
+    `private_key`. Без decrypt на этой ветке в config.json уезжает `enc:v1:...`
+    → `xray -test`: invalid privateKey → бутстрап легаси-ноды падает."""
+    node = make_node(db_session, name="migrated-legacy", host="10.0.0.12")
+    cfg = make_config(db_session, node, protocol=models.VPNConfigProtocol.vless_reality)
+    _set_settings(db_session, cfg, private_key_enc=None,
+                  private_key=encrypt("MIGRATED-LEGACY-KEY"))
+    ev = _collect_site_extra_vars(db_session, node)
+    assert ev.get("vless_reality_private_key") == "MIGRATED-LEGACY-KEY", ev
+
+
 def test_reality_legacy_dest_in_camo_dest(db_session):
     """Легаси-ноды хранят reality dest в camo_dest (host:port), не в dest.
     Без fallback reality-роль падает на assert `vless_reality_dest length>0`."""
