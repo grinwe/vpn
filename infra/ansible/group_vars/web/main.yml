@@ -19,6 +19,25 @@ deploy_app_stack_payment_provider: "cryptobot"
 # kill installed clients. Worker forwards /<token> to
 # <grinwer.online>/api/sub/<token>.
 deploy_app_stack_sub_link_base_url: "{{ vault_sub_link_base_url | default('') }}"
+# Резервный фронт саб-ссылки (если основной ляжет). Пусто = фолбэка нет.
+deploy_app_stack_sub_link_fallback_base_url: "{{ vault_sub_link_fallback_base_url | default('') }}"
+
+# --- Always-on тики: kill-switch'и держим здесь, а не только в коде -------
+# Аудит 2026-07-25: эти ручки существовали лишь как os.getenv-дефолты внутри
+# worker.py — в проде выключить взбесившийся тик было нечем, кроме правки
+# кода и деплоя. Значения ниже = те же дефолты, менять по месту.
+deploy_app_stack_cert_renewal_interval: 86400   # 0 — выключить тик
+deploy_app_stack_cert_renewal_days: 21          # порог near-expiry, держать < 30
+deploy_app_stack_cert_renewal_max_per_tick: 6
+deploy_app_stack_reality_dest_health_interval: 86400  # 0 — выключить тик
+deploy_app_stack_reality_dest_fail_threshold: 2
+# ВЫКЛ осознанно: воркер пробит dest из NL, а geo-чувствительные dest'ы
+# (гос-сайты) из-за границы отдают иначе → ротация по false-positive.
+deploy_app_stack_reality_dest_auto_rotate: 0
+deploy_app_stack_reality_dest_max_rotate_per_tick: 3
+deploy_app_stack_pending_rescue_force_age: 1800
+deploy_app_stack_pending_rescue_abandon_age: 86400
+deploy_app_stack_restore_hy2_after_reinstall: 1
 
 # #53 — TTL for the Telegram initData handshake at /api/webapp/auth.
 # 300s is Telegram's recommended validation window; keep short to

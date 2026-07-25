@@ -84,6 +84,10 @@ vault_probe_agent_token: ""
 # back to the backend's own domain. See Worker code in the ops notes.
 vault_sub_link_base_url: ""
 
+# Резервный базовый URL саб-ссылки: второй фронт на случай, если основной
+# (vault_sub_link_base_url) заблокируют. Пусто = фолбэка нет.
+vault_sub_link_fallback_base_url: ""
+
 # ── WS+CDN / xhttp DNS front (Cloudflare DNS-only, no proxy) ──────────
 # Front zone for ws-cdn AND xhttp SNI — a clean, dedicated domain (NOT
 # grinwer.online, which is the admin/web domain). Default wgse.info.

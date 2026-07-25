@@ -831,16 +831,45 @@ def run_reality_dest_health_tick() -> dict:
                 session.commit()
                 if created:
                     orch.run_task_async(task, node=node)
-                subs = (
-                    session.query(models.Subscription)
+                # Ре-минт нужен ВСЕМ, у кого есть кред на этой ноде, а не
+                # только «домашним» подпискам: у диверсной (N×M) сабы
+                # Subscription.node_id указывает на другую ноду, и её креды
+                # на этой оставались со сталым SNI — тот самый «reality н/д»
+                # у диверсных юзеров (аудит 2026-07-25).
+                sub_ids = {
+                    sid
+                    for (sid,) in session.query(models.Subscription.id)
                     .filter(
                         models.Subscription.node_id == node.id,
                         models.Subscription.status
                         == models.SubscriptionStatus.active,
                     )
                     .all()
+                }
+                sub_ids.update(
+                    sid
+                    for (sid,) in session.query(models.Credential.subscription_id)
+                    .join(
+                        models.Subscription,
+                        models.Subscription.id == models.Credential.subscription_id,
+                    )
+                    .filter(
+                        models.Credential.node_id == node.id,
+                        models.Credential.is_active.is_(True),
+                        models.Subscription.status
+                        == models.SubscriptionStatus.active,
+                    )
+                    .distinct()
+                    .all()
+                    if sid is not None
                 )
-                for sub in subs:
+                for sub in (
+                    session.query(models.Subscription)
+                    .filter(models.Subscription.id.in_(sub_ids))
+                    .all()
+                    if sub_ids
+                    else []
+                ):
                     try:
                         orch.rebuild_subscription_config_text(sub)
                     except Exception:  # noqa: BLE001

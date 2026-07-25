@@ -47,6 +47,40 @@
 # port_hopping_range) → iptables хочет "start:end". DNAT в PREROUTING правит
 # dport ДО INPUT-фильтра, поэтому существующего ACCEPT на :443 достаточно —
 # отдельно диапазон в INPUT открывать не надо. Пусто = обычный одно-портовый hy2.
+# Сначала снимаем СТАРЫЕ правила хоппинга и только потом ставим актуальное:
+# правило матчится по диапазону, поэтому смена port_hopping_range (или его
+# отключение) оставляла прежний DNAT навсегда — а netfilter-persistent ниже
+# ещё и переживал его через ребут. Копились правила на все когда-либо
+# заданные диапазоны (аудит 2026-07-25). Ищем по comment'у, который сами же
+# и ставим; iptables-save|grep — потому что модуль iptables умеет удалять
+# только точно описанное правило.
+- name: Drop stale Hysteria2 port-hopping DNAT rules
+  ansible.builtin.shell: |
+    set -o pipefail
+    removed=0
+    # Актуальное правило (если хоппинг включён) не трогаем — иначе таска была
+    # бы вечно changed и на каждом прогоне пересоздавала DNAT.
+    keep_dport="{{ hysteria2_port_hopping_range | default('') | replace('-', ':') }}"
+    keep_dest=":{{ hysteria2_port | int }}"
+    while read -r rule; do
+      [ -n "$rule" ] || continue
+      if [ -n "$keep_dport" ] \
+         && [[ "$rule" == *"--dport $keep_dport "* ]] \
+         && [[ "$rule" == *"--to-destination $keep_dest"* ]]; then
+        continue
+      fi
+      # shellcheck disable=SC2086
+      if iptables -t nat -D PREROUTING ${rule#-A PREROUTING }; then
+        removed=$((removed + 1))
+      fi
+    done <<< "$(iptables-save -t nat | grep -F 'hy2-port-hopping' | grep '^-A PREROUTING' || true)"
+    echo "removed=$removed"
+  args:
+    executable: /bin/bash
+  register: _hy2_dnat_cleanup
+  changed_when: "'removed=0' not in _hy2_dnat_cleanup.stdout"
+  failed_when: false
+
 - name: Ensure Hysteria2 port-hopping DNAT (range → hysteria2_port)
   ansible.builtin.iptables:
     table: nat
