@@ -36,6 +36,11 @@ export interface BalanceInfo {
   has_active_balance_sub: boolean;
   trial_available: boolean;
   trial_amount_kopecks: number;
+  // Можно ли сразу потратить бонус на активацию плана. False, если у юзера
+  // уже есть живая подписка — /subscriptions/activate снёс бы её (сменa
+  // тарифа в single-sub модели). Опционально: старый бэк поля не отдаёт,
+  // undefined читается как «нельзя» — безопасный дефолт на время деплоя.
+  trial_autoactivate_allowed?: boolean;
 }
 
 export interface TrialActivateResponse {
