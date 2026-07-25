@@ -374,3 +374,70 @@ pre-existing `E402`, из-за которого lint-шаг CI падал ещё
 Побочная находка при проверке фикса №13: **`ghproxy.com` отдаёт 1797 байт**
 (мёртв) — первый источник в цепочке скачивания xray нерабочий, флот и так
 качает с github напрямую. Цепочку стоит пересмотреть отдельно.
+
+---
+
+## Регрессия миграции секретов и разбор (2026-07-25, вечер)
+
+Разовая миграция из `223dd71` (`scripts/encrypt_legacy_secrets.py --apply`)
+зашифровала reality-ключи **прямо в поле** `VPNConfig.settings["private_key"]`,
+а не переложила их в `private_key_enc`. Потребитель —
+`_collect_site_extra_vars` (`provisioning.py`) — читал эту «легаси-ветку» без
+`decrypt()`, поэтому в `extra_vars`, а оттуда в `config.json`, уезжала строка
+`enc:v1:…`:
+
+```
+Failed to build REALITY config. > invalid "privateKey": enc:v1:gAAAAAB…
+```
+
+`xray -test` в роли валился, `site.yml` обрывался — упали бутстрапы **2773
+(ufo-ru-02)** и **2774 (aeza-ru-01)**. Задеты ровно 4 легаси-ноды, которые
+держат ключ в старом поле: ufo-ru-01/02/03, aeza-ru-01.
+
+Коварство: роль рендерит `config.json` **до** валидации, поэтому на обеих
+нодах на диске остался битый конфиг, а живой `xray` продолжал работать со
+старым конфигом из памяти — reality упал бы при первом же рестарте, а не в
+момент падения таски.
+
+**Фикс** (`bd3a587`): обе ветки читаются через `decrypt()` — на
+незашифрованном значении это no-op, ноды вне миграции не задеты. Регресс:
+`test_reality_legacy_key_encrypted_in_place`.
+
+**Восстановление**: деплой `--tags app` → преф-чек (sha256 расшифрованного
+ключа из БД против ключа из ansible-бэкапа `config.json.*~` на ноде — совпал,
+значит клиентов не отцепит) → `POST /nodes/{10,12}/bootstrap` (таски 2777/2778
+success, авто-resync 2779–2782 success). Проверено: `xray -test` = 0, клиенты
+на месте (aeza 92, ufo-ru-02 40), `:443` SNI=dest отдаёт серт зеркала
+(`*.ozon.ru`, `*.yandex.tr`), default-ветка stream — LE-серт xhttp.
+
+### Открытые хвосты той же миграции
+
+Проверено фан-аутом по коду (14 подтверждённых находок, 5 отклонены):
+
+1. **HIGH — `api/admin_claim.py:126`**: claim-orphan ищет кред
+   `config_text ILIKE '%uuid%'`, то есть по колонке, которая теперь шифртекст →
+   эндпоинт отдаёт 404 ровно для той популяции, ради которой написан. Чинится
+   матчингом `decrypt(...)` в питоне либо денормализацией UUID в индексируемую
+   колонку.
+2. **HIGH — сама миграция покрыла 2 поля из ~9.** Остальные, куда тот же
+   silent-plaintext-баг мог уронить секрет открытым текстом, скрипт не смотрит:
+   `CloudProvider.api_token_enc`, `VPNNode.provider_root_password_enc`,
+   `WGExitNode.wg_private_key_enc` и `provider_root_password_enc`,
+   `RelayExitLink.wg_client_private_key_enc`,
+   `VPNNode.relay_config["wg_private_key_enc"]`, ss/stls-пароли. Отдельно:
+   `ensure_reality_config` пишет ключ в `private_key_enc`, а скрипт смотрит
+   только на `private_key` — то есть ключи нод, заказанных через node_spawner,
+   скрипту невидимы в принципе. Нужен скан остаточного plaintext по всем полям.
+3. **MEDIUM — `_extract_vless_uuid` / `_extract_hy2_auth`** (`provisioning.py`)
+   не проверяют результат `decrypt()` на `None` → `re.match(None)` даёт
+   `TypeError` вместо задокументированного `None`, и один нечитаемый кред
+   роняет весь ресинк/rebuild-батч вместо «skip credential N». Срабатывает при
+   рассинхроне `APP_SECRET_KEY` или одной битой строке.
+4. **MEDIUM — `_collect_site_extra_vars`**: гейт проверяет шифртекст (всегда
+   truthy), а в `extra_vars` уходит результат `decrypt()`, который может быть
+   `None` → ansible падает на `NoneType has no len()` без намёка на настоящую
+   причину. Latent: нужен ротированный ключ или `ALLOW_PLAINTEXT_SECRETS=1`.
+5. **LOW — `infra/ansible/scripts/generate_restore_sql.py`** пишет
+   `config_text` и `settings.private_key` плейнтекстом в поля, которые весь
+   остальной код пишет только через `encrypt()` → DR-восстановление вернёт
+   plaintext в БД.
