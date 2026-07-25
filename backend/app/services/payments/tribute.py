@@ -178,12 +178,21 @@ class TributeProvider:
             customer_id = "0"
 
         amount: float | None = None
-        try:
-            if inner.get("amount") is not None:
-                # smallest units (копейки/центы) → мажорные единицы.
-                amount = int(inner["amount"]) / 100
-        except (TypeError, ValueError):
-            amount = None
+        raw_amount = inner.get("amount")
+        if raw_amount is not None:
+            try:
+                # smallest units (копейки/центы) → мажорные единицы. Через
+                # float(): строковое "500.0" на int() давало ValueError → amount
+                # None → сверка суммы в payment_webhook отключалась целиком
+                # (она под `if event.amount is not None`), т.е. счёт зачислялся
+                # без проверки (аудит 2026-07-25).
+                amount = float(str(raw_amount)) / 100
+            except (TypeError, ValueError):
+                logger.warning(
+                    "tribute: не удалось распарсить сумму вебхука %r (uuid=%s) — "
+                    "сверка суммы будет невозможна", raw_amount, inner.get("uuid"),
+                )
+                amount = None
 
         return WebhookEvent(
             external_id=str(customer_id),

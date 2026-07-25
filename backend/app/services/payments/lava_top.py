@@ -37,6 +37,55 @@ DEFAULT_API_BASE = "https://gate.lava.top"
 _SUPPORTED_CURRENCIES = ("RUB", "USD", "EUR")
 
 
+def _coerce_amount(value) -> float | None:
+    """Число или строка (``"100.00"``) → float, иначе ``None``.
+
+    Платформы охотно меняют тип поля между релизами; строгий
+    ``isinstance(value, (int, float))`` превращал такую смену в тихий
+    ``amount=None``, а он на fail-open-сверке означал бы зачисление счёта без
+    проверки суммы (аудит 2026-07-25). ``bool`` отсекаем явно — он подкласс int.
+    """
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str):
+        try:
+            return float(value.replace(",", ".").strip())
+        except ValueError:
+            return None
+    return None
+
+
+def _sale_amount(item: dict) -> tuple[float | None, str | None]:
+    """Достать (сумма, валюта) продажи из строки ``GET /api/v2/invoices``.
+
+    Форма ответа платформой не зафиксирована и отличается от ответа create
+    (``amountTotal``). Пробуем известные варианты по очереди:
+    ``receipt.amount`` (фискальный чек — приезжает АСИНХРОННО, у свежей
+    продажи его может ещё не быть), ``amountTotal`` (число или объект),
+    ``amount`` верхнего уровня. Ни один не подошёл → ``(None, None)``, и
+    вызывающий обязан трактовать это как «сверить нечем», а не «сверка ок».
+    """
+    receipt = item.get("receipt") if isinstance(item.get("receipt"), dict) else {}
+    candidates: list[tuple[object, object]] = [
+        (receipt.get("amount"), receipt.get("currency")),
+    ]
+    total = item.get("amountTotal")
+    if isinstance(total, dict):
+        candidates.append((total.get("amount"), total.get("currency")))
+    else:
+        candidates.append((total, item.get("currency")))
+    candidates.append((item.get("amount"), item.get("currency")))
+
+    for raw_amount, raw_currency in candidates:
+        amount = _coerce_amount(raw_amount)
+        if amount is not None:
+            currency = raw_currency if isinstance(raw_currency, str) else None
+            return amount, currency
+    return None, None
+
+
 class LavaTopProvider:
     name = "lava_top"
 
@@ -154,14 +203,25 @@ class LavaTopProvider:
             utm = item.get("clientUtm")
             raw_id = utm.get("utm_content") if isinstance(utm, dict) else None
             invoice_id = int(raw_id) if raw_id and str(raw_id).isdigit() else None
-            receipt = item.get("receipt") if isinstance(item.get("receipt"), dict) else {}
-            amount = receipt.get("amount")
+            amount, currency = _sale_amount(item)
+            if amount is None:
+                # Сумму не нашли ни в одной известной форме — НЕ прячем это:
+                # воркер обязан отказаться зачислять (fail-closed), иначе смена
+                # формы ответа lava молча снимала бы единственную проверку суммы
+                # на основном денежном пути (аудит 2026-07-25).
+                logger.warning(
+                    "lava_top: не удалось распарсить сумму продажи %s (invoice_id=%s); "
+                    "поля: %s", item.get("id"), invoice_id, sorted(item),
+                )
             out.append(
                 {
                     "invoice_id": invoice_id,
-                    "amount": float(amount) if isinstance(amount, (int, float)) else None,
-                    "currency": receipt.get("currency"),
+                    "amount": amount,
+                    "currency": currency,
                     "contract_id": item.get("id"),
+                    "offer_id": (item.get("offer") or {}).get("id")
+                    if isinstance(item.get("offer"), dict)
+                    else item.get("offerId"),
                     "completed": str(item.get("status") or "").upper() == "COMPLETED",
                 }
             )

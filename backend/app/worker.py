@@ -302,6 +302,78 @@ def run_pending_rescue_tick() -> dict:
     return {"scanned": scanned, "rescued": rescued, "abandoned": abandoned}
 
 
+def _notify_admins_safe(session, *, kind: str, text: str, dedup_key: dict, extra: dict) -> None:
+    """notify_admins, который не может уронить тик.
+
+    Алерт — диагностика; если админ-нотификация упала (нет чата, обрыв БД),
+    это не повод оборвать сверку остальных счетов.
+    """
+    try:
+        from .services.admin_notify import notify_admins
+
+        notify_admins(
+            session,
+            kind=kind,
+            text=text,
+            dedup_key=dedup_key,
+            extra=extra,
+            autocommit=True,
+        )
+    except Exception:  # noqa: BLE001
+        logger.exception("lava_reconcile: не удалось отправить алерт %s", kind)
+
+
+def _alert_stale_lava_sale(session, invoice, sale: dict) -> None:
+    """COMPLETED-продажа по счёту, который уже НЕ pending.
+
+    Два разных случая, и оба до 2026-07-25 были невидимы:
+    * счёт уже ``paid``, а по нему висит ЖИВАЯ pending-строка lava-платежа —
+      значит человек заплатил второй раз (двойная оплата, деньги надо вернуть);
+    * счёт ``cancelled``/``expired``, а платёж прошёл — деньги списаны за
+      неактивный счёт.
+    """
+    from . import models
+
+    contract_id = str(sale.get("contract_id") or "").strip()
+    if invoice.status == models.InvoiceStatus.paid:
+        duplicate = (
+            session.query(models.Payment)
+            .filter(
+                models.Payment.invoice_id == invoice.id,
+                models.Payment.provider == "lava_top",
+                models.Payment.status == models.PaymentStatus.pending,
+            )
+            .first()
+        )
+        if duplicate is None:
+            return  # штатная идемпотентность: наш же платёж уже зачтён
+        text = (
+            f"⚠️ lava.top: счёт #{invoice.id} уже оплачен, но пришла ещё одна "
+            f"завершённая продажа {contract_id or '?'} — похоже на ДВОЙНУЮ оплату. "
+            f"Проверить и вернуть лишнее."
+        )
+        kind = "payment_double_paid"
+    else:
+        text = (
+            f"⚠️ lava.top: продажа {contract_id or '?'} завершена, а счёт "
+            f"#{invoice.id} в статусе {invoice.status.value} — деньги списаны за "
+            f"неактивный счёт. Разобрать вручную."
+        )
+        kind = "payment_for_inactive_invoice"
+    logger.warning("lava_reconcile: %s (invoice %s)", kind, invoice.id)
+    _notify_admins_safe(
+        session,
+        kind=kind,
+        text=text,
+        dedup_key={"invoice_id": invoice.id, "contract_id": contract_id},
+        extra={
+            "invoice_id": invoice.id,
+            "contract_id": contract_id,
+            "invoice_status": invoice.status.value,
+        },
+    )
+
+
 def run_lava_reconcile_tick() -> dict:
     """Webhook-independent reconcile для карточных платежей lava.top.
 
@@ -356,30 +428,94 @@ def run_lava_reconcile_tick() -> dict:
                 continue
             inv_id = sale["invoice_id"]
             invoice = session.get(models.Invoice, inv_id)
-            if invoice is None or invoice.status != models.InvoiceStatus.pending:
+            if invoice is None:
+                continue
+            if invoice.status != models.InvoiceStatus.pending:
+                # Раньше здесь был немой continue. Но вебхук в проде не долетает,
+                # т.е. сверка — ЕДИНСТВЕННЫЙ канал, который видит карточные
+                # платежи: «оплатил поверх уже оплаченного/отменённого счёта»
+                # не замечал никто, и алерт payment_double_paid был мёртв на
+                # основном денежном пути (аудит 2026-07-25). Дискриминатор тот
+                # же, что в вебхуке: живая pending Payment-строка = НОВЫЙ платёж.
+                _alert_stale_lava_sale(session, invoice, sale)
                 continue
             checked += 1
             # Сверка суммы (RUB↔RUB, как в webhook): продажа lava должна
             # покрывать сумму счёта — иначе не зачисляем (частичная оплата).
+            # FAIL-CLOSED: сумма, которую не удалось распарсить, — это «сверить
+            # нечем», а не «сверка пройдена». Раньше `is not None` в условии
+            # означал, что None (пустой ещё фискальный чек, строковая сумма,
+            # переименованное поле) зачисляет счёт ЦЕЛИКОМ без единой проверки.
             sale_amount = sale.get("amount")
-            if sale_amount is not None and float(sale_amount) + 0.01 < float(invoice.amount):
+            if sale_amount is None:
+                logger.warning(
+                    "lava_reconcile: invoice %s — сумма продажи %s не распарсилась, "
+                    "НЕ зачисляем (ручная сверка)", inv_id, sale.get("contract_id"),
+                )
+                _notify_admins_safe(
+                    session,
+                    kind="payment_amount_unverified",
+                    text=(
+                        f"⚠️ lava.top: продажа {sale.get('contract_id')} по счёту "
+                        f"#{inv_id} завершена, но сумму сверить не удалось — счёт "
+                        f"оставлен pending. Проверить вручную (форма ответа "
+                        f"/api/v2/invoices могла измениться)."
+                    ),
+                    dedup_key={"invoice_id": inv_id},
+                    extra={"invoice_id": inv_id, "contract_id": sale.get("contract_id")},
+                )
+                continue
+            if float(sale_amount) + 0.01 < float(invoice.amount):
                 logger.warning(
                     "lava_reconcile: invoice %s underpaid (lava=%s, invoice=%s) — skip",
                     inv_id, sale_amount, invoice.amount,
                 )
                 continue
-            # Помечаем ту же pending Payment-строку, что создал webapp_topup
-            # (provider=lava_top), чтобы её external_id/статус сошлись.
-            pending_payment = (
-                session.query(models.Payment)
-                .filter(
-                    models.Payment.invoice_id == inv_id,
-                    models.Payment.provider == "lava_top",
-                    models.Payment.status == models.PaymentStatus.pending,
+            sale_currency = (sale.get("currency") or "").strip().upper()
+            invoice_currency = (invoice.currency or "").strip().upper()
+            if sale_currency and invoice_currency and sale_currency != invoice_currency:
+                logger.warning(
+                    "lava_reconcile: invoice %s currency mismatch (lava=%s, invoice=%s) — skip",
+                    inv_id, sale_currency, invoice_currency,
                 )
-                .order_by(models.Payment.id.desc())
-                .first()
-            )
+                continue
+            expected_offer = (os.getenv("LAVA_TOP_OFFER_ID") or "").strip()
+            sale_offer = str(sale.get("offer_id") or "").strip()
+            if expected_offer and sale_offer and sale_offer != expected_offer:
+                logger.warning(
+                    "lava_reconcile: invoice %s — продажа по ЧУЖОМУ офферу %s "
+                    "(ожидался %s) — skip", inv_id, sale_offer, expected_offer,
+                )
+                continue
+            # Помечаем ту же pending Payment-строку, что создал webapp_topup
+            # (provider=lava_top). Приоритет — матч по contract_id: он лежит в
+            # Payment.external_id с момента checkout'а, и это единственная
+            # надёжная привязка продажи к НАШЕМУ чекауту. Слепой «последний
+            # pending по id DESC» — тот же дефект, что чинили для вебхука (#117).
+            contract_id = str(sale.get("contract_id") or "").strip()
+            pending_payment = None
+            if contract_id:
+                pending_payment = (
+                    session.query(models.Payment)
+                    .filter(
+                        models.Payment.invoice_id == inv_id,
+                        models.Payment.provider == "lava_top",
+                        models.Payment.external_id == contract_id,
+                    )
+                    .order_by(models.Payment.id.desc())
+                    .first()
+                )
+            if pending_payment is None:
+                pending_payment = (
+                    session.query(models.Payment)
+                    .filter(
+                        models.Payment.invoice_id == inv_id,
+                        models.Payment.provider == "lava_top",
+                        models.Payment.status == models.PaymentStatus.pending,
+                    )
+                    .order_by(models.Payment.id.desc())
+                    .first()
+                )
             payment_id = pending_payment.id if pending_payment else None
             try:
                 _mark_invoice_paid_core(

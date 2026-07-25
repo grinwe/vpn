@@ -257,6 +257,191 @@ def test_hy2_resync_pushes_pair_from_uri(db_session):
     assert clients == [{"username": "user-rs-1", "password": "rsPass9"}]
 
 
+# ── P1: денежный путь (сверка lava, идемпотентность, IDOR) ───────────────
+
+
+class _FakeLavaProvider:
+    name = "lava_top"
+
+    def __init__(self, rows):
+        self._rows = rows
+
+    def list_recent_invoices(self):
+        return self._rows
+
+
+def _patch_lava(monkeypatch, rows):
+    monkeypatch.setenv("LAVA_TOP_API_KEY", "x")
+    monkeypatch.setattr("app.queue.schedule_tick", lambda *a, **k: None)
+    monkeypatch.setattr(
+        "app.services.payments.get_provider", lambda name=None: _FakeLavaProvider(rows)
+    )
+
+
+def _pending_topup(db, user, *, amount=100.0):
+    from app import models
+
+    inv = models.Invoice(
+        user_id=user.id, amount=amount, currency="RUB", kind="topup",
+        status=models.InvoiceStatus.pending,
+    )
+    db.add(inv)
+    db.commit()
+    db.refresh(inv)
+    return inv
+
+
+def test_reconcile_does_not_credit_when_amount_unparsable(db_session, monkeypatch):
+    """Находка #7 (high): сверка суммы стояла под ``amount is not None``, т.е.
+    непарсимая/отсутствующая сумма (пустой ещё фискальный чек, строковое поле,
+    переименование в API) ЗАЧИСЛЯЛА счёт целиком без единой проверки. Должно
+    быть fail-closed: не зачисляем и зовём админа."""
+    from app import models
+
+    user = make_user(db_session, telegram_id="lava-noamount")
+    inv = _pending_topup(db_session, user, amount=5000.0)
+    before = user.balance_kopecks or 0
+
+    _patch_lava(monkeypatch, [
+        {"invoice_id": inv.id, "amount": None, "currency": "RUB",
+         "contract_id": "c-noamount", "completed": True},
+    ])
+
+    res = worker.run_lava_reconcile_tick()
+
+    assert res["credited"] == 0
+    db_session.expire_all()
+    assert db_session.get(models.Invoice, inv.id).status == models.InvoiceStatus.pending
+    assert (db_session.get(models.User, user.id).balance_kopecks or 0) == before
+
+
+def test_reconcile_skips_foreign_currency(db_session, monkeypatch):
+    """Валюта продажи не сверялась вовсе — 100 USD закрывали счёт на 100 ₽."""
+    from app import models
+
+    user = make_user(db_session, telegram_id="lava-cur")
+    inv = _pending_topup(db_session, user, amount=100.0)
+
+    _patch_lava(monkeypatch, [
+        {"invoice_id": inv.id, "amount": 100.0, "currency": "USD",
+         "contract_id": "c-cur", "completed": True},
+    ])
+
+    res = worker.run_lava_reconcile_tick()
+
+    assert res["credited"] == 0
+    db_session.expire_all()
+    assert db_session.get(models.Invoice, inv.id).status == models.InvoiceStatus.pending
+
+
+def test_reconcile_alerts_on_sale_for_already_paid_invoice(db_session, monkeypatch):
+    """Находка #6 (high): не-pending счёт пропускался немым continue. При
+    неработающем вебхуке сверка — единственный канал, видящий карточные
+    платежи, поэтому двойная оплата не замечалась вообще."""
+    from app import models
+
+    user = make_user(db_session, telegram_id="lava-double")
+    inv = _pending_topup(db_session, user, amount=100.0)
+    inv.status = models.InvoiceStatus.paid
+    db_session.add(models.Payment(
+        invoice_id=inv.id, provider="lava_top",
+        external_id="c-second", amount=100.0, currency="RUB",
+        status=models.PaymentStatus.pending,
+    ))
+    db_session.commit()
+
+    alerts: list[str] = []
+    monkeypatch.setattr(
+        "app.services.admin_notify.notify_admins",
+        lambda db, *, kind, text, dedup_key=None, extra=None, autocommit=False: (
+            alerts.append(kind)
+        ),
+    )
+    _patch_lava(monkeypatch, [
+        {"invoice_id": inv.id, "amount": 100.0, "currency": "RUB",
+         "contract_id": "c-second", "completed": True},
+    ])
+
+    worker.run_lava_reconcile_tick()
+
+    assert "payment_double_paid" in alerts
+
+
+def test_reconcile_matches_payment_row_by_contract_id(db_session, monkeypatch):
+    """Находка #8: помечалась «последняя pending по id DESC», хотя
+    contract_id продажи лежит в Payment.external_id с момента checkout'а."""
+    from app import models
+
+    user = make_user(db_session, telegram_id="lava-contract")
+    inv = _pending_topup(db_session, user, amount=100.0)
+    ours = models.Payment(
+        invoice_id=inv.id, provider="lava_top",
+        external_id="c-ours", amount=100.0, currency="RUB",
+        status=models.PaymentStatus.pending,
+    )
+    other = models.Payment(
+        invoice_id=inv.id, provider="lava_top",
+        external_id="c-other", amount=100.0, currency="RUB",
+        status=models.PaymentStatus.pending,
+    )
+    db_session.add_all([ours, other])
+    db_session.commit()
+    # other создан последним → слепой «id DESC» выбрал бы именно его.
+    assert other.id > ours.id
+
+    _patch_lava(monkeypatch, [
+        {"invoice_id": inv.id, "amount": 100.0, "currency": "RUB",
+         "contract_id": "c-ours", "completed": True},
+    ])
+
+    worker.run_lava_reconcile_tick()
+
+    db_session.expire_all()
+    assert db_session.get(models.Payment, ours.id).status == models.PaymentStatus.paid
+    assert db_session.get(models.Payment, other.id).status == models.PaymentStatus.pending
+
+
+def test_lava_sale_amount_accepts_string_and_alternative_fields():
+    """Строковая сумма и форма ``amountTotal`` больше не читаются как None."""
+    from app.services.payments.lava_top import _coerce_amount, _sale_amount
+
+    assert _coerce_amount("100.00") == 100.0
+    assert _coerce_amount(True) is None
+    assert _coerce_amount("nope") is None
+    assert _sale_amount({"receipt": {"amount": 50, "currency": "RUB"}}) == (50.0, "RUB")
+    assert _sale_amount({"amountTotal": {"amount": "75.5", "currency": "RUB"}}) == (
+        75.5, "RUB",
+    )
+    assert _sale_amount({"amount": 12, "currency": "USD"}) == (12.0, "USD")
+    assert _sale_amount({"status": "COMPLETED"}) == (None, None)
+
+
+def test_checkout_requires_ownership_proof_for_anonymous_caller(client, db_session):
+    """Находка #10: ownership-guard стоял под ``if req_tg``, т.е. снимался
+    отсутствием поля в теле, а эндпоинт анонимный."""
+    from app import models
+
+    victim = make_user(db_session, telegram_id="tg-victim")
+    inv = _pending_topup(db_session, victim, amount=100.0)
+
+    # Фикстура client ходит с админ-токеном; здесь нужен именно анонимный
+    # вызов — эндпоинт открыт наружу без него.
+    anon = {"X-Admin-Token": ""}
+
+    # Без telegram_id вообще — раньше проходило дальше и создавало чекаут.
+    res = client.post(f"/api/invoices/{inv.id}/checkout", json={}, headers=anon)
+    assert res.status_code == 403, res.text
+
+    # С ЧУЖИМ telegram_id — 403 и раньше, проверяем что не сломали.
+    res2 = client.post(
+        f"/api/invoices/{inv.id}/checkout",
+        json={"telegram_id": "tg-attacker"},
+        headers=anon,
+    )
+    assert res2.status_code == 403, res2.text
+    assert db_session.get(models.Invoice, inv.id).status == models.InvoiceStatus.pending
+
+
 def test_cert_renewal_tick_disabled_by_zero_interval(monkeypatch):
     """CERT_RENEWAL_INTERVAL=0 — задокументированный kill-switch: тик не
     перепланирует себя и затухает."""
