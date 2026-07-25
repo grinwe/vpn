@@ -1752,6 +1752,12 @@ def run_retention_tick() -> dict:
             cond = or_(
                 models.AuditLog.action == "subscription_fetch",
                 models.AuditLog.action.like("%:delivered"),
+                # webapp_open пишется на КАЖДОЕ открытие кабинета (обмен
+                # initData на JWT), т.е. растёт быстрее всего остального —
+                # без чистки таблица распухнет так же, как от
+                # subscription_fetch. Онбординг-воронка считается по свежим
+                # когортам, поэтому 90 дней истории достаточно.
+                models.AuditLog.action == "webapp_open",
             )
             for _ in range(max_batches):
                 ids = [

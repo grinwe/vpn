@@ -284,6 +284,83 @@ def test_hy2_resync_pushes_pair_from_uri(db_session):
     assert clients == [{"username": "user-rs-1", "password": "rsPass9"}]
 
 
+# ── E0: онбординг-телеметрия ─────────────────────────────────────────────
+
+
+def test_webapp_auth_writes_open_event(client, db_session, monkeypatch):
+    """E0.1: открытие кабинета обязано оседать в аудите. Без этого воронка
+    обрывается на /start и «не дошёл до Mini App» неотличимо от «открыл и
+    ушёл» — а это разные проблемы с разными фиксами.
+
+    conftest намеренно вычищает BOT_TOKEN (чтобы pytest не перенастроил вебхук
+    живого бота), поэтому подпись initData не собрать — подменяем проверку
+    целиком: тест про телеметрию, а не про криптографию (её проверяют
+    отдельные тесты initData)."""
+    import json as _json
+
+    from app import models
+    from app.config import get_settings
+
+    settings = get_settings()
+    monkeypatch.setattr(settings, "bot_token", "123456:test", raising=False)
+    monkeypatch.setattr(
+        "app.api_webapp._verify_init_data",
+        lambda *a, **k: {"user": _json.dumps({"id": 770001})},
+    )
+
+    res = client.post("/api/webapp/auth", json={"init_data": "stub"})
+    assert res.status_code == 200, res.text
+    user_id = res.json()["user_id"]
+
+    events = (
+        db_session.query(models.AuditLog)
+        .filter(models.AuditLog.action == "webapp_open",
+                models.AuditLog.target_id == user_id)
+        .all()
+    )
+    assert len(events) == 1, "открытие кабинета не залогировано"
+    assert events[0].actor_type == models.AuditActor.user
+
+
+def test_trial_activation_outcome_is_audited(client, db_session):
+    """E0.2: пишем ИСХОД активации, а не только успех — повторный тап должен
+    оставлять след, иначе «тапнул, но ничего не получил» невидимо."""
+    from app import models
+
+    user = make_user(db_session, telegram_id="tg-trial-audit")
+    make_plan(db_session, name="trial-plan-audit")
+
+    res = client.post("/api/webapp/trial/activate", headers=_auth_headers(user.id))
+    assert res.status_code in (200, 503), res.text
+
+    if res.status_code == 200:
+        ok = (
+            db_session.query(models.AuditLog)
+            .filter(models.AuditLog.action == "trial_activated",
+                    models.AuditLog.target_id == user.id)
+            .all()
+        )
+        assert len(ok) == 1, "успешная активация не залогирована"
+        # Повторный тап — 409 и отдельная запись об отказе.
+        again = client.post("/api/webapp/trial/activate", headers=_auth_headers(user.id))
+        assert again.status_code == 409
+        rejected = (
+            db_session.query(models.AuditLog)
+            .filter(models.AuditLog.action == "trial_activate_rejected",
+                    models.AuditLog.target_id == user.id)
+            .all()
+        )
+        assert rejected, "отказ активации не залогирован"
+    else:
+        rejected = (
+            db_session.query(models.AuditLog)
+            .filter(models.AuditLog.action == "trial_activate_rejected",
+                    models.AuditLog.target_id == user.id)
+            .all()
+        )
+        assert rejected and rejected[0].extra.get("reason") == "no_trial_plan"
+
+
 # ── Sec-1: без APP_SECRET_KEY процесс не стартует ────────────────────────
 
 

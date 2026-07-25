@@ -30,6 +30,7 @@ from sqlalchemy.orm import Session
 
 from . import models, schemas
 from .api import _subscriptions_for_user
+from .api._common import _audit
 from .config import get_settings
 from .db import SessionLocal
 from .rate_limit import limiter
@@ -198,11 +199,33 @@ def webapp_auth(request: Request, body: AuthRequest, db: Session = Depends(get_d
         .filter(models.User.telegram_id == telegram_id)
         .one_or_none()
     )
+    created_here = user is None
     if user is None:
         user = models.User(telegram_id=telegram_id)
         db.add(user)
         db.commit()
         db.refresh(user)
+
+    # Онбординг-телеметрия (роадмап E0.1): единственная точка, где видно, что
+    # человек РЕАЛЬНО открыл кабинет. До этого воронка обрывалась на /start:
+    # нельзя было отличить «не дошёл до Mini App» от «открыл и ушёл», а это
+    # разные проблемы с разными фиксами. Пишем на каждый /auth (он же обмен
+    # initData на JWT, т.е. фактически «открыл приложение»); первое открытие
+    # ищется как MIN(created_at) по этому action.
+    try:
+        _audit(
+            db,
+            f"tg:{telegram_id}",
+            "webapp_open",
+            "user",
+            user.id,
+            metadata={"first_seen_here": created_here},
+            actor_type=models.AuditActor.user,
+        )
+    except Exception:  # noqa: BLE001
+        # Телеметрия не имеет права мешать входу в кабинет.
+        db.rollback()
+        logger.exception("webapp_open audit failed for user %s", user.id)
 
     token = issue_token(user.id, settings.webapp_jwt_secret, settings.webapp_jwt_ttl_seconds)
     return AuthResponse(
@@ -894,12 +917,27 @@ def webapp_activate_trial(
     """
     from .services import trial as trial_svc
 
+    # Онбординг-телеметрия (роадмап E0.2): фиксируем ИСХОД, а не только успех.
+    # Без этого «тапнул, но ничего не получил» неотличимо от «не тапал»: до
+    # 2026-07-25 провал активации в webapp уходил в console.warn и нигде не
+    # оседал, хотя это ровно то место, где юзер уходит навсегда.
     try:
         result = trial_svc.activate_trial(db, user.id)
     except trial_svc.TrialAlreadyActivated:
+        _audit(db, f"user:{user.id}", "trial_activate_rejected", "user", user.id,
+               metadata={"reason": "already_activated"},
+               actor_type=models.AuditActor.user)
         raise HTTPException(status_code=409, detail="Trial already activated")
     except trial_svc.NoTrialPlan:
+        # Не ошибка юзера: в БД нет видимого 30-дневного плана, т.е. оффер
+        # физически невыполним, а баннер при этом мог показываться.
+        _audit(db, f"user:{user.id}", "trial_activate_rejected", "user", user.id,
+               metadata={"reason": "no_trial_plan"},
+               actor_type=models.AuditActor.user)
         raise HTTPException(status_code=503, detail="No trial plan configured")
+    _audit(db, f"user:{user.id}", "trial_activated", "user", user.id,
+           metadata={"amount_kopecks": result.trial_amount_kopecks},
+           actor_type=models.AuditActor.user, commit=False)
     db.commit()
     return TrialActivateWebAppResponse(
         trial_amount_kopecks=result.trial_amount_kopecks,
