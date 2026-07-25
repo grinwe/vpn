@@ -4,6 +4,10 @@
 каждый тест назван по номеру находки, чтобы связь «находка → защита» не
 терялась при последующих правках.
 """
+import pytest
+
+from app import queue as q
+from app import worker
 from app.api_webapp import issue_token
 from app.config import get_settings
 
@@ -64,3 +68,100 @@ def test_trial_autoactivate_false_after_trial_claimed(client, db_session):
     balance = res.json()["balance"]
     assert balance["trial_available"] is False
     assert balance["trial_autoactivate_allowed"] is False
+
+
+# ── P0-2: self-reschedule always-on тиков ────────────────────────────────
+
+
+class _EmptySession:
+    """Сессия-заглушка: тик доходит до выборки, находит пусто и выходит."""
+
+    def query(self, *a, **k):
+        return self
+
+    def join(self, *a, **k):
+        return self
+
+    def filter(self, *a, **k):
+        return self
+
+    def all(self):
+        return []
+
+    def commit(self):
+        pass
+
+    def close(self):
+        pass
+
+
+@pytest.mark.parametrize(
+    "tick, env_var, default_interval",
+    [
+        (worker.run_cert_renewal_tick, "CERT_RENEWAL_INTERVAL", 86400),
+        (
+            worker.run_reality_dest_health_tick,
+            "REALITY_DEST_HEALTH_INTERVAL",
+            86400,
+        ),
+    ],
+)
+def test_always_on_ticks_reschedule_with_full_interval(
+    monkeypatch, tick, env_var, default_interval
+):
+    """Находки #2/#4 (high): в теле тика self-reschedule шёл с
+    ``min(interval, 300)`` — clamp из bootstrap-ветки, где он означает «первый
+    прогон ≤5 мин». В теле это давало certbot --force-renewal каждые 5 минут
+    (лимит LE «5 дубликатов в неделю») и dest-порог «2 раза подряд» = 10 минут
+    вместо двух суток. Плюс ``schedule_tick`` вообще не был импортирован в этих
+    двух функциях: NameError глотался except'ом → тик не перепланировался
+    никогда. Тест ловит оба: вызов состоялся И период не обрезан."""
+    calls: list[tuple[str, int]] = []
+    monkeypatch.setattr(
+        q, "schedule_tick",
+        lambda path, delay, **kw: calls.append((path, delay)),
+    )
+    monkeypatch.setattr("app.db.SessionLocal", _EmptySession)
+    monkeypatch.delenv(env_var, raising=False)
+
+    tick()
+
+    assert calls, (
+        f"{tick.__name__} не перепланировал себя — self-reschedule мёртв "
+        "(проверь импорт schedule_tick внутри функции)"
+    )
+    _path, delay = calls[0]
+    assert delay == default_interval, (
+        f"{tick.__name__} перепланировался через {delay}с вместо "
+        f"{default_interval}с — вернулся clamp min(interval, 300)"
+    )
+
+
+def test_cert_renewal_tick_honours_custom_interval(monkeypatch):
+    """Кастомный CERT_RENEWAL_INTERVAL должен доезжать до планировщика
+    как есть — иначе kill-switch/замедление тика через env не работает."""
+    calls: list[int] = []
+    monkeypatch.setattr(
+        q, "schedule_tick", lambda path, delay, **kw: calls.append(delay)
+    )
+    monkeypatch.setattr("app.db.SessionLocal", _EmptySession)
+    monkeypatch.setenv("CERT_RENEWAL_INTERVAL", "43200")
+
+    worker.run_cert_renewal_tick()
+
+    assert calls == [43200]
+
+
+def test_cert_renewal_tick_disabled_by_zero_interval(monkeypatch):
+    """CERT_RENEWAL_INTERVAL=0 — задокументированный kill-switch: тик не
+    перепланирует себя и затухает."""
+    calls: list[int] = []
+    monkeypatch.setattr(
+        q, "schedule_tick", lambda path, delay, **kw: calls.append(delay)
+    )
+    monkeypatch.setattr("app.db.SessionLocal", _EmptySession)
+    monkeypatch.setenv("CERT_RENEWAL_INTERVAL", "0")
+
+    worker.run_cert_renewal_tick()
+
+    assert calls == []

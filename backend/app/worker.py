@@ -454,15 +454,24 @@ def run_cert_renewal_tick() -> dict:
 
     from .db import SessionLocal
     from . import models
+    from .queue import schedule_tick
     from .services.provisioning import ProvisioningOrchestrator
     from .time_utils import utcnow
 
     interval = _env_int("CERT_RENEWAL_INTERVAL", 86400)
     if interval > 0:
         try:
+            # Голый interval, БЕЗ min(..., 300): clamp принадлежит только
+            # bootstrap-ветке main() («первый прогон ≤5 мин»). В теле тика он
+            # означал бы certbot --force-renewal каждые 5 минут до 6 нод за
+            # прогон → упор в лимит LE «5 дубликатов серта в неделю» за час
+            # (аудит 2026-07-25). До фикса это не стреляло только потому, что
+            # schedule_tick здесь не был импортирован и вызов молча падал
+            # NameError'ом в except ниже — т.е. тик вообще не перепланировался
+            # и работал один раз за жизнь контейнера.
             schedule_tick(
                 "app.worker.run_cert_renewal_tick",
-                min(interval, 300),
+                interval,
                 tick_id="tick-cert-renewal",
                 replace=True,
             )
@@ -584,6 +593,7 @@ def run_reality_dest_health_tick() -> dict:
 
     from .db import SessionLocal
     from . import models
+    from .queue import schedule_tick
     from .services.node_spawner import pick_reality_sni
     from .services.provisioning import ProvisioningOrchestrator
     from .services.warm_pool import invalidate_node_warm_pool
@@ -592,9 +602,14 @@ def run_reality_dest_health_tick() -> dict:
     interval = _env_int("REALITY_DEST_HEALTH_INTERVAL", 86400)
     if interval > 0:
         try:
+            # Голый interval (см. run_cert_renewal_tick): с min(..., 300)
+            # порог REALITY_DEST_FAIL_THRESHOLD=2 «два раза ПОДРЯД» означал бы
+            # 10 минут вместо двух суток, а при REALITY_DEST_AUTO_ROTATE=1 —
+            # ротацию до 3 нод каждые 5 минут. Плюс schedule_tick здесь не был
+            # импортирован — тик не перепланировался вовсе (аудит 2026-07-25).
             schedule_tick(
                 "app.worker.run_reality_dest_health_tick",
-                min(interval, 300),
+                interval,
                 tick_id="tick-reality-dest-health",
                 replace=True,
             )
