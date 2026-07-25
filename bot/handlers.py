@@ -20,6 +20,20 @@ from .config import (
     SUB_LINK_BASE_URL,
     TELEGRAM_STARS_WEBHOOK_SECRET,
 )
+from .keyboards import (
+    BTN_BUY,
+    BTN_HELP,
+    BTN_INVITE,
+    BTN_MAIN_MENU,
+    BTN_TOPUP,
+    BTN_VPN_BROKEN,
+    help_back_keyboard,
+    help_keyboard,
+    onboarding_keyboard,
+    start_keyboard,
+    webapp_inline_keyboard,
+    welcome_action_keyboard,
+)
 
 # Stage 9b — человекочитаемые подписи кнопок выбора способа оплаты.
 # Неизвестное имя провайдера показывается как есть (кнопка всё равно
@@ -72,21 +86,6 @@ def _build_sub_url(sub_token: str | None) -> str | None:
         if parsed.scheme and parsed.netloc:
             return f"{parsed.scheme}://{parsed.netloc}/api/sub/{sub_token}"
     return None
-from .keyboards import (
-    BTN_BUY,
-    BTN_HELP,
-    BTN_INVITE,
-    BTN_MAIN_MENU,
-    BTN_TOPUP,
-    BTN_VPN_BROKEN,
-    help_back_keyboard,
-    help_keyboard,
-    onboarding_keyboard,
-    start_keyboard,
-    webapp_inline_keyboard,
-    welcome_action_keyboard,
-)
-
 router = Router()
 logger = logging.getLogger(__name__)
 
