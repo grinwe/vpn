@@ -557,22 +557,28 @@ def _validate_extra_vars(extra: dict[str, Any], *, node_hint: str) -> None:
     the provisioning task fails loudly rather than silently running a
     poisoned playbook.
     """
-    for key, value in extra.items():
+    for key, value in list(extra.items()):
         if key in _FORBIDDEN_EXTRA_KEYS:
             raise ValueError(
                 f"extra_vars for node {node_hint}: key {key!r} is reserved by ansible"
             )
         if value is None:
-            # None доезжает до ansible как `null`, то есть переменная
-            # ОПРЕДЕЛЕНА и пуста: роли проверяют `X is not defined or
-            # X | length == 0` и падают на `NoneType has no len()` вместо
-            # своего fail_msg. Ловим здесь — обычно это несработавший
-            # decrypt (см. _decrypt_required).
-            raise ValueError(
-                f"extra_vars for node {node_hint}: key {key!r} is None — "
-                "ansible получит null и роль упадёт на невнятной ошибке; "
-                "чаще всего это нерасшифрованный секрет"
+            # None доезжает до ansible как `null`: переменная ОПРЕДЕЛЕНА и
+            # пуста, поэтому роли с `X is not defined or X | length == 0`
+            # падают на «object of type 'NoneType' has no len()» — по такой
+            # ошибке причину не найти. Нормализуем в пустую строку, чтобы
+            # роль ушла в свою ветку «не задано» и напечатала свой fail_msg.
+            # Падать здесь нельзя: null законно приезжает из settings старых
+            # нод (DR-восстановление пишет в JSONB незаполненные поля как
+            # null), а секреты и так закрыты _decrypt_required выше.
+            logger.warning(
+                "extra_vars for node %s: key %r is None — нормализую в пустую "
+                "строку (если это секрет — ищи причину в decrypt)",
+                node_hint,
+                key,
             )
+            extra[key] = ""
+            continue
         if isinstance(value, str):
             for marker in _JINJA_MARKERS:
                 if marker in value:

@@ -220,14 +220,16 @@ def test_extra_vars_raises_named_error_on_undecryptable_reality_key(db_session):
         raise AssertionError("ожидали SecretDecryptError")
 
 
-def test_validate_extra_vars_rejects_none_value():
-    """Defence-in-depth: любая будущая ветка с None ловится до ansible."""
-    import pytest
-
+def test_validate_extra_vars_normalizes_none_to_empty_string():
+    """Defence-in-depth: None не должен уехать в ansible как `null` — роль на
+    нём падает с «NoneType has no len()». Падать здесь нельзя (null законно
+    приезжает из JSONB старых нод), поэтому нормализуем."""
     from app.services.provisioning import _validate_extra_vars
 
-    with pytest.raises(ValueError, match="is None"):
-        _validate_extra_vars({"some_secret": None}, node_hint="node-x")
+    extra = {"some_secret": None, "port": 443}
+    _validate_extra_vars(extra, node_hint="node-x")
+    assert extra["some_secret"] == ""
+    assert extra["port"] == 443
 
 
 # ── DR-восстановление: restore.sql не должен возвращать plaintext в БД ──────
