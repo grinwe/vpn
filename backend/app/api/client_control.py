@@ -873,6 +873,12 @@ class DeviceMini(BaseModel):
 
 class DevicesByTelegramResponse(BaseModel):
     devices: list[DeviceMini]
+    # Сколько секунд осталось до конца троттла переноса (None — можно
+    # переносить прямо сейчас). Нужно боту, чтобы НЕ показывать пикер «какое
+    # устройство перенести», если перенос всё равно будет отклонён: юзер
+    # выбирал устройство и только потом узнавал «уже перекидывали недавно» —
+    # выглядело как противоречие бота самому себе (репорт юзера 2026-07-26).
+    retry_after_sec: int | None = None
 
 
 @router.get(
@@ -916,7 +922,24 @@ def devices_by_telegram(
         not in (models.DeviceStatus.disabled, models.DeviceStatus.revoked)
     ]
     live.sort(key=lambda x: x.device_id)  # стабильный порядок кнопок
-    return DevicesByTelegramResponse(devices=live)
+
+    # Троттл общий для обоих путей (per-device и whole-sub) — обе ветки
+    # смотрят на свежие OperatorNodeReport, поэтому и считаем по ним же,
+    # по самому строгому из двух окон.
+    throttle_min = max(_REPORT_BROKEN_THROTTLE_MIN, 5)
+    recent = (
+        db.query(models.OperatorNodeReport.reported_at)
+        .filter(models.OperatorNodeReport.user_id == user.id)
+        .order_by(models.OperatorNodeReport.reported_at.desc())
+        .first()
+    )
+    retry_after: int | None = None
+    if recent is not None and recent[0] is not None:
+        elapsed = (utcnow() - recent[0]).total_seconds()
+        left = throttle_min * 60 - elapsed
+        if left > 0:
+            retry_after = int(left) + 1
+    return DevicesByTelegramResponse(devices=live, retry_after_sec=retry_after)
 
 
 class ReportBrokenDeviceByTelegramRequest(BaseModel):

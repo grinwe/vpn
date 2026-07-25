@@ -112,3 +112,58 @@ def test_gift_button_absent_without_https_webapp(kb, monkeypatch):
     mod = importlib.reload(kb)
     texts = _texts(mod.welcome_action_keyboard(trial_available=True, is_new=True))
     assert "🎁 Забрать бесплатный месяц" not in texts
+
+
+# ── Троттл переноса: не предлагать выбор, которым нельзя воспользоваться ──
+
+
+def test_devices_by_telegram_reports_active_throttle(client, db_session):
+    """Репорт юзера 2026-07-26: бот спрашивал «какое устройство не работает?»,
+    юзер выбирал — и получал «уже перекидывали недавно». Бэкенд обязан отдать
+    остаток троттла, чтобы бот не показывал бесполезный выбор."""
+    from datetime import timedelta
+
+    from app import models
+    from app.time_utils import utcnow
+
+    from .factories import (
+        make_config,
+        make_device,
+        make_node,
+        make_plan,
+        make_subscription,
+        make_user,
+    )
+
+    user = make_user(db_session, telegram_id="tg-throttle-1")
+    node = make_node(db_session, name="node-throttle")
+    cfg = make_config(db_session, node, name="cfg-throttle")
+    plan = make_plan(db_session, name="plan-throttle")
+    sub = make_subscription(db_session, user, plan, node)
+    make_device(db_session, sub, cfg, access_username="user-throttle-1")
+
+    # Свежий перенос — троттл активен.
+    db_session.add(models.OperatorNodeReport(
+        user_id=user.id, subscription_id=sub.id, reported_at=utcnow(),
+    ))
+    db_session.commit()
+
+    res = client.get(
+        f"/api/admin/client-control/devices-by-telegram?telegram_id={user.telegram_id}"
+    )
+    assert res.status_code == 200, res.text
+    data = res.json()
+    assert data["devices"], "устройства должны отдаваться как и раньше"
+    assert data["retry_after_sec"] and data["retry_after_sec"] > 0, (
+        "активный троттл не отражён — бот покажет пикер, который ничего не сделает"
+    )
+
+    # Старый перенос — троттл истёк, перенос снова доступен.
+    old = db_session.query(models.OperatorNodeReport).one()
+    old.reported_at = utcnow() - timedelta(minutes=30)
+    db_session.commit()
+
+    again = client.get(
+        f"/api/admin/client-control/devices-by-telegram?telegram_id={user.telegram_id}"
+    )
+    assert again.json()["retry_after_sec"] is None
