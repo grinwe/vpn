@@ -421,6 +421,10 @@ success, авто-resync 2779–2782 success). Проверено: `xray -test` 
    эндпоинт отдаёт 404 ровно для той популяции, ради которой написан. Чинится
    матчингом `decrypt(...)` в питоне либо денормализацией UUID в индексируемую
    колонку.
+   **Закрыто:** поиск перенесён в питон (`_subscriptions_carrying_uuid`) —
+   `decrypt()` покрывает и шифртекст, и легаси-плейнтекст; ответ 404 теперь
+   отличает «UUID не наш» от «креды не расшифровались».
+
 2. **HIGH — сама миграция покрыла 2 поля из ~9.** Остальные, куда тот же
    silent-plaintext-баг мог уронить секрет открытым текстом, скрипт не смотрит:
    `CloudProvider.api_token_enc`, `VPNNode.provider_root_password_enc`,
@@ -430,15 +434,29 @@ success, авто-resync 2779–2782 success). Проверено: `xray -test` 
    `ensure_reality_config` пишет ключ в `private_key_enc`, а скрипт смотрит
    только на `private_key` — то есть ключи нод, заказанных через node_spawner,
    скрипту невидимы в принципе. Нужен скан остаточного plaintext по всем полям.
+   **Закрыто:** скрипт переписан на явную таблицу `SPECS` (12 полей, включая
+   `Device.connection_uri` и JSONB-ключи), отчёт по каждому полю, коды возврата
+   0/1/2 («чисто» ≠ «не проверялось»), канарейка против no-op-шифра под
+   `ALLOW_PLAINTEXT_SECRETS`, `--only` для точечных прогонов. Тест
+   `test_spec_table_covers_all_enc_columns` роняет сборку, если появится новая
+   `*_enc`-колонка мимо таблицы.
+
 3. **MEDIUM — `_extract_vless_uuid` / `_extract_hy2_auth`** (`provisioning.py`)
    не проверяют результат `decrypt()` на `None` → `re.match(None)` даёт
    `TypeError` вместо задокументированного `None`, и один нечитаемый кред
    роняет весь ресинк/rebuild-батч вместо «skip credential N». Срабатывает при
    рассинхроне `APP_SECRET_KEY` или одной битой строке.
+   **Закрыто:** обе функции проверяют результат `decrypt()` и возвращают `None`
+   с предупреждением в лог — батч ресинка переживает битую строку.
+
 4. **MEDIUM — `_collect_site_extra_vars`**: гейт проверяет шифртекст (всегда
    truthy), а в `extra_vars` уходит результат `decrypt()`, который может быть
    `None` → ansible падает на `NoneType has no len()` без намёка на настоящую
    причину. Latent: нужен ротированный ключ или `ALLOW_PLAINTEXT_SECRETS=1`.
+   **Закрыто:** секреты идут через `_decrypt_required` (падение с именем ноды и
+   config id вместо `null` в extra_vars), а `_validate_extra_vars` отбивает любое
+   `None` как defence-in-depth.
+
 5. **LOW — `infra/ansible/scripts/generate_restore_sql.py`** ✅ ИСПРАВЛЕНО:
    писал `config_text` и `settings.private_key` плейнтекстом в поля, которые
    весь остальной код пишет только через `encrypt()` → DR-восстановление
