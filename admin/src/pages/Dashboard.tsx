@@ -2,29 +2,62 @@ import { useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { api, StatsOut } from "../api";
 
-type FunnelStep = { key: string; label: string; count: number; pct: number };
+type FunnelStep = {
+  key: string;
+  label: string;
+  /** null — шаг НЕизмерим (нет данных телеметрии). Это не то же, что 0. */
+  count: number | null;
+  denominator: number;
+  pct: number | null;
+  measurable: boolean;
+};
 type FunnelOut = {
   days: number | null;
   total: number;
+  /** Сколько юзеров когорты пришли после включения телеметрии (2026-07-25). */
+  telemetry_cohort: number;
   steps: FunnelStep[];
   losses: FunnelStep[];
   trial_failures: number;
-  telemetry_partial: boolean;
 };
 
-/** Полоска шага воронки: ширина = доля от пришедших в бота. */
+/** Полоска шага воронки. Ширина = доля от СВОЕГО знаменателя (у шага про
+ *  кабинет он свой — под-когорта с телеметрией).
+ *
+ *  Неизмеримый шаг рисуется словами «нет данных», а не нулевой/полной полосой:
+ *  отсутствие данных, поданное как результат, — это ложь, по которой принимают
+ *  решения (первая версия показывала «98.6% не открыли кабинет», хотя про 72 из
+ *  73 юзеров событий просто не существовало). */
 function FunnelBar({ step, tone }: { step: FunnelStep; tone: "step" | "loss" }) {
   const bar = tone === "loss" ? "bg-red-800" : "bg-emerald-800";
+  if (!step.measurable)
+    return (
+      <div className="mb-2">
+        <div className="flex justify-between text-sm">
+          <span className="text-slate-400">{step.label}</span>
+          <span className="text-slate-500 italic">нет данных</span>
+        </div>
+        <div className="h-2 bg-slate-900 rounded mt-1 border border-dashed border-slate-700" />
+      </div>
+    );
   return (
     <div className="mb-2">
       <div className="flex justify-between text-sm">
         <span className="text-slate-300">{step.label}</span>
         <span className="text-slate-400">
-          {step.count} <span className="text-slate-500">({step.pct}%)</span>
+          {step.count}
+          <span className="text-slate-500">
+            {" "}
+            ({step.pct}%
+            {step.denominator !== undefined && ` от ${step.denominator}`})
+          </span>
         </span>
       </div>
       <div className="h-2 bg-slate-900 rounded mt-1 overflow-hidden">
-        <div className={`h-full ${bar}`} style={{ width: `${Math.min(step.pct, 100)}%` }} />
+        <div
+          className={`h-full ${bar}`}
+          style={{ width: `${Math.min(step.pct ?? 0, 100)}%` }}
+        />
       </div>
     </div>
   );
@@ -80,12 +113,22 @@ function OnboardingFunnel() {
                 AuditLog «trial_activate_rejected».
               </div>
             )}
-            {data.telemetry_partial && (
-              <div className="text-xs text-slate-500 mt-3">
-                Часть когорты старше телеметрии (2026-07-25): «Открыли кабинет»
-                занижено — события тогда ещё не писались.
-              </div>
-            )}
+            <div className="text-xs text-slate-500 mt-3">
+              {data.telemetry_cohort === 0 ? (
+                <>
+                  Про шаг «Открыли кабинет» данных нет: телеметрия пишется с
+                  2026-07-25, а все юзеры этой когорты пришли раньше. Шаги
+                  «триал / ссылка / оплата» считаются по состоянию БД и верны за
+                  всю историю.
+                </>
+              ) : (
+                <>
+                  «Открыли кабинет» считается по {data.telemetry_cohort} юзерам,
+                  пришедшим после включения телеметрии (2026-07-25); остальные
+                  шаги — по всей когорте из {data.total}.
+                </>
+              )}
+            </div>
           </>
         )}
       </div>

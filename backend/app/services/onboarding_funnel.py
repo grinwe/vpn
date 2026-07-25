@@ -4,10 +4,20 @@
 (`scripts/onboarding_funnel.py`) — иначе две реализации разойдутся ровно тогда,
 когда по ним начнут принимать решения.
 
-Телеметрия появилась 2026-07-25 (роадмап E0), поэтому у когорт СТАРШЕ этой даты
-`opened_cabinet` всегда 0: события `webapp_open` тогда просто не писались. Это
-отражено флагом ``telemetry_since`` в ответе, чтобы админка не выдавала «никто не
-открывал кабинет» за факт.
+⚠️ Шаги считаются из РАЗНЫХ источников, и это определяет всю арифметику:
+
+* «забрали триал», «получили ссылку», «оплатили» — из состояния БД
+  (`User.trial_activated_at`, `Device`, `Invoice`), т.е. известны за всю
+  историю;
+* «открыли кабинет» — из событий аудита `webapp_open`, которые пишутся только
+  с ``TELEMETRY_SINCE``.
+
+Поэтому шаг про кабинет считается по СВОЕЙ под-когорте — юзерам, пришедшим
+после включения телеметрии, — и имеет собственный знаменатель. Смешивать их в
+одну шкалу нельзя: первая версия делила единицу на всех 73 юзеров и рисовала
+«98.6% не открыли кабинет», хотя про 72 из них данных просто не существует.
+Отсутствие данных, поданное как потеря, — худший вид вранья в аналитике: по
+нему принимают решения.
 """
 from __future__ import annotations
 
@@ -20,6 +30,19 @@ from ..time_utils import utcnow
 
 # Дата, с которой пишутся webapp_open / trial_activate_*.
 TELEMETRY_SINCE = datetime(2026, 7, 25)
+
+
+def _step(key: str, label: str, count: int, denominator: int, *, measurable: bool = True) -> dict:
+    return {
+        "key": key,
+        "label": label,
+        "count": count if measurable else None,
+        # Знаменатель у шагов разный (см. докстринг), поэтому отдаём его явно —
+        # иначе UI посчитает процент не от того основания.
+        "denominator": denominator,
+        "pct": round(100 * count / denominator, 1) if (measurable and denominator) else None,
+        "measurable": measurable,
+    }
 
 
 def compute(db: Session, days: int | None = 7) -> dict:
@@ -35,10 +58,16 @@ def compute(db: Session, days: int | None = 7) -> dict:
     if not total:
         return {
             "days": days, "total": 0, "steps": [], "losses": [],
-            "trial_failures": 0, "telemetry_partial": False,
+            "trial_failures": 0, "telemetry_cohort": 0,
         }
 
     ids = [u.id for u in users]
+    # Под-когорта, про которую телеметрия вообще может что-то сказать.
+    measurable_users = [
+        u for u in users if u.created_at and u.created_at >= TELEMETRY_SINCE
+    ]
+    measurable_ids = {u.id for u in measurable_users}
+    cohort = len(measurable_users)
 
     def _targets(action: str) -> set[int]:
         return {
@@ -48,7 +77,10 @@ def compute(db: Session, days: int | None = 7) -> dict:
             .distinct().all()
         }
 
-    opened = _targets("webapp_open")
+    # Считаем открытия ТОЛЬКО по измеримой под-когорте: событие от старого
+    # юзера (зашёл в кабинет уже после включения телеметрии) ничего не говорит
+    # о его онбординге и только завышало бы картину.
+    opened = _targets("webapp_open") & measurable_ids
     trial_failed = _targets("trial_activate_rejected")
     claimed = {u.id for u in users if u.trial_activated_at is not None}
     with_device = {
@@ -62,33 +94,32 @@ def compute(db: Session, days: int | None = 7) -> dict:
         .distinct().all()
     }
 
-    # Когорта частично старше телеметрии → «открыли кабинет» занижено.
-    oldest = min(u.created_at for u in users if u.created_at)
-    telemetry_partial = bool(oldest and oldest < TELEMETRY_SINCE)
-
     steps = [
-        {"key": "started", "label": "Пришли в бота", "count": total},
-        {"key": "opened", "label": "Открыли кабинет", "count": len(opened)},
-        {"key": "trial", "label": "Забрали триал", "count": len(claimed)},
-        {"key": "device", "label": "Получили ссылку", "count": len(with_device)},
-        {"key": "paid", "label": "Оплатили", "count": len(paid)},
+        _step("started", "Пришли в бота", total, total),
+        _step("opened", "Открыли кабинет", len(opened), cohort, measurable=cohort > 0),
+        _step("trial", "Забрали триал", len(claimed), total),
+        # NB: «получили ссылку» может быть БОЛЬШЕ, чем «забрали триал» — сюда
+        # входят купившие подписку без триала. Это не сбой воронки: шаги
+        # параллельные, а не вложенные.
+        _step("device", "Получили ссылку", len(with_device), total),
+        _step("paid", "Оплатили", len(paid), total),
     ]
     losses = [
-        {"key": "never_opened", "label": "Не открыли кабинет",
-         "count": total - len(opened)},
-        {"key": "opened_no_trial", "label": "Открыли, но без триала",
-         "count": len([u for u in users if u.id in opened and u.id not in claimed])},
-        {"key": "trial_no_device", "label": "Забрали триал, но без ссылки",
-         "count": len([u for u in users if u.id in claimed and u.id not in with_device])},
+        _step("never_opened", "Не открыли кабинет",
+              cohort - len(opened), cohort, measurable=cohort > 0),
+        _step("opened_no_trial", "Открыли, но без триала",
+              len(opened - claimed), cohort, measurable=cohort > 0),
+        _step("trial_no_device", "Забрали триал, но без ссылки",
+              len(claimed - with_device), total),
     ]
-    for row in steps + losses:
-        row["pct"] = round(100 * row["count"] / total, 1)
 
     return {
         "days": days,
         "total": total,
+        # Сколько юзеров когорты вообще попадают под телеметрию. 0 — значит про
+        # кабинет мы не знаем НИЧЕГО, и UI обязан сказать это словами.
+        "telemetry_cohort": cohort,
         "steps": steps,
         "losses": losses,
         "trial_failures": len(trial_failed),
-        "telemetry_partial": telemetry_partial,
     }

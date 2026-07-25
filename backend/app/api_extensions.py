@@ -763,19 +763,23 @@ def ad_sources_funnel(
 class FunnelStep(BaseModel):
     key: str
     label: str
-    count: int
-    pct: float
+    # None, когда шаг НЕизмерим (нет данных телеметрии) — это принципиально
+    # иное состояние, чем 0, и UI обязан показать его словами, а не полосой.
+    count: int | None
+    denominator: int
+    pct: float | None
+    measurable: bool
 
 
 class OnboardingFunnelResponse(BaseModel):
     days: int | None
     total: int
+    # Сколько юзеров когорты пришли ПОСЛЕ включения телеметрии (2026-07-25).
+    # 0 — про шаг «открыли кабинет» не известно ничего.
+    telemetry_cohort: int
     steps: list[FunnelStep]
     losses: list[FunnelStep]
     trial_failures: int
-    # True, если часть когорты старше телеметрии (2026-07-25) — тогда «открыли
-    # кабинет» занижено, и админка обязана это показать, а не выдавать за факт.
-    telemetry_partial: bool
 
 
 @ext_router.get("/admin/onboarding-funnel", response_model=OnboardingFunnelResponse)

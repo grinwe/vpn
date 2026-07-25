@@ -31,19 +31,31 @@ def main() -> int:
         print("в окне нет юзеров")
         return 0
 
+    def _fmt(row: dict) -> str:
+        if not row["measurable"]:
+            return f"  {row['label']:<34}{'нет данных':>12}"
+        return (
+            f"  {row['label']:<34}{row['count']:>4}  "
+            f"({row['pct']:>5.1f}% от {row['denominator']})"
+        )
+
     window = f"за {args.days} дн." if args.days else "за всё время"
     print(f"\nОнбординг-воронка {window}: пришло в бота {data['total']}\n")
     for row in data["steps"][1:]:
-        print(f"  {row['label']:<34}{row['count']:>4}  ({row['pct']:>5.1f}%)")
+        print(_fmt(row))
     print("\nгде теряем:")
     for row in data["losses"]:
-        print(f"  {row['label']:<34}{row['count']:>4}  ({row['pct']:>5.1f}%)")
+        print(_fmt(row))
     if data["trial_failures"]:
         print(f"\n  ⚠️ у {data['trial_failures']} юзеров активация триала ОТКАЗАЛА "
               f"(AuditLog.action='trial_activate_rejected', extra.reason)")
-    if data["telemetry_partial"]:
-        print("\n  ⓘ часть когорты старше телеметрии (2026-07-25) — «открыли")
-        print("    кабинет» занижено: события тогда ещё не писались.")
+    if data["telemetry_cohort"] == 0:
+        print("\n  ⓘ про шаг «открыли кабинет» данных НЕТ: телеметрия пишется с")
+        print("    2026-07-25, вся когорта пришла раньше. Шаги триал/ссылка/оплата")
+        print("    считаются по состоянию БД и верны за всю историю.")
+    else:
+        print(f"\n  ⓘ «открыли кабинет» — по {data['telemetry_cohort']} юзерам с")
+        print(f"    телеметрией; остальные шаги — по всем {data['total']}.")
     return 0
 
 

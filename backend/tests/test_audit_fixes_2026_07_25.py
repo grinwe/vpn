@@ -380,15 +380,45 @@ def test_onboarding_funnel_endpoint_counts_steps(client, db_session):
 
     assert data["total"] >= 1
     steps = {s["key"]: s for s in data["steps"]}
-    assert steps["opened"]["count"] >= 1, "открытие кабинета не попало в воронку"
     assert steps["started"]["count"] == data["total"]
+    # Юзер создан сейчас (после TELEMETRY_SINCE), значит шаг измерим и открытие
+    # засчитано.
+    assert steps["opened"]["measurable"] is True
+    assert steps["opened"]["count"] >= 1, "открытие кабинета не попало в воронку"
     losses = {s["key"]: s for s in data["losses"]}
-    # У этого юзера есть открытие, но нет триала — он обязан попасть именно сюда.
     assert losses["opened_no_trial"]["count"] >= 1
-    # Проценты считаются от пришедших, а не от предыдущего шага.
+    # Ключевое: процент шага про кабинет считается от СВОЕЙ под-когорты
+    # (юзеры с телеметрией), а не от всех пришедших — иначе отсутствие данных
+    # по старым юзерам рисуется как «98% не открыли кабинет».
+    assert steps["opened"]["denominator"] == data["telemetry_cohort"]
     assert steps["opened"]["pct"] == round(
-        100 * steps["opened"]["count"] / data["total"], 1
+        100 * steps["opened"]["count"] / data["telemetry_cohort"], 1
     )
+
+
+def test_funnel_marks_cabinet_step_unmeasurable_for_old_cohort(client, db_session):
+    """Юзеры, пришедшие ДО включения телеметрии, не должны считаться
+    «не открывшими кабинет»: событий про них не существует. Отсутствие данных,
+    поданное как потеря, — это ложь, по которой принимают решения."""
+    from datetime import timedelta
+
+    from app.services.onboarding_funnel import TELEMETRY_SINCE, compute
+
+    user = make_user(db_session, telegram_id="tg-old-cohort")
+    user.created_at = TELEMETRY_SINCE - timedelta(days=10)
+    db_session.commit()
+
+    data = compute(db_session, days=None)
+    steps = {s["key"]: s for s in data["steps"]}
+    losses = {s["key"]: s for s in data["losses"]}
+
+    if data["telemetry_cohort"] == 0:
+        assert steps["opened"]["measurable"] is False
+        assert steps["opened"]["count"] is None
+        assert losses["never_opened"]["measurable"] is False
+    # Шаги по состоянию БД остаются измеримыми в любом случае.
+    assert steps["trial"]["measurable"] is True
+    assert steps["device"]["denominator"] == data["total"]
 
 
 # ── Sec-1: без APP_SECRET_KEY процесс не стартует ────────────────────────
