@@ -20,16 +20,21 @@ _maybe_restart() {
   systemctl restart hysteria-server
 }
 
+# Имя/пароль передаём через окружение, а НЕ подстановкой в текст python-скрипта:
+# значение с кавычкой или переводом строки иначе выполнялось бы как код (root на
+# ноде). Наши секреты — token_urlsafe, но зависеть от этого нельзя (аудит
+# 2026-07-25).
 cmd_add() {
   local user="$1" pass="$2"
   # Use python3 to safely edit YAML
-  python3 -c "
-import yaml, sys
-with open('${CONFIG}') as f:
-    cfg = yaml.safe_load(f)
+  HY2_CONFIG="${CONFIG}" HY2_USER="${user}" HY2_PASS="${pass}" python3 -c "
+import os, yaml
+path = os.environ['HY2_CONFIG']
+with open(path) as f:
+    cfg = yaml.safe_load(f) or {}
 up = cfg.setdefault('auth', {}).setdefault('userpass', {})
-up['${user}'] = '${pass}'
-with open('${CONFIG}', 'w') as f:
+up[os.environ['HY2_USER']] = os.environ['HY2_PASS']
+with open(path, 'w') as f:
     yaml.dump(cfg, f, default_flow_style=False)
   "
   _maybe_restart
@@ -38,13 +43,14 @@ with open('${CONFIG}', 'w') as f:
 
 cmd_del() {
   local user="$1"
-  python3 -c "
-import yaml
-with open('${CONFIG}') as f:
-    cfg = yaml.safe_load(f)
+  HY2_CONFIG="${CONFIG}" HY2_USER="${user}" python3 -c "
+import os, yaml
+path = os.environ['HY2_CONFIG']
+with open(path) as f:
+    cfg = yaml.safe_load(f) or {}
 up = cfg.get('auth', {}).get('userpass', {})
-up.pop('${user}', None)
-with open('${CONFIG}', 'w') as f:
+up.pop(os.environ['HY2_USER'], None)
+with open(path, 'w') as f:
     yaml.dump(cfg, f, default_flow_style=False)
   "
   _maybe_restart

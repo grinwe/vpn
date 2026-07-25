@@ -94,6 +94,42 @@
     group: root
     mode: '0750'
 
+# Сохраняем пер-юзерные учётки между прогонами роли — ровно как
+# install_vless_reality сохраняет clients из config.json. Шаблон рендерит
+# auth.userpass с нуля, т.е. КАЖДЫЙ прогон роли стирал всех юзеров ноды, а
+# компенсирующий resync_hy2 жил в бэкенде под `if success:` — падение play
+# ПОСЛЕ hy2-роли (а она с 2026-07-22 идёт первой среди протокольных, и сразу
+# за ней reality с громкими preflight-ассертами) оставляло hy2 мёртвым у всех
+# юзеров ноды до следующего успешного прогона. Теперь роль недеструктивна сама
+# по себе, в том числе при ручном прогоне мимо бэкенда (аудит 2026-07-25).
+- name: Check for existing Hysteria2 config
+  ansible.builtin.stat:
+    path: /etc/hysteria/config.yaml
+  register: hysteria2_existing_config
+
+- name: Slurp existing Hysteria2 config
+  ansible.builtin.slurp:
+    src: /etc/hysteria/config.yaml
+  register: hysteria2_existing_config_raw
+  when: hysteria2_existing_config.stat.exists
+
+- name: Extract existing Hysteria2 userpass entries
+  ansible.builtin.set_fact:
+    hysteria2_existing_userpass: >-
+      {{
+        (hysteria2_existing_config_raw.content | b64decode | from_yaml).auth.userpass
+        | default({})
+      }}
+  when: hysteria2_existing_config.stat.exists
+  # Битый/недописанный конфиг не должен ронять play: провалимся на пустую
+  # карту, а backend-resync до-льёт учётки после рендера (второй пояс).
+  ignore_errors: true
+
+- name: Default to empty userpass map on first bootstrap
+  ansible.builtin.set_fact:
+    hysteria2_existing_userpass: {}
+  when: hysteria2_existing_userpass is not defined
+
 - name: Render Hysteria2 server config
   template:
     src: config.yaml.j2

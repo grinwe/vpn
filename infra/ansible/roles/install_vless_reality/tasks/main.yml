@@ -298,12 +298,28 @@
     state: absent
   when: not (reality_stream_unify | default(false))
 
+# Гейт по наличию nginx.conf ОБЯЗАТЕЛЕН: blockinfile проверяет существование
+# файла ДО разбора state и валится rc=257 «Path ... does not exist !» даже при
+# state=absent. На свежей ноде nginx ещё не установлен (его тянут роли
+# install_vless_xhttp/ws_cdn, которые идут ПОСЛЕ этой), а unify там выключен
+# (reality_stream_unify = bool(settings.public_port)) — т.е. до фикса эта
+# откатная таска валила бутстрап КАЖДОЙ новой ноды (аудит 2026-07-25).
+# create: true тут нельзя: модуль создал бы пустой /etc/nginx/nginx.conf и
+# сломал последующую установку nginx.
+- name: Check nginx.conf presence before 443-unify rollback
+  ansible.builtin.stat:
+    path: /etc/nginx/nginx.conf
+  register: _reality_nginx_conf
+  when: not (reality_stream_unify | default(false))
+
 - name: Remove top-level stream{} block when 443-unify disabled
   ansible.builtin.blockinfile:
     path: /etc/nginx/nginx.conf
     marker: "# {mark} V8-443-UNIFY-STREAM"
     state: absent
-  when: not (reality_stream_unify | default(false))
+  when:
+    - not (reality_stream_unify | default(false))
+    - _reality_nginx_conf.stat.exists | default(false)
 
 # Guarded reload: на ПЕРВОМ unify-bootstrap'е xhttp/ws ещё на :443 → stream :443
 # конфликтует → nginx -t падает → НЕ релоадим (xhttp-роль ниже подвинет на 8443 и
