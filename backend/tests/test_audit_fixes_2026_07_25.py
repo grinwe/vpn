@@ -152,6 +152,111 @@ def test_cert_renewal_tick_honours_custom_interval(monkeypatch):
     assert calls == [43200]
 
 
+# ── P0-3: hy2-URI обязан нести пару username:password ────────────────────
+
+
+def test_hy2_uri_carries_username_and_password(db_session):
+    """Находка #3 (high): URI отдавал голый пароль в userinfo, а нода на
+    ``auth.type: userpass`` держит карту username→password и делит присланную
+    строку по первому ':'. Ссылка без имени не проходила auth НИКОГДА — вся
+    недельная реанимация hy2 стояла на мёртвом формате."""
+    from urllib.parse import urlsplit
+
+    from app import models
+    from app.services.provisioning import _build_hysteria2_credential, _hy2_auth
+
+    from .factories import make_config
+
+    node = make_node(db_session, name="hy2-uri", host="203.0.113.77")
+    cfg = make_config(
+        db_session, node, name="hy2",
+        protocol=models.VPNConfigProtocol.hysteria2, sni="hy2.example.info",
+    )
+
+    uri = _build_hysteria2_credential(node, cfg, _hy2_auth("user-7-9", "pw123"))
+
+    userinfo = urlsplit(uri).netloc.split("@")[0]
+    assert userinfo == "user-7-9:pw123"
+
+
+def test_rebuild_remints_legacy_hy2_uri_with_username(db_session):
+    """Легаси-креды в БД лежат в старом формате. Ре-минт обязан дошить
+    username из access_username, НЕ трогая пароль (он уже лежит на ноде под
+    этим именем) — иначе фикс не чинит существующих юзеров."""
+    from app import models
+    from app.security import decrypt, encrypt
+    from app.services.provisioning import ProvisioningOrchestrator
+
+    from .factories import make_config, make_device
+
+    node = make_node(db_session, name="hy2-legacy", host="203.0.113.78")
+    cfg = make_config(
+        db_session, node, name="hy2",
+        protocol=models.VPNConfigProtocol.hysteria2, sni="legacy.example.info",
+    )
+    user = make_user(db_session, telegram_id="tg-hy2-legacy")
+    plan = make_plan(db_session, name="plan-hy2-legacy")
+    sub = make_subscription(db_session, user, plan, node)
+    device = make_device(db_session, sub, cfg, access_username="user-legacy-1")
+    legacy_uri = f"hy2://oldPass123@{node.host}:{cfg.port}?sni=legacy.example.info#hy2-x"
+    db_session.add(models.Credential(
+        subscription_id=sub.id, device_id=device.id, config_id=cfg.id,
+        node_id=node.id, proto=models.VPNConfigProtocol.hysteria2.value,
+        config_text=encrypt(legacy_uri), access_username="user-legacy-1",
+        is_active=True,
+    ))
+    db_session.commit()
+
+    orch = ProvisioningOrchestrator(db_session)
+    orch.rebuild_subscription_config_text(sub)
+
+    cred = (
+        db_session.query(models.Credential)
+        .filter(models.Credential.subscription_id == sub.id)
+        .one()
+    )
+    rebuilt = decrypt(cred.config_text)
+    assert rebuilt.startswith("hy2://user-legacy-1:oldPass123@"), rebuilt
+
+
+def test_hy2_resync_pushes_pair_from_uri(db_session):
+    """Ресинк обязан класть на ноду ТУ ЖЕ пару, что у клиента в ссылке —
+    иначе auth не сойдётся даже при верном формате URI."""
+    from app import models
+    from app.security import encrypt
+    from app.services.provisioning import (
+        ProvisioningOrchestrator,
+        _build_hysteria2_credential,
+        _hy2_auth,
+    )
+
+    from .factories import make_config, make_device
+
+    node = make_node(db_session, name="hy2-resync", host="203.0.113.79")
+    cfg = make_config(
+        db_session, node, name="hy2",
+        protocol=models.VPNConfigProtocol.hysteria2, sni="resync.example.info",
+    )
+    user = make_user(db_session, telegram_id="tg-hy2-resync")
+    plan = make_plan(db_session, name="plan-hy2-resync")
+    sub = make_subscription(db_session, user, plan, node)
+    device = make_device(db_session, sub, cfg, access_username="user-rs-1")
+    uri = _build_hysteria2_credential(node, cfg, _hy2_auth("user-rs-1", "rsPass9"))
+    db_session.add(models.Credential(
+        subscription_id=sub.id, device_id=device.id, config_id=cfg.id,
+        node_id=node.id, proto=models.VPNConfigProtocol.hysteria2.value,
+        config_text=encrypt(uri), access_username="user-rs-1", is_active=True,
+    ))
+    db_session.commit()
+
+    orch = ProvisioningOrchestrator(db_session)
+    tasks = orch.resync_node_hysteria2_clients(node)
+
+    assert len(tasks) == 1
+    clients = tasks[0].payload["clients"]
+    assert clients == [{"username": "user-rs-1", "password": "rsPass9"}]
+
+
 def test_cert_renewal_tick_disabled_by_zero_interval(monkeypatch):
     """CERT_RENEWAL_INTERVAL=0 — задокументированный kill-switch: тик не
     перепланирует себя и затухает."""

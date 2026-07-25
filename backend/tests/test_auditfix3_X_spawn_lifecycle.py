@@ -209,9 +209,18 @@ def test_resync_hysteria2_noop_without_hy2_users(db_session: Session) -> None:
     assert orch.resync_node_hysteria2_clients(node) == []
 
 
-def test_extract_hy2_password_parses_uri() -> None:
+def test_extract_hy2_auth_parses_uri() -> None:
+    uri = "hy2://user-1-2:myPassw0rd@203.0.113.5:8443?sni=x#tag"
+    assert prov_mod._extract_hy2_auth(encrypt(uri)) == "user-1-2:myPassw0rd"
+    assert prov_mod._split_hy2_auth("user-1-2:myPassw0rd") == ("user-1-2", "myPassw0rd")
+
+
+def test_extract_hy2_auth_tolerates_legacy_password_only_uri() -> None:
+    """Легаси-креды (до 2026-07-25) несут голый пароль — парсер обязан их
+    прочитать, иначе ре-минт и resync потеряют пароль и вышибут юзера."""
     uri = "hy2://myPassw0rd@203.0.113.5:8443?sni=x#tag"
-    assert prov_mod._extract_hy2_password(encrypt(uri)) == "myPassw0rd"
+    assert prov_mod._extract_hy2_auth(encrypt(uri)) == "myPassw0rd"
+    assert prov_mod._split_hy2_auth("myPassw0rd") == (None, "myPassw0rd")
 
 
 # ── #81 — REALITY_DEST env-override применяется ──────────────────────────
