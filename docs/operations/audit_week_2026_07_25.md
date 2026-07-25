@@ -410,9 +410,11 @@ success, авто-resync 2779–2782 success). Проверено: `xray -test` 
 на месте (aeza 92, ufo-ru-02 40), `:443` SNI=dest отдаёт серт зеркала
 (`*.ozon.ru`, `*.yandex.tr`), default-ветка stream — LE-серт xhttp.
 
-### Открытые хвосты той же миграции
+### Хвосты той же миграции — ЗАКРЫТЫ
 
-Проверено фан-аутом по коду (14 подтверждённых находок, 5 отклонены):
+Найдено фан-аутом по коду (14 подтверждённых находок, 5 отклонены),
+исправлено в том же заходе; регрессы — `backend/tests/test_secret_migration_fixes.py`
+и `backend/tests/test_encrypt_legacy_secrets_coverage.py`:
 
 1. **HIGH — `api/admin_claim.py:126`**: claim-orphan ищет кред
    `config_text ILIKE '%uuid%'`, то есть по колонке, которая теперь шифртекст →
@@ -437,7 +439,14 @@ success, авто-resync 2779–2782 success). Проверено: `xray -test` 
    truthy), а в `extra_vars` уходит результат `decrypt()`, который может быть
    `None` → ansible падает на `NoneType has no len()` без намёка на настоящую
    причину. Latent: нужен ротированный ключ или `ALLOW_PLAINTEXT_SECRETS=1`.
-5. **LOW — `infra/ansible/scripts/generate_restore_sql.py`** пишет
-   `config_text` и `settings.private_key` плейнтекстом в поля, которые весь
-   остальной код пишет только через `encrypt()` → DR-восстановление вернёт
-   plaintext в БД.
+5. **LOW — `infra/ansible/scripts/generate_restore_sql.py`** ✅ ИСПРАВЛЕНО:
+   писал `config_text` и `settings.private_key` плейнтекстом в поля, которые
+   весь остальной код пишет только через `encrypt()` → DR-восстановление
+   вернуло бы plaintext в БД. Теперь оба поля идут через `protect_secret()`,
+   ключ резолвится «`--app-secret-key` > env `APP_SECRET_KEY`», без ключа
+   скрипт отказывается генерировать SQL (exit 3), явная форточка —
+   `--allow-plaintext-secrets`. Попутно: `encrypt_with_app_key(x or "")`
+   шифровал пустую строку вместо NULL, из-за чего exit/relay-link без
+   WG-ключа уезжал в БД с «ключом» из нуля байт и проходил гейт
+   `if not exit_node.wg_private_key_enc`. Правка синхронизирована во вторую
+   копию `scripts/generate_restore_sql.py`.

@@ -68,9 +68,10 @@ def extract_uuid_from_vless_url(value: str | None) -> str | None:
 
     Accepts either a bare UUID string or a full ``vless://UUID@host:port?...``
     URI — operators paste whatever the user sends from Hiddify. The
-    returned UUID is always lowercased so substring matches against
-    ``Credential.config_text`` (which the URL-builder writes lowercase)
-    are stable.
+    returned UUID is always lowercased: claim-orphan матчит его подстрокой по
+    РАСШИФРОВАННОМУ ``Credential.config_text`` (сама колонка с 2026-07-25
+    хранит Fernet-блоб), и обе стороны сравнения приводятся к нижнему
+    регистру — регистро-независимость прежнего SQL ``ILIKE`` сохранена.
     """
     if not value:
         return None

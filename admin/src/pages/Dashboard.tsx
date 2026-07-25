@@ -1,5 +1,97 @@
+import { useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { api, StatsOut } from "../api";
+
+type FunnelStep = { key: string; label: string; count: number; pct: number };
+type FunnelOut = {
+  days: number | null;
+  total: number;
+  steps: FunnelStep[];
+  losses: FunnelStep[];
+  trial_failures: number;
+  telemetry_partial: boolean;
+};
+
+/** Полоска шага воронки: ширина = доля от пришедших в бота. */
+function FunnelBar({ step, tone }: { step: FunnelStep; tone: "step" | "loss" }) {
+  const bar = tone === "loss" ? "bg-red-800" : "bg-emerald-800";
+  return (
+    <div className="mb-2">
+      <div className="flex justify-between text-sm">
+        <span className="text-slate-300">{step.label}</span>
+        <span className="text-slate-400">
+          {step.count} <span className="text-slate-500">({step.pct}%)</span>
+        </span>
+      </div>
+      <div className="h-2 bg-slate-900 rounded mt-1 overflow-hidden">
+        <div className={`h-full ${bar}`} style={{ width: `${Math.min(step.pct, 100)}%` }} />
+      </div>
+    </div>
+  );
+}
+
+function OnboardingFunnel() {
+  const [days, setDays] = useState(7);
+  const { data, isLoading, error } = useQuery<FunnelOut>({
+    queryKey: ["onboarding-funnel", days],
+    queryFn: () => api.get(`/admin/onboarding-funnel?days=${days}`),
+  });
+
+  return (
+    <section className="mb-6">
+      <div className="flex items-center gap-3 mb-2">
+        <h2 className="text-xs uppercase text-slate-400">Онбординг новых юзеров</h2>
+        <div className="flex gap-1">
+          {[7, 30, 0].map((d) => (
+            <button
+              key={d}
+              onClick={() => setDays(d)}
+              className={`text-xs px-2 py-0.5 rounded ${
+                days === d ? "bg-slate-700 text-white" : "bg-slate-800 text-slate-400"
+              }`}
+            >
+              {d === 0 ? "всё время" : `${d} дн.`}
+            </button>
+          ))}
+        </div>
+      </div>
+      <div className="bg-slate-800 rounded-lg p-4 border border-slate-700">
+        {isLoading ? (
+          <div className="text-slate-400 text-sm">Загрузка…</div>
+        ) : error || !data ? (
+          <div className="text-red-400 text-sm">Ошибка: {String(error)}</div>
+        ) : data.total === 0 ? (
+          <div className="text-slate-400 text-sm">В окне нет новых юзеров.</div>
+        ) : (
+          <>
+            <div className="text-sm text-slate-400 mb-3">
+              Пришло в бота: <span className="text-white font-semibold">{data.total}</span>
+            </div>
+            {data.steps.slice(1).map((s) => (
+              <FunnelBar key={s.key} step={s} tone="step" />
+            ))}
+            <div className="text-xs uppercase text-slate-500 mt-4 mb-2">Где теряем</div>
+            {data.losses.map((s) => (
+              <FunnelBar key={s.key} step={s} tone="loss" />
+            ))}
+            {data.trial_failures > 0 && (
+              <div className="text-sm text-yellow-400 mt-3">
+                ⚠️ У {data.trial_failures} юзеров активация триала отказала — смотри
+                AuditLog «trial_activate_rejected».
+              </div>
+            )}
+            {data.telemetry_partial && (
+              <div className="text-xs text-slate-500 mt-3">
+                Часть когорты старше телеметрии (2026-07-25): «Открыли кабинет»
+                занижено — события тогда ещё не писались.
+              </div>
+            )}
+          </>
+        )}
+      </div>
+    </section>
+  );
+}
 
 function Card({
   title,
@@ -50,6 +142,8 @@ export default function Dashboard() {
           {isFetching ? "…" : "↻"}
         </button>
       </div>
+
+      <OnboardingFunnel />
 
       <section className="mb-6">
         <h2 className="text-xs uppercase text-slate-400 mb-2">Пользователи</h2>

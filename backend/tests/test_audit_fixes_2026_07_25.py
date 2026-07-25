@@ -361,6 +361,36 @@ def test_trial_activation_outcome_is_audited(client, db_session):
         assert rejected and rejected[0].extra.get("reason") == "no_trial_plan"
 
 
+def test_onboarding_funnel_endpoint_counts_steps(client, db_session):
+    """Админка и CLI считают воронку ОДНИМ сервисом — иначе цифры разъедутся
+    ровно тогда, когда по ним начнут принимать решения."""
+    from app import models
+
+    user = make_user(db_session, telegram_id="tg-funnel-1")
+    db_session.add(models.AuditLog(
+        actor=f"tg:{user.telegram_id}", action="webapp_open",
+        target_type="user", target_id=user.id,
+        actor_type=models.AuditActor.user,
+    ))
+    db_session.commit()
+
+    res = client.get("/api/admin/onboarding-funnel?days=7")
+    assert res.status_code == 200, res.text
+    data = res.json()
+
+    assert data["total"] >= 1
+    steps = {s["key"]: s for s in data["steps"]}
+    assert steps["opened"]["count"] >= 1, "открытие кабинета не попало в воронку"
+    assert steps["started"]["count"] == data["total"]
+    losses = {s["key"]: s for s in data["losses"]}
+    # У этого юзера есть открытие, но нет триала — он обязан попасть именно сюда.
+    assert losses["opened_no_trial"]["count"] >= 1
+    # Проценты считаются от пришедших, а не от предыдущего шага.
+    assert steps["opened"]["pct"] == round(
+        100 * steps["opened"]["count"] / data["total"], 1
+    )
+
+
 # ── Sec-1: без APP_SECRET_KEY процесс не стартует ────────────────────────
 
 

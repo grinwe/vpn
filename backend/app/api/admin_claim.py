@@ -15,6 +15,7 @@ across the claim. Full spec + flow in
 """
 from __future__ import annotations
 
+import logging
 from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, Depends, Header, HTTPException
@@ -23,6 +24,7 @@ from sqlalchemy.orm import Session
 
 from .. import models
 from ..auth import require_admin
+from ..security import decrypt
 from ..services.vless import extract_uuid_from_vless_url
 from ..time_utils import utcnow
 from ._common import (
@@ -31,11 +33,17 @@ from ._common import (
     get_db,
 )
 
+logger = logging.getLogger(__name__)
+
 router = APIRouter()
 
 # Placeholder user that owns orphan subscriptions/credentials produced
 # by the 2026-05-19 disaster recovery. See POSTMORTEM_2026-05-19.md §3.3.3.
 ORPHAN_OWNER_ID = 999999
+
+# Скан кредов при поиске по UUID идёт в питоне (см. _subscriptions_carrying_uuid),
+# поэтому тянем выборку курсором порциями, а не одним .all().
+_UUID_SCAN_CHUNK = 500
 
 
 class ClaimOrphanRequest(BaseModel):
@@ -94,6 +102,62 @@ def _resolve_target_user(
     return user
 
 
+def _subscriptions_carrying_uuid(db: Session, uuid: str) -> tuple[set[int], int]:
+    """Найти подписки, чьи креды несут ``uuid``, расшифровывая ``config_text``.
+
+    Матчим в питоне, а не SQL-подстрокой (``config_text ILIKE '%uuid%'``, как
+    было до 2026-07-25): дошифровка легаси-секретов переписала колонку
+    Fernet-блобом ``enc:v1:…`` ПРЯМО НА МЕСТЕ, подстрока перестала находить
+    что-либо, и эндпоинт отдавал 404 ровно той популяции сирот, ради которой
+    написан. ``decrypt`` возвращает плейнтекст как есть, поэтому одна ветка
+    покрывает и шифртекст, и легаси-плейнтекст — а он в проде появится снова
+    после DR-восстановления (``generate_restore_sql.py`` инсертит ``config_text``
+    без шифрования).
+
+    Единственный предфильтр — INNER JOIN на Subscription: warm-пул
+    (``subscription_id IS NULL``) claim'у не интересен и составляет основную
+    массу таблицы. Фильтров по ``proto``/``is_active`` намеренно НЕТ: у сироты
+    с не-VLESS протоколом UUID лежит в ``placeholder:warm-recovery:<uuid>``, а
+    отозванный кред всё равно однозначно указывает на подписку — сузив выборку,
+    мы вернули бы тот же молчаливый 404 другим путём. Скан идёт по всем
+    привязанным кредам, а не только по сиротам, чтобы не-сирота давал внятный
+    409 с текущим владельцем. При сотнях тысяч assigned-строк скан стоит
+    сделать двухфазным (сначала сироты, полный проход — только ради 409).
+
+    Возвращает ``(subscription_ids, undecryptable)``: второе число отличает
+    «UUID не наш» от «рассинхрон APP_SECRET_KEY» в тексте 404.
+    """
+    needle = uuid.lower()
+    sub_ids: set[int] = set()
+    undecryptable = 0
+    rows = (
+        db.query(models.Credential.subscription_id, models.Credential.config_text)
+        .join(
+            models.Subscription,
+            models.Credential.subscription_id == models.Subscription.id,
+        )
+        .yield_per(_UUID_SCAN_CHUNK)
+    )
+    for subscription_id, config_text in rows:
+        try:
+            plain = decrypt(config_text)
+        except Exception:  # noqa: BLE001
+            plain = None
+        if not plain:
+            undecryptable += 1
+            continue
+        if needle in plain.lower():
+            sub_ids.add(subscription_id)
+    if undecryptable:
+        logger.warning(
+            "claim-orphan: %s credential(s) не расшифровались при поиске UUID %s "
+            "— вероятен рассинхрон APP_SECRET_KEY",
+            undecryptable,
+            uuid,
+        )
+    return sub_ids, undecryptable
+
+
 @router.post("/admin/claim-orphan", response_model=ClaimOrphanResponse)
 def claim_orphan(
     body: ClaimOrphanRequest,
@@ -114,32 +178,26 @@ def claim_orphan(
             400, "Cannot claim orphan to the placeholder user itself."
         )
 
-    # Find credential(s) carrying this UUID. We join Subscription so the
-    # subsequent owner check happens against the live ``sub.user_id``,
-    # not a stale denormalization.
-    creds = (
-        db.query(models.Credential)
-        .join(
-            models.Subscription,
-            models.Credential.subscription_id == models.Subscription.id,
-        )
-        .filter(models.Credential.config_text.ilike(f"%{uuid}%"))
-        .all()
-    )
-    if not creds:
-        raise HTTPException(
-            404, f"No credential found whose config_text contains UUID {uuid}"
-        )
+    # Ищем подписку по UUID из клиентской ссылки. Скан идёт по ВСЕМ кредам,
+    # привязанным к подпискам, а не только по сиротам: если UUID нашёлся у
+    # не-сироты, оператор обязан увидеть внятный 409 с текущим владельцем
+    # (ниже), а не 404 «ничего не найдено».
+    sub_ids, undecryptable = _subscriptions_carrying_uuid(db, uuid)
+    if not sub_ids:
+        detail = f"No credential found carrying UUID {uuid}"
+        if undecryptable:
+            detail += (
+                f" ({undecryptable} credential(s) failed to decrypt — "
+                "check APP_SECRET_KEY)"
+            )
+        raise HTTPException(404, detail)
 
-    sub_ids = {c.subscription_id for c in creds if c.subscription_id is not None}
     if len(sub_ids) > 1:
         raise HTTPException(
             409,
             f"UUID matches credentials in multiple subscriptions: {sorted(sub_ids)}",
         )
-    sub_id = next(iter(sub_ids), None)
-    if sub_id is None:
-        raise HTTPException(409, "Matched credential is not bound to any subscription")
+    sub_id = next(iter(sub_ids))
 
     sub = db.get(models.Subscription, sub_id)
     if sub is None:

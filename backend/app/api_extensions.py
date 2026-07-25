@@ -746,6 +746,40 @@ def ad_sources_funnel(
     )
 
 
+class FunnelStep(BaseModel):
+    key: str
+    label: str
+    count: int
+    pct: float
+
+
+class OnboardingFunnelResponse(BaseModel):
+    days: int | None
+    total: int
+    steps: list[FunnelStep]
+    losses: list[FunnelStep]
+    trial_failures: int
+    # True, если часть когорты старше телеметрии (2026-07-25) — тогда «открыли
+    # кабинет» занижено, и админка обязана это показать, а не выдавать за факт.
+    telemetry_partial: bool
+
+
+@ext_router.get("/admin/onboarding-funnel", response_model=OnboardingFunnelResponse)
+def onboarding_funnel(
+    days: int = 7,
+    db: Session = Depends(get_db),
+    admin_token: str = Depends(require_admin),
+):
+    """Воронка нового юзера: бот → кабинет → триал → ссылка → оплата.
+
+    Считает тот же сервис, что и CLI (`scripts/onboarding_funnel.py`), чтобы
+    цифры в админке и в консоли не разъезжались. ``days=0`` — за всё время.
+    """
+    from .services import onboarding_funnel as funnel_svc
+
+    return funnel_svc.compute(db, days or None)
+
+
 # ── Ad links (управляемые рекламные deep-link'и, admin) ──
 
 class AdLinkCreate(BaseModel):

@@ -140,11 +140,11 @@ Input:
 - `admin_users.json` — выгрузка таблицы users из закешированной вкладки админки (через JS-snippet в DevTools console)
 - `inventories/prod/hosts.yml` для добивки host/region для нод
 - `--node-id-map 'name1:id1,name2:id2'` чтобы сохранить legacy node_id (важно для warm-email-prefix consistency)
-- `--app-secret-key` — для Fernet-шифрования WG private keys
+- `--app-secret-key` (или переменная окружения `APP_SECRET_KEY`) — Fernet-ключ для ВСЕХ секретов: `credentials.config_text`, reality `private_key_enc`, WG-ключи exit'ов и relay-линков. Без него скрипт отказывается генерировать SQL (exit 3); осознанный обход — `--allow-plaintext-secrets` + прогон `scripts.encrypt_legacy_secrets --apply` сразу после restore. Перед применением сверь `app_secret_key_fingerprint` из шапки restore.sql с ключом нового backend'а.
 
 Output `restore.sql` содержит INSERT'ы для:
 - **`vpn_nodes`** — 5 нод с правильными host/region, ssh_port=22, status=active.
-- **`vpn_configs`** — по 2 на ноду (vless-reality + vless-xhttp), с derived public_key, settings JSONB (private_key, public_key, short_id, server_name, camo_dest для Reality; domain, xhttp_path, xhttp_mode для xhttp).
+- **`vpn_configs`** — по 2 на ноду (vless-reality + vless-xhttp), с derived public_key, settings JSONB (private_key_enc — Fernet, public_key, short_id, server_name, camo_dest для Reality; domain, xhttp_path, xhttp_mode для xhttp).
 - **`users`** — 39 row'ов (38 из admin + 1 placeholder `999999`/`__recovery_orphans__` для orphan-подписок). С telegram_id, email, created_at, balance_kopecks, trial_activated_at (выставляется для юзеров с подписками/балансом — чтобы не получили "первый месяц на нас" повторно).
 - **`subscriptions`** — 8 known (user-* form, expires_at=first_provision_epoch + plan_duration_days, auto_renew=TRUE, extra_device_slots=count(devices)-plan.max_devices) + 14 orphan (на placeholder user, expires=NOW+30d, auto_renew=FALSE).
 - **`devices`** — 9 known + 14 orphan. access_username = email из xray.clients[], sub_token свежесгенерён.

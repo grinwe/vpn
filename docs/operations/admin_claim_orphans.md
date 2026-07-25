@@ -26,10 +26,16 @@ WHERE s.user_id = 999999
 ORDER BY s.node_id, d.access_username;
 ```
 
+> ⚠️ С 2026-07-25 `config_text` в этих выборках отдаёт **шифртекст**
+> `enc:v1:…` (дошифровка легаси-секретов, `scripts/encrypt_legacy_secrets.py`).
+> Чтобы увидеть саму ссылку, расшифруй значение бэкендом, а не глазами:
+> `docker compose exec -T backend python -c "from app.security import decrypt; print(decrypt('enc:v1:...'))"`.
+> Сам эндпоинт claim-orphan расшифровывает креды сам — ему шифртекст не мешает.
+
 В каждой:
 * `access_username` — `warm-<node_id>-<hex>` (то же что в xray.clients[])
 * `config_text` — полноценный VLESS URL с реальным UUID, который юзер
-  сейчас использует в Hiddify
+  сейчас использует в Hiddify (в БД — под шифрованием, см. врезку выше)
 * `subscription.user_id = 999999` (placeholder), `subscription.expires_at`
   через 30 дней — после чего backend revoke'нёт девайс автоматически.
 
@@ -100,9 +106,16 @@ admin-claim просто **TRANSFER'ит** ownership, не пересоздаё�
 
 1. Распарсить UUID из payload через `extract_uuid_from_vless_url`. Помимо
    ошибки парсинга, отказываем если target user — сам placeholder (999999).
-2. Найти все `Credential` где `config_text ilike '%<uuid>%'`. Сгруппировать
-   по `subscription_id`. Ожидаем ровно один (409 на multiple matches,
-   404 на none).
+2. Найти все `Credential`, привязанные к подписке (INNER JOIN на
+   `subscriptions` — warm-пул с `subscription_id IS NULL` пропускаем),
+   расшифровать `config_text` и оставить те, где UUID встречается подстрокой.
+   Сгруппировать по `subscription_id`, ожидаем ровно один (409 на multiple
+   matches, 404 на none). **Почему не SQL `ILIKE`:** с 2026-07-25 колонка
+   `config_text` хранит шифртекст `enc:v1:…` (дошифровка легаси-секретов), и
+   SQL-подстрока не находила НИЧЕГО — эндпоинт отдавал 404 всем сиротам.
+   Питоновский матчинг работает и с шифртекстом, и с плейнтекстом (его снова
+   насыпает DR-восстановление `generate_restore_sql.py`). Если ни один кред не
+   расшифровался, 404 явно указывает на `APP_SECRET_KEY`.
 3. Проверить инвариант: `subscription.user_id == ORPHAN_OWNER_ID` (409
    иначе — либо уже claim'нута, либо вообще не orphan).
 4. Подтянуть **все** sibling devices/credentials этой Subscription —

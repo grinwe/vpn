@@ -9,9 +9,17 @@
 * ``nodes.json`` — параметры VLESS-инбаундов (port, sni, short_id,
   ws_path, xhttp_path, private_key) — взятые из тех же config.json.
 * ``wg.json`` (опц.) — exit-ноды и relay-links из wg-конфигов
-  (см. ``aggregate_wg_inventory.py``). Чтобы заполнить relay_exit_links
-  с зашифрованными private-ключами, нужен ``--app-secret-key`` —
-  тот же APP_SECRET_KEY, что использовал старый backend для Fernet.
+  (см. ``aggregate_wg_inventory.py``).
+
+APP_SECRET_KEY обязателен (``--app-secret-key`` либо одноимённая переменная
+окружения): им шифруются ВСЕ секреты, которые backend читает через
+``security.decrypt()`` — ``credentials.config_text`` (внутри UUID клиента),
+reality-``private_key``, WG-ключи exit'ов и relay-линков. Без ключа скрипт
+отказывается генерировать SQL: иначе restore зальёт в свежую БД плейнтекст и
+молча откатит фикс 223dd71. Осознанный обход — ``--allow-plaintext-secrets``
+(сценарий «ключ утерян безвозвратно, поднимаемся с новым»); после такого
+восстановления обязателен прогон
+``docker compose exec -T backend python -m scripts.encrypt_legacy_secrets --apply``.
 * ``inventories/prod/hosts.yml`` — карта ``name → ansible_host``
   и ``location`` (= region). Без неё мы не знаем IP'ов нод.
 
@@ -48,6 +56,7 @@ audit_log, referral_codes — это всё либо потеряно навсе
 не критично для восстановления доступа.
 
 Usage:
+    APP_SECRET_KEY="$(ssh root@<mgmt> 'docker compose -f /opt/vpn/docker-compose.yml exec -T backend env' | sed -n 's/^APP_SECRET_KEY=//p')" \\
     python3 scripts/generate_restore_sql.py \\
         --users-json   infra/ansible/recovered/users.json \\
         --nodes-json   infra/ansible/recovered/nodes.json \\
@@ -62,6 +71,7 @@ from __future__ import annotations
 import argparse
 import base64
 import json
+import os
 import secrets
 import sys
 from datetime import datetime, timedelta, timezone
@@ -99,9 +109,9 @@ def _fernet_from_secret(secret: str) -> Fernet:
     return Fernet(base64.urlsafe_b64encode(digest))
 
 
-def encrypt_with_app_key(value: str, app_secret_key: str | None) -> str | None:
-    """Шифрует строку в формате backend'а. Без ключа возвращает None и
-    предупреждает — вызывающий должен решать, как обойтись."""
+def encrypt_with_app_key(value: str | None, app_secret_key: str | None) -> str | None:
+    """Шифрует строку в формате backend'а. Без ключа — None (низкоуровневый
+    примитив; вызывающие ходят через :func:`protect_secret`)."""
     if value is None:
         return None
     if not app_secret_key:
@@ -109,6 +119,55 @@ def encrypt_with_app_key(value: str, app_secret_key: str | None) -> str | None:
     cipher = _fernet_from_secret(app_secret_key)
     token = cipher.encrypt(value.encode("utf-8")).decode("ascii")
     return _ENC_PREFIX + token
+
+
+def resolve_app_secret_key(cli_value: str | None) -> str | None:
+    """Ключ из флага, иначе из окружения.
+
+    Env — предпочтительный путь в DR: ключ и так лежит в .env web-хоста и в
+    vault, а argv светится в ``ps`` и в history оператора, куда секретам не
+    место.
+    """
+    if cli_value and cli_value.strip():
+        return cli_value.strip()
+    return (os.getenv("APP_SECRET_KEY") or "").strip() or None
+
+
+def protect_secret(
+    value: str | None, app_secret_key: str | None, *, allow_plaintext: bool
+) -> str | None:
+    """Значение для колонки, которую backend читает через ``decrypt()``.
+
+    Отдельно от :func:`encrypt_with_app_key`, потому что здесь «нет ключа» НЕ
+    означает NULL: ``credentials.config_text`` — NOT NULL, а reality без
+    private_key просто не поднимется. Молча писать плейнтекст нельзя — ровно
+    так в проде осело 28 кредов до 223dd71, — поэтому единственный путь без
+    ключа явный: ``--allow-plaintext-secrets``.
+    """
+    if value is None:
+        return None
+    if app_secret_key:
+        return encrypt_with_app_key(value, app_secret_key)
+    if allow_plaintext:
+        return value
+    raise RuntimeError(
+        "protect_secret вызван без APP_SECRET_KEY и без allow_plaintext — "
+        "баг вызывающего: проверка обязана была отработать в начале main()."
+    )
+
+
+def key_fingerprint(app_secret_key: str) -> str:
+    """8 hex — чтобы оператор глазами сверил ключ генерации с тем, что поедет
+    в .env нового backend'а.
+
+    Домен-сепаратор обязателен: сам Fernet-ключ = sha256(APP_SECRET_KEY), так
+    что печатать куски этого дайджеста нельзя — это буквально байты ключа.
+    Рассинхрон ключей — главный новый способ отстрелить себе ногу: с ним
+    restore ляжет успешно, а декрипт кредов вернёт None и сабы отдадут 503.
+    """
+    return hashlib.sha256(
+        b"restore-sql-key-fingerprint:" + app_secret_key.encode("utf-8")
+    ).hexdigest()[:8]
 
 
 def derive_reality_public_key(private_b64url: str) -> str:
@@ -209,7 +268,7 @@ def parse_telegram_map(spec: str | None) -> dict[int, str]:
     return out
 
 
-def main() -> int:
+def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--users-json", required=True, type=Path)
     parser.add_argument("--nodes-json", required=True, type=Path)
@@ -222,10 +281,19 @@ def main() -> int:
     )
     parser.add_argument(
         "--app-secret-key", default=None,
-        help="APP_SECRET_KEY (Fernet) для шифрования WG private keys. "
-             "Если не задан и --wg-json есть, relay_exit_links НЕ "
-             "эмитятся (там private_key_enc NOT NULL); wg_exit_nodes "
-             "эмитятся с private_key_enc=NULL.",
+        help="APP_SECRET_KEY (Fernet) — тот же, что был у старого backend'а. "
+             "Им шифруются credentials.config_text, reality private_key и "
+             "WG-ключи. Можно (предпочтительно) передать через переменную "
+             "окружения APP_SECRET_KEY — argv виден в ps. Без ключа скрипт "
+             "отказывается генерировать SQL.",
+    )
+    parser.add_argument(
+        "--allow-plaintext-secrets", action="store_true",
+        help="Осознанно писать секреты открытым текстом — только когда ключ "
+             "утерян безвозвратно и новый backend поднимается с новым "
+             "APP_SECRET_KEY. decrypt() на плейнтексте — no-op, БД заведётся; "
+             "сразу после restore прогони `docker compose exec -T backend "
+             "python -m scripts.encrypt_legacy_secrets --apply`.",
     )
     parser.add_argument(
         "--default-plan-id", type=int, default=1,
@@ -274,7 +342,35 @@ def main() -> int:
              "Дефолт 30 (Solo). Если у тебя другие планы — допилишь руками "
              "после применения SQL.",
     )
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
+
+    # Ключ резолвим ДО чтения входных файлов: DR-скрипт обязан падать мгновенно
+    # и одинаково, а не после минуты работы и не на середине записи restore.sql.
+    app_key = resolve_app_secret_key(args.app_secret_key)
+    allow_plaintext = bool(args.allow_plaintext_secrets)
+    if not app_key and not allow_plaintext:
+        print(
+            "[fatal] APP_SECRET_KEY не задан (ни --app-secret-key, ни переменная "
+            "окружения). restore.sql пишет секреты в поля, которые backend читает "
+            "через decrypt(): credentials.config_text (внутри UUID клиента) и "
+            "reality private_key. Без ключа они лягут в новую БД открытым текстом "
+            "и молча откатят фикс 223dd71.\n"
+            "        Где взять: vault → deploy_app_stack_app_secret_key, либо .env "
+            "на web-хосте.\n"
+            "        Если ключ утерян безвозвратно — перезапусти с "
+            "--allow-plaintext-secrets и сразу после restore прогони "
+            "`docker compose exec -T backend python -m "
+            "scripts.encrypt_legacy_secrets --apply`.",
+            file=sys.stderr,
+        )
+        return 3
+    if not app_key:
+        print(
+            "[warn] --allow-plaintext-secrets: секреты уедут в restore.sql "
+            "ОТКРЫТЫМ ТЕКСТОМ. Сам файл — секрет: не клади в git, удали с mgmt "
+            "и с ноутбука после применения.",
+            file=sys.stderr,
+        )
 
     users = json.loads(args.users_json.read_text())
     nodes = json.loads(args.nodes_json.read_text())
@@ -308,6 +404,19 @@ def main() -> int:
     lines.append(f"-- generated_at: {datetime.now(timezone.utc).isoformat()}")
     lines.append(f"-- grace_days: {args.grace_days}  default_plan_id: {args.default_plan_id}")
     lines.append("-- Все INSERT'ы идемпотентны (ON CONFLICT DO NOTHING).")
+    if app_key:
+        # Отпечаток в шапке, чтобы при разборе полётов было видно, каким ключом
+        # шифровался файл: сверить с новым .env дешевле, чем ловить 503 на сабах.
+        lines.append(f"-- app_secret_key_fingerprint: {key_fingerprint(app_key)}")
+    else:
+        lines.append(
+            "-- ВНИМАНИЕ: сгенерировано с --allow-plaintext-secrets — "
+            "config_text и reality private_key лежат ОТКРЫТЫМ ТЕКСТОМ."
+        )
+        lines.append(
+            "-- После применения обязательно: docker compose exec -T backend "
+            "python -m scripts.encrypt_legacy_secrets --apply"
+        )
     lines.append("BEGIN;")
     lines.append("")
 
@@ -373,8 +482,18 @@ def main() -> int:
                 # Берём первый shortId (бэкенд читает settings.short_id).
                 short_ids = cfg.get("short_ids") or []
                 short_id = next((sid for sid in short_ids if sid), "")
+                # private_key — секрет: живой код кладёт его в
+                # settings.private_key_enc через encrypt() (node_spawner.py), а
+                # читает как decrypt(private_key_enc or private_key)
+                # (provisioning._collect_site_extra_vars). Имя поля не должно
+                # врать про содержимое, поэтому в плейнтекст-режиме пишем в
+                # легаси-имя private_key — бэкенд понимает обе ветки.
+                priv_field = "private_key_enc" if app_key else "private_key"
                 settings = {
-                    "private_key": cfg.get("private_key"),
+                    priv_field: protect_secret(
+                        cfg.get("private_key"), app_key,
+                        allow_plaintext=allow_plaintext,
+                    ),
                     "public_key": public_key,
                     "short_id": short_id,
                     "server_name": sni,
@@ -443,20 +562,31 @@ def main() -> int:
         lines.append("-- wg_exit_nodes")
         for idx, ex in enumerate(wg_exits, start=1):
             exit_id_by_name[ex["name"]] = idx
-            priv_enc = encrypt_with_app_key(ex.get("wg_private_key") or "", args.app_secret_key)
-            if priv_enc is None and ex.get("wg_private_key"):
+            # `or None`, а не `or ""`: encrypt_with_app_key("") успешно шифрует
+            # пустую строку, и exit БЕЗ ключа уезжал в БД с «ключом» из нуля
+            # байт — гейт `if not exit_node.wg_private_key_enc`
+            # (provisioning.py) такой шифртекст пропускает, и WG-туннель молча
+            # не поднимается. Старый warning этот случай не ловил: он требовал
+            # непустой wg_private_key и срабатывал только когда не задан
+            # APP_SECRET_KEY, а теперь ключ проверен в начале main().
+            priv_enc = protect_secret(
+                ex.get("wg_private_key") or None, app_key,
+                allow_plaintext=allow_plaintext,
+            )
+            if priv_enc is None:
                 print(
-                    f"[warn] wg_exit_nodes.{ex['name']}: no APP_SECRET_KEY → "
-                    f"wg_private_key_enc=NULL. Подкрути в БД руками когда "
-                    f"подберёшь ключ.",
+                    f"[warn] wg_exit_nodes.{ex['name']}: в wg.json нет "
+                    f"wg_private_key → wg_private_key_enc=NULL, туннели с этого "
+                    f"exit'а не поднимутся. Допиши ключ в БД руками.",
                     file=sys.stderr,
                 )
             # Для wg_exit_nodes используем DO UPDATE (а не DO NOTHING),
-            # потому что при первом restore.sql без --app-secret-key
-            # ноды могли создаться с private_key_enc=NULL. Повторный
-            # запуск с ключом должен ОБНОВИТЬ зашифрованный ключ, не
-            # пропустить. Public key/host/region/port менять не
-            # рискуем — оставляем что было.
+            # потому что при первом прогоне wg.json мог быть собран без
+            # приватных ключей (ноды создались с private_key_enc=NULL) либо
+            # прогон был плейнтекстовым. COALESCE(EXCLUDED, старое) берёт
+            # EXCLUDED всегда, когда он не NULL, — повторный прогон с ключом
+            # ЗАМЕНЯЕТ значение, а не только дошивает. Public key/host/region/
+            # port менять не рискуем — оставляем что было.
             lines.append(
                 "INSERT INTO wg_exit_nodes "
                 "(id, name, region, host, ssh_port, wg_port, wg_address_v4, "
@@ -481,63 +611,63 @@ def main() -> int:
             )
         lines.append("")
 
-        # relay_exit_links — только если APP_SECRET_KEY есть, иначе
-        # NOT NULL на wg_client_private_key_enc провалится.
+        # relay_exit_links.wg_client_private_key_enc — NOT NULL, поэтому линки
+        # без ключа пропускаем поштучно. Ветки «нет APP_SECRET_KEY → пропустить
+        # всю таблицу» больше нет: ключ (или явное разрешение на плейнтекст)
+        # проверен в начале main(), до чтения входных файлов.
         lines.append("-- relay_exit_links")
-        if not args.app_secret_key:
-            lines.append(
-                "-- (пропущено: нет APP_SECRET_KEY. relay_exit_links."
-                "wg_client_private_key_enc NOT NULL, без шифровки таблицу "
-                "не заполнить. Перезапусти с --app-secret-key когда узнаешь его.)"
-            )
-        else:
-            link_id = 1
-            skipped_links = 0
-            for ln in wg_links:
-                jump_id = assigned.get(ln["jump"])
-                exit_id = exit_id_by_name.get(ln["exit"])
-                if jump_id is None or exit_id is None:
-                    print(
-                        f"[warn] relay_exit_link {ln['jump']}→{ln['exit']}: "
-                        f"jump_id={jump_id} exit_id={exit_id} — пропуск.",
-                        file=sys.stderr,
-                    )
-                    skipped_links += 1
-                    continue
-                priv_enc = encrypt_with_app_key(
-                    ln.get("wg_client_private_key") or "", args.app_secret_key
-                )
-                if priv_enc is None:
-                    print(
-                        f"[warn] relay_exit_link {ln['jump']}→{ln['exit']}: "
-                        f"private key empty — пропуск.",
-                        file=sys.stderr,
-                    )
-                    skipped_links += 1
-                    continue
-                lines.append(
-                    "INSERT INTO relay_exit_links "
-                    "(id, relay_node_id, exit_id, wg_interface_name, "
-                    "wg_client_private_key_enc, wg_client_public_key, "
-                    "wg_client_address_v4, created_at) "
-                    f"VALUES ({link_id}, {jump_id}, {exit_id}, "
-                    f"{sql_str(ln.get('wg_interface_name') or 'wg0')}, "
-                    f"{sql_str(priv_enc)}, "
-                    f"{sql_str(ln.get('wg_client_public_key'))}, "
-                    f"{sql_str(ln.get('wg_client_address_v4'))}, "
-                    f"NOW()) "
-                    "ON CONFLICT DO NOTHING;"
-                )
-                link_id += 1
-            lines.append(
-                "SELECT setval('relay_exit_links_id_seq', "
-                "GREATEST((SELECT COALESCE(MAX(id),0) FROM relay_exit_links), 1));"
-            )
-            if skipped_links:
+        link_id = 1
+        skipped_links = 0
+        for ln in wg_links:
+            jump_id = assigned.get(ln["jump"])
+            exit_id = exit_id_by_name.get(ln["exit"])
+            if jump_id is None or exit_id is None:
                 print(
-                    f"[warn] relay_exit_links: skipped {skipped_links}",
+                    f"[warn] relay_exit_link {ln['jump']}→{ln['exit']}: "
+                    f"jump_id={jump_id} exit_id={exit_id} — пропуск.",
                     file=sys.stderr,
                 )
+                skipped_links += 1
+                continue
+            # `or None`, а не `or ""` — см. коммент у wg_exit_nodes. Здесь
+            # ветка ниже была ПОЛНОСТЬЮ мёртвой: внутри старого else
+            # app_secret_key заведомо truthy, а "" успешно шифруется, поэтому
+            # линк с пустым ключом уезжал в БД с нулевым «ключом».
+            priv_enc = protect_secret(
+                ln.get("wg_client_private_key") or None, app_key,
+                allow_plaintext=allow_plaintext,
+            )
+            if priv_enc is None:
+                print(
+                    f"[warn] relay_exit_link {ln['jump']}→{ln['exit']}: "
+                    f"private key empty — пропуск.",
+                    file=sys.stderr,
+                )
+                skipped_links += 1
+                continue
+            lines.append(
+                "INSERT INTO relay_exit_links "
+                "(id, relay_node_id, exit_id, wg_interface_name, "
+                "wg_client_private_key_enc, wg_client_public_key, "
+                "wg_client_address_v4, created_at) "
+                f"VALUES ({link_id}, {jump_id}, {exit_id}, "
+                f"{sql_str(ln.get('wg_interface_name') or 'wg0')}, "
+                f"{sql_str(priv_enc)}, "
+                f"{sql_str(ln.get('wg_client_public_key'))}, "
+                f"{sql_str(ln.get('wg_client_address_v4'))}, "
+                f"NOW()) "
+                "ON CONFLICT DO NOTHING;"
+            )
+            link_id += 1
+        lines.append(
+            "SELECT setval('relay_exit_links_id_seq', "
+            "GREATEST((SELECT COALESCE(MAX(id),0) FROM relay_exit_links), 1));"
+        )
+        if skipped_links:
+            print(
+                f"[warn] relay_exit_links: skipped {skipped_links}",
+                file=sys.stderr,
+            )
         lines.append("")
 
     # ── users ────────────────────────────────────────────────────────
@@ -804,6 +934,13 @@ def main() -> int:
                 region=(inventory.get(node_name) or {}).get("region") or "",
                 uuid=d["uuid"] or "",
             )
+            # config_text — секрет: внутри UUID, которым клиент и авторизуется
+            # на ноде. Весь живой код пишет эту колонку только через encrypt()
+            # (warm_pool, provisioning), плейнтекст отсюда вернул бы в свежую
+            # БД ровно то, что вычистил 223dd71.
+            config_text_stored = protect_secret(
+                config_text, app_key, allow_plaintext=allow_plaintext
+            )
             lines.append(
                 "INSERT INTO credentials "
                 "(id, subscription_id, device_id, config_id, node_id, "
@@ -812,7 +949,7 @@ def main() -> int:
                 f"VALUES ({known_cred_id}, {d['subscription_id']}, "
                 f"{d['device_id']}, {sql_int(cfg_info['config_id'])}, "
                 f"{d['node_id']}, {sql_str(cfg_info['protocol'])}, "
-                f"{sql_str(config_text)}, {sql_str(d['email'])}, "
+                f"{sql_str(config_text_stored)}, {sql_str(d['email'])}, "
                 f"'assigned', TRUE, NOW(), NOW()) "
                 "ON CONFLICT (id) DO NOTHING;"
             )
@@ -896,6 +1033,10 @@ def main() -> int:
                     region=(inventory.get(node_name) or {}).get("region") or "",
                     uuid=uuid,
                 )
+                # Тот же секрет, что и у known-кредов (см. выше): шифруем.
+                config_text_stored = protect_secret(
+                    config_text, app_key, allow_plaintext=allow_plaintext
+                )
                 lines.append(
                     "INSERT INTO credentials "
                     "(id, subscription_id, device_id, config_id, node_id, "
@@ -904,7 +1045,7 @@ def main() -> int:
                     f"VALUES ({orphan_cred_id}, {orphan_sub_id}, "
                     f"{orphan_dev_id}, {sql_int(cfg_info['config_id'])}, "
                     f"{node_db_id}, {sql_str(cfg_info['protocol'])}, "
-                    f"{sql_str(config_text)}, {sql_str(bundle['email'])}, "
+                    f"{sql_str(config_text_stored)}, {sql_str(bundle['email'])}, "
                     f"'assigned', TRUE, NOW(), NOW()) "
                     "ON CONFLICT (id) DO NOTHING;"
                 )
@@ -941,7 +1082,7 @@ def main() -> int:
         wg = json.loads(args.wg_json.read_text())
         wg_summary = (
             f" wg_exits={len(wg.get('exits') or [])}"
-            f" wg_links={'skipped' if not args.app_secret_key else len(wg.get('links') or [])}"
+            f" wg_links={len(wg.get('links') or [])}"
         )
 
     users_with_tg = sum(
@@ -958,7 +1099,9 @@ def main() -> int:
         f"users={len(all_user_ids)} (with_tg={users_with_tg}, "
         f"with_balance={users_with_balance}) "
         f"subscriptions={len(by_sub)} devices={dev_id - 1}"
-        f"{credentials_summary}{wg_summary} -> {args.output}",
+        f"{credentials_summary}{wg_summary} "
+        f"secrets={'encrypted:' + key_fingerprint(app_key) if app_key else 'PLAINTEXT'}"
+        f" -> {args.output}",
         file=sys.stderr,
     )
     return 0
@@ -1025,9 +1168,13 @@ def _build_vless_url_for_credential(
         q = "&".join(f"{k}={v}" for k, v in params.items() if v)
         return f"vless://{uuid}@{cdn_domain}:{port}?{q}#ws-cdn-{region_tag}"
 
-    # Unknown protocol — placeholder. Backend не должен использовать
-    # этот credential для нового назначения (state=assigned), для
-    # admin-claim'а UUID найдётся в access_username, config_text не критичен.
+    # Unknown protocol — placeholder. Backend не должен использовать этот
+    # credential для нового назначения (state=assigned). UUID оставляем прямо
+    # в строке, и это не косметика: admin-claim ищет кред ТОЛЬКО по
+    # config_text (api/admin_claim.py), других лукапов по UUID нет. В
+    # access_username UUID не найдётся никогда — там xray-овый email
+    # (`warm-<node_id>-<hex>` у warm-бандлов, `user-<uid>-<sid>-<epoch>-<nonce>`
+    # у известных девайсов).
     return f"placeholder:warm-recovery:{uuid}"
 
 

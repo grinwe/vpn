@@ -512,6 +512,36 @@ _FORBIDDEN_EXTRA_KEYS = frozenset(
 )
 
 
+class SecretDecryptError(RuntimeError):
+    """Секрет из БД не расшифровался — играть с этим дальше нельзя.
+
+    Отдельный тип, чтобы падение было опознаваемым в /admin/tasks: причина
+    всегда системная (ротация ``APP_SECRET_KEY``, процесс поднят с
+    ``ALLOW_PLAINTEXT_SECRETS=1`` против зашифрованной БД, битый блоб), а не
+    «плохая нода».
+    """
+
+
+def _decrypt_required(blob: str | None, *, what: str, hint: str) -> str:
+    """Расшифровать секрет, который ОБЯЗАН доехать до ansible.
+
+    ``decrypt()`` не бросает, а ВОЗВРАЩАЕТ None, когда значение помечено
+    ``enc:v1:``, но расшифровать его нечем. Раньше этот None молча уезжал в
+    extra_vars, ansible получал ``"vless_reality_private_key": null`` и роль
+    падала на ``object of type 'NoneType' has no len()`` — сообщение, по
+    которому настоящую причину не найти. Теперь падаем здесь и называем, ЧЕЙ
+    секрет не читается.
+    """
+    value = decrypt(blob)
+    if not value:
+        raise SecretDecryptError(
+            f"{hint}: не удалось расшифровать {what} — проверь APP_SECRET_KEY "
+            "(ротация ключа / процесс с ALLOW_PLAINTEXT_SECRETS против "
+            "зашифрованной БД) либо целостность значения в БД"
+        )
+    return value
+
+
 def _validate_extra_vars(extra: dict[str, Any], *, node_hint: str) -> None:
     """Defence-in-depth check before we hand ``extra`` to ansible.
 
@@ -531,6 +561,17 @@ def _validate_extra_vars(extra: dict[str, Any], *, node_hint: str) -> None:
         if key in _FORBIDDEN_EXTRA_KEYS:
             raise ValueError(
                 f"extra_vars for node {node_hint}: key {key!r} is reserved by ansible"
+            )
+        if value is None:
+            # None доезжает до ansible как `null`, то есть переменная
+            # ОПРЕДЕЛЕНА и пуста: роли проверяют `X is not defined or
+            # X | length == 0` и падают на `NoneType has no len()` вместо
+            # своего fail_msg. Ловим здесь — обычно это несработавший
+            # decrypt (см. _decrypt_required).
+            raise ValueError(
+                f"extra_vars for node {node_hint}: key {key!r} is None — "
+                "ansible получит null и роль упадёт на невнятной ошибке; "
+                "чаще всего это нерасшифрованный секрет"
             )
         if isinstance(value, str):
             for marker in _JINJA_MARKERS:
@@ -629,10 +670,15 @@ def _collect_site_extra_vars(
             stls_pwd_enc = settings.get("shadowtls_password_enc")
             if not ss_pwd_enc or not stls_pwd_enc:
                 continue
+            _hint = f"node {node.name}/config {cfg.id}"
             extra.update({
                 "shadowtls_port": cfg.port,
-                "shadowtls_password": decrypt(stls_pwd_enc),
-                "shadowtls_ss_password": decrypt(ss_pwd_enc),
+                "shadowtls_password": _decrypt_required(
+                    stls_pwd_enc, what="shadowtls_password", hint=_hint
+                ),
+                "shadowtls_ss_password": _decrypt_required(
+                    ss_pwd_enc, what="ss_password", hint=_hint
+                ),
                 "shadowtls_handshake_domain": cfg.sni or _stls.DEFAULT_HANDSHAKE_DOMAIN,
             })
             health_ports.append(cfg.port)
@@ -656,7 +702,11 @@ def _collect_site_extra_vars(
             if not (priv_enc or priv_plain) or not cfg.public_key:
                 continue
             extra.update({
-                "vless_reality_private_key": decrypt(priv_enc or priv_plain),
+                "vless_reality_private_key": _decrypt_required(
+                    priv_enc or priv_plain,
+                    what="reality private_key",
+                    hint=f"node {node.name}/config {cfg.id}",
+                ),
                 "vless_reality_public_key": cfg.public_key,
                 "vless_reality_short_id": settings.get("short_id", ""),
                 "vless_reality_port": cfg.port,
@@ -867,7 +917,11 @@ def _collect_exit_extra_vars(
             f"wg_address_v4={exit_node.wg_address_v4!r}: {exc}"
         ) from exc
     extra: dict[str, Any] = {
-        "wg_exit_private_key": decrypt(exit_node.wg_private_key_enc),
+        "wg_exit_private_key": _decrypt_required(
+            exit_node.wg_private_key_enc,
+            what="wg_private_key",
+            hint=f"exit {exit_node.name}",
+        ),
         "wg_exit_peers": peers,
         "wg_exit_port": exit_node.wg_port,
         "wg_exit_address_v4": exit_node.wg_address_v4,
@@ -1069,6 +1123,18 @@ def _extract_vless_uuid(
             cred_id,
         )
         return None
+    if not uri:
+        # decrypt() не бросает, а ВОЗВРАЩАЕТ None, когда строка помечена
+        # enc:v1:, но расшифровать её нечем (ротация APP_SECRET_KEY, режим
+        # ALLOW_PLAINTEXT_SECRETS против зашифрованной БД, битый блоб). Без
+        # этой ветки re.match(None) кидал TypeError и ронял ВЕСЬ батч
+        # ресинка/ребилда — ровно то, от чего докстринг обещает защитить.
+        logger.warning(
+            "vless-uuid: decrypt returned empty for credential %s — "
+            "UUID не унаследуется при миграции",
+            cred_id,
+        )
+        return None
     match = _VLESS_UUID_RE.match(uri)
     if not match:
         logger.warning(
@@ -1123,6 +1189,11 @@ def _extract_hy2_auth(
         uri = decrypt(config_text_enc)
     except Exception:  # noqa: BLE001
         logger.warning("hy2-auth: decrypt failed for credential %s", cred_id)
+        return None
+    if not uri:
+        # См. _extract_vless_uuid: None из decrypt() — не исключение, а
+        # штатный возврат. re.match(None) валил весь hy2-ресинк ноды.
+        logger.warning("hy2-auth: decrypt returned empty for credential %s", cred_id)
         return None
     match = re.match(r"^hy2://([^@/]+)@", uri)
     if not match:
