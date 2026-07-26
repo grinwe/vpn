@@ -567,6 +567,13 @@ export interface VPNNodeOut {
   // cert_expires_at — ближайшее истечение LE-серта (xhttp/ws-cdn) ноды.
   // Пишет cert-renewal-тик (внешняя TLS-проба). null = нет сертов/не пробовано.
   cert_expires_at: string | null;
+  // Версии софта на ноде — снимает tick-node-versions по SSH раз в час.
+  // xray_version — что реально стоит на ноде; release_version — версия НАШЕГО
+  // кода из /etc/vpn-node-release.json (пишется бутстрапом после успеха всех
+  // ролей). versions_checked_at=null → ноду ещё ни разу не опрашивали.
+  xray_version: string | null;
+  release_version: string | null;
+  versions_checked_at: string | null;
   blocked_regions: string[];
   cooldown_until: string | null;
   suspect_since: string | null;
@@ -792,6 +799,53 @@ export function renewNodeCerts(
     `/nodes/${nodeId}/renew-certs`,
     {},
   );
+}
+
+// Точечная доставка ядра xray целевой версии (только роль xray_core, ~30-60с
+// против 5-8 минут полного бутстрапа). config.json не трогается, клиенты ноды
+// остаются; рестарт xray рвёт живые соединения примерно на 100 мс.
+export function upgradeNodeXray(
+  nodeId: number,
+): Promise<{ node_id: number; task_id: number }> {
+  return api.post<{ node_id: number; task_id: number }>(
+    `/nodes/${nodeId}/upgrade-xray`,
+    {},
+  );
+}
+
+// Тот же апгрейд по списку нод («обновить выбранные»). Неизвестные id
+// возвращаются в skipped — батч не падает целиком из-за одной удалённой ноды.
+export function upgradeNodesXray(
+  nodeIds: number[],
+  reason?: string,
+): Promise<{
+  started: { node_id: number; task_id: number }[];
+  skipped: number[];
+}> {
+  return api.post(`/nodes/upgrade-xray`, { node_ids: nodeIds, reason });
+}
+
+// Сводка версий: наш код, upstream-релиз xray, пин в роли и дрейф по нодам.
+// Upstream берётся из кэша (наполняет tick-xray-upstream) — на каждый рендер
+// в GitHub не ходим.
+export interface VersionsOverview {
+  app_version: string;
+  xray: {
+    latest: string | null;
+    pinned: string | null;
+    pin_behind_upstream: boolean;
+    checked_at: string | null;
+    html_url: string | null;
+    last_error: string | null;
+  };
+  nodes_total: number;
+  nodes_outdated_xray: string[];
+  nodes_outdated_release: string[];
+  nodes_version_unknown: string[];
+}
+
+export function fetchVersionsOverview(): Promise<VersionsOverview> {
+  return api.get<VersionsOverview>(`/versions/overview`);
 }
 
 // Правка дисплейных/маршрутных полей ноды (name/region/pool_id/notes).

@@ -282,6 +282,14 @@ export default function Help({ botUsername, devices = [] }: Props) {
           </>
         )}
       </div>
+
+      {/* Версия сборки. Нужна поддержке: юзер присылает её вместе с жалобой, и
+          сразу видно, старый ли у него бандл из кэша Telegram-вебвью. Vite
+          запекает значение на сборке (build-arg VITE_APP_VERSION из файла
+          VERSION). */}
+      <p className="text-tg-hint text-[11px] text-center mt-6">
+        версия {import.meta.env.VITE_APP_VERSION ?? "0.0.0-dev"}
+      </p>
     </div>
   );
 }

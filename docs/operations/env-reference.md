@@ -68,6 +68,13 @@
 | `ALLOW_INPROCESS_PROVISIONING` | `""` | backend | Dev escape-hatch: `"1"` → backend выполняет ansible сам, без RQ. **Не** включать в prod — блокирует HTTP request'ы. |
 | `MIN_HEALTHY_SCORE` | `50` | backend, worker | Минимальный `health_score` ноды для попадания в `choose_node` / `_eligible_nodes`. |
 | `CHOOSE_NODE_INCLUDE_REGISTERING` | `0` | backend, worker | audit #72. По умолчанию `choose_node` НЕ выдаёт юзеров на ноду в статусе `registering` (bootstrap ещё идёт → холодный provision падает). `"1"` возвращает старое поведение (registering участвует в выборке). |
+| `APP_VERSION` | из файла `VERSION` | backend·worker | Версия выката (семвер). Кладёт `deploy_app_stack`, читая `VERSION` в корне репозитория; отдаётся в `GET /api/version`, уезжает на ноды в extra_vars `vpn_release_version` и пишется в `/etc/vpn-node-release.json`. Не задана → `0.0.0-dev`. Фронты получают ту же строку build-arg'ом `VITE_APP_VERSION`. |
+| `NODE_VERSIONS_INTERVAL` | `3600` | worker | `run_node_versions_tick` — SSH-обход активных нод за фактическими версиями (`xray version` + маркер `/etc/vpn-node-release.json`) в колонки `vpn_nodes.xray_version` / `release_version` / `versions_checked_at`. Первый прогон после рестарта воркера — через ≤5 мин. `0` — отключить. |
+| `NODE_VERSIONS_SSH_WORKERS` | `8` | worker | Размер пула потоков для этого обхода. SSH блокирующий, ноды независимы; больше 8 упирается не в CPU, а в сеть. |
+| `XRAY_UPSTREAM_INTERVAL` | `21600` | worker | `run_xray_upstream_tick` — проверка последнего релиза XTLS/Xray-core на GitHub, кэш в `software_releases`, пуш админу при дрейфе (пин отстал от upstream / ноды отстали от пина). Апгрейд НЕ автоматический: `xray_core_sha256` меняется парой к версии. `0` — отключить. |
+| `XRAY_RELEASES_URL` | GitHub API latest | worker | Переопределение источника релизов (тест/зеркало). |
+| `XRAY_DRIFT_DEDUP_WINDOW_SEC` | `604800` | worker | Окно дедупа пуша про дрейф версий. Ключ дедупа — пара (upstream, пин), поэтому при неизменных версиях повторных пушей нет всю неделю. |
+| `GITHUB_TOKEN` | — | worker | Необязателен: анонимного лимита GitHub (60 запросов/час на IP) хватает для проверки раз в 6 часов. Нужен, только если IP делится с другими потребителями API. |
 | `RESTORE_HY2_AFTER_REINSTALL` | `1` | worker | audit #78. После reinstall (диск стёрт) бэкенд авто-восстанавливает пер-юзерные hysteria2-учётки через `resync_node_hysteria2_clients` (device/apply-таски). `"0"` отключает (оператор восстанавливает вручную по warning-логу). |
 
 ## Worker ticks

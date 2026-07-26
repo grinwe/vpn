@@ -33,6 +33,9 @@ import {
   reinstallNode,
   renewNode,
   renewNodeCerts,
+  upgradeNodeXray,
+  fetchVersionsOverview,
+  VersionsOverview,
   updateNode,
   listPools,
   VPNNodeUpdateIn,
@@ -59,7 +62,7 @@ import { WorkerHealthBadge } from "../workerHealth";
 // is the full set to poll; the sub-arrays break down by phase.
 
 type TrackedOp = {
-  kind: "migration" | "bootstrap" | "resync" | "diagnose" | "diagnose_link";
+  kind: "migration" | "bootstrap" | "resync" | "diagnose" | "diagnose_link" | "upgrade_xray";
   nodeId: number;
   nodeName: string;
   // For kind=diagnose_link only — id of the RelayExitLink the diagnose was
@@ -152,6 +155,149 @@ function CertBadge({ expiresAt }: { expiresAt: string | null }) {
     >
       {days}д
     </span>
+  );
+}
+
+// Бейдж дрейфа версии xray: сверяет то, что реально стоит на ноде
+// (tick-node-versions снимает по SSH), с пином в роли xray_core. Отдельной
+// колонки намеренно нет — таблица уже упёрлась в ширину, поэтому бейдж живёт
+// в ячейке Cert, а подробности (версия нашего кода на ноде, когда опрашивали)
+// — в раскрытой строке.
+function XrayVersionBadge({
+  version,
+  pinned,
+  checkedAt,
+}: {
+  version: string | null;
+  pinned: string | null;
+  checkedAt: string | null;
+}) {
+  const strip = (v: string | null) => (v ? v.replace(/^v/, "") : null);
+  if (!version)
+    return (
+      <span
+        className="text-xs px-1 py-0.5 rounded bg-slate-800 text-slate-500"
+        title={
+          checkedAt
+            ? `Опрашивали ${new Date(checkedAt).toLocaleString()}, версию xray не прочитали`
+            : "Ноду ещё ни разу не опрашивали (tick-node-versions)"
+        }
+      >
+        xray —
+      </span>
+    );
+  const drift = !!pinned && strip(version) !== strip(pinned);
+  return (
+    <span
+      className={`text-xs px-1 py-0.5 rounded font-mono ${
+        drift ? "bg-yellow-700" : "bg-emerald-800"
+      }`}
+      title={
+        (drift
+          ? `На ноде ${version}, целевая версия ${pinned}`
+          : `xray ${version} — совпадает с пином`) +
+        (checkedAt ? `\nПроверено ${new Date(checkedAt).toLocaleString()}` : "")
+      }
+    >
+      {strip(version)}
+    </span>
+  );
+}
+
+// Панель версий в раскрытой строке ноды: что стоит по факту, что должно
+// стоять, какой версией нашего кода нода прошита и когда это выяснялось.
+// Кнопка «Обновить xray» гоняет только роль xray_core (~30-60с против 5-8
+// минут полного бутстрапа) — рестарт xray рвёт живые соединения примерно на
+// 100 мс, клиенты переподключаются сами.
+function NodeVersionsPanel({
+  node,
+  pinnedXray,
+  appVersion,
+  addOp,
+}: {
+  node: VPNNodeOut;
+  pinnedXray: string | null;
+  appVersion: string | null;
+  addOp: (op: TrackedOp) => void;
+}) {
+  const qc = useQueryClient();
+  const strip = (v: string | null) => (v ? v.replace(/^v/, "") : null);
+  const xrayDrift =
+    !!node.xray_version && !!pinnedXray &&
+    strip(node.xray_version) !== strip(pinnedXray);
+  const releaseDrift =
+    !!node.release_version && !!appVersion && node.release_version !== appVersion;
+
+  const upgrade = useMutation({
+    mutationFn: () => upgradeNodeXray(node.id),
+    onSuccess: (res) => {
+      addOp({
+        kind: "upgrade_xray",
+        nodeId: node.id,
+        nodeName: node.name,
+        taskIds: [res.task_id],
+        revokeTaskIds: [],
+        deviceTaskIds: [],
+        resyncTaskIds: [res.task_id],
+        startedAt: Date.now(),
+      });
+      qc.invalidateQueries({ queryKey: ["nodes"] });
+      qc.invalidateQueries({ queryKey: ["provisioning-tasks"] });
+    },
+    onError: (e) => alert(`Не удалось запустить апгрейд: ${String(e)}`),
+  });
+
+  const row = (label: string, value: string | null, drift: boolean, hint: string) => (
+    <div className="flex items-baseline gap-2">
+      <span className="text-slate-400 w-32 shrink-0">{label}</span>
+      <span
+        className={`font-mono ${drift ? "text-yellow-400" : "text-slate-200"}`}
+        title={hint}
+      >
+        {value ?? "—"}
+      </span>
+    </div>
+  );
+
+  return (
+    <section className="rounded border border-slate-800 p-3">
+      <div className="flex items-center justify-between mb-2">
+        <h3 className="font-semibold">Версии</h3>
+        <button
+          onClick={() => {
+            if (
+              !window.confirm(
+                `Обновить xray на ${node.name} до ${pinnedXray ?? "целевой версии"}?\n` +
+                  "Рестарт ядра разорвёт активные соединения на ~100 мс.",
+              )
+            )
+              return;
+            upgrade.mutate();
+          }}
+          disabled={upgrade.isPending}
+          className="text-xs px-2 py-1 rounded bg-slate-800 hover:bg-slate-700 disabled:opacity-50"
+        >
+          {upgrade.isPending ? "Запускаю…" : "Обновить xray"}
+        </button>
+      </div>
+      <div className="text-sm space-y-1">
+        {row("xray на ноде", node.xray_version, xrayDrift, "Снимает tick-node-versions по SSH")}
+        {row("xray целевая", pinnedXray, false, "xray_core_version в роли; меняется коммитом")}
+        {row(
+          "код на ноде",
+          node.release_version,
+          releaseDrift,
+          "Маркер /etc/vpn-node-release.json — пишется бутстрапом после успеха всех ролей",
+        )}
+        {row("код у нас", appVersion, false, "Файл VERSION в репозитории")}
+      </div>
+      <p className="text-xs text-slate-500 mt-2">
+        {node.versions_checked_at
+          ? `Проверено ${new Date(node.versions_checked_at).toLocaleString()}`
+          : "Ноду ещё ни разу не опрашивали (tick-node-versions, раз в час)"}
+        {releaseDrift && " · нода прошита старой версией кода — нужен полный бутстрап"}
+      </p>
+    </section>
   );
 }
 
@@ -1263,6 +1409,17 @@ export default function Nodes() {
     retry: false,
   });
 
+  // Пин версии xray — один запрос на страницу (не на строку): бейджу в каждой
+  // строке нужно с чем сравнивать версию ноды. Обновляется редко, поэтому
+  // отдельный интервал вместо общего поллинга нод.
+  const versionsOverview = useQuery<VersionsOverview>({
+    queryKey: ["versions-overview"],
+    queryFn: fetchVersionsOverview,
+    staleTime: 60_000,
+    refetchInterval: 300_000,
+    retry: false,
+  });
+
   if (isLoading) return <div>Загрузка…</div>;
   if (error) {
     const msg = error instanceof ApiError ? `${error.status}: ${error.message}` : String(error);
@@ -1533,7 +1690,14 @@ export default function Nodes() {
                     )}
                   </td>
                   <td className="hidden lg:table-cell">
-                    <CertBadge expiresAt={n.cert_expires_at} />
+                    <span className="inline-flex items-center gap-1">
+                      <CertBadge expiresAt={n.cert_expires_at} />
+                      <XrayVersionBadge
+                        version={n.xray_version}
+                        pinned={versionsOverview.data?.xray.pinned ?? null}
+                        checkedAt={n.versions_checked_at}
+                      />
+                    </span>
                   </td>
                   <td>
                     <span className="inline-flex items-center gap-1">
@@ -1832,6 +1996,12 @@ export default function Nodes() {
                 {expanded && (
                   <tr className="border-b border-slate-800 bg-slate-900/60">
                     <td colSpan={14} className="p-3 md:p-4 space-y-4">
+                      <NodeVersionsPanel
+                        node={n}
+                        pinnedXray={versionsOverview.data?.xray.pinned ?? null}
+                        appVersion={versionsOverview.data?.app_version ?? null}
+                        addOp={addOp}
+                      />
                       <RelayLinksSection
                         nodeId={n.id}
                         nodeName={n.name}
@@ -4050,6 +4220,7 @@ const KIND_LABELS: Record<string, string> = {
   resync: "Resync",
   diagnose: "Диагностика",
   diagnose_link: "Диагностика link",
+  upgrade_xray: "Апгрейд xray",
 };
 
 function OperationProgressBanner({

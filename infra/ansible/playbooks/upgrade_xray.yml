@@ -20,7 +20,8 @@
 # xray_mirror_url прокидывает бэкенд в extra_vars: временный однохостовый
 # inventory не подхватывает group_vars, а без зеркала RU-нода за
 # заблокированным github ядро не скачает.
-- hosts: all
+- name: Upgrade xray-core on node
+  hosts: all
   become: true
   gather_facts: true
   roles:

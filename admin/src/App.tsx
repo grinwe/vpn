@@ -6,6 +6,7 @@ import Dashboard from "./pages/Dashboard";
 import Users from "./pages/Users";
 import Invoices from "./pages/Invoices";
 import Nodes from "./pages/Nodes";
+import Versions from "./pages/Versions";
 import Plans from "./pages/Plans";
 import ApiTokens from "./pages/ApiTokens";
 import Tasks from "./pages/Tasks";
@@ -23,6 +24,7 @@ const NAV_ITEMS: { to: string; label: string; end?: boolean }[] = [
   { to: "/invoices", label: "Invoices" },
   { to: "/plans", label: "Plans" },
   { to: "/nodes", label: "Nodes" },
+  { to: "/versions", label: "Версии" },
   { to: "/exits", label: "Exits" },
   { to: "/tasks", label: "Tasks" },
   { to: "/health-pings", label: "Health" },
@@ -92,6 +94,7 @@ function Layout({ children }: { children: React.ReactNode }) {
           <NavLink to="/invoices" className={linkCls}>Invoices</NavLink>
           <NavLink to="/plans" className={linkCls}>Plans</NavLink>
           <NavLink to="/nodes" className={linkCls}>Nodes</NavLink>
+          <NavLink to="/versions" className={linkCls}>Версии</NavLink>
           <NavLink to="/exits" className={linkCls}>Exits</NavLink>
           <NavLink to="/tasks" className={linkCls}>Tasks</NavLink>
           <NavLink to="/health-pings" className={linkCls}>Health</NavLink>
@@ -136,6 +139,7 @@ export default function App() {
       <Route path="/invoices" element={<Protected><Invoices /></Protected>} />
       <Route path="/plans" element={<Protected><Plans /></Protected>} />
       <Route path="/nodes" element={<Protected><Nodes /></Protected>} />
+      <Route path="/versions" element={<Protected><Versions /></Protected>} />
       <Route path="/exits" element={<Protected><Exits /></Protected>} />
       <Route path="/tasks" element={<Protected><Tasks /></Protected>} />
       <Route path="/tokens" element={<Protected><ApiTokens /></Protected>} />
