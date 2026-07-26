@@ -1173,6 +1173,10 @@ class SoftwareRelease(Base):
     # должно требовать миграции типа.
     name = Column(String, nullable=False, unique=True, index=True)
     latest_version = Column(String, nullable=True)
+    # Наш целевой пин на момент проверки. Пишет воркер: ansible-дерево есть
+    # только в его образе (COPY infra), а API-контейнер роль прочитать не может
+    # — без этой колонки сводка версий отдавала pinned=null.
+    pinned_version = Column(String, nullable=True)
     published_at = Column(DateTime, nullable=True)
     html_url = Column(String, nullable=True)
     checked_at = Column(DateTime, nullable=True)

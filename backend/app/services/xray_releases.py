@@ -160,7 +160,11 @@ def version_overview(session) -> dict[str, Any]:
     from ..version import app_version
 
     row = _release_row(session)
-    pin = pinned_version()
+    # Файл роли виден только воркеру (ansible-дерево лежит в его образе), а этот
+    # код зовёт ещё и API-контейнер. Поэтому: сначала файл, иначе — то, что
+    # воркер записал в БД на последней проверке. Иначе сводка врала бы
+    # `pinned: null` и «дрейф» не считался вовсе.
+    pin = pinned_version() or row.pinned_version
     latest = row.latest_version
 
     nodes = (
@@ -208,11 +212,18 @@ def check_upstream_and_notify(session) -> dict[str, Any]:
 
     if "error" in result:
         row.last_error = result["error"][:500]
+        # Пин читается локально и от доступности GitHub не зависит — обновляем
+        # даже на неудачной проверке, иначе после бампа роли сводка показывала бы
+        # старый пин до первого успешного похода наружу.
+        row.pinned_version = pinned_version() or row.pinned_version
         session.commit()
         logger.warning("xray-upstream: %s", result["error"])
         return {"latest": row.latest_version, "notified": False, "error": result["error"]}
 
     row.latest_version = result["version"]
+    # Тик всегда идёт в воркере, где ansible-дерево есть — фиксируем пин для
+    # API-контейнера.
+    row.pinned_version = pinned_version() or row.pinned_version
     row.published_at = result["published_at"]
     row.html_url = result["html_url"]
     row.checked_at = utcnow()

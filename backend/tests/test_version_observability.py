@@ -275,3 +275,33 @@ def test_upgrade_xray_does_not_touch_node_status(db_session):
 
     assert node.health_score == 100
     assert node.status == models.VPNNodeStatus.active
+
+
+def test_overview_falls_back_to_pin_from_db(db_session, monkeypatch):
+    """API-контейнер ansible-дерева не видит (оно только в образе воркера) —
+    пин обязан подхватываться из того, что воркер записал в БД."""
+    monkeypatch.setattr(xray_releases, "pinned_version", lambda: None)
+    row = _seed_release(db_session, "v27.0.0")
+    row.pinned_version = "v26.3.27"
+    db_session.commit()
+
+    overview = xray_releases.version_overview(db_session)
+    assert overview["xray"]["pinned"] == "v26.3.27"
+    assert overview["xray"]["pin_behind_upstream"] is True
+
+
+def test_upstream_error_still_records_pin(db_session, monkeypatch):
+    """Пин читается локально: неудачный поход к GitHub не должен оставлять
+    сводку с прошлым (или пустым) пином после бампа роли."""
+    monkeypatch.setattr(xray_releases, "pinned_version", lambda: "v26.3.27")
+    monkeypatch.setattr(
+        xray_releases, "fetch_latest_release", lambda: {"error": "URLError: timeout"}
+    )
+    xray_releases.check_upstream_and_notify(db_session)
+
+    row = (
+        db_session.query(models.SoftwareRelease)
+        .filter(models.SoftwareRelease.name == xray_releases.RELEASE_NAME)
+        .one()
+    )
+    assert row.pinned_version == "v26.3.27"
