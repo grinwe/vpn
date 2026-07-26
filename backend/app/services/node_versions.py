@@ -44,8 +44,10 @@ logger = logging.getLogger(__name__)
 
 # `xray version` печатает: "Xray 26.3.27 (Xray, Penetrates Everything.) ..."
 _XRAY_VERSION_RE = re.compile(r"^Xray\s+(\S+)", re.MULTILINE)
-# `hysteria version` печатает многострочный блок с "Version\tv2.10.0".
-_HYSTERIA_VERSION_RE = re.compile(r"^Version\s+(\S+)", re.MULTILINE)
+# `hysteria version` печатает многострочный блок, где строка версии выглядит как
+# "Version:\tv2.10.0" — с ДВОЕТОЧИЕМ и табом (проверено на проде; без него
+# версия молча не парсилась и все ноды выглядели как «hy2 не установлен»).
+_HYSTERIA_VERSION_RE = re.compile(r"^Version:?\s+(\S+)", re.MULTILINE)
 
 XRAY_BIN = "/usr/local/bin/xray"
 HYSTERIA_BIN = "/usr/local/bin/hysteria"

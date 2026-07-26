@@ -330,9 +330,17 @@ def test_parse_probe_output_reads_hysteria_version():
         "---8<---\n"
         '{"version": "1.0.0"}\n'
         "---8<---\n"
-        "Version\tv2.10.0\n"
+        "Version:\tv2.10.0\n"
     )
     assert _parse_probe_output(raw) == ("26.3.27", "1.0.0", "v2.10.0")
+
+
+def test_parse_probe_output_hysteria_real_format():
+    """Регресс: `hysteria version` печатает "Version:\tv2.10.0" — с двоеточием.
+    Первый вариант regex его не матчил, и на проде все 10 нод выглядели как
+    «hy2 не установлен», хотя демон работал."""
+    raw = "x\n---8<---\n---8<---\nVersion:\tv2.10.0\nBuildDate:\t2026-07-13\n"
+    assert _parse_probe_output(raw)[2] == "v2.10.0"
 
 
 def test_parse_probe_output_node_without_hysteria():
