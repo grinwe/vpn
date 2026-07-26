@@ -1395,22 +1395,25 @@ export default function Nodes() {
       ))}
 
       <div className="overflow-x-auto -mx-3 px-3 md:mx-0 md:px-0">
-        <table className="w-full text-sm min-w-[1100px]">
+        {/* min-w только с lg: там видны все 14 колонок. На телефоне колонок
+            остаётся 5 (Имя/Статус/Health/Юзеры/Активна + действия), и таблица
+            должна помещаться в экран, а не требовать скролла. */}
+        <table className="w-full text-sm lg:min-w-[1100px]">
         <thead className="text-left text-slate-400 border-b border-slate-700">
           <tr>
             <th className="py-2 w-8"></th>
-            <th>ID</th>
+            <th className="hidden lg:table-cell">ID</th>
             <th>Имя</th>
-            <th>Регион</th>
-            <th>Host</th>
-            <th>Pool</th>
+            <th className="hidden lg:table-cell">Регион</th>
+            <th className="hidden lg:table-cell">Host</th>
+            <th className="hidden lg:table-cell">Pool</th>
             <th>Статус</th>
             <th>Health</th>
-            <th>WG</th>
+            <th className="hidden md:table-cell">WG</th>
             <th>Юзеры</th>
-            <th>Cert</th>
+            <th className="hidden lg:table-cell">Cert</th>
             <th>Активна</th>
-            <th>SSH · обновлено</th>
+            <th className="hidden md:table-cell">SSH · обновлено</th>
             <th></th>
           </tr>
         </thead>
@@ -1424,11 +1427,11 @@ export default function Nodes() {
                   onClick={() => setExpandedNodeId(expanded ? null : n.id)}
                 >
                   <td className="py-2 text-slate-500">{expanded ? "▼" : "▶"}</td>
-                  <td>{n.id}</td>
+                  <td className="hidden lg:table-cell">{n.id}</td>
                   <td className="font-mono">{n.name}</td>
-                  <td>{n.region}</td>
-                  <td className="font-mono text-slate-400">{n.host}</td>
-                  <td>{n.pool_id ?? "—"}</td>
+                  <td className="hidden lg:table-cell">{n.region}</td>
+                  <td className="font-mono text-slate-400 hidden lg:table-cell">{n.host}</td>
+                  <td className="hidden lg:table-cell">{n.pool_id ?? "—"}</td>
                   <td onClick={(e) => e.stopPropagation()}>
                     <select
                       value={n.status}
@@ -1509,7 +1512,7 @@ export default function Nodes() {
                       )}
                     </div>
                   </td>
-                  <td>
+                  <td className="hidden md:table-cell">
                     <HealthDots
                       links={n.exit_links}
                       peerLabel={(l) => `${l.exit_name} · ${l.wg_interface_name}`}
@@ -1529,7 +1532,7 @@ export default function Nodes() {
                       </span>
                     )}
                   </td>
-                  <td>
+                  <td className="hidden lg:table-cell">
                     <CertBadge expiresAt={n.cert_expires_at} />
                   </td>
                   <td>
@@ -1542,7 +1545,7 @@ export default function Nodes() {
                       />
                     </span>
                   </td>
-                  <td>
+                  <td className="hidden md:table-cell">
                     <div className="flex flex-col gap-0.5">
                       <SSHStatusBadge lastSshAt={n.last_ssh_at} />
                       <span className="text-[10px] text-slate-500">
