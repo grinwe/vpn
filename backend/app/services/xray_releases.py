@@ -215,6 +215,13 @@ def _release_row(session, product: ProductSpec | None = None):
     if row is None:
         row = models.SoftwareRelease(name=spec.key)
         session.add(row)
+        # Флашим СРАЗУ: SessionLocal создан с autoflush=False, поэтому pending
+        # INSERT не виден последующим SELECT'ам, и в одном прогоне тика строка
+        # успевала создаться дважды (version_overview трогает оба продукта, а
+        # следом их же обходит цикл проверки) → на commit прилетал
+        # UniqueViolation по uq_software_releases_name, и вся проверка
+        # откатывалась: hysteria так и не появлялась в БД.
+        session.flush()
     return row
 
 
@@ -266,6 +273,11 @@ def version_overview(session) -> dict[str, Any]:
     our_version = app_version()
 
     def _drift(attr: str, pin: str | None, spec: ProductSpec) -> list[str]:
+        # Без известного пина сравнивать не с чем: раньше при пустом пине
+        # ВСЕ ноды попадали в «отстают» (версия != None), и сводка звала
+        # обновлять флот, который на самом деле в порядке.
+        if not pin:
+            return []
         return [
             n.name
             for n in nodes

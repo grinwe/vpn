@@ -446,3 +446,37 @@ def test_upgrade_hysteria_does_not_touch_node_status(db_session):
     db_session.refresh(node)
     assert node.health_score == 100
     assert node.status == models.VPNNodeStatus.active
+
+
+def test_release_rows_created_once_per_product(db_session, monkeypatch):
+    """Регресс: SessionLocal с autoflush=False — pending INSERT не виден
+    следующему SELECT, и один прогон тика создавал строку продукта дважды →
+    UniqueViolation на commit откатывал всю проверку (hysteria не появлялась)."""
+    monkeypatch.setattr(xray_releases, "pinned_version", lambda spec=None: "v1.0.0")
+    monkeypatch.setattr(
+        xray_releases,
+        "fetch_latest_release",
+        lambda spec=None: {
+            "version": "v1.0.0", "published_at": None, "html_url": "https://x",
+        },
+    )
+
+    xray_releases.check_upstream_and_notify(db_session)
+
+    names = [r.name for r in db_session.query(models.SoftwareRelease).all()]
+    assert sorted(names) == sorted(p.key for p in xray_releases.PRODUCTS)
+    assert len(names) == len(set(names))
+
+
+def test_unknown_pin_does_not_mark_all_nodes_outdated(db_session, monkeypatch):
+    """Пустой пин — не повод объявлять дрейф: раньше сводка звала обновлять
+    весь флот, который в порядке."""
+    monkeypatch.setattr(xray_releases, "pinned_version", lambda spec=None: None)
+    node = make_node(db_session, name="pinless", host="203.0.113.40")
+    node.xray_version = "26.3.27"
+    node.hysteria_version = "v2.10.0"
+    db_session.commit()
+
+    overview = xray_releases.version_overview(db_session)
+    assert overview["nodes_outdated_xray"] == []
+    assert overview["nodes_outdated_hysteria"] == []
