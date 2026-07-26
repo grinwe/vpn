@@ -1565,7 +1565,7 @@ export default function Nodes() {
                       }
                       aria-label="Действия"
                       aria-expanded={actionsFor === n.id}
-                      className={`text-xs px-2 py-1 rounded ${
+                      className={`text-xs px-2 py-1 rounded lg:hidden ${
                         actionsFor === n.id
                           ? "bg-slate-600"
                           : "bg-slate-800 hover:bg-slate-700"
@@ -1574,11 +1574,15 @@ export default function Nodes() {
                       ⋯
                     </button>
                     <div
-                      className={
+                      // На широком экране действия всегда на виду — лишний
+                      // клик по «⋯» ради того, что и так помещается, только
+                      // замедляет работу. Меню остаётся там, где место реально
+                      // кончается: на телефоне и планшете.
+                      className={`lg:static lg:z-auto lg:flex lg:w-auto lg:max-w-none lg:flex-nowrap lg:rounded-none lg:border-0 lg:bg-transparent lg:p-0 lg:shadow-none lg:mt-0 ${
                         actionsFor === n.id
                           ? "absolute right-1 top-full mt-1 z-30 w-[540px] max-w-[88vw] rounded-lg border border-slate-700 bg-slate-900 p-2 shadow-xl shadow-black/40 flex flex-wrap gap-1"
                           : "hidden"
-                      }
+                      }`}
                     >
                       <button
                         disabled={setActive.isPending}
@@ -3791,12 +3795,15 @@ function NodeTrafficChart({ nodeId }: { nodeId: number }) {
           </span>
         </div>
       </div>
-      {/* preserveAspectRatio="none" растягивал SVG неравномерно: на телефоне
-          подписи и линии деформировались. xMidYMid meet сохраняет пропорции. */}
+      {/* Высота ФИКСИРОВАННАЯ. С сохранением пропорций (xMidYMid meet + h-auto)
+          график масштабировался вместе с шириной окна: на 1900px он вырастал
+          до ~320px и занимал пол-экрана. Для спарклайна важна ширина, а высота
+          должна оставаться постоянной, поэтому здесь осознанный non-uniform
+          растяг. */}
       <svg
         viewBox={`0 0 ${W} ${H}`}
-        preserveAspectRatio="xMidYMid meet"
-        className="w-full h-auto"
+        preserveAspectRatio="none"
+        className="w-full h-[120px] md:h-[150px]"
         role="img"
         aria-label={`Трафик и активные юзеры за ${
           CHART_RANGES.find((r) => r.hours === hours)?.label ?? ""
