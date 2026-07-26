@@ -1,3 +1,4 @@
+import { useSearchParams } from "react-router-dom";
 import { useEffect, useState } from "react";
 import {
   useInfiniteQuery,
@@ -48,7 +49,13 @@ function errText(e: unknown): string {
 
 export default function Users() {
   const qc = useQueryClient();
-  const [search, setSearch] = useState("");
+  // Переход из других разделов: /users?telegram_id=123 (ссылки из списка нод,
+  // из активных юзеров ноды). До 2026-07-26 параметр не читался вовсе, и такая
+  // ссылка открывала просто общий список — то есть переход «кред → юзер»
+  // формально существовал, но никуда не вёл.
+  const [searchParams, setSearchParams] = useSearchParams();
+  const urlTelegramId = searchParams.get("telegram_id") ?? "";
+  const [search, setSearch] = useState(urlTelegramId);
   // Debounce the search input so we don't hammer the backend on every
   // keystroke — 300ms is the sweet spot between "feels instant" and
   // "one request per full word".
@@ -60,7 +67,12 @@ export default function Users() {
   // Tab filter.  Default "active" — banned accounts are usually ban-waves
   // of hundreds of rows that the operator only wants to see intentionally
   // (either to review the wave or to batch-unban a false positive).
-  const [banned, setBanned] = useState<BannedFilter>("active");
+  // Приходя по ссылке на конкретного юзера, показываем ВСЕХ: дефолтный
+  // фильтр «активные» скрыл бы забаненного, и переход выглядел бы как
+  // «юзер не найден».
+  const [banned, setBanned] = useState<BannedFilter>(
+    urlTelegramId ? "all" : "active",
+  );
   // Выбранный юзер храним как id, а сам объект деривим из загруженного
   // списка (см. `selected` ниже). Так любой refetch списка (после ban,
   // batch-операций, пополнения) автоматически перерисовывает сайдбар —
@@ -129,6 +141,21 @@ export default function Users() {
   // на вкладке «Активные»), selected → null и сайдбар закрывается: это
   // корректно отражает реальность, а не показывает застывший снапшот.
   const selected = users.find((u) => u.id === selectedId) ?? null;
+
+  // Пришли по ссылке — открываем карточку сами, как только юзер нашёлся.
+  // Ждать, пока оператор ткнёт в единственную строку, незачем: он уже сказал,
+  // кого хочет увидеть.
+  useEffect(() => {
+    if (!urlTelegramId || selectedId !== null) return;
+    const hit = users.find((u) => String(u.telegram_id) === urlTelegramId);
+    if (hit) {
+      setSelectedId(hit.id);
+      // Параметр отработал — убираем из URL, чтобы «назад» и последующая
+      // ручная фильтрация не тянули его обратно.
+      searchParams.delete("telegram_id");
+      setSearchParams(searchParams, { replace: true });
+    }
+  }, [urlTelegramId, users, selectedId, searchParams, setSearchParams]);
 
   const {
     data: subs,

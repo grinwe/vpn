@@ -619,6 +619,22 @@ function statusColor(status: string) {
 }
 
 export default function Nodes() {
+  // Какая нода показывает меню действий (одна за раз — иначе на узком экране
+  // выпадашки наезжают друг на друга).
+  const [actionsFor, setActionsFor] = useState<number | null>(null);
+  useEffect(() => {
+    if (actionsFor === null) return;
+    const onKey = (e: KeyboardEvent) => e.key === "Escape" && setActionsFor(null);
+    // Клик мимо меню закрывает его: иначе выпадашка живёт до повторного тапа
+    // по «⋯», перекрывая соседние строки.
+    const onClick = () => setActionsFor(null);
+    window.addEventListener("keydown", onKey);
+    window.addEventListener("click", onClick);
+    return () => {
+      window.removeEventListener("keydown", onKey);
+      window.removeEventListener("click", onClick);
+    };
+  }, [actionsFor]);
   const [createOpen, setCreateOpen] = useState(false);
   const [orderOpen, setOrderOpen] = useState(false);
   // Раскрытая нода живёт в URL (?node=<id>), а не в локальном state — тогда
@@ -1378,7 +1394,8 @@ export default function Nodes() {
         />
       ))}
 
-      <table className="w-full text-sm">
+      <div className="overflow-x-auto -mx-3 px-3 md:mx-0 md:px-0">
+        <table className="w-full text-sm min-w-[1100px]">
         <thead className="text-left text-slate-400 border-b border-slate-700">
           <tr>
             <th className="py-2 w-8"></th>
@@ -1533,8 +1550,33 @@ export default function Nodes() {
                       </span>
                     </div>
                   </td>
-                  <td onClick={(e) => e.stopPropagation()}>
-                    <div className="flex gap-1">
+                  <td className="relative" onClick={(e) => e.stopPropagation()}>
+                    {/* 18 контролов в один ряд распирали таблицу шире экрана —
+                        именно они, а не сама таблица, ломали вёрстку на
+                        телефоне и обрезали шапку на десктопе. Прячем их в
+                        меню: строка ноды становится читаемой, а действия
+                        по-прежнему в один тап. */}
+                    <button
+                      onClick={() =>
+                        setActionsFor((v) => (v === n.id ? null : n.id))
+                      }
+                      aria-label="Действия"
+                      aria-expanded={actionsFor === n.id}
+                      className={`text-xs px-2 py-1 rounded ${
+                        actionsFor === n.id
+                          ? "bg-slate-600"
+                          : "bg-slate-800 hover:bg-slate-700"
+                      }`}
+                    >
+                      ⋯
+                    </button>
+                    <div
+                      className={
+                        actionsFor === n.id
+                          ? "absolute right-1 top-full mt-1 z-30 w-[540px] max-w-[88vw] rounded-lg border border-slate-700 bg-slate-900 p-2 shadow-xl shadow-black/40 flex flex-wrap gap-1"
+                          : "hidden"
+                      }
+                    >
                       <button
                         disabled={setActive.isPending}
                         onClick={() => {
@@ -1782,7 +1824,7 @@ export default function Nodes() {
                 </tr>
                 {expanded && (
                   <tr className="border-b border-slate-800 bg-slate-900/60">
-                    <td colSpan={12} className="p-4 space-y-4">
+                    <td colSpan={14} className="p-3 md:p-4 space-y-4">
                       <RelayLinksSection
                         nodeId={n.id}
                         nodeName={n.name}
@@ -1801,13 +1843,14 @@ export default function Nodes() {
           })}
           {data && data.length === 0 && (
             <tr>
-              <td colSpan={12} className="py-4 text-slate-500 text-center">
+              <td colSpan={14} className="py-4 text-slate-500 text-center">
                 Нод нет
               </td>
             </tr>
           )}
         </tbody>
       </table>
+        </div>
 
       <p className="text-xs text-slate-500 mt-4">
         После создания ноды бэкенд автоматически ставит таску на bootstrap
@@ -3624,10 +3667,22 @@ function formatBytes(bytes: number): string {
   return `${(bytes / 1024 / 1024 / 1024).toFixed(2)} GB`;
 }
 
+/** Периоды графика. 720 ч = 30 суток — ровно столько держит
+ *  TRAFFIC_SAMPLE_RETENTION_DAYS, дальше в БД данных нет. */
+const CHART_RANGES: { label: string; hours: number }[] = [
+  { label: "24ч", hours: 24 },
+  { label: "7д", hours: 168 },
+  { label: "30д", hours: 720 },
+];
+
 function NodeTrafficChart({ nodeId }: { nodeId: number }) {
+  const [hours, setHours] = useState(24);
   const { data, isLoading, error } = useQuery<NodeTrafficHistoryOut>({
-    queryKey: ["node-traffic-history", nodeId],
-    queryFn: () => api.get(`/nodes/${nodeId}/traffic-history?hours=24`),
+    // hours ОБЯЗАН быть в ключе: иначе react-query отдаст кэш предыдущего
+    // периода и переключатель будет молча показывать старые данные.
+    queryKey: ["node-traffic-history", nodeId, hours],
+    queryFn: () =>
+      api.get(`/nodes/${nodeId}/traffic-history?hours=${hours}&max_points=400`),
     refetchInterval: 60_000,
   });
 
@@ -3691,18 +3746,38 @@ function NodeTrafficChart({ nodeId }: { nodeId: number }) {
 
   // Vertical gridlines every 6 hours
   const gridTimes: number[] = [];
-  const step = 6 * 60 * 60 * 1000;
+  // Шаг сетки под период: на 30 днях шестичасовые деления давали бы 120 линий
+  // и нечитаемую кашу подписей.
+  const stepHours = hours <= 24 ? 6 : hours <= 168 ? 24 : 24 * 5;
+  const step = stepHours * 60 * 60 * 1000;
   for (let t = Math.ceil(fromMs / step) * step; t <= toMs; t += step) {
     gridTimes.push(t);
   }
 
   return (
     <div className="rounded border border-slate-700 p-3 text-xs">
-      <div className="flex items-center justify-between mb-2">
-        <div className="text-xs uppercase tracking-wide text-slate-400">
-          Трафик и юзеры за 24ч
+      <div className="flex flex-wrap items-center gap-2 justify-between mb-2">
+        <div className="flex items-center gap-2">
+          <div className="text-xs uppercase tracking-wide text-slate-400">
+            Трафик и юзеры
+          </div>
+          <div className="flex gap-1">
+            {CHART_RANGES.map((r) => (
+              <button
+                key={r.hours}
+                onClick={() => setHours(r.hours)}
+                className={`text-[11px] px-2 py-0.5 rounded ${
+                  hours === r.hours
+                    ? "bg-slate-600 text-white"
+                    : "bg-slate-800 text-slate-400 hover:bg-slate-700"
+                }`}
+              >
+                {r.label}
+              </button>
+            ))}
+          </div>
         </div>
-        <div className="flex gap-4 text-[11px] text-slate-500">
+        <div className="flex flex-wrap gap-x-4 gap-y-1 text-[11px] text-slate-500">
           <span>
             <span className="inline-block w-3 h-0.5 bg-emerald-400 align-middle mr-1" />
             active_users (max {maxUsers})
@@ -3713,19 +3788,30 @@ function NodeTrafficChart({ nodeId }: { nodeId: number }) {
           </span>
         </div>
       </div>
+      {/* preserveAspectRatio="none" растягивал SVG неравномерно: на телефоне
+          подписи и линии деформировались. xMidYMid meet сохраняет пропорции. */}
       <svg
         viewBox={`0 0 ${W} ${H}`}
-        preserveAspectRatio="none"
-        className="w-full"
-        style={{ height: H }}
+        preserveAspectRatio="xMidYMid meet"
+        className="w-full h-auto"
+        role="img"
+        aria-label={`Трафик и активные юзеры за ${
+          CHART_RANGES.find((r) => r.hours === hours)?.label ?? ""
+        }`}
       >
         {/* X-axis grid */}
         {gridTimes.map((t) => {
           const x = padL + ((t - fromMs) / spanMs) * plotW;
-          const label = new Date(t).toLocaleTimeString([], {
-            hour: "2-digit",
-            minute: "2-digit",
-          });
+          const label =
+            hours <= 24
+              ? new Date(t).toLocaleTimeString([], {
+                  hour: "2-digit",
+                  minute: "2-digit",
+                })
+              : new Date(t).toLocaleDateString([], {
+                  day: "2-digit",
+                  month: "2-digit",
+                });
           return (
             <g key={t}>
               <line

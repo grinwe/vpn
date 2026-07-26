@@ -1579,6 +1579,39 @@ def list_node_users(
     )
 
 
+def _downsample_traffic(
+    points: list["schemas.NodeTrafficSamplePoint"], max_points: int
+) -> list["schemas.NodeTrafficSamplePoint"]:
+    """Схлопнуть серию в ``max_points`` равных бакетов по времени.
+
+    Бакеты режем по ИНДЕКСУ, а не по времени: сэмплы уже идут с постоянным
+    шагом (тик коллектора), а пропуски (нода лежала, тик не отработал) при
+    делении по времени дали бы пустые бакеты и разрывы в линии.
+
+    Метка бакета — время ПОСЛЕДНЕГО сэмпла в нём: так правый край графика
+    всегда совпадает с «сейчас», а не уезжает на полбакета назад.
+    """
+    if max_points <= 0 or len(points) <= max_points:
+        return points
+    size = len(points) / max_points
+    out: list[schemas.NodeTrafficSamplePoint] = []
+    for i in range(max_points):
+        chunk = points[int(i * size) : int((i + 1) * size)]
+        if not chunk:
+            continue
+        out.append(
+            schemas.NodeTrafficSamplePoint(
+                observed_at=chunk[-1].observed_at,
+                # мгновенный счётчик → пик по бакету
+                active_users=max(c.active_users or 0 for c in chunk),
+                # дельты за тик → сумма по бакету
+                uplink_bytes=sum(c.uplink_bytes or 0 for c in chunk),
+                downlink_bytes=sum(c.downlink_bytes or 0 for c in chunk),
+            )
+        )
+    return out
+
+
 @router.get(
     "/nodes/{node_id}/traffic-history",
     response_model=schemas.NodeTrafficHistoryOut,
@@ -1587,14 +1620,25 @@ def get_node_traffic_history(
     node_id: int,
     db: Session = Depends(get_db),
     admin_token: str = Depends(require_admin),
-    hours: int = Query(default=24, ge=1, le=168),
+    hours: int = Query(default=24, ge=1, le=720),
+    max_points: int = Query(default=300, ge=24, le=2000),
 ):
     """Return NodeTrafficSample series for the last ``hours`` hours.
 
-    Hard-bounded to [1, 168] so a misclick in the UI can't drag the
-    whole month of samples (~8600 rows per node). Default 24h lines up
-    with the admin sparkline; operators who want a longer window pass
-    ``?hours=72`` etc.
+    Верхняя граница — 720 ч (30 суток): столько же держит
+    ``TRAFFIC_SAMPLE_RETENTION_DAYS``, дальше данных в БД просто нет.
+
+    Сэмплы пишутся раз в ``TRAFFIC_STATS_INTERVAL`` (300 с), т.е. 12 точек в
+    час на ноду: сутки ≈ 288 точек, 30 дней ≈ 8600. Отдавать их сырыми в
+    админку бессмысленно — график шириной 720 px физически не покажет больше
+    ~700 точек, а json на 8600 записей тормозит и сеть, и рендер. Поэтому при
+    превышении ``max_points`` серия схлопывается в равные бакеты.
+
+    Агрегация РАЗНАЯ по смыслу полей, и это важно:
+      * ``uplink_bytes``/``downlink_bytes`` — ДЕЛЬТА за тик (коллектор дёргает
+        ``xray api statsquery --reset``), поэтому по бакету их СУММИРУЕМ;
+      * ``active_users`` — мгновенный счётчик, сумма была бы бессмыслицей;
+        берём максимум по бакету (пик нагрузки виднее среднего).
     """
     node = db.get(models.VPNNode, node_id)
     if not node:
@@ -1612,19 +1656,23 @@ def get_node_traffic_history(
         .all()
     )
 
+    points = [
+        schemas.NodeTrafficSamplePoint(
+            observed_at=s.observed_at,
+            active_users=s.active_users,
+            uplink_bytes=s.uplink_bytes,
+            downlink_bytes=s.downlink_bytes,
+        )
+        for s in samples
+    ]
+    if len(points) > max_points:
+        points = _downsample_traffic(points, max_points)
+
     return schemas.NodeTrafficHistoryOut(
         node_id=node_id,
         from_ts=from_ts,
         to_ts=to_ts,
-        samples=[
-            schemas.NodeTrafficSamplePoint(
-                observed_at=s.observed_at,
-                active_users=s.active_users,
-                uplink_bytes=s.uplink_bytes,
-                downlink_bytes=s.downlink_bytes,
-            )
-            for s in samples
-        ],
+        samples=points,
     )
 
 

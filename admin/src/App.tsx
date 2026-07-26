@@ -1,4 +1,5 @@
-import { Navigate, NavLink, Route, Routes } from "react-router-dom";
+import { useEffect, useState } from "react";
+import { Navigate, NavLink, Route, Routes, useLocation } from "react-router-dom";
 import { useAuth } from "./auth";
 import Login from "./pages/Login";
 import Dashboard from "./pages/Dashboard";
@@ -16,15 +17,76 @@ import Broadcasts from "./pages/Broadcasts";
 import OperatorMatrix from "./pages/OperatorMatrix";
 import AdLinks from "./pages/AdLinks";
 
+const NAV_ITEMS: { to: string; label: string; end?: boolean }[] = [
+  { to: "/", label: "Dashboard", end: true },
+  { to: "/users", label: "Users" },
+  { to: "/invoices", label: "Invoices" },
+  { to: "/plans", label: "Plans" },
+  { to: "/nodes", label: "Nodes" },
+  { to: "/exits", label: "Exits" },
+  { to: "/tasks", label: "Tasks" },
+  { to: "/health-pings", label: "Health" },
+  { to: "/operators", label: "Operators" },
+  { to: "/broadcasts", label: "Broadcasts" },
+  { to: "/ad-links", label: "Реклама" },
+  { to: "/tokens", label: "API tokens" },
+  { to: "/cloud", label: "Cloud" },
+  { to: "/audit", label: "Audit" },
+];
+
 function Layout({ children }: { children: React.ReactNode }) {
   const { logout } = useAuth();
+  const [menuOpen, setMenuOpen] = useState(false);
+  const location = useLocation();
   const linkCls = ({ isActive }: { isActive: boolean }) =>
-    `px-3 py-2 rounded ${isActive ? "bg-slate-700" : "hover:bg-slate-800"}`;
+    `px-3 py-2 rounded whitespace-nowrap ${
+      isActive ? "bg-slate-700" : "hover:bg-slate-800"
+    }`;
+  const current =
+    NAV_ITEMS.find((i) => (i.end ? location.pathname === i.to : location.pathname.startsWith(i.to)))
+      ?.label ?? "Admin";
+
+  // Меню закрываем при переходе — иначе после тапа по ссылке панель остаётся
+  // висеть поверх страницы, на которую ты только что перешёл.
+  useEffect(() => setMenuOpen(false), [location.pathname]);
+
   return (
     <div className="min-h-full flex flex-col">
-      <header className="bg-slate-950 border-b border-slate-800 px-4 py-2 flex items-center gap-2">
-        <span className="font-semibold mr-4">VPN Admin</span>
-        <nav className="flex gap-1 text-sm">
+      <header className="bg-slate-950 border-b border-slate-800 sticky top-0 z-30">
+        {/* Мобильная шапка: имя раздела + бургер. 14 ссылок в одну строку на
+            телефоне превращались в кашу, которая ещё и распирала вьюпорт. */}
+        <div className="flex items-center gap-2 px-3 py-2 md:hidden">
+          <button
+            onClick={() => setMenuOpen((v) => !v)}
+            aria-label="Меню"
+            aria-expanded={menuOpen}
+            className="px-2 py-1 rounded bg-slate-800 hover:bg-slate-700 text-lg leading-none"
+          >
+            {menuOpen ? "✕" : "☰"}
+          </button>
+          <span className="font-semibold">{current}</span>
+          <button
+            onClick={logout}
+            className="ml-auto text-sm px-3 py-1.5 rounded bg-slate-800 hover:bg-slate-700"
+          >
+            Выйти
+          </button>
+        </div>
+        {menuOpen && (
+          <nav className="md:hidden grid grid-cols-2 gap-1 px-3 pb-3 text-sm border-t border-slate-800 pt-2">
+            {NAV_ITEMS.map((i) => (
+              <NavLink key={i.to} to={i.to} end={i.end} className={linkCls}>
+                {i.label}
+              </NavLink>
+            ))}
+          </nav>
+        )}
+
+        {/* Десктоп: прежняя строка, но со скроллом — на 1280px 14 пунктов
+            вытесняли кнопку выхода за край экрана. */}
+        <div className="hidden md:flex items-center gap-2 px-4 py-2">
+          <span className="font-semibold mr-4 shrink-0">VPN Admin</span>
+          <nav className="flex gap-1 text-sm overflow-x-auto">
           <NavLink to="/" end className={linkCls}>Dashboard</NavLink>
           <NavLink to="/users" className={linkCls}>Users</NavLink>
           <NavLink to="/invoices" className={linkCls}>Invoices</NavLink>
@@ -39,15 +101,18 @@ function Layout({ children }: { children: React.ReactNode }) {
           <NavLink to="/tokens" className={linkCls}>API tokens</NavLink>
           <NavLink to="/cloud" className={linkCls}>Cloud</NavLink>
           <NavLink to="/audit" className={linkCls}>Audit</NavLink>
-        </nav>
-        <button
-          onClick={logout}
-          className="ml-auto text-sm px-3 py-2 rounded bg-slate-800 hover:bg-slate-700"
-        >
-          Logout
-        </button>
+          </nav>
+          <button
+            onClick={logout}
+            className="ml-auto shrink-0 text-sm px-3 py-2 rounded bg-slate-800 hover:bg-slate-700"
+          >
+            Выйти
+          </button>
+        </div>
       </header>
-      <main className="flex-1 p-6">{children}</main>
+      {/* min-w-0 обязателен: без него широкие таблицы внутри flex-колонки
+          растягивают контейнер и ломают вёрстку всей страницы. */}
+      <main className="flex-1 min-w-0 p-3 md:p-6">{children}</main>
     </div>
   );
 }
