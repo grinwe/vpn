@@ -324,6 +324,10 @@ class VPNNode(Base):
     # Версия НАШЕГО кода, которой прошита нода: site.yml пишет её в
     # /etc/vpn-node-release.json после успешного прогона всех ролей.
     release_version = Column(String, nullable=True)
+    # Версия бинаря hysteria (демон hysteria-server — отдельный продукт, xray его
+    # не обслуживает). До 2026-07-26 не пинилась и не собиралась вовсе: роль
+    # ставила latest один раз и больше не трогала.
+    hysteria_version = Column(String, nullable=True)
     versions_checked_at = Column(DateTime, nullable=True)
 
     pool = relationship("ServerPool", back_populates="nodes")

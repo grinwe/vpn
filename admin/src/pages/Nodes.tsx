@@ -34,6 +34,7 @@ import {
   renewNode,
   renewNodeCerts,
   upgradeNodeXray,
+  upgradeNodeHysteria,
   fetchVersionsOverview,
   VersionsOverview,
   updateNode,
@@ -62,7 +63,7 @@ import { WorkerHealthBadge } from "../workerHealth";
 // is the full set to poll; the sub-arrays break down by phase.
 
 type TrackedOp = {
-  kind: "migration" | "bootstrap" | "resync" | "diagnose" | "diagnose_link" | "upgrade_xray";
+  kind: "migration" | "bootstrap" | "resync" | "diagnose" | "diagnose_link" | "upgrade_xray" | "upgrade_hysteria";
   nodeId: number;
   nodeName: string;
   // For kind=diagnose_link only — id of the RelayExitLink the diagnose was
@@ -212,11 +213,13 @@ function XrayVersionBadge({
 function NodeVersionsPanel({
   node,
   pinnedXray,
+  pinnedHysteria,
   appVersion,
   addOp,
 }: {
   node: VPNNodeOut;
   pinnedXray: string | null;
+  pinnedHysteria: string | null;
   appVersion: string | null;
   addOp: (op: TrackedOp) => void;
 }) {
@@ -225,6 +228,9 @@ function NodeVersionsPanel({
   const xrayDrift =
     !!node.xray_version && !!pinnedXray &&
     strip(node.xray_version) !== strip(pinnedXray);
+  const hy2Drift =
+    !!node.hysteria_version && !!pinnedHysteria &&
+    strip(node.hysteria_version) !== strip(pinnedHysteria);
   const releaseDrift =
     !!node.release_version && !!appVersion && node.release_version !== appVersion;
 
@@ -233,6 +239,25 @@ function NodeVersionsPanel({
     onSuccess: (res) => {
       addOp({
         kind: "upgrade_xray",
+        nodeId: node.id,
+        nodeName: node.name,
+        taskIds: [res.task_id],
+        revokeTaskIds: [],
+        deviceTaskIds: [],
+        resyncTaskIds: [res.task_id],
+        startedAt: Date.now(),
+      });
+      qc.invalidateQueries({ queryKey: ["nodes"] });
+      qc.invalidateQueries({ queryKey: ["provisioning-tasks"] });
+    },
+    onError: (e) => alert(`Не удалось запустить апгрейд: ${String(e)}`),
+  });
+
+  const upgradeHy2 = useMutation({
+    mutationFn: () => upgradeNodeHysteria(node.id),
+    onSuccess: (res) => {
+      addOp({
+        kind: "upgrade_hysteria",
         nodeId: node.id,
         nodeName: node.name,
         taskIds: [res.task_id],
@@ -263,26 +288,61 @@ function NodeVersionsPanel({
     <section className="rounded border border-slate-800 p-3">
       <div className="flex items-center justify-between mb-2">
         <h3 className="font-semibold">Версии</h3>
-        <button
-          onClick={() => {
-            if (
-              !window.confirm(
-                `Обновить xray на ${node.name} до ${pinnedXray ?? "целевой версии"}?\n` +
-                  "Рестарт ядра разорвёт активные соединения на ~100 мс.",
+        <div className="flex items-center gap-2">
+          <button
+            onClick={() => {
+              if (
+                !window.confirm(
+                  `Обновить xray на ${node.name} до ${pinnedXray ?? "целевой версии"}?\n` +
+                    "Рестарт ядра разорвёт активные соединения на ~100 мс.",
+                )
               )
-            )
-              return;
-            upgrade.mutate();
-          }}
-          disabled={upgrade.isPending}
-          className="text-xs px-2 py-1 rounded bg-slate-800 hover:bg-slate-700 disabled:opacity-50"
-        >
-          {upgrade.isPending ? "Запускаю…" : "Обновить xray"}
-        </button>
+                return;
+              upgrade.mutate();
+            }}
+            disabled={upgrade.isPending}
+            className="text-xs px-2 py-1 rounded bg-slate-800 hover:bg-slate-700 disabled:opacity-50"
+          >
+            {upgrade.isPending ? "Запускаю…" : "Обновить xray"}
+          </button>
+          {/* Отдельная кнопка, а не «обновить всё»: hy2 — другой демон, и его
+              рестарт рвёт QUIC-сессии заметнее, чем 100 мс у xray. На нодах без
+              hy2 прячем — обновлять там нечего. */}
+          {node.hysteria_version && (
+            <button
+              onClick={() => {
+                if (
+                  !window.confirm(
+                    `Обновить hysteria на ${node.name} до ${pinnedHysteria ?? "целевой версии"}?\n` +
+                      "Рестарт демона разорвёт активные QUIC-сессии.",
+                  )
+                )
+                  return;
+                upgradeHy2.mutate();
+              }}
+              disabled={upgradeHy2.isPending}
+              className="text-xs px-2 py-1 rounded bg-slate-800 hover:bg-slate-700 disabled:opacity-50"
+            >
+              {upgradeHy2.isPending ? "Запускаю…" : "Обновить hysteria"}
+            </button>
+          )}
+        </div>
       </div>
       <div className="text-sm space-y-1">
         {row("xray на ноде", node.xray_version, xrayDrift, "Снимает tick-node-versions по SSH")}
         {row("xray целевая", pinnedXray, false, "xray_core_version в роли; меняется коммитом")}
+        {row(
+          "hysteria на ноде",
+          node.hysteria_version,
+          hy2Drift,
+          "Отдельный демон hysteria-server — снимает тот же тик",
+        )}
+        {row(
+          "hysteria целевая",
+          pinnedHysteria,
+          false,
+          "hysteria2_version в роли install_hysteria2; меняется коммитом",
+        )}
         {row(
           "код на ноде",
           node.release_version,
@@ -1999,6 +2059,7 @@ export default function Nodes() {
                       <NodeVersionsPanel
                         node={n}
                         pinnedXray={versionsOverview.data?.xray.pinned ?? null}
+                        pinnedHysteria={versionsOverview.data?.hysteria.pinned ?? null}
                         appVersion={versionsOverview.data?.app_version ?? null}
                         addOp={addOp}
                       />
@@ -4221,6 +4282,7 @@ const KIND_LABELS: Record<string, string> = {
   diagnose: "Диагностика",
   diagnose_link: "Диагностика link",
   upgrade_xray: "Апгрейд xray",
+  upgrade_hysteria: "Апгрейд hysteria",
 };
 
 function OperationProgressBanner({

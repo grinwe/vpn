@@ -836,6 +836,75 @@ def upgrade_nodes_xray_batch(
     return {"started": started, "skipped": skipped}
 
 
+@router.post("/nodes/{node_id}/upgrade-hysteria")
+def upgrade_node_hysteria_route(
+    node_id: int,
+    db: Session = Depends(get_db),
+    admin_token: str = Depends(require_admin),
+    admin_actor: str | None = Header(default=None, alias=ADMIN_ACTOR_HEADER),
+):
+    """Доставить на ноду бинарь hysteria целевой версии (пин из роли).
+
+    Точечно: только бинарная часть роли install_hysteria2, без перерендера
+    config.yaml — пер-юзерные hy2-учётки не задеваются. Рестарт демона рвёт
+    активные QUIC-сессии, клиент переподключается сам.
+    """
+    node = db.get(models.VPNNode, node_id)
+    if not node:
+        raise HTTPException(status_code=404, detail="Node not found")
+    orchestrator = ProvisioningOrchestrator(db)
+    task = orchestrator.upgrade_node_hysteria(node, reason="manual")
+    actor, actor_type = _resolve_admin_actor(admin_actor)
+    _audit(
+        db,
+        actor,
+        "node_upgrade_hysteria",
+        "vpn_node",
+        node.id,
+        actor_type=actor_type,
+        metadata={"task_id": task.id},
+    )
+    db.commit()
+    return {"node_id": node.id, "task_id": task.id}
+
+
+@router.post("/nodes/upgrade-hysteria")
+def upgrade_nodes_hysteria_batch(
+    payload: UpgradeXrayRequest,
+    db: Session = Depends(get_db),
+    admin_token: str = Depends(require_admin),
+    admin_actor: str | None = Header(default=None, alias=ADMIN_ACTOR_HEADER),
+):
+    """Тот же апгрейд hysteria, но по списку нод. Форма запроса общая с xray."""
+    if not payload.node_ids:
+        raise HTTPException(status_code=400, detail="node_ids is empty")
+
+    orchestrator = ProvisioningOrchestrator(db)
+    started: list[dict[str, int]] = []
+    skipped: list[int] = []
+    actor, actor_type = _resolve_admin_actor(admin_actor)
+    for node_id in payload.node_ids:
+        node = db.get(models.VPNNode, node_id)
+        if not node:
+            skipped.append(node_id)
+            continue
+        task = orchestrator.upgrade_node_hysteria(
+            node, reason=payload.reason or "batch"
+        )
+        started.append({"node_id": node.id, "task_id": task.id})
+        _audit(
+            db,
+            actor,
+            "node_upgrade_hysteria",
+            "vpn_node",
+            node.id,
+            actor_type=actor_type,
+            metadata={"task_id": task.id, "batch": True},
+        )
+    db.commit()
+    return {"started": started, "skipped": skipped}
+
+
 @router.get("/versions/overview")
 def versions_overview(
     db: Session = Depends(get_db),

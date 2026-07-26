@@ -1,0 +1,35 @@
+---
+# Бинарь ставим сами, по пину из defaults, а не upstream-installer'ом из pipe:
+# тот игнорировал версию (ставил latest и только при отсутствии бинаря), не
+# проверял целостность и требовал доступа к get.hy2.sh — на RU-нодах это лишняя
+# точка отказа. Скрипт зеркалит xray-core-fetch.sh: зеркало → github, sha256,
+# сверка фактической версии после установки.
+- name: Stage hysteria fetcher
+  ansible.builtin.copy:
+    src: hysteria-fetch.sh
+    dest: /usr/local/bin/hysteria-fetch.sh
+    owner: root
+    group: root
+    mode: '0755'
+
+- name: Install / refresh hysteria ({{ hysteria2_version }})
+  ansible.builtin.command: >-
+    /usr/local/bin/hysteria-fetch.sh
+    {{ hysteria2_version }}
+    {{ hysteria2_sha256 | default('') }}
+  register: hy2_install
+  changed_when: "'установлен:' in hy2_install.stdout"
+  failed_when: hy2_install.rc != 0
+
+# Свежий бинарь сам по себе не подхватывается: install заменяет файл атомарно, а
+# работающий процесс держит старый inode. Хэндлер `restart hysteria2` дёргается
+# только при смене config.yaml/юнита, поэтому при апгрейде ОДНОГО бинаря рестарт
+# делаем здесь — иначе «обновили» бы, а в памяти осталась прежняя версия (ровно
+# та же ловушка, что закрыта в роли xray_core).
+- name: Restart hysteria after binary update
+  ansible.builtin.systemd:
+    name: hysteria-server
+    state: restarted
+  when: hy2_install is changed
+  # Первый бутстрап: юнита ещё нет, его создаёт задача ниже — там же и старт.
+  failed_when: false

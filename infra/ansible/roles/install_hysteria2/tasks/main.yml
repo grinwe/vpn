@@ -107,18 +107,11 @@
     proto: udp
   failed_when: false
 
-- name: Install Hysteria2 from upstream
-  shell: |
-    set -euo pipefail
-    if command -v hysteria >/dev/null 2>&1; then
-      echo "hysteria already installed: $(hysteria version 2>&1 | head -n1)"
-      exit 0
-    fi
-    bash <(curl -fsSL https://get.hy2.sh/)
-  args:
-    executable: /bin/bash
-  register: hy2_install
-  changed_when: "'already installed' not in hy2_install.stdout"
+# Установка/обновление самого бинаря вынесена в binary.yml: тот же файл
+# подключает playbooks/upgrade_hysteria.yml (точечный апгрейд без остальной
+# роли), поэтому логика доставки живёт в одном месте.
+- name: Install / refresh hysteria binary
+  ansible.builtin.include_tasks: binary.yml
 
 - name: Ensure Hysteria2 config directory
   file:

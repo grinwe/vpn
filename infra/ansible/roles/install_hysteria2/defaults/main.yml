@@ -1,0 +1,20 @@
+---
+# Пин версии hysteria. До 2026-07-26 версия не пинилась вообще: роль ставила
+# `bash <(curl -fsSL https://get.hy2.sh/)` и только если бинаря нет, поэтому
+# нода получала latest на день своего рождения, обновить его роль не могла, а
+# разъезд версий по флоту был невидим (у xray пин есть с самого начала).
+#
+# ⚠️ ОБНОВЛЯТЬ ПАРОЙ, как у xray_core:
+#   1. hysteria2_version — БЕЗ префикса `app/` (тег релиза `app/vX.Y.Z`,
+#      слэш в URL экранируется скриптом);
+#   2. hysteria2_sha256 — сумма бинаря hysteria-linux-amd64 из hashes.txt того же
+#      релиза: `curl -sSL https://github.com/apernet/hysteria/releases/download/
+#      app%2F<ver>/hashes.txt | grep 'hysteria-linux-amd64$'`.
+# Сменить только версию = fetch-скрипт отвергнет каждый источник по несовпадению
+# хэша и нода останется на старом бинаре (громко, с rc=1).
+#
+# И ещё: добавить версию в XRAY_VERSIONS-соседа `HYSTERIA_VERSIONS`
+# (roles/mgmt_mirror/files/refresh-assets.sh) + прогнать mgmt_mirror.yml —
+# для RU-нод за заблокированным github зеркало единственный рабочий источник.
+hysteria2_version: "v2.10.0"
+hysteria2_sha256: "04f7804159ef1d798de12a817d73aab4b9040ebe45fc62e223000c5c59e987fe"

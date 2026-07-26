@@ -1843,7 +1843,8 @@ class ProvisioningOrchestrator:
             # zip) не означает, что нода перестала нести трафик, а успех не
             # повод промоутить registering→active и гнать полный ресинк.
             if task.action in (
-                "resync_vless", "resync_hy2", "renew_certs", "upgrade_xray",
+                "resync_vless", "resync_hy2", "renew_certs",
+                "upgrade_xray", "upgrade_hysteria",
             ):
                 return
             # Diagnose is READ-ONLY (staged probe + read-only on-host play).
@@ -2239,6 +2240,21 @@ class ProvisioningOrchestrator:
                         inventory,
                         limit=node.name,
                         extra_vars=xray_vars,
+                        timeout=300,
+                    )
+                elif task.action == "upgrade_hysteria":
+                    # Точечный апгрейд бинаря hysteria: только бинарная часть
+                    # роли (tasks_from: binary), без перерендера config.yaml —
+                    # значит пер-юзерные учётки auth.userpass не задеваются.
+                    hy2_vars: dict[str, Any] = {}
+                    mirror_url = _resolve_xray_mirror_url()
+                    if mirror_url:
+                        hy2_vars["xray_mirror_url"] = mirror_url
+                    result = run_playbook(
+                        "playbooks/upgrade_hysteria.yml",
+                        inventory,
+                        limit=node.name,
+                        extra_vars=hy2_vars,
                         timeout=300,
                     )
                 else:
@@ -3949,6 +3965,23 @@ class ProvisioningOrchestrator:
             # Origin-CA) — нечего renew'ить, таску не плодим.
             return None
         task = self.create_task("node", node.id, "renew_certs", {"domains": domains})
+        self.db.commit()
+        self.run_task_async(task, node=node)
+        return task
+
+    def upgrade_node_hysteria(
+        self, node: models.VPNNode, *, reason: str | None = None
+    ) -> models.ProvisioningTask:
+        """Доставить на ноду бинарь hysteria целевой версии (пин из роли).
+
+        Как и у xray, точечно: гоняется только бинарная часть роли, config.yaml
+        не перерендеривается, поэтому пер-юзерные hy2-учётки остаются на месте.
+        Рестарт hysteria-server рвёт активные QUIC-сессии — клиент поднимает их
+        заново сам.
+        """
+        task = self.create_task(
+            "node", node.id, "upgrade_hysteria", {"reason": reason} if reason else {}
+        )
         self.db.commit()
         self.run_task_async(task, node=node)
         return task

@@ -22,6 +22,7 @@ import os
 import re
 import urllib.error
 import urllib.request
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -30,15 +31,69 @@ from ..time_utils import utcnow
 
 logger = logging.getLogger(__name__)
 
-RELEASE_NAME = "xray-core"
-
-GITHUB_LATEST_URL = os.getenv(
-    "XRAY_RELEASES_URL",
-    "https://api.github.com/repos/XTLS/Xray-core/releases/latest",
-)
 HTTP_TIMEOUT = int(os.getenv("XRAY_RELEASES_TIMEOUT", "15"))
 
-_PIN_RE = re.compile(r"^xray_core_version:\s*[\"']?(?P<version>[^\"'\s]+)", re.MULTILINE)
+
+@dataclass(frozen=True)
+class ProductSpec:
+    """Один отслеживаемый продукт: где upstream, где наш пин, как звать в UI.
+
+    Два продукта вместо одного появились не сразу: три VLESS-протокола держит
+    один бинарь xray, а hysteria2 — отдельный демон со своим релиз-циклом, и до
+    2026-07-26 его версия не пинилась и не собиралась вообще.
+    """
+
+    key: str            # ключ в software_releases.name и в JSON-ответах API
+    label: str          # как показывать человеку
+    api_url: str        # GitHub releases/latest
+    pin_file: str       # путь внутри ansible-дерева до defaults роли
+    pin_var: str        # имя переменной пина в этом файле
+    # Префикс тега, который upstream добавляет, а мы в пине не храним: у
+    # apernet/hysteria релизы называются `app/vX.Y.Z` (монорепа app+core), и без
+    # срезания префикса сравнение с пином давало бы вечный ложный дрейф.
+    tag_prefix: str = ""
+    # Как обновлять: подсказка в тексте пуша админу.
+    upgrade_hint: str = ""
+
+
+PRODUCTS: tuple[ProductSpec, ...] = (
+    ProductSpec(
+        key="xray-core",
+        label="Xray-core",
+        api_url=os.getenv(
+            "XRAY_RELEASES_URL",
+            "https://api.github.com/repos/XTLS/Xray-core/releases/latest",
+        ),
+        pin_file="roles/xray_core/defaults/main.yml",
+        pin_var="xray_core_version",
+        upgrade_hint=(
+            "Бамп — руками: xray_core_version + xray_core_sha256 в паре "
+            "(иначе установка упадёт на несовпадении хэша), затем деплой."
+        ),
+    ),
+    ProductSpec(
+        key="hysteria",
+        label="Hysteria2",
+        api_url=os.getenv(
+            "HYSTERIA_RELEASES_URL",
+            "https://api.github.com/repos/apernet/hysteria/releases/latest",
+        ),
+        pin_file="roles/install_hysteria2/defaults/main.yml",
+        pin_var="hysteria2_version",
+        tag_prefix="app/",
+        upgrade_hint=(
+            "Бамп — руками: hysteria2_version + hysteria2_sha256 в паре (хэш "
+            "берётся из hashes.txt релиза), плюс HYSTERIA_VERSIONS в "
+            "refresh-assets.sh для зеркала, затем деплой."
+        ),
+    ),
+)
+
+PRODUCTS_BY_KEY = {p.key: p for p in PRODUCTS}
+
+# Историческое имя: модуль начинался как «только xray». Оставлено, потому что на
+# него ссылаются тесты и вызовы API/воркера.
+RELEASE_NAME = "xray-core"
 
 
 def _ansible_root() -> Path | None:
@@ -64,43 +119,51 @@ def _ansible_root() -> Path | None:
     return None
 
 
-def pinned_version() -> str | None:
-    """Версия xray, зашитая в роль (``xray_core_version``)."""
+def pinned_version(product: ProductSpec | None = None) -> str | None:
+    """Версия, зашитая в роль продукта (``<product>_version`` в её defaults)."""
+    spec = product or PRODUCTS_BY_KEY[RELEASE_NAME]
     root = _ansible_root()
     if root is None:
-        logger.warning("xray-releases: ansible-дерево не найдено — пин неизвестен")
+        logger.warning("releases: ansible-дерево не найдено — пин неизвестен")
         return None
-    defaults = root / "roles" / "xray_core" / "defaults" / "main.yml"
+    defaults = root / spec.pin_file
     try:
         text = defaults.read_text(encoding="utf-8")
     except OSError as exc:
-        logger.warning("xray-releases: не прочитать пин из %s: %s", defaults, exc)
+        logger.warning("releases: не прочитать пин из %s: %s", defaults, exc)
         return None
-    match = _PIN_RE.search(text)
+    pattern = re.compile(
+        rf"^{re.escape(spec.pin_var)}:\s*[\"']?(?P<version>[^\"'\s]+)", re.MULTILINE
+    )
+    match = pattern.search(text)
     return match.group("version") if match else None
 
 
-def _normalize(version: str | None) -> str | None:
-    """``v26.3.27`` и ``26.3.27`` — одна и та же версия.
+def _normalize(version: str | None, *, tag_prefix: str = "") -> str | None:
+    """Привести версию к сравнимому виду.
 
-    Роль пинит с ``v``, ``xray version`` печатает без — без нормализации любое
-    сравнение давало бы вечный «дрейф».
+    Роль пинит с ``v``, ``xray version`` печатает без; у hysteria upstream-тег
+    ещё и с префиксом ``app/``. Без нормализации любое сравнение давало бы
+    вечный ложный «дрейф».
     """
     if not version:
         return None
     value = version.strip()
+    if tag_prefix and value.startswith(tag_prefix):
+        value = value[len(tag_prefix):]
     return value[1:] if value.startswith("v") else value
 
 
-def fetch_latest_release() -> dict[str, Any]:
-    """Сходить на GitHub за последним релизом.
+def fetch_latest_release(product: ProductSpec | None = None) -> dict[str, Any]:
+    """Сходить на GitHub за последним релизом продукта.
 
     Возвращает ``{"version": ..., "published_at": ..., "html_url": ...}`` либо
     ``{"error": ...}``. Наружу не бросаем: недоступный GitHub — рядовая
     ситуация, тик из-за неё падать не должен.
     """
+    spec = product or PRODUCTS_BY_KEY[RELEASE_NAME]
     request = urllib.request.Request(
-        GITHUB_LATEST_URL,
+        spec.api_url,
         headers={
             "Accept": "application/vnd.github+json",
             # GitHub отвечает 403 на запросы без User-Agent.
@@ -140,32 +203,59 @@ def fetch_latest_release() -> dict[str, Any]:
     }
 
 
-def _release_row(session):
+def _release_row(session, product: ProductSpec | None = None):
     from .. import models
 
+    spec = product or PRODUCTS_BY_KEY[RELEASE_NAME]
     row = (
         session.query(models.SoftwareRelease)
-        .filter(models.SoftwareRelease.name == RELEASE_NAME)
+        .filter(models.SoftwareRelease.name == spec.key)
         .one_or_none()
     )
     if row is None:
-        row = models.SoftwareRelease(name=RELEASE_NAME)
+        row = models.SoftwareRelease(name=spec.key)
         session.add(row)
     return row
 
 
-def version_overview(session) -> dict[str, Any]:
-    """Сводка «upstream vs пин vs ноды» для админки и уведомления."""
-    from .. import models
-    from ..version import app_version
-
-    row = _release_row(session)
+def _product_state(session, spec: ProductSpec) -> dict[str, Any]:
+    """Кэш релиза + пин по одному продукту, в форме для API."""
+    row = _release_row(session, spec)
     # Файл роли виден только воркеру (ansible-дерево лежит в его образе), а этот
     # код зовёт ещё и API-контейнер. Поэтому: сначала файл, иначе — то, что
     # воркер записал в БД на последней проверке. Иначе сводка врала бы
     # `pinned: null` и «дрейф» не считался вовсе.
-    pin = pinned_version() or row.pinned_version
+    pin = pinned_version(spec) or row.pinned_version
     latest = row.latest_version
+    return {
+        "label": spec.label,
+        "latest": latest,
+        "pinned": pin,
+        "pin_behind_upstream": bool(
+            latest
+            and pin
+            and _normalize(latest, tag_prefix=spec.tag_prefix)
+            != _normalize(pin, tag_prefix=spec.tag_prefix)
+        ),
+        "checked_at": row.checked_at.isoformat() if row.checked_at else None,
+        "html_url": row.html_url,
+        "last_error": row.last_error,
+    }
+
+
+def version_overview(session) -> dict[str, Any]:
+    """Сводка «upstream vs пин vs ноды» для админки и уведомлений.
+
+    Ключ ``xray`` сохранён отдельно от ``products`` намеренно: на него уже
+    смотрит фронт, и ломать его форму ради симметрии нет смысла.
+    """
+    from .. import models
+    from ..version import app_version
+
+    xray_spec = PRODUCTS_BY_KEY["xray-core"]
+    hy2_spec = PRODUCTS_BY_KEY["hysteria"]
+    xray_state = _product_state(session, xray_spec)
+    hy2_state = _product_state(session, hy2_spec)
 
     nodes = (
         session.query(models.VPNNode)
@@ -174,56 +264,61 @@ def version_overview(session) -> dict[str, Any]:
         .all()
     )
     our_version = app_version()
-    outdated_xray = [
-        n for n in nodes
-        if n.xray_version and _normalize(n.xray_version) != _normalize(pin)
-    ]
-    outdated_release = [
-        n for n in nodes
-        if n.release_version and n.release_version != our_version
-    ]
-    unknown = [n for n in nodes if not n.xray_version]
+
+    def _drift(attr: str, pin: str | None, spec: ProductSpec) -> list[str]:
+        return [
+            n.name
+            for n in nodes
+            if getattr(n, attr)
+            and _normalize(getattr(n, attr), tag_prefix=spec.tag_prefix)
+            != _normalize(pin, tag_prefix=spec.tag_prefix)
+        ]
 
     return {
         "app_version": our_version,
-        "xray": {
-            "latest": latest,
-            "pinned": pin,
-            "pin_behind_upstream": bool(
-                latest and pin and _normalize(latest) != _normalize(pin)
-            ),
-            "checked_at": row.checked_at.isoformat() if row.checked_at else None,
-            "html_url": row.html_url,
-            "last_error": row.last_error,
-        },
+        "xray": xray_state,
+        "hysteria": hy2_state,
         "nodes_total": len(nodes),
-        "nodes_outdated_xray": [n.name for n in outdated_xray],
-        "nodes_outdated_release": [n.name for n in outdated_release],
-        "nodes_version_unknown": [n.name for n in unknown],
+        "nodes_outdated_xray": _drift("xray_version", xray_state["pinned"], xray_spec),
+        "nodes_outdated_hysteria": _drift(
+            "hysteria_version", hy2_state["pinned"], hy2_spec
+        ),
+        "nodes_outdated_release": [
+            n.name for n in nodes if n.release_version and n.release_version != our_version
+        ],
+        "nodes_version_unknown": [n.name for n in nodes if not n.xray_version],
+        # Отдельный список: нода без hy2-конфига бинаря и не имеет — это не
+        # «не смогли опросить», а норма, поэтому в один список с xray не мешаем.
+        "nodes_hysteria_unknown": [n.name for n in nodes if not n.hysteria_version],
     }
 
 
-def check_upstream_and_notify(session) -> dict[str, Any]:
-    """Обновить кэш релиза и разбудить админа, если версии разъехались."""
+def check_product_and_notify(session, spec: ProductSpec) -> dict[str, Any]:
+    """Обновить кэш релиза одного продукта и разбудить админа при дрейфе."""
     from .admin_notify import notify_admins
 
-    row = _release_row(session)
-    result = fetch_latest_release()
+    row = _release_row(session, spec)
+    result = fetch_latest_release(spec)
 
     if "error" in result:
         row.last_error = result["error"][:500]
         # Пин читается локально и от доступности GitHub не зависит — обновляем
         # даже на неудачной проверке, иначе после бампа роли сводка показывала бы
         # старый пин до первого успешного похода наружу.
-        row.pinned_version = pinned_version() or row.pinned_version
+        row.pinned_version = pinned_version(spec) or row.pinned_version
         session.commit()
-        logger.warning("xray-upstream: %s", result["error"])
-        return {"latest": row.latest_version, "notified": False, "error": result["error"]}
+        logger.warning("releases[%s]: %s", spec.key, result["error"])
+        return {
+            "product": spec.key,
+            "latest": row.latest_version,
+            "notified": False,
+            "error": result["error"],
+        }
 
     row.latest_version = result["version"]
     # Тик всегда идёт в воркере, где ansible-дерево есть — фиксируем пин для
     # API-контейнера.
-    row.pinned_version = pinned_version() or row.pinned_version
+    row.pinned_version = pinned_version(spec) or row.pinned_version
     row.published_at = result["published_at"]
     row.html_url = result["html_url"]
     row.checked_at = utcnow()
@@ -231,39 +326,68 @@ def check_upstream_and_notify(session) -> dict[str, Any]:
     session.commit()
 
     overview = version_overview(session)
-    pin = overview["xray"]["pinned"]
-    latest = overview["xray"]["latest"]
-    outdated_nodes = overview["nodes_outdated_xray"]
+    state = overview["xray"] if spec.key == "xray-core" else overview["hysteria"]
+    pin = state["pinned"]
+    latest = state["latest"]
+    outdated_nodes = (
+        overview["nodes_outdated_xray"]
+        if spec.key == "xray-core"
+        else overview["nodes_outdated_hysteria"]
+    )
 
     lines: list[str] = []
-    if overview["xray"]["pin_behind_upstream"]:
+    if state["pin_behind_upstream"]:
         lines.append(
-            f"🆕 Xray-core: вышла {latest}, у нас в роли пин {pin}.\n"
-            "Бамп — руками: xray_core_version + xray_core_sha256 в паре "
-            "(иначе установка упадёт на несовпадении хэша), затем деплой."
+            f"🆕 {spec.label}: вышла {latest}, у нас в роли пин {pin}.\n{spec.upgrade_hint}"
         )
     if outdated_nodes:
         shown = ", ".join(outdated_nodes[:10])
         tail = f" и ещё {len(outdated_nodes) - 10}" if len(outdated_nodes) > 10 else ""
         lines.append(
-            f"📦 Ноды не на пине {pin}: {shown}{tail}. "
-            "Обновить можно точечно кнопкой «Обновить xray» в админке."
+            f"📦 {spec.label}: ноды не на пине {pin}: {shown}{tail}. "
+            "Обновить можно точечно кнопкой в админке (страница «Версии»)."
         )
 
     if not lines:
-        return {"latest": latest, "notified": False, "outdated": 0}
+        return {
+            "product": spec.key,
+            "latest": latest,
+            "notified": False,
+            "outdated": 0,
+        }
 
     notify_admins(
         session,
         kind="xray_version_drift",
         text="\n\n".join(lines),
-        # Ключ дедупа — пара (upstream, пин): пока не вышел новый релиз и не
-        # сменился пин, повторных пушей нет. Список отставших нод в ключ НЕ
-        # входит: он меняется по мере апгрейда, и каждая обновлённая нода
-        # порождала бы новый пуш про оставшиеся.
-        dedup_key={"latest": latest, "pinned": pin},
+        # Ключ дедупа — тройка (продукт, upstream, пин): пока не вышел новый
+        # релиз и не сменился пин, повторных пушей нет. Список отставших нод в
+        # ключ НЕ входит: он меняется по мере апгрейда, и каждая обновлённая
+        # нода порождала бы новый пуш про оставшиеся.
+        dedup_key={"product": spec.key, "latest": latest, "pinned": pin},
         extra={"outdated_nodes": outdated_nodes},
         window_sec=int(os.getenv("XRAY_DRIFT_DEDUP_WINDOW_SEC", str(7 * 86400))),
         autocommit=True,
     )
-    return {"latest": latest, "notified": True, "outdated": len(outdated_nodes)}
+    return {
+        "product": spec.key,
+        "latest": latest,
+        "notified": True,
+        "outdated": len(outdated_nodes),
+    }
+
+
+def check_upstream_and_notify(session) -> dict[str, Any]:
+    """Прогнать проверку по ВСЕМ отслеживаемым продуктам.
+
+    Один тик на оба: поход к GitHub занимает доли секунды, а два расписания
+    ради этого пришлось бы держать в синхроне.
+    """
+    results = [check_product_and_notify(session, spec) for spec in PRODUCTS]
+    xray = next((r for r in results if r["product"] == "xray-core"), {})
+    return {
+        # Плоские ключи по xray — на них смотрят существующие тесты и логи тика.
+        "latest": xray.get("latest"),
+        "notified": any(r.get("notified") for r in results),
+        "products": results,
+    }

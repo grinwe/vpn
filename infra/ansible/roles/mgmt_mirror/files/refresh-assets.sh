@@ -26,6 +26,7 @@ MODE="all"
 case "${1:-}" in
     --geoip-only)         MODE="geoip" ;;
     --xray-only)          MODE="xray" ;;
+    --hysteria-only)      MODE="hysteria" ;;
     --node-exporter-only) MODE="node_exporter" ;;
     "") ;;
     *) echo "Unknown arg: $1" >&2; exit 1 ;;
@@ -43,13 +44,21 @@ XRAY_VERSIONS=(
     "v26.3.27"
 )
 
+# hysteria версии — держать в синхроне с
+# roles/install_hysteria2/defaults/main.yml (hysteria2_version). Тег релиза у
+# apernet/hysteria — `app/vX.Y.Z`, в URL слэш экранируется как %2F; здесь
+# указываем версию БЕЗ префикса, как в роли.
+HYSTERIA_VERSIONS=(
+    "v2.10.0"
+)
+
 # node_exporter версии — держать в синхроне с
 # roles/node_exporter/defaults/main.yml (node_exporter_version, БЕЗ 'v').
 NODE_EXPORTER_VERSIONS=(
     "1.8.2"
 )
 
-mkdir -p "$ASSETS_DIR/xray" "$ASSETS_DIR/node_exporter"
+mkdir -p "$ASSETS_DIR/xray" "$ASSETS_DIR/hysteria" "$ASSETS_DIR/node_exporter"
 
 fetch_atomic() {
     local url="$1" dest="$2" min_bytes="${3:-100000}"
@@ -102,6 +111,23 @@ if [[ "$MODE" == "all" || "$MODE" == "xray" ]]; then
     done
 fi
 
+# hysteria: голый бинарь (не архив). Для RU-нод за заблокированным github
+# зеркало — единственный рабочий источник, так что версию сюда надо добавлять
+# ВМЕСТЕ с бампом пина в роли, иначе апгрейд на них не доедет.
+if [[ "$MODE" == "all" || "$MODE" == "hysteria" ]]; then
+    for ver in "${HYSTERIA_VERSIONS[@]}"; do
+        f="$ASSETS_DIR/hysteria/hysteria-linux-amd64-${ver}"
+        if [ -f "$f" ]; then
+            echo "→ hysteria-linux-amd64-${ver} уже есть, skip"
+            continue
+        fi
+        fetch_atomic \
+            "https://github.com/apernet/hysteria/releases/download/app%2F${ver}/hysteria-linux-amd64" \
+            "$f" \
+            5000000
+    done
+fi
+
 if [[ "$MODE" == "all" || "$MODE" == "node_exporter" ]]; then
     for ver in "${NODE_EXPORTER_VERSIONS[@]}"; do
         f="$ASSETS_DIR/node_exporter/node_exporter-${ver}.linux-amd64.tar.gz"
@@ -118,4 +144,4 @@ fi
 
 echo
 echo "=== Mirror inventory ==="
-ls -la "$ASSETS_DIR" "$ASSETS_DIR/xray" "$ASSETS_DIR/node_exporter" 2>/dev/null
+ls -la "$ASSETS_DIR" "$ASSETS_DIR/xray" "$ASSETS_DIR/hysteria" "$ASSETS_DIR/node_exporter" 2>/dev/null

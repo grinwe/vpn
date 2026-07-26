@@ -5,6 +5,7 @@ import {
   api,
   ApiError,
   fetchVersionsOverview,
+  upgradeNodesHysteria,
   upgradeNodesXray,
   VersionsOverview,
   VPNNodeOut,
@@ -81,6 +82,7 @@ export default function Versions() {
   });
 
   const pinned = overview.data?.xray.pinned ?? null;
+  const pinnedHy2 = overview.data?.hysteria.pinned ?? null;
   const appVersion = overview.data?.app_version ?? null;
 
   const rows = useMemo(() => {
@@ -95,6 +97,28 @@ export default function Versions() {
       ),
     [rows, pinned],
   );
+  const outdatedHy2 = useMemo(
+    () =>
+      rows.filter(
+        (n) =>
+          n.hysteria_version &&
+          pinnedHy2 &&
+          strip(n.hysteria_version) !== strip(pinnedHy2),
+      ),
+    [rows, pinnedHy2],
+  );
+
+  const upgradeHy2 = useMutation({
+    mutationFn: (ids: number[]) => upgradeNodesHysteria(ids, "versions-page"),
+    onSuccess: (res) => {
+      setSelected(new Set());
+      qc.invalidateQueries({ queryKey: ["nodes"] });
+      qc.invalidateQueries({ queryKey: ["provisioning-tasks"] });
+      const skipped = res.skipped.length ? `, пропущено: ${res.skipped.join(", ")}` : "";
+      alert(`Запущено задач: ${res.started.length}${skipped}`);
+    },
+    onError: (e) => alert(`Не удалось запустить апгрейд: ${String(e)}`),
+  });
 
   const upgrade = useMutation({
     mutationFn: (ids: number[]) => upgradeNodesXray(ids, "versions-page"),
@@ -117,16 +141,21 @@ export default function Versions() {
     });
   }
 
-  function runUpgrade(ids: number[]) {
+  function runUpgrade(ids: number[], product: "xray" | "hysteria" = "xray") {
     if (!ids.length) return;
+    const isXray = product === "xray";
+    const target = (isXray ? pinned : pinnedHy2) ?? "целевой версии";
+    const warning = isXray
+      ? "На каждой ноде рестарт ядра разорвёт активные соединения на ~100 мс."
+      : "На каждой ноде рестарт демона разорвёт активные QUIC-сессии.";
     if (
       !window.confirm(
-        `Обновить xray на ${ids.length} нод(е/ах) до ${pinned ?? "целевой версии"}?\n` +
-          "На каждой ноде рестарт ядра разорвёт активные соединения на ~100 мс.",
+        `Обновить ${isXray ? "xray" : "hysteria"} на ${ids.length} нод(е/ах) до ${target}?\n` +
+          warning,
       )
     )
       return;
-    upgrade.mutate(ids);
+    (isXray ? upgrade : upgradeHy2).mutate(ids);
   }
 
   if (nodes.error || overview.error) {
@@ -141,7 +170,9 @@ export default function Versions() {
   }
 
   const xray = overview.data?.xray;
+  const hy2 = overview.data?.hysteria;
   const pinBehind = !!xray?.pin_behind_upstream;
+  const hy2PinBehind = !!hy2?.pin_behind_upstream;
 
   return (
     <div>
@@ -180,6 +211,23 @@ export default function Versions() {
                 : "Ещё не проверялось"
           }
         />
+        <SummaryCard
+          label="hysteria: целевая (пин в роли)"
+          value={pinnedHy2 ?? "—"}
+          hint="hysteria2_version в roles/install_hysteria2; меняется коммитом вместе с sha256"
+        />
+        <SummaryCard
+          label="hysteria: последняя upstream"
+          value={hy2?.latest ?? "—"}
+          tone={hy2PinBehind ? "warn" : "normal"}
+          hint={
+            hy2?.last_error
+              ? `Проверка не удалась: ${hy2.last_error}`
+              : hy2?.checked_at
+                ? `Проверено ${new Date(hy2.checked_at).toLocaleString()}`
+                : "Ещё не проверялось"
+          }
+        />
       </div>
 
       {pinBehind && (
@@ -194,6 +242,30 @@ export default function Versions() {
               {" "}
               <a
                 href={xray.html_url}
+                target="_blank"
+                rel="noreferrer"
+                className="underline"
+              >
+                Релиз на GitHub
+              </a>
+            </>
+          )}
+        </div>
+      )}
+
+      {hy2PinBehind && (
+        <div className="mb-6 p-3 rounded border border-yellow-900/50 bg-yellow-950/20 text-sm">
+          Hysteria2: вышла {hy2?.latest}, у нас пин {pinnedHy2}. Бампать так же
+          парой — <code className="mx-1 font-mono">hysteria2_version</code> +
+          <code className="mx-1 font-mono">hysteria2_sha256</code> (хэш из
+          hashes.txt релиза), плюс{" "}
+          <code className="font-mono">HYSTERIA_VERSIONS</code> в
+          refresh-assets.sh, иначе RU-ноды не скачают бинарь с зеркала.
+          {hy2?.html_url && (
+            <>
+              {" "}
+              <a
+                href={hy2.html_url}
                 target="_blank"
                 rel="noreferrer"
                 className="underline"
@@ -221,9 +293,24 @@ export default function Versions() {
         >
           Обновить все отставшие ({outdated.length})
         </button>
+        <button
+          onClick={() => runUpgrade([...selected], "hysteria")}
+          disabled={!selected.size || upgradeHy2.isPending}
+          className="text-sm px-3 py-1.5 rounded bg-slate-800 hover:bg-slate-700 disabled:opacity-40"
+        >
+          Обновить hysteria на выбранных ({selected.size})
+        </button>
+        <button
+          onClick={() => runUpgrade(outdatedHy2.map((n) => n.id), "hysteria")}
+          disabled={!outdatedHy2.length || upgradeHy2.isPending}
+          className="text-sm px-3 py-1.5 rounded bg-slate-800 hover:bg-slate-700 disabled:opacity-40"
+          title="Все ноды, чья версия hysteria не совпадает с пином"
+        >
+          Обновить отставшие hysteria ({outdatedHy2.length})
+        </button>
         <span className="text-xs text-slate-500">
-          Точечный прогон роли xray_core, ~30-60с на ноду. Полный бутстрап — на
-          странице Nodes.
+          Точечный прогон (только бинарь + рестарт), ~30-60с на ноду. Полный
+          бутстрап — на странице Nodes.
         </span>
       </div>
 
@@ -234,6 +321,7 @@ export default function Versions() {
               <th className="py-2 w-8"></th>
               <th>Нода</th>
               <th>xray</th>
+              <th>hysteria</th>
               <th className="hidden sm:table-cell">Код на ноде</th>
               <th className="hidden md:table-cell">Проверено</th>
               <th></th>
@@ -243,6 +331,10 @@ export default function Versions() {
             {rows.map((n) => {
               const xrayDrift =
                 !!n.xray_version && !!pinned && strip(n.xray_version) !== strip(pinned);
+              const hy2Drift =
+                !!n.hysteria_version &&
+                !!pinnedHy2 &&
+                strip(n.hysteria_version) !== strip(pinnedHy2);
               const releaseDrift =
                 !!n.release_version && !!appVersion && n.release_version !== appVersion;
               return (
@@ -263,6 +355,19 @@ export default function Versions() {
                       title={xrayDrift ? `Целевая версия ${pinned}` : undefined}
                     />
                   </td>
+                  <td>
+                    <Cell
+                      value={strip(n.hysteria_version)}
+                      drift={hy2Drift}
+                      title={
+                        hy2Drift
+                          ? `Целевая версия ${pinnedHy2}`
+                          : n.hysteria_version
+                            ? undefined
+                            : "hysteria2 на этой ноде не настроен"
+                      }
+                    />
+                  </td>
                   <td className="hidden sm:table-cell">
                     <Cell
                       value={n.release_version}
@@ -280,20 +385,31 @@ export default function Versions() {
                       : "ни разу"}
                   </td>
                   <td className="text-right">
-                    <button
-                      onClick={() => runUpgrade([n.id])}
-                      disabled={upgrade.isPending}
-                      className="text-xs px-2 py-1 rounded bg-slate-800 hover:bg-slate-700 disabled:opacity-40"
-                    >
-                      Обновить
-                    </button>
+                    <div className="flex justify-end gap-1">
+                      <button
+                        onClick={() => runUpgrade([n.id])}
+                        disabled={upgrade.isPending}
+                        className="text-xs px-2 py-1 rounded bg-slate-800 hover:bg-slate-700 disabled:opacity-40"
+                      >
+                        xray
+                      </button>
+                      {n.hysteria_version && (
+                        <button
+                          onClick={() => runUpgrade([n.id], "hysteria")}
+                          disabled={upgradeHy2.isPending}
+                          className="text-xs px-2 py-1 rounded bg-slate-800 hover:bg-slate-700 disabled:opacity-40"
+                        >
+                          hy2
+                        </button>
+                      )}
+                    </div>
                   </td>
                 </tr>
               );
             })}
             {!rows.length && (
               <tr>
-                <td colSpan={6} className="py-4 text-slate-500 text-center">
+                <td colSpan={7} className="py-4 text-slate-500 text-center">
                   Нод нет
                 </td>
               </tr>
@@ -304,7 +420,8 @@ export default function Versions() {
 
       <p className="text-xs text-slate-500 mt-4">
         Версии с нод снимает тик <code className="font-mono">tick-node-versions</code>{" "}
-        раз в час по SSH: <code className="font-mono">xray version</code> и маркер{" "}
+        раз в час по SSH: <code className="font-mono">xray version</code>,{" "}
+        <code className="font-mono">hysteria version</code> и маркер{" "}
         <code className="font-mono">/etc/vpn-node-release.json</code>, который
         бутстрап пишет только после успешного прогона всех ролей. Поэтому «код на
         ноде» отстаёт ровно тогда, когда ноду ещё не перекатывали после выката.

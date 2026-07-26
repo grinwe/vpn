@@ -302,6 +302,8 @@ class VPNNodeOut(VPNNodeCreate):
     # самое, что «опросили и не нашли».
     xray_version: str | None = None
     release_version: str | None = None
+    # hysteria2 — отдельный демон со своим бинарём, xray его не обслуживает.
+    hysteria_version: str | None = None
     versions_checked_at: UTCDateTime | None = None
     # Reconciler-видимость: desired_generation > reconciled_generation, т.е.
     # ноде нужен прогон, но он отложен на reconcile-тик (defer-модель). Без

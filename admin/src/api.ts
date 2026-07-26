@@ -573,6 +573,8 @@ export interface VPNNodeOut {
   // ролей). versions_checked_at=null → ноду ещё ни разу не опрашивали.
   xray_version: string | null;
   release_version: string | null;
+  // hysteria2 — отдельный демон со своим бинарём (xray его не обслуживает).
+  hysteria_version: string | null;
   versions_checked_at: string | null;
   blocked_regions: string[];
   cooldown_until: string | null;
@@ -825,23 +827,54 @@ export function upgradeNodesXray(
   return api.post(`/nodes/upgrade-xray`, { node_ids: nodeIds, reason });
 }
 
-// Сводка версий: наш код, upstream-релиз xray, пин в роли и дрейф по нодам.
+// То же для бинаря hysteria: только бинарная часть роли install_hysteria2,
+// config.yaml не перерендеривается — пер-юзерные hy2-учётки не задеваются.
+// Рестарт демона рвёт активные QUIC-сессии (клиент переподключается сам).
+export function upgradeNodeHysteria(
+  nodeId: number,
+): Promise<{ node_id: number; task_id: number }> {
+  return api.post<{ node_id: number; task_id: number }>(
+    `/nodes/${nodeId}/upgrade-hysteria`,
+    {},
+  );
+}
+
+export function upgradeNodesHysteria(
+  nodeIds: number[],
+  reason?: string,
+): Promise<{
+  started: { node_id: number; task_id: number }[];
+  skipped: number[];
+}> {
+  return api.post(`/nodes/upgrade-hysteria`, { node_ids: nodeIds, reason });
+}
+
+// Сводка версий: наш код, upstream-релизы xray и hysteria, пины в ролях и дрейф
+// по нодам.
 // Upstream берётся из кэша (наполняет tick-xray-upstream) — на каждый рендер
 // в GitHub не ходим.
+export interface ProductVersionState {
+  label: string;
+  latest: string | null;
+  pinned: string | null;
+  pin_behind_upstream: boolean;
+  checked_at: string | null;
+  html_url: string | null;
+  last_error: string | null;
+}
+
 export interface VersionsOverview {
   app_version: string;
-  xray: {
-    latest: string | null;
-    pinned: string | null;
-    pin_behind_upstream: boolean;
-    checked_at: string | null;
-    html_url: string | null;
-    last_error: string | null;
-  };
+  xray: ProductVersionState;
+  hysteria: ProductVersionState;
   nodes_total: number;
   nodes_outdated_xray: string[];
+  nodes_outdated_hysteria: string[];
   nodes_outdated_release: string[];
   nodes_version_unknown: string[];
+  // Нода без hy2-конфига бинаря и не имеет — это норма, поэтому список
+  // отдельный от nodes_version_unknown (там «не смогли снять версию xray»).
+  nodes_hysteria_unknown: string[];
 }
 
 export function fetchVersionsOverview(): Promise<VersionsOverview> {

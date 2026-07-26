@@ -44,16 +44,23 @@ logger = logging.getLogger(__name__)
 
 # `xray version` печатает: "Xray 26.3.27 (Xray, Penetrates Everything.) ..."
 _XRAY_VERSION_RE = re.compile(r"^Xray\s+(\S+)", re.MULTILINE)
+# `hysteria version` печатает многострочный блок с "Version\tv2.10.0".
+_HYSTERIA_VERSION_RE = re.compile(r"^Version\s+(\S+)", re.MULTILINE)
 
 XRAY_BIN = "/usr/local/bin/xray"
+HYSTERIA_BIN = "/usr/local/bin/hysteria"
 RELEASE_MARKER = "/etc/vpn-node-release.json"
 
-# Обе команды в одном exec: лишний round-trip на ноду ради одной строки не
-# нужен, а `|| true` не даёт непоставленному xray уронить весь вывод.
+# Разделитель секций вывода. Все команды идут одним exec: лишние round-trip'ы на
+# ноду ради одной строки не нужны, а `|| true` не даёт отсутствующему бинарю
+# (нода без hy2 или без vless) уронить весь вывод.
+_SECTION = "---8<---"
 _PROBE_COMMAND = (
     f"{XRAY_BIN} version 2>/dev/null | head -n1 || true; "
-    f"echo '---'; "
-    f"cat {RELEASE_MARKER} 2>/dev/null || true"
+    f"echo '{_SECTION}'; "
+    f"cat {RELEASE_MARKER} 2>/dev/null || true; "
+    f"echo '{_SECTION}'; "
+    f"{HYSTERIA_BIN} version 2>/dev/null | grep -E '^Version' || true"
 )
 
 
@@ -64,6 +71,7 @@ class NodeVersions:
     node_id: int
     xray_version: str | None = None
     release_version: str | None = None
+    hysteria_version: str | None = None
     error: str | None = None
 
 
@@ -77,26 +85,34 @@ class _NodeRef:
     ssh_port: int | None
 
 
-def _parse_probe_output(raw: str) -> tuple[str | None, str | None]:
-    """Разобрать вывод ``_PROBE_COMMAND`` на (версия xray, версия релиза)."""
-    head, _, tail = raw.partition("---")
-    match = _XRAY_VERSION_RE.search(head)
+def _parse_probe_output(raw: str) -> tuple[str | None, str | None, str | None]:
+    """Разобрать вывод ``_PROBE_COMMAND``.
+
+    Возвращает ``(версия xray, версия нашего кода, версия hysteria)``. Каждая
+    секция независима: отсутствие одного бинаря (нода без hy2, нода без vless)
+    не должно стоить нам остальных версий.
+    """
+    sections = raw.split(_SECTION)
+    match = _XRAY_VERSION_RE.search(sections[0] if sections else "")
     xray_version = match.group(1) if match else None
 
+    hy2_match = _HYSTERIA_VERSION_RE.search(sections[2] if len(sections) > 2 else "")
+    hysteria_version = hy2_match.group(1) if hy2_match else None
+
     release_version = None
-    marker = tail.strip()
+    marker = (sections[1] if len(sections) > 1 else "").strip()
     if marker:
         try:
             payload = json.loads(marker)
         except ValueError:
             # Маркер битый (недописан, руками правили) — это не повод терять
-            # версию xray, поэтому просто не заполняем поле.
+            # версии бинарей, поэтому просто не заполняем поле.
             logger.warning("node-versions: битый %s: %r", RELEASE_MARKER, marker[:120])
         else:
             if isinstance(payload, dict):
                 value = payload.get("version")
                 release_version = str(value) if value else None
-    return xray_version, release_version
+    return xray_version, release_version, hysteria_version
 
 
 def collect_node_versions(node) -> NodeVersions:
@@ -133,11 +149,12 @@ def collect_node_versions(node) -> NodeVersions:
         except Exception:  # noqa: BLE001
             pass
 
-    xray_version, release_version = _parse_probe_output(out)
+    xray_version, release_version, hysteria_version = _parse_probe_output(out)
     return NodeVersions(
         node_id=node.id,
         xray_version=xray_version,
         release_version=release_version,
+        hysteria_version=hysteria_version,
     )
 
 
@@ -201,6 +218,8 @@ def collect_all_nodes_versions(session, *, workers: int | None = None) -> list[N
                 node.xray_version = result.xray_version
             if result.release_version:
                 node.release_version = result.release_version
+            if result.hysteria_version:
+                node.hysteria_version = result.hysteria_version
             node.versions_checked_at = utcnow()
 
     session.commit()
