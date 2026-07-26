@@ -24,6 +24,7 @@ from sqlalchemy.orm import Session
 from .. import models
 from ..db import SessionLocal
 from ..security import compute_client_id_hmac, decrypt, encrypt
+from ..version import app_version
 from .ansible_runner import (
     AnsibleCancelled,
     build_inventory_for_exit_node,
@@ -657,6 +658,11 @@ def _collect_site_extra_vars(
     mirror_url = _resolve_xray_mirror_url()
     if mirror_url:
         extra["xray_mirror_url"] = mirror_url
+    # Версия кода, которой прошиваем ноду: site.yml пишет её в
+    # /etc/vpn-node-release.json (post_tasks, только после успеха всех ролей), а
+    # тик сбора версий читает обратно. Без этого «какие ноды уже догнали
+    # изменения ролей, а какие нет» отслеживалось на глаз.
+    extra["vpn_release_version"] = app_version()
     # Ports the health-check role must see listening after site.yml
     # finishes. Built from the set of enabled VPNConfig rows so adding
     # or removing a protocol on the node automatically adjusts which
@@ -1832,7 +1838,13 @@ class ProvisioningOrchestrator:
             # трафик: провал re-issue одного домена обнулял health_score живой
             # ноды, а успех промоутил её в active и запускал полный vless+hy2
             # ресинк с рестартом hysteria-server (аудит 2026-07-25).
-            if task.action in ("resync_vless", "resync_hy2", "renew_certs"):
+            # upgrade_xray — тоже точечный пост-хелпер: доставляет бинарь ядра и
+            # рестартует юниты. Его провал (нода недоступна, зеркало не отдало
+            # zip) не означает, что нода перестала нести трафик, а успех не
+            # повод промоутить registering→active и гнать полный ресинк.
+            if task.action in (
+                "resync_vless", "resync_hy2", "renew_certs", "upgrade_xray",
+            ):
                 return
             # Diagnose is READ-ONLY (staged probe + read-only on-host play).
             # A FAILED probe of a temporarily-unreachable node must NOT zero
@@ -2207,6 +2219,26 @@ class ProvisioningOrchestrator:
                         extra_vars={
                             "cert_domains": (payload or {}).get("domains") or [],
                         },
+                        timeout=300,
+                    )
+                elif task.action == "upgrade_xray":
+                    # Точечный апгрейд ядра xray: только роль xray_core (скачать
+                    # бинарь целевой версии + рестарт живых юнитов), без полного
+                    # site.yml на 900с. Кнопка «Обновить xray» в админке и батч
+                    # по выбранным нодам. Целевая версия и её sha256 живут в
+                    # роли и меняются коммитом — здесь их не переопределяем.
+                    xray_vars: dict[str, Any] = {}
+                    mirror_url = _resolve_xray_mirror_url()
+                    if mirror_url:
+                        # Однохостовый временный inventory не подхватывает
+                        # group_vars, а без зеркала RU-нода за заблокированным
+                        # github ядро не скачает.
+                        xray_vars["xray_mirror_url"] = mirror_url
+                    result = run_playbook(
+                        "playbooks/upgrade_xray.yml",
+                        inventory,
+                        limit=node.name,
+                        extra_vars=xray_vars,
                         timeout=300,
                     )
                 else:
@@ -3917,6 +3949,23 @@ class ProvisioningOrchestrator:
             # Origin-CA) — нечего renew'ить, таску не плодим.
             return None
         task = self.create_task("node", node.id, "renew_certs", {"domains": domains})
+        self.db.commit()
+        self.run_task_async(task, node=node)
+        return task
+
+    def upgrade_node_xray(
+        self, node: models.VPNNode, *, reason: str | None = None
+    ) -> models.ProvisioningTask:
+        """Доставить на ноду ядро xray целевой версии (пин из роли).
+
+        Точечная альтернатива полному бутстрапу: прогоняется только роль
+        ``xray_core`` (~30-60с против 5-8 минут), config.json не
+        перерендеривается, клиенты ноды остаются на месте. Рестарт xray рвёт
+        живые соединения примерно на 100 мс — клиенты переподключаются сами.
+        """
+        task = self.create_task(
+            "node", node.id, "upgrade_xray", {"reason": reason} if reason else {}
+        )
         self.db.commit()
         self.run_task_async(task, node=node)
         return task

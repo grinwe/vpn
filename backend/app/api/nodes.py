@@ -755,6 +755,103 @@ def renew_node_certs_route(
     return {"node_id": node.id, "task_id": task.id}
 
 
+class UpgradeXrayRequest(BaseModel):
+    """Батч-апгрейд: список нод, которые оператор выбрал в админке."""
+
+    node_ids: list[int]
+    reason: str | None = None
+
+
+@router.post("/nodes/{node_id}/upgrade-xray")
+def upgrade_node_xray_route(
+    node_id: int,
+    db: Session = Depends(get_db),
+    admin_token: str = Depends(require_admin),
+    admin_actor: str | None = Header(default=None, alias=ADMIN_ACTOR_HEADER),
+):
+    """Доставить на ноду ядро xray целевой версии (пин из роли xray_core).
+
+    Точечно: гоняется только ``playbooks/upgrade_xray.yml``, а не весь site.yml.
+    config.json не трогается, клиенты ноды на месте; рестарт xray рвёт живые
+    соединения примерно на 100 мс.
+    """
+    node = db.get(models.VPNNode, node_id)
+    if not node:
+        raise HTTPException(status_code=404, detail="Node not found")
+    orchestrator = ProvisioningOrchestrator(db)
+    task = orchestrator.upgrade_node_xray(node, reason="manual")
+    actor, actor_type = _resolve_admin_actor(admin_actor)
+    _audit(
+        db,
+        actor,
+        "node_upgrade_xray",
+        "vpn_node",
+        node.id,
+        actor_type=actor_type,
+        metadata={"task_id": task.id},
+    )
+    db.commit()
+    return {"node_id": node.id, "task_id": task.id}
+
+
+@router.post("/nodes/upgrade-xray")
+def upgrade_nodes_xray_batch(
+    payload: UpgradeXrayRequest,
+    db: Session = Depends(get_db),
+    admin_token: str = Depends(require_admin),
+    admin_actor: str | None = Header(default=None, alias=ADMIN_ACTOR_HEADER),
+):
+    """Тот же апгрейд, но по списку нод — «обновить выбранные» из админки.
+
+    Таски создаются по одной на ноду и уезжают в общую очередь провижининга:
+    её семафор сам растянет фанаут, чтобы 10 одновременных прогонов не выели
+    слоты у горячего пути выдачи конфигов. Неизвестные id молча пропускаем и
+    возвращаем в ``skipped`` — оператор увидит расхождение, а батч не упадёт
+    целиком из-за одной удалённой ноды.
+    """
+    if not payload.node_ids:
+        raise HTTPException(status_code=400, detail="node_ids is empty")
+
+    orchestrator = ProvisioningOrchestrator(db)
+    started: list[dict[str, int]] = []
+    skipped: list[int] = []
+    actor, actor_type = _resolve_admin_actor(admin_actor)
+    for node_id in payload.node_ids:
+        node = db.get(models.VPNNode, node_id)
+        if not node:
+            skipped.append(node_id)
+            continue
+        task = orchestrator.upgrade_node_xray(node, reason=payload.reason or "batch")
+        started.append({"node_id": node.id, "task_id": task.id})
+        _audit(
+            db,
+            actor,
+            "node_upgrade_xray",
+            "vpn_node",
+            node.id,
+            actor_type=actor_type,
+            metadata={"task_id": task.id, "batch": True},
+        )
+    db.commit()
+    return {"started": started, "skipped": skipped}
+
+
+@router.get("/versions/overview")
+def versions_overview(
+    db: Session = Depends(get_db),
+    admin_token: str = Depends(require_admin),
+):
+    """Сводка версий: наш код, upstream-релиз xray, пин в роли и дрейф по нодам.
+
+    Кормит страницу «Версии» в админке. Upstream берётся из кэша
+    (``software_releases``, наполняет tick-xray-upstream) — на каждый рендер в
+    GitHub не ходим.
+    """
+    from ..services.xray_releases import version_overview
+
+    return version_overview(db)
+
+
 @router.post("/nodes/{node_id}/auto-diagnose/disable", status_code=200)
 def disable_node_auto_diagnose(
     node_id: int,

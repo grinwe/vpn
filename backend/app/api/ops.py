@@ -28,6 +28,15 @@ from ._common import ADMIN_ACTOR_HEADER, _audit, _resolve_admin_actor, get_db
 router = APIRouter()
 
 
+@router.get("/version")
+def get_version() -> dict[str, str | None]:
+    """Версия выкаченного кода. Без авторизации — секрета тут нет, а фронтам
+    (и человеку через curl) она нужна, чтобы понять, какой билд отвечает."""
+    from ..version import version_info
+
+    return version_info()
+
+
 _TICK_INTERVAL_ENV = {
     "tick-pending-rescue": ("PENDING_RESCUE_INTERVAL", "60"),
     "tick-autoscale": ("AUTOSCALE_INTERVAL", "0"),
@@ -38,6 +47,8 @@ _TICK_INTERVAL_ENV = {
     "tick-relay-link-health": ("RELAY_LINK_HEALTH_INTERVAL", "300"),
     "tick-health-ping": ("USER_HEALTH_PING_INTERVAL", "1800"),
     "tick-broadcast-dispatch": ("BROADCAST_DISPATCH_INTERVAL", "10"),
+    "tick-node-versions": ("NODE_VERSIONS_INTERVAL", "3600"),
+    "tick-xray-upstream": ("XRAY_UPSTREAM_INTERVAL", "21600"),
 }
 
 

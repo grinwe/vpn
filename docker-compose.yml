@@ -40,6 +40,9 @@ services:
     build: ./backend
     environment:
       APP_ENV: ${APP_ENV:-dev}
+      # Версия выката из файла VERSION (ansible кладёт её в .env). Отдаётся
+      # в GET /api/version и уезжает на ноды маркером при бутстрапе.
+      APP_VERSION: ${APP_VERSION:-0.0.0-dev}
       DATABASE_URL: ${DATABASE_URL}
       ADMIN_API_TOKEN: ${ADMIN_API_TOKEN}
       APP_SECRET_KEY: ${APP_SECRET_KEY}
@@ -173,6 +176,9 @@ services:
       DATABASE_URL: ${DATABASE_URL}
       ADMIN_API_TOKEN: ${ADMIN_API_TOKEN}
       APP_SECRET_KEY: ${APP_SECRET_KEY}
+      # Воркер прошивает эту версию нодам (extra_vars vpn_release_version →
+      # /etc/vpn-node-release.json), поэтому она нужна и здесь, не только в API.
+      APP_VERSION: ${APP_VERSION:-0.0.0-dev}
       REDIS_URL: "redis://:${REDIS_PASSWORD}@redis:6379/0"
       QUEUE_BACKEND: "rq"
       WORKER_ROLE: "provisioning"
@@ -342,6 +348,9 @@ services:
     build:
       context: ./admin
       args:
+        # Версия выката — Vite запекает её в бандл, поэтому смена VERSION
+        # требует ребилда (деплой его и делает: дерево изменилось).
+        VITE_APP_VERSION: ${APP_VERSION:-0.0.0-dev}
         # Rebuild required on change — Vite bakes the base into every
         # asset URL. Default "admin" сохраняет старое поведение;
         # прод передаёт secret path из ansible vault.
@@ -357,7 +366,10 @@ services:
     restart: unless-stopped
 
   webapp:
-    build: ./webapp
+    build:
+      context: ./webapp
+      args:
+        VITE_APP_VERSION: ${APP_VERSION:-0.0.0-dev}
     ports:
       - "127.0.0.1:8082:80"
     restart: unless-stopped

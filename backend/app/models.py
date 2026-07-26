@@ -316,6 +316,15 @@ class VPNNode(Base):
     # (анти-спам: единичные пропущенные пинги не будят админа). Чистится на
     # recovery. Своя колонка, НЕ suspect_since (та — у traffic-drop детектора).
     unreachable_since = Column(DateTime, nullable=True)
+    # Версии софта на ноде — снимает tick-node-versions по SSH (см.
+    # services/node_versions.py). До 2026-07-26 фактическая версия xray нигде не
+    # сохранялась: её знал только bash-скрипт установки, и «на каких нодах уже
+    # новое ядро» приходилось выяснять руками.
+    xray_version = Column(String, nullable=True)
+    # Версия НАШЕГО кода, которой прошита нода: site.yml пишет её в
+    # /etc/vpn-node-release.json после успешного прогона всех ролей.
+    release_version = Column(String, nullable=True)
+    versions_checked_at = Column(DateTime, nullable=True)
 
     pool = relationship("ServerPool", back_populates="nodes")
     configs = relationship("VPNConfig", back_populates="node", cascade="all, delete-orphan")
@@ -1145,6 +1154,31 @@ class ApiToken(Base):
     is_active = Column(Boolean, default=True, nullable=False)
     created_at = Column(DateTime, default=utcnow, nullable=False)
     last_used_at = Column(DateTime, nullable=True)
+
+
+class SoftwareRelease(Base):
+    """Кэш последнего upstream-релиза стороннего софта (пока — Xray-core).
+
+    Тик ``tick-xray-upstream`` раз в несколько часов спрашивает GitHub и кладёт
+    ответ сюда. Кэш нужен, чтобы админка показывала «последняя версия / у нас
+    пин / на нодах» не дёргая GitHub на каждый рендер (и не упираясь в его
+    rate-limit), а также чтобы отличить «релиза не было» от «мы не смогли
+    сходить»: ``checked_at`` обновляется только при успешном ответе.
+    """
+
+    __tablename__ = "software_releases"
+
+    id = Column(Integer, primary_key=True)
+    # 'xray-core'; строкой, а не enum — добавление hysteria2/sing-box сюда не
+    # должно требовать миграции типа.
+    name = Column(String, nullable=False, unique=True, index=True)
+    latest_version = Column(String, nullable=True)
+    published_at = Column(DateTime, nullable=True)
+    html_url = Column(String, nullable=True)
+    checked_at = Column(DateTime, nullable=True)
+    # Текст последней ошибки похода к upstream — чтобы «не проверялось N часов»
+    # можно было объяснить, не лазая в логи воркера.
+    last_error = Column(String, nullable=True)
 
 
 class AuditLog(Base):

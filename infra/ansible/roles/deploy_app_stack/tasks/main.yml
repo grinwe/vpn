@@ -97,6 +97,22 @@
   register: repo_sync
   notify: recreate app stack
 
+# Версия выката. Единственный источник правды — файл VERSION в корне репозитория
+# (семвер, бампается руками): .git из rsync исключён, образы собираются на хосте
+# без тегов, так что иначе на проде не остаётся НИКАКОГО следа ревизии. Читаем с
+# контроллера — то же дерево, что уезжает синком выше.
+- name: Read release version from VERSION file
+  ansible.builtin.slurp:
+    src: "{{ deploy_app_stack_repo_src }}/VERSION"
+  delegate_to: localhost
+  become: false
+  register: _release_version_raw
+  changed_when: false
+
+- name: Expose release version to templates
+  ansible.builtin.set_fact:
+    deploy_app_stack_release_version: "{{ (_release_version_raw.content | b64decode).strip() }}"
+
 - name: Render .env for docker-compose
   template:
     src: env.j2

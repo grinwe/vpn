@@ -1047,7 +1047,36 @@ class NotificationOut(BaseModel):
     target_id: int | None = None
 
 
+# Классы уведомлений, которые поллер бота забирает и доставляет. Список закрытый:
+# admin-алерт с kind'ом, которого тут нет, молча осядет в audit_logs и до админа
+# не доедет. Вынесен на уровень модуля, чтобы это можно было проверить тестом.
+ADMIN_NOTIFICATION_ACTIONS = [
+    "renewal_reminder", "expiry_reminder",
+    "renewal_reminder_1d", "expiry_reminder_1d",
+    "config_ready", "migration_notice", "sublink_rotated",
+    "low_balance_warning", "trial_expiry_warning", "health_ping_request",
+    # Admin push-уведомления (см. services/admin_notify.py).
+    # Текст полностью рендерится на backend-е и кладётся в
+    # extra["text"] — бот отдаёт as-is, без собственного
+    # форматирования по kind.
+    "admin_alert_user_report",
+    "admin_alert_infra_ssh",
+    "admin_alert_infra_dlq",
+    # Speaking node/exit diagnosis push (diagnostics overhaul) — text is
+    # rendered in services/admin_notify.notify_node_diagnosis; the bot
+    # attaches the ack/mute/follow keyboard from target_kind/target_id.
+    "admin_alert_node_diagnosis",
+    # Дрейф версий xray: вышел новый релиз / ноды отстали от пина в роли
+    # (services/xray_releases.py). Без строки в этом списке пуш молча
+    # оседал бы в audit_logs и до админа не доезжал.
+    "admin_alert_xray_version_drift",
+]
+
+
 @ext_router.get("/notifications/pending", response_model=list[NotificationOut])
+
+
+
 def get_pending_notifications(
     db: Session = Depends(get_db),
     admin_token: str = Depends(require_admin),
@@ -1065,23 +1094,7 @@ def get_pending_notifications(
     # them from the poller list also suppresses delivery of any
     # backlog rows that were written before the gate landed, so
     # nobody gets a stale "we caught you sharing" ping.
-    notif_actions = [
-        "renewal_reminder", "expiry_reminder",
-        "renewal_reminder_1d", "expiry_reminder_1d",
-        "config_ready", "migration_notice", "sublink_rotated",
-        "low_balance_warning", "trial_expiry_warning", "health_ping_request",
-        # Admin push-уведомления (см. services/admin_notify.py).
-        # Текст полностью рендерится на backend-е и кладётся в
-        # extra["text"] — бот отдаёт as-is, без собственного
-        # форматирования по kind.
-        "admin_alert_user_report",
-        "admin_alert_infra_ssh",
-        "admin_alert_infra_dlq",
-        # Speaking node/exit diagnosis push (diagnostics overhaul) — text is
-        # rendered in services/admin_notify.notify_node_diagnosis; the bot
-        # attaches the ack/mute/follow keyboard from target_kind/target_id.
-        "admin_alert_node_diagnosis",
-    ]
+    notif_actions = ADMIN_NOTIFICATION_ACTIONS
     # Admin broadcast — массовая рассылка (см. /admin/broadcasts). Держим её в
     # ОТДЕЛЬНОМ, низкоприоритетном классе: диспетчер наполняет её батчами по
     # BROADCAST_BATCH_SIZE=50/тик, а поллер сливает 20/тик — при общей очереди с

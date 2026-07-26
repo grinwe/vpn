@@ -41,6 +41,26 @@
     - role: install_sharing_enforcer
       tags: [sharing_enforcer]
     - check_node_health
+  post_tasks:
+    # Маркер «какой версией кода прошита нода». Пишется post_tasks, ПОСЛЕ всех
+    # ролей: если play упал посередине, маркер остаётся старым и честно
+    # показывает, что нода не догналась. Версия приезжает в extra_vars от
+    # бэкенда (_collect_site_extra_vars → vpn_release_version); при ручном
+    # прогоне ansible её нет — тогда маркер не трогаем, чтобы не затереть
+    # реальную версию строкой-заглушкой.
+    - name: Stamp node release marker
+      ansible.builtin.copy:
+        dest: /etc/vpn-node-release.json
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          {
+            "version": "{{ vpn_release_version }}",
+            "applied_at": "{{ ansible_date_time.iso8601 }}"
+          }
+      when: vpn_release_version | default('') | length > 0
+      tags: [release_marker]
 
 # ── WireGuard exit nodes (foreign, non-RU) ──────────────────────────
 - hosts: wg_exit_nodes

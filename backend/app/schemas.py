@@ -295,6 +295,14 @@ class VPNNodeOut(VPNNodeCreate):
     # min из config.settings.cert_expires_at (пишет cert-renewal-тик внешней
     # TLS-пробой). None = сертов нет / ещё не пробовано. Для cert-бейджа.
     cert_expires_at: UTCDateTime | None = None
+    # Версии софта на ноде — снимает tick-node-versions по SSH (маппятся из ORM
+    # автоматически). xray_version — что реально стоит; release_version — какой
+    # версией нашего кода нода прошита (маркер /etc/vpn-node-release.json);
+    # versions_checked_at=None значит «ни разу не опрашивали», и это не то же
+    # самое, что «опросили и не нашли».
+    xray_version: str | None = None
+    release_version: str | None = None
+    versions_checked_at: UTCDateTime | None = None
     # Reconciler-видимость: desired_generation > reconciled_generation, т.е.
     # ноде нужен прогон, но он отложен на reconcile-тик (defer-модель). Без
     # этого флага операторское действие при включённом RECONCILER_ENABLED

@@ -125,10 +125,15 @@ def notify_admins(
     # JSONB containment: `AuditLog.extra @> needle`. SQLAlchemy JSONB-
     # comparator.contains() → "@>". Любое соответствие в окне — серию
     # не пишем.
+    # Ищем и доставленные строки тоже: бот после отправки ПЕРЕИМЕНОВЫВАЕТ
+    # action в "<action>:delivered" (api_extensions, ack поллера). Пока здесь
+    # стояло строгое равенство, любая строка выпадала из дедупа через ~10
+    # секунд после доставки — то есть окно в 600/1800/86400с фактически не
+    # работало, и повторяющееся событие будило админа на каждом тике.
     existing = (
         db.query(models.AuditLog.id)
         .filter(
-            models.AuditLog.action == action_name,
+            models.AuditLog.action.in_([action_name, f"{action_name}:delivered"]),
             models.AuditLog.actor_type == models.AuditActor.system,
             models.AuditLog.created_at >= cutoff,
             models.AuditLog.extra.contains(needle),

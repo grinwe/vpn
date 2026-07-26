@@ -896,6 +896,90 @@ def run_reality_dest_health_tick() -> dict:
     return {"probed": probed, "broken": broken, "rotated": rotated}
 
 
+def run_node_versions_tick() -> dict:
+    """Снять с нод фактические версии софта: xray + маркер нашей прошивки.
+
+    Ходим по SSH (services/node_versions.py), а не ansible: периодический
+    ansible-фанаут выедал бы слоты семафора у горячего пути выдачи конфигов.
+    Пишем в ``vpn_nodes.xray_version`` / ``release_version`` /
+    ``versions_checked_at`` — на них смотрят бейдж в админке и тик сравнения
+    версий. ``NODE_VERSIONS_INTERVAL=0`` выключает.
+    """
+    from .db import SessionLocal
+    from .queue import schedule_tick
+    from .services.node_versions import collect_all_nodes_versions
+
+    interval = _env_int("NODE_VERSIONS_INTERVAL", 3600)
+    if interval > 0:
+        try:
+            # Голый interval, БЕЗ min(..., 300) — clamp принадлежит только
+            # bootstrap-ветке main(). См. комментарий в run_cert_renewal_tick.
+            schedule_tick(
+                "app.worker.run_node_versions_tick",
+                interval,
+                tick_id="tick-node-versions",
+                replace=True,
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("node-versions: failed to reschedule tick")
+
+    session = SessionLocal()
+    try:
+        results = collect_all_nodes_versions(session)
+    except Exception:  # noqa: BLE001
+        logger.exception("node-versions: collection failed")
+        session.rollback()
+        return {"collected": 0, "failed": 0}
+    finally:
+        session.close()
+
+    failed = sum(1 for r in results if r.error)
+    collected = len(results) - failed
+    if failed:
+        logger.warning(
+            "node-versions: collected=%s failed=%s", collected, failed
+        )
+    return {"collected": collected, "failed": failed}
+
+
+def run_xray_upstream_tick() -> dict:
+    """Проверить, не вышла ли новая версия Xray-core, и сказать админу.
+
+    Сравниваем три вещи: последний upstream-релиз, наш пин в роли
+    (``xray_core_version``) и то, что реально стоит на нодах. Апгрейд НЕ
+    автоматический и быть им не может: ``xray_core_sha256`` пинится в паре с
+    версией, и подмена одной версии без пересчёта хэша положила бы установку на
+    всём флоте (fetch-скрипт отвергнет каждый источник по несовпадению sha).
+    Поэтому тик только уведомляет — решение и бамп остаются за человеком.
+    ``XRAY_UPSTREAM_INTERVAL=0`` выключает.
+    """
+    from .db import SessionLocal
+    from .queue import schedule_tick
+    from .services.xray_releases import check_upstream_and_notify
+
+    interval = _env_int("XRAY_UPSTREAM_INTERVAL", 21600)
+    if interval > 0:
+        try:
+            schedule_tick(
+                "app.worker.run_xray_upstream_tick",
+                interval,
+                tick_id="tick-xray-upstream",
+                replace=True,
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("xray-upstream: failed to reschedule tick")
+
+    session = SessionLocal()
+    try:
+        return check_upstream_and_notify(session)
+    except Exception:  # noqa: BLE001
+        logger.exception("xray-upstream: check failed")
+        session.rollback()
+        return {"latest": None, "notified": False}
+    finally:
+        session.close()
+
+
 def run_operator_report_watch_tick() -> dict:
     """Periodic — resolve operator-routing reports by observed reconnect.
 
@@ -3956,6 +4040,44 @@ def main() -> None:
             )
         except Exception:  # noqa: BLE001
             logger.exception("Failed to schedule cert-renewal tick")
+
+    # Node-versions tick — снимает с нод фактические версии xray и маркер нашей
+    # прошивки (/etc/vpn-node-release.json). Дефолт раз в час; первый прогон
+    # ≤5 мин после старта, чтобы админка не ждала час с пустыми версиями.
+    node_versions_interval = _env_int("NODE_VERSIONS_INTERVAL", 3600)
+    if do_bootstrap and node_versions_interval > 0:
+        try:
+            schedule_tick(
+                "app.worker.run_node_versions_tick",
+                min(node_versions_interval, 300),
+                tick_id="tick-node-versions",
+                replace=True,
+            )
+            logger.info(
+                "Node-versions tick bootstrapped: first run in %ss (interval=%ss)",
+                min(node_versions_interval, 300), node_versions_interval,
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("Failed to schedule node-versions tick")
+
+    # Xray-upstream tick — следит за релизами XTLS/Xray-core и будит админа,
+    # когда наш пин отстал (сам апгрейд не автоматизируем: sha256 пинится парой
+    # к версии). Дефолт раз в 6 часов.
+    xray_upstream_interval = _env_int("XRAY_UPSTREAM_INTERVAL", 21600)
+    if do_bootstrap and xray_upstream_interval > 0:
+        try:
+            schedule_tick(
+                "app.worker.run_xray_upstream_tick",
+                min(xray_upstream_interval, 300),
+                tick_id="tick-xray-upstream",
+                replace=True,
+            )
+            logger.info(
+                "Xray-upstream tick bootstrapped: first run in %ss (interval=%ss)",
+                min(xray_upstream_interval, 300), xray_upstream_interval,
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("Failed to schedule xray-upstream tick")
 
     # Reality-dest health tick — пробит reality-dest'ы на TLS1.3+h2 и авто-
     # ротирует битые (легаси-домены деградируют → Reality молча мёртв,

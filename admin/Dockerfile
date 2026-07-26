@@ -9,6 +9,10 @@ ARG VITE_ADMIN_BASE_PATH=admin
 FROM node:20-alpine AS build
 ARG VITE_ADMIN_BASE_PATH
 ENV VITE_ADMIN_BASE_PATH=${VITE_ADMIN_BASE_PATH}
+# Версия выката (файл VERSION в корне репозитория). Vite запекает её в бандл —
+# без неё админка не смогла бы показать, какой билд отдаётся браузеру.
+ARG VITE_APP_VERSION=0.0.0-dev
+ENV VITE_APP_VERSION=${VITE_APP_VERSION}
 WORKDIR /app
 COPY package.json package-lock.json ./
 RUN npm ci --no-audit --no-fund

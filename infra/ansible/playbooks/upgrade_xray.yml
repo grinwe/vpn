@@ -1,0 +1,41 @@
+---
+# Точечный апгрейд ядра xray БЕЗ полного site.yml. Зовётся
+# provisioning._execute_task (action=upgrade_xray) — кнопка «Обновить xray» в
+# админке и батч по выбранным нодам.
+#
+# Зачем отдельный плейбук: раньше единственным способом доставить новое ядро был
+# полный bootstrap (5-8 минут, все роли, перерендер конфигов). Здесь — только
+# роль xray_core: скачать бинарь нужной версии и рестартовать живые xray-юниты.
+# Роль идемпотентна, на ноде с уже нужной версией это no-op за секунды.
+#
+# ⚠️ Версия и sha256 идут ПАРОЙ (roles/xray_core/defaults/main.yml): подмена
+# версии без пересчёта хэша заставит fetch-скрипт отвергнуть каждый источник и
+# оставит ноду на старом ядре. Поэтому переопределять их здесь через extra_vars
+# не следует — целевая версия живёт в роли и меняется коммитом.
+#
+# ⚠️ Рестарт xray рвёт установленные соединения (~100 мс, клиенты
+# переподключаются сами). Плейбук трогает ТОЛЬКО ядро: config.json не
+# перерендеривается, клиенты на ноде остаются на месте.
+#
+# xray_mirror_url прокидывает бэкенд в extra_vars: временный однохостовый
+# inventory не подхватывает group_vars, а без зеркала RU-нода за
+# заблокированным github ядро не скачает.
+- hosts: all
+  become: true
+  gather_facts: true
+  roles:
+    - xray_core
+
+  post_tasks:
+    # Фактическая версия после апгрейда — чтобы результат таски в /admin/tasks
+    # отвечал на «что в итоге встало», не заставляя лезть на ноду. Read-only,
+    # не влияет на статус прогона.
+    - name: Report installed xray version
+      ansible.builtin.command: /usr/local/bin/xray version
+      register: _xray_version_after
+      changed_when: false
+      failed_when: false
+
+    - name: Show installed xray version
+      ansible.builtin.debug:
+        msg: "xray on {{ inventory_hostname }}: {{ (_xray_version_after.stdout_lines | first) | default('unknown') }}"

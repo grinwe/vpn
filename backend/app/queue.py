@@ -414,6 +414,8 @@ TICK_IDS = {
     "app.worker.run_lava_reconcile_tick": "tick-lava-reconcile",
     "app.worker.run_cert_renewal_tick": "tick-cert-renewal",
     "app.worker.run_reality_dest_health_tick": "tick-reality-dest-health",
+    "app.worker.run_node_versions_tick": "tick-node-versions",
+    "app.worker.run_xray_upstream_tick": "tick-xray-upstream",
 }
 
 # Per-tick hard timeouts. Без них зависшая SSH (traffic-stats,
@@ -452,6 +454,11 @@ TICK_TIMEOUTS = {
     "tick-cert-renewal": 240,
     # TLS1.3+h2-пробы ко всем reality-dest'ам + авто-ротация битых. Network-bound.
     "tick-reality-dest-health": 240,
+    # SSH ко всем активным нодам за версиями софта (пул потоков, две короткие
+    # команды на ноду). Бюджет как у traffic-stats: сеть, а не CPU.
+    "tick-node-versions": 120,
+    # Один HTTP-запрос к GitHub + сравнение версий в БД.
+    "tick-xray-upstream": 60,
 }
 
 
