@@ -3,6 +3,29 @@ PrivateKey = {{ wg_exit_private_key }}
 Address = {{ wg_exit_address_v4 | default('10.77.0.1/24') }}
 ListenPort = {{ wg_exit_port | default(51820) }}
 
+{#- NAT и FORWARD привязаны к жизненному циклу интерфейса, а не к прогону
+    роли. Раньше их ставили только iptables-таски роли с `notify: persist
+    iptables`, а тот handler требует netfilter-persistent — пакет
+    iptables-persistent ставит bootstrap_node, который катается по группе
+    vpn_nodes и до exit-нод не доходит. Ветка-фолбэк писала правила в
+    /etc/iptables/rules.v4, но без пакета этот файл при загрузке никто не
+    читает. Итог: после ребута exit-ноды wg-quick@wg0 поднимался, ip_forward
+    выживал, а MASQUERADE и FORWARD ACCEPT исчезали — весь зарубежный трафик
+    всех relay'ев этого exit'а умирал, при живом РУ-сегменте. Автоматической
+    ремедиации не было: реконсайлер ходит только по vpn_nodes.
+    Аудит RU split-routing 2026-07-28, находка А2.
+
+    `-C || -A` делает строки идемпотентными: они не задублируются, если
+    правило уже стоит (роль применила его напрямую, либо netfilter-persistent
+    всё же восстановил). PostDown снимает только то, что реально есть, и
+    никогда не валит остановку интерфейса. -#}
+PostUp = iptables -t nat -C POSTROUTING -s {{ wg_exit_network_v4 | default('10.77.0.0/24') }} -o {{ ansible_default_ipv4.interface }} -j MASQUERADE 2>/dev/null || iptables -t nat -A POSTROUTING -s {{ wg_exit_network_v4 | default('10.77.0.0/24') }} -o {{ ansible_default_ipv4.interface }} -j MASQUERADE
+PostUp = iptables -C FORWARD -i %i -j ACCEPT 2>/dev/null || iptables -A FORWARD -i %i -j ACCEPT
+PostUp = iptables -C FORWARD -o %i -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || iptables -A FORWARD -o %i -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+PostDown = iptables -t nat -D POSTROUTING -s {{ wg_exit_network_v4 | default('10.77.0.0/24') }} -o {{ ansible_default_ipv4.interface }} -j MASQUERADE 2>/dev/null || true
+PostDown = iptables -D FORWARD -i %i -j ACCEPT 2>/dev/null || true
+PostDown = iptables -D FORWARD -o %i -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || true
+
 {% for peer in wg_exit_peers %}
 [Peer]
 # {{ peer.name }}
