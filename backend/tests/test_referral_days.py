@@ -146,3 +146,40 @@ def test_one_referral_code_per_user(db_session):
     second = ensure_referral_code(db_session, user)
     assert first.code == second.code
     assert db_session.query(models.ReferralCode).filter_by(owner_id=user.id).count() == 1
+
+
+# ── рекламные метки: CAC и ROI ──────────────────────────────────────────────
+# Воронка по метке была, но без затрат отвечала только на «сколько пришло».
+
+
+def test_ad_link_cac_and_roi(client, db_session):
+    resp = client.post(
+        "/api/admin/ad-links",
+        json={"name": "нарезчик №1", "tag": "clip1", "cost_kopecks": 300000},
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["cost_kopecks"] == 300000
+    # Никто ещё не заплатил — делить не на что, а не «CAC = 0».
+    assert body["cac_kopecks"] is None
+    assert body["roi"] == 0.0
+
+
+def test_ad_link_without_cost_has_no_cac(client):
+    """Бесплатное размещение (обмен, свой канал) — CAC и ROI не считаем."""
+    resp = client.post("/api/admin/ad-links", json={"name": "обмен", "tag": "swap1"})
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["cost_kopecks"] is None
+    assert resp.json()["cac_kopecks"] is None
+    assert resp.json()["roi"] is None
+
+
+def test_ad_link_zero_cost_is_stored_as_null(client, db_session):
+    """0 ₽ — это «бесплатно», а не делитель: иначе CAC делил бы на ноль."""
+    created = client.post(
+        "/api/admin/ad-links", json={"name": "нулевая", "tag": "zero1", "cost_kopecks": 5000}
+    ).json()
+    resp = client.patch(f"/api/admin/ad-links/{created['id']}", json={"cost_kopecks": 0})
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["cost_kopecks"] is None
+    assert resp.json()["roi"] is None

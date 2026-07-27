@@ -866,12 +866,16 @@ class AdLinkCreate(BaseModel):
     name: str
     tag: str | None = None  # пусто → сгенерим ad_<random>
     notes: str | None = None
+    # Во сколько обошлось размещение (копейки). Без него воронка не отвечает
+    # на «окупилось ли»; NULL = бесплатно (обмен, свой канал).
+    cost_kopecks: int | None = None
 
 
 class AdLinkUpdate(BaseModel):
     name: str | None = None
     is_active: bool | None = None
     notes: str | None = None
+    cost_kopecks: int | None = None
 
 
 class AdLinkOut(BaseModel):
@@ -887,6 +891,12 @@ class AdLinkOut(BaseModel):
     trial: int
     paid: int
     revenue_kopecks: int
+    cost_kopecks: int | None
+    # Цена платящего клиента по этой метке. None, если затрат нет или ещё никто
+    # не заплатил — делить не на что.
+    cac_kopecks: int | None
+    # Во сколько раз выручка перекрыла затраты. <1 — канал убыточен.
+    roi: float | None
 
 
 def _ad_link_share_url(tag: str) -> str | None:
@@ -896,12 +906,18 @@ def _ad_link_share_url(tag: str) -> str | None:
 
 def _ad_link_out(link: models.AdLink, funnel: dict[str, dict[str, int]]) -> AdLinkOut:
     f = funnel.get(link.tag) or {}
+    paid = f.get("paid", 0)
+    revenue = f.get("revenue_kopecks", 0)
+    cost = link.cost_kopecks
     return AdLinkOut(
         id=link.id, name=link.name, tag=link.tag, is_active=link.is_active,
         notes=link.notes, created_at=link.created_at,
         share_url=_ad_link_share_url(link.tag),
         started=f.get("started", 0), trial=f.get("trial", 0),
-        paid=f.get("paid", 0), revenue_kopecks=f.get("revenue_kopecks", 0),
+        paid=paid, revenue_kopecks=revenue,
+        cost_kopecks=cost,
+        cac_kopecks=int(round(cost / paid)) if cost and paid else None,
+        roi=round(revenue / cost, 2) if cost else None,
     )
 
 
@@ -935,7 +951,10 @@ def create_ad_link(
         )
     if db.query(models.AdLink).filter_by(tag=tag).first():
         raise HTTPException(status_code=409, detail=f"ссылка с меткой '{tag}' уже существует")
-    link = models.AdLink(name=name, tag=tag, notes=(body.notes or None))
+    link = models.AdLink(
+        name=name, tag=tag, notes=(body.notes or None),
+        cost_kopecks=body.cost_kopecks,
+    )
     db.add(link)
     db.commit()
     db.refresh(link)
@@ -962,6 +981,10 @@ def update_ad_link(
         link.is_active = body.is_active
     if body.notes is not None:
         link.notes = body.notes or None
+    if body.cost_kopecks is not None:
+        # 0 трактуем как «бесплатное размещение» и храним NULL: иначе CAC делил
+        # бы на ноль, а ROI показывал бесконечность.
+        link.cost_kopecks = body.cost_kopecks or None
     db.commit()
     db.refresh(link)
     return _ad_link_out(link, _compute_source_funnel(db))

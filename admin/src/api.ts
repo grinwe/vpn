@@ -1340,16 +1340,23 @@ export interface AdLinkOut {
   trial: number;
   paid: number;
   revenue_kopecks: number;
+  // Затраты на размещение и производные. cac/roi = null, когда затрат нет
+  // (бесплатное размещение) или ещё никто не заплатил — делить не на что.
+  cost_kopecks: number | null;
+  cac_kopecks: number | null;
+  roi: number | null;
 }
 
 export interface AdLinkCreateIn {
   name: string;
   tag?: string | null; // пусто → бэкенд сгенерит ad_<random>
   notes?: string | null;
+  cost_kopecks?: number | null;
 }
 
 export interface AdLinkUpdateIn {
   name?: string | null;
   is_active?: boolean | null;
   notes?: string | null;
+  cost_kopecks?: number | null;
 }

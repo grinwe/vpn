@@ -2,7 +2,7 @@ import { useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api, AdLinkOut, AdLinkCreateIn } from "../api";
 
-const EMPTY_FORM: AdLinkCreateIn = { name: "", tag: "", notes: "" };
+const EMPTY_FORM: AdLinkCreateIn = { name: "", tag: "", notes: "", cost_kopecks: null };
 
 function rub(kopecks: number): string {
   return (kopecks / 100).toLocaleString("ru-RU", { maximumFractionDigits: 0 });
@@ -43,7 +43,10 @@ export default function AdLinks() {
   });
 
   const updateLink = useMutation({
-    mutationFn: (payload: { id: number; body: { name?: string; notes?: string | null } }) =>
+    mutationFn: (payload: {
+      id: number;
+      body: { name?: string; notes?: string | null; cost_kopecks?: number | null };
+    }) =>
       api.patch<AdLinkOut>(`/admin/ad-links/${payload.id}`, payload.body),
     onSuccess: () => {
       resetForm();
@@ -67,7 +70,12 @@ export default function AdLinks() {
 
   const startEdit = (link: AdLinkOut) => {
     setEditingId(link.id);
-    setForm({ name: link.name, tag: link.tag, notes: link.notes ?? "" });
+    setForm({
+      name: link.name,
+      tag: link.tag,
+      notes: link.notes ?? "",
+      cost_kopecks: link.cost_kopecks,
+    });
     setError(null);
   };
 
@@ -79,7 +87,14 @@ export default function AdLinks() {
     }
     if (editingId != null) {
       // tag неизменяем — правим только ярлык/заметки.
-      updateLink.mutate({ id: editingId, body: { name: form.name, notes: form.notes || null } });
+      updateLink.mutate({
+        id: editingId,
+        body: {
+          name: form.name,
+          notes: form.notes || null,
+          cost_kopecks: form.cost_kopecks ?? 0,
+        },
+      });
     } else {
       createLink.mutate(form);
     }
@@ -116,6 +131,9 @@ export default function AdLinks() {
                 <th className="text-right">Оплата</th>
                 <th className="text-right">Конв.</th>
                 <th className="text-right">Выручка ₽</th>
+                <th className="text-right">Затраты ₽</th>
+                <th className="text-right">CAC ₽</th>
+                <th className="text-right">ROI</th>
                 <th>Акт.</th>
                 <th></th>
               </tr>
@@ -141,7 +159,22 @@ export default function AdLinks() {
                   <td className="text-right">{l.trial}</td>
                   <td className="text-right">{l.paid}</td>
                   <td className="text-right">{conv(l.paid, l.started)}</td>
-                  <td className="text-right">{rub(l.revenue_kopecks)}</td>
+                  <td className="text-right">
+                    {l.cost_kopecks ? rub(l.cost_kopecks) : "—"}
+                  </td>
+                  <td className="text-right" title="Затраты ÷ число оплативших">
+                    {l.cac_kopecks ? rub(l.cac_kopecks) : "—"}
+                  </td>
+                  {/* ROI < 1 — канал не отбился: подсвечиваем, потому что это
+                      единственная цифра, ради которой заводят затраты. */}
+                  <td
+                    className={`text-right ${
+                      l.roi === null ? "" : l.roi >= 1 ? "text-emerald-400" : "text-yellow-400"
+                    }`}
+                    title="Выручка ÷ затраты"
+                  >
+                    {l.roi === null ? "—" : `${l.roi}×`}
+                  </td>
                   <td>{l.is_active ? "✓" : "✕"}</td>
                   <td className="text-right space-x-1 whitespace-nowrap">
                     <button
@@ -175,7 +208,7 @@ export default function AdLinks() {
               ))}
               {data && data.length === 0 && (
                 <tr>
-                  <td colSpan={9} className="py-4 text-slate-500 text-center">
+                  <td colSpan={12} className="py-4 text-slate-500 text-center">
                     Рекламных ссылок пока нет — создай первую справа.
                   </td>
                 </tr>
@@ -217,12 +250,32 @@ export default function AdLinks() {
         </label>
 
         <label className="block text-sm">
+          Затраты, ₽
+          <input
+            type="number"
+            min={0}
+            value={form.cost_kopecks != null ? form.cost_kopecks / 100 : ""}
+            onChange={(e) =>
+              setForm({
+                ...form,
+                cost_kopecks: e.target.value ? Math.round(Number(e.target.value) * 100) : null,
+              })
+            }
+            placeholder="сколько заплатили за размещение"
+            className="mt-1 w-full px-3 py-2 rounded bg-slate-900 border border-slate-700"
+          />
+          <span className="text-[11px] text-slate-500">
+            Пусто или 0 — бесплатно (обмен, свой канал). Из этого считаются CAC и ROI.
+          </span>
+        </label>
+
+        <label className="block text-sm">
           Заметки
           <input
             type="text"
             value={form.notes ?? ""}
             onChange={(e) => setForm({ ...form, notes: e.target.value })}
-            placeholder="канал, цена размещения…"
+            placeholder="канал, договорённости…"
             className="mt-1 w-full px-3 py-2 rounded bg-slate-900 border border-slate-700"
           />
         </label>

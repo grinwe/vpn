@@ -1298,6 +1298,11 @@ class AdLink(Base):
     name = Column(String, nullable=False)  # человекочитаемый ярлык
     tag = Column(String(64), unique=True, nullable=False, index=True)  # метка в start-param
     is_active = Column(Boolean, nullable=False, default=True, server_default="true")
+    # Во сколько обошлось размещение. Без этого поля воронка по метке отвечала
+    # на «сколько пришло», но не на главный вопрос закупки — «окупилось ли»:
+    # CAC = cost_kopecks / paid, ROI = revenue_kopecks / cost_kopecks.
+    # Заполняет админ руками; NULL = бесплатное размещение (обмен, свой канал).
+    cost_kopecks = Column(Integer, nullable=True)
     notes = Column(String, nullable=True)
     created_at = Column(DateTime, default=utcnow)
 
