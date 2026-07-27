@@ -235,10 +235,20 @@ def referral_bonus(
     """
     amount = days_to_kopecks(db, days) if days is not None else REFERRAL_BONUS_KOPECKS
     if amount <= 0:
-        # Прайс не настроен (нет видимого 30-дневного плана) — начислять нечего.
-        # Молча не пишем нулевую транзакцию: она бы заняла reference и
-        # заблокировала повторную выплату, когда прайс появится.
-        raise ValueError("referral reward is zero — no visible 30-day plan to price it")
+        # Прайс не настроен (нет видимого 30-дневного плана) — оценить подарок в
+        # днях нечем. Падать здесь нельзя: реферер сделал свою работу, а мы
+        # лишили бы его награды из-за нашей же незаполненной таблицы планов.
+        # Поэтому фолбэк на легаси-сумму; ноль не пишем ни при каких раскладах —
+        # нулевая транзакция заняла бы reference и заблокировала выплату
+        # навсегда.
+        logger.warning(
+            "referral: подарок в днях (%s) не оценён — нет видимого 30-дневного "
+            "плана, начисляю легаси-сумму %s копеек",
+            days, REFERRAL_BONUS_KOPECKS,
+        )
+        amount = REFERRAL_BONUS_KOPECKS
+    if amount <= 0:
+        raise ValueError("referral reward is zero — nothing to credit")
     return topup(
         db, user_id, amount,
         reference=reference,

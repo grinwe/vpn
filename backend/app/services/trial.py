@@ -129,8 +129,11 @@ def activate_trial(db: Session, user_id: int) -> TrialActivationResult:
             )
             ref_bonus = tx.amount_kopecks
         except ValueError:
-            # Прайс не настроен — подарок не начисляем, но триал выдаём.
-            logger.warning("trial.activate: реферальный подарок не оценён (нет плана)")
+            # Награда не может быть нулевой ни при каких настройках (без прайса
+            # есть фолбэк на легаси-сумму), так что сюда попадём только если
+            # обнулили и её. Триал в любом случае выдаём — подарок приглашённому
+            # это приятный довесок, а не условие.
+            logger.warning("trial.activate: реферальный подарок обнулён настройками")
 
     logger.info(
         "trial.activate user=%s amount=%s ref_bonus=%s expires=%s",

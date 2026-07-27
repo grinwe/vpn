@@ -53,15 +53,14 @@ def test_referral_bonus_credits_days_not_flat_sum(db_session):
     assert tx.kind == models.BalanceTxKind.bonus
 
 
-def test_referral_bonus_without_price_refuses(db_session):
-    """Нет видимого 30-дневного плана — оценить подарок нечем. Пишем не нулевую
-    транзакцию (она заняла бы reference и заблокировала выплату навсегда), а
-    падаем, чтобы вызывающий решил сам."""
-    import pytest
-
+def test_referral_bonus_without_price_falls_back(db_session):
+    """Нет видимого 30-дневного плана — оценить подарок в днях нечем, но реферер
+    свою работу сделал: начисляем легаси-сумму, а не ноль и не отказ."""
     user = make_user(db_session, telegram_id="no-price")
-    with pytest.raises(ValueError):
-        balance_svc.referral_bonus(db_session, user.id, reference="test:2", days=30)
+    tx = balance_svc.referral_bonus(
+        db_session, user.id, reference="test:2", days=30
+    )
+    assert tx.amount_kopecks == balance_svc.REFERRAL_BONUS_KOPECKS
 
 
 def test_referral_bonus_legacy_flat_sum_still_works(db_session):
