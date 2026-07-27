@@ -301,6 +301,39 @@ def _healthy_node_ids(db: Session, creds) -> set[int]:
     return {n.id for n in rows if _node_serviceable(n, now)}
 
 
+# Протоколы, умеющие RU split-tunnel: их xray-конфиг несёт routing-правила
+# (РУ → direct-local, остальное → direct-wgN) и привязку к WG через sockopt.
+# hysteria2 — отдельный демон без секций routing/outbounds, его сокеты никто
+# не биндит на туннель, поэтому на relay-ноде он выпускает ВЕСЬ трафик с
+# российского IP: заблокированное остаётся заблокированным при индикации
+# «подключено». Аудит RU split-routing 2026-07-28, находка А1.
+_SPLIT_TUNNEL_PROTOS = {"vless-reality", "vless-xhttp", "vless-ws-cdn"}
+
+
+def _tunnel_blind_node_ids(db: Session, creds) -> set[int]:
+    """node_id relay-нод — тех, у кого есть хотя бы один ``RelayExitLink``.
+
+    На такой ноде «наружу» означает «через WG в зарубежный exit», и кред
+    протокола без split-tunnel даёт юзеру рабочий коннект БЕЗ VPN. Пустой
+    результат = фильтр не применять (kill-switch ``SUB_FILTER_TUNNEL_BLIND=0``,
+    у кредов нет node_id, либо ни одна их нода не relay).
+    """
+    if (os.getenv("SUB_FILTER_TUNNEL_BLIND") or "1").strip().lower() in (
+        "0", "off", "false",
+    ):
+        return set()
+    node_ids = {c.node_id for c in creds if c.is_active and c.node_id is not None}
+    if not node_ids:
+        return set()
+    rows = (
+        db.query(models.RelayExitLink.relay_node_id)
+        .filter(models.RelayExitLink.relay_node_id.in_(node_ids))
+        .distinct()
+        .all()
+    )
+    return {r[0] for r in rows}
+
+
 # Эмодзи по протоколу для display-name эндпоинта в клиенте. Различает протокол
 # ВИЗУАЛЬНО без техножаргона (юзеру не нужны слова Reality/XHTTP — с autoconnect
 # lowestdelay HAPP сам выбирает рабочий). cred.proto — строка с дефисами.
@@ -330,7 +363,9 @@ def _relabel_uri(uri: str, proto: str, index: int) -> str:
     return f"{base}#{emoji} V8 сервер {index}"
 
 
-def _decrypt_configs(creds, *, sub, device_id=None, node_filter=None):
+def _decrypt_configs(
+    creds, *, sub, device_id=None, node_filter=None, tunnel_blind_nodes=None
+):
     """Собирает ``SubLinkConfig`` из АКТИВНЫХ кредов, расшифровывая config_text.
 
     ``node_filter`` — множество допустимых node_id (креды на прочих нодах
@@ -338,7 +373,11 @@ def _decrypt_configs(creds, *, sub, device_id=None, node_filter=None):
     логируется с полным контекстом (cred/proto/node/device/sub) — раньше
     per-device ветка молча выкидывала недешифруемый кред, и частичная
     деградация подписки (рассинхрон APP_SECRET_KEY, битый config_text) была
-    невидима для диагностики."""
+    невидима для диагностики.
+
+    ``tunnel_blind_nodes`` — node_id relay-нод: на них выкидываем креды
+    протоколов вне ``_SPLIT_TUNNEL_PROTOS``, потому что такой эндпоинт
+    отдаёт юзеру коннект вообще без VPN (см. ``_tunnel_blind_node_ids``)."""
     out: list[SubLinkConfig] = []
     for cred in creds:
         if not cred.is_active:
@@ -348,6 +387,18 @@ def _decrypt_configs(creds, *, sub, device_id=None, node_filter=None):
             and cred.node_id is not None
             and cred.node_id not in node_filter
         ):
+            continue
+        if (
+            tunnel_blind_nodes
+            and cred.node_id in tunnel_blind_nodes
+            and cred.proto not in _SPLIT_TUNNEL_PROTOS
+        ):
+            logger.warning(
+                "sub-link: dropping tunnel-blind credential %s (proto=%s) on relay "
+                "node %s — this endpoint egresses with the relay's own IP, no VPN "
+                "(sub=%s, device=%s)",
+                cred.id, cred.proto, cred.node_id, sub.id, device_id,
+            )
             continue
         decrypted = _decrypt(cred.config_text)
         if decrypted:
@@ -460,15 +511,35 @@ def dynamic_sub_link(token: str, db: Session = Depends(get_db)):
         # иначе клиент держит заведомо мёртвый эндпоинт в ротации client-side
         # failover (лишние таймауты на каждом реконнекте).
         healthy = _healthy_node_ids(db, source_device.credentials)
+        blind = _tunnel_blind_node_ids(db, source_device.credentials)
         configs = _decrypt_configs(
             source_device.credentials,
             sub=sub,
             device_id=source_device.id,
             node_filter=healthy or None,
+            tunnel_blind_nodes=blind,
         )
         # Fallback: фильтр по здоровью выкинул все креды (единственная нода в
         # cooldown) → лучше отдать живой-но-неоптимальный набор, чем 503.
+        # tunnel-blind фильтр здесь СОХРАНЯЕМ: эндпоинт без VPN — это не
+        # «неоптимально», это не тот продукт, за который платят.
         if not configs and healthy:
+            configs = _decrypt_configs(
+                source_device.credentials,
+                sub=sub,
+                device_id=source_device.id,
+                tunnel_blind_nodes=blind,
+            )
+        # Последняя ступень: у юзера НЕТ ни одного туннелирующего эндпоинта.
+        # Отдаём как есть — 503 навсегда оставил бы его вообще без связи, —
+        # но кричим в лог: это состояние чинится снятием hy2-конфигов с
+        # relay-нод или доведением hy2 до настоящего split-tunnel.
+        if not configs and blind:
+            logger.error(
+                "sub-link: sub=%s device=%s has ONLY tunnel-blind endpoints on relay "
+                "nodes — serving them anyway, but this user gets no VPN",
+                sub.id, source_device.id,
+            )
             configs = _decrypt_configs(
                 source_device.credentials, sub=sub, device_id=source_device.id
             )
@@ -534,8 +605,21 @@ def dynamic_sub_link(token: str, db: Session = Depends(get_db)):
     # Как и в per-device ветке: отсекаем креды нездоровых нод и логируем пустой
     # decrypt (общий хелпер).
     healthy = _healthy_node_ids(db, sub.credentials)
-    configs = _decrypt_configs(sub.credentials, sub=sub, node_filter=healthy or None)
+    blind = _tunnel_blind_node_ids(db, sub.credentials)
+    configs = _decrypt_configs(
+        sub.credentials,
+        sub=sub,
+        node_filter=healthy or None,
+        tunnel_blind_nodes=blind,
+    )
     if not configs and healthy:
+        configs = _decrypt_configs(sub.credentials, sub=sub, tunnel_blind_nodes=blind)
+    if not configs and blind:
+        logger.error(
+            "sub-link: legacy sub=%s has ONLY tunnel-blind endpoints on relay nodes "
+            "— serving them anyway, but this user gets no VPN",
+            sub.id,
+        )
         configs = _decrypt_configs(sub.credentials, sub=sub)
 
     # Same safety as the per-device branch — see the invariant box
