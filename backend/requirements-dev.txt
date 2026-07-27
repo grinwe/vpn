@@ -3,3 +3,7 @@
 pytest>=8
 pytest-asyncio>=0.23
 httpx>=0.27
+# Рендер ansible-шаблонов в test_split_routing_parity.py. В рантайме не нужен
+# (плейбуки крутит ansible-core в worker-образе), но тест паритета RU-обхода
+# должен падать, а не скипаться, если jinja2 не приехал.
+jinja2>=3.1
