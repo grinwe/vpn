@@ -206,10 +206,27 @@ def _mark_invoice_paid_core(
                 )
                 if already is None:
                     try:
+                        # Награда в ДНЯХ: сколько именно — берём из кода
+                        # реферера (там поля лежали с самой первой миграции и
+                        # до сих пор не использовались), с падением на
+                        # общий дефолт REFERRAL_REWARD_DAYS.
+                        ref_code = (
+                            db.query(models.ReferralCode)
+                            .filter_by(owner_id=topup_user.referred_by_id)
+                            .order_by(models.ReferralCode.id.desc())
+                            .first()
+                        )
+                        reward_days = (
+                            ref_code.reward_days
+                            if ref_code and ref_code.reward_days
+                            else balance_svc.REFERRAL_REWARD_DAYS
+                        )
                         balance_svc.referral_bonus(
                             db,
                             topup_user.referred_by_id,
                             reference=ref_key,
+                            days=reward_days,
+                            note=f"referral reward: {reward_days}d",
                         )
                     except Exception:
                         # Don't fail the whole topup over a referral

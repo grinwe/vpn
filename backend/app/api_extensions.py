@@ -155,6 +155,79 @@ def _sub_response_headers(
     return headers
 
 
+def ensure_referral_code(db: Session, user) -> "models.ReferralCode":
+    """Вернуть активный реферальный код пользователя, создав при необходимости.
+
+    Один хелпер на всех, потому что кодов исторически было два формата: ручка
+    для бота минтила ``token_urlsafe(8)``, ручка вебаппа — 6 символов в верхнем
+    регистре, и один и тот же человек видел в боте и в мини-аппе РАЗНЫЕ ссылки.
+    """
+    existing = (
+        db.query(models.ReferralCode)
+        .filter_by(owner_id=user.id, is_active=True)
+        .order_by(models.ReferralCode.id.desc())
+        .first()
+    )
+    if existing is not None:
+        return existing
+    ref = models.ReferralCode(owner_id=user.id, code=secrets.token_urlsafe(8))
+    db.add(ref)
+    db.flush()
+    return ref
+
+
+def referral_share_url(code: str) -> str | None:
+    """``t.me/<bot>?start=ref_<code>``. None, если BOT_USERNAME не задан."""
+    bot = os.getenv("BOT_USERNAME")
+    return f"https://t.me/{bot}?start=ref_{code}" if bot else None
+
+
+def _mark_first_config_fetch(db: Session, sub) -> None:
+    """Отметить первое скачивание конфига и позвать привести друга.
+
+    Момент «вау»: человек только что забрал рабочий конфиг — единственная точка,
+    где мы знаем, что VPN у него поехал. Предлагать реферальную ссылку в
+    приветствии бессмысленно (человеку ещё нечего рекомендовать), а здесь —
+    уместно, и рынок делает так же.
+
+    Пишем в отдельную колонку, а не считаем по audit_logs: те сэмплируются и
+    чистятся ретеншеном. Гейт `first_config_fetch_at IS NULL` заодно делает
+    приглашение одноразовым — саб-ссылку клиент дёргает каждые пару часов.
+
+    Read-путь горячий, поэтому всё внутри try: ни отметка, ни приглашение не
+    стоят того, чтобы уронить выдачу конфига.
+    """
+    try:
+        user = db.get(models.User, sub.user_id) if sub.user_id else None
+        if user is None or user.first_config_fetch_at is not None:
+            return
+        user.first_config_fetch_at = utcnow()
+        if user.telegram_id:
+            from .services import balance as balance_svc
+
+            ref = ensure_referral_code(db, user)
+            db.add(
+                models.AuditLog(
+                    actor="system",
+                    actor_type=models.AuditActor.system,
+                    action="referral_invite",
+                    target_type="user",
+                    target_id=user.id,
+                    extra={
+                        "telegram_id": user.telegram_id,
+                        "share_url": referral_share_url(ref.code),
+                        "reward_days": (
+                            ref.reward_days or balance_svc.REFERRAL_REWARD_DAYS
+                        ),
+                    },
+                )
+            )
+        db.commit()
+    except Exception:  # noqa: BLE001
+        logger.exception("first-config-fetch: не удалось отметить user=%s", sub.user_id)
+        db.rollback()
+
+
 def _should_log_sub_fetch() -> bool:
     """Сэмплирование записи ``subscription_fetch`` в самом горячем read-пути.
 
@@ -419,6 +492,8 @@ def dynamic_sub_link(token: str, db: Session = Depends(get_db)):
                 headers={"Retry-After": _retry_after_sec()},
             )
 
+        _mark_first_config_fetch(db, sub)
+
         # Read-путь ничего, кроме audit-строки, не пишет — при сэмплировании
         # (SUB_FETCH_AUDIT_SAMPLE>1) просто пропускаем и INSERT, и COMMIT.
         if _should_log_sub_fetch():
@@ -478,6 +553,8 @@ def dynamic_sub_link(token: str, db: Session = Depends(get_db)):
 
     uris = "\n".join(c.uri for c in configs)
     encoded = base64.b64encode(uris.encode()).decode()
+
+    _mark_first_config_fetch(db, sub)
 
     # См. per-device ветку: сэмплируем горячую audit-запись (аудит #247).
     if _should_log_sub_fetch():
@@ -546,22 +623,7 @@ def get_or_create_referral(
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
 
-    existing = (
-        db.query(models.ReferralCode)
-        .filter_by(owner_id=user.id, is_active=True)
-        .first()
-    )
-    if existing:
-        return ReferralCodeOut(
-            code=existing.code,
-            uses=existing.uses,
-            bonus_days=existing.bonus_days,
-            reward_days=existing.reward_days,
-        )
-
-    code = secrets.token_urlsafe(8)
-    ref = models.ReferralCode(owner_id=user.id, code=code)
-    db.add(ref)
+    ref = ensure_referral_code(db, user)
     db.commit()
     db.refresh(ref)
     return ReferralCodeOut(
@@ -1055,6 +1117,9 @@ ADMIN_NOTIFICATION_ACTIONS = [
     "renewal_reminder_1d", "expiry_reminder_1d",
     "config_ready", "migration_notice", "sublink_rotated",
     "low_balance_warning", "trial_expiry_warning", "health_ping_request",
+    # Приглашение позвать друга — шлём ОДИН раз, сразу после первого скачивания
+    # конфига (см. _mark_first_config_fetch).
+    "referral_invite",
     # Admin push-уведомления (см. services/admin_notify.py).
     # Текст полностью рендерится на backend-е и кладётся в
     # extra["text"] — бот отдаёт as-is, без собственного
@@ -1159,6 +1224,30 @@ def get_pending_notifications(
             text = (
                 "✅ Конфиг VPN готов!\n"
                 + (f"Ссылка: {sub_uri}\n" if sub_uri else "")
+            )
+        elif log.action == "referral_invite":
+            # Шлётся один раз — сразу после того, как человек впервые скачал
+            # конфиг, то есть когда ему УЖЕ есть что рекомендовать.
+            #
+            # Формулировка «отправь другу», а не «выложи в канал», намеренная:
+            # публичный пост со ссылкой на VPN-бота — это состав по ч.18
+            # ст.14.3 КоАП (в январе 2026 за такое уже оштрафовали владельца
+            # Telegram-канала), причём отвечает разместивший. Личная
+            # рекомендация конкретному человеку рекламой не является.
+            ref_url = extra.get("share_url")
+            reward_days = extra.get("reward_days")
+            reward_line = (
+                f"За каждого друга, который оплатит подписку, "
+                f"дарим тебе {reward_days} дней.\n"
+                if reward_days
+                else ""
+            )
+            text = (
+                "🎉 VPN подключён — поздравляем!\n\n"
+                + reward_line
+                + (f"Твоя ссылка для друзей:\n{ref_url}\n\n" if ref_url else "")
+                + "Отправь её тому, кому она нужна, в личку — так и надёжнее, "
+                "и по-человечески."
             )
         elif log.action == "migration_notice":
             # Намеренно без URL. Подписочная ссылка, лежащая в профиле

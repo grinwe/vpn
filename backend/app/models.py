@@ -413,6 +413,12 @@ class User(Base):
     email = Column(String, unique=True, index=True, nullable=True)
     created_at = Column(DateTime, default=utcnow)
     referred_by_id = Column(Integer, ForeignKey("users.id"), nullable=True)
+    # Когда пользователь ВПЕРВЫЕ скачал конфиг по саб-ссылке. Единственный
+    # доступный признак «человек дошёл до рабочего VPN»: Device.last_seen_at в
+    # модели объявлен, но никем не пишется, per-user трафик не собирается, а
+    # hysteria2 вообще невидим для статистики. Материализуем в колонку, потому
+    # что вычислять на лету из audit_logs нельзя — их чистит ретеншен (90 дней).
+    first_config_fetch_at = Column(DateTime, nullable=True)
     # Рекламный источник (first-touch): метка из deep-link старт-параметра
     # ``t.me/bot?start=<tag>`` (не ``ref_``-префикс — те идут в referred_by_id).
     # Ставится ОДИН раз при первом /start с меткой. Воронка started→trial→paid

@@ -34,6 +34,13 @@ logger = logging.getLogger(__name__)
 
 FREEZE_DAYS = int(os.getenv("FREEZE_DAYS", "14"))
 REFERRAL_BONUS_KOPECKS = int(os.getenv("REFERRAL_BONUS_KOPECKS", "5000"))
+# Награда рефереру — в ДНЯХ подписки, начисляется когда приглашённый ВПЕРВЫЕ
+# заплатил (см. api/invoices.py). Дни, а не рубли: стоят нам маржи, читаются
+# понятнее и не обесцениваются при смене прайса.
+REFERRAL_REWARD_DAYS = int(os.getenv("REFERRAL_REWARD_DAYS", "30"))
+# Подарок приглашённому при активации триала — меньше, чем рефереру: он ещё
+# ничего не заплатил, и щедрость здесь оплачивает фарм триалов, а не рост.
+REFERRAL_INVITEE_DAYS = int(os.getenv("REFERRAL_INVITEE_DAYS", "7"))
 TRIAL_DURATION_DAYS = int(os.getenv("TRIAL_DURATION_DAYS", "30"))
 TRIAL_EXPIRY_WARN_DAYS = int(os.getenv("TRIAL_EXPIRY_WARN_DAYS", "3"))
 MIN_TOPUP_KOPECKS = int(os.getenv("MIN_TOPUP_KOPECKS", "10000"))
@@ -190,15 +197,53 @@ def topup(
     return tx
 
 
+def days_to_kopecks(db: Session, days: int) -> int:
+    """Во сколько обходится подарок в ``days`` дней подписки.
+
+    Считаем по самому дешёвому видимому 30-дневному плану — тому же, на который
+    ориентируется триал. Так «30 дней в подарок» автоматически следует за
+    прайсом, а не застывает константой в коде.
+
+    Награда именно в днях, а не в рублях, — сознательный выбор: день стоит нам
+    маржи, а не выручки, и весь рынок (Paper VPN, FKey) платит рефералам
+    временем. Плюс фиксированная сумма в 50 ₽ обесценивалась при каждом
+    повышении прайса, а «месяц» читается одинаково всегда.
+    """
+    from .trial import _trial_plan  # локально: trial импортирует balance
+
+    plan = _trial_plan(db)
+    if plan is None or not plan.duration_days:
+        return 0
+    per_day = float(plan.price) * 100 / plan.duration_days
+    return int(round(per_day * max(0, days)))
+
+
 def referral_bonus(
-    db: Session, user_id: int, *, reference: str
+    db: Session,
+    user_id: int,
+    *,
+    reference: str,
+    days: int | None = None,
+    note: str = "referral bonus",
 ) -> models.BalanceTransaction:
-    """Credit ``REFERRAL_BONUS_KOPECKS`` as a ``kind=bonus`` topup."""
+    """Начислить реферальную награду как ``kind=bonus``.
+
+    ``days`` — размер подарка в днях подписки (конвертируется в копейки по
+    текущему прайсу). Без него падаем на легаси-константу
+    ``REFERRAL_BONUS_KOPECKS``: она осталась ради обратной совместимости с
+    прод-env, где сумма задана явно.
+    """
+    amount = days_to_kopecks(db, days) if days is not None else REFERRAL_BONUS_KOPECKS
+    if amount <= 0:
+        # Прайс не настроен (нет видимого 30-дневного плана) — начислять нечего.
+        # Молча не пишем нулевую транзакцию: она бы заняла reference и
+        # заблокировала повторную выплату, когда прайс появится.
+        raise ValueError("referral reward is zero — no visible 30-day plan to price it")
     return topup(
-        db, user_id, REFERRAL_BONUS_KOPECKS,
+        db, user_id, amount,
         reference=reference,
         kind=models.BalanceTxKind.bonus,
-        note="referral bonus",
+        note=note,
     )
 
 

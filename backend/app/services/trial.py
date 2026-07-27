@@ -104,10 +104,33 @@ def activate_trial(db: Session, user_id: int) -> TrialActivationResult:
 
     ref_bonus = 0
     if user.referred_by_id is not None:
-        balance_svc.referral_bonus(
-            db, user.id, reference=f"referral_signup:{user.id}"
+        # Приглашённому — подарок в днях от кода, по которому он пришёл
+        # (bonus_days), иначе общий дефолт. Реферер за это НЕ получает ничего:
+        # его награда привязана к первому платежу приглашённого
+        # (api/invoices.py), иначе рефералка вырождается в фарм триалов.
+        ref_code = (
+            db.query(models.ReferralCode)
+            .filter_by(owner_id=user.referred_by_id)
+            .order_by(models.ReferralCode.id.desc())
+            .first()
         )
-        ref_bonus = balance_svc.REFERRAL_BONUS_KOPECKS
+        invitee_days = (
+            ref_code.bonus_days
+            if ref_code and ref_code.bonus_days
+            else balance_svc.REFERRAL_INVITEE_DAYS
+        )
+        try:
+            tx = balance_svc.referral_bonus(
+                db,
+                user.id,
+                reference=f"referral_signup:{user.id}",
+                days=invitee_days,
+                note=f"referral welcome: {invitee_days}d",
+            )
+            ref_bonus = tx.amount_kopecks
+        except ValueError:
+            # Прайс не настроен — подарок не начисляем, но триал выдаём.
+            logger.warning("trial.activate: реферальный подарок не оценён (нет плана)")
 
     logger.info(
         "trial.activate user=%s amount=%s ref_bonus=%s expires=%s",
