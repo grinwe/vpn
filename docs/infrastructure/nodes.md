@@ -2,7 +2,7 @@
 
 Документ про **ноды-exit'ы**: кто их регистрирует, какой у них жизненный цикл, какие на них роли выполняются и что значит каждая колонка в `VPNNode`. Детали про оркестратор ansible — в `infrastructure/ansible.md`, про орchestration из backend'а — в `components/provisioning.md`. Здесь — перспектива самих нод.
 
-> **Deprecation notice (0.2/0.3, April 2026):** `shadowtls_ss` и `hysteria2` — legacy-протоколы. Роли `install_shadowtls_stack` и `install_hysteria2` закомментированы в [site.yml](../../infra/ansible/site.yml), UI запрещает создание новых `shadowtls+shadowsocks` / `hysteria2` конфигов.  Описания ниже оставлены для легаси-нод, которые пока их ещё отдают; полное удаление — в 0.4 после rollout.
+> **Статус протоколов (обновлено 2026-07-28):** `shadowtls_ss` — legacy, роль `install_shadowtls_stack` закомментирована в [site.yml](../../infra/ansible/site.yml). `hysteria2` **реанимирован 22.07.2026**: роль активна в `site.yml` (гейт — `hysteria2_port` из БД), backend-API создание разрешает; запрет остался только в admin-UI и обходится прямым вызовом API. ⚠️ **hysteria2 не умеет split-tunnel** — на relay-ноде он выпускает весь трафик с российского IP (см. «RU-обход» ниже). Саб-линк такие креды не отдаёт (`SUB_FILTER_TUNNEL_BLIND`).
 
 ## Модель: `VPNNode` и её колонки
 
@@ -173,8 +173,8 @@ client ──TLS (Reality, RU :443)──▶ jump node (RU) ──WireGuard tunn
 
 **Jump-нода**:
 
-- `VPNNode.relay_config` = `{"wg_private_key": "...", "wg_address_v4": "10.77.0.2/24", "wg_endpoint": "<exit_ip>:51820", "wg_exit_public_key": "...", ...}`.
-- В `site.yml` (см. `infrastructure/ansible.md`) на неё выполняется роль `install_vless_reality` **плюс** `relay_jump_node` — последняя ставит WG-клиента и **патчит через jq** существующий `config.json` xray, добавляя `sockopt.interface: wg0` в freedom-outbound. Тем самым весь пользовательский трафик уходит в wg0, а SSH/ansible — через основной интерфейс.
+- Source of truth — таблица `relay_exit_links` (N:N, по одному `wgN` на линк). `VPNNode.relay_config` = legacy-форма, оставшаяся от эпохи одного `wg0`: `{"wg_private_key": "...", "wg_address_v4": "10.77.0.2/24", "wg_endpoint": "<exit_ip>:51820", "wg_exit_public_key": "...", ...}`.
+- В `site.yml` (см. `infrastructure/ansible.md`) на неё выполняются роли `install_vless_*` **плюс** `relay_jump_node` — последняя ставит WG-клиентов (по одному на линк) и **патчит через jq** существующие `config*.json` xray, добавляя `sockopt.interface: wgN` в freedom-outbound. Тем самым весь пользовательский трафик уходит в туннель, а SSH/ansible — через основной интерфейс.
 - Hysteria2 **не патчится** этим способом (UDP route через kernel routing table — комментарий в `relay_jump_node/tasks/main.yml`).
 
 **Exit-нода**:
@@ -186,7 +186,7 @@ client ──TLS (Reality, RU :443)──▶ jump node (RU) ──WireGuard tunn
   - `iptables -t nat POSTROUTING MASQUERADE` на `default_ipv4.interface`;
   - `iptables FORWARD ACCEPT` в обе стороны (in/out wg0).
 - **Не** ставит xray, shadow-tls, hysteria. **Не** живёт в `vpn_nodes` таблице (обычно) — это «inventory-only» машина, про которую БД ничего не знает. Её `ansible_host` прописан в group `wg_exit_nodes` статического inventory.
-- На момент написания группа `wg_exit_nodes` в `inventories/prod/hosts.yml` **пустая** — relay-cхема описана в коде, но в проде не работает. См. ⚠️ ниже.
+- ~~На момент написания группа `wg_exit_nodes` пустая~~ — **неверно с 21.04.2026**: в `inventories/prod/hosts.yml` 7 exit-хостов (TR/FR×2/UK×2/CZ/NL), relay-схема в проде работает и является нормой для РУ-нод.
 
 ### RU-обход (split-tunnel на geoip:ru)
 
@@ -199,23 +199,36 @@ client ──TLS (Reality, RU :443)──▶ jump node (RU) ──WireGuard tunn
 { "ip": ["geoip:ru", "geoip:private"], "outboundTag": "direct-local" }
 ```
 
-`direct-local` — freedom-outbound **без** `sockopt.interface`, поэтому даже на relay-ноде РУ-трафик выходит с её родного (РУ) IP, а не уходит в WireGuard к exit'у. Список доменов — **намеренно самописный regexp** (курированный список РУ-хостов), а не `geosite:category-ru`; geoip:ru покрывает резолвящиеся в РУ-IP домены через `IPIfNonMatch`.
+`direct-local` — freedom-outbound **без** `sockopt.interface`, поэтому даже на relay-ноде РУ-трафик выходит с её родного (РУ) IP, а не уходит в WireGuard к exit'у. Список доменов — **намеренно самописный** (курированный список РУ-хостов), а не `geosite:category-ru`: зоны заданы regexp'ами (`\.ru$`, `\.su$`, `\.xn--p1ai$`, `.moscow`, `.tatar`, `.дети`, `.рус`), конкретные бренды и CDN — записями `domain:` (суффиксный матч: домен + все поддомены).
+
+> **Почему бренды — `domain:`, а не regexp (2026-07-28).** До этого стоял `regexp:^(yandex|mail|vk|ok|…)\..+$`, анкоренный на **первый лейбл**, а не на регистрируемый суффикс. Он ловил `mail.google.com`, `mail.proton.me`, `mail.yahoo.com`, `ok.google.com`, `hh.com` — они уходили напрямую с РУ-IP; для Proton это была жёсткая поломка (в РФ заблокирован → домен просто не открывался у юзера с включённым VPN). Обратная сторона того же якоря: `www.vk.com` / `m.vk.com` первым лейблом не матчились вовсе. Бренды в зоне `.ru` покрыты `\.ru$` и в списке не нужны — там только не-`.ru` зоны и CDN (`userapi.com`, `mycdn.me`, `yastatic.net`), на которые приходится основной объём байт. Паритет трёх шаблонов закреплён тестом `backend/tests/test_split_routing_parity.py`.
 
 `geoip.dat` (v2fly community, MIT) ставится обеими ролями в `/usr/local/share/xray/geoip.dat` (`get_url force:no` — один раз на bootstrap, идемпотентно на комбинированной ноде) и обновляется еженедельным `geoip-update.timer`; refresh-сервис делает `try-restart` обоих флаворов (`xray` и `xray-xhttp`) best-effort (`-` префикс — трогает только активные юниты). Без файла xray падает с `failed to load geoip` — поэтому обе роли валидируют рендер через `xray -test` до старта.
 
 **Почему именно так — 5 выстраданных правок** (рационал жил в сообщениях коммитов, не было отдельной доки — этот раздел её заменяет). Каждый пункт — отдельный fix после реального бага, проверенного по access-логам xray:
 
 1. **`direct-local` без `sockopt` отдельным outbound'ом** (`678fb3b`). На relay-ноде дефолтный `direct` outbound патчится `sockopt.interface = wgN` → весь «direct» трафик уходит в WG к exit'у. Первая версия правила слала `geoip:ru → direct` — и РУ-трафик послушно утекал на exit (2ip.ru с клиента показывал IP exit-ноды). Нужен **отдельный** freedom-outbound без sockopt = чистый egress через main-iface ноды.
-2. **`domainStrategy: IPIfNonMatch`** (`9353a76`). Дефолтный `AsIs` не резолвит domain-назначения в IP → правило `ip:[geoip:ru]` по domain-коннектам **никогда не матчит**. `IPIfNonMatch` резолвит domain в IP, только если ни одно domain-правило не попало (минимальный overhead).
+2. **`domainStrategy: IPIfNonMatch`** (`9353a76`). Дефолтный `AsIs` не резолвит domain-назначения в IP → правило `ip:[geoip:ru]` по domain-коннектам **никогда не матчит**. `IPIfNonMatch` резолвит domain в IP и делает второй проход по правилам — но **только если в первом не сматчилось НИ ОДНО правило**, включая fan-out по `user`. ⚠️ Практическое следствие (аудит 2026-07-28): у кредa с `exit_id` правило `{"user": […], "outboundTag": "direct-wgN"}` матчится в первом проходе всегда (email известен без резолва), поэтому второй проход не наступает и **geoip-подстраховка для него мертва** — работает только доменный список. У легаси-кредов без `exit_id` user-правила нет, и geoip отрабатывает. Отсюда «у одних работает, у других нет».
 3. **Секция `dns` (Yandex первым)** (`a6d7c58`). Без `dns` xray не резолвит domain→IP для routing'а, и `IPIfNonMatch` молча не срабатывает. Лог подтверждал: `accepted tcp:2ip.ru:443 [vless-reality -> direct-wg2]` (назначение — domain, geoip-правило не применилось). Порядок DNS: **Yandex `77.88.8.8` первым** — отдаёт РУ-IP для РУ-сайтов даже за CDN (foreign DNS часто возвращает Cloudflare). Сам DNS-трафик к 77.88.8.8 попадает под `geoip:ru → direct-local`.
 4. **Domain-правило ДО geoip-правила** (`48ae3bd`). Даже со всем выше geoip-путь оказался ненадёжен (в той Reality-сборке geoip.dat либо не грузился, либо `IPIfNonMatch` не резолвил sniffed-SNI до routing'а — в логах старта не было строк про geoip). Domain-правило матчит **прямо по sniffed SNI, без резолва** — покрывает `.ru/.su/.рф` + явный список `.com`-доменов РУ-гигантов. Geoip-правило остаётся **ниже как safety-net** для прямых IP-коннектов (когда клиент обходит sniffing).
 5. **Требует `sniffing.enabled: true` + `destOverride: [http, tls]`** на inbound — иначе пункт 4 (matching по SNI) не работает. Оба конфига (Reality и XHTTP) это имеют.
 
-> **XHTTP-специфика:** XHTTP-inbound слушает loopback за nginx (Stage-4 camo), но sniffing работает по **внутреннему** TLS-stream'у проксируемого коннекта, не по внешнему транспорту — поэтому RU-обход на XHTTP идентичен Reality. Reconcile relay-линков (`xray_reconcile.jq`/`xray_unpatch.jq`) патчит **только** `config.json` (Reality) и трогает только `direct-wg*` — правила `direct-local` и сам `config_xhttp.json` не затрагиваются, обход переживает attach/detach.
+> **XHTTP-специфика:** XHTTP-inbound слушает loopback за nginx (Stage-4 camo), но sniffing работает по **внутреннему** TLS-stream'у проксируемого коннекта, не по внешнему транспорту — поэтому RU-обход на XHTTP идентичен Reality. Reconcile relay-линков (`xray_reconcile.jq`/`xray_unpatch.jq`) ходит по маске `config*.json` — то есть по **всем трём** протоколам (маска появилась в `c926838`, апрель 2026; утверждение «только config.json» было неверным с тех пор). Трогает он только `direct-wg*` и `sockopt` у `direct`, а правила `direct-local` и RU-блок не затрагивает — обход переживает attach/detach.
 >
 > **Где это вообще работает:** RU-обход осмыслен только на **relay/РУ-нодах**, где `direct` уходит в WG (≠ `direct-local`). На standalone-зарубежной ноде `_primary` пуст → `direct` и `direct-local` оба egress'ят локально → правило безвредный no-op (РУ-сайты всё равно видят зарубежный IP, выгоды нет).
 
-> `vless_ws_cdn` и `hysteria2` RU-обхода **не несут** (на данный момент неактуальны). У `hysteria2` вообще нет per-destination routing — добавление потребовало бы секции `acl`+`outbounds`.
+> **Матрица «протокол × split-tunnel» (2026-07-28).**
+>
+> | Протокол | RU-правила | Привязка к WG | Итог на relay-ноде |
+> |---|---|---|---|
+> | `vless_reality` | есть (с 21.04.2026) | `sockopt` на `direct`/`direct-wgN` | работает |
+> | `vless_xhttp` | есть (с 05.06.2026) | то же | работает |
+> | `vless_ws_cdn` | есть (с **28.07.2026**) | то же | работает |
+> | `hysteria2` | **нет и не может быть в текущем виде** | **никакой** | ⚠️ весь трафик выходит с РУ-IP |
+>
+> `vless_ws_cdn` не имел RU-правил до 28.07.2026 — при этом `sockopt` на `wgN` у него был, то есть на relay-ноде через WG уходил **весь** трафик, включая российский. Портирован весь блок: секция `dns`, `domainStrategy`, два RU-правила выше fan-out, outbound `direct-local`, `include_role: xray_geoip` и `try-restart xray-ws-cdn` в `geoip-update.service`.
+>
+> У `hysteria2` нет per-destination routing (нужны секции `acl`+`outbounds`), и его сокеты никто не биндит на туннель — это **отдельный демон**, а WG-маршрут на relay-ноде намеренно хуже основного (`Table = off` + `metric 200`). Поэтому hy2 на relay-ноде даёт коннект **вообще без VPN**: РУ-сайты работают, заблокированное остаётся заблокированным. Митигейт — саб-линк такие креды не отдаёт (`SUB_FILTER_TUNNEL_BLIND`, см. `components/backend-api.md`). Полное лечение — `acl.inline` + `bindDevice`, не сделано; разбор в `operations/ru_split_routing_audit_2026_07_28.md`.
 
 ## Роли, запускаемые на ноде
 
@@ -341,7 +354,7 @@ for provider_id in [primary] + fallbacks:
 
 ## ⚠️ Неясные места
 
-- **`wg_exit_nodes` группа в `inventories/prod/hosts.yml` пустая.** Код роли `wg_exit_node` готов, `relay_jump_node` готова, но ни одна нода не описана — фактически relay-схема в проде не используется. Неясно, есть ли она хоть где-то в inventory вне git.
+- ~~**`wg_exit_nodes` группа пустая, relay-схема в проде не используется.**~~ **Снято 2026-07-28:** в инвентаре 7 exit-хостов, relay-схема — норма для РУ-нод. Открытые вопросы по ней теперь другие: `hysteria2` на relay-ноде не туннелируется вовсе, а geoip-подстраховка мертва у кредов с `exit_id` (см. матрицу протоколов выше и `operations/ru_split_routing_audit_2026_07_28.md`).
 - **`relay_config` у jump-ноды хранится как JSONB plaintext.** В отличие от паролей `VPNConfig.settings`, которые зашифрованы Fernet, WG-приватник jump-ноды лежит в БД в открытом виде. Компрометация дампа БД = компрометация туннеля.
 - **Health score агрегация не зафиксирована в одном месте.** Декремент/инкремент раскиданы по worker-тикам и handler'ам `HealthProbe`. Порог `MIN_HEALTHY_SCORE` — константа в `provisioning.py`, но откуда берётся «что именно декрементит» — читается только в коде, не в документе.
 - **Автовосстановления из `error` нет.** Нода, попавшая в error (единичный сбой API провайдера во время destroy, например), остаётся там до ручного вмешательства (`PATCH /api/nodes/{id}/status → active` или `destroy_node`). Нет self-heal'а, который бы через X часов попробовал снова.

@@ -26,7 +26,9 @@
 | `vless-xhttp` | [install_vless_xhttp](../infra/ansible/roles/install_vless_xhttp) | 443 | (TLS fronting domain) | xray |
 | `vless-ws-cdn` | [install_vless_ws_cdn](../infra/ansible/roles/install_vless_ws_cdn) | 443 | (CDN domain) | xray + Cloudflare proxy |
 
-> `shadowtls+shadowsocks` — **deprecated** (0.2, April 2026).  `hysteria2` — **deprecated** (0.3, April 2026). Роли `install_shadowtls_stack` и `install_hysteria2` закомментированы в [site.yml](../infra/ansible/site.yml), UI не даёт создавать новые конфиги.  Enum-значения `shadowtls_ss` / `hysteria2` оставлены в `VPNConfigProtocol` и бэкенд-branch'и — until 0.4 — на случай легаси-нод.
+> `shadowtls+shadowsocks` — **deprecated** (0.2, April 2026), роль `install_shadowtls_stack` закомментирована в [site.yml](../infra/ansible/site.yml).
+>
+> `hysteria2` — **реанимирован 22.07.2026**: роль активна (гейт — `hysteria2_port` из БД), backend-API создание разрешает, запрет остался только в admin-UI. ⚠️ **Не умеет split-tunnel**: на relay-ноде (нода с `RelayExitLink`) выпускает весь трафик с российского IP — то есть даёт коннект без VPN. Саб-линк такие креды не отдаёт (`SUB_FILTER_TUNNEL_BLIND`); подробности — [infrastructure/nodes.md](infrastructure/nodes.md) «RU-обход» и [operations/ru_split_routing_audit_2026_07_28.md](operations/ru_split_routing_audit_2026_07_28.md).
 
 Источник дефолтов: [admin/src/pages/Nodes.tsx `PROTOCOL_DEFAULTS`](../admin/src/pages/Nodes.tsx). Если меняешь значения в ansible-ролях — синхронизируй оба места, иначе форма в Admin UI будет предлагать не то, что реально поднимется на ноде.
 
