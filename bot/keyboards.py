@@ -76,6 +76,10 @@ def help_keyboard() -> types.InlineKeyboardMarkup:
                 callback_data="help:cabinet",
             )],
             [types.InlineKeyboardButton(
+                text="🇷🇺 Не открываются Яндекс / банки",
+                callback_data="help:ru_sites",
+            )],
+            [types.InlineKeyboardButton(
                 text="🌐 VPN не подключается / медленный",
                 callback_data="help:vpn",
             )],

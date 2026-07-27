@@ -183,3 +183,44 @@ def test_ad_link_zero_cost_is_stored_as_null(client, db_session):
     assert resp.status_code == 200, resp.text
     assert resp.json()["cost_kopecks"] is None
     assert resp.json()["roi"] is None
+
+
+# ── оффер про российские сайты ──────────────────────────────────────────────
+# С 15.04.2026 Яндекс/банки/маркетплейсы закрываются при включённом VPN. У нас
+# есть раздельный маршрут, но он живёт не везде — текст обязан это оговаривать.
+
+
+def _read(path: str) -> str:
+    from pathlib import Path
+
+    import pytest
+
+    p = Path(__file__).resolve().parents[2] / path
+    if not p.is_file():
+        pytest.skip(f"{path} недоступен (backend-only тест-образ)")
+    return p.read_text(encoding="utf-8")
+
+
+def test_bot_help_has_ru_sites_section():
+    handlers = _read("bot/handlers.py")
+    keyboards = _read("bot/keyboards.py")
+    assert "_HELP_RU_SITES" in handlers
+    # Кнопка обязана вести на существующий обработчик, иначе раздел недостижим.
+    assert 'callback_data="help:ru_sites"' in keyboards
+    assert 'F.data == "help:ru_sites"' in handlers
+
+
+def test_ru_sites_copy_does_not_overpromise():
+    """Сплит работает на РУ-нодах и на Reality/XHTTP, но не на ws-cdn и hy2 —
+    текст не должен обещать, что «всегда всё работает»."""
+    handlers = _read("bot/handlers.py")
+    start = handlers.index("_HELP_RU_SITES = (")
+    copy = handlers[start:start + 1200]
+    assert "не на всех серверах" in copy
+    assert "поддержку" in copy
+
+
+def test_webapp_help_mentions_ru_sites():
+    help_page = _read("webapp/src/pages/Help.tsx")
+    assert "Российские сайты и банки" in help_page
+    assert "не на всех серверах" in help_page
