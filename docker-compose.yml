@@ -99,6 +99,12 @@ services:
       SUB_HAPP_AUTOCONNECT: ${SUB_HAPP_AUTOCONNECT:-off}
       SUB_HAPP_AUTOCONNECT_SINCE: ${SUB_HAPP_AUTOCONNECT_SINCE:-}
       SUB_LINK_FALLBACK_BASE_URL: ${SUB_LINK_FALLBACK_BASE_URL:-}
+      # Аварийные рубильники фильтров саб-выдачи. Тот же класс бага, что у
+      # SUB_HAPP_AUTOCONNECT выше: у сервиса нет env_file, только этот
+      # allowlist, поэтому переменная без строки здесь = правка .env молча
+      # ничего не делает, а рубильник недоступен ровно тогда, когда нужен.
+      SUB_FILTER_TUNNEL_BLIND: ${SUB_FILTER_TUNNEL_BLIND:-0}
+      SUB_FILTER_UNHEALTHY_NODES: ${SUB_FILTER_UNHEALTHY_NODES:-1}
       # Stage 4 — balance billing. Backend reads these for the
       # WebApp endpoints (freeze caps, min topup, referral bonus).
       FREEZE_DAYS: ${FREEZE_DAYS:-14}

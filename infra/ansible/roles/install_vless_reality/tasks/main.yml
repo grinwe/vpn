@@ -94,6 +94,14 @@
       Проверь apt/репозиторий на ноде и повтори бутстрап. Reality не тронут.
   when: reality_stream_unify | default(false)
 
+# Единый список РУ-зон/доменов для split-tunnel — общий на все 4 протокола
+# (reality, xhttp, ws-cdn, hysteria2). Роль задач не выполняет, только
+# отдаёт переменные ru_direct_zones / ru_direct_domains, которые шаблон
+# рендерит в свой синтаксис. Без неё рендер упадёт на undefined.
+- name: Load shared RU-direct domain list
+  include_role:
+    name: ru_direct_list
+
 # geoip.dat нужен до первого рендера config.json: routing rule
 # `ip: ["geoip:ru", "geoip:private"]` без файла данных не резолвится,
 # xray падает со "failed to load geoip" на старте. Установка + weekly

@@ -1,15 +1,15 @@
-"""Саб-линк не отдаёт эндпоинты, которые на relay-ноде выходят без VPN.
+"""Аварийный рубильник: убрать из выдачи эндпоинты без split-tunnel.
 
-Аудит RU split-routing 2026-07-28, находка А1. hysteria2 — отдельный демон
-без секций routing/outbounds; WG-маршрут на relay-ноде намеренно хуже
-основного (``Table = off`` + ``metric 200``), поэтому в туннель попадает
-только то, что xray биндит через ``sockopt.interface``. hy2 не биндит ничего
-— его трафик целиком выходит с российского IP relay-ноды. Для юзера это
-худший вид поломки: клиент показывает «подключено», РУ-сайты работают, а
-заблокированное остаётся заблокированным.
+Штатно каждый протокол туннелируется сам — у трёх vless-флаворов через
+routing-правила + ``sockopt.interface``, у hysteria2 через ``outbounds``
+(``bindDevice: wgN``) + ``acl.inline``. Поэтому фильтр по умолчанию
+ВЫКЛЮЧЕН.
 
-Обострено тем, что HAPP-autoconnect ``lowestdelay`` включён всем, а hy2 —
-единственный лег без WG-хопа, то есть системно выигрывает по задержке.
+Он нужен на случай, когда ansible-раскатка split-tunnel где-то не прошла:
+на такой ноде эндпоинт даёт коннект вообще без VPN (клиент показывает
+«подключено», РУ-сайты работают, заблокированное остаётся заблокированным),
+и убрать его из выдачи нужно раньше, чем починится нода.
+``SUB_FILTER_TUNNEL_BLIND=1`` включает.
 """
 from __future__ import annotations
 
@@ -89,8 +89,11 @@ def _uris(resp) -> list[str]:
     return [line.split("#", 1)[0] for line in text.splitlines() if line.strip()]
 
 
-def test_hysteria2_dropped_on_relay_node(client, db_session):
-    """На relay-ноде hy2 выкидывается, vless-леги остаются."""
+def test_shadowtls_dropped_on_relay_node(client, db_session, monkeypatch):
+    """С включённым рубильником протокол без split-tunnel выкидывается,
+    остальные остаются. shadowtls — единственный такой протокол после
+    2026-07-28: роль отключена, split-tunnel там никто не делал."""
+    monkeypatch.setenv("SUB_FILTER_TUNNEL_BLIND", "1")
     node, cfg, sub = _setup(db_session, node_name="relay-ru-1")
     _mk_exit_link(db_session, node)
     dev = _mk_device_with_creds(
@@ -100,7 +103,7 @@ def test_hysteria2_dropped_on_relay_node(client, db_session):
         token="tok-relay",
         protos_uris=[
             ("vless-reality", "vless://reality-uri"),
-            ("hysteria2", "hy2://blind-uri"),
+            ("shadowtls+shadowsocks", "ss://blind-uri"),
         ],
     )
 
@@ -109,12 +112,30 @@ def test_hysteria2_dropped_on_relay_node(client, db_session):
     assert resp.status_code == 200
     uris = _uris(resp)
     assert "vless://reality-uri" in uris
-    assert "hy2://blind-uri" not in uris
+    assert "ss://blind-uri" not in uris
+
+
+def test_hysteria2_kept_on_relay_node(client, db_session, monkeypatch):
+    """hy2 НЕ режется даже с включённым рубильником: с 2026-07-28 он умеет
+    split-tunnel (outbounds + acl в config.yaml.j2). Регресс-гард — иначе
+    фикс роли и фильтр разъедутся, и рабочий протокол начнёт вырезаться."""
+    monkeypatch.setenv("SUB_FILTER_TUNNEL_BLIND", "1")
+    node, cfg, sub = _setup(db_session, node_name="relay-hy2-ok")
+    _mk_exit_link(db_session, node)
+    dev = _mk_device_with_creds(
+        db_session, sub, cfg, token="tok-hy2-ok",
+        protos_uris=[("hysteria2", "hy2://tunnelled-uri")],
+    )
+
+    resp = client.get(f"/api/sub/{dev.sub_token}")
+
+    assert resp.status_code == 200
+    assert "hy2://tunnelled-uri" in _uris(resp)
 
 
 def test_hysteria2_kept_on_direct_node(client, db_session):
     """На ноде без relay-линков hy2 корректен — выходит с её же IP, как и
-    должен. Фильтр обязан быть узким, иначе он вырежет рабочий протокол."""
+    должен."""
     node, cfg, sub = _setup(db_session, node_name="direct-nl-1")
     dev = _mk_device_with_creds(
         db_session,
@@ -133,12 +154,13 @@ def test_hysteria2_kept_on_direct_node(client, db_session):
     assert "hy2://fine-uri" in _uris(resp)
 
 
-def test_only_blind_endpoints_still_served(client, db_session, caplog):
+def test_only_blind_endpoints_still_served(client, db_session, caplog, monkeypatch):
     """Если туннелирующих легов не осталось вовсе — отдаём что есть.
 
     503 навсегда оставил бы юзера без связи; кривой коннект хотя бы работает.
     Но это состояние обязано быть громким в логах.
     """
+    monkeypatch.setenv("SUB_FILTER_TUNNEL_BLIND", "1")
     node, cfg, sub = _setup(db_session, node_name="relay-ru-2")
     _mk_exit_link(db_session, node)
     dev = _mk_device_with_creds(
@@ -146,7 +168,7 @@ def test_only_blind_endpoints_still_served(client, db_session, caplog):
         sub,
         cfg,
         token="tok-only-blind",
-        protos_uris=[("hysteria2", "hy2://only-uri")],
+        protos_uris=[("shadowtls+shadowsocks", "ss://only-uri")],
     )
 
     # alembic fileConfig(disable_existing_loggers) на старте харнесса глушит
@@ -157,40 +179,41 @@ def test_only_blind_endpoints_still_served(client, db_session, caplog):
         resp = client.get(f"/api/sub/{dev.sub_token}")
 
     assert resp.status_code == 200
-    assert "hy2://only-uri" in _uris(resp)
+    assert "ss://only-uri" in _uris(resp)
     assert any("no VPN" in r.getMessage() for r in caplog.records)
 
 
-def test_kill_switch_disables_filter(client, db_session, monkeypatch):
-    """``SUB_FILTER_TUNNEL_BLIND=0`` возвращает старое поведение."""
-    monkeypatch.setenv("SUB_FILTER_TUNNEL_BLIND", "0")
+def test_filter_is_off_by_default(client, db_session):
+    """Дефолт — рубильник ВЫКЛЮЧЕН: штатно каждый протокол туннелируется сам,
+    и саба не должна ничего резать без явного включения."""
     node, cfg, sub = _setup(db_session, node_name="relay-ru-3")
     _mk_exit_link(db_session, node)
     dev = _mk_device_with_creds(
         db_session,
         sub,
         cfg,
-        token="tok-killswitch",
+        token="tok-default-off",
         protos_uris=[
             ("vless-reality", "vless://reality-uri"),
-            ("hysteria2", "hy2://blind-uri"),
+            ("shadowtls+shadowsocks", "ss://legacy-uri"),
         ],
     )
 
     resp = client.get(f"/api/sub/{dev.sub_token}")
 
     assert resp.status_code == 200
-    assert "hy2://blind-uri" in _uris(resp)
+    assert "ss://legacy-uri" in _uris(resp)
 
 
-def test_legacy_sub_token_branch_also_filters(client, db_session):
+def test_legacy_sub_token_branch_also_filters(client, db_session, monkeypatch):
     """Легаси-ветка (токен подписки, а не девайса) фильтрует так же."""
+    monkeypatch.setenv("SUB_FILTER_TUNNEL_BLIND", "1")
     node, cfg, sub = _setup(db_session, node_name="relay-ru-4")
     _mk_exit_link(db_session, node)
     sub.sub_token = "legacy-tok"
     for proto, uri in (
         ("vless-xhttp", "vless://xhttp-uri"),
-        ("hysteria2", "hy2://blind-uri"),
+        ("shadowtls+shadowsocks", "ss://blind-uri"),
     ):
         db_session.add(
             models.Credential(
@@ -209,13 +232,14 @@ def test_legacy_sub_token_branch_also_filters(client, db_session):
     assert resp.status_code == 200
     uris = _uris(resp)
     assert "vless://xhttp-uri" in uris
-    assert "hy2://blind-uri" not in uris
+    assert "ss://blind-uri" not in uris
 
 
-def test_ws_cdn_is_not_filtered(client, db_session):
-    """ws-cdn остаётся: он под xray, sockopt на wgN у него есть, и с
-    2026-07-28 у него есть и RU-правила. Регресс-гард на случай, если
-    кто-то расширит фильтр «за компанию»."""
+def test_ws_cdn_is_not_filtered(client, db_session, monkeypatch):
+    """ws-cdn остаётся даже с включённым рубильником: он под xray, sockopt на
+    wgN у него есть, и с 2026-07-28 есть RU-правила. Регресс-гард на случай,
+    если кто-то расширит фильтр «за компанию»."""
+    monkeypatch.setenv("SUB_FILTER_TUNNEL_BLIND", "1")
     node, cfg, sub = _setup(db_session, node_name="relay-ru-5")
     _mk_exit_link(db_session, node)
     dev = _mk_device_with_creds(

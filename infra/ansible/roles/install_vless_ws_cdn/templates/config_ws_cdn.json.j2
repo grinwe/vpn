@@ -59,31 +59,12 @@
       },
       {
         "type": "field",
-        "domain": [
-          "regexp:\\.ru$",
-          "regexp:\\.su$",
-          "regexp:\\.xn--p1ai$",
-          "regexp:\\.moscow$",
-          "regexp:\\.tatar$",
-          "regexp:\\.xn--d1acj3b$",
-          "regexp:\\.xn--p1acf$",
-          "domain:vk.com",
-          "domain:vk.me",
-          "domain:vk.cc",
-          "domain:userapi.com",
-          "domain:mycdn.me",
-          "domain:yandex.com",
-          "domain:yandex.net",
-          "domain:yastatic.net",
-          "domain:habr.com",
-          "domain:2gis.com",
-          "domain:avito.st",
-          "domain:okko.tv",
-          "domain:premier.one",
-          "domain:more.tv",
-          "domain:my.games",
-          "domain:zvuk.com"
-        ],
+        {#- Список — из роли ru_direct_list (единый на все 4 протокола).
+            Зоны рендерим regexp'ами, конкретные домены — `domain:`
+            (суффиксный матч: домен + все поддомены). -#}
+        "domain": {{ ((ru_direct_zones | map('regex_replace', '^(.*)$', 'regexp:\\\\.\\1$') | list)
+                    + (ru_direct_domains | map('regex_replace', '^(.*)$', 'domain:\\1') | list))
+                   | to_json }},
         "outboundTag": "direct-local"
       },
       {

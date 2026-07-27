@@ -1,0 +1,7 @@
+---
+galaxy_info:
+  role_name: ru_direct_list
+  description: >-
+    Единый список РУ-зон и РУ-доменов для split-tunnel. Носитель переменных,
+    задач не выполняет.
+dependencies: []

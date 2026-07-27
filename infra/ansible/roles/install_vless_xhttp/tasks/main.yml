@@ -114,6 +114,14 @@
     group: nogroup
     mode: '0750'
 
+# Единый список РУ-зон/доменов для split-tunnel — общий на все 4 протокола
+# (reality, xhttp, ws-cdn, hysteria2). Роль задач не выполняет, только
+# отдаёт переменные ru_direct_zones / ru_direct_domains, которые шаблон
+# рендерит в свой синтаксис. Без неё рендер упадёт на undefined.
+- name: Load shared RU-direct domain list
+  include_role:
+    name: ru_direct_list
+
 # geoip.dat нужен XHTTP так же как Reality: routing rule RU-обхода
 # `ip: ["geoip:ru", "geoip:private"]` без файла не резолвится → xray
 # падает на старте. Установка и weekly refresh — общая роль xray_geoip

@@ -301,25 +301,40 @@ def _healthy_node_ids(db: Session, creds) -> set[int]:
     return {n.id for n in rows if _node_serviceable(n, now)}
 
 
-# Протоколы, умеющие RU split-tunnel: их xray-конфиг несёт routing-правила
-# (РУ → direct-local, остальное → direct-wgN) и привязку к WG через sockopt.
-# hysteria2 — отдельный демон без секций routing/outbounds, его сокеты никто
-# не биндит на туннель, поэтому на relay-ноде он выпускает ВЕСЬ трафик с
-# российского IP: заблокированное остаётся заблокированным при индикации
-# «подключено». Аудит RU split-routing 2026-07-28, находка А1.
-_SPLIT_TUNNEL_PROTOS = {"vless-reality", "vless-xhttp", "vless-ws-cdn"}
+# Протоколы, умеющие RU split-tunnel на relay-ноде. С 2026-07-28 это ВСЕ
+# четыре: у трёх vless-флаворов это routing-правила + sockopt.interface, у
+# hysteria2 — секции ``outbounds`` (direct с ``bindDevice: wgN``) и
+# ``acl.inline`` (РУ → local, остальное → tunnel). До той даты hy2 не биндил
+# ничего и на relay-ноде выпускал весь трафик с российского IP.
+#
+# ``shadowtls+shadowsocks`` в список НЕ входит намеренно: роль отключена,
+# split-tunnel там никто не делал, и живой кред этого протокола на relay-ноде
+# — та же поломка, что была у hy2.
+_SPLIT_TUNNEL_PROTOS = {
+    "vless-reality",
+    "vless-xhttp",
+    "vless-ws-cdn",
+    "hysteria2",
+}
 
 
 def _tunnel_blind_node_ids(db: Session, creds) -> set[int]:
     """node_id relay-нод — тех, у кого есть хотя бы один ``RelayExitLink``.
 
     На такой ноде «наружу» означает «через WG в зарубежный exit», и кред
-    протокола без split-tunnel даёт юзеру рабочий коннект БЕЗ VPN. Пустой
-    результат = фильтр не применять (kill-switch ``SUB_FILTER_TUNNEL_BLIND=0``,
-    у кредов нет node_id, либо ни одна их нода не relay).
+    протокола без split-tunnel даёт юзеру рабочий коннект БЕЗ VPN.
+
+    ⚠️ По умолчанию ВЫКЛЮЧЕН. Это аварийный рубильник, а не штатный механизм:
+    штатно каждый протокол туннелируется сам (см. ``_SPLIT_TUNNEL_PROTOS``).
+    Включать (``SUB_FILTER_TUNNEL_BLIND=1``), если ansible-раскатка
+    split-tunnel где-то не прошла и надо срочно убрать слепые эндпоинты из
+    выдачи, не дожидаясь починки ноды.
+
+    Пустой результат = фильтр не применять (выключен рубильником, у кредов
+    нет node_id, либо ни одна их нода не relay).
     """
-    if (os.getenv("SUB_FILTER_TUNNEL_BLIND") or "1").strip().lower() in (
-        "0", "off", "false",
+    if (os.getenv("SUB_FILTER_TUNNEL_BLIND") or "0").strip().lower() not in (
+        "1", "on", "true", "yes",
     ):
         return set()
     node_ids = {c.node_id for c in creds if c.is_active and c.node_id is not None}

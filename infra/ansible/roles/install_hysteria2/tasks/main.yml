@@ -113,6 +113,22 @@
 - name: Install / refresh hysteria binary
   ansible.builtin.include_tasks: binary.yml
 
+# Единый список РУ-зон/доменов для split-tunnel — тот же, что кормит три
+# xray-шаблона. Шаблон рендерит его в ACL-синтаксис hysteria (suffix:).
+# Без роли рендер упадёт на undefined.
+- name: Load shared RU-direct domain list
+  include_role:
+    name: ru_direct_list
+
+# geoip.dat: с 2026-07-28 ACL hysteria на relay-ноде ссылается на geoip:ru и
+# geoip:private, а файл берётся из /usr/local/share/xray (общий с xray, формат
+# один — v2ray geoip.dat). Роль идемпотентна (creates:-гард), на combo-нодах
+# это no-op. Ставим безусловно, а не только на relay: нода может стать relay
+# позже, и тогда файл уже будет на месте.
+- name: Provision geoip.dat fetcher + weekly refresh timer
+  include_role:
+    name: xray_geoip
+
 - name: Ensure Hysteria2 config directory
   file:
     path: /etc/hysteria
@@ -166,6 +182,37 @@
     mode: '0640'
     backup: yes
   notify: restart hysteria2
+
+# У hysteria нет `-test` (в отличие от xray), а сломанный конфиг виден только
+# как краш-луп в systemd — на volatile-journald RU-нодах причину потом не
+# восстановить. Проверяем то, что можно проверить статически: YAML парсится,
+# а на relay-ноде реально приехали split-tunnel секции с непустым bindDevice.
+# Без этой проверки опечатка в шаблоне выкатилась бы на весь флот молча.
+- name: Validate Hysteria2 config before starting
+  ansible.builtin.command:
+    argv:
+      - python3
+      - -c
+      - |
+        import sys, yaml
+        cfg = yaml.safe_load(open('/etc/hysteria/config.yaml')) or {}
+        if not cfg.get('auth', {}).get('userpass'):
+            sys.exit('hysteria config: пустой auth.userpass — будет краш-луп')
+        obs = {o.get('name') for o in cfg.get('outbounds') or []}
+        acl = cfg.get('acl', {}).get('inline') or []
+        if obs or acl:
+            if not {'tunnel', 'local'} <= obs:
+                sys.exit(f'hysteria config: ожидались outbounds tunnel+local, есть {obs}')
+            if cfg['outbounds'][0].get('name') != 'tunnel':
+                sys.exit('hysteria config: tunnel должен быть ПЕРВЫМ outbound (fail-safe)')
+            if not cfg['outbounds'][0]['direct'].get('bindDevice'):
+                sys.exit('hysteria config: у tunnel пустой bindDevice')
+            if acl[-1] != 'tunnel(all)':
+                sys.exit(f'hysteria config: последнее ACL-правило должно быть tunnel(all), а не {acl[-1]}')
+            used = {r.split('(', 1)[0] for r in acl} - {'reject'}
+            if not used <= obs:
+                sys.exit(f'hysteria config: ACL ссылается на несуществующие outbounds {used - obs}')
+  changed_when: false
 
 - name: Install Hysteria2 user management helper
   copy:

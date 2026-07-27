@@ -1,4 +1,4 @@
-"""Паритет RU split-routing между тремя vless-шаблонами.
+"""Паритет RU split-routing между всеми четырьмя протоколами.
 
 История, ради которой этот тест существует: правки RU-обхода в этом проекте
 стабильно приземлялись в ОДИН протокол за раз. reality получил RU-правила
@@ -8,9 +8,14 @@
 регрессия, когда geoip-правило вело на ``direct`` вместо ``direct-local``
 (e72e2db → 678fb3b): клиент видел IP exit-ноды на 2ip.ru.
 
-Тест рендерит все три шаблона в трёх топологиях и проверяет инварианты,
+Тест рендерит все шаблоны в трёх топологиях и проверяет инварианты,
 нарушение любого из которых означает утечку трафика не в ту сторону.
 Он намеренно НЕ ходит в БД и не требует сети.
+
+hysteria2 живёт по другим правилам (YAML + ACL вместо JSON + routing.rules),
+поэтому его инварианты проверяются отдельным блоком в конце файла — но список
+РУ-зон и доменов у него ОБЩИЙ с xray-шаблонами (роль ru_direct_list), и это
+тоже проверяется.
 """
 
 from __future__ import annotations
@@ -21,8 +26,18 @@ from pathlib import Path
 
 import jinja2
 import pytest
+import yaml
 
 ROLES = Path(__file__).resolve().parents[2] / "infra" / "ansible" / "roles"
+
+if not ROLES.is_dir():  # прогон без infra/ (напр. смонтирован только backend/)
+    pytest.skip("infra/ansible/roles недоступна", allow_module_level=True)
+
+# Единый источник правды для РУ-списков — роль-носитель. Все шаблоны рендерят
+# ЕГО, каждый в свой синтаксис; захардкоженных копий быть не должно.
+RU_LIST_VARS = yaml.safe_load(
+    (ROLES / "ru_direct_list" / "defaults" / "main.yml").read_text()
+)
 
 # Минимальные обязательные переменные каждого шаблона: тест проверяет
 # структуру роутинга, а не конкретные значения ключей/портов.
@@ -76,7 +91,9 @@ def _render(template: str, topology: str) -> dict:
     # Фильтры ansible, используемые шаблонами.
     env.filters["to_json"] = json.dumps
     env.filters["regex_replace"] = lambda s, pattern, repl: re.sub(pattern, repl, s)
-    rendered = env.get_template(filename).render(**base_vars, **TOPOLOGIES[topology])
+    rendered = env.get_template(filename).render(
+        **base_vars, **RU_LIST_VARS, **TOPOLOGIES[topology]
+    )
     return json.loads(rendered)
 
 
@@ -125,6 +142,20 @@ def test_ru_rules_point_at_direct_local(template: str, topology: str) -> None:
     assert "direct-local" in outbounds, "нет outbound direct-local"
     # Без sockopt — в этом весь смысл: выход с IP самой ноды, мимо туннеля.
     assert "streamSettings" not in outbounds["direct-local"]
+    # ...и это должен быть freedom: подмена на blackhole «зарезала» бы РУ-сайты
+    # вместо того, чтобы пускать их напрямую.
+    assert outbounds["direct-local"]["protocol"] == "freedom"
+    assert outbounds["block"]["protocol"] == "blackhole"
+
+    # На relay-ноде дефолтный direct обязан быть привязан к туннелю — иначе
+    # ВЕСЬ не-РУ трафик уйдёт напрямую с РУ-IP (то есть без VPN).
+    primary = TOPOLOGIES[topology].get("xray_primary_interface")
+    if primary:
+        assert (
+            outbounds["direct"]["streamSettings"]["sockopt"]["interface"] == primary
+        )
+    else:
+        assert "streamSettings" not in outbounds["direct"]
 
 
 @pytest.mark.parametrize(("template", "topology"), CASES)
@@ -186,11 +217,10 @@ def test_quic_sniffing_enabled(template: str, topology: str) -> None:
 
 
 def test_ru_domain_lists_are_identical_across_protocols() -> None:
-    """Сам паритет: доменный список обязан совпадать во всех трёх шаблонах.
+    """Сам паритет: доменный список обязан совпадать во всех xray-шаблонах.
 
-    Пока RU-блок продублирован копипастой (вынести его в общий макрос —
-    отдельная задача), это единственное, что мешает правке приземлиться в
-    один протокол и разъехаться с остальными.
+    Источник один (роль ``ru_direct_list``), но шаблон может отрендерить его
+    криво или частично — тест сверяет результат, а не входные данные.
     """
     lists = {}
     for template in TEMPLATES:
@@ -206,6 +236,28 @@ def test_ru_domain_lists_are_identical_across_protocols() -> None:
             f"лишние {set(domains) - set(reference)}, "
             f"недостающие {set(reference) - set(domains)}"
         )
+
+
+def test_dns_and_rule_shape_identical_across_protocols() -> None:
+    """Не только домены: резолверы (и их ПОРЯДОК) и форма RU-правил тоже
+    обязаны совпадать. Иначе один протокол начнёт классифицировать РУ-домены
+    иначе, чем два других, на той же ноде."""
+    ref_dns = None
+    ref_shape = None
+    for template in TEMPLATES:
+        cfg = _render(template, "single-link-relay")
+        dns = cfg["dns"]["servers"]
+        # форма: последовательность (ip|domain, outboundTag) для RU-блока
+        shape = [
+            ("ip" if r.get("ip") else "domain", r["outboundTag"])
+            for r in cfg["routing"]["rules"]
+            if r.get("ip") or r.get("domain")
+        ]
+        if ref_dns is None:
+            ref_dns, ref_shape = dns, shape
+            continue
+        assert dns == ref_dns, f"{template}: dns.servers разошлись с reality"
+        assert shape == ref_shape, f"{template}: форма RU-правил разошлась"
 
 
 def test_brand_rules_do_not_catch_foreign_domains() -> None:
@@ -249,3 +301,114 @@ def test_brand_rules_do_not_catch_foreign_domains() -> None:
         "okko.tv",
     ):
         assert matches(host), f"{host} НЕ попал в RU-обход"
+
+
+# ── hysteria2 ────────────────────────────────────────────────────────────
+# Другой формат (YAML + ACL вместо JSON + routing.rules), те же инварианты:
+# РУ — мимо туннеля, всё остальное — в туннель, приватные сети закрыты.
+# До 2026-07-28 секций outbounds/acl тут не было вовсе, и hy2 на relay-ноде
+# выпускал ВЕСЬ трафик с российского IP — клиент показывал «подключено», а
+# заблокированное оставалось заблокированным.
+
+HY2_TEMPLATES = ROLES / "install_hysteria2" / "templates"
+HY2_BASE_VARS = {
+    "hysteria2_port": 443,
+    "hysteria2_domain": "node1.example.com",
+    "hysteria2_cert_path": "/etc/letsencrypt/live/node1/fullchain.pem",
+    "hysteria2_key_path": "/etc/letsencrypt/live/node1/privkey.pem",
+    "hysteria2_existing_userpass": {"user-1-2": "secret"},
+}
+
+
+def _render_hy2(topology: str) -> dict:
+    env = jinja2.Environment(
+        loader=jinja2.FileSystemLoader(str(HY2_TEMPLATES)),
+        undefined=jinja2.StrictUndefined,
+    )
+    env.filters["dictsort"] = lambda d: sorted(d.items())
+    # ``lookup('password', ...)`` — ansible-only, генерит sentinel-пароль.
+    env.globals["lookup"] = lambda *a, **k: "x" * 32
+    rendered = env.get_template("config.yaml.j2").render(
+        **HY2_BASE_VARS, **RU_LIST_VARS, **TOPOLOGIES[topology]
+    )
+    return yaml.safe_load(rendered)
+
+
+@pytest.mark.parametrize("topology", list(TOPOLOGIES))
+def test_hy2_renders_valid_yaml(topology: str) -> None:
+    cfg = _render_hy2(topology)
+    assert cfg["auth"]["userpass"], "пустой userpass → hysteria уходит в краш-луп"
+
+
+def test_hy2_direct_node_has_no_split_sections() -> None:
+    """На ноде без relay-линков туннеля нет — секции не должны появляться.
+
+    Иначе ``bindDevice`` укажет на несуществующий интерфейс и весь трафик
+    ноды умрёт.
+    """
+    cfg = _render_hy2("direct-node")
+    assert "outbounds" not in cfg
+    assert "acl" not in cfg
+
+
+@pytest.mark.parametrize("topology", ["single-link-relay", "multi-link-relay"])
+def test_hy2_relay_binds_tunnel(topology: str) -> None:
+    """На relay-ноде есть оба outbound'а, tunnel забинден на wgN и стоит
+    ПЕРВЫМ: при неприменившемся ACL hysteria шлёт всё в первый outbound, и
+    деградация должна быть в сторону «РУ-сайты видят зарубежный IP», а не
+    «VPN не работает вовсе»."""
+    cfg = _render_hy2(topology)
+    outbounds = cfg["outbounds"]
+    assert [o["name"] for o in outbounds] == ["tunnel", "local"]
+    assert outbounds[0]["direct"]["bindDevice"] == "wg0"
+    # local — БЕЗ bindDevice: это и есть «мимо туннеля, с IP самой ноды».
+    assert "bindDevice" not in outbounds[1].get("direct", {})
+
+
+@pytest.mark.parametrize("topology", ["single-link-relay", "multi-link-relay"])
+def test_hy2_acl_order_and_catchall(topology: str) -> None:
+    """Порядок ACL несущий: приватные сети режем первыми, РУ уводим в local,
+    и последним правилом всё остальное обязано уйти в туннель."""
+    acl = _render_hy2(topology)["acl"]["inline"]
+    assert acl[0] == "reject(geoip:private)"
+    assert acl[-1] == "tunnel(all)"
+    assert "local(geoip:ru)" in acl
+    # Ни одно правило не ссылается на несуществующий outbound.
+    used = {r.split("(", 1)[0] for r in acl}
+    assert used <= {"reject", "local", "tunnel"}, used
+
+
+def test_hy2_uses_the_same_ru_list_as_xray() -> None:
+    """Списки РУ-зон и доменов у hysteria2 и xray обязаны совпадать.
+
+    Ровно ради этого списки вынесены в роль ``ru_direct_list``: до неё
+    правка приземлялась в один протокол и разъезжалась с остальными.
+    """
+    acl = _render_hy2("single-link-relay")["acl"]["inline"]
+    hy2_suffixes = {
+        r[len("local(suffix:") : -1] for r in acl if r.startswith("local(suffix:")
+    }
+
+    rules = _render("reality", "single-link-relay")["routing"]["rules"]
+    xray_domains = next(r["domain"] for r in rules if r.get("domain"))
+    xray_zones = {
+        d[len("regexp:\\.") : -1] for d in xray_domains if d.startswith("regexp:")
+    }
+    xray_suffixes = {
+        d[len("domain:") :] for d in xray_domains if d.startswith("domain:")
+    }
+
+    assert hy2_suffixes == xray_zones | xray_suffixes, (
+        f"списки разошлись: только у hy2 {hy2_suffixes - (xray_zones | xray_suffixes)}, "
+        f"только у xray {(xray_zones | xray_suffixes) - hy2_suffixes}"
+    )
+
+
+def test_hy2_geoip_path_matches_xray_geoip_role() -> None:
+    """ACL ссылается на geoip.dat, который качает роль xray_geoip — второй
+    копии файла и второго таймера обновления быть не должно."""
+    cfg = _render_hy2("single-link-relay")
+    assert cfg["acl"]["geoip"] == "/usr/local/share/xray/geoip.dat"
+
+    fetcher = (ROLES / "xray_geoip" / "files" / "xray-geoip-fetch.sh").read_text()
+    assert "/usr/local/share/xray/geoip.dat" in fetcher
