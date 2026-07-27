@@ -290,6 +290,65 @@ def _run_task_best_effort(
         return False
 
 
+def _reapply_links_after_endpoint_change(
+    db: Session,
+    exit_node: models.WGExitNode,
+    *,
+    actor: str,
+    actor_type,
+) -> list[int]:
+    """Пере-прошить wgN.conf на всех relay'ях этого exit'а.
+
+    Зовётся, когда изменились ``host``/``wg_port``/``wg_public_key`` — то
+    есть ровно те поля, что зашиты в конфиг WG-клиента на каждом relay'е.
+    Payload идентичен ручному Reconnect: bootstrap_exit.yml на exit'е +
+    relay_tunnel_apply.yml на relay'е.
+
+    Отказ постановки задачи не откатывает уже сохранённую правку exit'а:
+    таска остаётся в ``pending``, её подберёт rescue-tick. Возвращает
+    id созданных задач (для аудита/логов).
+    """
+    links = (
+        db.query(models.RelayExitLink)
+        .filter(models.RelayExitLink.exit_id == exit_node.id)
+        .all()
+    )
+    if not links:
+        return []
+
+    orchestrator = ProvisioningOrchestrator(db)
+    task_ids: list[int] = []
+    for link in links:
+        task = orchestrator.create_task(
+            "relay_tunnel",
+            link.relay_node_id,
+            "apply",
+            {"exit_id": exit_node.id, "link_id": link.id},
+        )
+        task_ids.append(task.id)
+    db.commit()
+
+    _audit(
+        db,
+        actor,
+        "wg_exit_endpoint_reapplied",
+        "wg_exit_node",
+        exit_node.id,
+        actor_type=actor_type,
+        metadata={"link_ids": [link.id for link in links], "task_ids": task_ids},
+    )
+
+    for task in (db.get(models.ProvisioningTask, tid) for tid in task_ids):
+        if task is not None:
+            _run_task_best_effort(orchestrator, task)
+
+    logger.info(
+        "exit %s endpoint changed — re-applying %d relay link(s): tasks %s",
+        exit_node.id, len(links), task_ids,
+    )
+    return task_ids
+
+
 @router.get("/exits", response_model=list[schemas.WGExitNodeOut])
 def list_exits(
     db: Session = Depends(get_db),
@@ -455,6 +514,15 @@ def update_exit(
     if not exit_node:
         raise HTTPException(status_code=404, detail="Exit node not found")
 
+    # Endpoint-поля зашиты в wgN.conf на КАЖДОМ relay'е этого exit'а. WG сам
+    # не переприцеливается: PersistentKeepalive продолжает слать кипэлайвы на
+    # старый адрес, wg-quick@ без Restart= не перезапустится, а exit не может
+    # спасти роумингом — wg0.conf.j2 рендерит peer'ов без Endpoint. Смена
+    # wg_port ломает обе стороны сразу. Раньше правка молча оставляла все
+    # туннели этого exit'а висеть, и лечилось это ручным Reconnect по каждому
+    # линку. Аудит RU split-routing 2026-07-28, находка А2.
+    _endpoint_before = (exit_node.host, exit_node.wg_port, exit_node.wg_public_key)
+
     if payload.name is not None:
         if (
             db.query(models.WGExitNode)
@@ -497,6 +565,12 @@ def update_exit(
     db.refresh(exit_node)
     actor, actor_type = _resolve_admin_actor(admin_actor)
     _audit(db, actor, "wg_exit_updated", "wg_exit_node", exit_node.id, actor_type=actor_type)
+
+    if (exit_node.host, exit_node.wg_port, exit_node.wg_public_key) != _endpoint_before:
+        _reapply_links_after_endpoint_change(
+            db, exit_node, actor=actor, actor_type=actor_type
+        )
+
     return _to_out(exit_node, peers_count=_peers_count(db, exit_node.id))
 
 
@@ -553,6 +627,12 @@ def keygen_exit(
 
     Overwrites any existing keys on the row. Returns only the public key
     — the private half is stored encrypted and never exposed via API.
+
+    Ротация ключа рвёт КАЖДЫЙ существующий туннель к этому exit'у: старый
+    публичный ключ зашит в ``wgN.conf`` на relay'ях, и без пере-прошивки
+    peer больше не проходит handshake. Поэтому после смены ключа сразу
+    ставим relay_tunnel/apply на все линки — как и ``PATCH /exits/{id}``
+    при смене endpoint-полей.
     """
     exit_node = db.get(models.WGExitNode, exit_id)
     if not exit_node:
@@ -563,6 +643,9 @@ def keygen_exit(
     db.commit()
     actor, actor_type = _resolve_admin_actor(admin_actor)
     _audit(db, actor, "wg_exit_keygen", "wg_exit_node", exit_node.id, actor_type=actor_type)
+    _reapply_links_after_endpoint_change(
+        db, exit_node, actor=actor, actor_type=actor_type
+    )
     return schemas.WGExitKeygenOut(id=exit_node.id, wg_public_key=pub)
 
 
