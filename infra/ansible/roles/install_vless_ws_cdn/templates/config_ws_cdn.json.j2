@@ -10,6 +10,18 @@
     "services": ["StatsService"]
   },
   "stats": {},
+  {#- dns + domainStrategy нужны RU-обходу: без них domain-правила ниже
+      работают только по отснифанному SNI, а IP-назначения не классифицируются
+      вовсе. Порядок резолверов как в reality/xhttp — Яндекс первым, чтобы
+      РУ-домены резолвились в РУ-IP и попадали под geoip:ru. -#}
+  "dns": {
+    "servers": [
+      "77.88.8.8",
+      "8.8.8.8",
+      "1.1.1.1"
+    ],
+    "queryStrategy": "UseIP"
+  },
   "policy": {
     "levels": {
       "0": {
@@ -23,11 +35,61 @@
     }
   },
   "routing": {
+    "domainStrategy": "IPIfNonMatch",
     "rules": [
       {
         "type": "field",
         "inboundTag": ["api-in"],
         "outboundTag": "api"
+      },
+      {#- RU-обход. Этот протокол не имел его НИКОГДА (аудит 2026-07-28,
+          находка Б1): правил не было, но дефолтный outbound `direct` получает
+          sockopt на wgN и из шаблона ниже, и из xray_reconcile.jq — то есть на
+          relay-ноде через WG уходил ВЕСЬ трафик, включая российский. Сбер,
+          Госуслуги, Ozon/WB, Avito, VK видели турецкий/французский IP → капчи и
+          «недоступно в вашем регионе». Бьёт ровно по тем, у кого reality/xhttp
+          зарезаны DPI, — то есть по самой нуждающейся в РУ-обходе группе.
+
+          Держать в паритете с reality/xhttp — обоснование каждого куска
+          в install_vless_reality/templates/config.json.j2. -#}
+      {
+        "type": "field",
+        "ip": ["geoip:private"],
+        "outboundTag": "block"
+      },
+      {
+        "type": "field",
+        "domain": [
+          "regexp:\\.ru$",
+          "regexp:\\.su$",
+          "regexp:\\.xn--p1ai$",
+          "regexp:\\.moscow$",
+          "regexp:\\.tatar$",
+          "regexp:\\.xn--d1acj3b$",
+          "regexp:\\.xn--p1acf$",
+          "domain:vk.com",
+          "domain:vk.me",
+          "domain:vk.cc",
+          "domain:userapi.com",
+          "domain:mycdn.me",
+          "domain:yandex.com",
+          "domain:yandex.net",
+          "domain:yastatic.net",
+          "domain:habr.com",
+          "domain:2gis.com",
+          "domain:avito.st",
+          "domain:okko.tv",
+          "domain:premier.one",
+          "domain:more.tv",
+          "domain:my.games",
+          "domain:zvuk.com"
+        ],
+        "outboundTag": "direct-local"
+      },
+      {
+        "type": "field",
+        "ip": ["geoip:ru"],
+        "outboundTag": "direct-local"
       }{% for _rule in _fan_out if _rule.emails %},
       {
         "type": "field",
@@ -68,7 +130,7 @@
       },
       "sniffing": {
         "enabled": true,
-        "destOverride": ["http", "tls"]
+        "destOverride": ["http", "tls", "quic"]
       }
     }
   ],
@@ -82,6 +144,12 @@
           "tcpKeepAliveInterval": 30
         }
       }{% endif %}
+    },
+    {#- direct-local — БЕЗ sockopt: это и есть «мимо туннеля, с IP самой
+        ноды». Цель RU-правил выше. -#}
+    {
+      "protocol": "freedom",
+      "tag": "direct-local"
     }{% for _ob in _fan_out %},
     {
       "protocol": "freedom",

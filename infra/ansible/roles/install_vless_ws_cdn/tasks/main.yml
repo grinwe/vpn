@@ -77,6 +77,16 @@
   include_role:
     name: xray_core
 
+# geoip.dat нужен до первого рендера config_ws_cdn.json — с 2026-07-28 в нём
+# есть routing rule `ip: ["geoip:ru"]`, а без файла данных xray падает со
+# "failed to load geoip" и валит `xray -test` ниже. Роль идемпотентна
+# (creates:-гард на initial fetch), так что на combo-нодах, где её уже
+# подтянул reality/xhttp, это no-op. На ws-cdn-only ноде — единственный
+# путь доставки файла.
+- name: Provision geoip.dat fetcher + weekly refresh timer
+  include_role:
+    name: xray_geoip
+
 # Also in bootstrap_node (the authoritative one). Kept here as a
 # safety net in case bootstrap order changes.
 - name: Ensure xray log directory

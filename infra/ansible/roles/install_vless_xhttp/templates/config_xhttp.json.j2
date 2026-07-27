@@ -38,19 +38,48 @@
         "inboundTag": ["api-in"],
         "outboundTag": "api"
       },
+      {#- RU-блок держать в паритете с install_vless_reality/templates/config.json.j2
+          и install_vless_ws_cdn/templates/config_ws_cdn.json.j2 — полное
+          обоснование каждого куска там. Историческая болезнь этого проекта:
+          правки RU-обхода приземляются в один протокол за раз (reality 21.04,
+          xhttp только 05.06, ws-cdn не получал их никогда). -#}
+      {
+        "type": "field",
+        "ip": ["geoip:private"],
+        "outboundTag": "block"
+      },
       {
         "type": "field",
         "domain": [
           "regexp:\\.ru$",
           "regexp:\\.su$",
           "regexp:\\.xn--p1ai$",
-          "regexp:^(yandex|mail|vk|ok|rutube|sberbank|gosuslugi|tinkoff|wildberries|ozon|avito|rambler|2gis|kinopoisk|dzen|hh|lenta|ria|tass|rbc|habr|dtf)\\..+$"
+          "regexp:\\.moscow$",
+          "regexp:\\.tatar$",
+          "regexp:\\.xn--d1acj3b$",
+          "regexp:\\.xn--p1acf$",
+          "domain:vk.com",
+          "domain:vk.me",
+          "domain:vk.cc",
+          "domain:userapi.com",
+          "domain:mycdn.me",
+          "domain:yandex.com",
+          "domain:yandex.net",
+          "domain:yastatic.net",
+          "domain:habr.com",
+          "domain:2gis.com",
+          "domain:avito.st",
+          "domain:okko.tv",
+          "domain:premier.one",
+          "domain:more.tv",
+          "domain:my.games",
+          "domain:zvuk.com"
         ],
         "outboundTag": "direct-local"
       },
       {
         "type": "field",
-        "ip": ["geoip:ru", "geoip:private"],
+        "ip": ["geoip:ru"],
         "outboundTag": "direct-local"
       }{% for _rule in _fan_out if _rule.emails %},
       {
@@ -94,7 +123,7 @@
       },
       "sniffing": {
         "enabled": true,
-        "destOverride": ["http", "tls"]
+        "destOverride": ["http", "tls", "quic"]
       }
     }
   ],
