@@ -61,10 +61,10 @@ acl:
     # Приватные сети и loopback самой ноды клиенту недоступны — симметрично
     # правилу geoip:private → block в xray-конфигах.
     - reject(geoip:private)
-{% for _z in ru_direct_zones %}
+{% for _z in ru_direct_list_zones %}
     - local(suffix:{{ _z }})
 {% endfor %}
-{% for _d in ru_direct_domains %}
+{% for _d in ru_direct_list_domains %}
     - local(suffix:{{ _d }})
 {% endfor %}
     # Резолвится в РУ-IP → тоже напрямую (домен мог не попасть в список выше).
@@ -73,6 +73,24 @@ acl:
     - tunnel(all)
   # Переиспользуем файл, который качает и обновляет роль xray_geoip: формат
   # общий (v2ray geoip.dat), второй копии и второго таймера не нужно.
+  geoip: /usr/local/share/xray/geoip.dat
+{% else %}
+# ── Direct-нода (туннеля нет) ─────────────────────────────────────────────
+# Split-tunnel тут не нужен: весь трафик и так выходит с IP самой ноды. Но
+# приватные сети закрыть надо — симметрично правилу geoip:private → block,
+# которое у xray-шаблонов стоит БЕЗУСЛОВНО. Без этого клиент дотягивается до
+# loopback ноды (gRPC StatsService xray на 127.0.0.1:10085-10087 перечисляет
+# все email'ы ноды и их трафик), до приватной сети ДЦ и до 169.254.169.254.
+outbounds:
+  - name: local
+    type: direct
+    direct:
+      mode: auto
+
+acl:
+  inline:
+    - reject(geoip:private)
+    - local(all)
   geoip: /usr/local/share/xray/geoip.dat
 {% endif %}
 

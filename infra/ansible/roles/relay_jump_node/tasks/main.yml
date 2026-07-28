@@ -100,6 +100,7 @@
         - xray.service
         - xray-xhttp.service
         - xray-ws-cdn.service
+        - hysteria-server.service
 
     - name: Install wg-quick restart drop-in
       copy:
@@ -131,6 +132,12 @@
         - xray
         - xray-xhttp
         - xray-ws-cdn
+        # hysteria тоже: с 2026-07-28 она биндится на wgN, а v2 проверяет
+        # девайс на СТАРТЕ (verifyDeviceName → net.InterfaceByName) и уходит
+        # в Fatal, если его нет. Без ordering после ребута демон падает и
+        # поднимается только Restart=on-failure'ом, теряя РУ-сегмент на эти
+        # секунды; с ordering стартует уже после туннелей.
+        - hysteria-server
       register: xray_ordering_dropin
 
     - name: Reload systemd after drop-in changes
@@ -282,13 +289,42 @@
         path: /etc/hysteria/config.yaml
       register: hy2_config
 
-    # Hysteria2 is UDP and typically not blocked — it keeps exiting
-    # directly. Moving it onto a tunnel would need policy routing.
-    - name: Note about Hysteria2 on relay nodes
-      debug:
-        msg: >-
-          Hysteria2 traffic exits directly (not through WG tunnel).
+    # Hysteria2 туннелируется с 2026-07-28 — комментарий «exits directly»,
+    # стоявший здесь, описывал состояние до фикса и был неверен с момента,
+    # когда hy2 реанимировали (22.07). Полный рендер конфига делает только
+    # install_hysteria2 в site.yml, а attach линка гоняет ЭТОТ плейбук —
+    # без реконсайла ниже новая РУ-нода (spawn → bootstrap без линков →
+    # админ цепляет exit) не получала split-секции вовсе.
+    - name: Load shared RU-direct domain list
+      include_role:
+        name: ru_direct_list
+        public: true
       when: hy2_config.stat.exists
+
+    - name: Stage Hysteria2 split-tunnel reconciler
+      copy:
+        src: reconcile_hy2_split.py
+        dest: /usr/local/sbin/reconcile_hy2_split.py
+        owner: root
+        group: root
+        mode: '0750'
+      when: hy2_config.stat.exists
+
+    - name: Reconcile Hysteria2 split-tunnel sections
+      ansible.builtin.command:
+        argv: [python3, /usr/local/sbin/reconcile_hy2_split.py]
+      environment:
+        HY2_CONFIG: /etc/hysteria/config.yaml
+        # Первичный интерфейс — тот же, что получает sockopt дефолтного
+        # `direct` у xray: у hysteria нет per-user routing, все её юзеры идут
+        # через один туннель.
+        HY2_BIND_DEV: "{{ (relay_wg_links | map(attribute='interface') | sort | first) }}"
+        HY2_RU_ZONES: "{{ ru_direct_list_zones | to_json }}"
+        HY2_RU_DOMAINS: "{{ ru_direct_list_domains | to_json }}"
+      register: hy2_reconcile
+      changed_when: "'changed' in hy2_reconcile.stdout"
+      when: hy2_config.stat.exists
+      notify: restart hysteria2 after relay change
 
 # ── DISABLE branch ───────────────────────────────────────────────
 # ТОЛЬКО при defined-but-empty relay_wg_links (бэкенд авторитетно говорит «у
@@ -333,6 +369,7 @@
         - xray
         - xray-xhttp
         - xray-ws-cdn
+        - hysteria-server
       register: xray_ordering_removed
 
     - name: Reload systemd after drop-in removal
@@ -377,3 +414,33 @@
       changed_when: unpatch_result.rc == 0
       failed_when: unpatch_result.rc not in [0, 78]
       notify: restart all xray services
+
+    # Симметрично xray: снимаем split-секции и у hysteria. Оставленный
+    # bindDevice на удалённый интерфейс — не «трафик пойдёт мимо», а полный
+    # отказ: hysteria v2 проверяет девайс на старте (verifyDeviceName →
+    # net.InterfaceByName) и уходит в Fatal, то есть hy2 теряет и РУ-сегмент,
+    # который обслуживал до детача.
+    - name: Find hysteria2 config (disable mode)
+      stat:
+        path: /etc/hysteria/config.yaml
+      register: hy2_config_disable
+
+    - name: Stage Hysteria2 split-tunnel reconciler (disable mode)
+      copy:
+        src: reconcile_hy2_split.py
+        dest: /usr/local/sbin/reconcile_hy2_split.py
+        owner: root
+        group: root
+        mode: '0750'
+      when: hy2_config_disable.stat.exists
+
+    - name: Strip Hysteria2 split-tunnel sections
+      ansible.builtin.command:
+        argv: [python3, /usr/local/sbin/reconcile_hy2_split.py]
+      environment:
+        HY2_CONFIG: /etc/hysteria/config.yaml
+        HY2_BIND_DEV: ""
+      register: hy2_strip
+      changed_when: "'changed' in hy2_strip.stdout"
+      when: hy2_config_disable.stat.exists
+      notify: restart hysteria2 after relay change

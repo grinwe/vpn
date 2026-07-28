@@ -119,6 +119,10 @@
 - name: Load shared RU-direct domain list
   include_role:
     name: ru_direct_list
+    # public: true — БЕЗ него defaults подключаемой роли не попадают в скоуп
+    # вызывающей (ansible.builtin.include_role: public=false по умолчанию), и
+    # рендер шаблона падает с AnsibleUndefinedVariable на КАЖДОЙ ноде.
+    public: true
 
 # geoip.dat: с 2026-07-28 ACL hysteria на relay-ноде ссылается на geoip:ru и
 # geoip:private, а файл берётся из /usr/local/share/xray (общий с xray, формат
@@ -194,24 +198,38 @@
       - python3
       - -c
       - |
-        import sys, yaml
+        import os, sys, yaml
         cfg = yaml.safe_load(open('/etc/hysteria/config.yaml')) or {}
         if not cfg.get('auth', {}).get('userpass'):
             sys.exit('hysteria config: пустой auth.userpass — будет краш-луп')
         obs = {o.get('name') for o in cfg.get('outbounds') or []}
         acl = cfg.get('acl', {}).get('inline') or []
-        if obs or acl:
+        if not obs and not acl:
+            sys.exit('hysteria config: нет ни outbounds, ни acl — приватные сети открыты клиенту')
+        if acl[0] != 'reject(geoip:private)':
+            sys.exit(f'hysteria config: первым ACL-правилом ждём reject(geoip:private), а не {acl[0]}')
+        used = {r.split('(', 1)[0] for r in acl} - {'reject'}
+        if not used <= obs:
+            sys.exit(f'hysteria config: ACL ссылается на несуществующие outbounds {used - obs}')
+        if 'tunnel' in obs:
+            # relay-нода: split-tunnel
             if not {'tunnel', 'local'} <= obs:
                 sys.exit(f'hysteria config: ожидались outbounds tunnel+local, есть {obs}')
             if cfg['outbounds'][0].get('name') != 'tunnel':
                 sys.exit('hysteria config: tunnel должен быть ПЕРВЫМ outbound (fail-safe)')
-            if not cfg['outbounds'][0]['direct'].get('bindDevice'):
+            dev = cfg['outbounds'][0]['direct'].get('bindDevice')
+            if not dev:
                 sys.exit('hysteria config: у tunnel пустой bindDevice')
+            # hysteria v2 проверяет девайс на СТАРТЕ и уходит в Fatal, если его
+            # нет: ловим здесь, пока play ещё может сказать почему.
+            if not os.path.exists('/sys/class/net/' + dev):
+                sys.exit(f'hysteria config: bindDevice={dev} не существует на ноде')
             if acl[-1] != 'tunnel(all)':
                 sys.exit(f'hysteria config: последнее ACL-правило должно быть tunnel(all), а не {acl[-1]}')
-            used = {r.split('(', 1)[0] for r in acl} - {'reject'}
-            if not used <= obs:
-                sys.exit(f'hysteria config: ACL ссылается на несуществующие outbounds {used - obs}')
+        else:
+            # direct-нода: туннеля нет, но приватные сети всё равно закрыты
+            if acl[-1] != 'local(all)':
+                sys.exit(f'hysteria config: на direct-ноде последним ждём local(all), а не {acl[-1]}')
   changed_when: false
 
 - name: Install Hysteria2 user management helper

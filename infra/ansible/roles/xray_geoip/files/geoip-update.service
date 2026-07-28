@@ -21,6 +21,11 @@ ExecStart=/usr/local/bin/xray-geoip-fetch.sh
 ExecStart=-/bin/systemctl try-restart xray
 ExecStart=-/bin/systemctl try-restart xray-xhttp
 ExecStart=-/bin/systemctl try-restart xray-ws-cdn
+# hysteria читает geo-базы ТОЛЬКО при старте (hot-reload нет, а geoUpdateInterval
+# не применяется, когда путь к файлу задан явно). Без этой строки hy2 крутила бы
+# geoip.dat, загруженный при старте демона, сколь угодно долго — а у неё, в
+# отличие от xray, правило geoip:ru несущее: доменный список покрывает не всё.
+ExecStart=-/bin/systemctl try-restart hysteria-server
 Nice=10
 IOSchedulingClass=best-effort
 IOSchedulingPriority=7

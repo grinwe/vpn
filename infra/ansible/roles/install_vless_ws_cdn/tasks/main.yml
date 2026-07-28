@@ -84,6 +84,10 @@
 - name: Load shared RU-direct domain list
   include_role:
     name: ru_direct_list
+    # public: true — БЕЗ него defaults подключаемой роли не попадают в скоуп
+    # вызывающей (ansible.builtin.include_role: public=false по умолчанию), и
+    # рендер шаблона падает с AnsibleUndefinedVariable на КАЖДОЙ ноде.
+    public: true
 
 # geoip.dat нужен до первого рендера config_ws_cdn.json — с 2026-07-28 в нём
 # есть routing rule `ip: ["geoip:ru"]`, а без файла данных xray падает со

@@ -340,15 +340,21 @@ def test_hy2_renders_valid_yaml(topology: str) -> None:
     assert cfg["auth"]["userpass"], "пустой userpass → hysteria уходит в краш-луп"
 
 
-def test_hy2_direct_node_has_no_split_sections() -> None:
-    """На ноде без relay-линков туннеля нет — секции не должны появляться.
+def test_hy2_direct_node_has_no_tunnel_but_blocks_private() -> None:
+    """На ноде без relay-линков туннеля нет — bindDevice не должен появиться
+    (он указал бы на несуществующий интерфейс, и hysteria не стартует вовсе).
 
-    Иначе ``bindDevice`` укажет на несуществующий интерфейс и весь трафик
-    ноды умрёт.
+    Но приватные сети закрыть надо и здесь: у трёх xray-шаблонов правило
+    geoip:private → block безусловное, иначе клиент дотягивается до
+    gRPC StatsService ноды и до 169.254.169.254.
     """
     cfg = _render_hy2("direct-node")
-    assert "outbounds" not in cfg
-    assert "acl" not in cfg
+    assert [o["name"] for o in cfg["outbounds"]] == ["local"]
+    assert "bindDevice" not in cfg["outbounds"][0]["direct"]
+    acl = cfg["acl"]["inline"]
+    assert acl[0] == "reject(geoip:private)"
+    assert acl[-1] == "local(all)"
+    assert not any(r.startswith("tunnel") for r in acl)
 
 
 @pytest.mark.parametrize("topology", ["single-link-relay", "multi-link-relay"])
@@ -412,3 +418,122 @@ def test_hy2_geoip_path_matches_xray_geoip_role() -> None:
 
     fetcher = (ROLES / "xray_geoip" / "files" / "xray-geoip-fetch.sh").read_text()
     assert "/usr/local/share/xray/geoip.dat" in fetcher
+
+
+# ── Скоупинг переменных ansible ──────────────────────────────────────────
+# Тесты выше рендерят шаблоны голым jinja2 и КОНСТРУКТИВНО не видят того, как
+# ansible передаёт переменные между ролями. Ровно на этом чуть не уехал прод:
+# `include_role` по умолчанию public=false, то есть defaults подключаемой роли
+# НЕ попадают в скоуп вызывающей, и рендер падает с AnsibleUndefinedVariable
+# на каждой ноде. Здесь — статический гард на то, что jinja проверить не может.
+
+ROLES_USING_RU_LIST = [
+    "install_vless_reality",
+    "install_vless_xhttp",
+    "install_vless_ws_cdn",
+    "install_hysteria2",
+]
+
+
+@pytest.mark.parametrize("role", ROLES_USING_RU_LIST)
+def test_ru_list_include_is_public(role: str) -> None:
+    """``include_role: ru_direct_list`` обязан быть с ``public: true``."""
+    tasks = yaml.safe_load((ROLES / role / "tasks" / "main.yml").read_text())
+    includes = [
+        t
+        for t in tasks
+        if isinstance(t, dict)
+        and (t.get("include_role") or {}).get("name") == "ru_direct_list"
+    ]
+    assert len(includes) == 1, f"{role}: ожидался ровно один include ru_direct_list"
+    assert includes[0]["include_role"].get("public") is True, (
+        f"{role}: include_role ru_direct_list без public: true — "
+        "defaults роли не попадут в скоуп и рендер упадёт на undefined"
+    )
+
+
+@pytest.mark.parametrize("role", ROLES_USING_RU_LIST)
+def test_ru_list_loaded_before_template_render(role: str) -> None:
+    """Список обязан подключаться ДО таски, рендерящей конфиг."""
+    tasks = yaml.safe_load((ROLES / role / "tasks" / "main.yml").read_text())
+    include_idx = template_idx = None
+    for i, task in enumerate(tasks):
+        if not isinstance(task, dict):
+            continue
+        if (task.get("include_role") or {}).get("name") == "ru_direct_list":
+            include_idx = i
+        tpl = task.get("template") or task.get("ansible.builtin.template")
+        if tpl and str(tpl.get("src", "")).endswith((".json.j2", ".yaml.j2")):
+            if template_idx is None:
+                template_idx = i
+    assert include_idx is not None, f"{role}: нет include ru_direct_list"
+    assert template_idx is not None, f"{role}: не найдена таска рендера конфига"
+    assert include_idx < template_idx, (
+        f"{role}: ru_direct_list подключается ПОСЛЕ рендера конфига"
+    )
+
+
+def test_hy2_reconciler_matches_template() -> None:
+    """Реконсайлер relay-роли обязан строить ТЕ ЖЕ секции, что и шаблон.
+
+    Полный рендер конфига делает только install_hysteria2 в site.yml, а
+    attach/detach линка гоняет relay_jump_node с реконсайлером. Разойдутся —
+    и нода получит одну конфигурацию после attach и другую после site.yml.
+    """
+    import importlib.util
+
+    src = ROLES / "relay_jump_node" / "files" / "reconcile_hy2_split.py"
+    spec = importlib.util.spec_from_file_location("reconcile_hy2_split", src)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+
+    outbounds, acl = mod.build_sections(
+        "wg0", RU_LIST_VARS["ru_direct_list_zones"], RU_LIST_VARS["ru_direct_list_domains"]
+    )
+    rendered = _render_hy2("single-link-relay")
+
+    assert outbounds == rendered["outbounds"], "outbounds реконсайлера ≠ шаблона"
+    assert acl == rendered["acl"], "acl реконсайлера ≠ шаблона"
+
+
+def test_hy2_reconciler_strips_sections_when_not_relay() -> None:
+    """Снятие последнего линка обязано убирать секции целиком: оставленный
+    bindDevice на удалённый интерфейс — не «трафик мимо туннеля», а Fatal при
+    старте hysteria, то есть потеря и РУ-сегмента."""
+    import importlib.util
+    import os
+    import tempfile
+
+    src = ROLES / "relay_jump_node" / "files" / "reconcile_hy2_split.py"
+    spec = importlib.util.spec_from_file_location("reconcile_hy2_split", src)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+
+    with tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False) as fh:
+        yaml.dump(
+            {
+                "listen": ":443",
+                "auth": {"type": "userpass", "userpass": {"u": "p"}},
+                "outbounds": [
+                    {"name": "tunnel", "type": "direct",
+                     "direct": {"bindDevice": "wg0"}},
+                ],
+                "acl": {"inline": ["tunnel(all)"]},
+            },
+            fh,
+        )
+        path = fh.name
+
+    try:
+        os.environ["HY2_CONFIG"] = path
+        os.environ["HY2_BIND_DEV"] = ""
+        assert mod.main() == 0
+        after = yaml.safe_load(open(path))
+        assert "outbounds" not in after
+        assert "acl" not in after
+        # Юзеры не пострадали.
+        assert after["auth"]["userpass"] == {"u": "p"}
+    finally:
+        os.unlink(path)
+        os.environ.pop("HY2_CONFIG", None)
+        os.environ.pop("HY2_BIND_DEV", None)
