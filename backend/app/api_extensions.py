@@ -182,6 +182,23 @@ def referral_share_url(code: str) -> str | None:
     return f"https://t.me/{bot}?start=ref_{code}" if bot else None
 
 
+def _plural_days(n: int) -> str:
+    """«1 день / 3 дня / 30 дней» — русские числительные требуют трёх форм.
+
+    Без этого шаблон печатал «дарим тебе 3 дней», и сообщение сразу читалось
+    как машинное.
+    """
+    n = int(n)
+    if 11 <= n % 100 <= 14:
+        return f"{n} дней"
+    tail = n % 10
+    if tail == 1:
+        return f"{n} день"
+    if tail in (2, 3, 4):
+        return f"{n} дня"
+    return f"{n} дней"
+
+
 def _mark_first_config_fetch(db: Session, sub) -> None:
     """Отметить первое скачивание конфига и позвать привести друга.
 
@@ -1348,28 +1365,25 @@ def get_pending_notifications(
                 + (f"Ссылка: {sub_uri}\n" if sub_uri else "")
             )
         elif log.action == "referral_invite":
-            # Шлётся один раз — сразу после того, как человек впервые скачал
-            # конфиг, то есть когда ему УЖЕ есть что рекомендовать.
+            # Шлётся один раз — после того, как человек впервые скачал конфиг.
             #
-            # Формулировка «отправь другу», а не «выложи в канал», намеренная:
-            # публичный пост со ссылкой на VPN-бота — это состав по ч.18
-            # ст.14.3 КоАП (в январе 2026 за такое уже оштрафовали владельца
-            # Telegram-канала), причём отвечает разместивший. Личная
-            # рекомендация конкретному человеку рекламой не является.
+            # Ссылку зовём отправить лично, а не постить публично: публикация
+            # ссылки на VPN-бота — состав по ч.18 ст.14.3 КоАП (в январе 2026
+            # за такое оштрафовали владельца Telegram-канала), и отвечает
+            # разместивший, то есть наш же пользователь. Прямо про закон в
+            # тексте не пишем — не пугаем, просто не предлагаем публичность.
             ref_url = extra.get("share_url")
             reward_days = extra.get("reward_days")
             reward_line = (
-                f"За каждого друга, который оплатит подписку, "
-                f"дарим тебе {reward_days} дней.\n"
+                f"Если приведёшь друга — получишь {_plural_days(reward_days)} "
+                "подписки, когда он оплатит.\n\n"
                 if reward_days
                 else ""
             )
             text = (
-                "🎉 VPN подключён — поздравляем!\n\n"
+                "Готово, VPN работает 🎉\n\n"
                 + reward_line
-                + (f"Твоя ссылка для друзей:\n{ref_url}\n\n" if ref_url else "")
-                + "Отправь её тому, кому она нужна, в личку — так и надёжнее, "
-                "и по-человечески."
+                + (f"Ссылка для друзей:\n{ref_url}" if ref_url else "")
             )
         elif log.action == "migration_notice":
             # Намеренно без URL. Подписочная ссылка, лежащая в профиле
@@ -1722,9 +1736,23 @@ def update_notification_prefs(
     )
 
 
+class NotificationAck(BaseModel):
+    """Что бот знает об отправленном сообщении.
+
+    ``message_id`` нужен, чтобы доставленное можно было ОТОЗВАТЬ: Bot API умеет
+    удалять свои сообщения 48 часов, но только по id. Пока мы его не сохраняли,
+    ошибочная рассылка была необратима — ровно это и случилось 2026-07-27 с
+    приглашением позвать друга.
+    """
+
+    message_id: int | None = None
+    chat_id: int | None = None
+
+
 @ext_router.post("/notifications/{notif_id}/ack")
 def ack_notification(
     notif_id: int,
+    body: NotificationAck | None = None,
     db: Session = Depends(get_db),
     admin_token: str = Depends(require_admin),
 ):
@@ -1736,6 +1764,13 @@ def ack_notification(
     if not log:
         raise HTTPException(status_code=404, detail="Notification not found")
     log.action = f"{log.action}:delivered"
+    if body and body.message_id:
+        # JSONB in-place не детектится SQLAlchemy → новый dict.
+        log.extra = {
+            **(log.extra or {}),
+            "message_id": body.message_id,
+            "chat_id": body.chat_id,
+        }
     db.add(log)
     db.commit()
     return {"ok": True}

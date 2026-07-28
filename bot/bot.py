@@ -97,7 +97,7 @@ async def notification_poller(bot: Bot):
                     _pending_err_last_status = None
                 notifications = await resp.json()
 
-            async def _ack(notif_id_inner: int) -> None:
+            async def _ack(notif_id_inner: int, sent: dict | None = None) -> None:
                 """ACK helper: помечает запись в audit_logs как `:delivered`,
                 чтобы /pending её больше не возвращал. Ретраим до 3 раз с
                 backoff: если ACK не пройдёт, запись останется в /pending и
@@ -112,6 +112,11 @@ async def notification_poller(bot: Bot):
                         async with session.post(
                             f"{BACKEND_URL}/api/notifications/{notif_id_inner}/ack",
                             headers=headers,
+                            # message_id — чтобы отправленное можно было
+                            # ОТОЗВАТЬ: Bot API удаляет свои сообщения 48 часов,
+                            # но только по id. Пока мы его не сохраняли,
+                            # ошибочная рассылка была необратима.
+                            json=(sent or {}),
                             timeout=__import__("aiohttp").ClientTimeout(total=5),
                         ) as ack_resp:
                             if ack_resp.status == 200:
@@ -134,7 +139,7 @@ async def notification_poller(bot: Bot):
                     notif_id_inner,
                 )
 
-            def _spawn_ack(notif_id_inner: int) -> None:
+            def _spawn_ack(notif_id_inner: int, sent: dict | None = None) -> None:
                 """Запускает _ack в фоне, не блокируя основной проход.
 
                 Дедуп: если ACK для notif_id уже в полёте — не спавним
@@ -144,7 +149,7 @@ async def notification_poller(bot: Bot):
                 """
                 if not notif_id_inner or notif_id_inner in _ack_tasks:
                     return
-                task = asyncio.create_task(_ack(notif_id_inner))
+                task = asyncio.create_task(_ack(notif_id_inner, sent))
                 _ack_tasks[notif_id_inner] = task
                 task.add_done_callback(
                     lambda _t, _nid=notif_id_inner: _ack_tasks.pop(_nid, None)
@@ -200,7 +205,7 @@ async def notification_poller(bot: Bot):
                         keyboard = node_diagnosis_keyboard(
                             notif.get("target_kind"), notif.get("target_id")
                         )
-                    await bot.send_message(
+                    sent_msg = await bot.send_message(
                         chat_id=int(telegram_id),
                         text=text,
                         parse_mode="HTML",
@@ -212,7 +217,13 @@ async def notification_poller(bot: Bot):
                         _sent_unacked[notif_id] = asyncio.get_event_loop().time()
                     # ACK — в фоне: залипший ACK бэкенда не должен держать
                     # отправку следующих (в т.ч. срочных) уведомлений тика.
-                    _spawn_ack(notif_id)
+                    _spawn_ack(
+                        notif_id,
+                        {
+                            "message_id": getattr(sent_msg, "message_id", None),
+                            "chat_id": int(telegram_id),
+                        },
+                    )
                     # Для admin_broadcast спим между сообщениями, чтобы не
                     # упереться в Telegram rate-limit ~30 msg/sec. При
                     # лимите _BROADCAST_PER_TICK тик отпустится за ~2.5s. Для

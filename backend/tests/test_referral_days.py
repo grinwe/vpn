@@ -223,3 +223,95 @@ def test_webapp_help_mentions_ru_sites():
     help_page = _read("webapp/src/pages/Help.tsx")
     assert "Российские сайты и банки" in help_page
     assert "не на всех серверах" in help_page
+
+
+# ── текст приглашения ───────────────────────────────────────────────────────
+# Первая версия ушла живому пользователю с «дарим тебе 3 дней»: сломанное
+# склонение плюс исторический дефальт 3 в коде вместо задуманных 30.
+
+
+def test_plural_days_russian_forms():
+    from app.api_extensions import _plural_days
+
+    assert _plural_days(1) == "1 день"
+    assert _plural_days(3) == "3 дня"
+    assert _plural_days(30) == "30 дней"
+    assert _plural_days(11) == "11 дней"  # 11-14 — исключение из правила
+    assert _plural_days(22) == "22 дня"
+    assert _plural_days(105) == "105 дней"
+
+
+def test_referral_code_defaults_are_current():
+    """Дефолты модели должны совпадать с тем, что обещает текст: иначе человек
+    получит «3 дня» там, где мы задумывали месяц."""
+    code = models.ReferralCode(owner_id=1, code="x")
+    # SQLAlchemy проставляет python-дефолты на flush; проверяем саму колонку.
+    assert models.ReferralCode.__table__.c.reward_days.default.arg == 30
+    assert models.ReferralCode.__table__.c.bonus_days.default.arg == 7
+    assert code is not None
+
+
+def test_invite_not_sent_to_existing_users(db_session):
+    """Гейт «колонка пуста» на новой колонке означает «пуста у всех», из-за
+    чего приглашение ушло существующим пользователям. Проставленная метка
+    обязана его останавливать."""
+    from app.api_extensions import _mark_first_config_fetch
+    from app.time_utils import utcnow
+
+    user = make_user(db_session, telegram_id="old-timer")
+    user.first_config_fetch_at = utcnow()  # как после бэкфилла миграции 0064
+    db_session.commit()
+
+    sub = type("SubStub", (), {"user_id": user.id})()
+    _mark_first_config_fetch(db_session, sub)
+
+    invites = (
+        db_session.query(models.AuditLog)
+        .filter_by(action="referral_invite", target_id=user.id)
+        .count()
+    )
+    assert invites == 0
+
+
+def test_ack_stores_message_id_for_recall(client, db_session):
+    """Без сохранённого message_id ошибочная рассылка необратима: Bot API
+    удаляет свои сообщения 48 часов, но только по id."""
+    log = models.AuditLog(
+        actor="system",
+        actor_type=models.AuditActor.system,
+        action="referral_invite",
+        target_type="user",
+        target_id=1,
+        extra={"telegram_id": "42"},
+    )
+    db_session.add(log)
+    db_session.commit()
+
+    resp = client.post(
+        f"/api/notifications/{log.id}/ack",
+        json={"message_id": 777, "chat_id": 42},
+    )
+    assert resp.status_code == 200, resp.text
+    db_session.refresh(log)
+    assert log.action == "referral_invite:delivered"
+    assert log.extra["message_id"] == 777
+    assert log.extra["chat_id"] == 42
+
+
+def test_ack_without_body_still_works(db_session, client):
+    """Старый бот (без message_id в теле) не должен ломаться на новом бэкенде."""
+    log = models.AuditLog(
+        actor="system",
+        actor_type=models.AuditActor.system,
+        action="config_ready",
+        target_type="user",
+        target_id=1,
+        extra={"telegram_id": "42"},
+    )
+    db_session.add(log)
+    db_session.commit()
+
+    resp = client.post(f"/api/notifications/{log.id}/ack")
+    assert resp.status_code == 200, resp.text
+    db_session.refresh(log)
+    assert log.action == "config_ready:delivered"
