@@ -482,6 +482,24 @@ _PROTO_ORDER = {
     "vless-ws-cdn": 3,
 }
 
+# Роль лега = протокол. Один источник правды для набора, подписи и ротации.
+LEG_ROLE_BY_PROTO = {
+    "vless-reality": "primary",
+    "hysteria2": "fast",
+    "vless-xhttp": "backup",
+    "vless-ws-cdn": "reserve",
+}
+
+
+def sub_leg_scheme() -> str:
+    """`legacy` — отдаём все активные креды (как было); `4x1` — только
+    опубликованные (по одному протоколу с ноды).
+
+    Флагом, а не миграцией: откат схемы должен стоить перезапуск контейнера, а
+    не откат данных.
+    """
+    return (os.getenv("SUB_LEG_SCHEME") or "legacy").strip().lower()
+
 
 def _relabel_uri(uri: str, proto: str, index: int) -> str:
     """Переписываем #fragment (display-name в клиенте) на «{эмодзи} {роль} N».
@@ -523,8 +541,13 @@ def _decrypt_configs(
     # один и тот же сервер разными протоколами — иначе номера в списке из
     # двенадцати строк не значат ничего.
     server_no: dict[int | None, int] = {}
+    publish_only = sub_leg_scheme() == "4x1"
     for cred in creds:
         if not cred.is_active:
+            continue
+        # Схема 4×1: на ноде лежат все протоколы, но в подписку идёт один.
+        # getattr — на случай кредов, прочитанных до миграции 0065.
+        if publish_only and not getattr(cred, "leg_published", True):
             continue
         if (
             node_filter is not None
@@ -1394,6 +1417,7 @@ ADMIN_NOTIFICATION_ACTIONS = [
     # (services/xray_releases.py). Без строки в этом списке пуш молча
     # оседал бы в audit_logs и до админа не доезжал.
     "admin_alert_xray_version_drift",
+    "admin_alert_leg_gap",
 ]
 
 

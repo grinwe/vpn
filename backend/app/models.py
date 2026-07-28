@@ -787,6 +787,19 @@ class Credential(Base):
     )
     proto = Column(String, nullable=False)
     config_text = Column(Text, nullable=False)
+    # Публикуется ли этот кред в подписке. Тёплый бандл назначается ЦЕЛИКОМ (на
+    # ноде под одним именем физически лежат все её протоколы), а в саб-линк при
+    # схеме 4×1 отдаём ровно один протокол с ноды — остальные висят
+    # неопубликованными и ждут своей очереди при ротации. Отдельная колонка, а
+    # НЕ is_active: is_active означает «учётка жива на ноде», её массово
+    # переставляет провижининг, и схема публикации разваливалась бы молча.
+    leg_published = Column(
+        Boolean, nullable=False, default=True, server_default="true"
+    )
+    # Роль лега в наборе: primary (reality) | fast (hy2) | backup (xhttp) |
+    # reserve (ws-cdn) | dup (дубль, выданный по эскалации). NULL — легаси-кред
+    # до перехода на схему.
+    leg_role = Column(String, nullable=True)
     # Username shared across all credentials in the same warm bundle.
     # When pool_state=warm, the warmer groups credentials by
     # (node_id, access_username) to atomically assign all protocols of

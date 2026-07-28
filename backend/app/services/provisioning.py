@@ -25,6 +25,7 @@ from .. import models
 from ..db import SessionLocal
 from ..security import compute_client_id_hmac, decrypt, encrypt
 from ..version import app_version
+from . import leg_scheme
 from .ansible_runner import (
     AnsibleCancelled,
     build_inventory_for_exit_node,
@@ -136,11 +137,17 @@ def choose_node(
     *,
     exclude_node_ids: list[int] | None = None,
     exclude_regions: list[str] | None = None,
+    required_proto: str | None = None,
 ) -> models.VPNNode:
     """Pick a VPN node, respecting plan pools, capacity, health and cooldown.
 
     Uses SELECT FOR UPDATE SKIP LOCKED to prevent concurrent provisioners
     from over-committing a single node.
+
+    ``required_proto`` — нода обязана нести включённый VPNConfig этого протокола.
+    Нужно схеме 4×1, где нода выбирается ПОД РОЛЬ: «дай ноду под hy2» без этого
+    фильтра могло вернуть ноду, на которой hy2 не настроен, и роль молча
+    выпадала бы из набора.
     """
     now = utcnow()
     query = db.query(models.VPNNode).filter(models.VPNNode.is_active.is_(True))
@@ -161,6 +168,21 @@ def choose_node(
 
     if exclude_regions:
         query = query.filter(~models.VPNNode.region.in_(exclude_regions))
+
+    if required_proto:
+        try:
+            proto_enum = models.VPNConfigProtocol(required_proto)
+        except ValueError as exc:
+            raise RuntimeError(f"unknown protocol {required_proto!r}") from exc
+        query = query.filter(
+            db.query(models.VPNConfig)
+            .filter(
+                models.VPNConfig.node_id == models.VPNNode.id,
+                models.VPNConfig.protocol == proto_enum,
+                models.VPNConfig.is_enabled.is_(True),
+            )
+            .exists()
+        )
 
     query = query.filter(
         (models.VPNNode.cooldown_until.is_(None))
@@ -3149,6 +3171,7 @@ class ProvisioningOrchestrator:
                 )
                 self.db.refresh(subscription)
                 self._maybe_attach_diverse(subscription, device, plan, node)
+                self._apply_leg_scheme(device)
                 return subscription, task
             except Exception:
                 # If wiring blew up after we marked the bundle assigned,
@@ -3289,7 +3312,22 @@ class ProvisioningOrchestrator:
         self.run_task_async(task, node=node)
         self.db.refresh(subscription)
         self._maybe_attach_diverse(subscription, device, plan, node)
+        self._apply_leg_scheme(device)
         return subscription, task
+
+    def _apply_leg_scheme(self, device: models.Device) -> None:
+        """Разложить креды устройства по ролям набора 4×1 (no-op без флага).
+
+        Best-effort: девайс к этому моменту уже рабочий, и упасть на раскладке
+        списка — значит уронить успешную покупку из-за косметики.
+        """
+        try:
+            plan = leg_scheme.apply_leg_scheme(self.db, device, commit=True)
+        except Exception:  # noqa: BLE001 — набор не важнее выданного девайса
+            logger.exception("leg-scheme: раскладка для device %s не удалась", device.id)
+            return
+        if plan is not None and plan.missing:
+            leg_scheme.notify_leg_gap(self.db, device, plan.missing)
 
     def _maybe_attach_diverse(
         self,
@@ -3320,6 +3358,12 @@ class ProvisioningOrchestrator:
             n_total = int(os.getenv("DIVERSE_SUB_NODES", "1") or "1")
         except ValueError:
             n_total = 1
+        if leg_scheme.leg_scheme_enabled():
+            # Схема 4×1 берёт с ноды ОДНУ роль, поэтому ширина набора = число
+            # нод. Ниже целевого опускаться нельзя: недобранная нода — это не
+            # «на одну строку меньше», а роль (протокол), которой у человека
+            # не будет вовсе.
+            n_total = max(n_total, leg_scheme.target_leg_nodes())
         if n_total <= 1:
             return  # флаг выключен → текущее однонодовое поведение
 
@@ -3541,6 +3585,7 @@ class ProvisioningOrchestrator:
             # best-effort: внутренний try/except гарантирует, что один битый девайс
             # не уронит весь backfill и не тронет primary.
             self._maybe_attach_diverse(sub, device, sub.plan, sub.node)
+            self._apply_leg_scheme(device)
             self.db.refresh(device)
             after = len(
                 {c.node_id for c in device.credentials if c.is_active and c.node_id}
