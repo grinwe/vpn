@@ -210,8 +210,9 @@ def test_bot_help_has_ru_sites_section():
 
 
 def test_ru_sites_copy_does_not_overpromise():
-    """Сплит работает на РУ-нодах и на Reality/XHTTP, но не на ws-cdn и hy2 —
-    текст не должен обещать, что «всегда всё работает»."""
+    """Сплит осмыслен только на relay-нодах (на standalone-зарубежной он
+    безвредный no-op), поэтому текст не должен обещать «всегда работает».
+    Оговорка про протоколы снята 2026-07-28 — там теперь паритет."""
     handlers = _read("bot/handlers.py")
     start = handlers.index("_HELP_RU_SITES = (")
     copy = handlers[start:start + 1200]
