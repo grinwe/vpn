@@ -46,11 +46,18 @@
 # прогоны роли (resync, добавление протокола) не качают повторно.
 # Для принудительного refresh — `rm /usr/local/share/xray/geoip.dat`
 # перед прогоном ИЛИ `systemctl start geoip-update.service`.
+# changed_when раньше стоял безусловным `true`, и таска рапортовала changed
+# ДАЖЕ когда creates её пропускал — в логе bootstrap'а это выглядело как
+# четыре скачивания geoip.dat подряд (роль подключается из четырёх
+# протокольных ролей). Файл при этом не трогался: mtime оставался прежним.
+# Ложные changed мешают читать лог и искать реальные тормоза, поэтому
+# отмечаем changed только когда скрипт действительно отработал.
 - name: Initial geoip.dat fetch (blocks play until file present)
   command: /usr/local/bin/xray-geoip-fetch.sh
   args:
     creates: /usr/local/share/xray/geoip.dat
-  changed_when: true
+  register: _geoip_initial_fetch
+  changed_when: _geoip_initial_fetch is not skipped
 
 - name: Enable weekly geoip refresh timer
   systemd:
