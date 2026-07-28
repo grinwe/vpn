@@ -1309,6 +1309,39 @@ async def _do_device_failover(
             _spawn(
                 _delayed_still_broken_prompt(bot, chat_id, int(report_id))
             )
+    elif action == "reshuffled":
+        # Первый шаг лестницы: ноды те же, протоколы другие. Человеку про
+        # протоколы знать незачем — ему важно «мы поменяли способ связи и надо
+        # обновить подписку».
+        report_id = data.get("report_id")
+        await bot.send_message(
+            chat_id,
+            "🔀 Переключили тебя на другой способ подключения — чаще всего "
+            "не работает именно он, а не сам сервер.\n\n"
+            "Нажми 🔄 рядом с профилем в приложении и попробуй подключиться.\n\n"
+            "Чтобы мы быстрее ловили блокировки — подскажи, какой у тебя интернет?",
+            reply_markup=(
+                operator_keyboard(int(report_id)) if report_id else help_keyboard()
+            ),
+        )
+        if report_id:
+            _spawn(_delayed_still_broken_prompt(bot, chat_id, int(report_id)))
+    elif action == "duplicated":
+        # Третий шаг: человеку с единственным живым протоколом дали второй
+        # сервер по нему же — страховка на случай падения его ноды.
+        report_id = data.get("report_id")
+        await bot.send_message(
+            chat_id,
+            "➕ Добавили тебе запасной сервер по тому способу связи, который у "
+            "тебя работает.\n\n"
+            "Нажми 🔄 рядом с профилем — в списке появится ещё один вариант.\n\n"
+            "Если и после этого не заработает — жми /help, разберёмся руками.",
+            reply_markup=(
+                operator_keyboard(int(report_id)) if report_id else help_keyboard()
+            ),
+        )
+        if report_id:
+            _spawn(_delayed_still_broken_prompt(bot, chat_id, int(report_id)))
     elif action == "throttled":
         # Ветки не было: throttled проваливался в else и юзер получал «Не смогли
         # автоматически подобрать другой сервер. Напиши в поддержку» — то есть

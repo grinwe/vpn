@@ -95,6 +95,7 @@ def _match_roles(
     pool: dict[int, dict[str, models.Credential]],
     roles: list[str],
     preferred: dict[str, int],
+    forbid: set[tuple[str, int]] | None = None,
 ) -> dict[str, int]:
     """Алгоритм Куна: максимальное паросочетание роль ↔ нода.
 
@@ -104,10 +105,15 @@ def _match_roles(
     """
     node_of_role: dict[str, int] = {}
     role_of_node: dict[int, str] = {}
+    banned = forbid or set()
 
     def candidates(role: str) -> list[int]:
         proto = PROTO_BY_ROLE[role]
-        nodes = [node_id for node_id, by_proto in pool.items() if proto in by_proto]
+        nodes = [
+            node_id
+            for node_id, by_proto in pool.items()
+            if proto in by_proto and (role, node_id) not in banned
+        ]
         nodes.sort(key=lambda nid: (nid != preferred.get(role), nid))
         return nodes
 
@@ -132,12 +138,18 @@ def plan_legs(
     creds: list[models.Credential],
     *,
     roles: list[str] | None = None,
+    forbid: set[tuple[str, int]] | None = None,
 ) -> LegAssignment:
     """Разложить креды по ролям, не трогая БД (чистая функция — её же зовут тесты).
 
     Учитываются только активные креды с известной нодой: неактивный кред — это
     учётка, которой на ноде уже нет, публиковать её значит показать человеку
     заведомо мёртвый эндпоинт.
+
+    ``forbid`` — пары (роль, нода), которые запрещено брать. На этом стоит
+    первый шаг ротации: запретив текущие пары, получаем набор, где КАЖДАЯ нода
+    отдаёт другой протокол, — и это ровно то, что нужно, когда режут транспорт,
+    а не ноду.
     """
     wanted = roles if roles is not None else [role for role, _ in LEG_ROLES]
 
@@ -161,7 +173,7 @@ def plan_legs(
             if role in wanted:
                 preferred.setdefault(role, cred.node_id)
 
-    node_of_role = _match_roles(pool, wanted, preferred)
+    node_of_role = _match_roles(pool, wanted, preferred, forbid)
 
     result = LegAssignment()
     for role in wanted:
@@ -187,6 +199,7 @@ def apply_leg_scheme(
     device: models.Device,
     *,
     commit: bool = False,
+    forbid: set[tuple[str, int]] | None = None,
 ) -> LegAssignment | None:
     """Проставить `leg_published`/`leg_role` кредам устройства.
 
@@ -199,7 +212,7 @@ def apply_leg_scheme(
         return None
 
     creds = list(device.credentials or [])
-    plan = plan_legs(creds)
+    plan = plan_legs(creds, forbid=forbid)
     keep = {id(cred) for cred in plan.published}
 
     for role, cred in plan.assigned.items():
@@ -277,3 +290,15 @@ def notify_leg_gap(
         )
     except Exception:  # noqa: BLE001 — алерт не важнее выданного девайса
         logger.exception("leg-scheme: не удалось уведомить админа о дефиците ролей")
+
+
+def current_pairs(device: models.Device) -> set[tuple[str, int]]:
+    """Текущие пары (роль, нода) набора — то, от чего должна уйти ротация."""
+    return {
+        (cred.leg_role, cred.node_id)
+        for cred in (device.credentials or [])
+        if cred.leg_published
+        and cred.leg_role
+        and cred.leg_role != DUP_ROLE
+        and cred.node_id is not None
+    }

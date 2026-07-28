@@ -40,6 +40,7 @@ from sqlalchemy.orm import Session
 
 from .. import models
 from ..rate_limit import limiter
+from ..services import rotation
 from ..services.provisioning import ProvisioningOrchestrator
 from ..time_utils import utcnow
 from ._common import _audit, get_db
@@ -721,7 +722,15 @@ class ReportBrokenRequest(BaseModel):
 
 class ReportBrokenResponse(BaseModel):
     action: Literal[
-        "migrated", "throttled", "no_subscription", "no_target", "user_not_found"
+        "migrated",
+        # Первый шаг ротационной лестницы: те же ноды, другие протоколы.
+        "reshuffled",
+        # Третий шаг: выдан второй лег по работающему протоколу.
+        "duplicated",
+        "throttled",
+        "no_subscription",
+        "no_target",
+        "user_not_found",
     ]
     report_id: int | None = None
     new_node_name: str | None = None
@@ -957,7 +966,14 @@ def devices_by_telegram(
 COMPLAINT_DEDUP_SEC = int(os.getenv("COMPLAINT_DEDUP_SEC", "60"))
 
 
-def _record_complaint(db: Session, user, *, proto: str | None = None) -> bool:
+def _record_complaint(
+    db: Session,
+    user,
+    *,
+    proto: str | None = None,
+    throttled: bool = True,
+    commit: bool = True,
+) -> bool:
     """Зафиксировать жалобу «VPN не работает». True — записали, False — дребезг.
 
     Пишем в audit-лог, а не в operator_node_reports: та таблица означает
@@ -985,11 +1001,108 @@ def _record_complaint(db: Session, user, *, proto: str | None = None) -> bool:
             action="complaint_received",
             target_type="user",
             target_id=user.id,
-            extra={"throttled": True, "proto": proto},
+            extra={"throttled": throttled, "proto": proto},
         )
     )
-    db.commit()
+    if commit:
+        db.commit()
+    else:
+        # flush, а не commit: вызывающий держит устройство под FOR UPDATE, и
+        # коммит здесь снял бы блокировку ровно посреди защиты от двойного
+        # тапа. Свои же SELECT'ы (счётчик лестницы) flush'нутую строку видят.
+        db.flush()
     return True
+
+
+def _rotation_report(
+    db: Session,
+    user,
+    sub,
+    device,
+    *,
+    target_node_id: int | None,
+    operator: str | None,
+) -> models.OperatorNodeReport:
+    """Репорт для шага лестницы, который НЕ обвиняет ноду.
+
+    ``failed_node_id`` пустой намеренно: перетасовка протоколов и дубль
+    отвечают на «режут транспорт», а не «нода мертва». Записать сюда ноду
+    значило бы влить фальшивый fail в крауд-матрицу node×operator и своими
+    руками выжигать здоровые ноды. Исход при этом меряется как обычно:
+    watcher засчитывает reconnect по любому активному креду устройства.
+    """
+    report = models.OperatorNodeReport(
+        user_id=user.id,
+        subscription_id=sub.id if sub else None,
+        device_id=device.id,
+        operator=operator if operator in _OPERATORS else None,
+        failed_node_id=None,
+        target_node_id=target_node_id,
+        target_access_username=device.access_username,
+        outcome="pending",
+    )
+    db.add(report)
+    db.commit()
+    db.refresh(report)
+    return report
+
+
+def _finish_reshuffle(db: Session, user, sub, device, plan, operator):
+    """Шаг 1 состоялся: у человека тот же набор нод и другие протоколы."""
+    primary = plan.assigned.get("primary") or next(iter(plan.assigned.values()), None)
+    report = _rotation_report(
+        db, user, sub, device,
+        target_node_id=primary.node_id if primary else None,
+        operator=operator,
+    )
+    _audit(
+        db,
+        f"user:{user.telegram_id}",
+        "client_reported_failure",
+        "subscription",
+        sub.id if sub else None,
+        metadata={
+            "report_id": report.id,
+            "device_id": device.id,
+            "scope": "protocol_reshuffle",
+            "source": "bot_vpn_broken",
+            "legs": {role: cred.node_id for role, cred in plan.assigned.items()},
+        },
+        actor_type=models.AuditActor.user,
+    )
+    return ReportBrokenResponse(
+        action="reshuffled",
+        report_id=report.id,
+        device_name=device.name or "Устройство",
+    )
+
+
+def _finish_duplicate(db: Session, user, sub, device, dup, operator):
+    """Шаг 3: второй лег по работающему протоколу — страховка от падения ноды."""
+    report = _rotation_report(
+        db, user, sub, device, target_node_id=dup.node_id, operator=operator
+    )
+    _audit(
+        db,
+        f"user:{user.telegram_id}",
+        "client_reported_failure",
+        "subscription",
+        sub.id if sub else None,
+        metadata={
+            "report_id": report.id,
+            "device_id": device.id,
+            "scope": "duplicate_leg",
+            "source": "bot_vpn_broken",
+            "proto": dup.proto,
+            "node_id": dup.node_id,
+        },
+        actor_type=models.AuditActor.user,
+    )
+    return ReportBrokenResponse(
+        action="duplicated",
+        report_id=report.id,
+        device_name=device.name or "Устройство",
+    )
 
 
 class ReportBrokenDeviceByTelegramRequest(BaseModel):
@@ -1047,6 +1160,26 @@ def report_broken_device_by_telegram(
     sub = device.subscription
     if sub is None or sub.plan is None:
         return ReportBrokenResponse(action="no_subscription")
+
+    # Жалоба фиксируется ВСЕГДА и до выбора шага: на её счётчике стоит
+    # лестница. commit=False — устройство держим под FOR UPDATE до конца.
+    _record_complaint(db, user, throttled=False, commit=False)
+
+    # Ротационная лестница. Первый шаг — перетасовать протоколы на ТЕХ ЖЕ
+    # нодах: чаще всего за жалобой стоит блокировка транспорта, а не смерть
+    # ноды, и менять ноду в этом случае значит стрелять мимо. Стоит это
+    # переставленного флага в БД — ни ansible, ни новых кредов.
+    step = rotation.decide_step(db, user.id)
+    if step == rotation.STEP_RESHUFFLE:
+        plan = rotation.reshuffle_legs(db, device)
+        if plan is not None:
+            return _finish_reshuffle(db, user, sub, device, plan, body.operator)
+        # Перетасовывать нечего (запас исчерпан) — идём переносить ноду.
+    elif step == rotation.STEP_DUPLICATE:
+        dup = rotation.grant_duplicate_leg(db, device)
+        if dup is not None:
+            return _finish_duplicate(db, user, sub, device, dup, body.operator)
+        # Дубль взять неоткуда — тоже падаем в перенос.
 
     # failover_device сам НЕ банит, но исключает уже забаненные юзером ноды —
     # снимаем протухшие авто-баны, чтобы пул для выбора не сужался навсегда.
