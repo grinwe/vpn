@@ -104,6 +104,72 @@ def _created_after(device, since_raw: str) -> bool:
     return created >= since
 
 
+def _sub_status_banner(sub) -> dict[str, str]:
+    """Блок статуса подписки над списком серверов (Happ: sub-info-*).
+
+    Смысл: человек видит срок и кнопку продления прямо в VPN-клиенте и не идёт
+    за этим в бота. Системный блок Happ (``sub-expire``) не годится — он считает
+    только полные дни и показывается максимум за 3 дня до конца, а нам нужен
+    статус всегда и с часами на финише.
+
+    Цвет несёт смысл: синий — всё в порядке, красный — пора платить. Текст
+    ограничен 200 символами (лимит Happ), кнопка — 25.
+    """
+    if not sub.expires_at:
+        return {}
+
+    left = sub.expires_at - utcnow()
+    total_hours = int(left.total_seconds() // 3600)
+    if left.total_seconds() <= 0:
+        text = "Подписка закончилась. Продлите, чтобы VPN снова заработал."
+        color = "red"
+    elif total_hours < 24:
+        # Часы, а не «0 дней»: на финише это единственная понятная человеку
+        # единица, и именно тут решение о продлении принимается.
+        hours = max(1, total_hours)
+        text = f"Подписка истекает через {_plural_hours(hours)}"
+        color = "red"
+    elif left.days <= 3:
+        text = f"Подписка истекает через {_plural_days(left.days)}"
+        color = "red"
+    else:
+        text = f"Подписка активна до {sub.expires_at.strftime('%d.%m.%Y')}"
+        color = "blue"
+
+    banner = {
+        "sub-info-text": text[:200],
+        "sub-info-color": color,
+    }
+    renew_url = _renew_link()
+    if renew_url:
+        banner["sub-info-button-text"] = "Продлить"
+        banner["sub-info-button-link"] = renew_url
+    return banner
+
+
+def _renew_link() -> str | None:
+    """Куда ведёт кнопка «Продлить» — deep-link в бота на выбор тарифа.
+
+    Именно в бота, а не в мини-апп: Happ открывает ссылку во внешнем браузере,
+    где Telegram WebApp не работает вовсе.
+    """
+    bot = (os.getenv("BOT_USERNAME") or "").strip()
+    return f"https://t.me/{bot}?start=renew" if bot else None
+
+
+def _plural_hours(n: int) -> str:
+    """«1 час / 3 часа / 5 часов» — см. _plural_days."""
+    n = int(n)
+    if 11 <= n % 100 <= 14:
+        return f"{n} часов"
+    tail = n % 10
+    if tail == 1:
+        return f"{n} час"
+    if tail in (2, 3, 4):
+        return f"{n} часа"
+    return f"{n} часов"
+
+
 def _sub_response_headers(
     sub: models.Subscription, token: str, device=None
 ) -> dict[str, str]:
@@ -145,7 +211,29 @@ def _sub_response_headers(
         "pragma": "no-cache",
     }
     if sub.expires_at:
-        headers["subscription-userinfo"] = f"expire={int(sub.expires_at.timestamp())}"
+        # ВСЕ ЧЕТЫРЕ ключа обязательны: Hiddify парсит заголовок только целиком
+        # (upload/download/total/expire) и при неполном наборе игнорирует его —
+        # а заодно теряет support-url и profile-web-page-url, которые цепляет
+        # только к распарсенному userinfo. Мы месяцами отдавали один expire и
+        # в Hiddify не показывали ничего.
+        #
+        # total=0 означает «безлимит» и в Hiddify, и в Happ. Это честно: тарифы
+        # у нас по устройствам, а не по гигабайтам, а per-user трафик мы вообще
+        # не собираем (тик traffic_stats сбрасывает счётчики xray и хранит лишь
+        # сумму по ноде; hysteria2 статистику не отдаёт совсем). Рисовать шкалу
+        # из выдуманных цифр — врать человеку.
+        headers["subscription-userinfo"] = (
+            "upload=0; download=0; total=0; "
+            f"expire={int(sub.expires_at.timestamp())}"
+        )
+    # Иконка Telegram справа в строке подписки (Happ) + ссылка «поддержка».
+    support = _renew_link()
+    if support:
+        headers["support-url"] = support
+    # Пуш-напоминания клиента за 3 дня до конца — бесплатный канал возврата,
+    # который работает даже когда человек отключил уведомления нашего бота.
+    headers["notification-subs-expire"] = "1"
+    headers.update(_sub_status_banner(sub))
     if _autoconnect_enabled(sub, device):
         headers["subscription-autoconnect"] = "true"  # канон (HAPP принимает и "1")
         headers["subscription-autoconnect-type"] = "lowestdelay"
@@ -367,32 +455,52 @@ def _tunnel_blind_node_ids(db: Session, creds) -> set[int]:
 
 
 # Эмодзи по протоколу для display-name эндпоинта в клиенте. Различает протокол
-# ВИЗУАЛЬНО без техножаргона (юзеру не нужны слова Reality/XHTTP — с autoconnect
-# lowestdelay HAPP сам выбирает рабочий). cred.proto — строка с дефисами.
-_PROTO_EMOJI = {
-    "vless-reality": "🛡️",
-    "vless-xhttp": "🌐",
-    "vless-ws-cdn": "☁️",
-    "hysteria2": "🚀",
-    "shadowtls": "🔒",
+# РОЛЬ вместо техножаргона: человеку не нужны слова Reality/XHTTP, ему нужно
+# понимать, что пробовать первым, если основное не пошло. Порядок ролей отражает
+# реальную картину на флоте:
+#   reality   — быстрый и незаметный, но в части регионов ТСПУ его режет;
+#   hysteria2 — UDP/QUIC, вытаскивает как раз те регионы, где TCP-Reality лёг;
+#   xhttp     — за nginx с LE-сертом, снаружи выглядит обычным сайтом;
+#   ws-cdn    — ещё один такой же запасной. Он задумывался «через Cloudflare»,
+#               но CF-проксирование для нас мертво (РКН режет CF-leg), и катаем
+#               мы его напрямую — то есть особой стойкости в нём НЕТ.
+# cred.proto — строка с дефисами.
+_PROTO_LABEL = {
+    "vless-reality": ("⚡", "Основной"),
+    "hysteria2": ("🚀", "Быстрый"),
+    "vless-xhttp": ("🛡️", "Запасной"),
+    "vless-ws-cdn": ("☁️", "Резервный"),
+    "shadowtls": ("🔒", "Резервный"),
 }
-_DEFAULT_PROTO_EMOJI = "⚡"
+_DEFAULT_PROTO_LABEL = ("🌐", "Сервер")
+
+# Порядок в списке = порядок, в котором стоит пробовать руками.
+_PROTO_ORDER = {
+    "vless-reality": 0,
+    "hysteria2": 1,
+    "vless-xhttp": 2,
+    "vless-ws-cdn": 3,
+}
 
 
 def _relabel_uri(uri: str, proto: str, index: int) -> str:
-    """Переписываем #fragment (display-name в клиенте) на нейтральное
-    «{эмодзи} V8 сервер N».
+    """Переписываем #fragment (display-name в клиенте) на «{эмодзи} {роль} N».
 
     Зачем: имя ноды НЕ должно палить страну (юзеры возмущаются «VPN в РФ» —
-    СОРМ/приватность) и НЕ должно быть техножаргоном (Reality/XHTTP). Эмодзи
-    различает протокол, ``index`` — сквозной номер в подписке. RAW UTF-8 (как
+    СОРМ/приватность) и НЕ должно быть техножаргоном (Reality/XHTTP). Раньше все
+    записи звались одинаково «V8 сервер N», и в списке из двенадцати штук
+    человек не мог отличить рабочий вариант от запасного — при ручном выборе
+    это означало тыкать наугад. Роль отвечает ровно на этот вопрос.
+
+    ``index`` — номер сервера (не сквозной номер строки), поэтому «Основной 2» и
+    «Быстрый 2» — это один и тот же сервер разными протоколами. RAW UTF-8 (как
     исходный ``#reality-Russia``), НЕ percent-энкодим: часть клиентов кажет
     %XX буквально. Делается на ОТДАЧЕ сабы (не запекается в cred.config_text) →
-    смена стиля/эмодзи не требует bulk-rebuild, только рефреш сабы у клиента.
+    смена стиля не требует bulk-rebuild, только рефреш сабы у клиента.
     """
-    emoji = _PROTO_EMOJI.get(proto, _DEFAULT_PROTO_EMOJI)
+    emoji, role = _PROTO_LABEL.get(proto, _DEFAULT_PROTO_LABEL)
     base = uri.split("#", 1)[0]
-    return f"{base}#{emoji} V8 сервер {index}"
+    return f"{base}#{emoji} {role} {index}"
 
 
 def _decrypt_configs(
@@ -411,6 +519,10 @@ def _decrypt_configs(
     протоколов вне ``_SPLIT_TUNNEL_PROTOS``, потому что такой эндпоинт
     отдаёт юзеру коннект вообще без VPN (см. ``_tunnel_blind_node_ids``)."""
     out: list[SubLinkConfig] = []
+    # Номер сервера, а не строки: «Основной 2» и «Быстрый 2» должны означать
+    # один и тот же сервер разными протоколами — иначе номера в списке из
+    # двенадцати строк не значат ничего.
+    server_no: dict[int | None, int] = {}
     for cred in creds:
         if not cred.is_active:
             continue
@@ -434,9 +546,10 @@ def _decrypt_configs(
             continue
         decrypted = _decrypt(cred.config_text)
         if decrypted:
+            index = server_no.setdefault(cred.node_id, len(server_no) + 1)
             out.append(SubLinkConfig(
                 protocol=cred.proto,
-                uri=_relabel_uri(decrypted, cred.proto, len(out) + 1),
+                uri=_relabel_uri(decrypted, cred.proto, index),
             ))
         else:
             logger.warning(
@@ -444,6 +557,10 @@ def _decrypt_configs(
                 "(proto=%s, node=%s, device=%s, sub=%s)",
                 cred.id, cred.proto, cred.node_id, device_id, sub.id,
             )
+    # Сверху — то, что стоит пробовать первым. Автовыбор (HAPP lowestdelay) на
+    # порядок не смотрит, но при ручном выборе человек тыкает в первую строку, и
+    # это должен быть основной протокол, а не случайный резервный.
+    out.sort(key=lambda c: _PROTO_ORDER.get(c.protocol, len(_PROTO_ORDER)))
     return out
 
 
@@ -754,7 +871,10 @@ _SOURCE_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 # Внутренние start-ключи бота/вебаппа — НЕ рекламные метки (иначе, напр.,
 # t.me/bot?start=support из вебаппа попал бы в рекламную воронку). ``ref_*``
 # отсекается отдельно (это реферал). Пополнять при новых служебных deep-link'ах.
-_RESERVED_SOURCES = frozenset({"support"})
+# ``renew`` — кнопка «Продлить» из блока статуса в VPN-клиенте (см.
+# _renew_link). Без него метка утекла бы в рекламную воронку и отравила
+# статистику каналов десятками фальшивых «переходов по рекламе».
+_RESERVED_SOURCES = frozenset({"support", "renew"})
 
 
 def _clean_source(raw: str | None) -> str | None:

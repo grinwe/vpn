@@ -402,6 +402,13 @@ async def cmd_start(message: types.Message, state: FSMContext):
         )
         return
 
+    # Deep-link из VPN-клиента: кнопка «Продлить» в блоке статуса подписки
+    # (Happ рисует его по sub-info-*, ссылка ведёт сюда). Человек уже знает,
+    # чего хочет, — показываем тарифы сразу, без приветствия.
+    if len(args) > 1 and args[1].strip() == "renew":
+        await list_plans(message)
+        return
+
     # Deep-link старт-параметр: ``ref_<code>`` — реферал человека (referred_by_id);
     # любой другой непустой payload — рекламная метка (source, first-touch).
     # Бэкенд валидирует/чистит метку, так что прокидываем сыро.
