@@ -1204,6 +1204,10 @@ async def self_report_vpn_broken(message: types.Message) -> None:
     # (репорт 2026-07-26).
     retry_after = data.get("retry_after_sec")
     if devices and retry_after:
+        # Жалобу бэкенд уже зафиксировал сам (devices-by-telegram пишет
+        # complaint_received, когда отвечает троттлом) — здесь только текст для
+        # человека. Раньше на этом месте сигнал терялся совсем: бот молча
+        # показывал «уже перенесли» и на сервер ничего не отправлял.
         mins = max(1, int(retry_after) // 60)
         await message.answer(
             f"👍 Мы уже перенесли тебя на другой сервер пару минут назад.\n\n"

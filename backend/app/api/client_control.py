@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import logging
 import os
+from datetime import timedelta
 from typing import Literal
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Request, status
@@ -939,7 +940,56 @@ def devices_by_telegram(
         left = throttle_min * 60 - elapsed
         if left > 0:
             retry_after = int(left) + 1
+    if retry_after:
+        # Внутри троттла бот показывает «уже перенесли пару минут назад» и
+        # дальше не идёт — то есть сама ЖАЛОБА раньше нигде не оседала. А это
+        # самый частый сценарий («не помогло, жму ещё раз») и главный сигнал
+        # для эскалации: человеку, который жалуется повторно, нужен другой
+        # протокол, а не повторный перенос.
+        _record_complaint(db, user)
     return DevicesByTelegramResponse(devices=live, retry_after_sec=retry_after)
+
+
+# Дребезг ≠ повторная жалоба. Троттл ограничивает ДЕЙСТВИЕ (не переносить чаще
+# раза в N минут), а это окно схлопывает двойные нажатия: человек нетерпелив и
+# жмёт кнопку дважды подряд — жалоба одна. Без дедупа порог эскалации
+# срабатывал бы от одного двойного клика.
+COMPLAINT_DEDUP_SEC = int(os.getenv("COMPLAINT_DEDUP_SEC", "60"))
+
+
+def _record_complaint(db: Session, user, *, proto: str | None = None) -> bool:
+    """Зафиксировать жалобу «VPN не работает». True — записали, False — дребезг.
+
+    Пишем в audit-лог, а не в operator_node_reports: та таблица означает
+    «сделали перенос и следим за исходом», а здесь переноса не было — человека
+    остановил троттл. Смешивать их нельзя, иначе watcher начнёт ждать
+    восстановления от жалобы, по которой ничего не делали.
+    """
+    cutoff = utcnow() - timedelta(seconds=COMPLAINT_DEDUP_SEC)
+    recent = (
+        db.query(models.AuditLog.id)
+        .filter(
+            models.AuditLog.action == "complaint_received",
+            models.AuditLog.target_type == "user",
+            models.AuditLog.target_id == user.id,
+            models.AuditLog.created_at >= cutoff,
+        )
+        .first()
+    )
+    if recent is not None:
+        return False
+    db.add(
+        models.AuditLog(
+            actor=str(user.telegram_id or user.id),
+            actor_type=models.AuditActor.user,
+            action="complaint_received",
+            target_type="user",
+            target_id=user.id,
+            extra={"throttled": True, "proto": proto},
+        )
+    )
+    db.commit()
+    return True
 
 
 class ReportBrokenDeviceByTelegramRequest(BaseModel):
@@ -975,7 +1025,15 @@ def report_broken_device_by_telegram(
     if user is None:
         return ReportBrokenResponse(action="user_not_found")
 
-    device = db.get(models.Device, body.device_id)
+    # FOR UPDATE: два тапа подряд (человек нетерпелив) шли в две параллельные
+    # транзакции, обе видели «переноса ещё не было» и обе его запускали —
+    # устройство успевало переехать дважды, второй раз впустую.
+    device = (
+        db.query(models.Device)
+        .filter(models.Device.id == body.device_id)
+        .with_for_update()
+        .first()
+    )
     if device is None or device.user_id != user.id:
         # Anti-forge: чужое/несуществующее устройство.
         return ReportBrokenResponse(action="no_subscription")

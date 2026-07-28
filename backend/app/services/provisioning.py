@@ -2062,7 +2062,25 @@ class ProvisioningOrchestrator:
                     )
                     return
                 device.status = models.DeviceStatus.active
+                # Активируем ТОЛЬКО те креды, которые эта таска реально
+                # заливала: нода из payload и протоколы из него же. Раньше
+                # ставили is_active всем кредам устройства — то есть любая
+                # apply-таска на одну ноду «воскрешала» и креды других нод, в
+                # том числе намеренно отозванные (после миграции или ротации).
+                # Человек получал в подписке эндпоинты, которых на нодах уже
+                # нет, и они выглядели как «сервер не работает».
+                task_payload = task.payload or {}
+                task_node_id = task_payload.get("node_id")
+                task_protos = {
+                    p.get("proto")
+                    for p in (task_payload.get("protocols") or [])
+                    if isinstance(p, dict) and p.get("proto")
+                }
                 for cred in device.credentials:
+                    if task_node_id is not None and cred.node_id != task_node_id:
+                        continue
+                    if task_protos and cred.proto not in task_protos:
+                        continue
                     cred.is_active = True
                     cred.revoked_at = None
             elif task.action == "revoke":
@@ -4415,6 +4433,21 @@ class ProvisioningOrchestrator:
         excluded = list(exclude_node_ids or [])
         if old_node.id not in excluded:
             excluded.append(old_node.id)
+        # Исключаем и ВТОРИЧНЫЕ ноды подписки, а не только primary: при
+        # диверсификации у человека уже есть креды на нескольких нодах, и
+        # «перенос» мог отправить его ровно туда, где он и так был. Снаружи это
+        # выглядело как «нажал не работает — ничего не изменилось».
+        for cred in (
+            self.db.query(models.Credential)
+            .filter(
+                models.Credential.subscription_id == subscription.id,
+                models.Credential.is_active.is_(True),
+                models.Credential.node_id.isnot(None),
+            )
+            .all()
+        ):
+            if cred.node_id not in excluded:
+                excluded.append(cred.node_id)
 
         if target_node_id is not None:
             if target_node_id == old_node.id:
