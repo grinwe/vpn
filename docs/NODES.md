@@ -22,7 +22,7 @@
 
 | Protocol | Ansible role | Default port | Default SNI | Service |
 |----------|--------------|--------------|-------------|---------|
-| `vless-reality` | [install_vless_reality](../infra/ansible/roles/install_vless_reality) | 9443 | `www.asus.com` | xray |
+| `vless-reality` | [install_vless_reality](../infra/ansible/roles/install_vless_reality) | 9443 (loopback, наружу 443) | авто из пула | xray |
 | `vless-xhttp` | [install_vless_xhttp](../infra/ansible/roles/install_vless_xhttp) | 443 | (TLS fronting domain) | xray |
 | `vless-ws-cdn` | [install_vless_ws_cdn](../infra/ansible/roles/install_vless_ws_cdn) | 443 | (CDN domain) | xray + Cloudflare proxy |
 
@@ -36,7 +36,11 @@
 
 По состоянию на April 2026 (см. таблицу TSPU status в [README.md](../README.md#supported-protocols)):
 
-1. **Primary: VLESS Reality** — основной протокол, per-user isolation + sharing enforcer. Порт 9443 (или high-port 47000+).
+1. **Primary: VLESS Reality** — основной протокол, per-user isolation + sharing enforcer.
+
+   **Порт.** На унифицированной ноде (есть xhttp/ws-cdn, значит есть nginx) reality слушает **loopback:9443**, а клиент подключается на **:443** — nginx stream `ssl_preread` разводит соединения по SNI. Признак режима — `settings.public_port = 443` на reality-конфиге: по нему provisioning выставляет роли `reality_stream_unify` и подставляет 443 в клиентский URI. Ставить 443 во внутренний порт нельзя — nginx уже держит `0.0.0.0:443`, и `127.0.0.1:443` это тот же сокет. На ноде без TCP-фронта reality остаётся публично на своём порту.
+
+   **SNI и dest.** Не задаются руками: при пустом `sni` бэкенд берёт домен из `REALITY_DEST_POOLS` по стране ДЦ и выбирает наименее используемый (`pick_reality_sni`) — per-node рандомизация, чтобы блокировка одного домена не выкосила весь флот. `dest` (он же `fallback` в форме) выводится как `<sni>:443`. Это **не** запасной сервер: `dest` — реальный сайт, к которому xray проксирует чужой трафик и чей TLS-хендшейк Reality выдаёт за свой, поэтому он обязан совпадать с `sni` и держать TLS 1.3 + HTTP/2. Пул ротировали 2026-07-22 после регионального DPI в Яр/Туле.
 2. **VLESS XHTTP** — основной TCP-протокол, обход 16KB curtain ТСПУ.
 3. **Fallback: VLESS+WS+CDN** — через Cloudflare. Работает, пока CF IP'шники в whitelist'е, но это moving target и каждая нода требует отдельного domain-setup'а.
 

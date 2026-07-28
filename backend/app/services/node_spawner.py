@@ -90,6 +90,11 @@ REALITY_DEST_POOL: tuple[str, ...] = REALITY_DEST_POOLS["ru"]
 DEFAULT_REALITY_SNI = os.getenv("REALITY_SNI") or REALITY_DEST_POOL[0]
 DEFAULT_REALITY_DEST = os.getenv("REALITY_DEST", f"{DEFAULT_REALITY_SNI}:443")
 DEFAULT_REALITY_PORT = int(os.getenv("REALITY_PORT", "443"))
+# Порт, на котором reality слушает LOOPBACK, когда нода унифицирована на :443
+# (перед ним nginx stream ssl_preread). Наружу такая нода отдаёт 443 —
+# см. ``public_port`` в ensure_reality_config. На этом порту стоит весь
+# текущий флот, менять без миграции существующих нод нельзя.
+UNIFIED_REALITY_LISTEN_PORT = int(os.getenv("REALITY_UNIFIED_LISTEN_PORT", "9443"))
 _REALITY_SNI_ENV_OVERRIDE: str | None = os.getenv("REALITY_SNI") or None
 
 # Hysteria2 (UDP/QUIC) defaults — used by ``ensure_hysteria2_config``.
@@ -347,19 +352,52 @@ def ensure_reality_config(
         dest_value = DEFAULT_REALITY_DEST
     else:
         dest_value = f"{sni_value}:443"
+    settings: dict[str, object] = {
+        "private_key_enc": encrypt(private_key),
+        "short_id": short_id,
+        "dest": dest_value,
+    }
+    # 443-унификация. Если на ноде уже есть TCP-фронт (xhttp/ws-cdn), значит
+    # там стоит nginx, и reality должен встать за stream ssl_preread: xray
+    # слушает loopback:<port>, клиент ходит на :443, stream разводит по SNI.
+    # ``public_port`` — единственный признак этого режима: по нему
+    # provisioning выставляет ``reality_stream_unify`` роли и подставляет 443
+    # в клиентский URI (см. provisioning.py:319, :731).
+    #
+    # Раньше признак не проставлял НИКТО — весь флот унифицировали разовым
+    # скриптом, а нода, созданная через админку, молча получалась
+    # неунифицированной: reality торчал на 9443 наружу, мимо общего :443.
+    # Нода без nginx-фронта (шаблон «Reality only») остаётся в обычном режиме
+    # — вешать туда stream не на чем.
+    has_tcp_front = any(
+        c.is_enabled
+        and c.protocol
+        in (
+            models.VPNConfigProtocol.vless_xhttp,
+            models.VPNConfigProtocol.vless_ws_cdn,
+        )
+        for c in node.configs
+    )
+    if has_tcp_front:
+        settings["public_port"] = 443
+
+    # Внутренний порт xray. В unify-режиме он ОБЯЗАН отличаться от 443:
+    # nginx слушает 0.0.0.0:443, и 127.0.0.1:443 для xray — это тот же сокет,
+    # то есть кто стартанул вторым, не поднимется. 9443 — то, на чём стоит
+    # весь текущий флот. Явно переданный порт уважаем как есть.
+    listen_port = port or (
+        UNIFIED_REALITY_LISTEN_PORT if has_tcp_front else DEFAULT_REALITY_PORT
+    )
+
     cfg = models.VPNConfig(
         node_id=node.id,
         name=f"{node.name}-vless-reality",
         protocol=models.VPNConfigProtocol.vless_reality,
-        port=port or DEFAULT_REALITY_PORT,
+        port=listen_port,
         sni=sni_value,
         public_key=public_key,
         fallback=dest_value,
-        settings={
-            "private_key_enc": encrypt(private_key),
-            "short_id": short_id,
-            "dest": dest_value,
-        },
+        settings=settings,
         is_enabled=True,
     )
     db.add(cfg)

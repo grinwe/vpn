@@ -2491,11 +2491,21 @@ interface ProtoDraft {
 }
 
 const PROTO_DEFAULTS: Record<CreatableProto, ProtoDraft> = {
+  // sni/fallback ПУСТЫЕ намеренно: бэкенд сам возьмёт домен из регионального
+  // пула REALITY_DEST_POOLS по стране ДЦ и распределит наименее используемый
+  // (pick_reality_sni), а dest выведет как <sni>:443. Хардкод www.asus.com
+  // жил здесь с 0.1 и давно разошёлся с проданными: на флоте ozon/ya/wb/
+  // kinopoisk/avito/rbc/yandex, а пул ротировали 2026-07-22 после
+  // регионального DPI в Яр/Туле.
+  //
+  // Порт 9443 — это порт, который xray слушает на LOOPBACK: нода за
+  // nginx stream ssl_preread, клиент ходит на :443 (443-унификация).
+  // Ставить сюда 443 нельзя — nginx уже держит 0.0.0.0:443.
   "vless-reality": {
     enabled: false,
     port: 9443,
-    sni: "www.asus.com",
-    fallback: "www.asus.com:443",
+    sni: "",
+    fallback: "",
   },
   "vless-ws-cdn": { enabled: false, port: 443, sni: "", fallback: "" },
   "vless-xhttp": { enabled: false, port: 443, sni: "", fallback: "" },
@@ -2966,10 +2976,10 @@ function CreateNodeForm({ onDone }: { onDone: () => void }) {
                   <span className="font-mono text-xs">{p}</span>
                   {isReality && (
                     <span
-                      className="text-[10px] text-slate-500"
-                      title="public_key + short_id бэкенд генерит сам, если оставить пустым"
+                      className="text-[10px] text-emerald-500/80"
+                      title="Ключи, SNI и dest бэкенд подбирает сам. SNI берётся из регионального пула по стране ДЦ (наименее используемый — чтобы блокировка одного домена не выкосила весь флот), dest = <sni>:443. Порт 9443 — это loopback-порт xray за nginx stream: клиент подключается на :443. Вписывать сюда 443 нельзя — его держит nginx."
                     >
-                      (keypair: auto-gen)
+                      (keypair + SNI: auto; :9443 — loopback за nginx, клиент на :443)
                     </span>
                   )}
                   {p === "vless-xhttp" && (
@@ -3023,7 +3033,7 @@ function CreateNodeForm({ onDone }: { onDone: () => void }) {
                           className="bg-slate-800 border border-slate-700 rounded px-2 py-1 font-mono"
                           placeholder={
                             isReality
-                              ? "www.asus.com"
+                              ? "пусто → авто из пула по региону"
                               : "пусто → авто CF-поддомен"
                           }
                           value={d.sni}
@@ -3038,7 +3048,7 @@ function CreateNodeForm({ onDone }: { onDone: () => void }) {
                         </span>
                         <input
                           className="bg-slate-800 border border-slate-700 rounded px-2 py-1 font-mono"
-                          placeholder="www.asus.com:443"
+                          placeholder="пусто → <sni>:443"
                           value={d.fallback}
                           onChange={(e) =>
                             patchProto(p, { fallback: e.target.value })
@@ -3334,7 +3344,7 @@ function EditConfigForm({
         <span className="text-slate-400 mb-1">Fallback (REALITY dest)</span>
         <input
           className="bg-slate-800 border border-slate-700 rounded px-2 py-1 font-mono"
-          placeholder="www.asus.com:443"
+          placeholder="пусто → <sni>:443"
           value={form.fallback ?? ""}
           onChange={(e) =>
             setForm({ ...form, fallback: e.target.value || null })
@@ -4171,7 +4181,8 @@ const PROTOCOL_DEFAULTS: Record<
   CreatableProtocol,
   { port: number; sni: string; name: string }
 > = {
-  "vless-reality": { port: 9443, sni: "www.asus.com", name: "vless-reality" },
+  // sni пустой → бэкенд возьмёт из регионального пула (см. PROTO_DEFAULTS).
+  "vless-reality": { port: 9443, sni: "", name: "vless-reality" },
   "vless-ws-cdn": { port: 443, sni: "", name: "vless-ws-cdn" },
   "vless-xhttp": { port: 443, sni: "", name: "vless-xhttp" },
   hysteria2: { port: 443, sni: "", name: "hysteria2" },

@@ -342,15 +342,25 @@ def create_node_with_configs(
 
     created_configs: list[models.VPNConfig] = []
     try:
-        # hysteria2 создаём ПОСЛЕДНИМ: ensure_hysteria2_config переиспользует
-        # LE-серт уже существующего xhttp/ws-cdn фронта этой ноды (своего ACME
-        # у hy2 на combo-ноде быть не может — он биндит :80/:443 и дерётся с
-        # nginx). Если hy2 приедет в payload раньше своего фронта, cert_path
-        # останется пустым, и нода поднимется с нерабочим hy2 — молча, только
-        # с warning в логах.
+        # Порядок создания несущий: два протокола смотрят на то, что уже есть
+        # на ноде, и получаются неполноценными, если приедут раньше своих
+        # зависимостей. Порядок клиентского JSON-массива к этому отношения
+        # иметь не должен, поэтому раскладываем сами.
+        #
+        #   1. xhttp / ws-cdn — TCP-фронты: ставят nginx и выпускают LE-серт;
+        #   2. reality — по наличию фронта включает 443-унификацию
+        #      (settings.public_port + loopback-listen);
+        #   3. hysteria2 — переиспользует LE-серт фронта (свой ACME у него на
+        #      combo-ноде дерётся с nginx за :80/:443).
+        _CREATE_ORDER = {
+            models.VPNConfigProtocol.vless_ws_cdn.value: 0,
+            models.VPNConfigProtocol.vless_xhttp.value: 0,
+            models.VPNConfigProtocol.vless_reality.value: 1,
+            models.VPNConfigProtocol.hysteria2.value: 2,
+        }
         for cfg_payload in sorted(
             payload.configs,
-            key=lambda c: c.protocol == models.VPNConfigProtocol.hysteria2.value,
+            key=lambda c: _CREATE_ORDER.get(c.protocol, 1),
         ):
             # ensure_hysteria2_config ищет фронт в ``node.configs`` — а это
             # lazy-relationship, закэшированный на момент первой загрузки ноды.
