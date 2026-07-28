@@ -28,7 +28,7 @@
 
 > `shadowtls+shadowsocks` — **deprecated** (0.2, April 2026), роль `install_shadowtls_stack` закомментирована в [site.yml](../infra/ansible/site.yml).
 >
-> `hysteria2` — **реанимирован 22.07.2026**: роль активна (гейт — `hysteria2_port` из БД), backend-API создание разрешает, запрет остался только в admin-UI. С **28.07.2026** умеет split-tunnel наравне с vless-флаворами: на relay-ноде `outbounds[].direct.bindDevice: wgN` + `acl.inline` (РУ → напрямую, остальное → в туннель). До этой даты выпускал весь трафик с российского IP, то есть давал коннект без VPN. Подробности — [infrastructure/nodes.md](infrastructure/nodes.md) «RU-обход» и [operations/ru_split_routing_audit_2026_07_28.md](operations/ru_split_routing_audit_2026_07_28.md).
+> `hysteria2` — **реанимирован 22.07.2026**: роль активна (гейт — `hysteria2_port` из БД), доступен в admin-UI. SNI вводить не нужно: бэкенд берёт домен и LE-серт уже созданного xhttp/ws-cdn фронта той же ноды (свой ACME у hy2 на combo-ноде дерётся с nginx за :80/:443), а obfs-пароль, лимиты полосы и port-hopping генерит сам. С **28.07.2026** умеет split-tunnel наравне с vless-флаворами: на relay-ноде `outbounds[].direct.bindDevice: wgN` + `acl.inline` (РУ → напрямую, остальное → в туннель). До этой даты выпускал весь трафик с российского IP, то есть давал коннект без VPN. Подробности — [infrastructure/nodes.md](infrastructure/nodes.md) «RU-обход» и [operations/ru_split_routing_audit_2026_07_28.md](operations/ru_split_routing_audit_2026_07_28.md).
 
 Источник дефолтов: [admin/src/pages/Nodes.tsx `PROTOCOL_DEFAULTS`](../admin/src/pages/Nodes.tsx). Если меняешь значения в ansible-ролях — синхронизируй оба места, иначе форма в Admin UI будет предлагать не то, что реально поднимется на ноде.
 

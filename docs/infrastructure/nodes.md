@@ -2,7 +2,7 @@
 
 Документ про **ноды-exit'ы**: кто их регистрирует, какой у них жизненный цикл, какие на них роли выполняются и что значит каждая колонка в `VPNNode`. Детали про оркестратор ansible — в `infrastructure/ansible.md`, про орchestration из backend'а — в `components/provisioning.md`. Здесь — перспектива самих нод.
 
-> **Статус протоколов (обновлено 2026-07-28):** `shadowtls_ss` — legacy, роль `install_shadowtls_stack` закомментирована в [site.yml](../../infra/ansible/site.yml). `hysteria2` **реанимирован 22.07.2026**: роль активна в `site.yml` (гейт — `hysteria2_port` из БД), backend-API создание разрешает; запрет остался только в admin-UI и обходится прямым вызовом API. С **28.07.2026** hysteria2 умеет split-tunnel наравне с vless-флаворами (`outbounds[].direct.bindDevice` + `acl.inline` — см. матрицу «протокол × split-tunnel» ниже). До этой даты он на relay-ноде выпускал весь трафик с российского IP, то есть давал коннект без VPN.
+> **Статус протоколов (обновлено 2026-07-28):** `shadowtls_ss` — legacy, роль `install_shadowtls_stack` закомментирована в [site.yml](../../infra/ansible/site.yml). `hysteria2` **реанимирован 22.07.2026**: роль активна в `site.yml` (гейт — `hysteria2_port` из БД); с 28.07.2026 протокол снова доступен и в admin-UI (форма создания ноды + добавление конфига к существующей). С **28.07.2026** hysteria2 умеет split-tunnel наравне с vless-флаворами (`outbounds[].direct.bindDevice` + `acl.inline` — см. матрицу «протокол × split-tunnel» ниже). До этой даты он на relay-ноде выпускал весь трафик с российского IP, то есть давал коннект без VPN.
 
 ## Модель: `VPNNode` и её колонки
 

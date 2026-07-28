@@ -230,6 +230,22 @@ def _build_config_from_payload(
             handshake_domain=payload.sni or None,
             name=payload.name or None,
         )
+    # hysteria2 без явного obfs_password = «авто»-режим: транспортные дефолты
+    # (obfs+пароль парой, лимиты полосы, port-hopping) и переиспользование
+    # LE-серта xhttp/ws-cdn фронта этой ноды. Ветка зеркалит ``create_config``
+    # (одиночный POST /configs) — без неё composite-путь /nodes/with-configs
+    # создавал бы hy2 голым: без obfs, без cert_path, без sni, то есть
+    # заведомо нерабочим. Разъехалось, когда hy2 вернули в UI 2026-07-28.
+    if protocol == models.VPNConfigProtocol.hysteria2 and not (
+        payload.settings or {}
+    ).get("obfs_password"):
+        from ..services.node_spawner import ensure_hysteria2_config
+        return ensure_hysteria2_config(
+            db, node,
+            port=payload.port or None,
+            sni=payload.sni or None,
+            name=payload.name or None,
+        )
 
     settings = dict(payload.settings or {})
     # vless-xhttp: nginx-фронт matchит SNI с settings.domain — без
@@ -326,7 +342,22 @@ def create_node_with_configs(
 
     created_configs: list[models.VPNConfig] = []
     try:
-        for cfg_payload in payload.configs:
+        # hysteria2 создаём ПОСЛЕДНИМ: ensure_hysteria2_config переиспользует
+        # LE-серт уже существующего xhttp/ws-cdn фронта этой ноды (своего ACME
+        # у hy2 на combo-ноде быть не может — он биндит :80/:443 и дерётся с
+        # nginx). Если hy2 приедет в payload раньше своего фронта, cert_path
+        # останется пустым, и нода поднимется с нерабочим hy2 — молча, только
+        # с warning в логах.
+        for cfg_payload in sorted(
+            payload.configs,
+            key=lambda c: c.protocol == models.VPNConfigProtocol.hysteria2.value,
+        ):
+            # ensure_hysteria2_config ищет фронт в ``node.configs`` — а это
+            # lazy-relationship, закэшированный на момент первой загрузки ноды.
+            # Без refresh он не увидит xhttp/ws-cdn, созданные в этом же цикле
+            # секундой раньше, и hy2 останется без домена и сертификата даже
+            # при правильном порядке.
+            db.refresh(node)
             cfg = _build_config_from_payload(db, node, cfg_payload)
             created_configs.append(cfg)
             _audit(

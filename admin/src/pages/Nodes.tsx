@@ -2466,11 +2466,21 @@ function RefreshRealityDestModal({
 // POST /nodes/with-configs → один bootstrap, видящий сразу полный
 // набор протоколов в первом site.yml-проходе.
 
-type CreatableProto = "vless-reality" | "vless-ws-cdn" | "vless-xhttp";
+type CreatableProto =
+  | "vless-reality"
+  | "vless-ws-cdn"
+  | "vless-xhttp"
+  | "hysteria2";
+// hysteria2 ПОСЛЕДНИМ в списке — в этом же порядке конфиги уезжают в
+// /nodes/with-configs, а ensure_hysteria2_config переиспользует LE-серт уже
+// созданного xhttp/ws-cdn фронта (свой ACME у hy2 на combo-ноде дерётся с
+// nginx за :80/:443). Бэкенд дополнительно пересортировывает payload, но
+// порядок здесь держим осмысленным.
 const CREATE_PROTOS: CreatableProto[] = [
   "vless-reality",
   "vless-ws-cdn",
   "vless-xhttp",
+  "hysteria2",
 ];
 
 interface ProtoDraft {
@@ -2489,6 +2499,9 @@ const PROTO_DEFAULTS: Record<CreatableProto, ProtoDraft> = {
   },
   "vless-ws-cdn": { enabled: false, port: 443, sni: "", fallback: "" },
   "vless-xhttp": { enabled: false, port: 443, sni: "", fallback: "" },
+  // UDP/QUIC на том же :443. sni пустой — бэкенд подставит домен xhttp/ws-cdn
+  // вместе с его сертификатом.
+  hysteria2: { enabled: false, port: 443, sni: "", fallback: "" },
 };
 
 type NodeTemplate = "full" | "reality" | "custom";
@@ -2497,6 +2510,7 @@ const TEMPLATE_ENABLED: Record<NodeTemplate, Set<CreatableProto>> = {
     "vless-reality",
     "vless-ws-cdn",
     "vless-xhttp",
+    "hysteria2",
   ]),
   reality: new Set<CreatableProto>(["vless-reality"]),
   custom: new Set<CreatableProto>(),
@@ -2777,6 +2791,7 @@ function CreateNodeForm({ onDone }: { onDone: () => void }) {
         "vless-reality": { ...PROTO_DEFAULTS["vless-reality"] },
         "vless-ws-cdn": { ...PROTO_DEFAULTS["vless-ws-cdn"] },
         "vless-xhttp": { ...PROTO_DEFAULTS["vless-xhttp"] },
+        hysteria2: { ...PROTO_DEFAULTS["hysteria2"] },
       };
       // дефолт = шаблон "full"
       for (const p of TEMPLATE_ENABLED["full"]) init[p].enabled = true;
@@ -2922,7 +2937,9 @@ function CreateNodeForm({ onDone }: { onDone: () => void }) {
               onChange={(e) => applyTemplate(e.target.value as NodeTemplate)}
               className="bg-slate-800 border border-slate-700 rounded px-2 py-1"
             >
-              <option value="full">Full VLESS stack (reality+ws+xhttp)</option>
+              <option value="full">
+                Полный стек (reality+ws+xhttp+hy2)
+              </option>
               <option value="reality">Reality only</option>
               <option value="custom">Custom (ничего по умолчанию)</option>
             </select>
@@ -2969,6 +2986,14 @@ function CreateNodeForm({ onDone }: { onDone: () => void }) {
                       title="бэкенд авто-создаёт CF-поддомен <rand>.wgse.info и проставляет sni — заполнять не нужно. Делит :443 с xhttp, разводятся по SNI."
                     >
                       (sni: auto = CF поддомен)
+                    </span>
+                  )}
+                  {p === "hysteria2" && (
+                    <span
+                      className="text-[10px] text-emerald-500/80"
+                      title="UDP/QUIC на :443 (не конфликтует с TCP-протоколами на том же порту). Пустой sni → бэкенд возьмёт домен и LE-серт уже созданного xhttp/ws-cdn фронта этой ноды: своего ACME у hy2 на combo-ноде быть не может, он дерётся с nginx за :80/:443. Obfs-пароль, лимиты полосы и port-hopping генерятся автоматически."
+                    >
+                      (UDP; sni + серт берутся у xhttp/ws-cdn)
                     </span>
                   )}
                 </label>
@@ -4137,12 +4162,11 @@ function NodeTrafficChart({ nodeId }: { nodeId: number }) {
 // Дефолты под каждый протокол — совпадают с тем, что ставит ansible
 // по дефолту (см. install_vless_reality/defaults). Если операторы
 // начнут менять порты в ролях — синхронизировать здесь.
-// shadowtls+shadowsocks убран из UI (0.2), hysteria2 убран (0.3).
-// Легаси-типы остаются в VPNConfigProtocol для строк со старых нод.
-type CreatableProtocol = Exclude<
-  VPNConfigProtocol,
-  "shadowtls+shadowsocks" | "hysteria2"
->;
+// shadowtls+shadowsocks убран из UI (0.2) — роль отключена и split-tunnel
+// там никто не делал. hysteria2 возвращён 2026-07-28: он снова активен в
+// site.yml и с той же даты умеет split-tunnel на relay-нодах (bindDevice +
+// acl), то есть больше не выпускает трафик мимо туннеля.
+type CreatableProtocol = Exclude<VPNConfigProtocol, "shadowtls+shadowsocks">;
 const PROTOCOL_DEFAULTS: Record<
   CreatableProtocol,
   { port: number; sni: string; name: string }
@@ -4150,6 +4174,7 @@ const PROTOCOL_DEFAULTS: Record<
   "vless-reality": { port: 9443, sni: "www.asus.com", name: "vless-reality" },
   "vless-ws-cdn": { port: 443, sni: "", name: "vless-ws-cdn" },
   "vless-xhttp": { port: 443, sni: "", name: "vless-xhttp" },
+  hysteria2: { port: 443, sni: "", name: "hysteria2" },
 };
 
 function AddConfigForm({
