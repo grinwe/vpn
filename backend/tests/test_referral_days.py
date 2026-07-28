@@ -77,8 +77,8 @@ def test_invitee_gets_days_on_trial(db_session):
 
     _visible_30d_plan(db_session, price=150.0)
     owner = make_user(db_session, telegram_id="owner-1")
-    code = models.ReferralCode(owner_id=owner.id, code="abc123", bonus_days=7,
-                               reward_days=30)
+    code = models.ReferralCode(owner_id=owner.id, code="abc123", bonus_days=3,
+                               reward_days=10)
     db_session.add(code)
     invitee = make_user(db_session, telegram_id="invitee-1")
     invitee.referred_by_id = owner.id
@@ -92,7 +92,7 @@ def test_invitee_gets_days_on_trial(db_session):
         .filter_by(reference=f"referral_signup:{invitee.id}")
         .one()
     )
-    assert invite_tx.amount_kopecks == balance_svc.days_to_kopecks(db_session, 7)
+    assert invite_tx.amount_kopecks == balance_svc.days_to_kopecks(db_session, 3)
 
     owner_rows = (
         db_session.query(models.BalanceTransaction)
@@ -246,8 +246,10 @@ def test_referral_code_defaults_are_current():
     получит «3 дня» там, где мы задумывали месяц."""
     code = models.ReferralCode(owner_id=1, code="x")
     # SQLAlchemy проставляет python-дефолты на flush; проверяем саму колонку.
-    assert models.ReferralCode.__table__.c.reward_days.default.arg == 30
-    assert models.ReferralCode.__table__.c.bonus_days.default.arg == 7
+    # 10 дней = 50 ₽ по прайсу Solo — та же экономика, что была до перехода на
+    # дни; 3 дня приглашённому идут сверх 30 дней триала.
+    assert models.ReferralCode.__table__.c.reward_days.default.arg == 10
+    assert models.ReferralCode.__table__.c.bonus_days.default.arg == 3
     assert code is not None
 
 
@@ -315,3 +317,12 @@ def test_ack_without_body_still_works(db_session, client):
     assert resp.status_code == 200, resp.text
     db_session.refresh(log)
     assert log.action == "config_ready:delivered"
+
+
+def test_reward_matches_previous_flat_sum(db_session):
+    """Смысл перехода на дни — назвать ту же сумму весомее, а не потратить
+    больше. 10 дней по прайсу Solo обязаны равняться прежним 50 ₽."""
+    _visible_30d_plan(db_session, price=150.0)
+    assert balance_svc.days_to_kopecks(db_session, balance_svc.REFERRAL_REWARD_DAYS) == 5000
+    # Приглашённому — втрое меньше: он ещё не заплатил, и это сверх триала.
+    assert balance_svc.days_to_kopecks(db_session, balance_svc.REFERRAL_INVITEE_DAYS) == 1500

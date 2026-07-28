@@ -35,12 +35,18 @@ logger = logging.getLogger(__name__)
 FREEZE_DAYS = int(os.getenv("FREEZE_DAYS", "14"))
 REFERRAL_BONUS_KOPECKS = int(os.getenv("REFERRAL_BONUS_KOPECKS", "5000"))
 # Награда рефереру — в ДНЯХ подписки, начисляется когда приглашённый ВПЕРВЫЕ
-# заплатил (см. api/invoices.py). Дни, а не рубли: стоят нам маржи, читаются
-# понятнее и не обесцениваются при смене прайса.
-REFERRAL_REWARD_DAYS = int(os.getenv("REFERRAL_REWARD_DAYS", "30"))
-# Подарок приглашённому при активации триала — меньше, чем рефереру: он ещё
-# ничего не заплатил, и щедрость здесь оплачивает фарм триалов, а не рост.
-REFERRAL_INVITEE_DAYS = int(os.getenv("REFERRAL_INVITEE_DAYS", "7"))
+# заплатил (см. api/invoices.py).
+#
+# 10 дней = 50 ₽ по текущему прайсу (Solo 150 ₽ / 30 дней) — ровно та сумма,
+# которую платили фиксированной константой до перехода на дни. Экономика не
+# изменилась, но «10 дней подписки» звучит весомее, чем «50 ₽»: в этом и смысл
+# перехода на дни, а не в увеличении расходов. Месяц в подарок (150 ₽ при
+# платеже приглашённого 150 ₽) съедал бы первый платёж целиком.
+REFERRAL_REWARD_DAYS = int(os.getenv("REFERRAL_REWARD_DAYS", "10"))
+# Подарок приглашённому при активации триала — сверх 30 дней самого триала, и
+# он ещё ничего не заплатил. Поэтому втрое меньше награды реферера: щедрость
+# здесь оплачивает фарм триалов, а не рост.
+REFERRAL_INVITEE_DAYS = int(os.getenv("REFERRAL_INVITEE_DAYS", "3"))
 TRIAL_DURATION_DAYS = int(os.getenv("TRIAL_DURATION_DAYS", "30"))
 TRIAL_EXPIRY_WARN_DAYS = int(os.getenv("TRIAL_EXPIRY_WARN_DAYS", "3"))
 MIN_TOPUP_KOPECKS = int(os.getenv("MIN_TOPUP_KOPECKS", "10000"))

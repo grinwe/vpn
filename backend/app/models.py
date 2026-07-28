@@ -1272,8 +1272,8 @@ class ReferralCode(Base):
     # Размеры подарков в днях подписки. До 2026-07-27 поля не читались вообще
     # (награда была фиксированной суммой), поэтому у старых кодов тут лежит
     # исторический дефолт 3 — миграция 0064 подтягивает их к текущим значениям.
-    bonus_days = Column(Integer, default=7)
-    reward_days = Column(Integer, default=30)
+    bonus_days = Column(Integer, default=3)
+    reward_days = Column(Integer, default=10)
     uses = Column(Integer, default=0)
     max_uses = Column(Integer, nullable=True)
     is_active = Column(Boolean, default=True)
