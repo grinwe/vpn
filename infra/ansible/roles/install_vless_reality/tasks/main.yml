@@ -55,6 +55,7 @@
       - ca-certificates
     state: present
     update_cache: yes
+    cache_valid_time: 3600
 
 # 443-унификация PREFLIGHT — модуль nginx-stream ОБЯЗАН стоять ДО того, как reality
 # уедет на loopback и в nginx.conf вставится stream{}. Инцидент 4vds-ru-01

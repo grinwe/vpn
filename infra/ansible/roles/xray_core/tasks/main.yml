@@ -1,64 +1,85 @@
 ---
-# Install xray-core with CDN-fallback chain. Заменяет inline-вызов
-# upstream's install-release.sh из install_vless_reality (тот висел
-# 5 минут SSL timeout'ом на RU-провайдерах, где curl к github не
-# проходит). Делает то же что upstream installer, но fetch — через
-# ghproxy.com с fallback'ом на direct github.
+# Роль подключается из нескольких протокольных ролей (reality/xhttp/ws-cdn), то есть за
+# один прогон site.yml вызывается 3 раза подряд. Работу она делает ровно один
+# раз — все таски идемпотентны, — но каждый повтор всё равно стоит своих
+# SSH-round-trip'ов по ~1с на таску. На bootstrap'е ноды это ~15с чистых
+# накладных расходов из ~316с (замер profile_tasks, 2026-07-28).
+#
+# Гард — block+when, а НЕ `meta: end_role`: последний появился только в
+# ansible-core 2.18 и на более старом контроллере роль просто падает
+# («invalid meta action»). requirements-worker допускает >=2.16.
+#
+# Флаг живёт в пределах одного play: set_fact без cacheable в fact_caching не
+# попадает, поэтому следующий прогон отработает роль заново, а точечный вызов
+# из отдельного плейбука не ломается.
+- name: Xray-core — provision once per run
+  when: not (_xray_core_provisioned | default(false) | bool)
+  block:
+    # Install xray-core with CDN-fallback chain. Заменяет inline-вызов
+    # upstream's install-release.sh из install_vless_reality (тот висел
+    # 5 минут SSL timeout'ом на RU-провайдерах, где curl к github не
+    # проходит). Делает то же что upstream installer, но fetch — через
+    # ghproxy.com с fallback'ом на direct github.
 
-- name: Ensure unzip + curl installed (xray-core install deps)
-  ansible.builtin.apt:
-    name: [unzip, curl]
-    state: present
-    update_cache: yes
+    - name: Ensure unzip + curl installed (xray-core install deps)
+      ansible.builtin.apt:
+        name: [unzip, curl]
+        state: present
+        update_cache: yes
+        cache_valid_time: 3600
 
-- name: Ensure xray data directory
-  ansible.builtin.file:
-    path: /usr/local/share/xray
-    state: directory
-    owner: root
-    group: root
-    mode: '0755'
+    - name: Ensure xray data directory
+      ansible.builtin.file:
+        path: /usr/local/share/xray
+        state: directory
+        owner: root
+        group: root
+        mode: '0755'
 
-- name: Stage xray-core fetcher
-  ansible.builtin.copy:
-    src: xray-core-fetch.sh
-    dest: /usr/local/bin/xray-core-fetch.sh
-    owner: root
-    group: root
-    mode: '0755'
+    - name: Stage xray-core fetcher
+      ansible.builtin.copy:
+        src: xray-core-fetch.sh
+        dest: /usr/local/bin/xray-core-fetch.sh
+        owner: root
+        group: root
+        mode: '0755'
 
-- name: Install / refresh xray-core ({{ xray_core_version }})
-  ansible.builtin.command: >-
-    /usr/local/bin/xray-core-fetch.sh
-    {{ xray_core_version }}
-    {{ xray_core_sha256 | default('') }}
-  register: xray_core_fetch
-  changed_when: "'установлен:' in xray_core_fetch.stdout"
-  failed_when: xray_core_fetch.rc != 0
+    - name: Install / refresh xray-core ({{ xray_core_version }})
+      ansible.builtin.command: >-
+        /usr/local/bin/xray-core-fetch.sh
+        {{ xray_core_version }}
+        {{ xray_core_sha256 | default('') }}
+      register: xray_core_fetch
+      changed_when: "'установлен:' in xray_core_fetch.stdout"
+      failed_when: xray_core_fetch.rc != 0
 
-# Свежий бинарь сам по себе не подхватывается: хэндлеры протокольных ролей
-# рестартуют сервисы только при изменении config.json/юнита, а страховочный
-# force-restart — только если сервис inactive. Поэтому после реальной
-# установки (условие = changed_when задачи выше) рестартуем все активные
-# xray-юниты прямо здесь. Двойной рестарт от хэндлеров ниже по прогону
-# безопасен (~100ms downtime).
-- name: Restart running xray services after core update
-  ansible.builtin.shell: |
-    for svc in xray xray-ws-cdn xray-xhttp; do
-      if systemctl is-active --quiet "${svc}" 2>/dev/null; then
-        systemctl restart "${svc}"
-      fi
-    done
-  args:
-    executable: /bin/bash
-  changed_when: true
-  when: "'установлен:' in xray_core_fetch.stdout"
+    # Свежий бинарь сам по себе не подхватывается: хэндлеры протокольных ролей
+    # рестартуют сервисы только при изменении config.json/юнита, а страховочный
+    # force-restart — только если сервис inactive. Поэтому после реальной
+    # установки (условие = changed_when задачи выше) рестартуем все активные
+    # xray-юниты прямо здесь. Двойной рестарт от хэндлеров ниже по прогону
+    # безопасен (~100ms downtime).
+    - name: Restart running xray services after core update
+      ansible.builtin.shell: |
+        for svc in xray xray-ws-cdn xray-xhttp; do
+          if systemctl is-active --quiet "${svc}" 2>/dev/null; then
+            systemctl restart "${svc}"
+          fi
+        done
+      args:
+        executable: /bin/bash
+      changed_when: true
+      when: "'установлен:' in xray_core_fetch.stdout"
 
-- name: Install xray.service systemd unit
-  ansible.builtin.copy:
-    src: xray.service
-    dest: /etc/systemd/system/xray.service
-    owner: root
-    group: root
-    mode: '0644'
-  notify: reload systemd
+    - name: Install xray.service systemd unit
+      ansible.builtin.copy:
+        src: xray.service
+        dest: /etc/systemd/system/xray.service
+        owner: root
+        group: root
+        mode: '0644'
+      notify: reload systemd
+
+    - name: Mark xray-core as provisioned for this run
+      ansible.builtin.set_fact:
+        _xray_core_provisioned: true

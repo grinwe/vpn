@@ -67,6 +67,7 @@
       - nginx
     state: present
     update_cache: yes
+    cache_valid_time: 3600
 
 # xray-core: self-install через mirror-backed роль xray_core (идемпотентно;
 # на combo-нодах xray_core скипнется при той же версии). Раньше был

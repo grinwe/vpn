@@ -82,6 +82,7 @@
       - iptables-persistent
     state: present
     update_cache: yes
+    cache_valid_time: 3600
     lock_timeout: 600
 
 # ── Открыть 22/80/443 на iptables-уровне ────────────────────────────

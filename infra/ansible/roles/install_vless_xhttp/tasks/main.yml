@@ -34,6 +34,7 @@
     name: [curl, unzip, jq, ca-certificates]
     state: present
     update_cache: yes
+    cache_valid_time: 3600
 
 # ── Stage-4 anti-probing front: nginx ───────────────────────────────
 #
