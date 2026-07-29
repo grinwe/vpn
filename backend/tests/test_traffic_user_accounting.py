@@ -108,6 +108,41 @@ def test_persist_node_result_applies_user_bytes(db_session):
     assert sample.details["vless-reality"]["user_bytes"] == {"user-1-1": 100}
 
 
+def test_accounting_failure_never_drowns_the_sample(db_session, monkeypatch):
+    """Счётчик — информационный, сэмпл — нет. Ошибка учёта (неприменённая
+    миграция, транзиентный сбой БД) не должна утопить NodeTrafficSample:
+    счётчики на ноде уже деструктивно сброшены, интервал не восстановить.
+    Изоляция — SAVEPOINT: голый try/except не спас бы, упавший UPDATE
+    отравляет транзакцию Postgres целиком."""
+    from sqlalchemy import text
+
+    from app.services import traffic_stats
+    from app.services.traffic_stats import _persist_node_result
+
+    node, sub = _sub_with_creds(db_session)
+
+    def _boom(session, *_args, **_kw):
+        # Реалистичный отказ: кривой SQL отравляет транзакцию (как
+        # ProgrammingError от отсутствующей колонки), а не питоний raise.
+        session.execute(text("SELECT no_such_column FROM subscriptions"))
+
+    monkeypatch.setattr(traffic_stats, "_apply_user_traffic", _boom)
+    result = NodeStatsResult(
+        uplink_bytes=1, downlink_bytes=1, active_users=1,
+        per_protocol={"vless-reality": ProtocolStats(
+            uplink=1, downlink=1, users={"user-1-1"}, user_bytes={"user-1-1": 2},
+        )},
+    )
+    _persist_node_result(db_session, node, result, interval_seconds=300)
+    db_session.commit()  # упало бы с InFailedSqlTransaction без сейвпоинта
+    assert (
+        db_session.query(models.NodeTrafficSample)
+        .filter_by(node_id=node.id).count() == 1
+    )
+    db_session.refresh(sub)
+    assert sub.traffic_used_bytes == 0  # дельта интервала честно потеряна
+
+
 def test_renewal_resets_the_meter(db_session):
     """Продление = новый оплаченный период = шкала с нуля."""
     from app.services import balance

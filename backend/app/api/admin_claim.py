@@ -252,6 +252,9 @@ def claim_orphan(
     sub.user_id = target_user.id
     sub.plan_id = plan.id
     sub.expires_at = new_expires
+    # Смена владельца: накопленные байты — расход ПРЕЖНЕГО владельца, новому
+    # они показали бы чужой трафик на только что начавшемся периоде.
+    sub.traffic_used_bytes = 0
     sub.updated_at = now
     for d in all_devices:
         d.user_id = target_user.id

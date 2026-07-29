@@ -609,7 +609,9 @@ def _apply_user_traffic(session, node, user_bytes: dict[str, int]) -> int:
             continue
         per_sub[sub_id] = per_sub.get(sub_id, 0) + delta
 
-    for sub_id, delta in per_sub.items():
+    # sorted — детерминированный порядок блокировок: два конкурентных
+    # применения (тик другой ноды, ручной refresh) не встанут в deadlock.
+    for sub_id, delta in sorted(per_sub.items()):
         # Атомарный SQL-инкремент: тик может толкаться с продлением
         # (обнуление) и с параллельным тиком по другой ноде.
         session.query(models.Subscription).filter(
@@ -644,7 +646,22 @@ def _persist_node_result(session, node, result: NodeStatsResult, interval_second
     )
     session.add(sample)
 
-    _apply_user_traffic(session, node, result.merged_user_bytes())
+    # Изоляция обязательна: счётчик — информационный, а сэмпл — нет. Ошибка
+    # здесь (миграция 0066 не применилась — воркер переживает падение
+    # run_migrations и едет дальше; транзиентный сбой БД) без изоляции
+    # утопила бы в rollback весь нодовый сэмпл и sharing-аудит, при том что
+    # счётчики на ноде уже деструктивно сброшены — интервал не восстановить.
+    # Именно SAVEPOINT (begin_nested), а не голый try/except: упавший UPDATE
+    # отравляет транзакцию Postgres, и без отката к сейвпоинту коммит сэмпла
+    # упал бы следом с InFailedSqlTransaction.
+    try:
+        with session.begin_nested():
+            _apply_user_traffic(session, node, result.merged_user_bytes())
+    except Exception:  # noqa: BLE001 — сэмпл дороже счётчика
+        logger.exception(
+            "traffic accounting failed for node %s — sample kept, deltas of "
+            "this interval lost", node.id,
+        )
 
     # Ingest sharing violations into AuditLog for admin visibility
     # and user-facing notifications (via bot notification poller).

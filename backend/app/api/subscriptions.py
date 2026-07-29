@@ -644,6 +644,10 @@ def enable_subscription(
         if sub.expires_at is None or sub.expires_at < now:
             days = sub.plan.duration_days if sub.plan else 30
             sub.expires_at = now + timedelta(days=days)
+            # Подарен новый период — шкала трафика начинает с нуля (как и в
+            # остальных точках продления). Ветка blocked-с-живым-сроком
+            # период не дарит, там и сброса нет.
+            sub.traffic_used_bytes = 0
         sub.status = models.SubscriptionStatus.active
         sub.notes = None
         sub.next_charge_at = now
