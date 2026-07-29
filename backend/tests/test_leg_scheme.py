@@ -245,3 +245,59 @@ def test_sub_link_shows_only_published_legs(monkeypatch):
     labels = [c.uri.split("#", 1)[1] for c in out]
     assert any("Основной" in lb for lb in labels)
     assert any("Быстрый" in lb for lb in labels)
+
+
+# ── Э6: перевод существующих устройств ──────────────────────────────────────
+
+
+def test_backfill_relays_legacy_device_with_enough_nodes(db_session, monkeypatch):
+    """Ключевой случай перехода: у девайса ноды уже набраны, но публикуются ВСЕ
+    протоколы (легаси-мир, 12 строк). Добирать нечего — а переразложить надо,
+    иначе переход на 4×1 обошёл бы стороной ровно тех, у кого набор широкий.
+    """
+    from app.services.provisioning import ProvisioningOrchestrator
+
+    monkeypatch.setenv("SUB_LEG_SCHEME", "4x1")
+    monkeypatch.setenv("DIVERSE_SUB_NODES", "1")
+    device = _device_with_creds(
+        db_session, {"a": ALL_PROTOS, "b": ALL_PROTOS, "c": ALL_PROTOS, "d": ALL_PROTOS}
+    )
+    device.status = models.DeviceStatus.active
+    sub = device.subscription
+    sub.status = models.SubscriptionStatus.active
+    db_session.commit()
+
+    orch = ProvisioningOrchestrator(db_session)
+    result = orch.backfill_diverse_subscriptions(
+        dry_run=False, user_id=sub.user_id, limit=10
+    )
+
+    assert result["leg_scheme"] == "4x1"
+    assert result["legs_relaid"] >= 1
+    db_session.refresh(device)
+    published = [c for c in device.credentials if c.leg_published]
+    assert len(published) == 4
+    assert len({c.node_id for c in published}) == 4
+
+
+def test_backfill_dry_run_changes_nothing(db_session, monkeypatch):
+    from app.services.provisioning import ProvisioningOrchestrator
+
+    monkeypatch.setenv("SUB_LEG_SCHEME", "4x1")
+    monkeypatch.setenv("DIVERSE_SUB_NODES", "1")
+    device = _device_with_creds(
+        db_session, {"a": ALL_PROTOS, "b": ALL_PROTOS, "c": ALL_PROTOS, "d": ALL_PROTOS}
+    )
+    device.status = models.DeviceStatus.active
+    sub = device.subscription
+    sub.status = models.SubscriptionStatus.active
+    db_session.commit()
+
+    orch = ProvisioningOrchestrator(db_session)
+    result = orch.backfill_diverse_subscriptions(
+        dry_run=True, user_id=sub.user_id, limit=10
+    )
+
+    assert result["legs_relaid"] >= 1, "dry-run обязан показать охват"
+    db_session.refresh(device)
+    assert all(c.leg_published for c in device.credentials), "dry-run не мутирует"

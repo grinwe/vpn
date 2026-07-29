@@ -1103,6 +1103,8 @@ def diverse_backfill(
             metadata={
                 "processed": result["processed"],
                 "nodes_added": result["nodes_added"],
+                "legs_relaid": result.get("legs_relaid"),
+                "legs_incomplete": result.get("legs_incomplete"),
                 "eligible_total": result["eligible_total"],
                 "limit": body.limit,
                 "user_id": body.user_id,

@@ -11,6 +11,7 @@ This module adds endpoints for:
 """
 from __future__ import annotations
 
+import base64
 import logging
 import os
 import re
@@ -104,6 +105,38 @@ def _created_after(device, since_raw: str) -> bool:
     return created >= since
 
 
+def _header_safe(value: str) -> str:
+    """Значение HTTP-заголовка, которое гарантированно уедет клиенту.
+
+    HTTP-заголовки — latin-1, и Starlette падает с UnicodeEncodeError на любой
+    кириллице: не «заголовок потерялся», а ВЕСЬ ответ подписки превращается в
+    500, то есть VPN перестаёт настраиваться у всех разом. Ровно это и
+    случилось с блоком статуса, где текст по определению русский.
+
+    Кодируем как ``base64:<...>`` — форма из документации Happ (announce).
+    Санитайзер общий на все заголовки намеренно: следующий русский текст в
+    заголовке появится обязательно, и он не должен ронять выдачу.
+    """
+    try:
+        value.encode("latin-1")
+    except (UnicodeEncodeError, AttributeError):
+        return "base64:" + base64.b64encode(str(value).encode("utf-8")).decode()
+    return value
+
+
+def _status_banner_enabled() -> bool:
+    """Рубильник блока статуса.
+
+    Нужен, потому что отрисовка ``base64:``-значений — единственное, что мы не
+    можем проверить со своей стороны: это делает чужой клиент. Если Happ
+    покажет вместо текста абракадабру, выключение обязано стоить одну
+    переменную окружения, а не откат релиза.
+    """
+    return (os.getenv("SUB_STATUS_BANNER") or "1").strip().lower() not in (
+        "0", "false", "off", "no",
+    )
+
+
 def _sub_status_banner(sub) -> dict[str, str]:
     """Блок статуса подписки над списком серверов (Happ: sub-info-*).
 
@@ -115,10 +148,16 @@ def _sub_status_banner(sub) -> dict[str, str]:
     Цвет несёт смысл: синий — всё в порядке, красный — пора платить. Текст
     ограничен 200 символами (лимит Happ), кнопка — 25.
     """
-    if not sub.expires_at:
+    expires_at = sub.expires_at
+    if not expires_at:
         return {}
 
-    left = sub.expires_at - utcnow()
+    # Приводим к naive-UTC перед вычитанием: в БД срок лежит naive, но приезжает
+    # он и из кода, где datetime собирают с tzinfo, а смешивать их нельзя —
+    # TypeError тут означает 500 на всей выдаче подписки, а не кривой баннер.
+    if expires_at.tzinfo is not None:
+        expires_at = expires_at.astimezone(timezone.utc).replace(tzinfo=None)
+    left = expires_at - utcnow()
     total_hours = int(left.total_seconds() // 3600)
     if left.total_seconds() <= 0:
         text = "Подписка закончилась. Продлите, чтобы VPN снова заработал."
@@ -133,7 +172,7 @@ def _sub_status_banner(sub) -> dict[str, str]:
         text = f"Подписка истекает через {_plural_days(left.days)}"
         color = "red"
     else:
-        text = f"Подписка активна до {sub.expires_at.strftime('%d.%m.%Y')}"
+        text = f"Подписка активна до {expires_at.strftime('%d.%m.%Y')}"
         color = "blue"
 
     banner = {
@@ -218,10 +257,10 @@ def _sub_response_headers(
         # в Hiddify не показывали ничего.
         #
         # total=0 означает «безлимит» и в Hiddify, и в Happ. Это честно: тарифы
-        # у нас по устройствам, а не по гигабайтам, а per-user трафик мы вообще
-        # не собираем (тик traffic_stats сбрасывает счётчики xray и хранит лишь
-        # сумму по ноде; hysteria2 статистику не отдаёт совсем). Рисовать шкалу
-        # из выдуманных цифр — врать человеку.
+        # у нас по устройствам, а не по гигабайтам, а per-user трафик мы не
+        # накапливаем — тик traffic_stats сбрасывает счётчики (xray `--reset`,
+        # hysteria `?clear=1`) и хранит лишь сумму по ноде за интервал. Рисовать
+        # шкалу из выдуманных цифр — врать человеку.
         headers["subscription-userinfo"] = (
             "upload=0; download=0; total=0; "
             f"expire={int(sub.expires_at.timestamp())}"
@@ -233,14 +272,18 @@ def _sub_response_headers(
     # Пуш-напоминания клиента за 3 дня до конца — бесплатный канал возврата,
     # который работает даже когда человек отключил уведомления нашего бота.
     headers["notification-subs-expire"] = "1"
-    headers.update(_sub_status_banner(sub))
+    if _status_banner_enabled():
+        headers.update(_sub_status_banner(sub))
     if _autoconnect_enabled(sub, device):
         headers["subscription-autoconnect"] = "true"  # канон (HAPP принимает и "1")
         headers["subscription-autoconnect-type"] = "lowestdelay"
     fallback = (os.getenv("SUB_LINK_FALLBACK_BASE_URL") or "").strip().rstrip("/")
     if fallback and token:
         headers["fallback-url"] = f"{fallback}/{token}"
-    return headers
+    # Последним рубежом, а не точечно у баннера: заголовок с кириллицей роняет
+    # ВЕСЬ ответ подписки в 500 (latin-1), и цена промаха тут — «VPN не
+    # настраивается ни у кого», а не «пропала одна подпись».
+    return {k: _header_safe(v) for k, v in headers.items()}
 
 
 def ensure_referral_code(db: Session, user) -> "models.ReferralCode":

@@ -183,3 +183,36 @@ def test_server_numbers_are_per_node_and_order_is_by_role(db_session):
         host = body.split("@", 1)[1]
         number = label.split()[-1]
         assert host_by_number.setdefault(number, host) == host, (number, host)
+
+
+# ── заголовки обязаны уезжать клиенту ───────────────────────────────────────
+
+
+def test_headers_are_latin1_encodable():
+    """HTTP-заголовки — latin-1. Кириллица в них роняет ВЕСЬ ответ подписки в
+    500: не «пропала подпись», а «VPN не настраивается ни у кого». Именно так
+    блок статуса и сломал выдачу до этой проверки."""
+    headers = _sub_response_headers(_Sub(timedelta(days=5)), "tok")
+    for key, value in headers.items():
+        key.encode("latin-1")
+        value.encode("latin-1")  # упадёт ровно на том, что уронило бы прод
+
+
+def test_russian_text_goes_as_base64():
+    """Форма из документации Happ (announce): ``base64:<...>``."""
+    import base64 as b64
+
+    headers = _sub_response_headers(_Sub(timedelta(days=5)), "tok")
+    text = headers["sub-info-text"]
+    assert text.startswith("base64:")
+    decoded = b64.b64decode(text.split(":", 1)[1]).decode("utf-8")
+    assert "Подписка" in decoded
+
+
+def test_banner_can_be_switched_off(monkeypatch):
+    """Отрисовку base64 делает чужой клиент, проверить её со своей стороны
+    нельзя — значит выключение обязано стоить переменную окружения, а не
+    откат релиза."""
+    monkeypatch.setenv("SUB_STATUS_BANNER", "0")
+    headers = _sub_response_headers(_Sub(timedelta(days=5)), "tok")
+    assert not any(k.startswith("sub-info") for k in headers)

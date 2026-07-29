@@ -22,11 +22,12 @@ import os
 from datetime import timedelta
 from typing import Any
 
-from sqlalchemy import func
+from sqlalchemy import and_, func
 from sqlalchemy.orm import Session
 
 from .. import models
 from ..time_utils import utcnow
+from . import leg_scheme
 
 
 def _sample_usernames(sample: models.NodeTrafficSample | None) -> set[str]:
@@ -44,6 +45,31 @@ def _sample_usernames(sample: models.NodeTrafficSample | None) -> set[str]:
         for u in users:
             if isinstance(u, str) and u:
                 out.add(u)
+    return out
+
+
+def _sample_usernames_by_proto(
+    sample: models.NodeTrafficSample | None,
+) -> dict[str, set[str]]:
+    """То же, что ``_sample_usernames``, но с разбивкой по протоколу.
+
+    При схеме 4×1 на ноду приходится ОДИН протокол, поэтому общий по ноде
+    carrying перестаёт отвечать на главный вопрос — «что именно тут режут».
+    Разбивка отвечает: провал по xhttp при живом reality — это блокировка
+    транспорта, а не смерть ноды, и лечится она перетасовкой, а не заменой IP.
+    """
+    out: dict[str, set[str]] = {}
+    if sample is None:
+        return out
+    for proto, payload in (sample.details or {}).items():
+        if proto == "_errors" or not isinstance(payload, dict):
+            continue
+        users = payload.get("users")
+        if not isinstance(users, list):
+            continue
+        found = {u for u in users if isinstance(u, str) and u}
+        if found:
+            out[proto] = found
     return out
 
 
@@ -70,6 +96,13 @@ def _healthy_device_count(db: Session, node_id: int, extra: Any = None) -> int:
             models.Subscription.status == models.SubscriptionStatus.active,
         )
     )
+    if leg_scheme.leg_scheme_enabled():
+        # При 4×1 активных кредов на ноде у девайса четыре, а ОТДАН ему один.
+        # Считать знаменатель по всем активным значит записать в «у кого нода
+        # доступна» тех, кому с неё не отдано ничего, — знаменатель раздувается
+        # вчетверо, а carrying_fraction ровно на столько же топится. Метрика
+        # начала бы кричать «нода мертва» на здоровом флоте.
+        q = q.filter(models.Credential.leg_published.is_(True))
     if extra is not None:
         q = q.filter(extra)
     return int(q.scalar() or 0)
@@ -107,6 +140,7 @@ def compute_carrying_fractions(db: Session) -> list[dict[str, Any]]:
             and sample.observed_at is not None
             and sample.observed_at < utcnow() - timedelta(minutes=max_age_min)
         )
+        by_proto_users = _sample_usernames_by_proto(sample)
         usernames = _sample_usernames(sample)
         if usernames:
             # Тот же фильтр «живых» девайсов, что и в eligible (is_active +
@@ -133,6 +167,71 @@ def compute_carrying_fractions(db: Session) -> list[dict[str, Any]]:
                 "carrying_fraction": frac,
                 "sample_at": sample.observed_at.isoformat() if sample else None,
                 "stale": stale,
+                "by_protocol": _per_protocol_fractions(
+                    db, node.id, by_proto_users, stale=stale
+                ),
             }
         )
     return out
+
+
+def _per_protocol_fractions(
+    db: Session,
+    node_id: int,
+    by_proto_users: dict[str, set[str]],
+    *,
+    stale: bool,
+) -> list[dict[str, Any]]:
+    """carrying по каждому протоколу, который нода реально кому-то отдаёт.
+
+    Знаменатель — девайсы, у кого ЭТОТ протокол с этой ноды в наборе; числитель
+    — из них те, кто в последнем сэмпле светился именно по нему. Это и есть
+    ответ на «режут транспорт или умерла нода»: в первом случае проваливается
+    одна строка, во втором — все сразу.
+    """
+    rows: list[dict[str, Any]] = []
+    protos = (
+        db.query(models.Credential.proto)
+        .join(models.Device, models.Credential.device_id == models.Device.id)
+        .join(
+            models.Subscription,
+            models.Device.subscription_id == models.Subscription.id,
+        )
+        .filter(
+            models.Credential.node_id == node_id,
+            models.Credential.is_active.is_(True),
+            models.Device.status == models.DeviceStatus.active,
+            models.Subscription.status == models.SubscriptionStatus.active,
+        )
+    )
+    if leg_scheme.leg_scheme_enabled():
+        protos = protos.filter(models.Credential.leg_published.is_(True))
+    for (proto,) in protos.distinct().all():
+        eligible = _healthy_device_count(
+            db, node_id, extra=models.Credential.proto == proto
+        )
+        users = by_proto_users.get(proto) or set()
+        carrying = (
+            _healthy_device_count(
+                db,
+                node_id,
+                extra=and_(
+                    models.Credential.proto == proto,
+                    models.Credential.access_username.in_(list(users)),
+                ),
+            )
+            if users
+            else 0
+        )
+        rows.append(
+            {
+                "proto": proto,
+                "eligible_devices": int(eligible),
+                "carrying_devices": int(carrying),
+                "carrying_fraction": (
+                    None if stale else (round(carrying / eligible, 3) if eligible else None)
+                ),
+            }
+        )
+    rows.sort(key=lambda r: r["proto"])
+    return rows

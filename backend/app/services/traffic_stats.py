@@ -64,6 +64,13 @@ KNOWN_PROTOCOL_PORTS: list[tuple[str, int]] = [
 ]
 
 XRAY_BIN = "/usr/local/bin/xray"
+# hy2 — отдельный демон со своим Traffic Stats API (HTTP на loopback), поэтому
+# в KNOWN_PROTOCOL_PORTS его нет: там gRPC-порты xray. Без этого сбора человек,
+# у которого работает ТОЛЬКО hy2 (регионы с жёстким DPI), выглядел для нас
+# «не подключившимся вовсе» — ни carrying_fraction, ни watcher репортов его
+# трафик не видели.
+HYSTERIA_PROTO = "hysteria2"
+HYSTERIA_TRAFFIC_PORT = int(os.getenv("HYSTERIA_TRAFFIC_API_PORT", "10088"))
 SSH_PORT_DEFAULT = 22
 SSH_USER = "root"
 # SSH-таймауты сборщика. Держим их в паритете с ssh_bootstrap
@@ -204,6 +211,59 @@ class NodeStatsResult:
         if errors:
             details["_errors"] = errors
         return details
+
+
+def _parse_hysteria_traffic(payload: str) -> ProtocolStats:
+    """Разобрать ответ hysteria Traffic Stats API.
+
+    Формат: ``{"user": {"tx": <байт-от-сервера>, "rx": <байт-к-серверу>}}``.
+    ``tx``/``rx`` считаются со стороны СЕРВЕРА, поэтому tx → downlink клиента,
+    а rx → uplink: перепутать их значит показать в админке зеркальную картину.
+    """
+    stats = ProtocolStats()
+    try:
+        data = json.loads(payload or "{}")
+    except (ValueError, TypeError) as exc:
+        stats.error = f"hysteria traffic parse: {exc}"
+        return stats
+    if not isinstance(data, dict):
+        stats.error = "hysteria traffic: unexpected payload"
+        return stats
+    for user, counters in data.items():
+        if not isinstance(user, str) or not user:
+            continue
+        if user == "__sentinel__":
+            # Заглушка против краш-лупа на пустом userpass — не человек.
+            continue
+        stats.users.add(user)
+        if isinstance(counters, dict):
+            stats.downlink += int(counters.get("tx") or 0)
+            stats.uplink += int(counters.get("rx") or 0)
+    return stats
+
+
+def _collect_hysteria(client: Any) -> ProtocolStats | None:
+    """Снять hy2-статистику через loopback-API ноды.
+
+    ``None`` — hy2 на ноде нет (curl не достучался до порта): это штатная
+    ситуация, а не сбой, и писать её в ``_errors`` значит завести вечный шум по
+    половине флота. А вот ответ, который не разбирается, — уже сбой, и он
+    доедет как ``error``.
+    """
+    url = f"http://127.0.0.1:{HYSTERIA_TRAFFIC_PORT}/traffic?clear=1"
+    cmd = f"curl -s --max-time 10 {url}"
+    try:
+        exit_status, stdout, stderr = _ssh_run(client, cmd)
+    except Exception as exc:  # noqa: BLE001
+        return ProtocolStats(error=f"ssh exec (hysteria): {exc}")
+    if exit_status != 0:
+        # 7 = connection refused (демона/секции нет), 28 = timeout.
+        if exit_status in (7, 28) or not (stderr or "").strip():
+            return None
+        return ProtocolStats(error=f"hysteria traffic exit {exit_status}")
+    if not (stdout or "").strip():
+        return None
+    return _parse_hysteria_traffic(stdout)
 
 
 def _parse_stat_name(name: str) -> tuple[str, str] | None:
@@ -389,6 +449,13 @@ def collect_node_stats(node) -> NodeStatsResult:
             result.uplink_bytes += stats.uplink
             result.downlink_bytes += stats.downlink
             all_users.update(stats.users)
+
+        hy2 = _collect_hysteria(client)
+        if hy2 is not None:
+            result.per_protocol[HYSTERIA_PROTO] = hy2
+            result.uplink_bytes += hy2.uplink
+            result.downlink_bytes += hy2.downlink
+            all_users.update(hy2.users)
 
         result.active_users = len(all_users)
 

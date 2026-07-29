@@ -233,8 +233,19 @@ class Credential(Base):
     access_username (indexed),
     is_active, revoked_at,
     pool_state: Enum(CredentialPoolState),  # warm/assigned/revoked
-    warmed_at, assigned_at
+    warmed_at, assigned_at,
+    leg_published,          # идёт ли этот протокол в саб-линк (схема 4×1)
+    leg_role,               # primary/fast/backup/reserve/dup; NULL = не опубликован
 ```
+
+**`leg_published` ≠ `is_active`.** `is_active` означает «учётка жива на ноде» и
+массово переставляется провижинингом; `leg_published` — «этот протокол отдан
+человеку в подписку». Тёплый бандл назначается ЦЕЛИКОМ (на ноде под одним
+именем лежат все её протоколы), а при схеме 4×1 публикуется ровно один — отсюда
+главное свойство: сменить протокол на той же ноде стоит переставленного флага,
+без ansible. Инвариант: `leg_role IS NOT NULL ⟺ leg_published`. Схема включается
+`SUB_LEG_SCHEME=4x1`; при `legacy` фильтр не применяется вовсе.
+См. `docs/operations/subset_epic_2026_07_29.md`.
 
 Три критичных индекса для warm pool (`0008_warmpool_and_balance.py`):
 - `ix_credentials_access_username` — группировка warm-пучков.

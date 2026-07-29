@@ -3315,19 +3315,40 @@ class ProvisioningOrchestrator:
         self._apply_leg_scheme(device)
         return subscription, task
 
+    @staticmethod
+    def _needs_leg_relay(device: models.Device) -> bool:
+        """Девайс публикует больше одного лега с ноды ⇒ он ещё в легаси-мире."""
+        seen: set[int] = set()
+        for cred in device.credentials or []:
+            if not (cred.is_active and cred.leg_published and cred.node_id):
+                continue
+            if cred.leg_role == leg_scheme.DUP_ROLE:
+                continue
+            if cred.node_id in seen:
+                return True
+            seen.add(cred.node_id)
+        return False
+
+    def _apply_leg_scheme_reporting(
+        self, device: models.Device
+    ) -> "leg_scheme.LegAssignment | None":
+        """Как ``_apply_leg_scheme``, но возвращает план — нужен счётчикам backfill."""
+        try:
+            plan = leg_scheme.apply_leg_scheme(self.db, device, commit=True)
+        except Exception:  # noqa: BLE001
+            logger.exception("leg-scheme: раскладка для device %s не удалась", device.id)
+            return None
+        if plan is not None and plan.missing:
+            leg_scheme.notify_leg_gap(self.db, device, plan.missing)
+        return plan
+
     def _apply_leg_scheme(self, device: models.Device) -> None:
         """Разложить креды устройства по ролям набора 4×1 (no-op без флага).
 
         Best-effort: девайс к этому моменту уже рабочий, и упасть на раскладке
         списка — значит уронить успешную покупку из-за косметики.
         """
-        try:
-            plan = leg_scheme.apply_leg_scheme(self.db, device, commit=True)
-        except Exception:  # noqa: BLE001 — набор не важнее выданного девайса
-            logger.exception("leg-scheme: раскладка для device %s не удалась", device.id)
-            return
-        if plan is not None and plan.missing:
-            leg_scheme.notify_leg_gap(self.db, device, plan.missing)
+        self._apply_leg_scheme_reporting(device)
 
     def _maybe_attach_diverse(
         self,
@@ -3527,8 +3548,14 @@ class ProvisioningOrchestrator:
             n_total = int(os.getenv("DIVERSE_SUB_NODES", "1") or "1")
         except ValueError:
             n_total = 1
+        scheme_on = leg_scheme.leg_scheme_enabled()
+        if scheme_on:
+            n_total = max(n_total, leg_scheme.target_leg_nodes())
         result: dict[str, Any] = {
             "flag_diverse_sub_nodes": n_total,
+            "leg_scheme": "4x1" if scheme_on else "legacy",
+            "legs_relaid": 0,      # девайсы, которым переразложили набор
+            "legs_incomplete": 0,  # из них: роль(и) закрыть не удалось
             "dry_run": dry_run,
             "limit": limit,
             "scanned": 0,
@@ -3568,7 +3595,19 @@ class ProvisioningOrchestrator:
                 c.node_id for c in device.credentials if c.is_active and c.node_id
             }
             if len(node_ids) >= n_total:
-                continue  # уже диверсный — пропускаем
+                # Ноды набраны. При схеме 4×1 этого мало: девайс из легаси-мира
+                # публикует ВСЕ протоколы всех своих нод (12 строк), и его надо
+                # переразложить — добор тут ни при чём, а без этого переход на
+                # 4×1 обошёл бы стороной ровно тех, у кого набор уже широкий.
+                if scheme_on and not dry_run:
+                    plan = self._apply_leg_scheme_reporting(device)
+                    if plan is not None:
+                        result["legs_relaid"] += 1
+                        if plan.missing:
+                            result["legs_incomplete"] += 1
+                elif scheme_on and self._needs_leg_relay(device):
+                    result["legs_relaid"] += 1
+                continue  # добирать нечего
             result["eligible_total"] += 1
             if result["processed"] >= limit:
                 continue  # лимит на прогон исчерпан — досчитываем остаток, но не трогаем
@@ -3585,7 +3624,11 @@ class ProvisioningOrchestrator:
             # best-effort: внутренний try/except гарантирует, что один битый девайс
             # не уронит весь backfill и не тронет primary.
             self._maybe_attach_diverse(sub, device, sub.plan, sub.node)
-            self._apply_leg_scheme(device)
+            plan = self._apply_leg_scheme_reporting(device)
+            if plan is not None:
+                result["legs_relaid"] += 1
+                if plan.missing:
+                    result["legs_incomplete"] += 1
             self.db.refresh(device)
             after = len(
                 {c.node_id for c in device.credentials if c.is_active and c.node_id}
