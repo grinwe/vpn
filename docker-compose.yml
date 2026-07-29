@@ -102,6 +102,9 @@ services:
       ROTATION_LADDER_WINDOW_SEC: ${ROTATION_LADDER_WINDOW_SEC:-86400}
       COMPLAINT_DEDUP_SEC: ${COMPLAINT_DEDUP_SEC:-60}
       SUB_STATUS_BANNER: ${SUB_STATUS_BANNER:-1}
+      # Прямая ссылка на мини-апп для кнопок в VPN-клиенте (пусто = deep-link
+      # в бота с кнопкой входа).
+      TELEGRAM_MINIAPP_SHORT_NAME: ${TELEGRAM_MINIAPP_SHORT_NAME:-}
       # Phase B — HAPP auto-connect (lowestdelay-on-reconnect) sub-headers.
       # Read ONLY by api_extensions._autoconnect_enabled (backend serves /sub).
       # Без этих строк .env-значение не доезжало до контейнера → autoconnect

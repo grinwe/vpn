@@ -70,7 +70,9 @@ def test_sub_link_returns_all_protocols_base64(client, db_session):
     resp = client.get(f"/api/sub/{sub.sub_token}", headers={})
     assert resp.status_code == 200
     body = base64.b64decode(resp.text).decode()
-    lines = [line for line in body.splitlines() if line]
+    # Строки с `#` — директивы блока статуса (Happ читает их из тела, потому
+    # что в заголовке русский текст не уезжает). Сами ссылки — всё остальное.
+    lines = [line for line in body.splitlines() if line and not line.startswith("#")]
     assert len(lines) == 2
     assert any(line.startswith("ss://") for line in lines)
     assert any(line.startswith("vless://") for line in lines)

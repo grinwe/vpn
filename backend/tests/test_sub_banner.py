@@ -89,7 +89,7 @@ def test_banner_button_needs_bot_username(monkeypatch):
     monkeypatch.setenv("BOT_USERNAME", "GV8_VPN_bot")
     banner = _sub_status_banner(_Sub(timedelta(days=1)))
     assert banner["sub-info-button-text"] == "Продлить"
-    assert banner["sub-info-button-link"].endswith("?start=renew")
+    assert banner["sub-info-button-link"].endswith("?start=account")
 
     monkeypatch.delenv("BOT_USERNAME", raising=False)
     banner = _sub_status_banner(_Sub(timedelta(days=1)))
@@ -198,21 +198,80 @@ def test_headers_are_latin1_encodable():
         value.encode("latin-1")  # упадёт ровно на том, что уронило бы прод
 
 
-def test_russian_text_goes_as_base64():
-    """Форма из документации Happ (announce): ``base64:<...>``."""
+def test_banner_travels_in_the_body_not_in_headers(monkeypatch):
+    """Блок статуса едет ТЕЛОМ.
+
+    Заголовки — latin-1, поэтому русский текст пришлось бы кодировать в
+    ``base64:``. Формально это уезжает, но Happ такое значение в sub-info не
+    разворачивает: на живом клиенте блок просто не появился, хотя все
+    заголовки доехали (прод, 2026-07-29). Тело же отдаётся в UTF-8, и
+    документация Happ прямо разрешает те же параметры комментарием.
+    """
     import base64 as b64
 
-    headers = _sub_response_headers(_Sub(timedelta(days=5)), "tok")
-    text = headers["sub-info-text"]
-    assert text.startswith("base64:")
-    decoded = b64.b64decode(text.split(":", 1)[1]).decode("utf-8")
-    assert "Подписка" in decoded
+    from app.api_extensions import _sub_body
+
+    monkeypatch.setenv("BOT_USERNAME", "GV8_VPN_bot")
+    sub = _Sub(timedelta(days=20))
+
+    headers = _sub_response_headers(sub, "tok")
+    assert not any(k.startswith("sub-info") for k in headers)
+
+    class _Cfg:
+        uri = "vless://u@h:443#⚡ Основной 1"
+
+    body = b64.b64decode(_sub_body([_Cfg()], sub)).decode("utf-8")
+    assert "#sub-info-text: Подписка активна до" in body
+    assert "#sub-info-color: blue" in body
+    assert body.rstrip().endswith("vless://u@h:443#⚡ Основной 1")
+
+
+def test_body_enables_native_expire_notice(monkeypatch):
+    """Системное предупреждение Happ за 3 дня перекрывает наш блок и рисует
+    кнопку «Продлить» само — на финише человек видит родной UI клиента."""
+    import base64 as b64
+
+    from app.api_extensions import _sub_body
+
+    monkeypatch.setenv("BOT_USERNAME", "GV8_VPN_bot")
+
+    class _Cfg:
+        uri = "vless://u@h:443#x"
+
+    body = b64.b64decode(_sub_body([_Cfg()], _Sub(timedelta(days=20)))).decode()
+    assert "#sub-expire: 1" in body
+    assert "#sub-expire-button-link: https://t.me/" in body
 
 
 def test_banner_can_be_switched_off(monkeypatch):
-    """Отрисовку base64 делает чужой клиент, проверить её со своей стороны
-    нельзя — значит выключение обязано стоить переменную окружения, а не
-    откат релиза."""
+    """Отрисовку делает чужой клиент, проверить её со своей стороны нельзя —
+    значит выключение обязано стоить переменную окружения, а не откат."""
+    import base64 as b64
+
+    from app.api_extensions import _sub_body
+
     monkeypatch.setenv("SUB_STATUS_BANNER", "0")
+
+    class _Cfg:
+        uri = "vless://u@h:443#x"
+
+    body = b64.b64decode(_sub_body([_Cfg()], _Sub(timedelta(days=5)))).decode()
+    assert "sub-info" not in body
+    assert body.strip() == "vless://u@h:443#x"
+
+
+def test_buttons_lead_to_the_account_not_to_start(monkeypatch):
+    """Человек, нажавший «продлить» в VPN-клиенте, уже знает чего хочет —
+    приветственный экран бота между ним и оплатой лишний."""
+    monkeypatch.setenv("BOT_USERNAME", "GV8_VPN_bot")
+    monkeypatch.delenv("TELEGRAM_MINIAPP_SHORT_NAME", raising=False)
+
+    banner = _sub_status_banner(_Sub(timedelta(days=5)))
+    assert banner["sub-info-button-link"].endswith("?start=account")
     headers = _sub_response_headers(_Sub(timedelta(days=5)), "tok")
-    assert not any(k.startswith("sub-info") for k in headers)
+    assert headers["support-url"].endswith("?start=account")
+
+    # С коротким именем из BotFather — кабинет открывается одним тапом.
+    monkeypatch.setenv("TELEGRAM_MINIAPP_SHORT_NAME", "app")
+    banner = _sub_status_banner(_Sub(timedelta(days=5)))
+    assert banner["sub-info-button-link"] == "https://t.me/GV8_VPN_bot/app"

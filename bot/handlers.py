@@ -409,6 +409,25 @@ async def cmd_start(message: types.Message, state: FSMContext):
         await list_plans(message)
         return
 
+    # Тот же deep-link, но в личный кабинет: кнопки «Продлить» и Telegram в
+    # VPN-клиенте ведут сюда, когда прямой ссылки на мини-апп нет (короткое
+    # имя приложения задаётся в BotFather). Открыть WebApp из внешнего
+    # браузера нельзя — только кнопкой изнутри Telegram, поэтому её и даём.
+    if len(args) > 1 and args[1].strip() == "account":
+        if WEBAPP_BASE_URL.startswith("https://"):
+            await message.answer(
+                "Продление и всё по подписке — в личном кабинете.",
+                reply_markup=types.InlineKeyboardMarkup(inline_keyboard=[[
+                    types.InlineKeyboardButton(
+                        text="🔐 Открыть личный кабинет",
+                        web_app=types.WebAppInfo(url=WEBAPP_BASE_URL),
+                    )
+                ]]),
+            )
+        else:
+            await list_plans(message)
+        return
+
     # Deep-link старт-параметр: ``ref_<code>`` — реферал человека (referred_by_id);
     # любой другой непустой payload — рекламная метка (source, first-touch).
     # Бэкенд валидирует/чистит метку, так что прокидываем сыро.

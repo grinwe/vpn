@@ -73,7 +73,9 @@ def test_default_env_writes_subscription_fetch(client, db_session, monkeypatch):
     assert resp.status_code == 200
     # URI несёт нейтральное имя эндпоинта (#«{эмодзи} V8 сервер N»,
     # 75769ca) — здесь важен сам кред, имя проверяется в test_sub_headers.
-    assert base64.b64decode(resp.text).decode().strip().split("#")[0] == "vless://node-default"
+    body = base64.b64decode(resp.text).decode()
+    uri = next(ln for ln in body.splitlines() if ln.startswith("vless://"))
+    assert uri.split("#")[0] == "vless://node-default"
     assert _fetch_count(db_session, dev.id) == 1
 
 
@@ -90,5 +92,9 @@ def test_sampling_skips_subscription_fetch(client, db_session, monkeypatch):
     # Клиент всё равно получает рабочий конфиг — сэмплируется только телеметрия.
     # URI несёт нейтральное имя эндпоинта (#«{эмодзи} V8 сервер N»,
     # 75769ca) — здесь важен сам кред, имя проверяется в test_sub_headers.
-    assert base64.b64decode(resp.text).decode().strip().split("#")[0] == "vless://node-sampled"
+    # Директивы блока статуса (строки с `#`) едут в том же теле — берём саму
+    # ссылку, а не первую строку.
+    body = base64.b64decode(resp.text).decode()
+    uri = next(ln for ln in body.splitlines() if ln.startswith("vless://"))
+    assert uri.split("#")[0] == "vless://node-sampled"
     assert _fetch_count(db_session, dev.id) == 0

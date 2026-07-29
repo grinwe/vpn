@@ -186,14 +186,60 @@ def _sub_status_banner(sub) -> dict[str, str]:
     return banner
 
 
-def _renew_link() -> str | None:
-    """Куда ведёт кнопка «Продлить» — deep-link в бота на выбор тарифа.
+def _sub_body_directives(sub) -> list[str]:
+    """Блок статуса строками-комментариями в ТЕЛЕ подписки.
 
-    Именно в бота, а не в мини-апп: Happ открывает ссылку во внешнем браузере,
-    где Telegram WebApp не работает вовсе.
+    Заголовками его слать нельзя: HTTP-заголовки — latin-1, а текст у нас
+    русский. Кодирование в ``base64:`` формально уезжает, но Happ его в
+    sub-info не разворачивает — на живом клиенте блок просто не появился, при
+    том что все заголовки доехали (проверено на проде 2026-07-29).
+
+    Тело же отдаётся в UTF-8, и документация Happ прямо разрешает те же
+    параметры комментарием перед ссылками (`#sub-info-text: ...`). Остальные
+    клиенты строки с `#` игнорируют — это стандартная форма для панелей.
+    """
+    if not _status_banner_enabled():
+        return []
+    banner = _sub_status_banner(sub)
+    if not banner:
+        return []
+    lines = [f"#{key}: {value}" for key, value in banner.items()]
+    # Системное уведомление Happ за 3 дня до конца: оно перекрывает наш блок
+    # на финише и рисует кнопку «Продлить» само. Нам это на руку — последние
+    # дни человек видит родное предупреждение клиента, а не нашу строку.
+    renew = _renew_link()
+    if renew:
+        lines.append("#sub-expire: 1")
+        lines.append(f"#sub-expire-button-link: {renew}")
+    return lines
+
+
+def _sub_body(configs, sub) -> str:
+    """base64-тело подписки: директивы блока статуса + ссылки."""
+    lines = _sub_body_directives(sub) + [c.uri for c in configs]
+    return base64.b64encode("\n".join(lines).encode()).decode()
+
+
+def _renew_link() -> str | None:
+    """Куда ведут кнопка «Продлить» и иконка Telegram — в личный кабинет.
+
+    Не на голый ``/start``: человек, нажавший «продлить» в VPN-клиенте, уже
+    знает, чего хочет, и приветственный экран бота — лишний шаг между ним и
+    оплатой.
+
+    Прямая ссылка на мини-апп (``t.me/<bot>/<short_name>``) открывает кабинет
+    одним тапом, но короткое имя приложения задаётся в BotFather и его может
+    не быть — тогда падаем на deep-link в бота, где ``account`` отвечает
+    сообщением с кнопкой входа. WebApp-кнопку саму по себе из внешнего
+    браузера открыть нельзя, только через Telegram.
     """
     bot = (os.getenv("BOT_USERNAME") or "").strip()
-    return f"https://t.me/{bot}?start=renew" if bot else None
+    if not bot:
+        return None
+    short_name = (os.getenv("TELEGRAM_MINIAPP_SHORT_NAME") or "").strip()
+    if short_name:
+        return f"https://t.me/{bot}/{short_name}"
+    return f"https://t.me/{bot}?start=account"
 
 
 def _plural_hours(n: int) -> str:
@@ -272,8 +318,9 @@ def _sub_response_headers(
     # Пуш-напоминания клиента за 3 дня до конца — бесплатный канал возврата,
     # который работает даже когда человек отключил уведомления нашего бота.
     headers["notification-subs-expire"] = "1"
-    if _status_banner_enabled():
-        headers.update(_sub_status_banner(sub))
+    # Блок статуса едет ТЕЛОМ (_sub_body_directives), а не заголовком: тут
+    # latin-1, и русский текст пришлось бы кодировать в base64 — Happ его в
+    # sub-info не разворачивает и просто не показывает блок.
     if _autoconnect_enabled(sub, device):
         headers["subscription-autoconnect"] = "true"  # канон (HAPP принимает и "1")
         headers["subscription-autoconnect-type"] = "lowestdelay"
@@ -663,8 +710,6 @@ def dynamic_sub_link(token: str, db: Session = Depends(get_db)):
     Clients (Hiddify, v2rayNG) poll this URL and auto-update when the
     server changes due to migration. The token is stable across migrations.
     """
-    import base64
-
     # ── Per-device lookup (preferred) ──────────────────────────────────
     device = db.query(models.Device).filter_by(sub_token=token).first()
     if device:
@@ -801,8 +846,7 @@ def dynamic_sub_link(token: str, db: Session = Depends(get_db)):
             )
             db.commit()
 
-        uris = "\n".join(c.uri for c in configs)
-        encoded = base64.b64encode(uris.encode()).decode()
+        encoded = _sub_body(configs, sub)
         return PlainTextResponse(
             content=encoded,
             media_type="text/plain",
@@ -850,8 +894,7 @@ def dynamic_sub_link(token: str, db: Session = Depends(get_db)):
             headers={"Retry-After": _retry_after_sec()},
         )
 
-    uris = "\n".join(c.uri for c in configs)
-    encoded = base64.b64encode(uris.encode()).decode()
+    encoded = _sub_body(configs, sub)
 
     _mark_first_config_fetch(db, sub)
 
