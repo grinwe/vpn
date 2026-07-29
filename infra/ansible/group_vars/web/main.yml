@@ -112,6 +112,10 @@ deploy_app_stack_agent_model: "claude-sonnet-4-6"
 # existing subs не трогаются (их миграция — backfill, Фаза A.2, ещё нет).
 # Откат: вернуть 1 + прокат (или тег pre-diverse-sub-e84426a).
 deploy_app_stack_diverse_sub_nodes: 3
+# Набор эндпоинтов: legacy (как было) → 4x1 включается ЗДЕСЬ отдельным прогоном,
+# уже после того как код с миграцией 0065 уехал и подписка проверена.
+# docs/operations/subset_epic_2026_07_29.md
+deploy_app_stack_sub_leg_scheme: legacy
 
 # Phase B — HAPP auto-select (subscription-autoconnect + lowestdelay) в заголовках
 # сабы. По умолчанию "off" (прод-поведение не меняется). Обкатка: выставить user_id
