@@ -172,8 +172,12 @@ def test_server_numbers_are_per_node_and_order_is_by_role(db_session):
     ], labels
 
     # Номер = сервер: две ноды дают ровно два разных номера, а не пять.
-    numbers = {lb.split()[-1] for lb in labels}
-    assert numbers == {"1", "2"}, labels
+    numbered = [lb for lb in labels if lb.split()[-1].isdigit()]
+    assert {lb.split()[-1] for lb in numbered} == {"1", "2"}, labels
+
+    # Одинокая роль номер не носит: «Резервный 1» при единственной строке
+    # выглядит так, будто остальные резервные потерялись.
+    assert "☁️ Резервный" in labels
 
     # И один номер закреплён за одним хостом: «Основной 1» и «Быстрый 1» —
     # это один сервер, иначе номера в списке ничего не значат.
@@ -182,6 +186,8 @@ def test_server_numbers_are_per_node_and_order_is_by_role(db_session):
         body, label = cfg.uri.split("#", 1)
         host = body.split("@", 1)[1]
         number = label.split()[-1]
+        if not number.isdigit():
+            continue
         assert host_by_number.setdefault(number, host) == host, (number, host)
 
 

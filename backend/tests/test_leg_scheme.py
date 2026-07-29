@@ -301,3 +301,55 @@ def test_backfill_dry_run_changes_nothing(db_session, monkeypatch):
     assert result["legs_relaid"] >= 1, "dry-run обязан показать охват"
     db_session.refresh(device)
     assert all(c.leg_published for c in device.credentials), "dry-run не мутирует"
+
+
+def test_single_role_needs_no_number(monkeypatch):
+    """При 4×1 каждая роль живёт на своём сервере, и «Основной 4» среди
+    четырёх строк читается как «а где ещё три Основных?»."""
+    from app.api_extensions import _decrypt_configs
+    from app.security import encrypt
+
+    class _Row:
+        def __init__(self, proto, node_id):
+            self.proto = proto
+            self.node_id = node_id
+            self.is_active = True
+            self.leg_published = True
+            self.id = node_id * 10
+            self.config_text = encrypt(f"vless://u@h{node_id}:443#raw")
+
+    monkeypatch.setenv("SUB_LEG_SCHEME", "4x1")
+    creds = [
+        _Row("vless-reality", 4),
+        _Row("hysteria2", 2),
+        _Row("vless-xhttp", 3),
+        _Row("vless-ws-cdn", 1),
+    ]
+    labels = [c.uri.split("#", 1)[1] for c in _decrypt_configs(creds, sub=None, device_id=None)]
+    assert labels == ["⚡ Основной", "🚀 Быстрый", "🛡️ Запасной", "☁️ Резервный"]
+
+
+def test_duplicate_role_keeps_numbers(monkeypatch):
+    """А вот после эскалации у человека два «Быстрых» на разных нодах — здесь
+    цифра снова несёт смысл, и убирать её нельзя."""
+    from app.api_extensions import _decrypt_configs
+    from app.security import encrypt
+
+    class _Row:
+        def __init__(self, proto, node_id):
+            self.proto = proto
+            self.node_id = node_id
+            self.is_active = True
+            self.leg_published = True
+            self.id = node_id * 10
+            self.config_text = encrypt(f"vless://u@h{node_id}:443#raw")
+
+    monkeypatch.setenv("SUB_LEG_SCHEME", "4x1")
+    creds = [
+        _Row("vless-reality", 1),
+        _Row("hysteria2", 2),
+        _Row("hysteria2", 3),  # дубль по эскалации
+    ]
+    labels = [c.uri.split("#", 1)[1] for c in _decrypt_configs(creds, sub=None, device_id=None)]
+    assert labels[0] == "⚡ Основной"
+    assert sorted(labels[1:]) == ["🚀 Быстрый 2", "🚀 Быстрый 3"]

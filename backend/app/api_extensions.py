@@ -604,7 +604,26 @@ def sub_leg_scheme() -> str:
     return (os.getenv("SUB_LEG_SCHEME") or "legacy").strip().lower()
 
 
-def _relabel_uri(uri: str, proto: str, index: int) -> str:
+def _strip_lonely_indices(configs: list[SubLinkConfig]) -> None:
+    """Убрать номер у ролей, встречающихся в списке ровно один раз.
+
+    При схеме 4×1 каждая роль живёт на своём сервере, поэтому «Основной 4»
+    среди четырёх строк читается как «а где ещё три Основных?». Номер нужен
+    только там, где роль дублируется — например после эскалации, когда человеку
+    выдан второй «Быстрый» на другой ноде: там цифра снова несёт смысл. И в
+    legacy-схеме, где ролей по три-четыре штуки, всё остаётся как было.
+    """
+    counts: dict[str, int] = {}
+    for cfg in configs:
+        role = _PROTO_LABEL.get(cfg.protocol, _DEFAULT_PROTO_LABEL)[1]
+        counts[role] = counts.get(role, 0) + 1
+    for cfg in configs:
+        role = _PROTO_LABEL.get(cfg.protocol, _DEFAULT_PROTO_LABEL)[1]
+        if counts[role] == 1:
+            cfg.uri = _relabel_uri(cfg.uri, cfg.protocol, None)
+
+
+def _relabel_uri(uri: str, proto: str, index: int | None) -> str:
     """Переписываем #fragment (display-name в клиенте) на «{эмодзи} {роль} N».
 
     Зачем: имя ноды НЕ должно палить страну (юзеры возмущаются «VPN в РФ» —
@@ -614,14 +633,20 @@ def _relabel_uri(uri: str, proto: str, index: int) -> str:
     это означало тыкать наугад. Роль отвечает ровно на этот вопрос.
 
     ``index`` — номер сервера (не сквозной номер строки), поэтому «Основной 2» и
-    «Быстрый 2» — это один и тот же сервер разными протоколами. RAW UTF-8 (как
-    исходный ``#reality-Russia``), НЕ percent-энкодим: часть клиентов кажет
-    %XX буквально. Делается на ОТДАЧЕ сабы (не запекается в cred.config_text) →
-    смена стиля не требует bulk-rebuild, только рефреш сабы у клиента.
+    «Быстрый 2» — это один и тот же сервер разными протоколами. ``None`` —
+    номера нет вовсе: при схеме 4×1 каждая роль живёт на своём сервере, роль в
+    списке одна, и цифра рядом с ней не значит ничего — «Основной 4» при
+    четырёх строках выглядит так, будто три «Основных» куда-то потерялись.
+
+    RAW UTF-8 (как исходный ``#reality-Russia``), НЕ percent-энкодим: часть
+    клиентов кажет %XX буквально. Делается на ОТДАЧЕ сабы (не запекается в
+    cred.config_text) → смена стиля не требует bulk-rebuild, только рефреш
+    сабы у клиента.
     """
     emoji, role = _PROTO_LABEL.get(proto, _DEFAULT_PROTO_LABEL)
     base = uri.split("#", 1)[0]
-    return f"{base}#{emoji} {role} {index}"
+    suffix = "" if index is None else f" {index}"
+    return f"{base}#{emoji} {role}{suffix}"
 
 
 def _decrypt_configs(
@@ -676,6 +701,7 @@ def _decrypt_configs(
             out.append(SubLinkConfig(
                 protocol=cred.proto,
                 uri=_relabel_uri(decrypted, cred.proto, index),
+                node_id=cred.node_id,
             ))
         else:
             logger.warning(
@@ -687,6 +713,7 @@ def _decrypt_configs(
     # порядок не смотрит, но при ручном выборе человек тыкает в первую строку, и
     # это должен быть основной протокол, а не случайный резервный.
     out.sort(key=lambda c: _PROTO_ORDER.get(c.protocol, len(_PROTO_ORDER)))
+    _strip_lonely_indices(out)
     return out
 
 
