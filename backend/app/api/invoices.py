@@ -16,6 +16,7 @@ from sqlalchemy.orm import Session, joinedload
 from .. import models, schemas
 from ..auth import optional_admin as optional_admin_token
 from ..auth import require_admin
+from ..services.balance import total_renewal_cost_kopecks
 from ..time_utils import utcnow
 from ._common import (
     ADMIN_ACTOR_HEADER,
@@ -339,13 +340,30 @@ def create_invoice(
         raise HTTPException(status_code=400, detail="Invalid invoice action") from exc
 
     user = _get_user_from_payload(db, body.user_id, body.telegram_id)
+    subscription = None
     if body.subscription_id:
         subscription = db.get(models.Subscription, body.subscription_id)
         if not subscription:
             raise HTTPException(status_code=404, detail="Subscription not found")
         if subscription.user_id != user.id or subscription.plan_id != plan.id:
             raise HTTPException(status_code=400, detail="Subscription does not match invoice data")
-    amount = body.amount if body.amount is not None else float(plan.price)
+    # Сумму диктует СЕРВЕР. body.amount — только с админ-токеном: эндпоинт
+    # доступен без него, а _mark_invoice_paid_core сумму с планом не сверяет —
+    # клиентский renewal-инвойс на 1 ₽ продлевал бы подписку целиком (дыра из
+    # ревью 2026-07-29). Вебхук провайдера сверяет платёж с Invoice.amount,
+    # то есть с той же подконтрольной клиенту цифрой — защита обязана стоять
+    # на создании счёта.
+    if body.amount is not None and not admin_token:
+        raise HTTPException(status_code=403, detail="amount override requires admin token")
+    if body.amount is not None:
+        amount = body.amount
+    elif action == models.InvoiceAction.renewal and subscription is not None:
+        # Цена продления со слотами: баланс-путь берёт доплату за
+        # extra_device_slots, а invoice-путь её терял — два пути продления
+        # брали разные деньги за один и тот же период.
+        amount = total_renewal_cost_kopecks(subscription) / 100
+    else:
+        amount = float(plan.price)
     invoice = models.Invoice(
         user_id=user.id,
         plan_id=plan.id,
