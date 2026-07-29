@@ -34,7 +34,8 @@ from .api._common import _audit
 from .config import get_settings
 from .db import SessionLocal
 from .rate_limit import limiter
-from .services.payments.base import ProviderError, get_provider
+from .services.payments.base import ProviderError
+from .services.payments.checkout import ProviderApiError, checkout_pending_invoice
 
 logger = logging.getLogger(__name__)
 
@@ -672,11 +673,22 @@ def webapp_checkout(
     # Pricing: send what the bot will actually charge the user. For
     # Stars, we convert RUB → ⭐ here so the Invoice.amount matches the
     # number Telegram will display. For other providers we keep RUB.
+    #
+    # Продление считаем со слотами (total_renewal_cost_kopecks): /me уже
+    # показывает цену с доплатой за extra_device_slots, а счёт выставлялся на
+    # голый plan.price — человек платил меньше, чем видел на экране, и меньше,
+    # чем списал бы баланс-путь за тот же период (ревью 2026-07-29).
+    if is_renewal and target_subscription is not None:
+        from .services import balance as balance_svc  # ленивый, как в /me
+
+        price_rub = balance_svc.total_renewal_cost_kopecks(target_subscription) / 100
+    else:
+        price_rub = float(plan.price)
     if body.provider == "telegram_stars":
-        amount = float(_rub_to_stars(float(plan.price)))
+        amount = float(_rub_to_stars(price_rub))
         currency = "XTR"
     else:
-        amount = float(plan.price)
+        amount = float(price_rub)
         currency = "RUB"
 
     invoice = models.Invoice(
@@ -691,41 +703,23 @@ def webapp_checkout(
     db.commit()
     db.refresh(invoice)
 
+    # Единый чекаут (services/payments/checkout.py): конвертация здесь не
+    # нужна — Invoice.amount уже в валюте провайдера (XTR/RUB), и хелпер
+    # такие суммы пропускает как есть. Описание нейтральное («Order #N»,
+    # Stage 9d) — задаёт сам хелпер.
     try:
-        provider = get_provider(body.provider)
+        result = checkout_pending_invoice(db, invoice, provider_name=body.provider)
+    except ProviderApiError as exc:
+        raise HTTPException(status_code=502, detail=f"payment provider error: {exc}")
     except ProviderError as exc:
         raise HTTPException(status_code=503, detail=str(exc))
 
-    try:
-        provider_invoice = provider.create_invoice(
-            invoice_id=invoice.id,
-            amount=amount,
-            currency=currency,
-            # Stage 9d: neutral description — bank compliance scanners flag
-            # the literal "VPN" in payment metadata. Plan name is intentionally
-            # omitted so acquirers see only an opaque order id.
-            description=f"Order #{invoice.id}",
-        )
-    except ProviderError as exc:
-        raise HTTPException(status_code=502, detail=f"payment provider error: {exc}")
-
-    payment = models.Payment(
-        invoice_id=invoice.id,
-        amount=invoice.amount,
-        currency=invoice.currency,
-        status=models.PaymentStatus.pending,
-        provider=provider.name,
-        external_id=provider_invoice.external_id,
-    )
-    db.add(payment)
-    db.commit()
-
     return CheckoutResponse(
         invoice_id=invoice.id,
-        provider=provider.name,
-        pay_url=provider_invoice.pay_url,
-        amount=provider_invoice.amount,
-        currency=provider_invoice.currency,
+        provider=result.provider,
+        pay_url=result.pay_url,
+        amount=result.amount,
+        currency=result.currency,
     )
 
 
@@ -854,39 +848,25 @@ def webapp_topup(
     db.commit()
     db.refresh(invoice)
 
+    # Единый чекаут; сумму для провайдера передаём явно (override): в
+    # topup-инвойсе amount по контракту в рублях (хук начисляет копейки),
+    # и вывести из него XTR-сумму хелпер не может.
     try:
-        provider = get_provider(body.provider)
+        result = checkout_pending_invoice(
+            db, invoice, provider_name=body.provider,
+            pay_amount=amount, pay_currency=currency,
+        )
+    except ProviderApiError as exc:
+        raise HTTPException(status_code=502, detail=f"payment provider error: {exc}")
     except ProviderError as exc:
         raise HTTPException(status_code=503, detail=str(exc))
 
-    try:
-        provider_invoice = provider.create_invoice(
-            invoice_id=invoice.id,
-            amount=amount,
-            currency=currency,
-            # Stage 9d: neutral description (no "VPN" / no "topup" literal).
-            description=f"Order #{invoice.id}",
-        )
-    except ProviderError as exc:
-        raise HTTPException(status_code=502, detail=f"payment provider error: {exc}")
-
-    payment = models.Payment(
-        invoice_id=invoice.id,
-        amount=amount_rub,
-        currency=currency,
-        status=models.PaymentStatus.pending,
-        provider=provider.name,
-        external_id=provider_invoice.external_id,
-    )
-    db.add(payment)
-    db.commit()
-
     return TopupResponse(
         invoice_id=invoice.id,
-        provider=provider.name,
-        pay_url=provider_invoice.pay_url,
-        amount=provider_invoice.amount,
-        currency=provider_invoice.currency,
+        provider=result.provider,
+        pay_url=result.pay_url,
+        amount=result.amount,
+        currency=result.currency,
     )
 
 

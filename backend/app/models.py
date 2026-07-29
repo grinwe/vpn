@@ -869,6 +869,11 @@ class Payment(Base):
     )
     provider = Column(String, default="manual")
     external_id = Column(String, nullable=True)
+    # Ссылка на оплату у провайдера. Персистится ради идемпотентности:
+    # «повторный тап → тот же pay_url» без второго похода к провайдеру —
+    # раньше URL жил только в ответе чекаута, и каждый повтор плодил новый
+    # счёт у провайдера (а lava зовёт это новым инвойсом в кабинете).
+    pay_url = Column(String, nullable=True)
     created_at = Column(DateTime, default=utcnow)
     updated_at = Column(DateTime, default=utcnow, onupdate=utcnow)
 

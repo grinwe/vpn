@@ -67,7 +67,7 @@ class _FakeProvider:
 @pytest.fixture
 def fake_provider(monkeypatch):
     provider = _FakeProvider()
-    monkeypatch.setattr("app.api_webapp.get_provider", lambda name=None: provider)
+    monkeypatch.setattr("app.services.payments.checkout.get_provider", lambda name=None: provider)
     return provider
 
 
