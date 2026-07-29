@@ -20,7 +20,7 @@
 
 - `HealthProbe`: есть ли периодический cleanup старых строк (retention)? В коде воркера не сразу видно такой тики, но таблица по смыслу должна расти быстро. Если cleanup'а нет — это отдельная тема.
 - Связь `Payment.subscription_id` и `Payment.invoice_id`: оба nullable. Какой из них авторитетен для stage-4 балансного flow — из модели не видно, нужен переход в `services/balance.py` и `_mark_invoice_paid_core`.
-- Поле `Subscription.traffic_used_mb` и `traffic_limit_mb` — кто его обновляет? Ноды пишут через `/api/nodes/{id}/traffic` (есть схема `NodeTrafficReport`), но не ясно, как агрегируются device-уровень в subscription-уровень — код агрегации смотрим в `api.py`, при необходимости отдельный проход.
+- ~~Поле `Subscription.traffic_used_mb` и `traffic_limit_mb` — кто его обновляет?~~ Закрыто 2026-07-29: блокирующий ингест (`api/traffic.py`) удалён, оба поля мертвы. Действующий учёт — `Subscription.traffic_used_bytes`: тик `traffic_stats` копит per-user байты (резолв через `Credential.access_username`), продление обнуляет.
 - `has_frozen_this_year` vs `frozen_days_used` / `frozen_year`: три поля одновременно описывают freeze-историю, одно из них — V2 упрощение. Какое правило сейчас в силе — «один раз в год» или «до N дней в год» — из модели нельзя однозначно сказать.
 
 ---

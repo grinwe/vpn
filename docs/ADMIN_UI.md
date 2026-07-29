@@ -102,10 +102,10 @@ CRUD по тарифам. Поля: `name`, `duration_days`, `max_devices`, `pri
 Управление scoped токенами (модель — `api_tokens`, префикс `X-Api-Token` в запросах). Хранится только SHA-256 хеш, plaintext показывается один раз при создании.
 
 - `GET /api/api-tokens` — список (id, name, scopes, is_active, last_used_at)
-- `POST /api/api-tokens` — создаёт новый; body `{name, scopes}`. Scopes выбираются чекбоксами из `AVAILABLE_SCOPES = ["probe:read", "probe:write", "traffic:write"]` — держи в sync с `ALL_SCOPES` в [auth.py](../backend/app/auth.py).
+- `POST /api/api-tokens` — создаёт новый; body `{name, scopes}`. Scopes выбираются чекбоксами из `AVAILABLE_SCOPES = ["probe:read", "probe:write"]` — держи в sync с `ALL_SCOPES` в [auth.py](../backend/app/auth.py). `traffic:write` удалён 2026-07-29 вместе с блокирующим ингестом.
 - `DELETE /api/api-tokens/{id}` — revoke (ставит `is_active=False`, запись не удаляется, `last_used_at` остаётся для аудита).
 
-**Кому это нужно:** probe-rigs (сканеры здоровья нод, `probe:read` + `probe:write`), traffic-collectors на самих нодах (`traffic:write`), и отдельные токены для людей-админов чтобы в `audit_log` их действия были отличимы от generic `"admin"` actor'а.
+**Кому это нужно:** probe-rigs (сканеры здоровья нод, `probe:read` + `probe:write`) и отдельные токены для людей-админов чтобы в `audit_log` их действия были отличимы от generic `"admin"` actor'а.
 
 ## Что чего тригерит — cheat sheet
 

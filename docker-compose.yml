@@ -314,6 +314,9 @@ services:
       # writes per-node uplink/downlink/active_users into
       # node_traffic_samples. 0 disables the tick.
       TRAFFIC_STATS_INTERVAL: ${TRAFFIC_STATS_INTERVAL:-300}
+      # Per-user учёт: тот же тик копит байты в Subscription.traffic_used_bytes
+      # (шкала в клиенте). 0 — аварийный стоп только учёта, сбор по нодам жив.
+      TRAFFIC_USER_ACCOUNTING: ${TRAFFIC_USER_ACCOUNTING:-1}
       # Phase C — bot health-ping with consent. Worker queues a
       # friendly "помогите нам улучшить сервис" prompt to active users
       # раз в [DEBOUNCE_HOURS, DEBOUNCE_HOURS + DEBOUNCE_JITTER_HOURS]
