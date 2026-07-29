@@ -16,6 +16,7 @@ import logging
 import os
 import re
 import secrets
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
 
@@ -314,6 +315,105 @@ def _plural_hours(n: int) -> str:
     if tail in (2, 3, 4):
         return f"{n} часа"
     return f"{n} часов"
+
+
+@dataclass(frozen=True)
+class SubTokenLookup:
+    """Что нашлось по sub_token: подписка и какое устройство обслуживать."""
+
+    sub: models.Subscription
+    # Устройство, которому принадлежит токен (None у legacy-подписочных).
+    token_device: models.Device | None
+    # Чьи креды реально отдаём: сам token_device либо живой сосед-алиас.
+    serve_device: models.Device | None
+    is_legacy: bool
+
+    @property
+    def aliased(self) -> bool:
+        return (
+            self.token_device is not None
+            and self.serve_device is not None
+            and self.serve_device.id != self.token_device.id
+        )
+
+
+def resolve_sub_token(db: Session, token: str) -> SubTokenLookup | None:
+    """Найти подписку и обслуживающее устройство по sub_token.
+
+    Вынесено из ``dynamic_sub_link`` ДОСЛОВНО (эпик «починка без Telegram»):
+    странице на саб-домене нужен тот же lookup, а копия неизбежно разъехалась
+    бы с оригиналом. Никаких побочных эффектов — ни аудита, ни отметки первой
+    выдачи, ни проверки «подписка обслуживаема»: это остаётся на вызывающем,
+    потому что странице продления нужна и ИСТЁКШАЯ подписка.
+
+    ``None`` — токен неизвестен (вызывающий решает: 404 или camo-страница).
+    """
+    device = db.query(models.Device).filter_by(sub_token=token).first()
+    if device:
+        sub = device.subscription
+        if sub is None:
+            return None
+
+        # ╔══════════════════════════════════════════════════════════════╗
+        # ║  DO NOT TOUCH without reading docs/components/backend-api.md ║
+        # ║  section "Sub-link invariant".                               ║
+        # ║                                                              ║
+        # ║  Seamless-migration alias. Every resync/migration path       ║
+        # ║  (admin override, drain, auto-migrate-on-block, webapp       ║
+        # ║  device-move, balance unfreeze) revokes the old Device row   ║
+        # ║  and provisions a fresh one on the target node with a NEW    ║
+        # ║  sub_token. The user's Hiddify/v2rayN profile is still       ║
+        # ║  pointing at the OLD token — without this fallback the       ║
+        # ║  saved subscription URL refreshes into an empty config and   ║
+        # ║  the user has to manually reimport the new URL, which is     ║
+        # ║  exactly the 404-loop we already shipped new URIs to fix.    ║
+        # ║                                                              ║
+        # ║  Load-bearing invariant (the three MUST hold together):      ║
+        # ║    1. provisioning.py `_handle_task_outcome` keeps the       ║
+        # ║       revoked Device row in the DB (option A).               ║
+        # ║    2. Reprovisioning creates a NEW Device on the same Sub    ║
+        # ║       (never mutates the old one's sub_token).               ║
+        # ║    3. This block finds the live sibling on the same Sub.    ║
+        # ║  Break any one and saved client URLs start 404-ing.          ║
+        # ║                                                              ║
+        # ║  Multi-device subs collapse to a single device after         ║
+        # ║  migration (`reprovision_subscription` provisions one) —     ║
+        # ║  known limitation, secondary clients alias onto the          ║
+        # ║  survivor. Accepted: same user, same sub.                    ║
+        # ╚══════════════════════════════════════════════════════════════╝
+        source_device = device
+        if device.status != models.DeviceStatus.active or not any(
+            c.is_active for c in device.credentials
+        ):
+            # Prefer the most recently-updated active sibling so
+            # chained migrations (A → B → C) always alias onto C,
+            # not some stale B that was left around.
+            live = next(
+                (
+                    d
+                    for d in sorted(
+                        sub.devices,
+                        key=lambda x: x.updated_at or x.created_at,
+                        reverse=True,
+                    )
+                    if d.id != device.id
+                    and d.status == models.DeviceStatus.active
+                    and any(c.is_active for c in d.credentials)
+                ),
+                None,
+            )
+            if live is not None:
+                source_device = live
+        return SubTokenLookup(
+            sub=sub, token_device=device, serve_device=source_device, is_legacy=False
+        )
+
+    sub = db.query(models.Subscription).filter_by(sub_token=token).first()
+    if sub is None:
+        return None
+    return SubTokenLookup(
+        sub=sub, token_device=None, serve_device=None, is_legacy=True
+    )
 
 
 def _sub_response_headers(
@@ -876,61 +976,14 @@ def dynamic_sub_link(
     (Hiddify неполный набор выбрасывает целиком, ему нельзя).
     """
     # ── Per-device lookup (preferred) ──────────────────────────────────
-    device = db.query(models.Device).filter_by(sub_token=token).first()
-    if device:
-        sub = device.subscription
+    # Сам lookup (включая seamless-alias на живого соседа) — в
+    # resolve_sub_token: им же пользуется страница починки на саб-домене.
+    found = resolve_sub_token(db, token)
+    if found is not None and not found.is_legacy:
+        device = found.token_device
+        sub = found.sub
         _raise_if_sub_not_serviceable(sub)
-
-        # ╔══════════════════════════════════════════════════════════════╗
-        # ║  DO NOT TOUCH without reading docs/components/backend-api.md ║
-        # ║  section "Sub-link invariant".                               ║
-        # ║                                                              ║
-        # ║  Seamless-migration alias. Every resync/migration path       ║
-        # ║  (admin override, drain, auto-migrate-on-block, webapp       ║
-        # ║  device-move, balance unfreeze) revokes the old Device row   ║
-        # ║  and provisions a fresh one on the target node with a NEW    ║
-        # ║  sub_token. The user's Hiddify/v2rayN profile is still       ║
-        # ║  pointing at the OLD token — without this fallback the       ║
-        # ║  saved subscription URL refreshes into an empty config and   ║
-        # ║  the user has to manually reimport the new URL, which is     ║
-        # ║  exactly the 404-loop we already shipped new URIs to fix.    ║
-        # ║                                                              ║
-        # ║  Load-bearing invariant (the three MUST hold together):      ║
-        # ║    1. provisioning.py `_handle_task_outcome` keeps the       ║
-        # ║       revoked Device row in the DB (option A).               ║
-        # ║    2. Reprovisioning creates a NEW Device on the same Sub    ║
-        # ║       (never mutates the old one's sub_token).               ║
-        # ║    3. This block finds the live sibling on the same Sub.    ║
-        # ║  Break any one and saved client URLs start 404-ing.          ║
-        # ║                                                              ║
-        # ║  Multi-device subs collapse to a single device after         ║
-        # ║  migration (`reprovision_subscription` provisions one) —     ║
-        # ║  known limitation, secondary clients alias onto the          ║
-        # ║  survivor. Accepted: same user, same sub.                    ║
-        # ╚══════════════════════════════════════════════════════════════╝
-        source_device = device
-        if device.status != models.DeviceStatus.active or not any(
-            c.is_active for c in device.credentials
-        ):
-            # Prefer the most recently-updated active sibling so
-            # chained migrations (A → B → C) always alias onto C,
-            # not some stale B that was left around.
-            live = next(
-                (
-                    d
-                    for d in sorted(
-                        sub.devices,
-                        key=lambda x: x.updated_at or x.created_at,
-                        reverse=True,
-                    )
-                    if d.id != device.id
-                    and d.status == models.DeviceStatus.active
-                    and any(c.is_active for c in d.credentials)
-                ),
-                None,
-            )
-            if live is not None:
-                source_device = live
+        source_device = found.serve_device
 
         # Исключаем креды нод в cooldown/декоммишене/с низким health_score —
         # иначе клиент держит заведомо мёртвый эндпоинт в ротации client-side
@@ -1023,9 +1076,9 @@ def dynamic_sub_link(
         )
 
     # ── Legacy per-subscription fallback ───────────────────────────────
-    sub = db.query(models.Subscription).filter_by(sub_token=token).first()
-    if not sub:
+    if found is None:
         raise HTTPException(status_code=404, detail="Subscription not found")
+    sub = found.sub
 
     _raise_if_sub_not_serviceable(sub)
 
