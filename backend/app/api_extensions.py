@@ -137,6 +137,51 @@ def _status_banner_enabled() -> bool:
     )
 
 
+def _happ_provider_id() -> str:
+    """Provider ID из кабинета happ-proxy.com — ключ ко всему Advanced-слою Happ.
+
+    Ресёрч по докам 2026-07-29: ``sub-info-*``, ``sub-expire`` и
+    ``notification-subs-expire`` — «Advanced parameters», и клиент МОЛЧА
+    игнорирует их, пока в ответе нет providerid. Прежние «проверено на живом
+    устройстве — не работает» (заголовки ``base64:``, тело base64 и plain)
+    прогонялись без providerid и потому ничего не доказали.
+    ``subscription-autoconnect`` сюда НЕ входит (раздел «Managing app
+    settings») — июньская обкатка lowestdelay без providerid валидна.
+
+    ID привязан хешем к домену, который дёргает клиент (наш CDN-прокси, а не
+    бэкенд). Побочка регистрации: клиент раз в сутки отстукивается на
+    check.happ-proxy.com с HWID.
+
+    Значение валидируется жёстко: оно едет и заголовком, и строкой тела.
+    CR/LF в заголовке — это 500 на всей выдаче (инвариант «VPN настраивается
+    у всех» дороже любого блока), а не-ASCII _header_safe завернул бы в
+    ``base64:`` — и клиент получил бы в заголовке и теле ДВА РАЗНЫХ id.
+    Кривой ID из vault безопаснее не слать вовсе.
+    """
+    pid = (os.getenv("HAPP_PROVIDER_ID") or "").strip()
+    # isascii() обязателен: str.isalnum() юникодный и пропустил бы кириллицу.
+    if pid and not (pid.isascii() and all(ch.isalnum() or ch in "-_" for ch in pid)):
+        return ""
+    return pid
+
+
+def _announce_enabled() -> bool:
+    """Слать ли ``announce`` — Standard-блок Happ, работающий БЕЗ Provider ID.
+
+    ``auto`` (дефолт): announce едет, только пока providerid не задан — с ним
+    статус рисует sub-info, и второй блок с тем же текстом был бы дублем.
+    ``1`` — слать и при providerid (страховка, если sub-info не отрисуется),
+    ``0`` — никогда. Аварийный рубильник ``SUB_STATUS_BANNER=0`` гасит и
+    announce тоже — он выключает весь блок статуса, любые режимы ниже него.
+    """
+    mode = (os.getenv("SUB_STATUS_ANNOUNCE") or "auto").strip().lower()
+    if mode in ("0", "false", "off", "no", "never"):
+        return False
+    if mode in ("1", "true", "on", "yes", "always"):
+        return True
+    return not _happ_provider_id()
+
+
 def _sub_status_banner(sub) -> dict[str, str]:
     """Блок статуса подписки над списком серверов (Happ: sub-info-*).
 
@@ -187,33 +232,41 @@ def _sub_status_banner(sub) -> dict[str, str]:
 
 
 def _sub_body_directives(sub) -> list[str]:
-    """Блок статуса строками-комментариями в ТЕЛЕ подписки.
+    """Директивы Happ строками-комментариями в ТЕЛЕ подписки.
 
-    Заголовками его слать нельзя: HTTP-заголовки — latin-1, а текст у нас
-    русский. Кодирование в ``base64:`` формально уезжает, но Happ его в
-    sub-info не разворачивает — на живом клиенте блок просто не появился, при
-    том что все заголовки доехали (проверено на проде 2026-07-29).
+    Тело — UTF-8, и документация Happ разрешает каждый параметр комментарием
+    ``#имя: значение`` перед ссылками наравне с заголовками (заголовки в
+    приоритете). Кириллица здесь едет как есть — в заголовках она невозможна
+    (latin-1), поэтому русский sub-info-текст живёт именно тут. Остальные
+    клиенты строки с ``#`` игнорируют — это стандартная форма для панелей.
 
-    Тело же отдаётся в UTF-8, и документация Happ прямо разрешает те же
-    параметры комментарием перед ссылками (`#sub-info-text: ...`). Остальные
-    клиенты строки с `#` игнорируют — это стандартная форма для панелей.
+    ``providerid`` — особый формат БЕЗ двоеточия (``#providerid {id}``), так в
+    доках. Без него sub-info-* клиент игнорирует (Advanced-слой): вывод «Happ
+    не читает директивы из тела», записанный 2026-07-29, не доказан — тесты
+    шли без providerid.
     """
+    lines: list[str] = []
+    provider_id = _happ_provider_id()
+    if provider_id:
+        # Не под рубильником баннера: providerid активирует ВЕСЬ Advanced-слой
+        # (sub-expire, notification-subs-expire), не только блок статуса.
+        lines.append(f"#providerid {provider_id}")
     if not _status_banner_enabled():
-        return []
+        return lines
     banner = _sub_status_banner(sub)
     if not banner:
-        return []
-    # Только текстовый блок: sub-expire едет заголовком (см.
-    # _sub_response_headers) — он ASCII, а заголовки клиент читает точно.
-    return [f"#{key}: {value}" for key, value in banner.items()]
+        return lines
+    lines += [f"#{key}: {value}" for key, value in banner.items()]
+    return lines
 
 
 def _sub_body(configs, sub, *, plain: bool = False) -> str:
     """Тело подписки: директивы блока статуса + ссылки.
 
-    ``plain`` — без base64. Клиенты понимают оба формата, но директивы из
-    закодированного тела Happ, судя по проверке на живом устройстве, не
-    разбирает.
+    ``plain`` — без base64, диагностика чтения директив из тела. Прежний
+    вывод «Happ не разбирает директивы из закодированного тела» не доказан:
+    проверка шла без providerid, а без него Advanced-директивы игнорируются
+    при любом способе доставки.
     """
     lines = _sub_body_directives(sub) + [c.uri for c in configs]
     body = "\n".join(lines)
@@ -266,8 +319,11 @@ def _sub_response_headers(
     пинга — мимо). Бесшовного per-server failover у HAPP через плоскую сабу НЕТ
     (сверено по их докам) — это максимум, и он чисто server-side. За гейтом
     ``SUB_HAPP_AUTOCONNECT`` (+ опц. ``_SINCE`` для «только новых девайсов»).
+    Autoconnect — раздел «Managing app settings», НЕ Advanced: работает без
+    providerid (обкатка 2026-06-13 это и показала).
     ``fallback-url`` (если задан ``SUB_LINK_FALLBACK_BASE_URL``) — фейловер
     ИСТОЧНИКА сабы на запасной домен, когда основной саб-URL режет РКН.
+    По докам Happ это тоже Advanced-параметр — без providerid не сработает.
 
     ``profile-update-interval`` (часы) — как часто Hiddify/v2rayNG/HAPP сами
     перечитывают сабу и через sibling-alias подхватывают новую ноду после
@@ -307,33 +363,52 @@ def _sub_response_headers(
         # накапливаем — тик traffic_stats сбрасывает счётчики (xray `--reset`,
         # hysteria `?clear=1`) и хранит лишь сумму по ноде за интервал. Рисовать
         # шкалу из выдуманных цифр — врать человеку.
+        expires = sub.expires_at
+        if expires.tzinfo is None:
+            # naive в БД — это UTC, но .timestamp() наивного datetime берёт
+            # ЛОКАЛЬНУЮ зону процесса. В контейнере она UTC и всё совпадает —
+            # однако дата, от которой клиент считает «через сколько платить»,
+            # не должна зависеть от TZ окружения.
+            expires = expires.replace(tzinfo=timezone.utc)
         headers["subscription-userinfo"] = (
             "upload=0; download=0; total=0; "
-            f"expire={int(sub.expires_at.timestamp())}"
+            f"expire={int(expires.timestamp())}"
         )
     # Иконка Telegram справа в строке подписки (Happ) + ссылка «поддержка».
     support = _renew_link()
     if support:
         headers["support-url"] = support
-    # Пуш-напоминания клиента за 3 дня до конца — бесплатный канал возврата,
-    # который работает даже когда человек отключил уведомления нашего бота.
-    headers["notification-subs-expire"] = "1"
+    provider_id = _happ_provider_id()
+    if provider_id:
+        # Ключ к Advanced-слою Happ: без него sub-expire, notification-subs-
+        # expire и sub-info-* клиент молча игнорирует. Дубль едет в теле
+        # (#providerid …) на случай прокси, режущего нестандартные заголовки.
+        headers["providerid"] = provider_id
+    if sub.expires_at:
+        # Пуш-напоминания клиента за 3 дня до конца — бесплатный канал
+        # возврата, работающий даже когда человек отключил уведомления нашего
+        # бота. Advanced: оживает только с providerid. Без срока подписки
+        # напоминать не о чем.
+        headers["notification-subs-expire"] = "1"
     # Родное предупреждение Happ «подписка заканчивается через N д.» + кнопка
-    # «Продлить». Именно оно отвечает на вопрос «через сколько», который у
-    # человека возникает в клиенте: строка состояния показывает только дату.
-    #
-    # Заголовком, а не в теле: директивы из тела клиент не разобрал ни в
-    # base64, ни в plain (проверено на живом устройстве 2026-07-29), а
-    # заголовки читает — subscription-userinfo и support-url доезжают. Здесь
-    # это возможно ровно потому, что значения ASCII: русский текст в заголовок
-    # не положить.
+    # «Продлить» (текст кнопки фиксирован клиентом). Показывает его сам клиент
+    # за ≤3 дня до конца и после истечения; Advanced — требует providerid.
+    # Значения ASCII, поэтому заголовок безопасен.
     if _status_banner_enabled() and sub.expires_at:
         headers["sub-expire"] = "1"
         if support:
             headers["sub-expire-button-link"] = support
-    # Блок статуса едет ТЕЛОМ (_sub_body_directives), а не заголовком: тут
-    # latin-1, и русский текст пришлось бы кодировать в base64 — Happ его в
-    # sub-info не разворачивает и просто не показывает блок.
+    # announce — Standard-блок Happ, работает БЕЗ providerid: голубой блок с
+    # нашим текстом статуса, форма ``base64:`` для него документирована. Это
+    # единственный видимый блок до регистрации Provider ID; русский sub-info
+    # продолжает ехать телом (_sub_body_directives) — в заголовок кириллицу
+    # не положить.
+    if _status_banner_enabled() and _announce_enabled():
+        announce_text = _sub_status_banner(sub).get("sub-info-text")
+        if announce_text:
+            headers["announce"] = (
+                "base64:" + base64.b64encode(announce_text.encode("utf-8")).decode()
+            )
     if _autoconnect_enabled(sub, device):
         headers["subscription-autoconnect"] = "true"  # канон (HAPP принимает и "1")
         headers["subscription-autoconnect-type"] = "lowestdelay"
@@ -754,11 +829,12 @@ def dynamic_sub_link(
     Clients (Hiddify, v2rayNG) poll this URL and auto-update when the
     server changes due to migration. The token is stable across migrations.
 
-    ``?fmt=plain`` отдаёт тело незакодированным. Нужно потому, что блок статуса
-    (директивы `#sub-info-*`) в клиенте не появился ни заголовками, ни в
-    base64-теле, и остаётся гипотеза, что Happ парсит директивы только из
-    plain-тела. Обычные клиенты параметр не шлют — поведение для них не
-    меняется ни на байт.
+    ``?fmt=plain`` отдаёт тело незакодированным — диагностика чтения директив
+    из тела. Исходная загадка «блок не появился ни заголовками, ни телом»
+    разгадана иначе: ``sub-info-*``/``sub-expire`` — Advanced-параметры Happ и
+    без providerid игнорируются при любом способе доставки. Параметр оставлен:
+    он позволит проверить plain- против base64-тела уже С providerid. Обычные
+    клиенты параметр не шлют — поведение для них не меняется ни на байт.
     """
     # ── Per-device lookup (preferred) ──────────────────────────────────
     device = db.query(models.Device).filter_by(sub_token=token).first()
