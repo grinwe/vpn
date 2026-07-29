@@ -337,3 +337,20 @@ def test_post_repair_checks_subscription_status(client, db_session, sub_with_tok
     db_session.expire_all()
     reports_before, reports_after = before[1], _counts(db_session)[1]
     assert reports_after == reports_before, "починки быть не должно"
+
+
+def test_technical_device_name_is_not_shown(client, db_session, sub_with_token):
+    """«Мы переключим primary» — это разговор с инженером. Технические имена
+    из провижининга заменяем нейтральным «это устройство»."""
+    _sub, device = sub_with_token
+    device.name = "primary"
+    db_session.commit()
+    resp = client.get(f"/api/sub/{device.sub_token}?fix=1", headers=HTML)
+    assert "primary" not in resp.text
+    assert "это устройство" in resp.text
+
+    # Имя, которое дал человек, показываем как есть.
+    device.name = "Мой телефон"
+    db_session.commit()
+    resp = client.get(f"/api/sub/{device.sub_token}?fix=1", headers=HTML)
+    assert "Мой телефон" in resp.text

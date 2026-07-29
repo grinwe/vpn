@@ -292,11 +292,19 @@ def _expiry_line(sub) -> str:
 # ── Экраны ──────────────────────────────────────────────────────────────
 
 
+# Имена, которые ставит провижининг, а не человек. Показывать их нельзя:
+# «Мы переключим primary» — это разговор с инженером, а не с пользователем.
+_TECH_DEVICE_NAMES = {"primary", "device", "устройство", "default"}
+
+
 def render_start(
     sub, token: str, *, device_name: str | None, repairable: bool = True
 ) -> HTMLResponse:
     """Главный экран: кнопка починки (и продления, если включено)."""
-    who = html.escape(device_name or "это устройство")
+    name = (device_name or "").strip()
+    if not name or name.lower() in _TECH_DEVICE_NAMES:
+        name = "это устройство"
+    who = html.escape(name)
     if repairable:
         body = (
             f"<p>Если VPN не подключается — нажмите кнопку ниже. "
