@@ -127,3 +127,11 @@ deploy_app_stack_sub_leg_scheme: 4x1
 deploy_app_stack_sub_happ_autoconnect: "all"
 # ISO-метка «только новые девайсы» (created_at >= метки). Пусто = без фильтра по дате.
 deploy_app_stack_sub_happ_autoconnect_since: ""
+# Provider ID из кабинета happ-proxy.com (привязан к домену саб-ссылки, т.е.
+# grn-ssync.pro). Без него Happ игнорирует весь Advanced-слой: sub-info-блок,
+# sub-expire-баннер, пуши об истечении. Autoconnect выше — НЕ Advanced,
+# работает и без providerid (обкатка 2026-06-13).
+deploy_app_stack_happ_provider_id: "{{ vault_happ_provider_id | default('') }}"
+# announce — Standard-блок статуса Happ (работает без providerid).
+# auto = слать, пока providerid не задан; 1 = всегда; 0 = никогда.
+deploy_app_stack_sub_status_announce: "auto"

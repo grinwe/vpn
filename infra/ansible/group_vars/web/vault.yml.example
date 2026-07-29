@@ -88,6 +88,11 @@ vault_sub_link_base_url: ""
 # (vault_sub_link_base_url) заблокируют. Пусто = фолбэка нет.
 vault_sub_link_fallback_base_url: ""
 
+# Provider ID Happ (кабинет happ-proxy.com). Привязан хешем к домену
+# саб-ссылки (vault_sub_link_base_url) — регистрировать именно его. Без
+# providerid Happ игнорирует sub-info/sub-expire/пуши об истечении.
+vault_happ_provider_id: ""
+
 # ── WS+CDN / xhttp DNS front (Cloudflare DNS-only, no proxy) ──────────
 # Front zone for ws-cdn AND xhttp SNI — a clean, dedicated domain (NOT
 # grinwer.online, which is the admin/web domain). Default wgse.info.

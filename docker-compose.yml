@@ -102,6 +102,12 @@ services:
       ROTATION_LADDER_WINDOW_SEC: ${ROTATION_LADDER_WINDOW_SEC:-86400}
       COMPLAINT_DEDUP_SEC: ${COMPLAINT_DEDUP_SEC:-60}
       SUB_STATUS_BANNER: ${SUB_STATUS_BANNER:-1}
+      # Provider ID Happ (happ-proxy.com): без него клиент игнорирует весь
+      # Advanced-слой — sub-info, sub-expire, пуши об истечении.
+      HAPP_PROVIDER_ID: ${HAPP_PROVIDER_ID:-}
+      # announce — Standard-блок статуса, работает без providerid.
+      # auto = слать, пока providerid не задан; 1 = всегда; 0 = никогда.
+      SUB_STATUS_ANNOUNCE: ${SUB_STATUS_ANNOUNCE:-auto}
       # Прямая ссылка на мини-апп для кнопок в VPN-клиенте (пусто = deep-link
       # в бота с кнопкой входа).
       TELEGRAM_MINIAPP_SHORT_NAME: ${TELEGRAM_MINIAPP_SHORT_NAME:-}
