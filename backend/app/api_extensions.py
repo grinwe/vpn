@@ -309,7 +309,8 @@ def _plural_hours(n: int) -> str:
 
 
 def _sub_response_headers(
-    sub: models.Subscription, token: str, device=None
+    sub: models.Subscription, token: str, device=None,
+    *, userinfo_expire_only: bool = False,
 ) -> dict[str, str]:
     """Заголовки саб-ответа (читаются клиентом на каждом рефреше — existing юзеры
     подхватят без переимпорта).
@@ -370,10 +371,20 @@ def _sub_response_headers(
             # однако дата, от которой клиент считает «через сколько платить»,
             # не должна зависеть от TZ окружения.
             expires = expires.replace(tzinfo=timezone.utc)
-        headers["subscription-userinfo"] = (
-            "upload=0; download=0; total=0; "
-            f"expire={int(expires.timestamp())}"
-        )
+        if userinfo_expire_only:
+            # Диагностика (?userinfo=expire): только срок, без трафик-ключей.
+            # Гипотеза — без upload/download/total Happ не рисует шкалу
+            # «0B/∞» (нулевые данные, шкала-пустышка), а дату «Истекает»
+            # сохраняет. Поведение недокументировано, потому опт-ин: Hiddify
+            # парсит заголовок только ЦЕЛИКОМ и при неполном наборе теряет
+            # его вместе с support-url — дефолт менять нельзя, пока Happ
+            # не подтвердит рендер на живом устройстве.
+            headers["subscription-userinfo"] = f"expire={int(expires.timestamp())}"
+        else:
+            headers["subscription-userinfo"] = (
+                "upload=0; download=0; total=0; "
+                f"expire={int(expires.timestamp())}"
+            )
     # Иконка Telegram справа в строке подписки (Happ) + ссылка «поддержка».
     support = _renew_link()
     if support:
@@ -818,6 +829,7 @@ def dynamic_sub_link(
     token: str,
     db: Session = Depends(get_db),
     fmt: str | None = None,
+    userinfo: str | None = None,
 ):
     """Dynamic subscription link — per-device or legacy per-subscription.
 
@@ -835,6 +847,12 @@ def dynamic_sub_link(
     без providerid игнорируются при любом способе доставки. Параметр оставлен:
     он позволит проверить plain- против base64-тела уже С providerid. Обычные
     клиенты параметр не шлют — поведение для них не меняется ни на байт.
+
+    ``?userinfo=expire`` — той же природы диагностика: userinfo без
+    трафик-ключей. Гипотеза — Happ перестанет рисовать шкалу-пустышку
+    «0B/∞» (данных о трафике мы не собираем), сохранив дату «Истекает».
+    Подтвердится на устройстве → кандидат на прод-дефолт для UA Happ
+    (Hiddify неполный набор выбрасывает целиком, ему нельзя).
     """
     # ── Per-device lookup (preferred) ──────────────────────────────────
     device = db.query(models.Device).filter_by(sub_token=token).first()
@@ -977,7 +995,10 @@ def dynamic_sub_link(
             content=encoded,
             media_type="text/plain",
             # device = владелец токена (для гейта «только новые девайсы» по created_at)
-            headers=_sub_response_headers(sub, token, device),
+            headers=_sub_response_headers(
+                sub, token, device,
+                userinfo_expire_only=(userinfo == "expire"),
+            ),
         )
 
     # ── Legacy per-subscription fallback ───────────────────────────────
@@ -1041,7 +1062,9 @@ def dynamic_sub_link(
     return PlainTextResponse(
         content=encoded,
         media_type="text/plain",
-        headers=_sub_response_headers(sub, token),
+        headers=_sub_response_headers(
+            sub, token, userinfo_expire_only=(userinfo == "expire"),
+        ),
     )
 
 

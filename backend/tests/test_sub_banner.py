@@ -425,6 +425,19 @@ def test_buttons_lead_to_the_account_not_to_start(monkeypatch):
     assert banner["sub-info-button-link"] == "https://t.me/GV8_VPN_bot/app"
 
 
+def test_userinfo_expire_only_is_opt_in():
+    """`?userinfo=expire` — диагностика шкалы «0B/∞»: без трафик-ключей Happ,
+    по гипотезе, не рисует пустышку, сохранив дату. Дефолт трогать нельзя:
+    Hiddify выбрасывает неполный userinfo целиком вместе с support-url."""
+    sub = _Sub(timedelta(days=5))
+    assert _sub_response_headers(sub, "tok", userinfo_expire_only=True)[
+        "subscription-userinfo"
+    ].startswith("expire=")
+    assert _sub_response_headers(sub, "tok")["subscription-userinfo"].startswith(
+        "upload=0; "
+    )
+
+
 def test_plain_format_is_opt_in(monkeypatch):
     """`?fmt=plain` — диагностика, а не смена поведения: клиенты параметр не
     шлют, и для них тело обязано остаться base64."""
