@@ -28,6 +28,7 @@ import hmac
 import html
 import logging
 import os
+import re
 import time
 from string import Template
 
@@ -287,8 +288,8 @@ def _help_button(*, enabled: bool) -> str:
     if not enabled:
         return (
             '<button class="secondary" disabled>Не помогло? Напишите нам</button>'
-            '<p class="muted">Кнопка станет активной после починки — '
-            "сначала нажмите её.</p>"
+            '<p class="muted">Сначала нажмите «Починить подключение». '
+            "Если не помогло, эта кнопка станет активной.</p>"
         )
     return (
         f'<a class="btn secondary" href="{html.escape(url)}">'
@@ -301,7 +302,7 @@ def _telegram_link() -> str:
     if not bot:
         return ""
     return (
-        f'<p class="muted">Если Telegram доступен — '
+        f'<p class="muted">Если Telegram доступен, '
         f'<a href="https://t.me/{html.escape(bot)}?start=account">открыть личный кабинет</a>.</p>'
     )
 
@@ -328,9 +329,13 @@ def _expiry_line(sub) -> str:
 # ── Экраны ──────────────────────────────────────────────────────────────
 
 
-# Имена, которые ставит провижининг, а не человек. Показывать их нельзя:
-# «Мы переключим primary» — это разговор с инженером, а не с пользователем.
-_TECH_DEVICE_NAMES = {"primary", "device", "устройство", "default"}
+# Имена, которые ставит провижининг, а не человек: primary, device-6,
+# default-2… Показывать их нельзя: «Мы переключим device-6» — это разговор
+# с инженером, а не с пользователем. Паттерн, а не список: нумерованные
+# варианты плодятся при каждом новом устройстве.
+_TECH_NAME_RE = re.compile(
+    r"^(primary|device|устройство|default|user)[\s_-]*\d*$", re.IGNORECASE
+)
 
 
 def render_start(
@@ -338,12 +343,12 @@ def render_start(
 ) -> HTMLResponse:
     """Главный экран: кнопка починки (и продления, если включено)."""
     name = (device_name or "").strip()
-    if not name or name.lower() in _TECH_DEVICE_NAMES:
+    if not name or _TECH_NAME_RE.match(name):
         name = "это устройство"
     who = html.escape(name)
     if repairable:
         body = (
-            f"<p>Если VPN не подключается — нажмите кнопку ниже. "
+            f"<p>Не подключается? Нажмите кнопку ниже. "
             f"Мы переключим <b>{who}</b> на другой способ связи или другой сервер.</p>"
         )
     else:
@@ -351,8 +356,8 @@ def render_start(
         # кнопка, которая всегда отвечает «не нашли устройство», хуже, чем
         # её отсутствие.
         body = (
-            "<p>По этой ссылке автоматическая починка недоступна — "
-            "обновите профиль в клиенте из личного кабинета.</p>"
+            "<p>По этой ссылке автоматическая починка недоступна. "
+            "Обновите профиль в клиенте из личного кабинета.</p>"
         )
     body += _expiry_line(sub)
     actions = _button_form(token, "Починить подключение") if repairable else ""
@@ -376,8 +381,20 @@ def _renew_button(sub, token: str) -> str:
     days = sub.plan.duration_days if sub.plan else 0
     if rub <= 0:
         return ""
-    label = f"Продлить на {days} дн. — {rub:g} ₽"
-    return _button_form(token, label, extra="&pay=1", secondary=True)
+    label = f"Продлить на {days} дн. за {rub:g} ₽"
+    button = _button_form(token, label, extra="&pay=1", secondary=True)
+    # Сумма выше цены плана — значит в ней доплата за дополнительные
+    # устройства. Без расшифровки человек видит цифру, не совпадающую с
+    # тарифом, и решает, что мы ошиблись.
+    slots = sub.extra_device_slots or 0
+    if slots:
+        base = float(sub.plan.price)
+        extra = rub - base
+        button += (
+            f'<p class="muted">{base:g} ₽ тариф плюс {extra:g} ₽ '
+            f"за дополнительные устройства ({slots}).</p>"
+        )
+    return button
 
 
 def render_outcome(outcome, sub, token: str) -> HTMLResponse:
@@ -402,24 +419,24 @@ def render_outcome(outcome, sub, token: str) -> HTMLResponse:
         )
     elif outcome.action == "duplicated":
         title, body = "Готово", (
-            '<p class="ok">Добавили запасной сервер — в клиенте появится ещё одна '
-            "строка.</p>" + refresh_hint
+            '<p class="ok">Добавили запасной сервер. В клиенте появится ещё '
+            "одна строка.</p>" + refresh_hint
         )
     elif outcome.action == "throttled":
         title, body = "Уже чиним", (
             '<p class="warn">Мы переключили вас пару минут назад.</p>'
-            "<p>Откройте клиент и нажмите 🔄 — новые серверы уже там. "
+            "<p>Откройте клиент и нажмите 🔄, новые серверы уже там. "
             "Если не помогло, попробуйте ещё раз через несколько минут.</p>"
         )
     elif outcome.action == "daily_limit":
         title, body = "Слишком часто", (
             '<p class="warn">Сегодня мы уже несколько раз меняли вам серверы.</p>'
-            "<p>Дальше нужна помощь человека — напишите в поддержку.</p>"
+            "<p>Дальше нужна помощь человека. Напишите нам.</p>"
         )
     elif outcome.action == "no_target":
         title, body = "Сейчас не получилось", (
             '<p class="warn">Свободного сервера нет прямо сейчас.</p>'
-            "<p>Попробуйте через 10 минут — они освобождаются постоянно.</p>"
+            "<p>Попробуйте через 10 минут: они освобождаются постоянно.</p>"
         )
     else:  # no_subscription
         # Сюда попадает и «только что починили»: свежепровиженное устройство
@@ -460,7 +477,7 @@ def render_rate_limited() -> HTMLResponse:
     return _render(
         title="Слишком часто",
         body="<p>Вы нажимали кнопку несколько раз подряд.</p>"
-        "<p>Подождите минуту и попробуйте снова — предыдущее нажатие могло "
+        "<p>Подождите минуту и попробуйте снова. Предыдущее нажатие могло "
         "уже сработать: откройте клиент и нажмите 🔄.</p>" + _telegram_link(),
         status_code=429,
     )
@@ -492,7 +509,7 @@ def render_pay_pending(invoice_id: int, token: str, *, paid: bool) -> HTMLRespon
             + _telegram_link(),
         )
     body = (
-        "<p>Ждём подтверждения от банка — обычно меньше минуты.</p>"
+        "<p>Ждём подтверждения от банка, обычно меньше минуты.</p>"
         '<p class="muted">Страница обновится сама. Платить второй раз не нужно.</p>'
     )
     # refresh ведёт на СВОЙ URL (?paid=<id>), иначе через 5 секунд человек

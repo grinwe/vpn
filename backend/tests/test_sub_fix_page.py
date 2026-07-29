@@ -343,11 +343,12 @@ def test_technical_device_name_is_not_shown(client, db_session, sub_with_token):
     """«Мы переключим primary» — это разговор с инженером. Технические имена
     из провижининга заменяем нейтральным «это устройство»."""
     _sub, device = sub_with_token
-    device.name = "primary"
-    db_session.commit()
-    resp = client.get(f"/api/sub/{device.sub_token}?fix=1", headers=HTML)
-    assert "primary" not in resp.text
-    assert "это устройство" in resp.text
+    for tech in ("primary", "device-6", "default_2", "user 3"):
+        device.name = tech
+        db_session.commit()
+        resp = client.get(f"/api/sub/{device.sub_token}?fix=1", headers=HTML)
+        assert tech not in resp.text, tech
+        assert "это устройство" in resp.text
 
     # Имя, которое дал человек, показываем как есть.
     device.name = "Мой телефон"

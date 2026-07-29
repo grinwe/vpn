@@ -243,3 +243,23 @@ def test_price_is_shown_before_payment(client, db_session, paid_env):
     page = client.get(f"/api/sub/{device.sub_token}?fix=1", headers=HTML)
     assert "110" in page.text
     assert "30 дн" in page.text
+
+
+def test_price_with_slots_is_explained(client, db_session, paid_env):
+    """Сумма выше тарифа расшифровывается: иначе человек видит цифру, не
+    совпадающую с планом, и решает, что мы ошиблись (владелец так и
+    отреагировал на живой странице)."""
+    sub, device, _fake = paid_env
+    sub.extra_device_slots = 1
+    db_session.commit()
+
+    page = client.get(f"/api/sub/{device.sub_token}?fix=1", headers=HTML)
+    assert "110" in page.text          # 10 ₽ план + 100 ₽ слот
+    assert "10 ₽ тариф" in page.text
+    assert "дополнительные устройства (1)" in page.text
+
+    # Без слотов расшифровки нет — она была бы шумом.
+    sub.extra_device_slots = 0
+    db_session.commit()
+    page = client.get(f"/api/sub/{device.sub_token}?fix=1", headers=HTML)
+    assert "тариф плюс" not in page.text
