@@ -16,7 +16,7 @@ import logging
 import os
 import re
 import secrets
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 
 from fastapi import APIRouter, Depends, HTTPException, Request
@@ -217,7 +217,14 @@ def _sub_status_banner(sub) -> dict[str, str]:
         text = f"Подписка истекает через {_plural_days(left.days)}"
         color = "red"
     else:
-        text = f"Подписка активна до {expires_at.strftime('%d.%m.%Y')}"
+        # Дата — по МСК, а не по UTC: срок хранится как 23:59:59 UTC, и
+        # UTC-дата ВСЕГДА на день раньше московской. Клиент рядом рисует
+        # «Истекает» в локальной зоне устройства — наши «до 14.08» против
+        # его «15.08» выглядели багом. RU-сервис, фиксированный UTC+3.
+        msk = expires_at.replace(tzinfo=timezone.utc).astimezone(
+            timezone(timedelta(hours=3))
+        )
+        text = f"Подписка активна до {msk.strftime('%d.%m.%Y')}"
         color = "blue"
 
     banner = {
@@ -310,7 +317,7 @@ def _plural_hours(n: int) -> str:
 
 def _sub_response_headers(
     sub: models.Subscription, token: str, device=None,
-    *, userinfo_expire_only: bool = False,
+    *, userinfo_expire_only: bool = False, sub_info_headers: bool = False,
 ) -> dict[str, str]:
     """Заголовки саб-ответа (читаются клиентом на каждом рефреше — existing юзеры
     подхватят без переимпорта).
@@ -427,6 +434,14 @@ def _sub_response_headers(
             headers["announce"] = (
                 "base64:" + base64.b64encode(announce_text.encode("utf-8")).decode()
             )
+    # Диагностика (?subinfo=headers): sub-info-* ЗАГОЛОВКАМИ, кириллица уедет
+    # base64:-обёрнутой через _header_safe. Форма для sub-info в доках не
+    # описана, но проверка 2026-07-29 «не разворачивает» шла без providerid и
+    # невалидна; с живым providerid (родной баннер рисуется) а вот директивы
+    # из base64-ТЕЛА клиент так и не читает — заголовки остались последним
+    # непроверенным каналом для цветного блока.
+    if sub_info_headers and _status_banner_enabled():
+        headers.update(_sub_status_banner(sub))
     if _autoconnect_enabled(sub, device):
         headers["subscription-autoconnect"] = "true"  # канон (HAPP принимает и "1")
         headers["subscription-autoconnect-type"] = "lowestdelay"
@@ -837,6 +852,7 @@ def dynamic_sub_link(
     db: Session = Depends(get_db),
     fmt: str | None = None,
     userinfo: str | None = None,
+    subinfo: str | None = None,
 ):
     """Dynamic subscription link — per-device or legacy per-subscription.
 
@@ -1005,6 +1021,7 @@ def dynamic_sub_link(
             headers=_sub_response_headers(
                 sub, token, device,
                 userinfo_expire_only=(userinfo == "expire"),
+                sub_info_headers=(subinfo == "headers"),
             ),
         )
 
@@ -1071,6 +1088,7 @@ def dynamic_sub_link(
         media_type="text/plain",
         headers=_sub_response_headers(
             sub, token, userinfo_expire_only=(userinfo == "expire"),
+            sub_info_headers=(subinfo == "headers"),
         ),
     )
 

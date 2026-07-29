@@ -434,6 +434,37 @@ def test_buttons_lead_to_the_account_not_to_start(monkeypatch):
     assert banner["sub-info-button-link"] == "https://t.me/GV8_VPN_bot/app"
 
 
+def test_subinfo_headers_diag_is_opt_in_and_latin1_safe(monkeypatch):
+    """`?subinfo=headers` — последний непроверенный канал для цветного блока:
+    из base64-тела Happ директивы не читает и с providerid (проверено на
+    устройстве 2026-07-29). Кириллица обязана уехать base64:-обёрнутой, а не
+    уронить выдачу; по умолчанию заголовков sub-info нет."""
+    monkeypatch.setenv("BOT_USERNAME", "GV8_VPN_bot")
+    sub = _Sub(timedelta(days=20))
+
+    default = _sub_response_headers(sub, "tok")
+    assert not any(k.startswith("sub-info") for k in default)
+
+    diag = _sub_response_headers(sub, "tok", sub_info_headers=True)
+    assert diag["sub-info-text"].startswith("base64:")
+    assert diag["sub-info-color"] == "blue"
+    assert diag["sub-info-button-text"].startswith("base64:")
+    for value in diag.values():
+        value.encode("latin-1")
+
+
+def test_banner_date_matches_client_msk_rendering():
+    """Срок хранится как 23:59:59 UTC — UTC-дата всегда на день раньше
+    московской, и рядом с клиентским «Истекает: 15.08» наш текст «до 14.08»
+    выглядел багом. Рендерим по МСК."""
+    from datetime import datetime as dt
+
+    sub = _Sub(None)
+    sub.expires_at = dt(2026, 8, 14, 23, 59, 59)
+    banner = _sub_status_banner(sub)
+    assert "15.08.2026" in banner["sub-info-text"]
+
+
 def test_userinfo_expire_only_is_opt_in():
     """`?userinfo=expire` — диагностика шкалы «0B/∞»: без трафик-ключей Happ,
     по гипотезе, не рисует пустышку, сохранив дату. Дефолт трогать нельзя:
