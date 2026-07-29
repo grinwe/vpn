@@ -33,7 +33,10 @@ export default {
     }
 
     const token = m[1];
-    const upstream = `${BACKEND}/api/sub/${token}`;
+    // url.search обязателен: без него диагностические параметры
+    // (?fmt=plain, ?userinfo=expire) молча отбрасываются — тест
+    // fmt=plain 2026-07-29 через CDN из-за этого ничего не проверил.
+    const upstream = `${BACKEND}/api/sub/${token}${url.search}`;
 
     const resp = await fetch(upstream, {
       method: request.method,
@@ -88,7 +91,8 @@ export default {
       return new Response(LANDING_HTML, { status: 200, headers: LANDING_HEADERS });
     }
 
-    const upstream = `${BACKEND}/api/sub/${m[1]}`;
+    // url.search: см. комментарий в pre-anti-probing версии выше.
+    const upstream = `${BACKEND}/api/sub/${m[1]}${url.search}`;
     const resp = await fetch(upstream, {
       method: request.method,
       headers: request.headers,
