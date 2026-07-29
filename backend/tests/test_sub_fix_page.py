@@ -377,3 +377,34 @@ def test_help_button_unlocks_only_after_a_repair(client, db_session, sub_with_to
     done = client.post(f"/api/sub/{device.sub_token}?fix=1&n={nonce}", headers=HTML)
     assert "?start=support" in done.text, "после починки — рабочая ссылка на админа"
     assert "start=support" in done.text
+
+
+def test_endpoint_branches_by_real_user_agent(client, sub_with_token, monkeypatch):
+    """Проводка ветвления проверяется ЧЕРЕЗ ЭНДПОИНТ, а не только на юните:
+    UA берётся из запроса, и ошибка в прокидывании не видна юнит-тестам."""
+    monkeypatch.setenv("SUB_LINK_BASE_URL", "https://grn-ssync.pro")
+    monkeypatch.setenv("SUB_FIX_ENTRYPOINTS", "all")
+    monkeypatch.setenv("HAPP_PROVIDER_ID", "WreSqg1i")
+    _sub, device = sub_with_token
+    url = f"/api/sub/{device.sub_token}"
+
+    happ = client.get(url, headers={"User-Agent": "Happ/2.4.1 (iPhone)"})
+    assert happ.headers["providerid"] == "WreSqg1i"
+    assert "announce-url" not in happ.headers
+
+    v2 = client.get(url, headers={"User-Agent": "v2rayTun/5.24.76 (Android)"})
+    assert v2.headers["announce-url"].endswith("?fix=1")
+    assert "providerid" not in v2.headers
+
+    hid = client.get(
+        url,
+        headers={"User-Agent": "HiddifyNext/4.1.1 (windows) like ClashMeta v2ray"},
+    )
+    assert hid.headers["support-url"].endswith("?fix=1")
+    assert "announce" not in hid.headers
+
+    # И тело: Happ-директивы уходят только тем, кто их читает.
+    import base64 as b64
+    assert b64.b64decode(happ.text).decode().startswith("#providerid")
+    assert not b64.b64decode(v2.text).decode().startswith("#")
+    assert not b64.b64decode(hid.text).decode().startswith("#")

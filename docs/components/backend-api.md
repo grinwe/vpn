@@ -169,6 +169,35 @@ def dynamic_sub_link(token: str, db: Session = Depends(get_db)):
 
 **Safety net.** Если ни прямой device, ни alias не дают ни одного работающего конфига — endpoint возвращает **503** с заголовком `Retry-After` (сек, env `SUB_RETRY_AFTER_SEC`, дефолт 60), а не пустой 200. Hiddify/v2rayN на пустой 200 затирают локально закешированный профиль (пользователь остаётся без VPN), на 503 — оставляют last-known-good и повторяют запрос; `Retry-After` даёт машиночитаемый хинт перезапросить сразу после провижининга, а не ждать плановый `profile-update-interval`. Срабатывает в окне между revoke и provision, либо если вся подписка сломана (все устройства revoked/failed без работающего sibling). Недешифруемый credential (пустой `_decrypt` — рассинхрон `APP_SECRET_KEY`, битый `config_text`) в **обеих** ветках логируется `logger.warning` с контекстом (cred/proto/node/device/sub), чтобы частичная деградация подписки была видна в логах.
 
+### Заголовки подписки — по клиенту, а не одним набором
+
+Клиенты называют себя в `User-Agent` (`Happ/2.4.1`, `v2rayTun/5.24.76`,
+`HiddifyNext/4.1.1 … like ClashMeta v2ray sing-box`), и набор украшений у них
+разный. Классификатор — `_client_kind()` в `api_extensions.py`, единственное
+место с UA-регулярками.
+
+| Слот | Happ | v2rayTun | Hiddify | unknown |
+|---|---|---|---|---|
+| `profile-title`, `profile-update-interval`, `subscription-userinfo`, `fallback-url` | ✅ | ✅ | ✅ | ✅ |
+| `providerid`, `sub-info-*`, `sub-expire*`, `notification-subs-expire` | ✅ | — | — | ✅ |
+| `announce` без цвета | ✅ (auto: молчит при providerid) | — | — | ✅ |
+| `announce` с `#RRGGBB` + `announce-url` | — | ✅ | — | — |
+| `profile-web-page-url` на страницу починки | — | — | ✅ | — |
+
+Почему ветвление обязательно: имя `announce` у Happ и v2rayTun **общее, а
+синтаксис разный** — цветовые коды `#RRGGBB`, которые v2rayTun красит, Happ
+показал бы буквально («#e05252Не подключается?»). Второй конфликт — `routing`
+(у v2rayTun это base64 их собственного экспорта, у Happ `happ://routing/…`);
+мы его не шлём, но помнить надо.
+
+`unknown` (пустой UA, curl, экзотика) получает набор Happ — то есть
+поведение для неопознанного клиента ровно то, что было до ветвления.
+
+Hiddify беден по дизайну: текстовых блоков и объявлений у него нет вовсе,
+поэтому вход на страницу отдаётся единственным доступным способом — ссылкой
+в меню профиля. Подробности про v2rayTun — `operations/env-reference.md` и
+ресёрч в памяти проекта.
+
 ### Страница починки `/api/sub/{token}?fix=1`
 
 Тот же путь, что выдача конфигов, но для БРАУЗЕРА: `Accept: text/html` →

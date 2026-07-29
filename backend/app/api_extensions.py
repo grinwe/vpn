@@ -167,19 +167,29 @@ def _happ_provider_id() -> str:
     return pid
 
 
-def _announce_enabled() -> bool:
-    """Слать ли ``announce`` — Standard-блок Happ, работающий БЕЗ Provider ID.
+def _announce_enabled(client: str = "happ") -> bool:
+    """Слать ли ``announce`` этому клиенту.
 
-    ``auto`` (дефолт): announce едет, только пока providerid не задан — с ним
-    статус рисует sub-info, и второй блок с тем же текстом был бы дублем.
-    ``1`` — слать и при providerid (страховка, если sub-info не отрисуется),
-    ``0`` — никогда. Аварийный рубильник ``SUB_STATUS_BANNER=0`` гасит и
-    announce тоже — он выключает весь блок статуса, любые режимы ниже него.
+    ``0`` — никогда (аварийный выключатель непроверенного рендера), ``1`` —
+    всегда. Разница в режиме ``auto`` (дефолт):
+
+    * **Happ** — announce едет, только пока providerid не задан: с ним статус
+      рисует полноценный sub-info-блок, и второй блок с тем же текстом был бы
+      дублем;
+    * **v2rayTun** — едет всегда, потому что sub-info он не понимает вовсе, и
+      announce у него ЕДИНСТВЕННЫЙ способ показать статус и дать вход на
+      страницу. Гасить его из-за чужого providerid значит оставить клиента
+      ни с чем.
+
+    Аварийный ``SUB_STATUS_BANNER=0`` гасит и announce тоже — он выключает
+    блок статуса целиком, поверх любых режимов здесь.
     """
     mode = (os.getenv("SUB_STATUS_ANNOUNCE") or "auto").strip().lower()
     if mode in ("0", "false", "off", "no", "never"):
         return False
     if mode in ("1", "true", "on", "yes", "always"):
+        return True
+    if client == "v2raytun":
         return True
     return not _happ_provider_id()
 
@@ -251,7 +261,7 @@ def _sub_status_banner(sub, token: str = "") -> dict[str, str]:
     return banner
 
 
-def _sub_body_directives(sub, token: str = "") -> list[str]:
+def _sub_body_directives(sub, token: str = "", client: str = "unknown") -> list[str]:
     """Директивы Happ строками-комментариями в ТЕЛЕ подписки.
 
     Тело — UTF-8, и документация Happ разрешает каждый параметр комментарием
@@ -266,6 +276,11 @@ def _sub_body_directives(sub, token: str = "") -> list[str]:
     не читает директивы из тела», записанный 2026-07-29, не доказан — тесты
     шли без providerid.
     """
+    # v2rayTun и Hiddify эти директивы не читают (у первого свой синтаксис
+    # announce, у второго нет блоков вовсе) — сыпать их в тело значит мусорить
+    # в файле, который человек может открыть глазами.
+    if client in ("v2raytun", "hiddify"):
+        return []
     lines: list[str] = []
     provider_id = _happ_provider_id()
     if provider_id:
@@ -281,7 +296,10 @@ def _sub_body_directives(sub, token: str = "") -> list[str]:
     return lines
 
 
-def _sub_body(configs, sub, *, plain: bool = False, token: str = "") -> str:
+def _sub_body(
+    configs, sub, *, plain: bool = False, token: str = "",
+    client: str = "unknown",
+) -> str:
     """Тело подписки: директивы блока статуса + ссылки.
 
     ``plain`` — без base64, диагностика чтения директив из тела. Прежний
@@ -289,7 +307,7 @@ def _sub_body(configs, sub, *, plain: bool = False, token: str = "") -> str:
     проверка шла без providerid, а без него Advanced-директивы игнорируются
     при любом способе доставки.
     """
-    lines = _sub_body_directives(sub, token) + [c.uri for c in configs]
+    lines = _sub_body_directives(sub, token, client) + [c.uri for c in configs]
     body = "\n".join(lines)
     return body if plain else base64.b64encode(body.encode()).decode()
 
@@ -333,6 +351,82 @@ def _fix_entrypoints() -> str:
     """Какие слоты в клиенте ведут на страницу: off / support / all."""
     mode = (os.getenv("SUB_FIX_ENTRYPOINTS") or "off").strip().lower()
     return mode if mode in ("off", "support", "all") else "off"
+
+
+# ── Кто именно пришёл за подпиской ──────────────────────────────────────
+#
+# Клиенты называют себя в User-Agent на каждом запросе (``Happ/2.4.1``,
+# ``v2rayTun/5.24.76``, ``HiddifyNext/4.1.1 (windows) like ClashMeta``), и
+# набор украшений у них РАЗНЫЙ: у Happ богатый Advanced-слой за Provider ID,
+# у v2rayTun — одна строка announce с раскраской и кликом, у Hiddify нет
+# ничего, кроме шкалы трафика и двух ссылок в меню профиля.
+#
+# Зачем ветвление, а не «слать всем всё»: имя ``announce`` у Happ и v2rayTun
+# ОБЩЕЕ, но синтаксис разный — цветовые коды ``#RRGGBB``, которые v2rayTun
+# красит, Happ покажет буквально («#ff5555Не подключается?»). Плюс каждый
+# клиент получает только осмысленные для него заголовки, а не кашу.
+_CLIENT_PATTERNS = (
+    # HiddifyNext называет себя «like ClashMeta v2ray sing-box», поэтому
+    # проверяется ПЕРВЫМ: иначе подстрока «v2ray» увела бы его в v2rayTun.
+    ("hiddify", re.compile(r"hiddify", re.I)),
+    ("v2raytun", re.compile(r"v2raytun", re.I)),
+    ("happ", re.compile(r"\bhapp\b|happ/", re.I)),
+    ("streisand", re.compile(r"streisand", re.I)),
+    ("v2rayng", re.compile(r"v2rayng", re.I)),
+)
+
+
+def _client_kind(user_agent: str | None) -> str:
+    """Какой клиент пришёл: happ / v2raytun / hiddify / … / unknown.
+
+    ``unknown`` (в том числе пустой UA) получает нынешний общий набор — то
+    есть добавление ветвления не может ничего сломать у клиента, которого мы
+    не опознали.
+    """
+    ua = user_agent or ""
+    for kind, pattern in _CLIENT_PATTERNS:
+        if pattern.search(ua):
+            return kind
+    return "unknown"
+
+
+def _v2raytun_announce(sub, token: str) -> tuple[str, str] | None:
+    """Строка объявления для v2rayTun + ссылка, которую она открывает.
+
+    У v2rayTun нет ни блока с фоном, ни кнопки с подписью: есть ``announce``
+    (строка под шкалой трафика) и ``announce-url`` (делает ВЕСЬ текст
+    тапабельным, справа появляется стрелка). Поэтому «кнопочность» пишется
+    словами внутри самого текста.
+
+    Цвет задаётся инлайн-кодом ``#RRGGBB`` перед словом и действует до
+    следующего кода — красим только призыв, чтобы строка не превратилась в
+    радугу. Регистрация клиенту не нужна, в отличие от Provider ID у Happ.
+    """
+    banner = _sub_status_banner(sub, token)
+    status = banner.get("sub-info-text")
+    if not status:
+        return None
+    entrypoints = _fix_entrypoints()
+    page = _fix_page_url(token) if entrypoints != "off" else None
+    if not page:
+        # Без страницы объявление остаётся просто статусом — красить и
+        # делать кликабельным нечего.
+        return status, ""
+    if entrypoints != "all":
+        # Режим ``support`` — переходная ступень: ссылка на страницу уже
+        # есть, но громкого призыва ещё нет. У Happ на этой ступени крупная
+        # кнопка тоже не появляется (она включается только в ``all``), и
+        # ломать лестницу раската ради одного клиента незачем.
+        return status, page
+    # Красный призыв + статус. Цвет статуса несёт тот же смысл, что
+    # sub-info-color у Happ: красный — пора платить, серый — всё в порядке.
+    # Иначе «Подписка закончилась» показывалась бы тем же тоном, что «активна
+    # до …», и человек не отличил бы одно от другого.
+    status_colour = "#e05252" if banner.get("sub-info-color") == "red" else "#9aa0a6"
+    return (
+        f"#e05252Не подключается? Нажмите здесь. {status_colour}{status}",
+        page,
+    )
 
 
 def _plural_hours(n: int) -> str:
@@ -449,7 +543,7 @@ def resolve_sub_token(db: Session, token: str) -> SubTokenLookup | None:
 
 def _sub_response_headers(
     sub: models.Subscription, token: str, device=None,
-    *, userinfo_expire_only: bool = False,
+    *, userinfo_expire_only: bool = False, user_agent: str | None = None,
 ) -> dict[str, str]:
     """Заголовки саб-ответа (читаются клиентом на каждом рефреше — existing юзеры
     подхватят без переимпорта).
@@ -478,6 +572,7 @@ def _sub_response_headers(
     токена; запрещаем CF-Worker'у и любым промежуточным прокси его кэшировать,
     иначе seamless-alias-инвариант обнулится закэшированным старым конфигом.
     """
+    client = _client_kind(user_agent)
     title = "V8-VPN"
     try:
         interval_h = int(os.getenv("SUB_PROFILE_UPDATE_INTERVAL_H") or "2")
@@ -490,6 +585,10 @@ def _sub_response_headers(
         "content-disposition": f'attachment; filename="{title}"',
         "cache-control": "no-store, private",
         "pragma": "no-cache",
+        # Ответ теперь зависит от клиента — говорим это вслух любому кэшу на
+        # пути. no-store уже запрещает кэширование, но Vary дешёвый и снимает
+        # целый класс «а вдруг промежуточный прокси всё же сложит».
+        "vary": "User-Agent",
     }
     if sub.expires_at:
         # ВСЕ ЧЕТЫРЕ ключа обязательны: Hiddify парсит заголовок только целиком
@@ -544,16 +643,39 @@ def _sub_response_headers(
     # странице человек уже есть через большую кнопку блока статуса, а два
     # входа в одно место — дубль. К тому же t.me-ссылка рисуется телеграмной
     # иконкой, и это единственный оставшийся способ попасть в бота из клиента.
-    support = page_url if entrypoints == "support" and page_url else tg_link
+    # Кому иконка ведёт на страницу:
+    #  * режим ``support`` — всем (переходный режим до больших кнопок);
+    #  * Hiddify — ВСЕГДА, когда страница включена: у него нет ни блока
+    #    статуса, ни объявлений, а ``profile-web-page-url`` на актуальных
+    #    версиях не отображается (баги hiddify-app#2063, #1722). То есть
+    #    support-url — его ЕДИНСТВЕННЫЙ достижимый вход, и уводить его в
+    #    Telegram значит оставить второго по массовости клиента вообще без
+    #    входа ровно тогда, когда Telegram недоступен;
+    #  * Happ — в Telegram: у него вход есть большой кнопкой блока статуса, а
+    #    t.me-ссылка рисуется телеграмной иконкой и остаётся единственным
+    #    способом попасть в бота прямо из клиента.
+    support_to_page = page_url and (
+        entrypoints == "support" or (client == "hiddify" and entrypoints == "all")
+    )
+    support = page_url if support_to_page else tg_link
     if support:
         headers["support-url"] = support
-    provider_id = _happ_provider_id()
+    # ── Happ-специфика ──────────────────────────────────────────────────
+    # Остальным эти заголовки бесполезны: v2rayTun и Hiddify их молча
+    # игнорируют. ``unknown`` тоже получает их — так поведение для
+    # неопознанного клиента остаётся ровно нынешним, и ветвление не может
+    # ничего сломать там, где мы не уверены, кто пришёл.
+    # streisand/v2rayng классифицируются (пригодится для статистики), но своих
+    # веток у них нет — значит набор им остаётся ПРЕЖНИМ. Иначе правка была бы
+    # чистой потерей: лишили бы их sub-info/providerid, не дав ничего взамен.
+    happ_slots = client not in ("v2raytun", "hiddify")
+    provider_id = _happ_provider_id() if happ_slots else ""
     if provider_id:
         # Ключ к Advanced-слою Happ: без него sub-expire, notification-subs-
         # expire и sub-info-* клиент молча игнорирует. Дубль едет в теле
         # (#providerid …) на случай прокси, режущего нестандартные заголовки.
         headers["providerid"] = provider_id
-    if sub.expires_at:
+    if happ_slots and sub.expires_at:
         # Пуш-напоминания клиента за 3 дня до конца — бесплатный канал
         # возврата, работающий даже когда человек отключил уведомления нашего
         # бота. Advanced: оживает только с providerid. Без срока подписки
@@ -563,7 +685,7 @@ def _sub_response_headers(
     # «Продлить» (текст кнопки фиксирован клиентом). Показывает его сам клиент
     # за ≤3 дня до конца и после истечения; Advanced — требует providerid.
     # Значения ASCII, поэтому заголовок безопасен.
-    if _status_banner_enabled() and sub.expires_at:
+    if happ_slots and _status_banner_enabled() and sub.expires_at:
         headers["sub-expire"] = "1"
         # В режиме ``all`` — на страницу, а не в Telegram. Именно у истёкшей
         # подписки родное предупреждение вытесняет блок sub-info, то есть эта
@@ -581,11 +703,28 @@ def _sub_response_headers(
         expire_link = page_url if expire_to_page else tg_link
         if expire_link:
             headers["sub-expire-button-link"] = expire_link
-    # announce — Standard-блок Happ, работает БЕЗ providerid, форма
-    # ``base64:`` документирована. Роль — запасной видимый статус, пока
-    # providerid не задан/не провалидирован (в auto-режиме он сам гаснет при
-    # заданном providerid: с живым sub-info это был бы дубль текста).
-    if _status_banner_enabled() and _announce_enabled():
+    # ── announce: одно имя, два разных синтаксиса ───────────────────────
+    #
+    # v2rayTun красит текст инлайн-кодами ``#RRGGBB`` и делает его тапабельным
+    # через ``announce-url``; Happ ни того, ни другого не умеет и показал бы
+    # цветовые коды буквально («#e05252Не подключается?»). Поэтому строка
+    # собирается ПОД КЛИЕНТА, а не одна на всех.
+    # _announce_enabled() гейтит обе ветки: v2rayTun-рендер единственный, что
+    # ещё не проверен на живом устройстве, и выключать его должно быть чем-то
+    # точнее общего SUB_STATUS_BANNER (тот гасит блок статуса целиком).
+    if _status_banner_enabled() and client == "v2raytun" and _announce_enabled(client):
+        pair = _v2raytun_announce(sub, token)
+        if pair:
+            text, url = pair
+            headers["announce"] = (
+                "base64:" + base64.b64encode(text.encode("utf-8")).decode()
+            )
+            if url:
+                headers["announce-url"] = url
+    elif _status_banner_enabled() and happ_slots and _announce_enabled(client):
+        # Happ-вариант: без цветовых кодов и без ссылки (их он не понимает).
+        # Роль — запасной видимый статус, пока providerid не задан или не
+        # провалидирован; в auto-режиме гаснет сам, когда живёт sub-info.
         announce_text = _sub_status_banner(sub, token).get("sub-info-text")
         if announce_text:
             headers["announce"] = (
@@ -596,8 +735,15 @@ def _sub_response_headers(
     # base64:-обёрнутую кириллицу в заголовках, а вот директивы из base64-ТЕЛА
     # не читает вовсе (тело остаётся документированным fallback'ом). Требует
     # providerid; без него клиент молча игнорирует — не вредно.
-    if _status_banner_enabled():
+    if happ_slots and _status_banner_enabled():
         headers.update(_sub_status_banner(sub, token))
+    # Бонусом к support-url: на версиях, где этот слот работает, у Hiddify
+    # появляется ещё и пункт в меню профиля. Полагаться на него нельзя (в
+    # 4.1.1 не отображается), поэтому основной вход — support-url выше.
+    if client == "hiddify" and page_url and entrypoints == "all":
+        # Только в ``all``: в режиме ``support`` на страницу уже ведёт
+        # support-url, и второй пункт меню с тем же адресом — дубль.
+        headers["profile-web-page-url"] = page_url
     if _autoconnect_enabled(sub, device):
         headers["subscription-autoconnect"] = "true"  # канон (HAPP принимает и "1")
         headers["subscription-autoconnect-type"] = "lowestdelay"
@@ -1206,7 +1352,10 @@ def dynamic_sub_link(
             )
             db.commit()
 
-        encoded = _sub_body(configs, sub, plain=(fmt == "plain"), token=token)
+        encoded = _sub_body(
+            configs, sub, plain=(fmt == "plain"), token=token,
+            client=_client_kind(request.headers.get("user-agent")),
+        )
         return PlainTextResponse(
             content=encoded,
             media_type="text/plain",
@@ -1214,6 +1363,7 @@ def dynamic_sub_link(
             headers=_sub_response_headers(
                 sub, token, device,
                 userinfo_expire_only=(userinfo == "expire"),
+                user_agent=request.headers.get("user-agent"),
             ),
         )
 
@@ -1257,7 +1407,10 @@ def dynamic_sub_link(
             headers={"Retry-After": _retry_after_sec()},
         )
 
-    encoded = _sub_body(configs, sub, plain=(fmt == "plain"), token=token)
+    encoded = _sub_body(
+            configs, sub, plain=(fmt == "plain"), token=token,
+            client=_client_kind(request.headers.get("user-agent")),
+        )
 
     _mark_first_config_fetch(db, sub)
 
@@ -1280,6 +1433,7 @@ def dynamic_sub_link(
         media_type="text/plain",
         headers=_sub_response_headers(
             sub, token, userinfo_expire_only=(userinfo == "expire"),
+            user_agent=request.headers.get("user-agent"),
         ),
     )
 
