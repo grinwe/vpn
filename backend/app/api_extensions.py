@@ -243,8 +243,9 @@ def _sub_body_directives(sub) -> list[str]:
 
     Тело — UTF-8, и документация Happ разрешает каждый параметр комментарием
     ``#имя: значение`` перед ссылками наравне с заголовками (заголовки в
-    приоритете). Кириллица здесь едет как есть — в заголовках она невозможна
-    (latin-1), поэтому русский sub-info-текст живёт именно тут. Остальные
+    приоритете). Рабочий канал sub-info — ЗАГОЛОВКИ (base64:-обёртку клиент
+    разворачивает, проверено 2026-07-29); из base64-тела директивы клиент не
+    читает, так что здесь они лишь документированный fallback. Остальные
     клиенты строки с ``#`` игнорируют — это стандартная форма для панелей.
 
     ``providerid`` — особый формат БЕЗ двоеточия (``#providerid {id}``), так в
@@ -317,7 +318,7 @@ def _plural_hours(n: int) -> str:
 
 def _sub_response_headers(
     sub: models.Subscription, token: str, device=None,
-    *, userinfo_expire_only: bool = False, sub_info_headers: bool = False,
+    *, userinfo_expire_only: bool = False,
 ) -> dict[str, str]:
     """Заголовки саб-ответа (читаются клиентом на каждом рефреше — existing юзеры
     подхватят без переимпорта).
@@ -423,24 +424,22 @@ def _sub_response_headers(
         headers["sub-expire"] = "1"
         if support:
             headers["sub-expire-button-link"] = support
-    # announce — Standard-блок Happ, работает БЕЗ providerid: голубой блок с
-    # нашим текстом статуса, форма ``base64:`` для него документирована. Это
-    # единственный видимый блок до регистрации Provider ID; русский sub-info
-    # продолжает ехать телом (_sub_body_directives) — в заголовок кириллицу
-    # не положить.
+    # announce — Standard-блок Happ, работает БЕЗ providerid, форма
+    # ``base64:`` документирована. Роль — запасной видимый статус, пока
+    # providerid не задан/не провалидирован (в auto-режиме он сам гаснет при
+    # заданном providerid: с живым sub-info это был бы дубль текста).
     if _status_banner_enabled() and _announce_enabled():
         announce_text = _sub_status_banner(sub).get("sub-info-text")
         if announce_text:
             headers["announce"] = (
                 "base64:" + base64.b64encode(announce_text.encode("utf-8")).decode()
             )
-    # Диагностика (?subinfo=headers): sub-info-* ЗАГОЛОВКАМИ, кириллица уедет
-    # base64:-обёрнутой через _header_safe. Форма для sub-info в доках не
-    # описана, но проверка 2026-07-29 «не разворачивает» шла без providerid и
-    # невалидна; с живым providerid (родной баннер рисуется) а вот директивы
-    # из base64-ТЕЛА клиент так и не читает — заголовки остались последним
-    # непроверенным каналом для цветного блока.
-    if sub_info_headers and _status_banner_enabled():
+    # Цветной блок статуса: sub-info-* ЗАГОЛОВКАМИ — рабочий канал, проверено
+    # на живом устройстве 2026-07-29 (?subinfo=headers): Happ разворачивает
+    # base64:-обёрнутую кириллицу в заголовках, а вот директивы из base64-ТЕЛА
+    # не читает вовсе (тело остаётся документированным fallback'ом). Требует
+    # providerid; без него клиент молча игнорирует — не вредно.
+    if _status_banner_enabled():
         headers.update(_sub_status_banner(sub))
     if _autoconnect_enabled(sub, device):
         headers["subscription-autoconnect"] = "true"  # канон (HAPP принимает и "1")
@@ -852,7 +851,6 @@ def dynamic_sub_link(
     db: Session = Depends(get_db),
     fmt: str | None = None,
     userinfo: str | None = None,
-    subinfo: str | None = None,
 ):
     """Dynamic subscription link — per-device or legacy per-subscription.
 
@@ -1021,7 +1019,6 @@ def dynamic_sub_link(
             headers=_sub_response_headers(
                 sub, token, device,
                 userinfo_expire_only=(userinfo == "expire"),
-                sub_info_headers=(subinfo == "headers"),
             ),
         )
 
@@ -1088,7 +1085,6 @@ def dynamic_sub_link(
         media_type="text/plain",
         headers=_sub_response_headers(
             sub, token, userinfo_expire_only=(userinfo == "expire"),
-            sub_info_headers=(subinfo == "headers"),
         ),
     )
 

@@ -213,13 +213,13 @@ def test_headers_are_latin1_encodable():
         value.encode("latin-1")  # упадёт ровно на том, что уронило бы прод
 
 
-def test_banner_travels_in_the_body_not_in_headers(monkeypatch):
-    """Русский sub-info-текст едет ТЕЛОМ.
+def test_banner_body_directives_stay_as_documented_fallback(monkeypatch):
+    """Директивы в теле остаются документированным fallback'ом.
 
-    Заголовки — latin-1, кириллицу туда не положить, а ``base64:``-форма для
-    sub-info-* в доках Happ не описана (в отличие от announce). Тело же
-    отдаётся в UTF-8, и документация Happ разрешает каждый параметр
-    комментарием перед ссылками наравне с заголовками.
+    Рабочий канал — заголовки (см. test_subinfo_rides_in_headers…), но тело
+    UTF-8 и Happ описывает передачу комментариями наравне с заголовками:
+    если клиент однажды начнёт читать тело, заголовки всё равно в приоритете
+    и дубля не будет.
     """
     import base64 as b64
 
@@ -227,9 +227,6 @@ def test_banner_travels_in_the_body_not_in_headers(monkeypatch):
 
     monkeypatch.setenv("BOT_USERNAME", "GV8_VPN_bot")
     sub = _Sub(timedelta(days=20))
-
-    headers = _sub_response_headers(sub, "tok")
-    assert not any(k.startswith("sub-info") for k in headers)
 
     class _Cfg:
         uri = "vless://u@h:443#⚡ Основной 1"
@@ -434,23 +431,26 @@ def test_buttons_lead_to_the_account_not_to_start(monkeypatch):
     assert banner["sub-info-button-link"] == "https://t.me/GV8_VPN_bot/app"
 
 
-def test_subinfo_headers_diag_is_opt_in_and_latin1_safe(monkeypatch):
-    """`?subinfo=headers` — последний непроверенный канал для цветного блока:
-    из base64-тела Happ директивы не читает и с providerid (проверено на
-    устройстве 2026-07-29). Кириллица обязана уехать base64:-обёрнутой, а не
-    уронить выдачу; по умолчанию заголовков sub-info нет."""
+def test_subinfo_rides_in_headers_base64_wrapped(monkeypatch):
+    """Цветной блок статуса едет ЗАГОЛОВКАМИ — рабочий канал, подтверждён на
+    живом устройстве 2026-07-29 (Happ разворачивает base64:-обёртку при
+    живом providerid; из base64-тела директивы не читает). Кириллица обязана
+    уехать base64:-обёрнутой, а не уронить выдачу (latin-1)."""
     monkeypatch.setenv("BOT_USERNAME", "GV8_VPN_bot")
     sub = _Sub(timedelta(days=20))
 
-    default = _sub_response_headers(sub, "tok")
-    assert not any(k.startswith("sub-info") for k in default)
-
-    diag = _sub_response_headers(sub, "tok", sub_info_headers=True)
-    assert diag["sub-info-text"].startswith("base64:")
-    assert diag["sub-info-color"] == "blue"
-    assert diag["sub-info-button-text"].startswith("base64:")
-    for value in diag.values():
+    headers = _sub_response_headers(sub, "tok")
+    assert headers["sub-info-text"].startswith("base64:")
+    assert headers["sub-info-color"] == "blue"
+    assert headers["sub-info-button-text"].startswith("base64:")
+    assert headers["sub-info-button-link"].startswith("https://t.me/")
+    for value in headers.values():
         value.encode("latin-1")
+
+    # Рубильник блока гасит и заголовки.
+    monkeypatch.setenv("SUB_STATUS_BANNER", "0")
+    off = _sub_response_headers(sub, "tok")
+    assert not any(k.startswith("sub-info") for k in off)
 
 
 def test_banner_date_matches_client_msk_rendering():

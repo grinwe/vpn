@@ -134,8 +134,7 @@ deploy_app_stack_sub_happ_autoconnect_since: ""
 deploy_app_stack_happ_provider_id: "{{ vault_happ_provider_id | default('') }}"
 # announce — Standard-блок статуса Happ (работает без providerid).
 # auto = слать, пока providerid не задан; 1 = всегда; 0 = никогда.
-# ВРЕМЕННО "1" (2026-07-29): клиент валидирует providerid не чаще раза в
-# сутки, и до первой валидации Advanced-слой (sub-info) мёртв — announce
-# даёт видимый блок сразу. Когда sub-info подтвердится на устройстве,
-# вернуть "auto", иначе у людей будет два блока с одним текстом.
-deploy_app_stack_sub_status_announce: "1"
+# 2026-07-29: sub-info ЗАГОЛОВКАМИ подтверждён на устройстве (цветной блок
+# с кнопкой) → auto: с заданным providerid announce молчит, дубля текста
+# нет. Если providerid когда-нибудь протухнет — сменить на "1" до починки.
+deploy_app_stack_sub_status_announce: "auto"
