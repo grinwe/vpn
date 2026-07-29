@@ -1,0 +1,262 @@
+# Эпик: починка и оплата без Telegram (страница на саб-домене)
+
+**Статус:** в работе с 2026-07-29 (вечер). План отревьюирован и исправлен:
+фактчек против кода + живые проверки инфраструктуры.
+
+## Зачем
+
+Человек со сломанным VPN заперт в круге: кнопка «VPN не работает» и оплата
+живут в Telegram-боте, а Telegram без VPN бывает недоступен (регионы с
+default-deny, whitelist-сценарии). Разрыв круга: домен саб-ссылки
+(grn-ssync.pro) доступен без VPN — с него клиент и так тянет конфиги. На нём
+же отдаём страницу, которая по sub_token умеет два действия: шаг лестницы
+ротации и счёт на продление картой.
+
+Механика починки готова (services/rotation.py, лестница, прод 2026-07-29),
+механика оплаты готова (lava.top без Telegram, тик сверки раз в минуту,
+`_mark_invoice_paid_core` двигает `expires_at` и сбрасывает шкалу трафика).
+Работа — обвязка.
+
+Решения владельца: входы — support-url + кнопка sub-info; оплата в этом же
+эпике; опрос оператора — не в этот заход.
+
+## Архитектура
+
+Одна страница, два действия, один URL (query, не новый путь):
+
+| Метод | URL наружу | Бэкенд | Что делает |
+|---|---|---|---|
+| GET | `https://grn-ssync.pro/<token>?fix=1` | GET /api/sub/{token}?fix=1 | HTML-страница, ничего не пишет в БД |
+| POST | `…?fix=1&n=<nonce>` | POST /api/sub/{token} | шаг лестницы → HTML с результатом |
+| POST | `…?fix=1&n=<nonce>&pay=1` | POST /api/sub/{token} | счёт lava.top → редирект на оплату |
+| GET | `…?fix=1&paid=<invoice_id>` | GET /api/sub/{token} | ожидание подтверждения (meta-refresh 5с, без JS) |
+
+**Инфраструктурные посылки — ПРОВЕРЕНЫ вживую 2026-07-29:**
+
+- CF Worker v8-sub ПОСЛЕ правки (вставлена в Dashboard 2026-07-29)
+  пробрасывает query string (`?fmt=plain` через CDN отдаёт plain-тело —
+  curl) и метод POST (405 от FastAPI доезжает через CDN — curl). Тело POST
+  воркер НЕ форвардит (fetch без body) — поэтому формы без полей, всё в
+  query. Контракт «метод и query — несущие» записан в worker-v8-sub.md.
+  Исходная посылка «работает сегодня без правки воркера» была неверна —
+  работает потому, что правка уже задеплоена.
+- Починка на POST, не на GET: GET дёргают префетчеры/антивирусы/«назад», а
+  шаги лестницы конечны (протоколов 4, перестановок ≤3).
+- **Дискриминатор Accept: страница отдаётся только при `text/html` в
+  `Accept`** (браузеры шлют, Happ/v2ray/Hiddify — нет). Закрывает footgun
+  «вставил URL с ?fix=1 в клиент как саб-ссылку → профиль ловит HTML вместо
+  base64». Без text/html поведение байт-в-байт как без ?fix.
+
+## Этапы (каждый катится и откатывается сам)
+
+### Д0. Денежные фиксы — самоценны, идут ПЕРВЫМИ (фактчек 2026-07-29)
+
+1. 🔴 **Дыра на 1 ₽**: `POST /api/invoices` доступен без админ-токена
+   (`optional_admin_token`) и принимает клиентский `amount` как есть
+   (invoices.py:348); `_mark_invoice_paid_core` сумму не сверяет →
+   renewal-инвойс на 1 ₽ продлевает подписку целиком (вебхук сверяет платёж
+   с тем же заниженным Invoice.amount). Фикс: без админ-токена клиентский
+   `amount` игнорируется, сумма считается сервером.
+2. 🔴 **Доплата за слоты теряется во всех invoice-путях**: баланс-путь берёт
+   `plan.price + slots × 100₽ × месяцы` (balance.py:372-379), invoice-пути
+   (бот → POST /api/invoices; webapp_checkout api_webapp.py:676) — голый
+   `plan.price`. WebApp уже сегодня показывает цену со слотами
+   (total_per_period_kopecks), а счёт выставляет меньше: два пути продления
+   берут разные деньги за одно и то же. Фикс: сумма renewal-счёта =
+   `total_renewal_cost_kopecks` (balance.py:139) / 100.
+3. **Дедуп pending-счёта + персист pay_url**: сегодня pay_url нигде не
+   хранится, каждый тап создаёт новый Invoice (бот и webapp). Фикс: колонка
+   `Payment.pay_url` (миграция) + правило «есть pending renewal-инвойс этой
+   подписки с живым pay_url → вернуть его, не создавая новый».
+4. **Общий хелпер checkout** — база: `checkout_invoice` (payments.py:142),
+   ТОЛЬКО у него есть `_convert_for_provider` (#108) и IntegrityError-дедуп
+   (#52); обе webapp-копии (api_webapp.py:621, :811) голые. Четвёртой копии
+   (страница) быть не должно. ⚠️ Stars: в webapp-копиях Invoice.amount
+   бывает в XTR — хелпер работает строго в RUB, Stars-ветку не трогаем.
+
+### Э0. Ядро починки — services/self_repair.py (новый)
+
+Логика жалобы живёт в client_control.py:1118
+(`report_broken_device_by_telegram`); от Telegram зависит resolve юзера +
+строка actor в аудите. Остальное — функция от device.
+
+```python
+@dataclass(frozen=True)
+class RepairOutcome:
+    action: Literal["migrated","reshuffled","duplicated","throttled","no_target","no_subscription"]
+    report_id / device_id / device_name / new_node_name / task_id / deduped
+
+def handle_broken_device(db, device, *, operator=None, source="bot_vpn_broken",
+                         actor=None, throttle_sec=None) -> RepairOutcome
+```
+
+- Литералы action совпадают с ReportBrokenResponse.action — бот не правится.
+- `throttle_sec=None` — сегодняшнее поведение; страница передаёт ~120 с.
+- FOR UPDATE берёт само ядро — закрывает двойной тап у webapp и страницы.
+- **Структурный факт (фактчек): relocate в коде — это fallthrough в
+  `failover_device` (client_control.py:1172-1190), а НЕ явная ветка
+  STEP_RELOCATE.** Ядро повторяет эту структуру, не выдумывает dispatch.
+- **Re-export'ы — по ФАКТУ импортов, а не по списку из головы.** Тесты
+  реально импортируют: `_do_failover` (3 файла: test_operator_report,
+  test_netfix_api_client_control_py, test_auditfix2_api_client_control_py),
+  `_resolve_reported_node_id`, `_prune_stale_auto_bans`, `_should_auto_ban`,
+  `_escalate_node_failure_reports`. Плюс module-coupling:
+  test_epic_e0_fixes.py:227 монкипатчит `client_control.COMPLAINT_DEDUP_SEC`
+  — константа остаётся читаемой через модуль client_control.
+- **Унификация webapp — поведенческое изменение, и это цель:** сегодня
+  webapp_report_broken_device (api_webapp.py:2033) зовёт failover_device
+  напрямую, пишет `health_ping_response` и НЕ пишет `complaint_received` —
+  жалобы из webapp невидимы для счётчика лестницы (rotation.py:71). После
+  перевода на ядро webapp-жалобы начинают двигать эскалацию. Совместимость:
+  `migrated = action in ("migrated","reshuffled","duplicated")` — иначе
+  Help.tsx:107 покажет «не смогли» на успешной починке; поле `outcome`
+  добавляем опциональным (фронт уже готов, Help.tsx:99-105).
+
+Приёмка: весь suite зелёный; правки тестов не требуются, если re-export'ы
+покрывают фактический список выше.
+
+### Э1. resolve_sub_token() — вынос лукапа из dynamic_sub_link
+
+Лукап «токен → подписка/устройство» с alias-блоком на живого соседа
+заинлайнен под рамкой «DO NOT TOUCH» (api_extensions.py:885). Выносим в
+хелпер, возвращающий dataclass (sub, token_device, serve_device, is_legacy).
+Дословно, вместе с рамкой, отдельным коммитом без единой правки логики —
+это самый несущий код репо (сломаешь — сохранённые URL клиентов 404-ят).
+Страховка — test_auditfix_api_extensions_py.py.
+
+⚠️ Функции вокруг (_sub_response_headers, _sub_status_banner, userinfo)
+сильно переработаны 2026-07-29 (sub-info заголовками, announce auto, байты
+трафика) — стартовать строго от свежего dev.
+
+### Э2. Страница и починка — backend/app/api/sub_fix.py (новый)
+
+- HTML через string.Template + html.escape (Jinja2 в прод-зависимостях нет).
+  Самодостаточная: ни CSS/шрифтов/картинок извне, ни JS; кнопки —
+  `<form method="post">`. Цель < 8 КБ.
+- Заголовки: `cache-control: no-store, private`, `referrer-policy:
+  no-referrer` (токен не должен уехать в Referer), `x-content-type-options:
+  nosniff`, `x-frame-options: DENY`, `x-robots-tag: noindex`.
+- `html.escape()` на Device.name — XSS-вектор (бот уже экранирует,
+  handlers.py:1313).
+- Nonce: `hmac_sha256(APP_SECRET_KEY, f"{token}:{floor(now/900)}")[:16]`,
+  принимаем текущий и предыдущий бакет. CSRF, не аутентификация.
+- Rate limit (slowapi, инстанс app/rate_limit.py): на НОВОМ POST-роуте свой
+  бакет — 2/minute + 6/hour по ключу ТОКЕНА (не IP: CGNAT у мобильных
+  операторов), 40/hour по IP. Ключ-функция своя, НЕ `_client_id_from_request`
+  из client_control (X-Client-ID спуфится). GET не лимитируем — это горячий
+  саб-поллинг (дефолт 300/min per-IP уже действует).
+- Дневной потолок: ≤5 успешных починок source="sub_page" на устройство/24ч
+  (по AuditLog) — отсекает вычерпывание пула по утёкшему токену.
+- В dynamic_sub_link: параметр fix + ранний возврат ДО
+  `_raise_if_sub_not_serviceable`, `_mark_first_config_fetch` и
+  `_should_log_sub_fetch` — страница не отравляет онбординг-воронку и аудит.
+
+Состояния (все 200 с человеческим текстом, кроме неизвестного токена):
+
+| Состояние | Что показываем |
+|---|---|
+| активна | кнопка «Починить подключение» |
+| reshuffle успешен | «переключили на другой способ связи» + шаги с 🔄 |
+| duplicate | «добавили запасной сервер» |
+| нет кандидатов | «сейчас нет свободного сервера, попробуйте через 10 минут» |
+| троттл | «уже переключили пару минут назад, нажмите 🔄» |
+| истекла | экран продления (Э3) |
+| на паузе / заблокирована | объяснение + контакт |
+| токен неизвестен | camo-лендинг «Internal Tools Portal» (как на корне воркера) |
+
+Последнее важно: никаких «подписка не найдена» — разница в статусе/размере
+сама становится оракулом для пробера.
+
+### Э3. Оплата со страницы
+
+- Через общий хелпер из Д0: Invoice(action=renewal, subscription_id, сумма
+  СЕРВЕРНАЯ с учётом слотов) → lava.top → Payment(pending, pay_url) →
+  303-редирект на pay_url. Дедуп: повторный тап → тот же pay_url.
+- lava.top сумму берёт из НАШЕГО Invoice.amount (offerId — «цена по запросу
+  через API», lava_top.py:132) — поэтому Д0-фиксы суммы обязательны до Э3.
+- Возврата (success_url) платформа не даёт — человек возвращается на вкладку
+  сам; страница `?paid=<invoice_id>` поллит статус meta-refresh'ем каждые
+  5с, с проверкой `invoice.subscription_id == sub.id` (чужой invoice_id не
+  раскрывается). Подтверждение ~30-60с (вебхуки lava в проде не долетают —
+  докстринг worker.py:380; работает тик сверки раз в минуту) — текст на
+  странице говорит это честно.
+- Продление и сброс шкалы трафика — ноль работы: `_mark_invoice_paid_core`
+  (invoices.py:277-291) делает оба сам.
+- Stars на странице невозможны (только внутри Telegram) — карта/СБП.
+
+### Э4. Кнопки в клиенте — _sub_response_headers / _sub_status_banner
+
+| Слот | Слой | Куда ведёт |
+|---|---|---|
+| support-url | Standard, работает всегда | страница |
+| sub-info-button | Advanced (providerid) | страница, текст «Не подключается?» |
+| sub-expire-button-link | Advanced, последние ≤3 дня | Telegram при `SUB_FIX_ENTRYPOINTS=support`; **страница при `=all`** |
+
+- Продление снимается с sub-info без потерь: пока активен expire-баннер,
+  sub-info не показывается вовсе — блок виден только в «зелёном» состоянии,
+  где тап значит «сломалось».
+- **Поправка ревью: expire-кнопка → Telegram противоречит цели эпика ровно
+  в сценарии, ради которого он писался** (истёкшая подписка + Telegram
+  недоступен → единственная видимая кнопка ведёт в тупик). Поэтому при
+  `=all` она ведёт на страницу, а страница даёт ссылку «открыть Telegram»
+  для тех, у кого он жив.
+- ⚠️ support-url не на t.me теряет Telegram-иконку в строке подписки Happ
+  (рисуется генерик-иконка) — осознанная цена, зафиксировано.
+- sub-info-кнопка реально рендерится: канал заголовков подтверждён на
+  устройстве 2026-07-29 (см. subset_epic).
+- URL строим от SUB_LINK_BASE_URL (grn-ssync.pro), никогда от
+  grinwer.online (проблемный из РФ).
+
+## Флаги
+
+| Переменная | Дефолт | Что делает |
+|---|---|---|
+| SUB_FIX_PAGE | 0 | страница отвечает; при 0 — camo на любой ?fix с text/html |
+| SUB_FIX_ENTRYPOINTS | off | off / support / all — какие слоты ведут на страницу (`all` включает и expire-кнопку) |
+| SUB_FIX_PAY | 0 | блок продления на странице |
+| SUB_FIX_THROTTLE_SEC | 120 | окно «уже переключили» для повторного POST |
+| SUB_FIX_DAILY_MAX | 5 | потолок починок source=sub_page на устройство/сутки |
+
+## Верификация
+
+Тесты (backend/tests/):
+- test_self_repair_core.py — три источника (бот/webapp/страница) на одном
+  состоянии дают одинаковый RepairOutcome; троттл; source в AuditLog.extra;
+  webapp-жалоба пишет complaint_received (унификация лестницы).
+- test_sub_fix_page.py — главный: GET ничего не меняет (ноль новых AuditLog,
+  complaints_in_window == 0, first_config_fetch_at не выставлен, леги не
+  тронуты); GET без fix отдаёт base64; **GET с fix=1 но БЕЗ text/html в
+  Accept отдаёт base64** (дискриминатор); POST без тела работает; битый
+  nonce → отказ без записи в БД; XSS в Device.name не протекает; неизвестный
+  токен → camo; alias revoked-девайса чинит соседа.
+- test_sub_fix_pay.py — счёт с subscription_id и СЕРВЕРНОЙ суммой (слоты!);
+  повторный тап → тот же pay_url; чужой invoice_id в ?paid= не раскрывается;
+  1₽-дыра закрыта (amount без админ-токена игнорируется).
+- Дописать в test_rotation_ladder.py: жалобы со страницы идут по лестнице
+  (reshuffle → relocate → duplicate).
+
+Ручная приёмка: страница в вебвью Android/iOS; починка + 🔄 → новый набор;
+тестовый счёт (≥50 ₽ — минимум lava) → оплата картой → через минуту
+expires_at сдвинулся и шкала обнулилась.
+
+Проверить в CF до релиза (зона grn-ssync.pro): Rocket Loader, Email
+Obfuscation, Bot Fight Mode — инжектят скрипты/challenge именно в text/html;
+в вебвью это белый экран. Сегодня зона отдаёт HTML только на camo-лендинге.
+
+## Риски
+
+- Утёкший токен = деструктивная кнопка: лимит по токену, дневной потолок,
+  nonce, алерт на всплеск source=sub_page.
+- Человек починился, но не нажал 🔄 — видит старый набор до 2ч. Инструкция
+  про 🔄 крупно; кандидат — SUB_PROFILE_UPDATE_INTERVAL_H=1.
+- Воркер «оптимизируют» и потеряют url.search/метод — контракт в
+  worker-v8-sub.md, плюс тест-канарейка руками при правках воркера.
+- Параллельная работа: правки 2026-07-29 (sub-info заголовками, announce,
+  трафик) все закоммичены и задеплоены; Э1/Э4 ложатся на эти же функции —
+  стартовать от свежего dev, `git status` перед каждым деплоем.
+
+## Документация к обновлению
+
+worker-v8-sub.md (контракт: метод и query — несущие), backend-api.md
+(?fix + POST /api/sub/{token}), payments.md (оплата без Telegram, дедуп,
+серверная сумма), env-reference.md (флаги SUB_FIX_*).
