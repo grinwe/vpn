@@ -226,21 +226,24 @@ def test_banner_travels_in_the_body_not_in_headers(monkeypatch):
     assert body.rstrip().endswith("vless://u@h:443#⚡ Основной 1")
 
 
-def test_body_enables_native_expire_notice(monkeypatch):
-    """Системное предупреждение Happ за 3 дня перекрывает наш блок и рисует
-    кнопку «Продлить» само — на финише человек видит родной UI клиента."""
-    import base64 as b64
+def test_native_expire_notice_goes_in_headers(monkeypatch):
+    """Родное «подписка заканчивается через N д.» + кнопка «Продлить».
 
-    from app.api_extensions import _sub_body
-
+    Заголовком, а не телом: директивы из тела клиент не разобрал ни в base64,
+    ни в plain (живое устройство, 2026-07-29), а заголовки читает. Здесь это
+    возможно ровно потому, что значения ASCII — русский текст в заголовок не
+    положить, он его роняет.
+    """
     monkeypatch.setenv("BOT_USERNAME", "GV8_VPN_bot")
+    headers = _sub_response_headers(_Sub(timedelta(days=20)), "tok")
+    assert headers["sub-expire"] == "1"
+    assert headers["sub-expire-button-link"].startswith("https://t.me/")
 
-    class _Cfg:
-        uri = "vless://u@h:443#x"
+    # Без срока предупреждать не о чем.
+    assert "sub-expire" not in _sub_response_headers(_Sub(None), "tok")
 
-    body = b64.b64decode(_sub_body([_Cfg()], _Sub(timedelta(days=20)))).decode()
-    assert "#sub-expire: 1" in body
-    assert "#sub-expire-button-link: https://t.me/" in body
+    monkeypatch.setenv("SUB_STATUS_BANNER", "0")
+    assert "sub-expire" not in _sub_response_headers(_Sub(timedelta(days=20)), "tok")
 
 
 def test_banner_can_be_switched_off(monkeypatch):

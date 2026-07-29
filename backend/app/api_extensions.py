@@ -203,15 +203,9 @@ def _sub_body_directives(sub) -> list[str]:
     banner = _sub_status_banner(sub)
     if not banner:
         return []
-    lines = [f"#{key}: {value}" for key, value in banner.items()]
-    # Системное уведомление Happ за 3 дня до конца: оно перекрывает наш блок
-    # на финише и рисует кнопку «Продлить» само. Нам это на руку — последние
-    # дни человек видит родное предупреждение клиента, а не нашу строку.
-    renew = _renew_link()
-    if renew:
-        lines.append("#sub-expire: 1")
-        lines.append(f"#sub-expire-button-link: {renew}")
-    return lines
+    # Только текстовый блок: sub-expire едет заголовком (см.
+    # _sub_response_headers) — он ASCII, а заголовки клиент читает точно.
+    return [f"#{key}: {value}" for key, value in banner.items()]
 
 
 def _sub_body(configs, sub, *, plain: bool = False) -> str:
@@ -324,6 +318,19 @@ def _sub_response_headers(
     # Пуш-напоминания клиента за 3 дня до конца — бесплатный канал возврата,
     # который работает даже когда человек отключил уведомления нашего бота.
     headers["notification-subs-expire"] = "1"
+    # Родное предупреждение Happ «подписка заканчивается через N д.» + кнопка
+    # «Продлить». Именно оно отвечает на вопрос «через сколько», который у
+    # человека возникает в клиенте: строка состояния показывает только дату.
+    #
+    # Заголовком, а не в теле: директивы из тела клиент не разобрал ни в
+    # base64, ни в plain (проверено на живом устройстве 2026-07-29), а
+    # заголовки читает — subscription-userinfo и support-url доезжают. Здесь
+    # это возможно ровно потому, что значения ASCII: русский текст в заголовок
+    # не положить.
+    if _status_banner_enabled() and sub.expires_at:
+        headers["sub-expire"] = "1"
+        if support:
+            headers["sub-expire-button-link"] = support
     # Блок статуса едет ТЕЛОМ (_sub_body_directives), а не заголовком: тут
     # latin-1, и русский текст пришлось бы кодировать в base64 — Happ его в
     # sub-info не разворачивает и просто не показывает блок.
