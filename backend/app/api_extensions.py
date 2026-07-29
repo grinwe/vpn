@@ -539,7 +539,12 @@ def _sub_response_headers(
     tg_link = _renew_link()
     entrypoints = _fix_entrypoints()
     page_url = _fix_page_url(token) if entrypoints != "off" else None
-    support = page_url if entrypoints in ("support", "all") and page_url else tg_link
+    # ``support`` — переходный режим (страница вместо Telegram в мелкой
+    # иконке). В ``all`` иконка ВОЗВРАЩАЕТСЯ в Telegram намеренно: на
+    # странице человек уже есть через большую кнопку блока статуса, а два
+    # входа в одно место — дубль. К тому же t.me-ссылка рисуется телеграмной
+    # иконкой, и это единственный оставшийся способ попасть в бота из клиента.
+    support = page_url if entrypoints == "support" and page_url else tg_link
     if support:
         headers["support-url"] = support
     provider_id = _happ_provider_id()

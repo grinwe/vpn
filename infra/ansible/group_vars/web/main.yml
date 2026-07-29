@@ -143,7 +143,7 @@ deploy_app_stack_sub_status_announce: "auto"
 # Раскатка: сначала page=1 при entrypoints=off (проверить руками по ссылке),
 # затем entrypoints=support, потом pay=1 и entrypoints=all.
 deploy_app_stack_sub_fix_page: 1  # ВКЛ 2026-07-29: ступень 1 — страница отвечает, входы в клиенте ещё off
-deploy_app_stack_sub_fix_pay: 0
+deploy_app_stack_sub_fix_pay: 1  # ВКЛ 2026-07-29: продление картой (lava.top) прямо со страницы
 deploy_app_stack_sub_fix_entrypoints: "all"  # ВКЛ 2026-07-29: большая кнопка блока статуса «Не подключается?» ведёт на страницу (иконка поддержки оказалась слишком мелкой). sub-expire-кнопка уйдёт туда же, когда включим SUB_FIX_PAY
 deploy_app_stack_sub_fix_throttle_sec: 120
 deploy_app_stack_sub_fix_daily_max: 5

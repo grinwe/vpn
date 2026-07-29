@@ -161,15 +161,20 @@ p{margin:.5rem 0}
 .ok{color:#0f7b34}
 .warn{color:#b45309}
 .bad{color:#b91c1c}
-button{width:100%;padding:.85rem 1rem;font-size:1rem;font-weight:600;
-       border:0;border-radius:10px;background:#2563eb;color:#fff;cursor:pointer}
-button.secondary{background:#e5e7eb;color:#16181d}
+button,.btn{display:block;box-sizing:border-box;width:100%;
+       padding:.85rem 1rem;font-size:1rem;font-weight:600;text-align:center;
+       text-decoration:none;border:0;border-radius:10px;
+       background:#2563eb;color:#fff;cursor:pointer}
+button.secondary,.btn.secondary{background:#e5e7eb;color:#16181d}
+button:disabled{opacity:.45;cursor:not-allowed}
+form{margin:0 0 .6rem}
+.btn{margin-bottom:.6rem}
 ol{padding-left:1.2rem}
 a{color:#2563eb}
 @media (prefers-color-scheme:dark){
   body{background:#0f1115;color:#e5e7eb}
   .card{background:#181b21;box-shadow:none}
-  button.secondary{background:#2a2f3a;color:#e5e7eb}
+  button.secondary,.btn.secondary{background:#2a2f3a;color:#e5e7eb}
   .muted{color:#9ca3af}
 }
 </style>
@@ -260,6 +265,37 @@ def _return_url(token: str, invoice_id: int) -> str | None:
     return f"{base}/{token}?fix=1&paid={invoice_id}"
 
 
+def _support_url() -> str | None:
+    """Диалог с админом: ``t.me/<bot>?start=support`` открывает FSM поддержки —
+    человек пишет одно сообщение, оно уходит админу, ответ приходит туда же."""
+    bot = (os.getenv("BOT_USERNAME") or "").strip()
+    return f"https://t.me/{bot}?start=support" if bot else None
+
+
+def _help_button(*, enabled: bool) -> str:
+    """Кнопка «Написать в поддержку» — активная только после починки.
+
+    Порядок намеренный: сначала человек жмёт «Починить», получает новый набор
+    серверов и пробует. Живой админ — дорогой ресурс, и звать его до того,
+    как отработала автоматика, значит тратить его на случаи, которые
+    чинятся кнопкой за секунду. Пока не починили — кнопка неактивна и прямо
+    объясняет, что нажать сначала.
+    """
+    url = _support_url()
+    if not url:
+        return ""
+    if not enabled:
+        return (
+            '<button class="secondary" disabled>Не помогло? Напишите нам</button>'
+            '<p class="muted">Кнопка станет активной после починки — '
+            "сначала нажмите её.</p>"
+        )
+    return (
+        f'<a class="btn secondary" href="{html.escape(url)}">'
+        "Не помогло? Напишите нам</a>"
+    )
+
+
 def _telegram_link() -> str:
     bot = (os.getenv("BOT_USERNAME") or "").strip()
     if not bot:
@@ -322,7 +358,10 @@ def render_start(
     actions = _button_form(token, "Починить подключение") if repairable else ""
     if pay_enabled():
         actions += _renew_button(sub, token)
-    return _render(title="Что-то не работает?", body=body + _telegram_link(), actions=actions)
+    # Пока не чинили — «Напишите нам» неактивна (см. _help_button). Для
+    # legacy-токена чинить нечего, поэтому там она сразу доступна.
+    actions += _help_button(enabled=not repairable)
+    return _render(title="Что-то не работает?", body=body, actions=actions)
 
 
 def _renew_button(sub, token: str) -> str:
@@ -393,7 +432,10 @@ def render_outcome(outcome, sub, token: str) -> HTMLResponse:
     actions = ""
     if outcome.action in ("no_target", "throttled"):
         actions = _button_form(token, "Попробовать ещё раз")
-    return _render(title=title, body=body + _telegram_link(), actions=actions)
+    # Автоматика отработала (или упёрлась в потолок) — теперь живой человек
+    # уместен, и кнопка активна.
+    actions += _help_button(enabled=True)
+    return _render(title=title, body=body, actions=actions)
 
 
 def render_expired(sub, token: str) -> HTMLResponse:

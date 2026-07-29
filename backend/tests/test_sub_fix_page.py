@@ -354,3 +354,25 @@ def test_technical_device_name_is_not_shown(client, db_session, sub_with_token):
     db_session.commit()
     resp = client.get(f"/api/sub/{device.sub_token}?fix=1", headers=HTML)
     assert "Мой телефон" in resp.text
+
+
+def test_help_button_unlocks_only_after_a_repair(client, db_session, sub_with_token, monkeypatch):
+    """«Напишите нам» активна только после починки.
+
+    Живой админ — дорогой ресурс: звать его до того, как отработала
+    автоматика, значит тратить его на случаи, которые чинятся кнопкой за
+    секунду. До починки кнопка неактивна и прямо говорит, что нажать сначала.
+    """
+    monkeypatch.setenv("BOT_USERNAME", "GV8_VPN_bot")
+    monkeypatch.setenv("SUB_LEG_SCHEME", "4x1")
+    _sub, device = sub_with_token
+
+    start = client.get(f"/api/sub/{device.sub_token}?fix=1", headers=HTML)
+    assert "Напишите нам" in start.text
+    assert "disabled" in start.text
+    assert "?start=support" not in start.text, "ссылки быть не должно, пока не чинили"
+
+    nonce = sub_fix.make_nonce(device.sub_token)
+    done = client.post(f"/api/sub/{device.sub_token}?fix=1&n={nonce}", headers=HTML)
+    assert "?start=support" in done.text, "после починки — рабочая ссылка на админа"
+    assert "start=support" in done.text
