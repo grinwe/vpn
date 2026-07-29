@@ -115,7 +115,7 @@ deploy_app_stack_diverse_sub_nodes: 3
 # Набор эндпоинтов: legacy (как было) → 4x1 включается ЗДЕСЬ отдельным прогоном,
 # уже после того как код с миграцией 0065 уехал и подписка проверена.
 # docs/operations/subset_epic_2026_07_29.md
-deploy_app_stack_sub_leg_scheme: legacy
+deploy_app_stack_sub_leg_scheme: 4x1
 
 # Phase B — HAPP auto-select (subscription-autoconnect + lowestdelay) в заголовках
 # сабы. По умолчанию "off" (прод-поведение не меняется). Обкатка: выставить user_id
