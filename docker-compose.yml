@@ -91,6 +91,17 @@ services:
       WARM_POOL_ENABLED: ${WARM_POOL_ENABLED:-1}
       # Diverse N×M subscription (Phase A): N nodes per sub (1 = current single-node).
       DIVERSE_SUB_NODES: ${DIVERSE_SUB_NODES:-1}
+      # Набор эндпоинтов 4×1: legacy = все протоколы всех нод в сабе (как было),
+      # 4x1 = по одной роли с ноды. Backend читает флаг в _decrypt_configs
+      # (фильтр публикации) и в лестнице ротации по жалобе.
+      # SUB_STATUS_BANNER — рубильник блока статуса в клиенте; он обязан быть
+      # ЗДЕСЬ, а не только в .env: иначе аварийное выключение потребует релиза.
+      SUB_LEG_SCHEME: ${SUB_LEG_SCHEME:-legacy}
+      SUB_LEG_NODES: ${SUB_LEG_NODES:-4}
+      SUB_LEG_DUP_MAX: ${SUB_LEG_DUP_MAX:-1}
+      ROTATION_LADDER_WINDOW_SEC: ${ROTATION_LADDER_WINDOW_SEC:-86400}
+      COMPLAINT_DEDUP_SEC: ${COMPLAINT_DEDUP_SEC:-60}
+      SUB_STATUS_BANNER: ${SUB_STATUS_BANNER:-1}
       # Phase B — HAPP auto-connect (lowestdelay-on-reconnect) sub-headers.
       # Read ONLY by api_extensions._autoconnect_enabled (backend serves /sub).
       # Без этих строк .env-значение не доезжало до контейнера → autoconnect
@@ -260,6 +271,12 @@ services:
       # Diverse N×M subscription (Phase A): N nodes per sub (1 = current single-node).
       # Worker copy — reprovision/migration paths also read it.
       DIVERSE_SUB_NODES: ${DIVERSE_SUB_NODES:-1}
+      # Копия набора 4×1: раскладку легов делает и провижининг, и backfill —
+      # оба живут в воркере. Разъехавшиеся значения тут означали бы, что
+      # покупка собирает набор по одной схеме, а бэкфилл по другой.
+      SUB_LEG_SCHEME: ${SUB_LEG_SCHEME:-legacy}
+      SUB_LEG_NODES: ${SUB_LEG_NODES:-4}
+      SUB_LEG_DUP_MAX: ${SUB_LEG_DUP_MAX:-1}
       # Cold-path throttle — sliding-window cap on warm-pool-miss
       # activations (migrations/reprovision bypass). Prevents a bot
       # burst from chaining ansible runs faster than xray tolerates.
