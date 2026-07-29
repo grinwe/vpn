@@ -83,3 +83,42 @@ def test_failover_device_diverse_excludes_blocked_and_spares_siblings(
     # соседнее устройство (cred на c) не тронуто
     db_session.refresh(dev_b)
     assert any(c.is_active and c.node_id == n_c.id for c in dev_b.credentials)
+
+
+def test_failover_applies_leg_scheme_to_the_new_device(
+    db_session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """После миграции схема публикации применяется к НОВОМУ устройству.
+
+    Без этого у него опубликованы ВСЕ леги (колонка leg_published дефолтится
+    в true), и человек, нажавший «VPN не работает», получает в клиенте 16
+    строк вместо четырёх — чинилка на его глазах ломает список серверов.
+    Поймано на живом проде 2026-07-29.
+    """
+    plan = make_plan(db_session, name="fd-legs-plan")
+    user = make_user(db_session, telegram_id="fd-legs")
+    node = make_node(db_session, name="fd-legs-a", region="ru", host="10.0.1.1")
+    fresh = make_node(db_session, name="fd-legs-fresh", region="ru", host="10.0.1.9")
+    cfg = make_config(db_session, node)
+    cfg_fresh = make_config(db_session, fresh)
+    sub = make_subscription(db_session, user, plan, node)
+    dev = make_device(db_session, sub, cfg, access_username="L")
+    _cred(db_session, node, dev, "L-a")
+    db_session.commit()
+
+    monkeypatch.setattr(prov_mod, "choose_node", lambda db, plan_, **kw: fresh)
+    orch = ProvisioningOrchestrator(db_session)
+    new_dev = make_device(db_session, sub, cfg_fresh, access_username="L-new")
+    monkeypatch.setattr(orch, "revoke_device", lambda *a, **k: None)
+    monkeypatch.setattr(
+        orch, "reprovision_subscription", lambda *a, **k: (new_dev, None)
+    )
+    monkeypatch.setattr(orch, "_maybe_attach_diverse", lambda *a, **k: None)
+
+    applied: list[int] = []
+    monkeypatch.setattr(
+        orch, "_apply_leg_scheme", lambda device: applied.append(device.id)
+    )
+
+    orch.failover_device(dev)
+    assert applied == [new_dev.id], "схема обязана примениться к новому устройству"

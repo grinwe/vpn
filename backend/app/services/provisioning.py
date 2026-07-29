@@ -4988,6 +4988,14 @@ class ProvisioningOrchestrator:
         self._maybe_attach_diverse(
             sub, new_device, plan, target, extra_exclude=list(blocked),
         )
+        # Схема публикации — ПОСЛЕ диверса, как на холодном пути. Без неё у
+        # нового устройства опубликованы ВСЕ леги (колонка leg_published
+        # дефолтится в true), и человек, нажавший «VPN не работает», получает
+        # в клиенте 16 строк вместо четырёх — то есть чинилка на его глазах
+        # ломает список серверов. Поймано на живом проде 2026-07-29; баг
+        # старше страницы починки — тот же результат давала любая миграция
+        # по жалобе из бота после включения схемы 4×1.
+        self._apply_leg_scheme(new_device)
         return target, new_device, task, old_primary
 
     def revoke_device(
