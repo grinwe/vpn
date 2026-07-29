@@ -138,3 +138,13 @@ deploy_app_stack_happ_provider_id: "{{ vault_happ_provider_id | default('') }}"
 # с кнопкой) → auto: с заданным providerid announce молчит, дубля текста
 # нет. Если providerid когда-нибудь протухнет — сменить на "1" до починки.
 deploy_app_stack_sub_status_announce: "auto"
+
+# Страница «починить и продлить» без Telegram (эпик sub_fix_epic_2026_07_29).
+# Раскатка: сначала page=1 при entrypoints=off (проверить руками по ссылке),
+# затем entrypoints=support, потом pay=1 и entrypoints=all.
+deploy_app_stack_sub_fix_page: 0
+deploy_app_stack_sub_fix_pay: 0
+deploy_app_stack_sub_fix_entrypoints: "off"
+deploy_app_stack_sub_fix_throttle_sec: 120
+deploy_app_stack_sub_fix_daily_max: 5
+deploy_app_stack_sub_fix_provider: "lava_top"

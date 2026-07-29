@@ -108,6 +108,19 @@ services:
       # announce — Standard-блок статуса, работает без providerid.
       # auto = слать, пока providerid не задан; 1 = всегда; 0 = никогда.
       SUB_STATUS_ANNOUNCE: ${SUB_STATUS_ANNOUNCE:-auto}
+      # Страница «починить и продлить» на домене саб-ссылки (?fix=1) —
+      # разрывает круг «VPN сломан → чинить только в Telegram → Telegram
+      # без VPN недоступен». Все флаги выключены по умолчанию.
+      SUB_FIX_PAGE: ${SUB_FIX_PAGE:-0}
+      SUB_FIX_PAY: ${SUB_FIX_PAY:-0}
+      # off / support / all — какие кнопки в VPN-клиенте ведут на страницу.
+      SUB_FIX_ENTRYPOINTS: ${SUB_FIX_ENTRYPOINTS:-off}
+      SUB_FIX_THROTTLE_SEC: ${SUB_FIX_THROTTLE_SEC:-120}
+      SUB_FIX_DAILY_MAX: ${SUB_FIX_DAILY_MAX:-5}
+      # Провайдер оплаты СО СТРАНИЦЫ. Пинится явно: общая ротация по
+      # умолчанию даёт cryptobot, а сюда приходит человек без Telegram —
+      # платить он будет картой.
+      SUB_FIX_PROVIDER: ${SUB_FIX_PROVIDER:-lava_top}
       # Прямая ссылка на мини-апп для кнопок в VPN-клиенте (пусто = deep-link
       # в бота с кнопкой входа).
       TELEGRAM_MINIAPP_SHORT_NAME: ${TELEGRAM_MINIAPP_SHORT_NAME:-}
