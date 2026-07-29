@@ -282,16 +282,22 @@ def _finish_duplicate(db, user, sub, device, dup, operator, source) -> RepairOut
     )
 
 
-def _recent_repairs(db: Session, device_id: int, *, since) -> int:
-    """Сколько успешных починок этого устройства было с момента ``since``.
+def _recent_repairs(db: Session, sub_id: int, *, since) -> int:
+    """Сколько починок этой ПОДПИСКИ было с момента ``since``.
 
-    Считаем по ``OperatorNodeReport`` (btree-индексы по device_id и
-    reported_at), а не JSONB-поиском по audit_logs: путь user-facing, а
+    Считаем по подписке, а НЕ по устройству: успешный перенос ноды
+    пересоздаёт Device (старый становится revoked, появляется новый с новым
+    id), поэтому счётчик по device_id обнулялся бы после каждой миграции — и
+    суточный потолок, который защищает пул нод от утёкшего токена, не
+    работал бы ровно там, где он нужен. Подписка живёт через все миграции.
+
+    Источник — ``OperatorNodeReport`` (btree-индексы по subscription_id и
+    reported_at), а не JSONB-поиск по audit_logs: путь user-facing, а
     audit_logs многомиллионная.
     """
     return (
         db.query(models.OperatorNodeReport)
-        .filter(models.OperatorNodeReport.device_id == device_id)
+        .filter(models.OperatorNodeReport.subscription_id == sub_id)
         .filter(models.OperatorNodeReport.reported_at >= since)
         .count()
     )
@@ -346,8 +352,22 @@ def handle_broken_device(
         return RepairOutcome(action="no_subscription")
 
     now = utcnow()
+    # Право на починку проверяет ЯДРО, а не экран.
+    #
+    # Экран истёкшей подписки кнопку починки не рисует — но это защита в слое
+    # отображения, а POST приходит по URL. Причём бесплатно: POST без nonce
+    # возвращает страницу, а на ней уже валидный nonce. Без этой проверки
+    # человек с истёкшей подпиской в grace-периоде (worker метит expired
+    # сразу, а устройства ревокает лишь через RENEWAL_GRACE_HOURS) мог бы
+    # раз за разом жечь слот ноды и полный прогон ansible, а вдобавок каждая
+    # такая «починка» вливала бы фальшивый fail-голос против ЗДОРОВОЙ ноды
+    # в крауд-матрицу.
+    if sub.status != models.SubscriptionStatus.active or (
+        sub.expires_at is not None and sub.expires_at < now
+    ):
+        return RepairOutcome(action="no_subscription", device_id=device.id)
     if daily_max is not None and daily_max > 0:
-        if _recent_repairs(db, device.id, since=now - timedelta(hours=24)) >= daily_max:
+        if _recent_repairs(db, sub.id, since=now - timedelta(hours=24)) >= daily_max:
             # Жалобу всё равно фиксируем: счётчик лестницы и телеметрия
             # канала не должны слепнуть от того, что человек упёрся в лимит.
             record_complaint(db, user, dedup_sec=dedup_sec, throttled=True, commit=False)
@@ -355,7 +375,7 @@ def handle_broken_device(
             return RepairOutcome(action="daily_limit", device_id=device.id)
 
     if throttle_sec is not None and throttle_sec > 0:
-        if _recent_repairs(db, device.id, since=now - timedelta(seconds=throttle_sec)):
+        if _recent_repairs(db, sub.id, since=now - timedelta(seconds=throttle_sec)):
             deduped = not record_complaint(
                 db, user, dedup_sec=dedup_sec, throttled=True, commit=False
             )
@@ -397,13 +417,21 @@ def handle_broken_device(
     orchestrator = ProvisioningOrchestrator(db)
     try:
         target, new_device, task, old_primary = orchestrator.failover_device(device)
-    except RuntimeError:
-        # Нет свежей ноды (всё исключено/нездорово) → канал предложит поддержку.
-        return RepairOutcome(action="no_target", device_id=device.id, deduped=deduped)
-    except Exception:  # noqa: BLE001
-        if db.is_active:
-            db.rollback()
-        logger.exception("self-repair: failover failed for device %s", device.id)
+    except (RuntimeError, Exception) as exc:  # noqa: BLE001
+        # ОТКАТ ОБЯЗАТЕЛЕН И ПЕРВЫМ ДЕЛОМ. failover_device мог успеть отозвать
+        # старое устройство и снять с него sub_token — коммит такого
+        # полусостояния убил бы seamless-alias инвариант (сохранённые URL
+        # клиентов начинают 404-ить). Условие `if db.is_active` здесь стояло
+        # бы во вред: у сессии в состоянии partial-rollback этот флаг False,
+        # то есть откат пропускался бы ровно тогда, когда он необходим.
+        db.rollback()
+        if not isinstance(exc, RuntimeError):
+            logger.exception("self-repair: failover failed for device %s", device.id)
+        # Откат снёс и жалобу (она была во flush'е) — пишем заново своей
+        # транзакцией. Без этого человек, которому не нашли ноду, не
+        # продвигался бы по лестнице вовсе: следующая жалоба снова считалась
+        # бы первой, и он навсегда застревал на самом дешёвом шаге.
+        record_complaint(db, user, dedup_sec=dedup_sec, throttled=False, commit=True)
         return RepairOutcome(action="no_target", device_id=device.id, deduped=deduped)
 
     report = models.OperatorNodeReport(

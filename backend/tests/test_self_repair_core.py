@@ -140,20 +140,32 @@ def test_throttle_blocks_repeat_repair_but_keeps_the_complaint(db_session, monke
     assert _complaints(db_session, user.id) == 2
 
 
-def test_daily_cap_stops_pool_drain(db_session, monkeypatch):
-    """Суточный потолок на устройство: утёкший sub_token иначе вычерпывает
-    пул нод бесконечными починками."""
+def test_daily_cap_counts_by_subscription_not_device(db_session, monkeypatch):
+    """Суточный потолок считается по ПОДПИСКЕ.
+
+    Успешный перенос ноды пересоздаёт Device, поэтому счётчик по device_id
+    обнулялся бы после каждой миграции — и потолок, который защищает пул нод
+    от утёкшего токена, не работал бы ровно там, где нужен."""
     monkeypatch.setenv("SUB_LEG_SCHEME", "4x1")
     user, sub, device = _device_on_nodes(db_session, "cap")
 
     # Две «вчерашние» починки не считаются, три сегодняшних — считаются.
+    # У сегодняшних device_id ЧУЖОЙ этому устройству (после миграции репорт
+    # пишется на НОВЫЙ device) — счётчик обязан видеть их все, потому что
+    # подписка одна и та же.
+    other = make_subscription_with_device(
+        db_session,
+        make_user(db_session, telegram_id="sr-cap-other"),
+        make_plan(db_session, name="sr-plan-cap-other"),
+        make_node(db_session, name="sr-cap-other-node", host="203.0.113.190"),
+    ).devices[0]
     for ago_h, count in ((30, 2), (1, 3)):
         for _ in range(count):
             db_session.add(
                 models.OperatorNodeReport(
                     user_id=user.id,
                     subscription_id=sub.id,
-                    device_id=device.id,
+                    device_id=device.id if ago_h > 24 else other.id,
                     reported_at=utcnow() - timedelta(hours=ago_h),
                     outcome="pending",
                 )
