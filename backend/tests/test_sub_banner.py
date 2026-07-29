@@ -40,10 +40,19 @@ def test_userinfo_has_all_four_keys(monkeypatch):
 
 
 def test_userinfo_total_zero_means_unlimited(monkeypatch):
-    """Тарифы у нас по устройствам, а per-user трафик не собирается вовсе —
-    поэтому честный безлимит (total=0), а не выдуманная шкала."""
+    """Тарифы у нас по устройствам — честный безлимит (total=0), а вот
+    download теперь настоящий: байты за период из тика traffic_stats."""
     headers = _sub_response_headers(_Sub(timedelta(days=10)), "tok")
     assert "total=0" in headers["subscription-userinfo"]
+
+
+def test_userinfo_download_carries_period_usage():
+    """Шкала в клиенте показывает реальный расход за оплаченный период —
+    «12.5 GB/∞» вместо вечного «0B»."""
+    sub = _Sub(timedelta(days=10))
+    sub.traffic_used_bytes = 13_421_772_800
+    headers = _sub_response_headers(sub, "tok")
+    assert "download=13421772800" in headers["subscription-userinfo"]
 
 
 def test_no_userinfo_without_expiry():

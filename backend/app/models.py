@@ -637,6 +637,16 @@ class Subscription(Base):
     traffic_used_mb = Column(
         Integer, nullable=False, server_default="0", default=0
     )
+    # Информационный счётчик для юзера (шкала в VPN-клиенте): сколько байт
+    # ушло через VPN за ТЕКУЩИЙ оплаченный период. Наполняет тик
+    # traffic_stats (per-user разбивка с нод), обнуляет каждое продление.
+    # НИКАКОЙ блокировки на нём нет — в отличие от traffic_used_mb, чей
+    # блокирующий ингест удалён (api/traffic.py, 2026-07-29). Байты, а не
+    # мегабайты: дельты за 5-минутный тик бывают < 1 МБ, и округление
+    # съедало бы трафик лёгких юзеров подчистую.
+    traffic_used_bytes = Column(
+        BigInteger, nullable=False, server_default="0", default=0
+    )
     auto_renew = Column(
         Boolean, nullable=False, server_default="false", default=False
     )

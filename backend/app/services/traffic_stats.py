@@ -161,7 +161,15 @@ class ProtocolStats:
     uplink: int = 0
     downlink: int = 0
     users: set[str] = field(default_factory=set)
+    # Суммарные байты (uplink+downlink) по access_username за интервал.
+    # Раньше per-user разбивка, которую отдают и xray, и hysteria,
+    # выбрасывалась на месте — из-за чего шкала трафика у юзера была
+    # вечным нулём, хотя данные каждый тик проезжали через руки.
+    user_bytes: dict[str, int] = field(default_factory=dict)
     error: str | None = None
+
+    def add_user_bytes(self, username: str, value: int) -> None:
+        self.user_bytes[username] = self.user_bytes.get(username, 0) + value
 
     def to_dict(self) -> dict[str, Any]:
         # ``users`` used to be a bare count (``int``). We now persist the
@@ -176,6 +184,11 @@ class ProtocolStats:
             "users": sorted(self.users),
             "user_count": len(self.users),
         }
+        if self.user_bytes:
+            # Дополнительный ключ, читатели details обязаны его не требовать
+            # (исторические сэмплы его не имеют). Нужен для верификации
+            # per-user учёта без SSH на ноду.
+            out["user_bytes"] = dict(sorted(self.user_bytes.items()))
         if self.error:
             out["error"] = self.error
         return out
@@ -212,6 +225,18 @@ class NodeStatsResult:
             details["_errors"] = errors
         return details
 
+    def merged_user_bytes(self) -> dict[str, int]:
+        """Байты за интервал по access_username, слитые по протоколам.
+
+        Одно имя несёт все протоколы девайса на ноде (warm-бандл), поэтому
+        суммирование по протоколам == суммирование по юзеру.
+        """
+        merged: dict[str, int] = {}
+        for stats in self.per_protocol.values():
+            for username, value in stats.user_bytes.items():
+                merged[username] = merged.get(username, 0) + value
+        return merged
+
 
 def _parse_hysteria_traffic(payload: str) -> ProtocolStats:
     """Разобрать ответ hysteria Traffic Stats API.
@@ -237,8 +262,12 @@ def _parse_hysteria_traffic(payload: str) -> ProtocolStats:
             continue
         stats.users.add(user)
         if isinstance(counters, dict):
-            stats.downlink += int(counters.get("tx") or 0)
-            stats.uplink += int(counters.get("rx") or 0)
+            tx = int(counters.get("tx") or 0)
+            rx = int(counters.get("rx") or 0)
+            stats.downlink += tx
+            stats.uplink += rx
+            if tx + rx > 0:
+                stats.add_user_bytes(user, tx + rx)
     return stats
 
 
@@ -346,6 +375,7 @@ def _parse_xray_stats_payload(raw: str) -> ProtocolStats:
         else:
             stats.downlink += value
         stats.users.add(email)
+        stats.add_user_bytes(email, value)
     return stats
 
 
@@ -531,6 +561,69 @@ def collect_and_persist(session, node, interval_seconds: int) -> dict[str, Any] 
     return _persist_node_result(session, node, result, interval_seconds)
 
 
+def _apply_user_traffic(session, node, user_bytes: dict[str, int]) -> int:
+    """Накопить интервал-дельты в ``Subscription.traffic_used_bytes``.
+
+    Чтение с нод деструктивное (``--reset`` / ``clear=1``), поэтому каждое
+    значение — честная дельта за интервал и двойного счёта нет. Резолв
+    username → подписка через CREDENTIAL.access_username (а не Device):
+    warm-креды носят имена ``warm-<node>-<hex>``, из которых ничего не
+    распарсить, но в БД они лежат байт-в-байт (см. api/nodes.py про тот же
+    резолв). Имена без креда (неназначенный warm-пул) — норма, молча мимо.
+
+    Счётчик информационный, для шкалы в клиенте: НИКАКОЙ блокировки на нём
+    нет и быть не должно (блокирующий ингест traffic_used_mb удалён —
+    см. миграцию 0066). Гейт TRAFFIC_USER_ACCOUNTING=0 — аварийный стоп.
+
+    Возвращает число подписок, получивших дельту.
+    """
+    from .. import models  # local import — как у соседей по модулю
+
+    if not user_bytes:
+        return 0
+    if (os.getenv("TRAFFIC_USER_ACCOUNTING") or "1").strip().lower() in (
+        "0", "false", "off", "no",
+    ):
+        return 0
+
+    rows = (
+        session.query(
+            models.Credential.access_username,
+            models.Credential.subscription_id,
+        )
+        .filter(
+            models.Credential.node_id == node.id,
+            models.Credential.access_username.in_(user_bytes.keys()),
+            models.Credential.subscription_id.isnot(None),
+        )
+        .all()
+    )
+    # Одно имя → несколько кредов (по протоколу на строку), но подписка у
+    # них одна; dict схлопывает дубли.
+    sub_by_username = {username: sub_id for username, sub_id in rows}
+
+    per_sub: dict[int, int] = {}
+    for username, delta in user_bytes.items():
+        sub_id = sub_by_username.get(username)
+        if sub_id is None or delta <= 0:
+            continue
+        per_sub[sub_id] = per_sub.get(sub_id, 0) + delta
+
+    for sub_id, delta in per_sub.items():
+        # Атомарный SQL-инкремент: тик может толкаться с продлением
+        # (обнуление) и с параллельным тиком по другой ноде.
+        session.query(models.Subscription).filter(
+            models.Subscription.id == sub_id
+        ).update(
+            {
+                models.Subscription.traffic_used_bytes:
+                    models.Subscription.traffic_used_bytes + delta
+            },
+            synchronize_session=False,
+        )
+    return len(per_sub)
+
+
 def _persist_node_result(session, node, result: NodeStatsResult, interval_seconds: int) -> dict[str, Any]:
     """Записать уже собранный ``NodeStatsResult`` одной ноды в сессию.
 
@@ -550,6 +643,8 @@ def _persist_node_result(session, node, result: NodeStatsResult, interval_second
         details=result.to_details(),
     )
     session.add(sample)
+
+    _apply_user_traffic(session, node, result.merged_user_bytes())
 
     # Ingest sharing violations into AuditLog for admin visibility
     # and user-facing notifications (via bot notification poller).

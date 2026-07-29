@@ -381,8 +381,15 @@ def _sub_response_headers(
             # не подтвердит рендер на живом устройстве.
             headers["subscription-userinfo"] = f"expire={int(expires.timestamp())}"
         else:
+            # download = реальные байты за текущий оплаченный период (наливает
+            # тик traffic_stats, обнуляет продление). Счётчик информационный:
+            # тарифы по устройствам, total=0 = безлимит — «12.5 GB/∞» вместо
+            # прежнего вечного «0B». upload не разделяем: клиент показывает
+            # сумму, а делить один счётчик на два поля — рисовать точность,
+            # которой нет.
+            used = int(getattr(sub, "traffic_used_bytes", 0) or 0)
             headers["subscription-userinfo"] = (
-                "upload=0; download=0; total=0; "
+                f"upload=0; download={used}; total=0; "
                 f"expire={int(expires.timestamp())}"
             )
     # Иконка Telegram справа в строке подписки (Happ) + ссылка «поддержка».

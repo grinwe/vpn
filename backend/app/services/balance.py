@@ -342,6 +342,8 @@ def activate_subscription(
 
     sub.expires_at = utcnow() + timedelta(days=sub.plan.duration_days)
     sub.auto_renew = True
+    # Новый оплаченный период — шкала трафика начинает с нуля.
+    sub.traffic_used_bytes = 0
     # Clear V1 fields.
     sub.prepaid_kopecks = 0
     sub.next_charge_at = None
@@ -401,6 +403,8 @@ def renew_subscription(db: Session, sub: models.Subscription) -> bool:
     # shorten the period if the tick fires a few hours late.
     base = sub.expires_at or utcnow()
     sub.expires_at = base + timedelta(days=sub.plan.duration_days)
+    # Новый оплаченный период — шкала трафика начинает с нуля.
+    sub.traffic_used_bytes = 0
     db.add(sub)
     db.flush()
 
@@ -471,6 +475,8 @@ def change_plan(
     sub.plan_id = new_plan.id
     sub.expires_at = now + timedelta(days=new_plan.duration_days)
     sub.auto_renew = True
+    # Смена плана оплачивает новый период — шкала трафика начинает с нуля.
+    sub.traffic_used_bytes = 0
 
     # Count live devices and set extra_device_slots for any that exceed
     # the new plan's bundle. This avoids "free" devices lingering after

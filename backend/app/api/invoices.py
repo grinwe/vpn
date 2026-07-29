@@ -285,6 +285,9 @@ def _mark_invoice_paid_core(
             now = utcnow()
             base_time = subscription.expires_at if subscription.expires_at > now else now
             subscription.expires_at = base_time + timedelta(days=plan.duration_days)
+            # Новый оплаченный период — шкала трафика в клиенте начинает с нуля
+            # (счётчик информационный, семантика «за период»).
+            subscription.traffic_used_bytes = 0
             subscription.status = models.SubscriptionStatus.active
             db.add(subscription)
             invoice.subscription_id = subscription.id
