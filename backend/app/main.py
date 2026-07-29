@@ -97,7 +97,25 @@ app = FastAPI(
 )
 
 app.state.limiter = limiter
-app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+
+
+def _rate_limited(request, exc: RateLimitExceeded):
+    """429 браузеру — человеческой страницей, всем остальным — как было.
+
+    Страница починки на саб-домене открывается в браузере (часто в вебвью
+    VPN-клиента), и голый JSON slowapi там означает две беды сразу: человек
+    видит белый экран с непонятной ошибкой вместо «попробуйте через минуту»,
+    а «скучный внутренний портал» внезапно отвечает JSON-ошибкой API — то
+    есть выдаёт себя проберу.
+    """
+    if "text/html" in (request.headers.get("accept") or "").lower():
+        from .api.sub_fix import render_rate_limited
+
+        return render_rate_limited()
+    return _rate_limit_exceeded_handler(request, exc)
+
+
+app.add_exception_handler(RateLimitExceeded, _rate_limited)
 app.add_middleware(SlowAPIMiddleware)
 
 

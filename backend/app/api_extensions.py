@@ -29,6 +29,7 @@ from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from . import models
+from .api import sub_fix
 from .api._common import get_db  # единый источник FastAPI-зависимости сессии (без третьей копии)
 from .config import get_settings
 from .rate_limit import limiter
@@ -183,7 +184,7 @@ def _announce_enabled() -> bool:
     return not _happ_provider_id()
 
 
-def _sub_status_banner(sub) -> dict[str, str]:
+def _sub_status_banner(sub, token: str = "") -> dict[str, str]:
     """Блок статуса подписки над списком серверов (Happ: sub-info-*).
 
     Смысл: человек видит срок и кнопку продления прямо в VPN-клиенте и не идёт
@@ -232,6 +233,17 @@ def _sub_status_banner(sub) -> dict[str, str]:
         "sub-info-text": text[:200],
         "sub-info-color": color,
     }
+    # Кнопка блока статуса. В режиме ``all`` она ведёт на страницу починки и
+    # называется «Не подключается?»: пока активно родное expire-предупреждение
+    # Happ, блок sub-info не показывается вовсе — значит он виден только когда
+    # до конца больше трёх дней, в «зелёном» состоянии. В этом окне человек
+    # открывает клиент и что-то жмёт ровно по одной причине: сломалось.
+    if _fix_entrypoints() == "all" and token:
+        page = _fix_page_url(token)
+        if page:
+            banner["sub-info-button-text"] = "Не подключается?"
+            banner["sub-info-button-link"] = page
+            return banner
     renew_url = _renew_link()
     if renew_url:
         banner["sub-info-button-text"] = "Продлить"
@@ -239,7 +251,7 @@ def _sub_status_banner(sub) -> dict[str, str]:
     return banner
 
 
-def _sub_body_directives(sub) -> list[str]:
+def _sub_body_directives(sub, token: str = "") -> list[str]:
     """Директивы Happ строками-комментариями в ТЕЛЕ подписки.
 
     Тело — UTF-8, и документация Happ разрешает каждый параметр комментарием
@@ -262,14 +274,14 @@ def _sub_body_directives(sub) -> list[str]:
         lines.append(f"#providerid {provider_id}")
     if not _status_banner_enabled():
         return lines
-    banner = _sub_status_banner(sub)
+    banner = _sub_status_banner(sub, token)
     if not banner:
         return lines
     lines += [f"#{key}: {value}" for key, value in banner.items()]
     return lines
 
 
-def _sub_body(configs, sub, *, plain: bool = False) -> str:
+def _sub_body(configs, sub, *, plain: bool = False, token: str = "") -> str:
     """Тело подписки: директивы блока статуса + ссылки.
 
     ``plain`` — без base64, диагностика чтения директив из тела. Прежний
@@ -277,7 +289,7 @@ def _sub_body(configs, sub, *, plain: bool = False) -> str:
     проверка шла без providerid, а без него Advanced-директивы игнорируются
     при любом способе доставки.
     """
-    lines = _sub_body_directives(sub) + [c.uri for c in configs]
+    lines = _sub_body_directives(sub, token) + [c.uri for c in configs]
     body = "\n".join(lines)
     return body if plain else base64.b64encode(body.encode()).decode()
 
@@ -302,6 +314,25 @@ def _renew_link() -> str | None:
     if short_name:
         return f"https://t.me/{bot}/{short_name}"
     return f"https://t.me/{bot}?start=account"
+
+
+def _fix_page_url(token: str) -> str | None:
+    """Ссылка на страницу починки для кнопок в VPN-клиенте.
+
+    Строится ТОЛЬКО от ``SUB_LINK_BASE_URL`` (домен саб-ссылки): именно он
+    доступен без VPN — с него клиент и так тянет конфиги. Вести кнопку на
+    основной домен бессмысленно, его как раз и может резать РКН.
+    """
+    base = (os.getenv("SUB_LINK_BASE_URL") or "").strip().rstrip("/")
+    if not base or not token:
+        return None
+    return f"{base}/{token}?fix=1"
+
+
+def _fix_entrypoints() -> str:
+    """Какие слоты в клиенте ведут на страницу: off / support / all."""
+    mode = (os.getenv("SUB_FIX_ENTRYPOINTS") or "off").strip().lower()
+    return mode if mode in ("off", "support", "all") else "off"
 
 
 def _plural_hours(n: int) -> str:
@@ -500,8 +531,15 @@ def _sub_response_headers(
                 f"upload=0; download={used}; total=0; "
                 f"expire={int(expires.timestamp())}"
             )
-    # Иконка Telegram справа в строке подписки (Happ) + ссылка «поддержка».
-    support = _renew_link()
+    # Иконка справа в строке подписки (Happ) — «куда идти, если сломалось».
+    # При включённых входах ведёт на страницу починки: она доступна без VPN,
+    # а Telegram в тех же условиях может быть недоступен — то есть кнопка
+    # «поддержка» вела бы ровно туда, куда человек не может попасть.
+    # Побочка: не-t.me ссылка теряет Telegram-иконку, остаётся обычная.
+    tg_link = _renew_link()
+    entrypoints = _fix_entrypoints()
+    page_url = _fix_page_url(token) if entrypoints != "off" else None
+    support = page_url if entrypoints in ("support", "all") and page_url else tg_link
     if support:
         headers["support-url"] = support
     provider_id = _happ_provider_id()
@@ -522,14 +560,21 @@ def _sub_response_headers(
     # Значения ASCII, поэтому заголовок безопасен.
     if _status_banner_enabled() and sub.expires_at:
         headers["sub-expire"] = "1"
-        if support:
-            headers["sub-expire-button-link"] = support
+        # В режиме ``all`` — на страницу, а не в Telegram. Именно у истёкшей
+        # подписки родное предупреждение вытесняет блок sub-info, то есть эта
+        # кнопка остаётся ЕДИНСТВЕННОЙ видимой — и вести ей в Telegram, до
+        # которого без VPN не добраться, значит замкнуть тот самый круг,
+        # ради разрыва которого написан эпик. На странице есть и продление,
+        # и ссылка в Telegram для тех, у кого он жив.
+        expire_link = page_url if entrypoints == "all" and page_url else tg_link
+        if expire_link:
+            headers["sub-expire-button-link"] = expire_link
     # announce — Standard-блок Happ, работает БЕЗ providerid, форма
     # ``base64:`` документирована. Роль — запасной видимый статус, пока
     # providerid не задан/не провалидирован (в auto-режиме он сам гаснет при
     # заданном providerid: с живым sub-info это был бы дубль текста).
     if _status_banner_enabled() and _announce_enabled():
-        announce_text = _sub_status_banner(sub).get("sub-info-text")
+        announce_text = _sub_status_banner(sub, token).get("sub-info-text")
         if announce_text:
             headers["announce"] = (
                 "base64:" + base64.b64encode(announce_text.encode("utf-8")).decode()
@@ -540,7 +585,7 @@ def _sub_response_headers(
     # не читает вовсе (тело остаётся документированным fallback'ом). Требует
     # providerid; без него клиент молча игнорирует — не вредно.
     if _status_banner_enabled():
-        headers.update(_sub_status_banner(sub))
+        headers.update(_sub_status_banner(sub, token))
     if _autoconnect_enabled(sub, device):
         headers["subscription-autoconnect"] = "true"  # канон (HAPP принимает и "1")
         headers["subscription-autoconnect-type"] = "lowestdelay"
@@ -945,12 +990,66 @@ def _raise_if_sub_not_serviceable(sub: models.Subscription) -> None:
         raise HTTPException(status_code=403, detail="Subscription expired")
 
 
+def _device_label(found) -> str | None:
+    device = found.serve_device or found.token_device
+    return (device.name if device else None) or None
+
+
+def _sub_fix_key(request: Request) -> str:
+    """Ключ лимита — сам токен из пути (см. докстринг ``sub_fix_action``)."""
+    return f"subfix:{request.path_params.get('token', '')}"
+
+
+@ext_router.post("/sub/{token}")
+@limiter.limit("2/minute;6/hour", key_func=_sub_fix_key)
+def sub_fix_action(
+    request: Request,  # noqa: ARG001 — нужен slowapi key_func
+    token: str,
+    db: Session = Depends(get_db),
+    fix: str | None = None,
+    n: str | None = None,
+    pay: str | None = None,
+):
+    """Действие со страницы починки: шаг лестницы или счёт на продление.
+
+    POST, а не GET, намеренно: GET дёргают префетчеры браузера, антивирусы и
+    превью-фетчеры, и каждый такой вызов сжигал бы конечный шаг лестницы.
+    Тело пустое — CF Worker его не форвардит, поэтому всё в query.
+
+    Лимит ключуется по ТОКЕНУ, а не по IP: у мобильных операторов CGNAT, и
+    per-IP лимит выкосил бы половину абонентов МТС одним нетерпеливым
+    соседом. GET-выдачу конфигов этот лимит не трогает — он на своём роуте.
+    """
+    if not sub_fix.page_enabled() or fix != "1":
+        return sub_fix.camo_response()
+    found = resolve_sub_token(db, token)
+    if found is None:
+        return sub_fix.camo_response()
+    # CSRF: без валидного nonce действие не выполняем и в БД не пишем.
+    if not sub_fix.nonce_valid(token, n):
+        return sub_fix.render_start(
+            found.sub, token,
+            device_name=_device_label(found),
+            repairable=not found.is_legacy,
+        )
+    if pay == "1":
+        if not sub_fix.pay_enabled():
+            return sub_fix.render_start(
+                found.sub, token, device_name=_device_label(found)
+            )
+        return sub_fix.do_pay(db, found, token)
+    return sub_fix.do_repair(db, found, token)
+
+
 @ext_router.get("/sub/{token}")
 def dynamic_sub_link(
+    request: Request,
     token: str,
     db: Session = Depends(get_db),
     fmt: str | None = None,
     userinfo: str | None = None,
+    fix: str | None = None,
+    paid: str | None = None,
 ):
     """Dynamic subscription link — per-device or legacy per-subscription.
 
@@ -975,6 +1074,37 @@ def dynamic_sub_link(
     Подтвердится на устройстве → кандидат на прод-дефолт для UA Happ
     (Hiddify неполный набор выбрасывает целиком, ему нельзя).
     """
+    # ── Страница починки (?fix=1) ──────────────────────────────────────
+    # Ветвление ДО _raise_if_sub_not_serviceable, _mark_first_config_fetch и
+    # аудита выдачи: открытие страницы ничего не пишет в БД и не отравляет
+    # онбординг-воронку («первая выдача конфига»), а истёкшей подписке нужен
+    # экран продления, а не 403.
+    if fix == "1" and sub_fix.page_enabled() and sub_fix.wants_html(request):
+        found = resolve_sub_token(db, token)
+        if found is None:
+            return sub_fix.camo_response()
+        sub = found.sub
+        if paid is not None:
+            # str, а не int: типизированный параметр заставлял бы FastAPI
+            # отвечать 422-JSON на ЛЮБОЙ нечисловой ?paid= — на горячем
+            # роуте выдачи конфигов, независимо от флагов страницы.
+            try:
+                invoice_id = int(paid)
+            except (TypeError, ValueError):
+                return sub_fix.camo_response()
+            return sub_fix.render_paid_state(db, found, token, invoice_id)
+        if sub.status == models.SubscriptionStatus.expired or (
+            sub.expires_at and sub.expires_at < utcnow()
+        ):
+            return sub_fix.render_expired(sub, token)
+        if sub.status != models.SubscriptionStatus.active:
+            return sub_fix.render_inactive(sub, token)
+        return sub_fix.render_start(
+            sub, token,
+            device_name=_device_label(found),
+            repairable=not found.is_legacy,
+        )
+
     # ── Per-device lookup (preferred) ──────────────────────────────────
     # Сам lookup (включая seamless-alias на живого соседа) — в
     # resolve_sub_token: им же пользуется страница починки на саб-домене.
@@ -1064,7 +1194,7 @@ def dynamic_sub_link(
             )
             db.commit()
 
-        encoded = _sub_body(configs, sub, plain=(fmt == "plain"))
+        encoded = _sub_body(configs, sub, plain=(fmt == "plain"), token=token)
         return PlainTextResponse(
             content=encoded,
             media_type="text/plain",
@@ -1115,7 +1245,7 @@ def dynamic_sub_link(
             headers={"Retry-After": _retry_after_sec()},
         )
 
-    encoded = _sub_body(configs, sub, plain=(fmt == "plain"))
+    encoded = _sub_body(configs, sub, plain=(fmt == "plain"), token=token)
 
     _mark_first_config_fetch(db, sub)
 

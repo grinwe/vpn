@@ -465,6 +465,44 @@ def test_banner_date_matches_client_msk_rendering():
     assert "15.08.2026" in banner["sub-info-text"]
 
 
+def test_fix_entrypoints_point_at_the_page(monkeypatch):
+    """Кнопки в клиенте ведут на страницу починки, и ТОЛЬКО с домена
+    саб-ссылки: основной домен как раз и может быть недоступен."""
+    monkeypatch.setenv("BOT_USERNAME", "GV8_VPN_bot")
+    monkeypatch.setenv("SUB_LINK_BASE_URL", "https://grn-ssync.pro")
+    sub = _Sub(timedelta(days=20))
+
+    # off (дефолт) — всё как раньше, ведёт в Telegram.
+    monkeypatch.delenv("SUB_FIX_ENTRYPOINTS", raising=False)
+    headers = _sub_response_headers(sub, "tok")
+    assert headers["support-url"].startswith("https://t.me/")
+
+    # support — на страницу уходит только иконка поддержки.
+    monkeypatch.setenv("SUB_FIX_ENTRYPOINTS", "support")
+    headers = _sub_response_headers(sub, "tok")
+    assert headers["support-url"] == "https://grn-ssync.pro/tok?fix=1"
+    assert _sub_status_banner(sub, "tok")["sub-info-button-link"].startswith(
+        "https://t.me/"
+    )
+
+    # all — и кнопка блока статуса тоже.
+    monkeypatch.setenv("SUB_FIX_ENTRYPOINTS", "all")
+    banner = _sub_status_banner(sub, "tok")
+    assert banner["sub-info-button-link"] == "https://grn-ssync.pro/tok?fix=1"
+    assert banner["sub-info-button-text"] == "Не подключается?"
+
+    # Родное предупреждение об истечении в режиме all тоже ведёт на страницу:
+    # именно оно вытесняет блок sub-info на последних днях и остаётся
+    # ЕДИНСТВЕННОЙ видимой кнопкой — а в Telegram без VPN не попасть.
+    headers = _sub_response_headers(sub, "tok")
+    assert headers["sub-expire-button-link"] == "https://grn-ssync.pro/tok?fix=1"
+
+    # В режиме support она остаётся телеграмной.
+    monkeypatch.setenv("SUB_FIX_ENTRYPOINTS", "support")
+    headers = _sub_response_headers(sub, "tok")
+    assert headers["sub-expire-button-link"].startswith("https://t.me/")
+
+
 def test_userinfo_expire_only_is_opt_in():
     """`?userinfo=expire` — диагностика шкалы «0B/∞»: без трафик-ключей Happ,
     по гипотезе, не рисует пустышку, сохранив дату. Дефолт трогать нельзя:
