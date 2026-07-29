@@ -39,7 +39,6 @@ from . import (
     subscriptions,
     tasks,
     tokens,
-    traffic,
     users,
 )
 from .users import _subscriptions_for_user
@@ -57,7 +56,6 @@ router.include_router(nodes.router)
 router.include_router(tasks.router)
 router.include_router(subscriptions.router)
 router.include_router(users.router)
-router.include_router(traffic.router)
 router.include_router(probes.router)
 router.include_router(health_pings.router)
 

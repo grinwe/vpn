@@ -34,12 +34,13 @@ from .db import SessionLocal
 # assert against it.
 SCOPE_PROBE_READ = "probe:read"
 SCOPE_PROBE_WRITE = "probe:write"
-SCOPE_TRAFFIC_WRITE = "traffic:write"
+# traffic:write удалён 2026-07-29 вместе с блокирующим ингестом трафика
+# (api/traffic.py): учёт теперь наливает тик traffic_stats напрямую, без
+# HTTP-ручки. Существующие токены с этим скоупом просто несут мёртвую метку.
 
 ALL_SCOPES: tuple[str, ...] = (
     SCOPE_PROBE_READ,
     SCOPE_PROBE_WRITE,
-    SCOPE_TRAFFIC_WRITE,
 )
 
 
