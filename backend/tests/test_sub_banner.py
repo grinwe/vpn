@@ -275,3 +275,23 @@ def test_buttons_lead_to_the_account_not_to_start(monkeypatch):
     monkeypatch.setenv("TELEGRAM_MINIAPP_SHORT_NAME", "app")
     banner = _sub_status_banner(_Sub(timedelta(days=5)))
     assert banner["sub-info-button-link"] == "https://t.me/GV8_VPN_bot/app"
+
+
+def test_plain_format_is_opt_in(monkeypatch):
+    """`?fmt=plain` — диагностика, а не смена поведения: клиенты параметр не
+    шлют, и для них тело обязано остаться base64."""
+    import base64 as b64
+
+    from app.api_extensions import _sub_body
+
+    monkeypatch.setenv("BOT_USERNAME", "GV8_VPN_bot")
+
+    class _Cfg:
+        uri = "vless://u@h:443#x"
+
+    sub = _Sub(timedelta(days=20))
+    default = _sub_body([_Cfg()], sub)
+    plain = _sub_body([_Cfg()], sub, plain=True)
+
+    assert b64.b64decode(default).decode() == plain
+    assert plain.startswith("#sub-info-text: ")

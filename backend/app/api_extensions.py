@@ -214,10 +214,16 @@ def _sub_body_directives(sub) -> list[str]:
     return lines
 
 
-def _sub_body(configs, sub) -> str:
-    """base64-тело подписки: директивы блока статуса + ссылки."""
+def _sub_body(configs, sub, *, plain: bool = False) -> str:
+    """Тело подписки: директивы блока статуса + ссылки.
+
+    ``plain`` — без base64. Клиенты понимают оба формата, но директивы из
+    закодированного тела Happ, судя по проверке на живом устройстве, не
+    разбирает.
+    """
     lines = _sub_body_directives(sub) + [c.uri for c in configs]
-    return base64.b64encode("\n".join(lines).encode()).decode()
+    body = "\n".join(lines)
+    return body if plain else base64.b64encode(body.encode()).decode()
 
 
 def _renew_link() -> str | None:
@@ -699,7 +705,11 @@ def _raise_if_sub_not_serviceable(sub: models.Subscription) -> None:
 
 
 @ext_router.get("/sub/{token}")
-def dynamic_sub_link(token: str, db: Session = Depends(get_db)):
+def dynamic_sub_link(
+    token: str,
+    db: Session = Depends(get_db),
+    fmt: str | None = None,
+):
     """Dynamic subscription link — per-device or legacy per-subscription.
 
     Lookup order:
@@ -709,6 +719,12 @@ def dynamic_sub_link(token: str, db: Session = Depends(get_db)):
 
     Clients (Hiddify, v2rayNG) poll this URL and auto-update when the
     server changes due to migration. The token is stable across migrations.
+
+    ``?fmt=plain`` отдаёт тело незакодированным. Нужно потому, что блок статуса
+    (директивы `#sub-info-*`) в клиенте не появился ни заголовками, ни в
+    base64-теле, и остаётся гипотеза, что Happ парсит директивы только из
+    plain-тела. Обычные клиенты параметр не шлют — поведение для них не
+    меняется ни на байт.
     """
     # ── Per-device lookup (preferred) ──────────────────────────────────
     device = db.query(models.Device).filter_by(sub_token=token).first()
@@ -846,7 +862,7 @@ def dynamic_sub_link(token: str, db: Session = Depends(get_db)):
             )
             db.commit()
 
-        encoded = _sub_body(configs, sub)
+        encoded = _sub_body(configs, sub, plain=(fmt == "plain"))
         return PlainTextResponse(
             content=encoded,
             media_type="text/plain",
@@ -894,7 +910,7 @@ def dynamic_sub_link(token: str, db: Session = Depends(get_db)):
             headers={"Retry-After": _retry_after_sec()},
         )
 
-    encoded = _sub_body(configs, sub)
+    encoded = _sub_body(configs, sub, plain=(fmt == "plain"))
 
     _mark_first_config_fetch(db, sub)
 
