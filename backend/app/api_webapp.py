@@ -2018,13 +2018,19 @@ def webapp_report_broken_device(
 ):
     """Per-device «ЭТО устройство не работает» (multi-device юзер выбрал одно).
 
-    Перетряхиваем ноды ТОЛЬКО этого устройства (``failover_device``) — соседние
-    девайсы не трогаем, ноду user-wide не баним. Репорт оператора пишем с
-    ``device_id`` (матрица оператор×нода). Anti-forge: устройство обязано
-    принадлежать юзеру. Затем webapp одним тапом проставляет карьер
-    (``/webapp/report-operator``). См. operator_routing_roadmap.md.
+    Работу делает общее ядро ``services/self_repair.py`` — то же самое, что у
+    бота и у страницы на саб-домене. До 2026-07-29 этот путь звал
+    ``failover_device`` напрямую, МИМО лестницы ротации: человек из кабинета
+    всегда получал самый дорогой шаг (смену ноды) и никогда не доходил до
+    перетасовки протоколов или дубля. Вдобавок его жалобы писались как
+    ``health_ping_response`` и не считались счётчиком эскалации — то есть
+    лестница для него вообще не двигалась.
+
+    Anti-forge (устройство принадлежит юзеру) и защиту от двойного тапа
+    (FOR UPDATE) тоже делает ядро.
     """
-    from .services.provisioning import ProvisioningOrchestrator
+    from .api.client_control import COMPLAINT_DEDUP_SEC
+    from .services import self_repair
 
     device = db.get(models.Device, body.device_id)
     if device is None or device.user_id != user.id:
@@ -2033,6 +2039,9 @@ def webapp_report_broken_device(
         raise HTTPException(status_code=400, detail="device is not active")
 
     sub_id = device.subscription_id
+    # Отдельная запись «человек ответил, что плохо» остаётся: на ней стоит
+    # воронка health-ping'а, и она не то же самое, что жалоба-триггер
+    # лестницы (её пишет ядро как complaint_received).
     db.add(
         models.AuditLog(
             actor=str(user.id),
@@ -2049,51 +2058,24 @@ def webapp_report_broken_device(
             },
         )
     )
+    db.flush()
 
-    migrated = False
-    report_id: int | None = None
-    target_node_name: str | None = None
-    old_primary: int | None = None
-    target = None
-    try:
-        target, new_device, _task, old_primary = ProvisioningOrchestrator(
-            db
-        ).failover_device(device)
-    except RuntimeError:
-        # Нет свежей ноды (всё исключено/нездорово) — аудит оставляем, миграции
-        # нет; webapp покажет «попробуй позже».
-        target = None
-    except Exception:  # noqa: BLE001
-        if db.is_active:
-            db.rollback()
-        logger.exception(
-            "webapp report-broken-device: failover failed for device %s", device.id
-        )
-        target = None
+    outcome = self_repair.handle_broken_device(
+        db,
+        body.device_id,
+        user=user,
+        dedup_sec=COMPLAINT_DEDUP_SEC,
+        source="webapp_report_broken",
+    )
 
-    if target is not None:
-        report = models.OperatorNodeReport(
-            user_id=user.id,
-            subscription_id=sub_id,
-            device_id=new_device.id,
-            operator=None,
-            failed_node_id=old_primary,
-            target_node_id=target.id,
-            target_access_username=new_device.access_username,
-            outcome="pending",
-        )
-        db.add(report)
-        db.flush()
-        migrated = True
-        report_id = report.id
-        target_node_name = target.name
-
-    db.commit()
     return HealthPingReportResponse(
         ok=True,
         subscription_id=sub_id,
-        node_id=old_primary,
-        migrated=migrated,
-        report_id=report_id,
-        target_node_name=target_node_name,
+        node_id=None,
+        # ОБЯЗАТЕЛЬНО по всем трём успешным шагам лестницы: фронт
+        # (webapp/src/pages/Help.tsx) читает булев флаг, и без reshuffled/
+        # duplicated он показал бы «не смогли починить» на успешной починке.
+        migrated=outcome.repaired,
+        report_id=outcome.report_id,
+        target_node_name=outcome.new_node_name,
     )

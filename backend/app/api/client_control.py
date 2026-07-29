@@ -40,7 +40,7 @@ from sqlalchemy.orm import Session
 
 from .. import models
 from ..rate_limit import limiter
-from ..services import rotation
+from ..services import self_repair
 from ..services.provisioning import ProvisioningOrchestrator
 from ..time_utils import utcnow
 from ._common import _audit, get_db
@@ -250,7 +250,6 @@ def _escalate_node_failure_reports(db: Session, node_id: int) -> None:
     report). The per-sub 5-min failover throttle + DISTINCT counting keep one
     impatient user from tripping it alone.
     """
-    from datetime import timedelta
 
     from sqlalchemy import func as sa_func
 
@@ -364,47 +363,12 @@ def _escalate_node_failure_reports(db: Session, node_id: int) -> None:
 
 # created_by авто-банов из user-driven путей этого модуля. Бот пишет
 # f"user:{telegram_id}" — ловим его LIKE-паттерном отдельно.
-_AUTO_BAN_SOURCES = ("client_control", "admin_panel")
-
-
-def _auto_ban_query(db: Session, user_id: int):
-    """Query авто-банов юзера (ручные админ-баны сюда не попадают)."""
-    from sqlalchemy import or_
-
-    return (
-        db.query(models.NodeUserBan)
-        .filter(models.NodeUserBan.user_id == user_id)
-        .filter(
-            or_(
-                models.NodeUserBan.created_by.in_(_AUTO_BAN_SOURCES),
-                models.NodeUserBan.created_by.like("user:%"),
-            )
-        )
-    )
-
-
-def _prune_stale_auto_bans(db: Session, user_id: int) -> int:
-    """Снять протухшие авто-баны юзера (TTL env NODE_USER_BAN_TTL_HOURS).
-
-    Best-effort и идемпотентно; 0/отрицательный TTL = отключено. Возвращает
-    число снятых банов.
-    """
-    from datetime import timedelta
-
-    ttl_h = int(os.getenv("NODE_USER_BAN_TTL_HOURS", "48"))
-    if ttl_h <= 0:
-        return 0
-    cutoff = utcnow() - timedelta(hours=ttl_h)
-    stale = (
-        _auto_ban_query(db, user_id)
-        .filter(models.NodeUserBan.created_at < cutoff)
-        .all()
-    )
-    for ban in stale:
-        db.delete(ban)
-    if stale:
-        db.commit()
-    return len(stale)
+# Авто-баны и снятие протухших переехали в services/self_repair.py вместе с
+# ядром починки; здесь — re-export: имена импортируют тесты и соседние
+# хендлеры этого модуля.
+_AUTO_BAN_SOURCES = self_repair.AUTO_BAN_SOURCES
+_auto_ban_query = self_repair.auto_ban_query
+_prune_stale_auto_bans = self_repair.prune_stale_auto_bans
 
 
 def _should_auto_ban(db: Session, user_id: int) -> bool:
@@ -465,7 +429,6 @@ def _do_failover(
     Не делает auth (caller отвечает) и не делает rate-limit. Только
     select target + миграция + audit + response.
     """
-    from datetime import timedelta
 
     if sub.status != models.SubscriptionStatus.active:
         return ReportFailureResponse(
@@ -699,15 +662,9 @@ def admin_report_failure(
 # проставит ok по факту переподключения.
 # См. docs/operations/operator_routing_roadmap.md.
 
-_OPERATORS = {
-    "mts",
-    "beeline",
-    "megafon",
-    "tele2",
-    "home_wifi",
-    "other",
-    "unknown",
-}
+# Переехало в services/self_repair.py (единый источник для всех каналов
+# починки); здесь re-export — имя импортирует api_webapp и соседние хендлеры.
+_OPERATORS = self_repair.OPERATORS
 
 # Анти-абьюз: один report-broken на юзера в это окно — иначе тапами
 # юзер вычерпает себе пул нод через авто-баны.
@@ -759,7 +716,6 @@ def report_broken_by_telegram(
     access_username новой ноды — watcher по нему проставит исход. Оператор
     приходит отдельным тапом (report-operator).
     """
-    from datetime import timedelta
 
     user = (
         db.query(models.User)
@@ -974,134 +930,18 @@ def _record_complaint(
     throttled: bool = True,
     commit: bool = True,
 ) -> bool:
-    """Зафиксировать жалобу «VPN не работает». True — записали, False — дребезг.
+    """Тонкая обёртка над ядром: окно дедупа берём из модульной константы.
 
-    Пишем в audit-лог, а не в operator_node_reports: та таблица означает
-    «сделали перенос и следим за исходом», а здесь переноса не было — человека
-    остановил троттл. Смешивать их нельзя, иначе watcher начнёт ждать
-    восстановления от жалобы, по которой ничего не делали.
+    Именно так, а не чтением env внутри ядра: ``COMPLAINT_DEDUP_SEC``
+    монкипатчат тесты через этот модуль, и значение обязано читаться в
+    момент вызова.
     """
-    cutoff = utcnow() - timedelta(seconds=COMPLAINT_DEDUP_SEC)
-    recent = (
-        db.query(models.AuditLog.id)
-        .filter(
-            models.AuditLog.action == "complaint_received",
-            models.AuditLog.target_type == "user",
-            models.AuditLog.target_id == user.id,
-            models.AuditLog.created_at >= cutoff,
-        )
-        .first()
-    )
-    if recent is not None:
-        return False
-    db.add(
-        models.AuditLog(
-            actor=str(user.telegram_id or user.id),
-            actor_type=models.AuditActor.user,
-            action="complaint_received",
-            target_type="user",
-            target_id=user.id,
-            extra={"throttled": throttled, "proto": proto},
-        )
-    )
-    if commit:
-        db.commit()
-    else:
-        # flush, а не commit: вызывающий держит устройство под FOR UPDATE, и
-        # коммит здесь снял бы блокировку ровно посреди защиты от двойного
-        # тапа. Свои же SELECT'ы (счётчик лестницы) flush'нутую строку видят.
-        db.flush()
-    return True
-
-
-def _rotation_report(
-    db: Session,
-    user,
-    sub,
-    device,
-    *,
-    target_node_id: int | None,
-    operator: str | None,
-) -> models.OperatorNodeReport:
-    """Репорт для шага лестницы, который НЕ обвиняет ноду.
-
-    ``failed_node_id`` пустой намеренно: перетасовка протоколов и дубль
-    отвечают на «режут транспорт», а не «нода мертва». Записать сюда ноду
-    значило бы влить фальшивый fail в крауд-матрицу node×operator и своими
-    руками выжигать здоровые ноды. Исход при этом меряется как обычно:
-    watcher засчитывает reconnect по любому активному креду устройства.
-    """
-    report = models.OperatorNodeReport(
-        user_id=user.id,
-        subscription_id=sub.id if sub else None,
-        device_id=device.id,
-        operator=operator if operator in _OPERATORS else None,
-        failed_node_id=None,
-        target_node_id=target_node_id,
-        target_access_username=device.access_username,
-        outcome="pending",
-    )
-    db.add(report)
-    db.commit()
-    db.refresh(report)
-    return report
-
-
-def _finish_reshuffle(db: Session, user, sub, device, plan, operator):
-    """Шаг 1 состоялся: у человека тот же набор нод и другие протоколы."""
-    primary = plan.assigned.get("primary") or next(iter(plan.assigned.values()), None)
-    report = _rotation_report(
-        db, user, sub, device,
-        target_node_id=primary.node_id if primary else None,
-        operator=operator,
-    )
-    _audit(
-        db,
-        f"user:{user.telegram_id}",
-        "client_reported_failure",
-        "subscription",
-        sub.id if sub else None,
-        metadata={
-            "report_id": report.id,
-            "device_id": device.id,
-            "scope": "protocol_reshuffle",
-            "source": "bot_vpn_broken",
-            "legs": {role: cred.node_id for role, cred in plan.assigned.items()},
-        },
-        actor_type=models.AuditActor.user,
-    )
-    return ReportBrokenResponse(
-        action="reshuffled",
-        report_id=report.id,
-        device_name=device.name or "Устройство",
-    )
-
-
-def _finish_duplicate(db: Session, user, sub, device, dup, operator):
-    """Шаг 3: второй лег по работающему протоколу — страховка от падения ноды."""
-    report = _rotation_report(
-        db, user, sub, device, target_node_id=dup.node_id, operator=operator
-    )
-    _audit(
-        db,
-        f"user:{user.telegram_id}",
-        "client_reported_failure",
-        "subscription",
-        sub.id if sub else None,
-        metadata={
-            "report_id": report.id,
-            "device_id": device.id,
-            "scope": "duplicate_leg",
-            "source": "bot_vpn_broken",
-            "proto": dup.proto,
-            "node_id": dup.node_id,
-        },
-        actor_type=models.AuditActor.user,
-    )
-    return ReportBrokenResponse(
-        action="duplicated",
-        report_id=report.id,
-        device_name=device.name or "Устройство",
+    return self_repair.record_complaint(
+        db, user,
+        dedup_sec=COMPLAINT_DEDUP_SEC,
+        proto=proto,
+        throttled=throttled,
+        commit=commit,
     )
 
 
@@ -1120,15 +960,15 @@ def report_broken_device_by_telegram(
     db: Session = Depends(get_db),
     admin_token: str = Depends(require_admin),  # noqa: ARG001 — bot shared token
 ) -> ReportBrokenResponse:
-    """Перенести ОДНО выбранное устройство на свободную ноду.
+    """Починить ОДНО выбранное устройство (кнопка «VPN не работает» в боте).
 
-    Resolve user по telegram_id, anti-forge (устройство обязано принадлежать
-    юзеру), затем ``failover_device`` — перетряхивает ноды только этого
-    устройства, ``sub_token``/UUID сохраняются (установленный клиент не
-    рвётся), user-wide ``NodeUserBan`` НЕ ставится. Троттла нет намеренно:
-    перенесённое устройство сразу становится revoked → повторный тап по нему
-    отсекается проверкой статуса ниже (как в шипнутом webapp-пути); а раз
-    бана нет — спам не выжигает пул нод.
+    От Telegram здесь зависит ровно resolve юзера — всё остальное делает
+    общее ядро ``services/self_repair.py`` (жалоба → лестница ротации →
+    перенос ноды), которым пользуются и WebApp, и страница на саб-домене.
+
+    Троттла нет намеренно: перенесённое устройство сразу становится
+    ``revoked`` → повторный тап по нему отсекается проверкой статуса внутри
+    ядра; а раз user-wide бана нет — спам не выжигает пул нод.
     """
     user = (
         db.query(models.User)
@@ -1138,116 +978,21 @@ def report_broken_device_by_telegram(
     if user is None:
         return ReportBrokenResponse(action="user_not_found")
 
-    # FOR UPDATE: два тапа подряд (человек нетерпелив) шли в две параллельные
-    # транзакции, обе видели «переноса ещё не было» и обе его запускали —
-    # устройство успевало переехать дважды, второй раз впустую.
-    device = (
-        db.query(models.Device)
-        .filter(models.Device.id == body.device_id)
-        .with_for_update()
-        .first()
-    )
-    if device is None or device.user_id != user.id:
-        # Anti-forge: чужое/несуществующее устройство.
-        return ReportBrokenResponse(action="no_subscription")
-    if device.status in (
-        models.DeviceStatus.disabled,
-        models.DeviceStatus.revoked,
-    ):
-        # Уже перенесли/отключили (напр. повторный тап по старой клавиатуре).
-        return ReportBrokenResponse(action="no_subscription")
-
-    sub = device.subscription
-    if sub is None or sub.plan is None:
-        return ReportBrokenResponse(action="no_subscription")
-
-    # Жалоба фиксируется ВСЕГДА и до выбора шага: на её счётчике стоит
-    # лестница. commit=False — устройство держим под FOR UPDATE до конца.
-    _record_complaint(db, user, throttled=False, commit=False)
-
-    # Ротационная лестница. Первый шаг — перетасовать протоколы на ТЕХ ЖЕ
-    # нодах: чаще всего за жалобой стоит блокировка транспорта, а не смерть
-    # ноды, и менять ноду в этом случае значит стрелять мимо. Стоит это
-    # переставленного флага в БД — ни ansible, ни новых кредов.
-    step = rotation.decide_step(db, user.id)
-    if step == rotation.STEP_RESHUFFLE:
-        plan = rotation.reshuffle_legs(db, device)
-        if plan is not None:
-            return _finish_reshuffle(db, user, sub, device, plan, body.operator)
-        # Перетасовывать нечего (запас исчерпан) — идём переносить ноду.
-    elif step == rotation.STEP_DUPLICATE:
-        dup = rotation.grant_duplicate_leg(db, device)
-        if dup is not None:
-            return _finish_duplicate(db, user, sub, device, dup, body.operator)
-        # Дубль взять неоткуда — тоже падаем в перенос.
-
-    # failover_device сам НЕ банит, но исключает уже забаненные юзером ноды —
-    # снимаем протухшие авто-баны, чтобы пул для выбора не сужался навсегда.
-    _prune_stale_auto_bans(db, user.id)
-
-    orchestrator = ProvisioningOrchestrator(db)
-    try:
-        target, new_device, task, old_primary = orchestrator.failover_device(device)
-    except RuntimeError:
-        # Нет свежей ноды (всё исключено/нездорово) → бот предложит поддержку.
-        return ReportBrokenResponse(action="no_target")
-    except Exception:  # noqa: BLE001
-        if db.is_active:
-            db.rollback()
-        logger.exception(
-            "report-broken-device: failover failed for device %s", device.id
-        )
-        return ReportBrokenResponse(action="no_target")
-
-    operator = body.operator if body.operator in _OPERATORS else None
-    report = models.OperatorNodeReport(
-        user_id=user.id,
-        subscription_id=sub.id,
-        device_id=new_device.id,
-        operator=operator,
-        failed_node_id=old_primary,
-        target_node_id=target.id,
-        target_access_username=new_device.access_username,
-        outcome="pending",
-    )
-    db.add(report)
-    db.commit()
-    db.refresh(report)
-    _audit(
+    outcome = self_repair.handle_broken_device(
         db,
-        f"user:{user.telegram_id}",
-        "client_reported_failure",
-        "subscription",
-        sub.id,
-        metadata={
-            "report_id": report.id,
-            "failed_node_id": old_primary,
-            # current_node_id — ключ, по которому крауд-счётчик
-            # (_escalate_node_failure_reports) собирает окно репортов.
-            "current_node_id": old_primary,
-            "target_node_id": target.id,
-            "device_id": new_device.id,
-            "scope": "device",
-            "source": "bot_vpn_broken",
-        },
-        actor_type=models.AuditActor.user,
+        body.device_id,
+        user=user,
+        dedup_sec=COMPLAINT_DEDUP_SEC,
+        operator=body.operator,
+        source="bot_vpn_broken",
     )
-    # Краудсорс здоровья ноды — как в whole-sub пути. Best-effort.
-    if old_primary:
-        try:
-            _escalate_node_failure_reports(db, old_primary)
-        except Exception:  # noqa: BLE001
-            logger.exception(
-                "report-broken-device: crowd-health escalation failed for node %s",
-                old_primary,
-            )
     return ReportBrokenResponse(
-        action="migrated",
-        report_id=report.id,
-        new_node_name=target.name,
-        new_node_region=target.region,
-        task_id=task.id if task else None,
-        device_name=new_device.name or "Устройство",
+        action=outcome.action,
+        report_id=outcome.report_id,
+        new_node_name=outcome.new_node_name,
+        new_node_region=outcome.new_node_region,
+        task_id=outcome.task_id,
+        device_name=outcome.device_name,
     )
 
 
@@ -1362,7 +1107,6 @@ def operator_routing_matrix(
     при total≥K. Окно/K — env `OPERATOR_MATRIX_WINDOW_HOURS`/`_MIN_DEVICES`.
     Advisory — choose_node это пока не использует.
     """
-    from datetime import timedelta
 
     window_h = int(os.getenv("OPERATOR_MATRIX_WINDOW_HOURS", "24"))
     min_devices = int(os.getenv("OPERATOR_MATRIX_MIN_DEVICES", "5"))
