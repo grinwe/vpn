@@ -566,7 +566,14 @@ def _sub_response_headers(
         # которого без VPN не добраться, значит замкнуть тот самый круг,
         # ради разрыва которого написан эпик. На странице есть и продление,
         # и ссылка в Telegram для тех, у кого он жив.
-        expire_link = page_url if entrypoints == "all" and page_url else tg_link
+        # …но только когда на странице реально МОЖНО заплатить. Пока
+        # SUB_FIX_PAY выключен, кнопка «Продлить» на странице показала бы
+        # текст «продлите в кабинете» — то есть лишний шаг на пути к оплате
+        # вместо прямой ссылки в кабинет.
+        expire_to_page = (
+            entrypoints == "all" and page_url and sub_fix.pay_enabled()
+        )
+        expire_link = page_url if expire_to_page else tg_link
         if expire_link:
             headers["sub-expire-button-link"] = expire_link
     # announce — Standard-блок Happ, работает БЕЗ providerid, форма

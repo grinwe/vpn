@@ -491,9 +491,13 @@ def test_fix_entrypoints_point_at_the_page(monkeypatch):
     assert banner["sub-info-button-link"] == "https://grn-ssync.pro/tok?fix=1"
     assert banner["sub-info-button-text"] == "Не подключается?"
 
-    # Родное предупреждение об истечении в режиме all тоже ведёт на страницу:
-    # именно оно вытесняет блок sub-info на последних днях и остаётся
-    # ЕДИНСТВЕННОЙ видимой кнопкой — а в Telegram без VPN не попасть.
+    # Родное предупреждение об истечении ведёт на страницу только когда там
+    # МОЖНО заплатить: иначе это лишний шаг на пути к оплате.
+    monkeypatch.setenv("SUB_FIX_PAY", "0")
+    headers = _sub_response_headers(sub, "tok")
+    assert headers["sub-expire-button-link"].startswith("https://t.me/")
+
+    monkeypatch.setenv("SUB_FIX_PAY", "1")
     headers = _sub_response_headers(sub, "tok")
     assert headers["sub-expire-button-link"] == "https://grn-ssync.pro/tok?fix=1"
 
