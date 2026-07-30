@@ -29,6 +29,7 @@ from ..services.health import recompute_node_health
 from ..services.node_spawner import (
     NodeSpawnError,
     destroy_node,
+    maybe_enable_reality_unify,
     reboot_node,
     reinstall_node,
     renew_node,
@@ -374,6 +375,11 @@ def create_node_with_configs(
                 db, actor, "config_created", "vpn_config", cfg.id,
                 actor_type=actor_type,
             )
+        # Догнать унификацию, если reality приехал раньше своего фронта
+        # (сортировка выше это предотвращает, но payload мог прийти и не от
+        # нашей формы — например из скрипта).
+        db.refresh(node)
+        maybe_enable_reality_unify(db, node)
     except HTTPException:
         # Rollback: убираем уже созданные configs + ноду. Юзер видит
         # чистое состояние и понимает что весь composite запрос
@@ -1285,6 +1291,11 @@ def create_config(
     # commit и backfill-креды молча откатываются (батч-сценарий «несколько
     # конфигов + один bootstrap в конце» терял их).
     db.commit()
+    # Добавили TCP-фронт к ноде, где reality уже стоял (типичный путь
+    # автоспавна: он заводит только reality, протоколы дозаливают потом) —
+    # включаем 443-унификацию задним числом, пока креды не розданы.
+    db.refresh(node)
+    maybe_enable_reality_unify(db, node)
     if not defer_bootstrap:
         task, _created = orchestrator.create_or_coalesce_node_bootstrap(
             node, {"pool_id": node.pool_id, "config_change": True}

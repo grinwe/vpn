@@ -406,6 +406,77 @@ def ensure_reality_config(
     return cfg
 
 
+def maybe_enable_reality_unify(db: Session, node: models.VPNNode) -> bool:
+    """Догнать 443-унификацию у reality, если TCP-фронт появился ПОЗЖЕ него.
+
+    ``ensure_reality_config`` включает режим, только когда фронт (xhttp/ws-cdn)
+    уже есть на ноде. Но reality часто создаётся первым: автоспавн заводит
+    ровно его и ничего больше, а протоколы дозаливают потом. Без этого хелпера
+    такая нода навсегда оставалась бы с reality наружу на своём порту — мимо
+    общего :443, в отличие от всего остального флота.
+
+    Возвращает True, если что-то поменяли.
+
+    ⚠️ Только пока у reality НЕТ выданных кредов. Смена порта меняет то, что
+    вшито в клиентские URI: при переходе с публичного 9443 на loopback+443
+    клиентский порт станет другим, а ``config_text`` уже розданных кредов
+    сам не перепишется. Нода со своими юзерами — случай для миграции, не для
+    молчаливой правки на лету.
+    """
+    reality = (
+        db.query(models.VPNConfig)
+        .filter(
+            models.VPNConfig.node_id == node.id,
+            models.VPNConfig.protocol == models.VPNConfigProtocol.vless_reality,
+            models.VPNConfig.is_enabled.is_(True),
+        )
+        .first()
+    )
+    if reality is None or (reality.settings or {}).get("public_port"):
+        return False
+
+    has_tcp_front = any(
+        c.is_enabled
+        and c.protocol
+        in (
+            models.VPNConfigProtocol.vless_xhttp,
+            models.VPNConfigProtocol.vless_ws_cdn,
+        )
+        for c in node.configs
+    )
+    if not has_tcp_front:
+        return False
+
+    issued = (
+        db.query(func.count(models.Credential.id))
+        .filter(
+            models.Credential.config_id == reality.id,
+            models.Credential.is_active.is_(True),
+        )
+        .scalar()
+    ) or 0
+    if issued:
+        logger.warning(
+            "node %s: reality не унифицирован на :443, но у него уже %d активных "
+            "кредов — не трогаем автоматически (смена порта разошлась бы с "
+            "config_text уже розданных клиентов). Нужна миграция.",
+            node.id, issued,
+        )
+        return False
+
+    settings = dict(reality.settings or {})
+    settings["public_port"] = 443
+    reality.settings = settings
+    reality.port = UNIFIED_REALITY_LISTEN_PORT
+    db.add(reality)
+    db.commit()
+    logger.info(
+        "node %s: reality догнал 443-унификацию (listen %s, наружу 443)",
+        node.id, UNIFIED_REALITY_LISTEN_PORT,
+    )
+    return True
+
+
 def ensure_shadowtls_config(
     db: Session,
     node: models.VPNNode,
