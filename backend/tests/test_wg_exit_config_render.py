@@ -40,7 +40,16 @@ _INTERFACE_KEYS = ("PrivateKey", "Address", "ListenPort")
 
 
 def _render(*, peers: list[dict] | None = None) -> str:
-    env = jinja2.Environment(undefined=jinja2.ChainableUndefined)
+    # trim_blocks=True — КАК РЕНДЕРИТ ANSIBLE, и это принципиально: он срезает
+    # перевод строки сразу после закрывающего тега блока/комментария. С
+    # дефолтами Jinja тот же шаблон рендерится иначе, и первая версия этого
+    # теста именно поэтому зеленела на всё ещё сломанном шаблоне. Тест обязан
+    # воспроизводить рантайм, а не абстрактную Jinja.
+    env = jinja2.Environment(
+        undefined=jinja2.ChainableUndefined,
+        trim_blocks=True,
+        keep_trailing_newline=True,
+    )
     return env.from_string(TEMPLATE.read_text()).render(
         wg_exit_private_key="cHJpdmF0ZS1rZXktc3R1Yg=",
         wg_exit_address_v4="10.77.0.1/24",
