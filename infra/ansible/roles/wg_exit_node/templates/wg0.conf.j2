@@ -18,7 +18,16 @@ ListenPort = {{ wg_exit_port | default(51820) }}
     `-C || -A` делает строки идемпотентными: они не задублируются, если
     правило уже стоит (роль применила его напрямую, либо netfilter-persistent
     всё же восстановил). PostDown снимает только то, что реально есть, и
-    никогда не валит остановку интерфейса. -#}
+    никогда не валит остановку интерфейса.
+
+    NB: закрывающий маркер этого комментария — БЕЗ дефиса, намеренно. С
+    дефисом Jinja съедала перевод строки после комментария, и в конфиге
+    PostUp приклеивался к ListenPort: выходило
+    "ListenPort = 51820PostUp = iptables ...". wg такой файл не парсит —
+    wg syncconf падал ("Servname not supported"), новые пиры на exit не
+    доезжали НИКОГДА, а wg-quick up после ребута не поднял бы интерфейс
+    вовсе. Ломалось молча: уже поднятые пиры живут в ядре, файл при этом
+    невалиден. Найдено 2026-07-30 при разборе мёртвых туннелей avps-ru-01. #}
 PostUp = iptables -t nat -C POSTROUTING -s {{ wg_exit_network_v4 | default('10.77.0.0/24') }} -o {{ ansible_default_ipv4.interface }} -j MASQUERADE 2>/dev/null || iptables -t nat -A POSTROUTING -s {{ wg_exit_network_v4 | default('10.77.0.0/24') }} -o {{ ansible_default_ipv4.interface }} -j MASQUERADE
 PostUp = iptables -C FORWARD -i %i -j ACCEPT 2>/dev/null || iptables -A FORWARD -i %i -j ACCEPT
 PostUp = iptables -C FORWARD -o %i -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || iptables -A FORWARD -o %i -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT

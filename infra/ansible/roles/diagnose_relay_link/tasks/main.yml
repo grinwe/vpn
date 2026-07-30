@@ -334,7 +334,13 @@
 - name: Write structured diagnose result to controller
   ansible.builtin.copy:
     content: "{{ diag_payload | to_nice_json }}"
-    dest: "{{ diag_result_file }}"
+    # diag_result_file_jump, а НЕ diag_result_file: базовый путь приезжает от
+    # бэкенда через -e, а extra-vars в ansible приоритетнее play-переменных —
+    # попытка перекрыть его в плейбуке молча не срабатывала. Роль писала в
+    # базовый путь, оркестратор читал `<base>.jump` и подставлял синтетический
+    # `_jump_result_file_missing`, то есть ВСЕ шесть jump-side проверок никогда
+    # не доезжали до админки (exit-side работали — там своё имя переменной).
+    dest: "{{ diag_result_file_jump }}"
     mode: "0644"
   vars:
     diag_payload:

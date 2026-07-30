@@ -36,8 +36,10 @@
   become: true
   gather_facts: false
   vars:
+    # Только производное имя. Переопределять сам diag_result_file бессмысленно:
+    # он приходит от оркестратора через -e и play-переменной не перекрывается
+    # (и раньше эта строка вдобавок ссылалась сама на себя по кругу).
     diag_result_file_jump: "{{ diag_result_file }}.jump"
-    diag_result_file: "{{ diag_result_file_jump }}"
   roles:
     - diagnose_relay_link
 
