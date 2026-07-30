@@ -206,9 +206,27 @@ def test_repeat_posts_are_rate_limited(client, sub_with_token):
 
 
 def test_device_name_is_escaped(client, db_session, sub_with_token):
-    """Имя устройства задаёт пользователь — это XSS-вектор."""
-    _sub, device = sub_with_token
+    """Имя устройства задаёт пользователь — это XSS-вектор.
+
+    Проверяем на подписке с ДВУМЯ устройствами: при одном имя вообще не
+    показывается (см. test_device_name_hidden_when_there_is_only_one).
+    """
+    from app import models as m
+
+    sub, device = sub_with_token
     device.name = '<script>alert("xss")</script>'
+    node = make_node(db_session, name="xss-node", host="203.0.113.241")
+    cfg = make_config(db_session, node)
+    db_session.add(
+        m.Device(
+            user_id=sub.user_id,
+            subscription_id=sub.id,
+            config_id=cfg.id,
+            name="второе",
+            status=m.DeviceStatus.active,
+            access_username="user-xss-2",
+        )
+    )
     db_session.commit()
 
     resp = client.get(f"/api/sub/{device.sub_token}?fix=1", headers=HTML)
@@ -275,7 +293,9 @@ def test_alias_repairs_the_live_sibling(client, db_session, sub_with_token, monk
 
     resp = client.get(f"/api/sub/{old_device.sub_token}?fix=1", headers=HTML)
     assert resp.status_code == 200
-    assert "новое" in resp.text
+    # Кнопка починки есть — значит страница нашла ЖИВОГО соседа: у
+    # ревокнутого устройства чинить было бы нечего.
+    assert "Починить подключение" in resp.text
 
 
 def test_camo_is_indistinguishable_from_the_root(client, monkeypatch):
@@ -339,22 +359,50 @@ def test_post_repair_checks_subscription_status(client, db_session, sub_with_tok
     assert reports_after == reports_before, "починки быть не должно"
 
 
-def test_technical_device_name_is_not_shown(client, db_session, sub_with_token):
-    """«Мы переключим primary» — это разговор с инженером. Технические имена
-    из провижининга заменяем нейтральным «это устройство»."""
+def test_device_name_hidden_when_there_is_only_one(client, db_session, sub_with_token):
+    """Имя устройства показываем ТОЛЬКО когда их несколько.
+
+    При единственном устройстве имя не отвечает ни на какой вопрос, зато
+    вылезает наружу всё, что человек когда-то вписал: на живом проде это
+    дало «Мы переключим Превью баннера на другой способ связи».
+    """
     _sub, device = sub_with_token
-    for tech in ("primary", "device-6", "default_2", "user 3"):
-        device.name = tech
+    for name in ("primary", "device-6", "Превью баннера", "Мой телефон"):
+        device.name = name
         db_session.commit()
         resp = client.get(f"/api/sub/{device.sub_token}?fix=1", headers=HTML)
-        assert tech not in resp.text, tech
+        assert name not in resp.text, name
         assert "это устройство" in resp.text
 
-    # Имя, которое дал человек, показываем как есть.
+
+def test_device_name_shown_when_several_devices(client, db_session, sub_with_token):
+    """А при нескольких устройствах имя отвечает на «какое именно чиним»."""
+    from app import models as m
+
+    sub, device = sub_with_token
     device.name = "Мой телефон"
+    node = make_node(db_session, name="two-dev-node", host="203.0.113.240")
+    cfg = make_config(db_session, node)
+    db_session.add(
+        m.Device(
+            user_id=sub.user_id,
+            subscription_id=sub.id,
+            config_id=cfg.id,
+            name="Ноутбук",
+            status=m.DeviceStatus.active,
+            access_username="user-two",
+        )
+    )
     db_session.commit()
+
     resp = client.get(f"/api/sub/{device.sub_token}?fix=1", headers=HTML)
     assert "Мой телефон" in resp.text
+    # Техническое имя всё равно не показываем — даже когда устройств много.
+    device.name = "device-6"
+    db_session.commit()
+    resp = client.get(f"/api/sub/{device.sub_token}?fix=1", headers=HTML)
+    assert "device-6" not in resp.text
+    assert "это устройство" in resp.text
 
 
 def test_help_button_unlocks_only_after_a_repair(client, db_session, sub_with_token, monkeypatch):

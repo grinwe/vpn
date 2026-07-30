@@ -102,24 +102,26 @@ def test_v2raytun_gets_clickable_coloured_announce(monkeypatch):
 
     assert h["announce-url"] == "https://grn-ssync.pro/tok?fix=1"
     text = base64.b64decode(h["announce"][len("base64:"):]).decode()
-    assert "Не подключается?" in text
-    assert "#e05252" in text, "призыв обязан быть цветным"
-    assert "активна до" in text, "статус подписки тоже показываем"
+    assert "подключается?" in text
+    # Цвет ставится перед КАЖДЫМ словом: инлайн-код красит одно следующее
+    # слово, а не текст до следующего кода (живая проверка 2026-07-30).
+    assert text.count("#e05252") == 4, text
+    # Срок НЕ дублируем: клиент рисует «Активна до …» сам, рядом со шкалой.
+    assert "активна до" not in text.lower()
 
     # Happ-специфика ему не уезжает: он её игнорирует, а мы не мусорим.
     for dead in ("providerid", "sub-info-text", "sub-expire", "notification-subs-expire"):
         assert dead not in h, dead
 
 
-def test_v2raytun_announce_has_no_url_without_the_page(monkeypatch):
-    """Без включённых входов красить и делать кликабельным нечего — остаётся
-    просто статус."""
+def test_v2raytun_says_nothing_without_the_page(monkeypatch):
+    """Вести некуда — строки нет вовсе: срок клиент показывает сам, а
+    объявление без ссылки не несёт ничего нового."""
     _prep(monkeypatch)
     monkeypatch.setenv("SUB_FIX_ENTRYPOINTS", "off")
     h = _headers("v2raytun")
+    assert "announce" not in h
     assert "announce-url" not in h
-    text = base64.b64decode(h["announce"][len("base64:"):]).decode()
-    assert "#e05252" not in text
 
 
 # ── Hiddify ─────────────────────────────────────────────────────────────
@@ -219,25 +221,6 @@ def test_v2raytun_announce_survives_providerid(monkeypatch):
     assert "announce" not in _headers("happ"), "у Happ дубля быть не должно"
 
 
-def test_status_colour_matches_urgency(monkeypatch):
-    """Цвет статуса в v2rayTun-announce несёт тот же смысл, что sub-info-color
-    у Happ: красный — пора платить. Иначе «Подписка закончилась» выглядела бы
-    ровно так же, как «активна до …»."""
-    _prep(monkeypatch)
-
-    ok = base64.b64decode(_headers("v2raytun")["announce"][7:]).decode()
-    assert "#9aa0a6" in ok, "спокойный статус — серым"
-
-    class _Expired(_Sub):
-        def __init__(self):
-            super().__init__(timedelta(hours=-2))
-
-    h = _sub_response_headers(_Expired(), "tok", user_agent=UA["v2raytun"])
-    text = base64.b64decode(h["announce"][7:]).decode()
-    assert "закончилась" in text
-    assert "#9aa0a6" not in text, "истёкшую подписку серым показывать нельзя"
-
-
 def test_body_directives_skip_clients_that_cannot_read_them(monkeypatch):
     """#providerid и #sub-info-* в теле — fallback ДЛЯ HAPP. v2rayTun и Hiddify
     их не читают, а тело человек может открыть глазами: мусорить не надо."""
@@ -275,7 +258,7 @@ def test_support_rung_is_quieter_than_all(monkeypatch):
     h = _headers("v2raytun")
     text = base64.b64decode(h["announce"][7:]).decode()
     assert h["announce-url"] == "https://grn-ssync.pro/tok?fix=1", "ссылка есть"
-    assert "Не подключается?" not in text, "громкого призыва на этой ступени нет"
+    assert "#e05252" not in text, "громкого призыва на этой ступени нет"
 
     # У Hiddify в support работает support-url, а второго пункта меню с тем
     # же адресом быть не должно — это дубль.
