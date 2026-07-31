@@ -440,6 +440,9 @@ services:
       TELEGRAM_STARS_WEBHOOK_SECRET: ${TELEGRAM_STARS_WEBHOOK_SECRET:-}
       SUB_LINK_BASE_URL: ${SUB_LINK_BASE_URL:-}
       WEBAPP_BASE_URL: ${WEBAPP_BASE_URL:-}
+      # Версия выката из файла VERSION — кэшбастер ?v= в URL мини-аппа
+      # (кнопки и menu-button), см. bot/keyboards.py:WEBAPP_URL.
+      APP_VERSION: ${APP_VERSION:-0.0.0-dev}
       NOTIFICATION_POLL_INTERVAL: ${NOTIFICATION_POLL_INTERVAL:-10}
       # Auto-delete ack-сообщения health-ping опроса через N секунд после
       # ответа юзера. 0 — выключить (оставить «Спасибо!» в чате навсегда).

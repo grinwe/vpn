@@ -141,6 +141,7 @@ def _install_stubs(monkeypatch):
         BTN_TOPUP="Пополнить",
         BTN_VPN_BROKEN="VPN не работает",
         WEBAPP_BASE_URL="",
+        WEBAPP_URL="",
         help_back_keyboard=_kb,
         help_keyboard=_kb,
         onboarding_keyboard=_kb,

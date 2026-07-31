@@ -57,6 +57,9 @@ def kb(monkeypatch):
     sys.modules["aiogram"].types = types_mod
     monkeypatch.setitem(sys.modules, "aiogram.types", types_mod)
     monkeypatch.setenv("WEBAPP_BASE_URL", "https://example.test/app")
+    # Пин: в тест-контейнере APP_VERSION приходит из compose-env, и без
+    # пина URL кнопок «плавал» бы между окружениями (кэшбастер ?v=).
+    monkeypatch.setenv("APP_VERSION", "9.9.9")
     mod = importlib.reload(importlib.import_module("bot.keyboards"))
     yield mod
     sys.modules.pop("bot.keyboards", None)
@@ -78,7 +81,9 @@ def test_new_user_sees_single_gift_button(kb):
     texts = _texts(markup)
 
     assert texts[0] == "🎁 Забрать бесплатный месяц"
-    assert markup.inline_keyboard[0][0].web_app.url == "https://example.test/app"
+    # Кэшбастер ?v=<версия> обязателен: без него Telegram-webview может
+    # открыть mini app из протухшего HTTP-кэша (белый лист после выката).
+    assert markup.inline_keyboard[0][0].web_app.url == "https://example.test/app/?v=9.9.9"
     # Один экран — одно действие: тарифы допустимы, «поломочные» пункты — нет.
     assert "❓ Проблема с ЛК" not in texts
     assert len(texts) <= 2, f"первый экран новичка перегружен: {texts}"

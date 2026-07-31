@@ -86,6 +86,8 @@ ansible-playbook -i inventories/prod/hosts.yml site.yml --tags web
 
 **DNS-режим backend-домена:** `grinwer.online` (или аналог) — **Proxied** в Cloudflare (оранжевое облачко). Это HTTP(S)-трафик, CF даёт DDoS-защиту и кеширует статику admin/webapp.
 
+**Кэшбастер мини-аппа:** бот подставляет `?v=<VERSION>` во все `WebAppInfo`-кнопки и на старте программно перезаписывает menu-кнопку «Личный кабинет» (`bot.py: set_chat_menu_button`) — менять её в BotFather вручную больше не нужно. Кэш webview ключуется полным URL, поэтому каждый бамп VERSION гарантированно приводит клиентов за свежим `index.html`.
+
 **Кэш-заголовки SPA (webapp/nginx.conf, admin/nginx.conf):** `index.html` отдаётся с `Cache-Control: no-cache` (клиент хранит, но ревалидирует по ETag — дешёвый 304), хэшированные `assets/*` — с `max-age=31536000, immutable`, а отсутствующий ассет даёт честный **404**, не SPA-fallback. Не убирать: без этого Telegram-webview кэширует `index.html` эвристически (часами держит ссылку на уже удалённый с диска бандл), fallback отдаёт HTML под `.js`-URL → module script блокируется по MIME → белый лист у вернувшихся юзеров после каждого выката, плюс CF кэширует этот HTML-под-`.js` на 4 часа (инцидент 2026-07-31, экран «Сменить подписку»).
 
 ### 4a. Mgmt-mirror (upstream-зеркало для vpn-нод)

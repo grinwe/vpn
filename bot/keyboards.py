@@ -4,9 +4,23 @@ from aiogram import types
 
 # Public HTTPS URL of the Telegram WebApp. Used to build the inline
 # "Личный кабинет" button on /start. The persistent entry point is the
-# Menu Button configured in BotFather (Bot Settings → Menu Button), so
-# this URL is only needed for the one-tap launch right after onboarding.
+# Menu Button: изначально задана в BotFather, но с появлением кэшбастера
+# бот на старте перезаписывает её программно (bot.py:set_chat_menu_button),
+# чтобы URL нёс актуальную версию.
 WEBAPP_BASE_URL = os.getenv("WEBAPP_BASE_URL", "").rstrip("/")
+
+# Кэшбастер мини-аппа: query с версией выката. HTTP-кэш Telegram-webview
+# ключуется полным URL (включая query), поэтому смена версии гарантированно
+# приводит клиента за свежим index.html — эвристически закэшированный старый
+# URL просто не участвует. Слэш перед query обязателен: /app?v=… ловит
+# лишний 301 на /app/?v=…. Во все WebAppInfo должен идти WEBAPP_URL;
+# WEBAPP_BASE_URL остаётся для https-гейтов и построения origin-ссылок.
+APP_VERSION = os.getenv("APP_VERSION", "").strip()
+WEBAPP_URL = (
+    f"{WEBAPP_BASE_URL}/?v={APP_VERSION}"
+    if WEBAPP_BASE_URL and APP_VERSION
+    else f"{WEBAPP_BASE_URL}/" if WEBAPP_BASE_URL else ""
+)
 
 
 # Text labels used by the persistent reply-keyboard buttons. Exported so
@@ -132,7 +146,7 @@ def webapp_inline_keyboard() -> types.InlineKeyboardMarkup | None:
             [
                 types.InlineKeyboardButton(
                     text="🔐 Открыть личный кабинет",
-                    web_app=types.WebAppInfo(url=WEBAPP_BASE_URL),
+                    web_app=types.WebAppInfo(url=WEBAPP_URL),
                 )
             ]
         ]
@@ -167,7 +181,7 @@ def welcome_action_keyboard(
                 # додумать сам.
                 text="🎁 Забрать бесплатный месяц" if onboarding
                 else "🔐 Открыть личный кабинет",
-                web_app=types.WebAppInfo(url=WEBAPP_BASE_URL),
+                web_app=types.WebAppInfo(url=WEBAPP_URL),
             )
         ])
     if onboarding:

@@ -5,10 +5,10 @@ from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
 from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
 from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.types import ErrorEvent
+from aiogram.types import ErrorEvent, MenuButtonWebApp, WebAppInfo
 from .config import BOT_TOKEN, BACKEND_URL, ADMIN_API_TOKEN, NOTIFICATION_POLL_INTERVAL, BOT_WEBHOOK_PORT
 from .handlers import close_session, router, get_session, onboarding_keyboard, health_ping_keyboard, node_diagnosis_keyboard
-from .keyboards import DEFAULT_COMMANDS
+from .keyboards import DEFAULT_COMMANDS, WEBAPP_URL
 from .middleware import BanGuard
 from .support import support_router
 
@@ -338,6 +338,21 @@ async def main():
         await bot.set_my_commands(DEFAULT_COMMANDS)
     except Exception:
         logger.exception("set_my_commands failed")
+
+    # Menu-кнопка «Личный кабинет» перезаписывается программно (изначально
+    # была задана в BotFather): URL несёт кэшбастер ?v=<версия выката>, и
+    # меняться он должен при каждом деплое — руками в BotFather это не
+    # прожить. Best-effort по той же причине, что и set_my_commands.
+    if WEBAPP_URL.startswith("https://"):
+        try:
+            await bot.set_chat_menu_button(
+                menu_button=MenuButtonWebApp(
+                    text="Личный кабинет",
+                    web_app=WebAppInfo(url=WEBAPP_URL),
+                )
+            )
+        except Exception:
+            logger.exception("set_chat_menu_button failed")
 
     # Start notification poller as background task
     poller_task = None

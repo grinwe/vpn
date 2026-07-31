@@ -22,6 +22,7 @@ from .config import (
 )
 from .keyboards import (
     WEBAPP_BASE_URL,
+    WEBAPP_URL,
     BTN_BUY,
     BTN_HELP,
     BTN_INVITE,
@@ -420,7 +421,7 @@ async def cmd_start(message: types.Message, state: FSMContext):
                 reply_markup=types.InlineKeyboardMarkup(inline_keyboard=[[
                     types.InlineKeyboardButton(
                         text="🔐 Открыть личный кабинет",
-                        web_app=types.WebAppInfo(url=WEBAPP_BASE_URL),
+                        web_app=types.WebAppInfo(url=WEBAPP_URL),
                     )
                 ]]),
             )
@@ -591,7 +592,7 @@ async def list_plans(message: types.Message):
         # текстом, а тапабельны только платные варианты.
         rows.insert(0, [types.InlineKeyboardButton(
             text="🎁 Забрать бесплатный месяц",
-            web_app=types.WebAppInfo(url=WEBAPP_BASE_URL),
+            web_app=types.WebAppInfo(url=WEBAPP_URL),
         )])
     keyboard = types.InlineKeyboardMarkup(inline_keyboard=rows)
     await message.answer("\n".join(lines), reply_markup=keyboard)
