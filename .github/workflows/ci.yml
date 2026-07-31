@@ -95,6 +95,12 @@ jobs:
       - name: Install dependencies
         run: npm ci --no-audit --no-fund
         working-directory: ${{ matrix.app }}
+      # Гейт хуков (react-hooks/rules-of-hooks = error): нарушение порядка
+      # хуков роняет весь React-экран в белый лист в рантайме, tsc его не
+      # ловит. Такой баг жил на проде 3.5 недели (Plans.tsx, 94b7ee5).
+      - name: Lint (react-hooks gate)
+        run: npm run lint
+        working-directory: ${{ matrix.app }}
       - name: Type-check and build
         run: npm run build
         working-directory: ${{ matrix.app }}
