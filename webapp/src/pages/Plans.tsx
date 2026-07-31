@@ -155,6 +155,26 @@ export default function Plans({ onActivated, subLinkBase, me, changeSubscription
     };
   }, []);
 
+  // Таймер-страховка для случая, когда openInvoice не вызовет callback.
+  const topupTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const clearTopupTimer = () => {
+    if (topupTimerRef.current !== null) {
+      clearTimeout(topupTimerRef.current);
+      topupTimerRef.current = null;
+    }
+  };
+  // Токен поколения платежа: закрытие шторки / новый платёж инкрементят его,
+  // отменяя отвязанный карточный поллинг (~90с живёт вне шторки), чтобы он не
+  // дёргал onActivated/showToast/setTopupState постфактум.
+  const payGenRef = useRef(0);
+  // Снимаем страховочный таймер при размонтировании страницы.
+  useEffect(() => () => clearTopupTimer(), []);
+
+  // ВСЕ хуки объявлены выше ранних return: на первом рендере plans === null и
+  // выполнение уходит в `return <Centered>Загрузка…</Centered>`, поэтому любой
+  // хук ниже этой точки выполнялся бы только со второго рендера. React считает
+  // хуки по порядку и на такое расхождение бросает «Rendered more hooks than
+  // during the previous render» — экран тарифов падал в белый лист целиком.
   // E2.5 — ранний return подменял всю страницу вместе с шапкой: юзер, поймавший
   // секундный обрыв на шаге выбора тарифа, оказывался в тупике без «назад» и
   // без «повторить».
@@ -238,18 +258,6 @@ export default function Plans({ onActivated, subLinkBase, me, changeSubscription
     }
   }
 
-  // Таймер-страховка для случая, когда openInvoice не вызовет callback.
-  const topupTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const clearTopupTimer = () => {
-    if (topupTimerRef.current !== null) {
-      clearTimeout(topupTimerRef.current);
-      topupTimerRef.current = null;
-    }
-  };
-  // Токен поколения платежа: закрытие шторки / новый платёж инкрементят его,
-  // отменяя отвязанный карточный поллинг (~90с живёт вне шторки), чтобы он не
-  // дёргал onActivated/showToast/setTopupState постфактум.
-  const payGenRef = useRef(0);
   // Закрытие шторки пополнения: всегда снимает занятость и таймер, чтобы
   // шторка не могла залипнуть навсегда; инкремент payGenRef гасит фоновый
   // поллинг закрытого платежа.
@@ -259,8 +267,6 @@ export default function Plans({ onActivated, subLinkBase, me, changeSubscription
     setTopupState(null);
     setTopupHint(null);
   }
-  // Снимаем страховочный таймер при размонтировании страницы.
-  useEffect(() => () => clearTopupTimer(), []);
 
   async function payTopup(amountKopecks: number, provider: string) {
     const tg = getTg();
