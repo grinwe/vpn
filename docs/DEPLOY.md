@@ -86,6 +86,8 @@ ansible-playbook -i inventories/prod/hosts.yml site.yml --tags web
 
 **DNS-режим backend-домена:** `grinwer.online` (или аналог) — **Proxied** в Cloudflare (оранжевое облачко). Это HTTP(S)-трафик, CF даёт DDoS-защиту и кеширует статику admin/webapp.
 
+**Кэш-заголовки SPA (webapp/nginx.conf, admin/nginx.conf):** `index.html` отдаётся с `Cache-Control: no-cache` (клиент хранит, но ревалидирует по ETag — дешёвый 304), хэшированные `assets/*` — с `max-age=31536000, immutable`, а отсутствующий ассет даёт честный **404**, не SPA-fallback. Не убирать: без этого Telegram-webview кэширует `index.html` эвристически (часами держит ссылку на уже удалённый с диска бандл), fallback отдаёт HTML под `.js`-URL → module script блокируется по MIME → белый лист у вернувшихся юзеров после каждого выката, плюс CF кэширует этот HTML-под-`.js` на 4 часа (инцидент 2026-07-31, экран «Сменить подписку»).
+
 ### 4a. Mgmt-mirror (upstream-зеркало для vpn-нод)
 
 На том же web-host'е поднимается отдельный compose-стек `mgmt-mirror` — nginx, который раздаёт ноды `geoip.dat`, `geosite.dat` и pinned-`Xray-linux-64-*.zip`. Это spasает bootstrap'ы на RU-провайдерах, где outbound к `github.com` (и зеркалам типа ghproxy/jsdelivr) троттлится до неюзабельного состояния. См. подробности в [docs/infrastructure/ansible.md § mgmt-mirror](infrastructure/ansible.md#mgmt-mirror--собственное-зеркало-upstream).
@@ -186,5 +188,6 @@ Worker автоматически:
 | Nodes list даёт 500 | `docker compose logs backend --tail 200` + `docker compose exec backend python -c "..."` прямой pydantic-тест |
 | Create node → statuses stuck `registering` | `docker compose logs worker --tail 200` — ищи ansible traceback. Чаще всего — `PROVISIONING_SSH_KEY` не примонтирован или pub-key не в authorized_keys ноды. |
 | WebApp показывает «Откройте через бота заново» | JWT протух (30 мин) или `WEBAPP_JWT_SECRET` сменился — нужно перезайти из бот-кнопки. |
+| WebApp — белый лист (только фон) сразу после выката | Клиент держит старый `index.html` из кэша webview и тянет удалённый бандл. Проверить, что nginx контейнера отдаёт `no-cache` на `index.html` и 404 (не HTML) на отсутствующие `assets/*` (см. §4). Лечится у клиента «Обновить страницу» в меню мини-аппа или само по истечении эвристики кэша. |
 | Bot не доставляет trial warning | `SELECT * FROM audit_log WHERE action LIKE 'trial_expiry_warning%' ORDER BY id DESC LIMIT 5` — если там нет новых, tick не отработал; если есть `:delivered` — уже доставил. |
 | Balance charge не списывает | `SELECT * FROM balance_transactions ORDER BY id DESC LIMIT 20` — смотри когда последний spend; tick живёт в `worker` контейнере, не в backend. |
