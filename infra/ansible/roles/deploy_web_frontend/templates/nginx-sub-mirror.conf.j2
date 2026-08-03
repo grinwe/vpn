@@ -52,7 +52,11 @@ server {
     # Ровно один сегмент-токен, как в TOKEN_RE воркера. GET отдаёт саб или
     # страницу ?fix=1, POST — действия починки (в отличие от воркера тело
     # POST сюда доезжает, форма работает без оговорок).
-    location ~ ^/(?<subtoken>[A-Za-z0-9_-]{20,80})/?$ {
+    #
+    # Регулярка В КАВЫЧКАХ обязательно: без них nginx принимает `{20,80}`
+    # за начало блока и обрывает шаблон на `[A-Za-z0-9_-]`, падая с
+    # «pcre2_compile() failed: missing closing parenthesis».
+    location ~ "^/(?<subtoken>[A-Za-z0-9_-]{20,80})/?$" {
         proxy_pass http://{{ deploy_web_frontend_api_upstream }}/api/sub/$subtoken$is_args$args;
         proxy_set_header Host $host;
         proxy_set_header X-Real-IP $remote_addr;
