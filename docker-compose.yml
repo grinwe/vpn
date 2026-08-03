@@ -150,6 +150,10 @@ services:
       # CDN-fronted domain (Cloudflare Worker proxy etc.) so an RKN
       # block on grinwer.online does not kill installed clients.
       SUB_LINK_BASE_URL: ${SUB_LINK_BASE_URL:-}
+      # Запасной фронт саб-ссылки (мимо CF) + доля токенов на нём, 0..100.
+      # Пусто/0 = вся раздача на основном домене, как было.
+      SUB_LINK_BASE_URL_ALT: ${SUB_LINK_BASE_URL_ALT:-}
+      SUB_LINK_ALT_SHARE: ${SUB_LINK_ALT_SHARE:-0}
       # WS+CDN / xhttp DNS front (Cloudflare DNS-only). Backend mints a
       # DNS-only A-record on config-create; the node serves TLS via LE.
       # CF-proxying ws/xhttp is dead. See services/cloudflare_dns.py.
@@ -317,6 +321,10 @@ services:
       # provisioning.py also bake the sub URL into Device.connection_uri
       # when running off the queue.
       SUB_LINK_BASE_URL: ${SUB_LINK_BASE_URL:-}
+      # Запасной фронт саб-ссылки (мимо CF) + доля токенов на нём, 0..100.
+      # Пусто/0 = вся раздача на основном домене, как было.
+      SUB_LINK_BASE_URL_ALT: ${SUB_LINK_BASE_URL_ALT:-}
+      SUB_LINK_ALT_SHARE: ${SUB_LINK_ALT_SHARE:-0}
       # WS+CDN / xhttp DNS front (Cloudflare DNS-only). Token/domain let the
       # backend mint DNS-only records; node serves TLS via LE (no Origin CA).
       CLOUDFLARE_DNS_TOKEN: ${CLOUDFLARE_DNS_TOKEN:-}
@@ -439,6 +447,10 @@ services:
       PAYMENT_PROVIDER_CHOICES: ${PAYMENT_PROVIDER_CHOICES:-}
       TELEGRAM_STARS_WEBHOOK_SECRET: ${TELEGRAM_STARS_WEBHOOK_SECRET:-}
       SUB_LINK_BASE_URL: ${SUB_LINK_BASE_URL:-}
+      # Запасной фронт саб-ссылки (мимо CF) + доля токенов на нём, 0..100.
+      # Пусто/0 = вся раздача на основном домене, как было.
+      SUB_LINK_BASE_URL_ALT: ${SUB_LINK_BASE_URL_ALT:-}
+      SUB_LINK_ALT_SHARE: ${SUB_LINK_ALT_SHARE:-0}
       WEBAPP_BASE_URL: ${WEBAPP_BASE_URL:-}
       # Версия выката из файла VERSION — кэшбастер ?v= в URL мини-аппа
       # (кнопки и menu-button), см. bot/keyboards.py:WEBAPP_URL.

@@ -24,6 +24,14 @@ PAYMENT_PROVIDER_CHOICES = [
 # Dynamic subscription link base URL (e.g. https://vpn.example.com/sub/)
 SUB_LINK_BASE_URL = os.getenv("SUB_LINK_BASE_URL", "")
 
+# Запасной фронт саб-ссылки (идёт мимо Cloudflare, прямо на origin) и доля
+# токенов на нём, 0..100. Логика ДОЛЖНА совпадать с
+# backend/app/services/sub_links.py — бот и бэкенд считают домен независимо,
+# и разойтись им нельзя: человек увидит в боте одну ссылку, а кнопка
+# «что-то не работает» в клиенте поведёт на другую.
+SUB_LINK_BASE_URL_ALT = os.getenv("SUB_LINK_BASE_URL_ALT", "")
+SUB_LINK_ALT_SHARE = os.getenv("SUB_LINK_ALT_SHARE", "0")
+
 # Notification polling interval in seconds (0 = disabled)
 NOTIFICATION_POLL_INTERVAL = int(os.getenv("NOTIFICATION_POLL_INTERVAL", "10"))
 

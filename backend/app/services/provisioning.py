@@ -25,7 +25,7 @@ from .. import models
 from ..db import SessionLocal
 from ..security import compute_client_id_hmac, decrypt, encrypt
 from ..version import app_version
-from . import leg_scheme
+from . import leg_scheme, sub_links
 from .ansible_runner import (
     AnsibleCancelled,
     build_inventory_for_exit_node,
@@ -3047,11 +3047,7 @@ class ProvisioningOrchestrator:
         if reuse_connection_uri is not None:
             connection_uri_encrypted = reuse_connection_uri
         else:
-            sub_base = os.getenv("SUB_LINK_BASE_URL", "").rstrip("/")
-            if sub_base:
-                device_uri = f"{sub_base}/{device_sub_token}"
-            else:
-                device_uri = f"/api/sub/{device_sub_token}"
+            device_uri = sub_links.sub_url_for(device_sub_token)
             connection_uri_encrypted = encrypt(device_uri)
 
         device = models.Device(
@@ -3207,11 +3203,7 @@ class ProvisioningOrchestrator:
         # this device's credentials. Sharing the link exposes one device,
         # not the entire subscription.
         device_sub_token = secrets.token_urlsafe(32)
-        sub_base = os.getenv("SUB_LINK_BASE_URL", "").rstrip("/")
-        if sub_base:
-            device_uri = f"{sub_base}/{device_sub_token}"
-        else:
-            device_uri = f"/api/sub/{device_sub_token}"
+        device_uri = sub_links.sub_url_for(device_sub_token)
 
         # Pick a representative config for Device.config_id. Since
         # migration 0030 the column is nullable (NULL means "this
@@ -4373,11 +4365,7 @@ class ProvisioningOrchestrator:
         if reuse_connection_uri is not None:
             connection_uri_encrypted = reuse_connection_uri
         else:
-            sub_base = os.getenv("SUB_LINK_BASE_URL", "").rstrip("/")
-            if sub_base:
-                device_uri = f"{sub_base}/{device_sub_token}"
-            else:
-                device_uri = f"/api/sub/{device_sub_token}"
+            device_uri = sub_links.sub_url_for(device_sub_token)
             connection_uri_encrypted = encrypt(device_uri)
 
         primary_config = next(

@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import html
 import logging
 import os
@@ -17,7 +18,9 @@ from .config import (
     BACKEND_URL,
     PAYMENT_PROVIDER,
     PAYMENT_PROVIDER_CHOICES,
+    SUB_LINK_ALT_SHARE,
     SUB_LINK_BASE_URL,
+    SUB_LINK_BASE_URL_ALT,
     TELEGRAM_STARS_WEBHOOK_SECRET,
 )
 from .keyboards import (
@@ -66,6 +69,32 @@ def _payment_method_rows(invoice_id: int, kind: str) -> list[list[types.InlineKe
     ]
 
 
+def _sub_base_for(sub_token: str) -> str:
+    """Домен саб-ссылки для этого токена: основной или запасной.
+
+    Зеркало ``SUB_LINK_BASE_URL_ALT`` идёт мимо Cloudflare, прямо на origin,
+    и открывается там, где основной фронт лёг. Раскладываем токены по двум
+    доменам, чтобы падение одного уносило часть людей, а не всех.
+
+    Копия ``backend/app/services/sub_links.use_alt`` — там же и объяснение,
+    почему sha256, а не встроенный hash(). Считают независимо бот, бэкенд и
+    провижининг, поэтому расхождение недопустимо: держи обе реализации в
+    одном виде (тест ``test_sub_link_balance.py`` сверяет их между собой).
+    """
+    primary = (SUB_LINK_BASE_URL or "").strip().rstrip("/")
+    alt = (SUB_LINK_BASE_URL_ALT or "").strip().rstrip("/")
+    try:
+        share = max(0, min(100, int((SUB_LINK_ALT_SHARE or "0").strip())))
+    except ValueError:
+        share = 0
+    if not alt or share <= 0:
+        return primary
+    if share >= 100:
+        return alt
+    digest = hashlib.sha256(sub_token.encode("utf-8")).hexdigest()
+    return alt if int(digest[:8], 16) % 100 < share else primary
+
+
 def _build_sub_url(sub_token: str | None) -> str | None:
     """Абсолютный URL подписки для показа юзеру.
 
@@ -80,8 +109,9 @@ def _build_sub_url(sub_token: str | None) -> str | None:
     """
     if not sub_token:
         return None
-    if SUB_LINK_BASE_URL:
-        return f"{SUB_LINK_BASE_URL.rstrip('/')}/{sub_token}"
+    base = _sub_base_for(sub_token)
+    if base:
+        return f"{base}/{sub_token}"
     webapp_base = os.getenv("WEBAPP_BASE_URL", "")
     if webapp_base:
         parsed = urlparse(webapp_base)

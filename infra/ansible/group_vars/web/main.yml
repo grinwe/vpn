@@ -26,7 +26,23 @@ deploy_app_stack_payment_provider: "cryptobot"
 # <grinwer.online>/api/sub/<token>.
 deploy_app_stack_sub_link_base_url: "{{ vault_sub_link_base_url | default('') }}"
 # Резервный фронт саб-ссылки (если основной ляжет). Пусто = фолбэка нет.
-deploy_app_stack_sub_link_fallback_base_url: "{{ vault_sub_link_fallback_base_url | default('') }}"
+#
+# Включён на зеркало: Happ по заголовку `fallback-url` сам перекидывает
+# ИСТОЧНИК подписки на запасной домен, когда основной перестал открываться.
+# Это единственный механизм, который чинит УЖЕ УСТАНОВЛЕННЫЕ клиенты — сам
+# адрес у них давно вбит и удалённо мы его не меняем. Требует providerid
+# (Advanced-параметр), а он у нас задан: HAPP_PROVIDER_ID.
+# Работает только у Happ; Hiddify и v2rayTun этот заголовок не читают —
+# им помогает раскладка ниже.
+deploy_app_stack_sub_link_fallback_base_url: "https://{{ deploy_web_frontend_sub_mirror_domain }}"
+
+# Раскладка НОВЫХ ссылок по двум фронтам: доля токенов, которым выдаём
+# запасной домен вместо основного. Влияет только на то, что мы ПОКАЗЫВАЕМ и
+# записываем новым девайсам — оба домена отдают любой токен, поэтому уже
+# розданные ссылки продолжают работать и менять долю можно в любой момент.
+# 0 = вся раздача на основном (поведение до фичи).
+deploy_app_stack_sub_link_base_url_alt: "https://{{ deploy_web_frontend_sub_mirror_domain }}"
+deploy_app_stack_sub_link_alt_share: 50
 
 # --- Always-on тики: kill-switch'и держим здесь, а не только в коде -------
 # Аудит 2026-07-25: эти ручки существовали лишь как os.getenv-дефолты внутри

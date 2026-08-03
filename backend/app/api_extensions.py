@@ -34,6 +34,7 @@ from .api._common import get_db  # единый источник FastAPI-зав�
 from .config import get_settings
 from .rate_limit import limiter
 from .security import decrypt as _decrypt
+from .services import sub_links
 from .services.admin_notify import notify_admins
 from .time_utils import utcnow
 
@@ -337,11 +338,14 @@ def _renew_link() -> str | None:
 def _fix_page_url(token: str) -> str | None:
     """Ссылка на страницу починки для кнопок в VPN-клиенте.
 
-    Строится ТОЛЬКО от ``SUB_LINK_BASE_URL`` (домен саб-ссылки): именно он
-    доступен без VPN — с него клиент и так тянет конфиги. Вести кнопку на
-    основной домен бессмысленно, его как раз и может резать РКН.
+    Строится ТОЛЬКО от домена саб-ссылки: именно он доступен без VPN — с него
+    клиент и так тянет конфиги. Вести кнопку на основной домен бессмысленно,
+    его как раз и может резать РКН.
+
+    Домен берём через ``sub_base_for``: он раскладывает токены по двум
+    фронтам, и кнопка обязана вести на ТОТ ЖЕ, что и сама подписка.
     """
-    base = (os.getenv("SUB_LINK_BASE_URL") or "").strip().rstrip("/")
+    base = sub_links.sub_base_for(token)
     if not base or not token:
         return None
     return f"{base}/{token}?fix=1"
