@@ -29,8 +29,20 @@ server {
 }
 
 server {
-    listen 443 ssl http2;
-    listen [::]:443 ssl http2;
+    # http2 СНЯТ намеренно, и это не про этот домен, а про соседний vhost.
+    # В nginx 1.24 `http2` — параметр слушающего СОКЕТА, а не server-блока
+    # (per-server `http2 off;` появился только в 1.25.1). Сокет :443 общий
+    # с зеркалом саб-линка (nginx-sub-mirror.conf.j2), которому HTTP/2
+    # противопоказан: RKN DPI на 4G режет H2-stream после handshake. Пока
+    # nginx младше 1.25.1, единственный способ выключить h2 зеркалу —
+    # выключить его на сокете.
+    #
+    # Для самого grinwer.online потеря нулевая: клиентский TLS терминирует
+    # Cloudflare, здесь остаётся только плечо CF→origin, которому HTTP/1.1
+    # достаточно. Вернуть http2 можно после апгрейда nginx до 1.25.1+,
+    # добавив в зеркало `http2 off;`.
+    listen 443 ssl;
+    listen [::]:443 ssl;
     server_name {{ deploy_web_frontend_domain }};
 
     ssl_certificate     /etc/letsencrypt/live/{{ deploy_web_frontend_domain }}/fullchain.pem;
