@@ -18,6 +18,22 @@ deploy_web_frontend_webapp_upstream: "127.0.0.1:8082"
 # nginx vhost file name under /etc/nginx/sites-available.
 deploy_web_frontend_site_name: "grinwer"
 
+# ── Зеркало саб-линка без Cloudflare ─────────────────────────────────
+#
+# Второй адрес для https://<домен>/<token> — тот же бэкенд, но клиент
+# приходит на наш origin напрямую, без CF в пути данных. Нужен, чтобы
+# отличить «домен grn-ssync.pro забанили» от «беда на стороне CF», и как
+# запасной путь, если основной фронт ляжет.
+#
+# Пустая строка = фича выключена (второй vhost не рендерится, серт не
+# запрашивается). Домен ОБЯЗАН быть DNS-only (серое облачко) — иначе CF
+# снова окажется в пути и смысл зеркала пропадёт.
+#
+# Ничего пользовательского на него НЕ переключается: SUB_LINK_BASE_URL
+# остаётся прежним, в заголовки клиентам этот адрес не попадает.
+deploy_web_frontend_sub_mirror_domain: ""
+deploy_web_frontend_sub_mirror_site_name: "sub-mirror"
+
 # Base path за которым публикуется admin SPA. Default "admin" — старое
 # поведение (https://grinwer.online/admin/). Чтобы убрать панель из
 # сканов активных проберов, положи в group_vars/web/vault.yml переменную

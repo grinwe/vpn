@@ -8,6 +8,12 @@ deploy_web_frontend_letsencrypt_email: "adept38@gmail.com"
 # Zone → DNS → Edit on the grinwer.online zone. Stored in the vault.
 deploy_web_frontend_cloudflare_api_token: "{{ vault_cloudflare_api_token | default('') }}"
 
+# Зеркало саб-линка без CF: тот же /<token>, но клиент приходит на origin
+# напрямую (запись grwr.ink — DNS-only). Дубль, не замена: SUB_LINK_BASE_URL
+# и заголовки клиентам по-прежнему указывают на grn-ssync.pro, в интерфейс
+# этот адрес не выведен. Нужен, чтобы отличить бан домена от беды на CF.
+deploy_web_frontend_sub_mirror_domain: "grwr.ink"
+
 # App stack lives on the same host for now. Override any of the
 # deploy_app_stack_* defaults here; secrets come from vault.yml next
 # to this file.

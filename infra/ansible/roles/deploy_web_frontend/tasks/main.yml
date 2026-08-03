@@ -206,3 +206,48 @@
     dest: "/etc/nginx/sites-enabled/{{ deploy_web_frontend_site_name }}.conf"
     state: link
   notify: reload nginx
+
+# ── Зеркало саб-линка без Cloudflare (опционально) ──────────────────
+#
+# Тот же порядок, что и у основного домена: сначала серт, потом vhost —
+# nginx не стартует с конфигом, ссылающимся на несуществующий cert.
+# Всё гейтится непустым deploy_web_frontend_sub_mirror_domain.
+- name: Check for existing sub-mirror certificate
+  stat:
+    path: "/etc/letsencrypt/live/{{ deploy_web_frontend_sub_mirror_domain }}/fullchain.pem"
+  register: sub_mirror_cert
+  when: deploy_web_frontend_sub_mirror_domain | length > 0
+
+- name: Request Let's Encrypt certificate for sub-mirror (DNS-01)
+  command: >
+    certbot certonly
+    --dns-cloudflare
+    --dns-cloudflare-credentials {{ deploy_web_frontend_cloudflare_credentials_path }}
+    --dns-cloudflare-propagation-seconds {{ deploy_web_frontend_dns_propagation_seconds }}
+    --non-interactive
+    --agree-tos
+    --email {{ deploy_web_frontend_letsencrypt_email }}
+    -d {{ deploy_web_frontend_sub_mirror_domain }}
+  when:
+    - deploy_web_frontend_sub_mirror_domain | length > 0
+    - deploy_web_frontend_request_cert | bool
+    - deploy_web_frontend_use_dns_challenge | bool
+    - not sub_mirror_cert.stat.exists
+  register: sub_mirror_certbot
+  changed_when: sub_mirror_certbot.rc == 0
+
+- name: Render sub-mirror nginx vhost
+  template:
+    src: nginx-sub-mirror.conf.j2
+    dest: "/etc/nginx/sites-available/{{ deploy_web_frontend_sub_mirror_site_name }}.conf"
+    mode: "0644"
+  when: deploy_web_frontend_sub_mirror_domain | length > 0
+  notify: reload nginx
+
+- name: Enable sub-mirror nginx vhost
+  file:
+    src: "/etc/nginx/sites-available/{{ deploy_web_frontend_sub_mirror_site_name }}.conf"
+    dest: "/etc/nginx/sites-enabled/{{ deploy_web_frontend_sub_mirror_site_name }}.conf"
+    state: link
+  when: deploy_web_frontend_sub_mirror_domain | length > 0
+  notify: reload nginx
