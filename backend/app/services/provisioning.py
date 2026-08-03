@@ -4308,6 +4308,12 @@ class ProvisioningOrchestrator:
                     # warm-fast-path: target_node/reuse_uuid is None) тоже получает
                     # диверсный набор. Идемпотентно (см. _maybe_attach_diverse).
                     self._maybe_attach_diverse(subscription, device, subscription.plan, node)
+                    # Раскладка 4×1 — СТРОГО после добора диверса: план строится
+                    # по фактическому набору кредов, и роли надо разносить уже по
+                    # всем нодам, а не по одной. Без этого вызова девайс уезжал с
+                    # 16 опубликованными легами вместо 4 (стена одинаковых строк
+                    # у человека) — ровно то, ради чего делался эпик 4×1.
+                    self._apply_leg_scheme(device)
                     return device, task
                 except Exception:
                     logger.exception("warm-pool wiring failed during reprovision, rolling back")
@@ -4458,6 +4464,14 @@ class ProvisioningOrchestrator:
         # refresh остаются однонодовыми. Идемпотентно.
         if target_node is None and reuse_uuid is None:
             self._maybe_attach_diverse(subscription, device, subscription.plan, node)
+        # Раскладка — БЕЗУСЛОВНО, в отличие от диверса выше. Диверс гейтится,
+        # потому что явная миграция и reality-dest refresh намеренно остаются
+        # однонодовыми; роли же нужны девайсу всегда, и после переезда особенно:
+        # кред на покинутой ноде становится неактивным, и его роль обязана
+        # переехать на живую ноду, иначе строка у человека ведёт в никуда.
+        # Идемпотентно: plan_legs держит текущие пары роль→нода в `preferred`,
+        # так что уже разложенный девайс не перетасовывается.
+        self._apply_leg_scheme(device)
         return device, task
 
     def migrate_subscription_to_new_node(
@@ -4651,6 +4665,11 @@ class ProvisioningOrchestrator:
             self._maybe_attach_diverse(
                 subscription, device, plan, target, extra_exclude=excluded
             )
+            # Ещё раз после ВНЕШНЕГО добора: reprovision выше уже разложил роли,
+            # но тогда диверсных нод ещё не существовало. Повторный вызов
+            # дешёвый и идемпотентный, зато роли расходятся по всему новому
+            # набору, а не жмутся на один primary.
+            self._apply_leg_scheme(device)
             if first_device is None:
                 first_device = device
                 first_task = task
@@ -4868,6 +4887,9 @@ class ProvisioningOrchestrator:
             sub, device, sub.plan, primary, extra_exclude=[node_id]
         )
         self.db.refresh(device)
+        # Ноду только что выпилили: её креды неактивны, и роль, которая на ней
+        # висела, осталась бы опубликованной пустышкой. Перекладываем по живым.
+        self._apply_leg_scheme(device)
         after = {
             c.node_id for c in device.credentials if c.is_active and c.node_id
         }

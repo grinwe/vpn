@@ -353,3 +353,53 @@ def test_duplicate_role_keeps_numbers(monkeypatch):
     labels = [c.uri.split("#", 1)[1] for c in _decrypt_configs(creds, sub=None, device_id=None)]
     assert labels[0] == "⚡ Основной"
     assert sorted(labels[1:]) == ["🚀 Быстрый 2", "🚀 Быстрый 3"]
+
+
+def test_every_diverse_attach_is_followed_by_leg_layout():
+    """Добрал диверсные ноды — разложи роли, иначе девайс уедет со стеной строк.
+
+    Регрессия 2026-08-03: ``_apply_leg_scheme`` звался только из
+    ``provision_subscription``, а ``reprovision_subscription`` (через неё идут
+    «добавить устройство» из кабинета, админ-ручка и все миграции),
+    ``migrate_subscription_to_new_node`` и ``swap_node_out`` его не звали.
+    Устройство получало 16 опубликованных легов вместо 4 — ровно ту стену
+    одинаковых строк, ради устранения которой схема 4×1 и делалась.
+
+    Проверка структурная, а не поведенческая, намеренно: цена бага — не
+    упавший запрос, а тихо разъехавшийся список у человека, и ловить это надо
+    на уровне «в новой ветке забыли вызов». Правило: в каждой функции, которая
+    добирает диверс, обязан быть вызов раскладки НИЖЕ последнего добора —
+    план строится по фактическому набору кредов.
+    """
+    import ast
+    from pathlib import Path
+
+    src = Path(__file__).resolve().parents[1] / "app" / "services" / "provisioning.py"
+    tree = ast.parse(src.read_text(encoding="utf-8"))
+
+    def call_lines(node, name):
+        return [
+            n.lineno
+            for n in ast.walk(node)
+            if isinstance(n, ast.Call)
+            and isinstance(n.func, ast.Attribute)
+            and n.func.attr == name
+        ]
+
+    offenders = []
+    for fn in ast.walk(tree):
+        if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        diverse = call_lines(fn, "_maybe_attach_diverse")
+        if not diverse:
+            continue
+        layout = call_lines(fn, "_apply_leg_scheme") + call_lines(
+            fn, "_apply_leg_scheme_reporting"
+        )
+        if not any(line > max(diverse) for line in layout):
+            offenders.append(f"{fn.name} (строка {max(diverse)})")
+
+    assert not offenders, (
+        "добор диверса без последующей раскладки 4×1: "
+        + ", ".join(offenders)
+    )
