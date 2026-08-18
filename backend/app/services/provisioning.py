@@ -2160,6 +2160,14 @@ class ProvisioningOrchestrator:
 
         # ── Post-provision callback: notify bot ──
         if success and task.action == "apply":
+            # Активация — единственная точка, где cold-креды становятся
+            # видимыми для plan_legs (он скипает is_active=False). Раскладка,
+            # применённая при создании девайса (failover_device, холодный
+            # provision), этих кредов ещё не видела: роль оставалась
+            # незакрытой, а целевая нода — активной-но-скрытой навсегда.
+            # Переприменяем после активации; идемпотентно — текущие пары
+            # роль→нода держатся в preferred, собранный набор не тасуется.
+            self._apply_leg_scheme(device)
             self._notify_bot_config_ready(device)
 
     def _notify_bot_config_ready(self, device: models.Device) -> None:

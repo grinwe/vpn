@@ -403,3 +403,113 @@ def test_every_diverse_attach_is_followed_by_leg_layout():
         "добор диверса без последующей раскладки 4×1: "
         + ", ".join(offenders)
     )
+
+
+def test_cred_activation_is_followed_by_leg_layout():
+    """Активировал креды — переприменяй раскладку 4×1.
+
+    Регрессия 2026-08-19: ``failover_device`` раскладывал роли сразу после
+    reprovision, когда креды целевой ноды ещё ``is_active=False`` (активация
+    происходит только в ``_handle_task_outcome`` после ansible), а
+    ``plan_legs`` неактивные скипает. Итог: роль reserve оставалась
+    незакрытой, целевая нода — активной-но-скрытой навсегда, и никто её
+    больше не переразмещал. Правило: в ``_handle_task_outcome`` ниже
+    последней активации кредов обязан быть вызов раскладки.
+    """
+    import ast
+    from pathlib import Path
+
+    src = Path(__file__).resolve().parents[1] / "app" / "services" / "provisioning.py"
+    tree = ast.parse(src.read_text(encoding="utf-8"))
+
+    fn = next(
+        n
+        for n in ast.walk(tree)
+        if isinstance(n, ast.FunctionDef) and n.name == "_handle_task_outcome"
+    )
+    activations = [
+        n.lineno
+        for n in ast.walk(fn)
+        if isinstance(n, ast.Assign)
+        and any(
+            isinstance(t, ast.Attribute) and t.attr == "is_active" for t in n.targets
+        )
+        and isinstance(n.value, ast.Constant)
+        and n.value.value is True
+    ]
+    assert activations, "активация кредов уехала из _handle_task_outcome — обнови тест"
+    layouts = [
+        n.lineno
+        for n in ast.walk(fn)
+        if isinstance(n, ast.Call)
+        and isinstance(n.func, ast.Attribute)
+        and n.func.attr in ("_apply_leg_scheme", "_apply_leg_scheme_reporting")
+    ]
+    assert any(line > max(activations) for line in layouts), (
+        "_handle_task_outcome активирует креды, но не переприменяет раскладку 4×1"
+    )
+
+
+def test_activation_closes_roles_left_open_by_cold_relocate(db_session, monkeypatch):
+    """Сценарий relocate: три warm-ноды разложены (primary/fast/backup),
+    креды целевой ноды созданы холодными — reserve без ноды. Успешная
+    apply-таска обязана активировать креды И дозакрыть reserve целевой
+    нодой, не тасуя уже собранные пары."""
+    from app.services.provisioning import ProvisioningOrchestrator
+
+    monkeypatch.setenv("SUB_LEG_SCHEME", "4x1")
+    monkeypatch.setattr(
+        ProvisioningOrchestrator,
+        "_notify_bot_config_ready",
+        lambda self, device: None,
+    )
+
+    device = _device_with_creds(
+        db_session, {"a": ALL_PROTOS, "b": ALL_PROTOS, "c": ALL_PROTOS}
+    )
+    plan_before = leg_scheme.apply_leg_scheme(db_session, device, commit=True)
+    assert plan_before is not None and plan_before.missing == ["reserve"]
+    pairs_before = leg_scheme.current_pairs(device)
+
+    target = make_node(db_session, name="leg-node-target", host="203.0.113.90")
+    make_config(db_session, target)
+    for proto in ALL_PROTOS:
+        db_session.add(
+            models.Credential(
+                subscription_id=device.subscription_id,
+                device_id=device.id,
+                node_id=target.id,
+                proto=proto,
+                config_text="enc-stub",
+                access_username=device.access_username,
+                is_active=False,  # cold: активирует только _handle_task_outcome
+            )
+        )
+    db_session.commit()
+
+    orch = ProvisioningOrchestrator(db_session)
+    task = orch.create_task(
+        "device",
+        device.id,
+        "apply",
+        {
+            "node_id": target.id,
+            "protocols": [{"proto": proto} for proto in ALL_PROTOS],
+        },
+    )
+    db_session.commit()
+
+    orch._handle_task_outcome(task, success=True)
+
+    db_session.expire_all()
+    refreshed = db_session.get(models.Device, device.id)
+    target_creds = [c for c in refreshed.credentials if c.node_id == target.id]
+    assert target_creds and all(c.is_active for c in target_creds)
+
+    published = [c for c in refreshed.credentials if c.leg_published]
+    assert len(published) == 4, "после активации набор обязан быть полным"
+    reserve = [c for c in published if c.leg_role == "reserve"]
+    assert reserve and reserve[0].node_id == target.id
+    assert reserve[0].proto == "vless-ws-cdn"
+    # Стабильность: собранные до активации пары не перетасованы.
+    assert pairs_before <= leg_scheme.current_pairs(refreshed)
