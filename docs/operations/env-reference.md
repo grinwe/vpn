@@ -147,7 +147,7 @@
 
 | переменная | default | кто читает | описание |
 |---|---|---|---|
-| `FREEZE_DAYS` | `14` | backend, worker | Сколько дней длится одна заморозка (1 раз в календарный год). `expires_at += FREEZE_DAYS` при freeze. |
+| `FREEZE_DAYS` | `7` | backend, worker | Сколько дней длится одна заморозка (1 раз в календарный год). `expires_at += FREEZE_DAYS` при freeze. |
 | `MIN_TOPUP_KOPECKS` | `10000` | backend, worker | Минимальная сумма пополнения (₽100). Дешевле — `/checkout` 400'ит. |
 | `EXTRA_DEVICE_KOPECKS_PER_MONTH` | `10000` | backend, worker | Надбавка per device/month сверх `plan.max_devices`. |
 | `REFERRAL_BONUS_KOPECKS` | `5000` | backend, worker | Бонус реферреру при первом `kind=topup` реферрала + бонус реферралу при активации trial. |
@@ -304,7 +304,7 @@ Handler `recreate app stack` в `deploy_app_stack` делает это авто�
 - **`RENEWAL_CHECK_INTERVAL` в `.env.example` = 300, в коде default = 3600.** `worker.py` имеет `os.getenv("RENEWAL_CHECK_INTERVAL", "3600")`, а `.env.example` ставит `300`. Разница в 12×. Непонятно, какое считается правильным.
 - **`AUTOSCALE_INTERVAL` default = `0` в коде, `300` в `.env.example`.** `0` означает «отключить полностью». Чистый env без `.env.example` выключит autoscale — это может быть сюрпризом при dev-разворачивании.
 - ✅ **`PROVISIONING_SSH_KEY` теперь обязателен.** Compose использует `${PROVISIONING_SSH_KEY:?...}` — без переменной `docker-compose up` выдаст ошибку, а не сломанный mount.
-- ✅ **`FREEZE_DAYS` — единственный freeze-tunable.** `MAX_FREEZE_DAYS_PER_PERIOD` и `FREEZE_YEAR_BUDGET_DAYS` убраны (были dead code). `FREEZE_DAYS=14` по умолчанию, 1 раз в год.
+- ✅ **`FREEZE_DAYS` — единственный freeze-tunable.** `MAX_FREEZE_DAYS_PER_PERIOD` и `FREEZE_YEAR_BUDGET_DAYS` убраны (были dead code). `FREEZE_DAYS=7` по умолчанию, 1 раз в год.
 - **Нет env для включения/выключения individual-провайдера.** Включение CryptoBot — только `PAYMENT_PROVIDER=cryptobot` или наличие в `PAYMENT_PROVIDERS` списке. Нет способа «оставить rotation, но временно выключить конкретно SBP» без редактирования списка.
 - **`SBP_<SLUG>_*` не валидируются на старте backend'а.** Если `PAYMENT_PROVIDERS=sbp:foo,cryptobot`, но нет `SBP_FOO_HMAC_SECRET` — ошибка всплывёт только в момент первого `/checkout` c этим провайдером. Pre-flight check для SBP не зафиксирован.
 - **`BOT_USERNAME` может быть пустым** — рефералки покажут бесшовный код вместо share-link. Warning'а backend не эмитит.

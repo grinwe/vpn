@@ -140,7 +140,7 @@ services:
       SUB_FILTER_UNHEALTHY_NODES: ${SUB_FILTER_UNHEALTHY_NODES:-1}
       # Stage 4 — balance billing. Backend reads these for the
       # WebApp endpoints (freeze caps, min topup, referral bonus).
-      FREEZE_DAYS: ${FREEZE_DAYS:-14}
+      FREEZE_DAYS: ${FREEZE_DAYS:-7}
       REFERRAL_BONUS_KOPECKS: ${REFERRAL_BONUS_KOPECKS:-5000}
       MIN_TOPUP_KOPECKS: ${MIN_TOPUP_KOPECKS:-10000}
       EXTRA_DEVICE_KOPECKS_PER_MONTH: ${EXTRA_DEVICE_KOPECKS_PER_MONTH:-10000}
@@ -312,7 +312,7 @@ services:
       # auto-unfreezes paused ones whose frozen_until lapsed. Tunables
       # cover the freeze caps, referral bonus and minimum topup.
       BALANCE_CHARGE_INTERVAL: ${BALANCE_CHARGE_INTERVAL:-3600}
-      FREEZE_DAYS: ${FREEZE_DAYS:-14}
+      FREEZE_DAYS: ${FREEZE_DAYS:-7}
       REFERRAL_BONUS_KOPECKS: ${REFERRAL_BONUS_KOPECKS:-5000}
       MIN_TOPUP_KOPECKS: ${MIN_TOPUP_KOPECKS:-10000}
       EXTRA_DEVICE_KOPECKS_PER_MONTH: ${EXTRA_DEVICE_KOPECKS_PER_MONTH:-10000}

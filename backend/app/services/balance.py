@@ -8,7 +8,7 @@ debit another month. If the wallet is short the sub is expired.
 Each mutation is row-locked (``SELECT ... FOR UPDATE``) so concurrent
 topups and charges can never race.
 
-Freeze: 1 per calendar year, ``FREEZE_DAYS`` days (default 14).
+Freeze: 1 per calendar year, ``FREEZE_DAYS`` days (default 7).
 ``expires_at += FREEZE_DAYS`` so the user doesn't lose paid time.
 Devices are revoked on freeze, re-provisioned on unfreeze. Early
 unfreeze is allowed but blocks further freezes until the next calendar
@@ -32,7 +32,7 @@ logger = logging.getLogger(__name__)
 
 # ── Tunables ─────────────────────────────────────────────────────────
 
-FREEZE_DAYS = int(os.getenv("FREEZE_DAYS", "14"))
+FREEZE_DAYS = int(os.getenv("FREEZE_DAYS", "7"))
 REFERRAL_BONUS_KOPECKS = int(os.getenv("REFERRAL_BONUS_KOPECKS", "5000"))
 # Награда рефереру — в ДНЯХ подписки, начисляется когда приглашённый ВПЕРВЫЕ
 # заплатил (см. api/invoices.py).
