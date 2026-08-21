@@ -18,6 +18,7 @@ from typing import Any
 
 from prometheus_client import Counter
 from sqlalchemy import case, func, or_
+from sqlalchemy import text as sql_text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -4986,35 +4987,115 @@ class ProvisioningOrchestrator:
         reuse_uri = device.connection_uri
         reuse_uuid = _device_vless_uuid(device)
 
-        self.revoke_device(
-            device,
-            reason=f"device-failover {old_primary}->{target.id}",
-            background=True,
-        )
-        if reuse_token:
-            self._release_sub_token(device)
-        new_device, task = self.reprovision_subscription(
-            sub,
-            device_name=device.name,
-            target_node=target,
-            reuse_sub_token=reuse_token,
-            reuse_connection_uri=reuse_uri,
-            reuse_uuid=reuse_uuid,
-        )
-        # Перетряхиваем диверс-набор ТОЛЬКО этого device на свежие, исключая
-        # весь битый набор (reprovision с reuse_uuid НЕ дёргает диверс сам).
-        self._maybe_attach_diverse(
-            sub, new_device, plan, target, extra_exclude=list(blocked),
-        )
-        # Схема публикации — ПОСЛЕ диверса, как на холодном пути. Без неё у
-        # нового устройства опубликованы ВСЕ леги (колонка leg_published
-        # дефолтится в true), и человек, нажавший «VPN не работает», получает
-        # в клиенте 16 строк вместо четырёх — то есть чинилка на его глазах
-        # ломает список серверов. Поймано на живом проде 2026-07-29; баг
-        # старше страницы починки — тот же результат давала любая миграция
-        # по жалобе из бота после включения схемы 4×1.
-        self._apply_leg_scheme(new_device)
-        return target, new_device, task, old_primary
+        # Порядок «сначала замена, потом ревок» — намеренно (инцидент
+        # 2026-08-21): прежний код коммитил ревок старого девайса ДО создания
+        # нового, и между этими коммитами у саб-токена не было ни одного
+        # живого девайса — клиент, нажавший «не работает», ловил пустую
+        # выдачу («ошибка конфигурации» в Happ) ровно пока его чинили. Теперь
+        # старый жив и опубликован, пока замена не собрана целиком; бонусом
+        # упавший reprovision больше не оставляет человека вовсе без девайса.
+        #
+        # Гард двойного тапа (ревью 2026-08-21): FOR UPDATE в self_repair
+        # умирает на первом же commit'е внутри failover, а старый девайс
+        # теперь остаётся active до конца сборки — без гарда второй тап
+        # запускал ПАРАЛЛЕЛЬНЫЙ failover, и проигравший токен-своп оставлял
+        # девайса-сироту (его replacement уже закоммичен). Session-level
+        # advisory lock переживает коммиты и умирает вместе с коннектом.
+        got = self.db.execute(
+            sql_text("SELECT pg_try_advisory_lock(4001, :dev)"),
+            {"dev": device.id},
+        ).scalar()
+        if not got:
+            raise RuntimeError(
+                f"failover for device {device.id} is already in progress"
+            )
+        try:
+            # sub_token у нового пока временный: reuse-токен занят старым
+            # (UNIQUE-пара sub_token/client_id_hmac), своп — последним шагом.
+            new_device, task = self.reprovision_subscription(
+                sub,
+                device_name=device.name,
+                target_node=target,
+                reuse_connection_uri=reuse_uri,
+                reuse_uuid=reuse_uuid,
+            )
+            try:
+                # Перетряхиваем диверс-набор ТОЛЬКО этого device на свежие,
+                # исключая весь битый набор (reprovision с reuse_uuid НЕ
+                # дёргает диверс сам).
+                self._maybe_attach_diverse(
+                    sub, new_device, plan, target, extra_exclude=list(blocked),
+                )
+                # Схема публикации — ПОСЛЕ диверса, как на холодном пути.
+                # Без неё у нового устройства опубликованы ВСЕ леги (колонка
+                # leg_published дефолтится в true) — 16 строк вместо четырёх
+                # (поймано на живом проде 2026-07-29).
+                self._apply_leg_scheme(new_device)
+                # Активация при живых легах: sibling-alias отдаёт только
+                # status=active девайсы, а тёплые диверс-креды физически
+                # живы на нодах — активируем сразу, чтобы alias подхватил
+                # замену в момент ревока старого. При СУХОМ warm-пуле
+                # активных легов нет: активацию сделает _handle_task_outcome
+                # после ansible, и остаточное окно (длиной в apply-таску)
+                # признаём — прежний код давал его же плюс пустую БД-сборку.
+                if any(
+                    c.is_active and c.leg_published
+                    for c in new_device.credentials
+                ):
+                    new_device.status = models.DeviceStatus.active
+                    self.db.add(new_device)
+                    self.db.commit()
+            except Exception:
+                # Компенсация сироты: replacement уже закоммичен
+                # reprovision'ом — без ревока он навсегда занял бы слот
+                # лимита плана (старый девайс мы ещё не трогали, юзер
+                # остаётся на нём).
+                self.db.rollback()
+                try:
+                    self.revoke_device(
+                        new_device,
+                        reason="failover compensation: replacement build failed",
+                        background=True,
+                    )
+                except Exception:  # noqa: BLE001
+                    logger.exception(
+                        "failover compensation failed: orphan device %s",
+                        new_device.id,
+                    )
+                raise
+
+            # Замена собрана и опубликована — теперь гасим старый. С этого
+            # commit'а и до токен-свопа старый токен отдаёт набор нового
+            # девайса через sibling-alias (замена уже active, см. выше).
+            self.revoke_device(
+                device,
+                reason=f"device-failover {old_primary}->{target.id}",
+                background=True,
+            )
+            if reuse_token:
+                # Byte-identical ссылки клиента и админки: переносим старый
+                # sub_token на новый девайс. Пара sub_token/client_id_hmac
+                # под UNIQUE — сначала NULL+flush у старого, затем
+                # присвоение. Сбой здесь безопасен: rollback вернёт токен
+                # ревокнутому старому, и alias продолжит вести на замену.
+                self._release_sub_token(device)
+                new_device.sub_token = reuse_token
+                new_device.client_id_hmac = compute_client_id_hmac(reuse_token)
+                self.db.add(new_device)
+                self.db.commit()
+            return target, new_device, task, old_primary
+        finally:
+            try:
+                self.db.rollback()
+                self.db.execute(
+                    sql_text("SELECT pg_advisory_unlock(4001, :dev)"),
+                    {"dev": device.id},
+                )
+                self.db.commit()
+            except Exception:  # noqa: BLE001 — лок умрёт вместе с коннектом
+                logger.exception(
+                    "failover: advisory unlock failed for device %s", device.id
+                )
 
     def revoke_device(
         self, device: models.Device, *, reason: str | None = None, background: bool = True

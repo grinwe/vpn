@@ -530,9 +530,23 @@ def run_lava_reconcile_tick() -> dict:
                     "lava_reconcile: credited invoice %s from lava sale %s (webhook missed)",
                     inv_id, sale.get("contract_id"),
                 )
-            except Exception:  # noqa: BLE001
+            except Exception as exc:  # noqa: BLE001
                 session.rollback()
                 logger.exception("lava_reconcile: failed to credit invoice %s", inv_id)
+                # Тот же алерт (и тот же дедуп-ключ), что у вебхука: деньги
+                # у провайдера есть, зачисление падает каждый тик — без
+                # алерта это невидимо (инцидент 2026-08-21, счёт #65).
+                _notify_admins_safe(
+                    session,
+                    kind="payment_credit_failed",
+                    text=(
+                        f"🔴 Деньги пришли, зачислить НЕ удалось: счёт #{inv_id} "
+                        f"(lava_top reconcile), причина: {repr(exc)[:160]}. "
+                        f"Счёт висит в pending — чинить причину."
+                    ),
+                    dedup_key={"invoice_id": inv_id},
+                    extra={"invoice_id": inv_id, "provider": "lava_top"},
+                )
     finally:
         session.close()
 

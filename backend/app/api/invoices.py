@@ -275,6 +275,26 @@ def _mark_invoice_paid_core(
     subscription: models.Subscription | None = None
     task: models.ProvisioningTask | None = None
     try:
+        # Страховка от гонки «оплатил new_subscription, пока активировался
+        # триал»: к моменту зачисления у юзера уже есть живая подписка этого
+        # плана, и провижининг второй гарантированно упадёт в «Device limit
+        # reached» — так завис счёт #65 (инцидент 2026-08-21): 500 ловили и
+        # вебхук, и reconcile-тик, и ручной mark paid. Проводим как продление
+        # существующей — деньги получены ровно за период этого плана.
+        if (
+            invoice.action == models.InvoiceAction.new_subscription
+            and not invoice.subscription_id
+        ):
+            existing = _active_subscription_for(db, invoice.user_id, invoice.plan_id)
+            if existing is not None:
+                logger.warning(
+                    "invoice %s: new_subscription при живой подписке %s "
+                    "(user %s, plan %s) — проводим как renewal",
+                    invoice.id, existing.id, invoice.user_id, invoice.plan_id,
+                )
+                invoice.action = models.InvoiceAction.renewal
+                invoice.subscription_id = existing.id
+
         if invoice.action == models.InvoiceAction.renewal:
             if not invoice.subscription_id:
                 raise HTTPException(status_code=400, detail="Invoice missing subscription for renewal")
@@ -290,7 +310,53 @@ def _mark_invoice_paid_core(
             # (счётчик информационный, семантика «за период»).
             subscription.traffic_used_bytes = 0
             subscription.status = models.SubscriptionStatus.active
+            # Ревью 2026-08-21: между выставлением счёта и оплатой подписка
+            # могла замёрзнуть/заблокироваться/истечь — прежний код молча
+            # ставил active, оставляя frozen_* поля (auto-unfreeze тик слеп
+            # к active, ручной unfreeze падает на «not frozen») и ноль живых
+            # девайсов (freeze/блокировка/grace-истечение их ревокают).
+            # Деньги приняты — чистим freeze-поля (годовой лимит
+            # has_frozen_this_year не возвращаем) и, если живых девайсов не
+            # осталось, реповижним — зеркально unfreeze_subscription.
+            subscription.frozen_at = None
+            subscription.frozen_until = None
             db.add(subscription)
+            db.flush()
+            has_live_device = any(
+                d.status
+                not in (models.DeviceStatus.revoked, models.DeviceStatus.disabled)
+                for d in subscription.devices
+            )
+            if not has_live_device:
+                from ..services.provisioning import ProvisioningOrchestrator
+
+                try:
+                    ProvisioningOrchestrator(db).reprovision_subscription(subscription)
+                except Exception:  # noqa: BLE001 — оплата важнее провижна
+                    logger.exception(
+                        "renewal invoice %s: reprovision после оплаты не удался — "
+                        "подписка %s активна без девайсов",
+                        invoice.id,
+                        subscription.id,
+                    )
+                    from ..services.admin_notify import notify_admins
+
+                    notify_admins(
+                        db,
+                        kind="renewal_reprovision_failed",
+                        text=(
+                            f"⚠️ Счёт #{invoice.id} оплачен и продлил подписку "
+                            f"{subscription.id}, но выдать девайс не удалось — "
+                            f"подписка активна без единого устройства. Нужен "
+                            f"ручной репровижн."
+                        ),
+                        dedup_key={"subscription_id": subscription.id},
+                        extra={
+                            "invoice_id": invoice.id,
+                            "subscription_id": subscription.id,
+                        },
+                        autocommit=False,
+                    )
             invoice.subscription_id = subscription.id
             credentials = subscription.credentials
         else:
@@ -322,6 +388,28 @@ def _mark_invoice_paid_core(
     return _invoice_with_credentials(invoice, credentials, subscription=subscription, task=task)
 
 
+def _active_subscription_for(
+    db: Session, user_id: int, plan_id: int | None
+) -> models.Subscription | None:
+    """Живая подписка юзера на этот план — цель авто-renewal.
+
+    Только ``active``: продление frozen размораживало бы её силой, а
+    blocked — оживляло бы то, что заблокировали намеренно.
+    """
+    if plan_id is None:
+        return None
+    return (
+        db.query(models.Subscription)
+        .filter(
+            models.Subscription.user_id == user_id,
+            models.Subscription.plan_id == plan_id,
+            models.Subscription.status == models.SubscriptionStatus.active,
+        )
+        .order_by(models.Subscription.id.desc())
+        .first()
+    )
+
+
 @router.post("/invoices", response_model=schemas.InvoiceOut)
 def create_invoice(
     request: Request,
@@ -347,6 +435,22 @@ def create_invoice(
             raise HTTPException(status_code=404, detail="Subscription not found")
         if subscription.user_id != user.id or subscription.plan_id != plan.id:
             raise HTTPException(status_code=400, detail="Subscription does not match invoice data")
+
+    # Бот шлёт new_subscription всегда (дефолт схемы), но «купить» при уже
+    # живой подписке этого плана — всегда продление: вторая подписка упрётся
+    # в per-user лимит девайсов плана при провижининге (инцидент 2026-08-21,
+    # счёт #65). Переключаем прямо на создании, чтобы админка и вебхук видели
+    # правду, а сумма ниже посчиталась ценой продления (со слотами).
+    if action == models.InvoiceAction.new_subscription and subscription is None:
+        existing = _active_subscription_for(db, user.id, plan.id)
+        if existing is not None:
+            logger.info(
+                "create_invoice: new_subscription при живой подписке %s "
+                "(user %s, plan %s) — счёт создаётся как renewal",
+                existing.id, user.id, plan.id,
+            )
+            action = models.InvoiceAction.renewal
+            subscription = existing
     # Сумму диктует СЕРВЕР. body.amount — только с админ-токеном: эндпоинт
     # доступен без него, а _mark_invoice_paid_core сумму с планом не сверяет —
     # клиентский renewal-инвойс на 1 ₽ продлевал бы подписку целиком (дыра из
@@ -367,7 +471,9 @@ def create_invoice(
     invoice = models.Invoice(
         user_id=user.id,
         plan_id=plan.id,
-        subscription_id=body.subscription_id,
+        # Не body.subscription_id: авто-renewal выше мог подставить живую
+        # подписку, которой в body не было.
+        subscription_id=subscription.id if subscription else None,
         amount=amount,
         currency=body.currency,
         action=action,

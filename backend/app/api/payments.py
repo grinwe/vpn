@@ -172,6 +172,44 @@ def checkout_invoice(
     )
 
 
+def _notify_credit_failed(provider_name: str, invoice_id: int, reason: str) -> None:
+    """Деньги пришли (подпись валидна), а зачисление упало — громче некуда.
+
+    Отдельная сессия: рабочая после падения может быть в аборте, а алерт
+    обязан уйти даже когда транзакция зачисления мертва. Дедуп по счёту —
+    провайдер ретраит вебхук каждую минуту, но новость одна.
+    """
+    from ..db import SessionLocal
+    from ..services.admin_notify import notify_admins
+
+    try:
+        session = SessionLocal()
+        try:
+            notify_admins(
+                session,
+                kind="payment_credit_failed",
+                text=(
+                    f"🔴 Деньги пришли, зачислить НЕ удалось: счёт #{invoice_id} "
+                    f"({provider_name}), причина: {reason[:160]}. Счёт висит в "
+                    f"pending — чинить причину, вебхук провайдер поретраит сам."
+                ),
+                dedup_key={"invoice_id": invoice_id},
+                extra={
+                    "invoice_id": invoice_id,
+                    "provider": provider_name,
+                    "reason": reason[:300],
+                },
+                window_sec=3600,
+                autocommit=True,
+            )
+        finally:
+            session.close()
+    except Exception:  # noqa: BLE001 — алерт не должен менять код ответа вебхука
+        logger.exception(
+            "payment_credit_failed: алерт по счёту %s не отправился", invoice_id
+        )
+
+
 @router.post("/payments/webhook/{provider_name}")
 @limiter.limit("30/minute")
 async def payment_webhook(
@@ -401,4 +439,23 @@ async def payment_webhook(
         )
         return {"ok": True, "invoice_id": result.id, "status": result.status}
 
-    return await asyncio.to_thread(_process_paid_event)
+    try:
+        return await asyncio.to_thread(_process_paid_event)
+    except HTTPException as exc:
+        # 4xx — протокольные отказы (не наш счёт, сумма не сошлась: по ним
+        # уже есть свои алерты). 5xx — деньги пришли, зачислить НЕ СМОГЛИ:
+        # провайдер поретраит и бросит, а счёт молча зависнет в pending —
+        # ровно так четыре часа висел #65 (инцидент 2026-08-21).
+        if exc.status_code >= 500:
+            # to_thread: алерт открывает sync-сессию к БД, а падаем мы как
+            # раз когда БД плохо — прямой вызов заморозил бы event loop
+            # (тот же механизм, что #199 выше).
+            await asyncio.to_thread(
+                _notify_credit_failed, provider.name, invoice_id, str(exc.detail)
+            )
+        raise
+    except Exception as exc:  # noqa: BLE001
+        await asyncio.to_thread(
+            _notify_credit_failed, provider.name, invoice_id, repr(exc)
+        )
+        raise
