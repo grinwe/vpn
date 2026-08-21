@@ -759,7 +759,14 @@ async def choose_payment_method(callback_query: types.CallbackQuery):
             text=f"{btn_text} · {_provider_label(provider)}", url=pay_url
         )
     ]
-    link_text = f"Ссылка на оплату ({_provider_label(provider)}):\n{pay_url}"
+    # Сырой pay_url в тексте не показываем: у lava.top он с километровым
+    # paymentParams-блобом и занимает пол-экрана. Прячем в гиперссылку;
+    # html.escape обязателен — в URL есть &, Telegram-HTML разворачивает
+    # entities и внутри href.
+    link_text = (
+        f'Оплатить можно <a href="{html.escape(pay_url, quote=True)}">'
+        f"по этой ссылке</a> ({_provider_label(provider)})."
+    )
 
     msg = callback_query.message
     # Сообщение старше 48ч приходит как InaccessibleMessage (нет
@@ -771,6 +778,7 @@ async def choose_payment_method(callback_query: types.CallbackQuery):
             chat_id=chat_id,
             text=link_text,
             reply_markup=types.InlineKeyboardMarkup(inline_keyboard=[pay_row]),
+            disable_web_page_preview=True,
         )
         await callback_query.answer()
         return
@@ -782,8 +790,13 @@ async def choose_payment_method(callback_query: types.CallbackQuery):
         await msg.edit_reply_markup(reply_markup=keyboard)
     except TelegramBadRequest:
         # message is not modified (повторный тап тем же способом) либо
-        # сообщение слишком старое для edit — шлём ссылку новым сообщением.
-        await msg.answer(link_text)
+        # сообщение слишком старое для edit — шлём ссылку новым сообщением,
+        # с той же кнопкой, что и в edit-пути.
+        await msg.answer(
+            link_text,
+            reply_markup=types.InlineKeyboardMarkup(inline_keyboard=[pay_row]),
+            disable_web_page_preview=True,
+        )
     await callback_query.answer()
 
 
