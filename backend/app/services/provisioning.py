@@ -5092,10 +5092,21 @@ class ProvisioningOrchestrator:
                     {"dev": device.id},
                 )
                 self.db.commit()
-            except Exception:  # noqa: BLE001 — лок умрёт вместе с коннектом
+            except Exception:  # noqa: BLE001
                 logger.exception(
                     "failover: advisory unlock failed for device %s", device.id
                 )
+                # Session-level лок живёт на КОННЕКТЕ, а коннект после
+                # session.close() возвращается в пул живым — неотпущенный лок
+                # заклинил бы failover этого девайса до пересоздания пула.
+                # Рвём коннект принудительно: с ним умирает и лок.
+                try:
+                    self.db.invalidate()
+                except Exception:  # noqa: BLE001
+                    logger.exception(
+                        "failover: connection invalidate failed for device %s",
+                        device.id,
+                    )
 
     def revoke_device(
         self, device: models.Device, *, reason: str | None = None, background: bool = True

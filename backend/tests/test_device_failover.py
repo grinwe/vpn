@@ -125,7 +125,20 @@ def test_failover_applies_leg_scheme_to_the_new_device(
 
 
 def _failover_fixture(db_session, monkeypatch, suffix: str):
-    """Общий сетап: битый девайс с токеном + свежая нода + оркестратор."""
+    """Общий сетап: битый девайс с токеном + свежая нода + оркестратор.
+
+    Advisory-локи failover'а — session-level и живут на коннекте; коннект
+    после close() возвращается в пул живым, а TRUNCATE RESTART IDENTITY
+    делает device.id одинаковыми между тестами — залипший лок соседнего
+    теста ловил бы ложный «already in progress». Рвём пул целиком.
+    """
+    from sqlalchemy import text as sql_text
+
+    from app.db import engine
+
+    engine.dispose()  # idle-коннекты пула (чужие залипшие локи)
+    db_session.execute(sql_text("SELECT pg_advisory_unlock_all()"))
+    db_session.commit()  # свой checked-out коннект
     plan = make_plan(db_session, name=f"fd-{suffix}-plan")
     user = make_user(db_session, telegram_id=f"fd-{suffix}")
     node = make_node(db_session, name=f"fd-{suffix}-a", region="ru", host="10.0.2.1")
