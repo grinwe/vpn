@@ -81,7 +81,9 @@ _MENU_TEXTS = frozenset(
 )
 
 
-@support_router.message(StateFilter(SupportStates.waiting_user_message))
+@support_router.message(
+    StateFilter(SupportStates.waiting_user_message), ~F.successful_payment
+)
 async def forward_to_admin(message: types.Message, state: FSMContext):
     # Команды и кнопки меню — не текст обращения: раньше «🏠 Главное меню»
     # или /plans, нажатые в диалоге поддержки, улетали админу как тикет
@@ -169,7 +171,9 @@ async def cancel_admin_reply(message: types.Message, state: FSMContext):
     await message.answer("Ответ отменён.")
 
 
-@support_router.message(StateFilter(SupportStates.admin_replying))
+@support_router.message(
+    StateFilter(SupportStates.admin_replying), ~F.successful_payment
+)
 async def relay_admin_reply(message: types.Message, state: FSMContext):
     data = await state.get_data()
     target_user_id = data.get("target_user_id")

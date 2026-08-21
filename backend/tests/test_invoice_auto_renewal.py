@@ -18,9 +18,23 @@ from __future__ import annotations
 
 from datetime import timedelta
 
+import pytest
+
 from app import models
+from app.services import provisioning_throttle
 
 from .factories import make_config, make_node, make_plan, make_subscription, make_user
+
+
+@pytest.fixture(autouse=True)
+def _reset_cold_throttle():
+    """Cold-path троттл — глобальный in-memory bucket на процесс: наши
+    провижининги съедали бюджет соседних файлов (порядок-зависимые
+    падения вебхук-тестов)."""
+    provisioning_throttle.reset_for_tests()
+    yield
+    provisioning_throttle.reset_for_tests()
+
 
 
 def _setup(db):

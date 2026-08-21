@@ -1462,6 +1462,12 @@ def dynamic_sub_link(
 
 class AutoRenewRequest(BaseModel):
     auto_renew: bool
+    # Владелец-инициатор (бот передаёт telegram_id тапнувшего). Задан →
+    # подписка обязана принадлежать ему: callback_data в Telegram
+    # подделываема, и «auto_renew:{чужой id}:off» без сверки гасил бы
+    # автопродление любой подписки (ревью 2026-08-21, IDOR). Не задан
+    # (админка) — поведение прежнее.
+    telegram_id: str | None = None
 
 
 @ext_router.post("/subscriptions/{subscription_id}/auto_renew")
@@ -1474,6 +1480,11 @@ def toggle_auto_renew(
     sub = db.get(models.Subscription, subscription_id)
     if not sub:
         raise HTTPException(status_code=404, detail="Subscription not found")
+    if body.telegram_id is not None:
+        owner_tg = sub.user.telegram_id if sub.user else None
+        if owner_tg != str(body.telegram_id):
+            # 404, не 403: не подтверждаем существование чужой подписки.
+            raise HTTPException(status_code=404, detail="Subscription not found")
     sub.auto_renew = body.auto_renew
     db.add(sub)
     db.commit()
@@ -1908,7 +1919,10 @@ def activate_trial(
     request: Request,
     body: TrialActivateRequest,
     db: Session = Depends(get_db),
-    admin_token: str | None = Depends(optional_admin),
+    # require, не optional: без токена эндпоинт позволял снаружи сжечь
+    # ЧУЖОЙ одноразовый триал по telegram_id (ревью 2026-08-21). Зовут его
+    # только бот и админка — оба с admin-заголовками.
+    admin_token: str = Depends(require_admin),
 ):
     """Grant the one-time trial bonus to a user identified by telegram_id.
 
@@ -1936,6 +1950,127 @@ def activate_trial(
         referral_bonus_kopecks=result.referral_bonus_kopecks,
         balance_kopecks=result.balance_kopecks,
         trial_expires_at=result.trial_expires_at.isoformat(),
+    )
+
+
+class TrialActivateFullResponse(BaseModel):
+    subscription_id: int
+    plan_name: str
+    expires_at: str
+
+
+@ext_router.post("/trial/activate_full", response_model=TrialActivateFullResponse)
+@limiter.limit("10/minute")
+def activate_trial_full(
+    request: Request,
+    body: TrialActivateRequest,
+    db: Session = Depends(get_db),
+    admin_token: str = Depends(require_admin),
+):
+    """Подарок ЦЕЛИКОМ: бонус на баланс + сразу подписка (бот-путь).
+
+    ЛК делает это двумя шагами (activateTrial → activateSubscription
+    самого дешёвого месячного, см. Home.tsx: «иначе большинство
+    застревает на бонусе»). Бот шагов не имеет и без этого эндпоинта
+    выдавал бы деньги вместо VPN — ровно воронка-ловушка из анализа
+    2026-07 (ревью 2026-08-21, critical).
+
+    Идемпотентность по бонусу: если триал уже был активирован, но живой
+    подписки нет и на балансе хватает — доделываем второй шаг. Это
+    заодно чинит юзеров, застрявших на бонусе исторически.
+    """
+    from .services import balance as balance_svc
+    from .services import trial as trial_svc
+    from .services.provisioning import ProvisioningOrchestrator
+
+    user = db.query(models.User).filter_by(telegram_id=body.telegram_id).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    # Шаг 1 — бонус. «Уже активирован» здесь не ошибка: шаг 2 может быть
+    # ещё не сделан (застрял на бонусе) — 409 отдадим ниже, только если
+    # жива и подписка.
+    try:
+        trial_svc.activate_trial(db, user.id)
+    except trial_svc.TrialAlreadyActivated:
+        pass
+    except trial_svc.NoTrialPlan:
+        raise HTTPException(status_code=503, detail="No trial plan configured")
+
+    # Гонка двойного тапа: FOR UPDATE на юзере до проверки подписок,
+    # как в webapp_activate.
+    db.refresh(user, with_for_update=True)
+    live = (
+        db.query(models.Subscription)
+        .filter(
+            models.Subscription.user_id == user.id,
+            models.Subscription.status.in_(
+                [
+                    models.SubscriptionStatus.active,
+                    models.SubscriptionStatus.frozen,
+                ]
+            ),
+        )
+        .first()
+    )
+    if live is not None:
+        raise HTTPException(
+            status_code=409, detail="User already has a live subscription"
+        )
+
+    plan = (
+        db.query(models.Plan)
+        .filter(
+            models.Plan.is_visible.is_(True),
+            models.Plan.duration_days < 365,
+        )
+        .order_by(models.Plan.price.asc())
+        .first()
+    )
+    if plan is None:
+        raise HTTPException(status_code=503, detail="No trial plan configured")
+
+    from .services.provisioning_throttle import ColdPathThrottled
+
+    orchestrator = ProvisioningOrchestrator(db)
+    try:
+        sub, _task = orchestrator.provision_subscription(user, plan)
+    except ColdPathThrottled as exc:
+        # Наплыв триальщиков мимо warm-пула: честный 503 с Retry-After
+        # вместо 500 — бот скажет «попробуй через минуту».
+        raise HTTPException(
+            status_code=503,
+            detail="provisioning is busy, retry later",
+            headers={"Retry-After": str(exc.retry_after_seconds)},
+        )
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+    try:
+        balance_svc.activate_subscription(
+            db, user.id, sub, reference=f"trial-full:{sub.id}"
+        )
+    except ValueError as exc:
+        # Бонуса не хватило на план (или его уже потратили) — подписку,
+        # только что запровижененную, гасим, деньги не трогаем.
+        db.rollback()
+        sub.status = models.SubscriptionStatus.expired
+        db.add(sub)
+        db.commit()
+        raise HTTPException(status_code=402, detail=str(exc))
+
+    db.commit()
+    db.refresh(sub)
+    from .api._common import _audit
+
+    _audit(
+        db, f"user:{user.id}", "trial_activated_full", "subscription", sub.id,
+        metadata={"plan_id": plan.id},
+        actor_type=models.AuditActor.user,
+    )
+    return TrialActivateFullResponse(
+        subscription_id=sub.id,
+        plan_name=plan.name,
+        expires_at=sub.expires_at.isoformat(),
     )
 
 

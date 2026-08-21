@@ -669,10 +669,14 @@ async def trial_activate_cb(callback_query: types.CallbackQuery):
     )
     bot = callback_query.bot
 
+    # activate_full = бонус + сразу подписка одним вызовом. Одношаговый
+    # /api/trial/activate давал только деньги на баланс, а потратить их в
+    # боте нечем — юзер застревал на бонусе с ложным обещанием ссылки
+    # (ревью 2026-08-21, critical; та же воронка-ловушка из анализа 2026-07).
     try:
         status_code, data = await _fetch_json(
             "POST",
-            f"{BACKEND_URL}/api/trial/activate",
+            f"{BACKEND_URL}/api/trial/activate_full",
             json={"telegram_id": str(uid)},
             headers=_admin_headers(uid),
         )
@@ -681,7 +685,7 @@ async def trial_activate_cb(callback_query: types.CallbackQuery):
 
     if status_code == 200:
         expires = ""
-        raw = (data or {}).get("trial_expires_at")
+        raw = (data or {}).get("expires_at")
         if raw:
             try:
                 from datetime import datetime as _dt
@@ -697,21 +701,41 @@ async def trial_activate_cb(callback_query: types.CallbackQuery):
             "и обнови подписку в приложении.",
         )
         # Ссылку выдаёт тот же код, что /config: единая точка правды.
+        # message может быть InaccessibleMessage (>48ч) — путь через
+        # bot/chat_id, иначе обещание ссылки обрывалось бы молча.
         if isinstance(callback_query.message, types.Message):
             await cmd_config(callback_query.message, user_id=uid)
+        else:
+            await cmd_config(None, user_id=uid, bot=bot, chat_id=chat_id)
         return
     if status_code == 409:
         await bot.send_message(
-            chat_id, "Подарок уже был использован 😉 Выбери тариф:"
+            chat_id,
+            "Подарок уже был использован, либо у тебя уже есть активная "
+            "подписка 😉 Ссылка для подключения: /config. Тарифы:",
         )
         if isinstance(callback_query.message, types.Message):
             await list_plans(callback_query.message, user_id=uid)
         else:
             await list_plans(None, user_id=uid, bot=bot, chat_id=chat_id)
         return
+    if status_code == 402:
+        await bot.send_message(
+            chat_id,
+            "Бонус уже потрачен, активировать месяц с него не получилось. "
+            "Выбери тариф: /plans, или загляни в баланс: /balance.",
+        )
+        return
     if status_code == 404:
         await bot.send_message(
             chat_id, "Не нашёл твой аккаунт. Нажми /start и попробуй ещё раз."
+        )
+        return
+    if status_code == 503:
+        await bot.send_message(
+            chat_id,
+            "Сейчас большой наплыв — попробуй через пару минут, подарок "
+            "никуда не денется 😊",
         )
         return
     await bot.send_message(
@@ -971,8 +995,26 @@ async def _stars_successful_payment(message: types.Message) -> None:
 
 @router.message(F.text == "Мой конфиг")
 @router.message(Command("config"))
-async def cmd_config(message: types.Message, user_id: int | None = None):
+async def cmd_config(
+    message: types.Message | None,
+    user_id: int | None = None,
+    *,
+    bot: "types.Bot | None" = None,
+    chat_id: int | None = None,
+):
+    """Ссылка подписки. ``bot``/``chat_id`` — путь для callback'ов на
+    сообщениях старше 48ч (InaccessibleMessage без ``.answer``)."""
+    if message is not None:
+        bot = message.bot
+        chat_id = message.chat.id
     uid = user_id if user_id is not None else message.from_user.id
+
+    async def _say(text: str, **kwargs):
+        if message is not None:
+            await _say(text, **kwargs)
+        else:
+            await bot.send_message(chat_id, text, **kwargs)
+
     try:
         status_code, data = await _fetch_json(
             "GET",
@@ -983,13 +1025,13 @@ async def cmd_config(message: types.Message, user_id: int | None = None):
         # Не путаем это с «нет подписок»: иначе во время деплоя платящий юзер
         # видит ложное «у тебя нет подписок».
         if status_code == 0:
-            await message.answer("Сервис временно недоступен. Попробуй позже.")
+            await _say("Сервис временно недоступен. Попробуй позже.")
             return
         if status_code != 200:
-            await message.answer("У тебя пока нет активных подписок. Используй /plans для покупки.")
+            await _say("У тебя пока нет активных подписок. Используй /plans для покупки.")
             return
     except aiohttp.ClientError:
-        await message.answer("Бэкенд недоступен. Попробуйте позже.")
+        await _say("Бэкенд недоступен. Попробуйте позже.")
         return
 
     # Find the latest active subscription with active credentials
@@ -1005,11 +1047,11 @@ async def cmd_config(message: types.Message, user_id: int | None = None):
             if sub.get("devices"):
                 for dev in sub["devices"]:
                     if dev.get("status") == "pending":
-                        await message.answer(
+                        await _say(
                             "⏳ Твой конфиг ещё создаётся. Подожди минуту и попробуй снова."
                         )
                         return
-        await message.answer("У тебя нет активных подписок с готовыми конфигами. Используй /plans.")
+        await _say("У тебя нет активных подписок с готовыми конфигами. Используй /plans.")
         return
 
     # /config отдаёт ОДНУ подписочную ссылку, а не список vless://.
@@ -1026,12 +1068,12 @@ async def cmd_config(message: types.Message, user_id: int | None = None):
             "cmd_config: no sub_url for user %s (SUB_LINK_BASE_URL + WEBAPP_BASE_URL оба пусты)",
             uid,
         )
-        await message.answer(
+        await _say(
             "Не удалось собрать ссылку подписки. Напиши в поддержку."
         )
         return
 
-    await message.answer(
+    await _say(
         "🔗 <b>Твоя ссылка подписки</b>\n"
         "Импортируй её в VPN-клиент (Hiddify / V2rayNG / Streisand) один раз — "
         "при смене сервера клиент сам подтянет новые настройки по этой ссылке.\n\n"
@@ -1040,7 +1082,7 @@ async def cmd_config(message: types.Message, user_id: int | None = None):
         reply_markup=onboarding_keyboard(),
         parse_mode="HTML",
     )
-    await message.answer(
+    await _say(
         f"<code>{sub_url}</code>",
         parse_mode="HTML",
         disable_web_page_preview=True,
@@ -1229,7 +1271,12 @@ async def toggle_auto_renew(callback_query: types.CallbackQuery):
         status_code, _ = await _fetch_json(
             "POST",
             f"{BACKEND_URL}/api/subscriptions/{sub_id}/auto_renew",
-            json={"auto_renew": enable},
+            # telegram_id обязателен: callback_data подделываема, бэкенд
+            # сверяет владельца подписки (ревью 2026-08-21, IDOR).
+            json={
+                "auto_renew": enable,
+                "telegram_id": str(callback_query.from_user.id),
+            },
             headers=_admin_headers(callback_query.from_user.id),
         )
     except aiohttp.ClientError:
