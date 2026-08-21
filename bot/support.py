@@ -75,8 +75,24 @@ async def cancel_user_support(message: types.Message, state: FSMContext):
     await message.answer("Ок, отменил. Если что — снова жми /help.")
 
 
+_MENU_TEXTS = frozenset(
+    {"🏠 Главное меню", "💎 Подписка", "💳 Пополнить", "🤝 Пригласить",
+     "❓ Помощь", "🆘 VPN не работает", "Купить VPN"}
+)
+
+
 @support_router.message(StateFilter(SupportStates.waiting_user_message))
 async def forward_to_admin(message: types.Message, state: FSMContext):
+    # Команды и кнопки меню — не текст обращения: раньше «🏠 Главное меню»
+    # или /plans, нажатые в диалоге поддержки, улетали админу как тикет
+    # (аудит 2026-08-21, тупик №8). Выходим из диалога и просим повторить.
+    text = (message.text or "").strip()
+    if text.startswith("/") or text in _MENU_TEXTS:
+        await state.clear()
+        await message.answer(
+            "Ок, вышел из диалога поддержки. Повтори действие ещё раз."
+        )
+        return
     if not ADMIN_IDS:
         await state.clear()
         await message.answer("Поддержка временно недоступна.")
@@ -106,19 +122,22 @@ async def forward_to_admin(message: types.Message, state: FSMContext):
         delivered = True
     except Exception:
         logger.exception("support forward failed")
-    finally:
-        await state.clear()
 
     # Подтверждение юзеру привязано к факту доставки контента админу:
     # если контент уже дошёл — не показываем «не получилось», иначе юзер
-    # отправит повторно и создаст дубль у админа.
+    # отправит повторно и создаст дубль у админа. Стейт чистим ТОЛЬКО при
+    # доставке: раньше он чистился в finally, и «попробуй ещё раз» после
+    # сбоя уходило в пустоту — ни один хэндлер не матчился (аудит
+    # 2026-08-21, тупик №2).
     if delivered:
+        await state.clear()
         await message.answer(
             "✅ Передали админу. Как только ответит — пришлю сюда же."
         )
     else:
         await message.answer(
-            "Не получилось отправить 😔 Попробуй ещё раз через минуту."
+            "Не получилось отправить 😔 Попробуй ещё раз через минуту "
+            "или нажми /cancel."
         )
 
 
@@ -155,7 +174,12 @@ async def relay_admin_reply(message: types.Message, state: FSMContext):
     data = await state.get_data()
     target_user_id = data.get("target_user_id")
     if not target_user_id:
+        # Стейт пережил рестарт наполовину (MemoryStorage) — молчаливый
+        # clear оставлял админа гадать, куда делся его текст.
         await state.clear()
+        await message.answer(
+            "Сессия ответа потеряна. Нажми «✍ Ответить» на запросе ещё раз."
+        )
         return
     try:
         # Сперва гарантированно доставляем сам контент (copy_to
@@ -175,10 +199,12 @@ async def relay_admin_reply(message: types.Message, state: FSMContext):
         return
     except Exception:
         logger.exception("support admin reply failed")
+        # Стейт оставляем живым: «попробуй ещё раз» с очищенным стейтом
+        # отправляло повтор в обычные хэндлеры, а не юзеру.
         await message.answer(
-            "Не удалось доставить (временный сбой). Попробуй ещё раз."
+            "Не удалось доставить (временный сбой). Попробуй ещё раз "
+            "или нажми /cancel."
         )
-        await state.clear()
         return
 
     # Контент доставлен — маркер «от поддержки» опционален; его сбой не

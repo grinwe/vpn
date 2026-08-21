@@ -388,6 +388,59 @@ def _mark_invoice_paid_core(
     return _invoice_with_credentials(invoice, credentials, subscription=subscription, task=task)
 
 
+@router.post("/invoices/topup", response_model=schemas.InvoiceOut)
+def create_topup_invoice(
+    body: schemas.TopupInvoiceCreate,
+    db: Session = Depends(get_db),
+    admin_token: str = Depends(require_admin),
+    admin_actor: str | None = Header(default=None, alias=ADMIN_ACTOR_HEADER),
+):
+    """Счёт на пополнение баланса для бота (аудит 2026-08-21, паритет A).
+
+    Зеркало webapp_topup без initData-аутентификации: бот ходит с
+    admin-токеном и передаёт telegram_id юзера. Сумма всегда в рублях —
+    конвертацию в валюту провайдера делает checkout, как у план-счетов
+    бота. Проведение — штатная topup-ветка ``_mark_invoice_paid_core``
+    (зачисление на баланс + реферальный бонус за первый топап).
+    """
+    from ..services import balance as balance_svc
+
+    user = (
+        db.query(models.User)
+        .filter_by(telegram_id=str(body.telegram_id))
+        .first()
+    )
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    if body.amount_kopecks < balance_svc.MIN_TOPUP_KOPECKS:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Minimum topup is {balance_svc.MIN_TOPUP_KOPECKS // 100} ₽"
+            ),
+        )
+
+    invoice = models.Invoice(
+        user_id=user.id,
+        plan_id=None,
+        amount=body.amount_kopecks / 100,
+        currency="RUB",
+        action=models.InvoiceAction.new_subscription,
+        kind="topup",
+    )
+    db.add(invoice)
+    db.commit()
+    db.refresh(invoice)
+
+    actor, actor_type = _resolve_admin_actor(admin_actor)
+    _audit(
+        db, actor, "invoice_created", "invoice", invoice.id,
+        actor_type=actor_type,
+        metadata={"kind": "topup", "amount_kopecks": body.amount_kopecks},
+    )
+    return invoice
+
+
 def _active_subscription_for(
     db: Session, user_id: int, plan_id: int | None
 ) -> models.Subscription | None:
@@ -451,6 +504,27 @@ def create_invoice(
             )
             action = models.InvoiceAction.renewal
             subscription = existing
+        elif not admin_token:
+            # Покупка ДРУГОГО плана при живой подписке из бота создавала
+            # вторую параллельную подписку с двойным списанием (аудит
+            # 2026-08-21, C1). Смена тарифа с перерасчётом живёт в ЛК;
+            # клиентский путь режем, админский (с токеном) — оставляем.
+            other = (
+                db.query(models.Subscription)
+                .filter(
+                    models.Subscription.user_id == user.id,
+                    models.Subscription.status
+                    == models.SubscriptionStatus.active,
+                    models.Subscription.plan_id != plan.id,
+                )
+                .order_by(models.Subscription.id.desc())
+                .first()
+            )
+            if other is not None:
+                raise HTTPException(
+                    status_code=409,
+                    detail="user already has an active subscription on another plan",
+                )
     # Сумму диктует СЕРВЕР. body.amount — только с админ-токеном: эндпоинт
     # доступен без него, а _mark_invoice_paid_core сумму с планом не сверяет —
     # клиентский renewal-инвойс на 1 ₽ продлевал бы подписку целиком (дыра из

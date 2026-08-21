@@ -535,20 +535,42 @@ async def cmd_start(message: types.Message, state: FSMContext):
 @router.message(F.text == BTN_BUY)
 @router.message(F.text == "Купить VPN")
 @router.message(Command("plans"))
-async def list_plans(message: types.Message):
+async def list_plans(
+    message: types.Message | None,
+    user_id: int | None = None,
+    *,
+    bot: "types.Bot | None" = None,
+    chat_id: int | None = None,
+):
+    """Прайс. ``user_id`` обязателен при вызове из callback'ов: там
+    ``message.from_user`` — сам БОТ, и триал-флаги считались бы по нему —
+    ложный оффер «бесплатный месяц» юзерам с истраченным триалом (аудит
+    2026-08-21, тупик №3). ``bot``/``chat_id`` — путь для сообщений
+    старше 48ч (InaccessibleMessage без ``.answer``)."""
+    if message is not None:
+        bot = message.bot
+        chat_id = message.chat.id
+    uid = user_id if user_id is not None else message.from_user.id
+
+    async def _say(text: str, **kwargs):
+        if message is not None:
+            await message.answer(text, **kwargs)
+        else:
+            await bot.send_message(chat_id, text, **kwargs)
+
     try:
         status, data = await _fetch_json("GET", f"{BACKEND_URL}/api/plans")
     except aiohttp.ClientError:
-        await message.answer("Бэкенд недоступен. Попробуйте позже.")
+        await _say("Бэкенд недоступен. Попробуйте позже.")
         return
 
     if status != 200:
-        await message.answer("Не удалось получить список тарифов. Попробуйте позже.")
+        await _say("Не удалось получить список тарифов. Попробуйте позже.")
         return
 
     plans = [p for p in (data or []) if p.get("is_visible", True)]
     if not plans:
-        await message.answer("Тарифы пока не настроены. Попробуйте позже.")
+        await _say("Тарифы пока не настроены. Попробуйте позже.")
         return
 
     # Group monthly vs yearly so it's obvious there are two billing cycles
@@ -566,7 +588,7 @@ async def list_plans(message: types.Message):
     # нижней клавиатуре, поэтому на прайс попадает половина новичков — и до
     # этого фикса видела просьбу заплатить без единого упоминания подарка,
     # который ей уже пообещали на первом экране.
-    trial_available, _has_devices = await _fetch_user_flags(message.from_user.id)
+    trial_available, _has_devices = await _fetch_user_flags(uid)
 
     lines: list[str] = []
     if trial_available:
@@ -617,15 +639,86 @@ async def list_plans(message: types.Message):
     rows.append(
         [types.InlineKeyboardButton(text="🤔 Какой выбрать?", callback_data="plans:help")]
     )
-    if trial_available and WEBAPP_BASE_URL.startswith("https://"):
+    if trial_available:
         # Кнопка подарка ПЕРВОЙ строкой клавиатуры — иначе оффер остаётся
-        # текстом, а тапабельны только платные варианты.
+        # текстом, а тапабельны только платные варианты. Активация нативная
+        # (trial:activate), а не web_app: ЛК у части юзеров не открывается.
         rows.insert(0, [types.InlineKeyboardButton(
             text="🎁 Забрать бесплатный месяц",
-            web_app=types.WebAppInfo(url=WEBAPP_URL),
+            callback_data="trial:activate",
         )])
     keyboard = types.InlineKeyboardMarkup(inline_keyboard=rows)
-    await message.answer("\n".join(lines), reply_markup=keyboard)
+    await _say("\n".join(lines), reply_markup=keyboard)
+
+
+@router.callback_query(F.data == "trial:activate")
+async def trial_activate_cb(callback_query: types.CallbackQuery):
+    """Нативная активация бесплатного месяца прямо в боте.
+
+    Раньше единственным путём была web_app-кнопка на ЛК — а ЛК у части
+    юзеров не открывается, и обещанный «месяц одним тапом» был
+    недостижим (аудит 2026-08-21, паритет A, критично). Эндпоинт
+    /api/trial/activate — тот же сервис, что у ЛК, дрейфа нет.
+    """
+    await callback_query.answer()
+    uid = callback_query.from_user.id
+    chat_id = (
+        callback_query.message.chat.id
+        if isinstance(callback_query.message, types.Message)
+        else uid
+    )
+    bot = callback_query.bot
+
+    try:
+        status_code, data = await _fetch_json(
+            "POST",
+            f"{BACKEND_URL}/api/trial/activate",
+            json={"telegram_id": str(uid)},
+            headers=_admin_headers(uid),
+        )
+    except aiohttp.ClientError:
+        status_code, data = 0, None
+
+    if status_code == 200:
+        expires = ""
+        raw = (data or {}).get("trial_expires_at")
+        if raw:
+            try:
+                from datetime import datetime as _dt
+
+                expires = " до " + _dt.fromisoformat(raw).strftime("%d.%m.%Y")
+            except (ValueError, TypeError):
+                expires = ""
+        await bot.send_message(
+            chat_id,
+            f"🎉 Готово! Бесплатный месяц активирован{expires}.\n"
+            "Сейчас пришлю ссылку для подключения. Конфиг может собираться "
+            "около минуты, если ссылка не заработает сразу, подожди чуть-чуть "
+            "и обнови подписку в приложении.",
+        )
+        # Ссылку выдаёт тот же код, что /config: единая точка правды.
+        if isinstance(callback_query.message, types.Message):
+            await cmd_config(callback_query.message, user_id=uid)
+        return
+    if status_code == 409:
+        await bot.send_message(
+            chat_id, "Подарок уже был использован 😉 Выбери тариф:"
+        )
+        if isinstance(callback_query.message, types.Message):
+            await list_plans(callback_query.message, user_id=uid)
+        else:
+            await list_plans(None, user_id=uid, bot=bot, chat_id=chat_id)
+        return
+    if status_code == 404:
+        await bot.send_message(
+            chat_id, "Не нашёл твой аккаунт. Нажми /start и попробуй ещё раз."
+        )
+        return
+    await bot.send_message(
+        chat_id,
+        "Не получилось активировать подарок 😔 Попробуй позже или напиши в "
+        "поддержку: /help.",
+    )
 
 
 @router.callback_query(F.data == "plans:help")
@@ -660,6 +753,19 @@ async def create_invoice(callback_query: types.CallbackQuery):
         await callback_query.answer("Бэкенд недоступен", show_alert=True)
         return
 
+    if status == 409:
+        # Живая подписка другого плана: раньше создавалась ВТОРАЯ
+        # параллельная с двойным списанием (аудит 2026-08-21, C1).
+        await callback_query.answer()
+        msg = callback_query.message
+        if isinstance(msg, types.Message):
+            await msg.answer(
+                "У тебя уже есть активная подписка на другой тариф.\n"
+                "Продлить её: /renew\n"
+                "Сменить тариф с перерасчётом можно в личном кабинете, либо "
+                "напиши в поддержку (/help) и мы поменяем вручную."
+            )
+        return
     if status != 200:
         await callback_query.answer("Ошибка при создании счета", show_alert=True)
         return
@@ -865,12 +971,13 @@ async def _stars_successful_payment(message: types.Message) -> None:
 
 @router.message(F.text == "Мой конфиг")
 @router.message(Command("config"))
-async def cmd_config(message: types.Message):
+async def cmd_config(message: types.Message, user_id: int | None = None):
+    uid = user_id if user_id is not None else message.from_user.id
     try:
         status_code, data = await _fetch_json(
             "GET",
-            f"{BACKEND_URL}/api/users/by_telegram/{message.from_user.id}",
-            headers=_admin_headers(message.from_user.id),
+            f"{BACKEND_URL}/api/users/by_telegram/{uid}",
+            headers=_admin_headers(uid),
         )
         # status_code==0 → бэкенд недоступен (_fetch_json уже съел ClientError).
         # Не путаем это с «нет подписок»: иначе во время деплоя платящий юзер
@@ -917,7 +1024,7 @@ async def cmd_config(message: types.Message):
         # Такое случается только в dev-окружении без WEBAPP_BASE_URL.
         logger.warning(
             "cmd_config: no sub_url for user %s (SUB_LINK_BASE_URL + WEBAPP_BASE_URL оба пусты)",
-            message.from_user.id,
+            uid,
         )
         await message.answer(
             "Не удалось собрать ссылку подписки. Напиши в поддержку."
@@ -1089,7 +1196,7 @@ async def cmd_renew(message: types.Message):
             [types.InlineKeyboardButton(text="Оплатить продление", url=pay_url)],
             [types.InlineKeyboardButton(
                 text="Включить автопродление",
-                callback_data=f"auto_renew:{sub['id']}",
+                callback_data=f"auto_renew:{sub['id']}:on",
             )],
         ]
     )
@@ -1103,23 +1210,66 @@ async def cmd_renew(message: types.Message):
 
 @router.callback_query(F.data.startswith("auto_renew:"))
 async def toggle_auto_renew(callback_query: types.CallbackQuery):
-    sub_id = int(callback_query.data.split(":", maxsplit=1)[1])
+    """Тумблер автопродления в ОБЕ стороны.
+
+    Раньше значение было прошито в True — «включить легко, выключить
+    нельзя»: остановить списания можно было только через поддержку
+    (аудит 2026-08-21, паритет A, высокий). Старые сообщения со старым
+    форматом callback_data (без :on/:off) трактуем как включение.
+    """
+    parts = callback_query.data.split(":")
+    try:
+        sub_id = int(parts[1])
+    except (ValueError, IndexError):
+        await callback_query.answer("Некорректный запрос", show_alert=True)
+        return
+    enable = len(parts) < 3 or parts[2] != "off"
+
     try:
         status_code, _ = await _fetch_json(
             "POST",
             f"{BACKEND_URL}/api/subscriptions/{sub_id}/auto_renew",
-            json={"auto_renew": True},
+            json={"auto_renew": enable},
             headers=_admin_headers(callback_query.from_user.id),
         )
     except aiohttp.ClientError:
         await callback_query.answer("Бэкенд недоступен", show_alert=True)
         return
 
-    if status_code == 200:
+    if status_code != 200:
+        await callback_query.answer(
+            "Не удалось изменить автопродление", show_alert=True
+        )
+        return
+
+    msg = callback_query.message
+    if enable:
         await callback_query.answer("Автопродление включено!")
-        await callback_query.message.answer("✅ Автопродление включено. Счет будет создан за 3 дня до истечения.")
+        if isinstance(msg, types.Message):
+            await msg.answer(
+                "✅ Автопродление включено. Счёт будет создан за 3 дня до "
+                "истечения. Передумаешь — выключи кнопкой ниже.",
+                reply_markup=types.InlineKeyboardMarkup(inline_keyboard=[[
+                    types.InlineKeyboardButton(
+                        text="Выключить автопродление",
+                        callback_data=f"auto_renew:{sub_id}:off",
+                    )
+                ]]),
+            )
     else:
-        await callback_query.answer("Не удалось включить автопродление", show_alert=True)
+        await callback_query.answer("Автопродление выключено")
+        if isinstance(msg, types.Message):
+            await msg.answer(
+                "☑️ Автопродление выключено: списаний больше не будет, "
+                "подписка доработает оплаченный срок. Включить обратно "
+                "можно кнопкой ниже.",
+                reply_markup=types.InlineKeyboardMarkup(inline_keyboard=[[
+                    types.InlineKeyboardButton(
+                        text="Включить автопродление",
+                        callback_data=f"auto_renew:{sub_id}:on",
+                    )
+                ]]),
+            )
 
 
 # ── Phase C: bot health-ping responses ──
@@ -2093,11 +2243,65 @@ async def _send_balance(target: types.Message, telegram_id: int) -> None:
     else:
         lines.append("Нет активных подписок. Нажмите /plans, чтобы выбрать тариф.")
 
+    # Пополнение прямо в боте (аудит 2026-08-21, паритет A, критично):
+    # раньше была только кнопка ЛК, а без баланса мертвы автосписания и
+    # доплаты. Пресеты создают topup-счёт и ведут в обычное меню оплаты.
+    kb_rows = [[
+        types.InlineKeyboardButton(text="➕ 200 ₽", callback_data="topup:20000"),
+        types.InlineKeyboardButton(text="➕ 500 ₽", callback_data="topup:50000"),
+        types.InlineKeyboardButton(text="➕ 1000 ₽", callback_data="topup:100000"),
+    ]]
     webapp_kb = webapp_inline_keyboard()
+    if webapp_kb is not None:
+        kb_rows.extend(webapp_kb.inline_keyboard)
     await target.answer(
         "\n".join(lines),
         parse_mode="HTML",
-        reply_markup=webapp_kb,
+        reply_markup=types.InlineKeyboardMarkup(inline_keyboard=kb_rows),
+    )
+
+
+@router.callback_query(F.data.startswith("topup:"))
+async def topup_preset(callback_query: types.CallbackQuery):
+    """Создать счёт на пополнение и показать меню способов оплаты."""
+    try:
+        amount_kopecks = int(callback_query.data.split(":", 1)[1])
+    except (ValueError, IndexError):
+        await callback_query.answer("Некорректная сумма", show_alert=True)
+        return
+    await callback_query.answer()
+    uid = callback_query.from_user.id
+    chat_id = (
+        callback_query.message.chat.id
+        if isinstance(callback_query.message, types.Message)
+        else uid
+    )
+
+    try:
+        status_code, invoice = await _fetch_json(
+            "POST",
+            f"{BACKEND_URL}/api/invoices/topup",
+            json={"telegram_id": str(uid), "amount_kopecks": amount_kopecks},
+            headers=_admin_headers(uid),
+        )
+    except aiohttp.ClientError:
+        status_code, invoice = 0, None
+
+    if status_code != 200 or not invoice:
+        await callback_query.bot.send_message(
+            chat_id, "Не удалось создать счёт. Попробуй позже."
+        )
+        return
+
+    rub = amount_kopecks // 100
+    await callback_query.bot.send_message(
+        chat_id,
+        f"💳 Пополнение баланса на {rub} ₽ (счёт #{invoice['id']}).\n"
+        "Выбери способ оплаты 👇 Деньги упадут на баланс сразу после "
+        "подтверждения.",
+        reply_markup=types.InlineKeyboardMarkup(
+            inline_keyboard=_payment_method_rows(invoice["id"], "top")
+        ),
     )
 
 
@@ -2513,9 +2717,23 @@ async def go_start(callback_query: types.CallbackQuery):
 
 @router.callback_query(F.data == "go:plans")
 async def go_plans(callback_query: types.CallbackQuery):
-    """Inline shortcut to /plans."""
+    """Inline shortcut to /plans.
+
+    telegram_id инициатора передаём явно: ``message.from_user`` тут — сам
+    бот, и триал-флаги считались бы по нему (ложный оффер подарка). Для
+    сообщений старше 48ч (InaccessibleMessage) шлём прайс новым сообщением.
+    """
     await callback_query.answer()
-    await list_plans(callback_query.message)
+    msg = callback_query.message
+    if isinstance(msg, types.Message):
+        await list_plans(msg, user_id=callback_query.from_user.id)
+    else:
+        await list_plans(
+            None,
+            user_id=callback_query.from_user.id,
+            bot=callback_query.bot,
+            chat_id=callback_query.from_user.id,
+        )
 
 
 @router.callback_query(F.data == "go:topup")
@@ -2922,3 +3140,42 @@ async def ops_exec_go(callback_query: types.CallbackQuery) -> None:
         )
     except TelegramBadRequest:
         await launching.edit_text(_strip_html(_render_ops_exec(result))[:4000])
+
+
+# ── Глобальные страховки диалога (аудит 2026-08-21, тупики №1/№4) ──
+# Регистрируются ПОСЛЕДНИМИ в файле намеренно: aiogram матчит хэндлеры в
+# порядке регистрации, и всё осмысленное должно перехватиться выше.
+
+
+@router.message(Command("cancel"))
+async def cmd_cancel_global(message: types.Message, state: FSMContext):
+    """/cancel вне FSM-стейтов: раньше он молча проглатывался.
+
+    В стейтах поддержки /cancel обрабатывают хэндлеры support_router
+    (он подключён раньше) — сюда доходит только «отменять нечего».
+    """
+    await state.clear()
+    _trial, has_devices = await _fetch_user_flags(message.from_user.id)
+    await message.answer(
+        "Ок, отменил. Выбери действие кнопкой ниже 👇",
+        reply_markup=start_keyboard(has_devices=has_devices),
+    )
+
+
+@router.message()
+async def fallback_unknown(message: types.Message, state: FSMContext):
+    """Catch-all: нераспознанный текст больше не тонет в тишине.
+
+    Главный клиент — юзер, чей диалог поддержки умер вместе с рестартом
+    бота (FSM в MemoryStorage): раньше его сообщение не матчилось НИ
+    ОДНИМ хэндлером, и человек писал в пустоту. Стейт на всякий случай
+    чистим: живой стейт до сюда не доходит (support_router раньше).
+    """
+    await state.clear()
+    _trial, has_devices = await _fetch_user_flags(message.from_user.id)
+    await message.answer(
+        "Не понял 🤔 Выбери действие кнопкой ниже.\n"
+        "Если писал в поддержку и видишь это, нажми «❓ Помощь» и отправь "
+        "сообщение ещё раз.",
+        reply_markup=start_keyboard(has_devices=has_devices),
+    )

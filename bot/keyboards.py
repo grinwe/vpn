@@ -170,17 +170,26 @@ def welcome_action_keyboard(
     """
     rows: list[list[types.InlineKeyboardButton]] = []
     has_webapp = WEBAPP_BASE_URL.startswith("https://")
-    onboarding = trial_available and has_webapp
+    # Подарок больше НЕ зависит от ЛК: активация нативная, прямо в боте
+    # (аудит 2026-08-21, паритет A: web_app-кнопка была единственным путём
+    # к триалу, а ЛК у части юзеров не открывается вовсе).
+    onboarding = trial_available
 
-    if has_webapp:
+    if onboarding:
         rows.append([
             types.InlineKeyboardButton(
                 # Подарок должен быть НАЗВАН на кнопке: раньше он жил одной
                 # строкой в тексте, а кнопка называлась «Открыть личный
                 # кабинет» — связь между офером и действием юзер должен был
                 # додумать сам.
-                text="🎁 Забрать бесплатный месяц" if onboarding
-                else "🔐 Открыть личный кабинет",
+                text="🎁 Забрать бесплатный месяц",
+                callback_data="trial:activate",
+            )
+        ])
+    elif has_webapp:
+        rows.append([
+            types.InlineKeyboardButton(
+                text="🔐 Открыть личный кабинет",
                 web_app=types.WebAppInfo(url=WEBAPP_URL),
             )
         ])

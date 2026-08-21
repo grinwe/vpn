@@ -669,6 +669,13 @@ class InvoiceCreate(BaseModel):
     action: str = "new_subscription"
 
 
+class TopupInvoiceCreate(BaseModel):
+    """Счёт на пополнение баланса из бота (admin-token путь)."""
+
+    telegram_id: str
+    amount_kopecks: int
+
+
 class InvoiceMarkPaidRequest(BaseModel):
     payment_id: int | None = None
 

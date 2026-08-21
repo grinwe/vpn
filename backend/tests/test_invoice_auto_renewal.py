@@ -112,6 +112,72 @@ def test_mark_paid_falls_back_to_renewal_on_race(client, db_session):
     assert subs == 1
 
 
+def test_cross_plan_purchase_is_gated_for_clients(client, db_session):
+    """C1 аудита 2026-08-21: покупка ДРУГОГО плана при живой подписке из
+    бота создавала вторую параллельную подписку с двойным списанием.
+    Клиентский путь (без admin-токена) режем 409; админский оставляем."""
+    import os
+
+    node, plan_a, user = _setup(db_session)
+    plan_b = make_plan(db_session, name="other-plan")
+    make_subscription(db_session, user, plan_a, node)
+
+    body = {
+        "plan_id": plan_b.id,
+        "telegram_id": user.telegram_id,
+        "currency": "RUB",
+        "action": "new_subscription",
+    }
+    # conftest-клиент ходит с админ-токеном по умолчанию — клиентский
+    # (ботовский) путь моделируем, снимая заголовок.
+    resp = client.post(
+        "/api/invoices", json=body, headers={"X-Admin-Token": ""}
+    )
+    assert resp.status_code == 409, resp.text
+
+    resp = client.post(
+        "/api/invoices",
+        json=body,
+        headers={"X-Admin-Token": os.environ["ADMIN_API_TOKEN"]},
+    )
+    assert resp.status_code == 200, resp.text
+
+
+def test_topup_invoice_endpoint(client, db_session):
+    """Паритет A: топап из бота — admin-token эндпоинт, сумма в рублях."""
+    import os
+
+    _node, _plan, user = _setup(db_session)
+    headers = {"X-Admin-Token": os.environ["ADMIN_API_TOKEN"]}
+
+    resp = client.post(
+        "/api/invoices/topup",
+        json={"telegram_id": user.telegram_id, "amount_kopecks": 20000},
+        headers=headers,
+    )
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert data["amount"] == 200.0
+    assert data["currency"] == "RUB"
+
+    # Без admin-токена — закрыто (conftest-клиент шлёт токен по
+    # умолчанию, снимаем заголовок).
+    resp = client.post(
+        "/api/invoices/topup",
+        json={"telegram_id": user.telegram_id, "amount_kopecks": 20000},
+        headers={"X-Admin-Token": ""},
+    )
+    assert resp.status_code in (401, 403), resp.text
+
+    # Меньше минимума — 400.
+    resp = client.post(
+        "/api/invoices/topup",
+        json={"telegram_id": user.telegram_id, "amount_kopecks": 1},
+        headers=headers,
+    )
+    assert resp.status_code == 400, resp.text
+
+
 def test_paid_renewal_unfreezes_and_reprovisions(client, db_session):
     """Ревью 2026-08-21: подписка могла замёрзнуть между выставлением счёта
     и оплатой. Прежний код ставил active, но оставлял frozen_* поля
