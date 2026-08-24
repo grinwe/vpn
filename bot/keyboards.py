@@ -69,6 +69,7 @@ DEFAULT_COMMANDS: list[types.BotCommand] = [
     types.BotCommand(command="plans", description="Тарифы"),
     types.BotCommand(command="balance", description="Баланс и подписки"),
     types.BotCommand(command="config", description="Получить конфиг"),
+    types.BotCommand(command="devices", description="Мои устройства"),
     types.BotCommand(command="referral", description="Пригласить друга"),
     types.BotCommand(command="settings", description="Настройки уведомлений"),
     types.BotCommand(command="help", description="Помощь и поддержка"),

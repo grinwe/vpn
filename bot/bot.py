@@ -7,7 +7,15 @@ from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import ErrorEvent, MenuButtonWebApp, WebAppInfo
 from .config import BOT_TOKEN, BACKEND_URL, ADMIN_API_TOKEN, NOTIFICATION_POLL_INTERVAL, BOT_WEBHOOK_PORT
-from .handlers import close_session, router, get_session, onboarding_keyboard, health_ping_keyboard, node_diagnosis_keyboard
+from .handlers import (
+    close_session,
+    devices_router,
+    get_session,
+    health_ping_keyboard,
+    node_diagnosis_keyboard,
+    onboarding_keyboard,
+    router,
+)
 from .keyboards import DEFAULT_COMMANDS, WEBAPP_URL
 from .middleware import BanGuard
 from .support import support_router
@@ -325,6 +333,10 @@ async def main():
     # handlers router — otherwise admin's typed reply would hit /start
     # or other button handlers before reaching the support relay.
     dp.include_router(support_router)
+    # devices_router — только StateFilter-хэндлеры переименования: должен
+    # стоять ДО главного роутера, иначе его команды/кнопки съедают текст
+    # раньше стейта, оставляя стейт липким (ревью 2026-08-25).
+    dp.include_router(devices_router)
     dp.include_router(router)
     # Глобальный errors-хендлер: ловит всё, что не поймали сами
     # хендлеры (таймауты бэкенда, KeyError на неожиданном JSON и пр.).

@@ -1491,6 +1491,72 @@ def toggle_auto_renew(
     return {"ok": True, "auto_renew": sub.auto_renew}
 
 
+# ── Устройства из бота (паритет с ЛК, аудит 2026-08-21) ────────────
+# Тонкие обёртки над webapp-хэндлерами: это обычные функции, зовём их
+# напрямую с юзером, найденным по telegram_id — логика слотов/402/
+# ownership остаётся в одном месте и не разъезжается.
+
+
+class DeviceByOwnerRequest(BaseModel):
+    telegram_id: str
+
+
+class DeviceRenameByOwnerRequest(BaseModel):
+    telegram_id: str
+    name: str
+
+
+def _user_by_tg_or_404(db: Session, telegram_id: str) -> models.User:
+    user = db.query(models.User).filter_by(telegram_id=str(telegram_id)).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    return user
+
+
+@ext_router.post("/bot/subscriptions/{subscription_id}/add_device")
+def bot_add_device(
+    subscription_id: int,
+    body: DeviceByOwnerRequest,
+    db: Session = Depends(get_db),
+    admin_token: str = Depends(require_admin),
+):
+    from .api_webapp import webapp_add_device
+
+    user = _user_by_tg_or_404(db, body.telegram_id)
+    return webapp_add_device(subscription_id=subscription_id, user=user, db=db)
+
+
+@ext_router.post("/bot/devices/{device_id}/rename")
+def bot_rename_device(
+    device_id: int,
+    body: DeviceRenameByOwnerRequest,
+    db: Session = Depends(get_db),
+    admin_token: str = Depends(require_admin),
+):
+    from .api_webapp import RenameDeviceRequest, webapp_rename_device
+
+    user = _user_by_tg_or_404(db, body.telegram_id)
+    return webapp_rename_device(
+        device_id=device_id,
+        body=RenameDeviceRequest(name=body.name),
+        user=user,
+        db=db,
+    )
+
+
+@ext_router.post("/bot/devices/{device_id}/remove")
+def bot_remove_device(
+    device_id: int,
+    body: DeviceByOwnerRequest,
+    db: Session = Depends(get_db),
+    admin_token: str = Depends(require_admin),
+):
+    from .api_webapp import webapp_remove_device
+
+    user = _user_by_tg_or_404(db, body.telegram_id)
+    return webapp_remove_device(device_id=device_id, user=user, db=db)
+
+
 class UnfreezeByOwnerRequest(BaseModel):
     telegram_id: str
 

@@ -9,8 +9,9 @@ from urllib.parse import urlparse
 import aiohttp
 from aiogram import F, Router, types
 from aiogram.exceptions import TelegramBadRequest
-from aiogram.filters import Command, CommandObject, CommandStart
+from aiogram.filters import Command, CommandObject, CommandStart, StateFilter
 from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
 
 from .config import (
     ADMIN_API_TOKEN,
@@ -3290,6 +3291,278 @@ async def ops_exec_go(callback_query: types.CallbackQuery) -> None:
         )
     except TelegramBadRequest:
         await launching.edit_text(_strip_html(_render_ops_exec(result))[:4000])
+
+
+# ── Устройства (паритет с ЛК, аудит 2026-08-21) ──
+
+# Отдельный роутер ТОЛЬКО для стейт-хэндлеров переименования: он
+# подключается в bot.py ДО главного (как support_router), иначе ранние
+# команды/кнопки главного роутера бьют раньше StateFilter, стейт
+# остаётся липким, и следующий свободный текст молча переименовывает
+# устройство (ревью 2026-08-25).
+devices_router = Router()
+
+
+class DeviceStates(StatesGroup):
+    waiting_rename = State()
+
+
+async def _send_devices(bot: "types.Bot", chat_id: int, uid: int) -> None:
+    """Экран «Мои устройства»: список + переименовать/удалить/добавить."""
+    try:
+        status_code, data = await _fetch_json(
+            "GET",
+            f"{BACKEND_URL}/api/users/by_telegram/{uid}",
+            headers=_admin_headers(uid),
+        )
+    except aiohttp.ClientError:
+        status_code, data = 0, None
+    if status_code == 0:
+        await bot.send_message(chat_id, "Сервис временно недоступен. Попробуй позже.")
+        return
+    if status_code != 200 or not data:
+        await bot.send_message(
+            chat_id,
+            "Подписок пока нет. Выбери тариф: /plans",
+        )
+        return
+
+    sub = next((s for s in data if s.get("status") == "active"), None)
+    if sub is None:
+        await bot.send_message(
+            chat_id, "Нет активной подписки. Статус: /status, тарифы: /plans"
+        )
+        return
+
+    live = [
+        d
+        for d in (sub.get("devices") or [])
+        if d.get("status") not in ("revoked", "disabled")
+    ]
+    esc = html.escape
+    lines = [f"📱 <b>Устройства</b> · план {esc(str(sub.get('plan_name', '')))}\n"]
+    rows: list[list[types.InlineKeyboardButton]] = []
+    for i, d in enumerate(live, 1):
+        name = esc(str(d.get("name") or f"устройство {i}"))
+        lines.append(f"{i}. {name} · {esc(str(d.get('status', '')))}")
+        rows.append([
+            types.InlineKeyboardButton(
+                text=f"✏️ {i}", callback_data=f"devren:{d['id']}"
+            ),
+            types.InlineKeyboardButton(
+                text=f"🗑 {i}", callback_data=f"devrm:{d['id']}"
+            ),
+        ])
+    if not live:
+        lines.append("Живых устройств нет.")
+    lines.append(
+        "\nОдно устройство — одна строка. Ссылка подписки общая: /config"
+    )
+    rows.append([
+        types.InlineKeyboardButton(
+            text="➕ Добавить устройство", callback_data=f"devadd:{sub['id']}"
+        )
+    ])
+    await bot.send_message(
+        chat_id,
+        "\n".join(lines),
+        parse_mode="HTML",
+        reply_markup=types.InlineKeyboardMarkup(inline_keyboard=rows),
+    )
+
+
+@router.message(Command("devices"))
+async def cmd_devices(message: types.Message):
+    await _send_devices(message.bot, message.chat.id, message.from_user.id)
+
+
+@router.callback_query(F.data.startswith("devadd:"))
+async def device_add_cb(callback_query: types.CallbackQuery):
+    try:
+        sub_id = int(callback_query.data.split(":", 1)[1])
+    except (ValueError, IndexError):
+        await callback_query.answer("Некорректный запрос", show_alert=True)
+        return
+    await callback_query.answer()
+    uid = callback_query.from_user.id
+    chat_id = (
+        callback_query.message.chat.id
+        if isinstance(callback_query.message, types.Message)
+        else uid
+    )
+    try:
+        status_code, data = await _fetch_json(
+            "POST",
+            f"{BACKEND_URL}/api/bot/subscriptions/{sub_id}/add_device",
+            json={"telegram_id": str(uid)},
+            headers=_admin_headers(uid),
+        )
+    except aiohttp.ClientError:
+        status_code, data = 0, None
+
+    if status_code == 200 and isinstance(data, dict):
+        charged = int(data.get("charged_kopecks") or 0)
+        fee_note = (
+            f" Списано {charged // 100} ₽ за дополнительный слот." if charged else ""
+        )
+        await callback_query.bot.send_message(
+            chat_id,
+            f"✅ Устройство добавлено (всего {data.get('device_count')})."
+            f"{fee_note}\nИмпортни ту же ссылку на новом устройстве: /config",
+        )
+        await _send_devices(callback_query.bot, chat_id, uid)
+        return
+    if status_code == 402:
+        detail = (data or {}).get("detail") or {}
+        hint = detail.get("hint") if isinstance(detail, dict) else None
+        need = (
+            int(detail.get("suggested_topup_kopecks") or 0) // 100
+            if isinstance(detail, dict)
+            else 0
+        )
+        await callback_query.bot.send_message(
+            chat_id,
+            (hint or "Не хватает баланса на дополнительное устройство.")
+            + (f"\nПополнить на {need} ₽ можно тут: /balance" if need else "\nПополнить: /balance"),
+        )
+        return
+    detail = (data or {}).get("detail") if isinstance(data, dict) else None
+    await callback_query.bot.send_message(
+        chat_id,
+        f"Не получилось добавить: {html.escape(str(detail))}"
+        if detail
+        else "Не получилось добавить устройство. Попробуй позже.",
+    )
+
+
+@router.callback_query(F.data.startswith("devrm:"))
+async def device_remove_confirm(callback_query: types.CallbackQuery):
+    try:
+        dev_id = int(callback_query.data.split(":", 1)[1])
+    except (ValueError, IndexError):
+        await callback_query.answer("Некорректный запрос", show_alert=True)
+        return
+    await callback_query.answer()
+    msg = callback_query.message
+    if isinstance(msg, types.Message):
+        await msg.answer(
+            "Удалить это устройство? VPN на нём отключится.",
+            reply_markup=types.InlineKeyboardMarkup(inline_keyboard=[[
+                types.InlineKeyboardButton(
+                    text="✅ Да, удалить", callback_data=f"devrmok:{dev_id}"
+                ),
+                types.InlineKeyboardButton(
+                    text="✖️ Отмена", callback_data="devcancel"
+                ),
+            ]]),
+        )
+
+
+@router.callback_query(F.data == "devcancel")
+async def device_cancel_cb(callback_query: types.CallbackQuery):
+    await callback_query.answer("Ок, не трогаю")
+    msg = callback_query.message
+    if isinstance(msg, types.Message):
+        try:
+            await msg.edit_reply_markup(reply_markup=None)
+        except TelegramBadRequest:
+            pass
+
+
+@router.callback_query(F.data.startswith("devrmok:"))
+async def device_remove_cb(callback_query: types.CallbackQuery):
+    try:
+        dev_id = int(callback_query.data.split(":", 1)[1])
+    except (ValueError, IndexError):
+        await callback_query.answer("Некорректный запрос", show_alert=True)
+        return
+    await callback_query.answer()
+    uid = callback_query.from_user.id
+    chat_id = (
+        callback_query.message.chat.id
+        if isinstance(callback_query.message, types.Message)
+        else uid
+    )
+    try:
+        status_code, data = await _fetch_json(
+            "POST",
+            f"{BACKEND_URL}/api/bot/devices/{dev_id}/remove",
+            json={"telegram_id": str(uid)},
+            headers=_admin_headers(uid),
+        )
+    except aiohttp.ClientError:
+        status_code, data = 0, None
+
+    if status_code == 200:
+        await callback_query.bot.send_message(chat_id, "🗑 Устройство удалено.")
+        await _send_devices(callback_query.bot, chat_id, uid)
+        return
+    detail = (data or {}).get("detail") if isinstance(data, dict) else None
+    await callback_query.bot.send_message(
+        chat_id,
+        f"Не получилось удалить: {html.escape(str(detail))}"
+        if detail
+        else "Не получилось удалить устройство. Попробуй позже.",
+    )
+
+
+@router.callback_query(F.data.startswith("devren:"))
+async def device_rename_start(callback_query: types.CallbackQuery, state: FSMContext):
+    try:
+        dev_id = int(callback_query.data.split(":", 1)[1])
+    except (ValueError, IndexError):
+        await callback_query.answer("Некорректный запрос", show_alert=True)
+        return
+    await callback_query.answer()
+    await state.set_state(DeviceStates.waiting_rename)
+    await state.update_data(rename_device_id=dev_id)
+    msg = callback_query.message
+    target_chat = (
+        msg.chat.id if isinstance(msg, types.Message) else callback_query.from_user.id
+    )
+    await callback_query.bot.send_message(
+        target_chat,
+        "Введи новое имя устройства (до 64 символов).\nОтменить: /cancel",
+    )
+
+
+@devices_router.message(StateFilter(DeviceStates.waiting_rename), Command("cancel"))
+async def device_rename_cancel(message: types.Message, state: FSMContext):
+    await state.clear()
+    await message.answer("Ок, переименование отменено.")
+
+
+@devices_router.message(StateFilter(DeviceStates.waiting_rename), F.text)
+async def device_rename_finish(message: types.Message, state: FSMContext):
+    if message.text.startswith("/"):
+        # Любая команда в стейте (роутер стоит раньше главного) — выход
+        # из переименования; юзер повторит команду уже вне стейта.
+        await state.clear()
+        await message.answer("Ок, переименование отменено. Повтори команду.")
+        return
+    data = await state.get_data()
+    dev_id = data.get("rename_device_id")
+    await state.clear()
+    if not dev_id:
+        await message.answer("Сессия потеряна. Открой /devices и попробуй ещё раз.")
+        return
+    uid = message.from_user.id
+    try:
+        status_code, resp = await _fetch_json(
+            "POST",
+            f"{BACKEND_URL}/api/bot/devices/{dev_id}/rename",
+            json={"telegram_id": str(uid), "name": message.text.strip()[:64]},
+            headers=_admin_headers(uid),
+        )
+    except aiohttp.ClientError:
+        status_code, resp = 0, None
+    if status_code == 200 and isinstance(resp, dict):
+        await message.answer(
+            f"✏️ Готово: {html.escape(str(resp.get('name')))}"
+        )
+        await _send_devices(message.bot, message.chat.id, uid)
+        return
+    await message.answer("Не получилось переименовать. Попробуй позже.")
 
 
 # ── Легаси-кнопки старожилов ──
