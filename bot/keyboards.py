@@ -225,14 +225,6 @@ def welcome_action_keyboard(
     return types.InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-def tariff_keyboard():
-    keyboard = [
-        [types.KeyboardButton(text="Basic 1m"), types.KeyboardButton(text="Basic 3m"), types.KeyboardButton(text="Basic 12m")],
-        [types.KeyboardButton(text="Pro 1m"), types.KeyboardButton(text="Pro 12m")],
-    ]
-    return types.ReplyKeyboardMarkup(keyboard=keyboard, resize_keyboard=True)
-
-
 def onboarding_keyboard() -> types.InlineKeyboardMarkup:
     """Inline keyboard with setup instructions per platform."""
     return types.InlineKeyboardMarkup(

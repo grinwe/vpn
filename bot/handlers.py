@@ -423,7 +423,9 @@ async def cmd_start(message: types.Message, state: FSMContext):
         from .support import SupportStates
         from .config import ADMIN_IDS
         if not ADMIN_IDS:
-            await message.answer("Поддержка пока не настроена.")
+            await message.answer(
+                "Поддержка пока не настроена.", reply_markup=help_keyboard()
+            )
             return
         await state.set_state(SupportStates.waiting_user_message)
         await message.answer(
@@ -564,6 +566,11 @@ async def list_plans(
         await _say("Бэкенд недоступен. Попробуйте позже.")
         return
 
+    if status == 0:
+        # _fetch_json ест сетевые ошибки сам и возвращает 0 — отличаем
+        # «бэкенд лежит» от «бэкенд ответил не-200» (аудит №14).
+        await _say("Сервис временно недоступен. Попробуй позже.")
+        return
     if status != 200:
         await _say("Не удалось получить список тарифов. Попробуйте позже.")
         return
@@ -761,7 +768,12 @@ async def plans_help(callback_query: types.CallbackQuery):
         "пользовались VPN раньше и точно знаете, что он вам нужен надолго.\n\n"
         "Передумаете — список устройств можно перезаписать в любой момент."
     )
-    await callback_query.message.answer(text)
+    await callback_query.message.answer(
+        text,
+        reply_markup=types.InlineKeyboardMarkup(inline_keyboard=[[
+            types.InlineKeyboardButton(text="💎 К тарифам", callback_data="go:plans")
+        ]]),
+    )
 
 
 @router.callback_query(F.data.startswith("plan:"))
@@ -1120,8 +1132,16 @@ async def status(message: types.Message):
         if status_code == 0:
             await message.answer("Сервис временно недоступен. Попробуй позже.")
             return
-        if status_code != 200:
-            await message.answer("Подписок не найдено. Используй /plans для покупки.")
+        if status_code != 200 or not data:
+            # Аудит 2026-08-21 №7: голый текст без следующего шага — тупик.
+            await message.answer(
+                "Подписок пока нет. Выбери тариф кнопкой ниже 👇",
+                reply_markup=types.InlineKeyboardMarkup(inline_keyboard=[[
+                    types.InlineKeyboardButton(
+                        text="💎 Тарифы", callback_data="go:plans"
+                    )
+                ]]),
+            )
             return
     except aiohttp.ClientError:
         await message.answer("Бэкенд недоступен. Попробуйте позже.")
@@ -1129,6 +1149,7 @@ async def status(message: types.Message):
 
     lines = ["📊 <b>Твои подписки:</b>\n"]
     esc = html.escape
+    unfreeze_rows: list[list[types.InlineKeyboardButton]] = []
     for sub in data:
         auto_renew = "✅" if sub.get("auto_renew") else "❌"
         # Имена нод/плана/региона приходят с бэкенда — экранируем перед HTML.
@@ -1140,7 +1161,67 @@ async def status(message: types.Message):
             f"<b>Статус:</b> {esc(str(sub['status']))}\n"
             f"<b>Автопродление:</b> {auto_renew}"
         )
-    await message.answer("\n\n".join(lines), parse_mode="HTML")
+        # Разморозка прямо из бота (паритет с ЛК, аудит 2026-08-21):
+        # замороженный без работающего ЛК был заперт до авто-разморозки.
+        if sub.get("status") == "frozen" and sub.get("id"):
+            unfreeze_rows.append([
+                types.InlineKeyboardButton(
+                    text=f"🔥 Разморозить {esc(str(sub['plan_name']))}",
+                    callback_data=f"unfreeze:{sub['id']}",
+                )
+            ])
+    await message.answer(
+        "\n\n".join(lines),
+        parse_mode="HTML",
+        reply_markup=(
+            types.InlineKeyboardMarkup(inline_keyboard=unfreeze_rows)
+            if unfreeze_rows
+            else None
+        ),
+    )
+
+
+@router.callback_query(F.data.startswith("unfreeze:"))
+async def unfreeze_cb(callback_query: types.CallbackQuery):
+    """Разморозить подписку из /status. Владельца сверяет бэкенд."""
+    try:
+        sub_id = int(callback_query.data.split(":", 1)[1])
+    except (ValueError, IndexError):
+        await callback_query.answer("Некорректный запрос", show_alert=True)
+        return
+    await callback_query.answer()
+    uid = callback_query.from_user.id
+    chat_id = (
+        callback_query.message.chat.id
+        if isinstance(callback_query.message, types.Message)
+        else uid
+    )
+    try:
+        status_code, _data = await _fetch_json(
+            "POST",
+            f"{BACKEND_URL}/api/subscriptions/{sub_id}/unfreeze",
+            json={"telegram_id": str(uid)},
+            headers=_admin_headers(uid),
+        )
+    except aiohttp.ClientError:
+        status_code = 0
+
+    if status_code == 200:
+        await callback_query.bot.send_message(
+            chat_id,
+            "🔥 Разморозил! VPN оживёт через минуту-две, ссылка прежняя "
+            "(/config). Учти: заморозка даётся один раз в год, и эта "
+            "попытка уже использована.",
+        )
+        return
+    if status_code == 409:
+        await callback_query.bot.send_message(
+            chat_id, "Эта подписка не заморожена. Посмотри статус: /status"
+        )
+        return
+    await callback_query.bot.send_message(
+        chat_id, "Не получилось разморозить. Попробуй позже или напиши /help."
+    )
 
 
 # ── /renew — продление подписки ──
@@ -1533,7 +1614,9 @@ async def _do_device_failover(
         )
     except aiohttp.ClientError:
         await bot.send_message(
-            chat_id, "Не получилось обработать — попробуй ещё раз через минуту."
+            chat_id,
+            "Не получилось обработать — попробуй ещё раз через минуту.",
+            reply_markup=help_keyboard(),
         )
         return None
     if status_code != 200 or not isinstance(data, dict):
@@ -1544,7 +1627,11 @@ async def _do_device_failover(
             tg_id, device_id, status_code, data,
         )
         await bot.send_message(
-            chat_id, "Не получилось обработать — попробуй ещё раз через минуту."
+            chat_id,
+            # Аудит №12: юзер со сломанным VPN и сбоящим бэком не должен
+            # оставаться без единого выхода.
+            "Не получилось обработать — попробуй ещё раз через минуту.",
+            reply_markup=help_keyboard(),
         )
         return None
 
@@ -3096,6 +3183,12 @@ async def ops_exec_confirm(callback_query: types.CallbackQuery) -> None:
     if not _is_admin(callback_query.from_user.id):
         await callback_query.answer("Только для админов.", show_alert=True)
         return
+    if not isinstance(callback_query.message, types.Message):
+        # Сообщение старше 48ч: edit невозможен (аудит №6, AttributeError).
+        await callback_query.answer(
+            "План устарел, вызови /ops заново.", show_alert=True
+        )
+        return
     plan_id = callback_query.data.split(":", maxsplit=1)[1]
     try:
         await callback_query.message.edit_reply_markup(
@@ -3111,6 +3204,11 @@ async def ops_exec_cancel(callback_query: types.CallbackQuery) -> None:
     if not _is_admin(callback_query.from_user.id):
         await callback_query.answer("Только для админов.", show_alert=True)
         return
+    if not isinstance(callback_query.message, types.Message):
+        await callback_query.answer(
+            "План устарел, вызови /ops заново.", show_alert=True
+        )
+        return
     plan_id = callback_query.data.split(":", maxsplit=1)[1]
     try:
         await callback_query.message.edit_reply_markup(reply_markup=_ops_run_keyboard(plan_id))
@@ -3124,6 +3222,11 @@ async def ops_exec_go(callback_query: types.CallbackQuery) -> None:
     """Подтверждение → POST /execute → «запускаю» → поллинг статуса → результат."""
     if not _is_admin(callback_query.from_user.id):
         await callback_query.answer("Только для админов.", show_alert=True)
+        return
+    if not isinstance(callback_query.message, types.Message):
+        await callback_query.answer(
+            "План устарел, вызови /ops заново.", show_alert=True
+        )
         return
     plan_id = callback_query.data.split(":", maxsplit=1)[1]
     actor_id = callback_query.from_user.id
@@ -3187,6 +3290,17 @@ async def ops_exec_go(callback_query: types.CallbackQuery) -> None:
         )
     except TelegramBadRequest:
         await launching.edit_text(_strip_html(_render_ops_exec(result))[:4000])
+
+
+# ── Легаси-кнопки старожилов ──
+
+
+@router.message(F.text.startswith(("Basic ", "Pro ")))
+async def legacy_tariff_buttons(message: types.Message):
+    """Персистентная reply-клавиатура «Basic 1m / Pro 12m» слалась до
+    2025-11-26 (мёртвый tariff_keyboard, удалён) и живёт у старожилов в
+    чатах вечно — тап по ней был тишиной (аудит 2026-08-21, №5)."""
+    await list_plans(message)
 
 
 # ── Глобальные страховки диалога (аудит 2026-08-21, тупики №1/№4) ──

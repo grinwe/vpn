@@ -131,3 +131,40 @@ def test_auto_renew_checks_owner(client, db_session):
     # Без telegram_id (админка) — прежнее поведение.
     resp = client.post(url, json={"auto_renew": True}, headers=_ADMIN)
     assert resp.status_code == 200, resp.text
+
+
+def test_unfreeze_by_owner(client, db_session):
+    """Разморозка из бота: ownership обязателен, не-frozen — 409."""
+    from datetime import datetime, timedelta
+
+    plan = make_plan(db_session)
+    node = make_node(db_session)
+    make_config(db_session, node)
+    owner = make_user(db_session, telegram_id="unfr-owner")
+    stranger = make_user(db_session, telegram_id="unfr-stranger")
+    sub = make_subscription(db_session, owner, plan, node)
+    sub.status = models.SubscriptionStatus.frozen
+    sub.frozen_at = datetime.utcnow()
+    sub.frozen_until = datetime.utcnow() + timedelta(days=7)
+    db_session.commit()
+
+    url = f"/api/subscriptions/{sub.id}/unfreeze"
+    resp = client.post(
+        url, json={"telegram_id": stranger.telegram_id}, headers=_ADMIN
+    )
+    assert resp.status_code == 404, resp.text
+
+    resp = client.post(
+        url, json={"telegram_id": owner.telegram_id}, headers=_ADMIN
+    )
+    assert resp.status_code == 200, resp.text
+    db_session.expire_all()
+    refreshed = db_session.get(models.Subscription, sub.id)
+    assert refreshed.status == models.SubscriptionStatus.active
+    assert refreshed.frozen_until is None
+
+    # Повторная разморозка активной — 409, не 500.
+    resp = client.post(
+        url, json={"telegram_id": owner.telegram_id}, headers=_ADMIN
+    )
+    assert resp.status_code == 409, resp.text

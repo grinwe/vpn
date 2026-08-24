@@ -1491,6 +1491,38 @@ def toggle_auto_renew(
     return {"ok": True, "auto_renew": sub.auto_renew}
 
 
+class UnfreezeByOwnerRequest(BaseModel):
+    telegram_id: str
+
+
+@ext_router.post("/subscriptions/{subscription_id}/unfreeze")
+def unfreeze_by_owner(
+    subscription_id: int,
+    body: UnfreezeByOwnerRequest,
+    db: Session = Depends(get_db),
+    admin_token: str = Depends(require_admin),
+):
+    """Разморозка из бота (паритет с ЛК, аудит 2026-08-21).
+
+    Замороженный без работающего ЛК был заперт до авто-разморозки.
+    Ownership по telegram_id обязателен: sub_id приходит из
+    callback_data, а она подделываема (тот же класс, что auto_renew).
+    """
+    from .services import balance as balance_svc
+
+    sub = db.get(models.Subscription, subscription_id)
+    owner_tg = sub.user.telegram_id if sub and sub.user else None
+    if not sub or owner_tg != str(body.telegram_id):
+        raise HTTPException(status_code=404, detail="Subscription not found")
+    try:
+        balance_svc.unfreeze_subscription(db, sub, auto=False)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+    db.commit()
+    db.refresh(sub)
+    return {"ok": True, "status": sub.status.value}
+
+
 # ── Referral system ──
 
 class ReferralCodeRequest(BaseModel):
