@@ -302,7 +302,15 @@ def run_pending_rescue_tick() -> dict:
     return {"scanned": scanned, "rescued": rescued, "abandoned": abandoned}
 
 
-def _notify_admins_safe(session, *, kind: str, text: str, dedup_key: dict, extra: dict) -> None:
+def _notify_admins_safe(
+    session,
+    *,
+    kind: str,
+    text: str,
+    dedup_key: dict,
+    extra: dict,
+    window_sec: int | None = None,
+) -> None:
     """notify_admins, который не может уронить тик.
 
     Алерт — диагностика; если админ-нотификация упала (нет чата, обрыв БД),
@@ -311,6 +319,9 @@ def _notify_admins_safe(session, *, kind: str, text: str, dedup_key: dict, extra
     try:
         from .services.admin_notify import notify_admins
 
+        kwargs = {}
+        if window_sec is not None:
+            kwargs["window_sec"] = window_sec
         notify_admins(
             session,
             kind=kind,
@@ -318,6 +329,7 @@ def _notify_admins_safe(session, *, kind: str, text: str, dedup_key: dict, extra
             dedup_key=dedup_key,
             extra=extra,
             autocommit=True,
+            **kwargs,
         )
     except Exception:  # noqa: BLE001
         logger.exception("lava_reconcile: не удалось отправить алерт %s", kind)
@@ -361,6 +373,9 @@ def _alert_stale_lava_sale(session, invoice, sale: dict) -> None:
         )
         kind = "payment_for_inactive_invoice"
     logger.warning("lava_reconcile: %s (invoice %s)", kind, invoice.id)
+    # Сутки, не дефолт: продажа висит в last-N выдаче лавы днями, и с
+    # 10-минутным окном один разобранный вручную счёт спамил админку
+    # каждые 10 минут (кейс 3dfdc4c1/счёт 65, 2026-08-24).
     _notify_admins_safe(
         session,
         kind=kind,
@@ -371,6 +386,7 @@ def _alert_stale_lava_sale(session, invoice, sale: dict) -> None:
             "contract_id": contract_id,
             "invoice_status": invoice.status.value,
         },
+        window_sec=86400,
     )
 
 

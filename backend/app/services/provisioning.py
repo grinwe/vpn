@@ -3340,7 +3340,34 @@ class ProvisioningOrchestrator:
             logger.exception("leg-scheme: раскладка для device %s не удалась", device.id)
             return None
         if plan is not None and plan.missing:
-            leg_scheme.notify_leg_gap(self.db, device, plan.missing)
+            # Незакрытая роль при apply-таске в пути — не дефицит, а
+            # ожидаемый transient: cold-креды активируются в
+            # _handle_task_outcome, и раскладка переприменится сама
+            # (каждый failover давал по два ложных leg_gap-алерта).
+            pending_apply = (
+                self.db.query(models.ProvisioningTask.id)
+                .filter(
+                    models.ProvisioningTask.target_type == "device",
+                    models.ProvisioningTask.target_id == device.id,
+                    models.ProvisioningTask.action == "apply",
+                    models.ProvisioningTask.status.in_(
+                        [
+                            models.ProvisioningTaskStatus.pending,
+                            models.ProvisioningTaskStatus.running,
+                        ]
+                    ),
+                )
+                .first()
+            )
+            if pending_apply is not None:
+                logger.info(
+                    "leg-scheme: device %s — роли %s не закрыты, но apply-таска "
+                    "в пути; алерт не шлём (дозакроется после активации)",
+                    device.id,
+                    ",".join(plan.missing),
+                )
+            else:
+                leg_scheme.notify_leg_gap(self.db, device, plan.missing)
         return plan
 
     def _apply_leg_scheme(self, device: models.Device) -> None:
