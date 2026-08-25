@@ -434,7 +434,18 @@ ansible <нода> -i inventories/prod/hosts.yml -m shell \
   --vault-password-file ~/.vpn_vault_pass
 ```
 
-**Починка (на каждой отвалившейся ноде):**
+**Починка — плейбуком** (идемпотентен, идёт по одной ноде, отказывается работать там, где это опасно):
+
+```bash
+cd infra/ansible
+ansible-playbook playbooks/fix_hy2_dnat.yml --vault-password-file ~/.vpn_vault_pass
+# только на конкретные:  -l aeza-ru-01,ufo-ru-01
+# посмотреть вхолостую:  --check
+```
+
+🔴 **Почему плейбук, а не `apt install` руками.** `apt install iptables-persistent` в postinst стартует юнит, а тот делает `iptables-restore` **без `--noflush`** — то есть ЗАМЕНЯЕТ живое ядро содержимым файла. Всё, что живёт только в ядре и в файл не попало, умирает молча: цепочки fail2ban, счётчики трафика, правила, добавленные ролями после последнего `save`. Воспроизведено в контейнере с systemd. Preseed `autosave_v4/v6`, который выглядит защитой, управляет только веткой `save` и к restore отношения не имеет. Плейбук перед установкой сверяет ядро с файлом и отказывается работать при расхождении.
+
+**Починка руками** (если плейбук почему-то недоступен — сверьте ядро с файлом ДО установки):
 
 ```bash
 DEBIAN_FRONTEND=noninteractive apt-get install -y iptables-persistent
