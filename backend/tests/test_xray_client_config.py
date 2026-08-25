@@ -132,6 +132,56 @@ def test_hysteria2_leg_carries_obfs_in_finalmask():
     }
 
 
+def test_port_hopping_is_off_unless_enabled(monkeypatch):
+    """Хоппинг упирается не в клиента, а в ноду: без DNAT-правила пакеты на
+    порты диапазона уходят в никуда, и рабочий лег становится молчащим."""
+    monkeypatch.delenv("SUB_XRAY_HY2_HOP", raising=False)
+    ob = xj.uri_to_outbound(HY2, "solo")
+    assert "quicParams" not in ob["streamSettings"]["finalmask"]
+
+
+def test_port_hopping_carries_range_from_the_uri(monkeypatch):
+    monkeypatch.setenv("SUB_XRAY_HY2_HOP", "all")
+    ob = xj.uri_to_outbound(HY2, "solo", hy2_hop=True)
+    quic = ob["streamSettings"]["finalmask"]["quicParams"]
+    # диапазон — ровно тот, что в ссылке; интервал строкой, объект Xray не примет
+    assert quic["udpHop"]["ports"] == "20000-40000"
+    assert quic["udpHop"]["interval"] == "10-30"
+    # обфускация никуда не девается — она в той же секции, но по своему ключу
+    assert ob["streamSettings"]["finalmask"]["udp"][0]["type"] == "salamander"
+
+
+@pytest.mark.parametrize("value,token,expected", [
+    ("off", "tok", False),
+    ("", "tok", False),
+    ("all", "tok", True),
+    ("on", "tok", True),
+    ("tok-a,tok-b", "tok-a", True),
+    ("tok-a,tok-b", "tok-c", False),
+    ("tok-a", "", False),
+])
+def test_hop_gate_accepts_off_all_or_token_list(monkeypatch, value, token, expected):
+    monkeypatch.setenv("SUB_XRAY_HY2_HOP", value)
+    assert xj.hy2_hop_enabled(token) is expected
+
+
+def test_hop_gate_reaches_the_profile(monkeypatch):
+    """Гейт должен работать пер-подписочно — значит токен обязан доехать от
+    build_body до самого лега, а не потеряться по дороге."""
+    monkeypatch.setenv("SUB_XRAY_HY2_HOP", "тот-самый-токен")
+
+    def hop_of(profiles):
+        for p in profiles:
+            for o in p["outbounds"]:
+                if o["protocol"] == "hysteria":
+                    return "quicParams" in o["streamSettings"].get("finalmask", {})
+        raise AssertionError("hy2-лег потерялся")
+
+    assert hop_of(xj.build_profiles(FULL_SET, "тот-самый-токен")) is True
+    assert hop_of(xj.build_profiles(FULL_SET, "чужой-токен")) is False
+    assert hop_of(xj.build_profiles(FULL_SET)) is False
+
+
 def test_hysteria2_with_unknown_obfs_is_refused():
     """Незнакомую обфускацию выразить нечем, а без неё сервер молчит — такой
     лег честнее не отдать, чем отдать неподключающимся."""

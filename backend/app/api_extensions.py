@@ -331,7 +331,7 @@ def _sub_payload(
         # без интернета из-за украшательства. Любая поломка сборки JSON —
         # повод отдать проверенный временем плоский список, а не упасть.
         try:
-            body = xray_client_config.build_body(configs)
+            body = xray_client_config.build_body(configs, token)
         except Exception:
             logger.exception(
                 "xray-json: build failed for token=%s sub=%s — serving plain list",

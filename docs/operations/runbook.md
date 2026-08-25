@@ -410,6 +410,49 @@ curl -sI https://grinwer.online/${NEW_PATH}/        # → 200 от admin SPA
 
 ---
 
+## 14. Порт-хоппинг Hysteria2 не работает (правила iptables не пережили ребут)
+
+**Симптом.** hy2-лег подключается на основном порту, но перестаёт работать, стоит клиенту задействовать порт-хоппинг. В логе Xray — `proxy/hysteria: failed to find an available destination > timeout: no recent network activity`.
+
+**Причина.** Роль `install_hysteria2` ставит DNAT-правило `hy2-port-hopping` (UDP `20000:40000` → порт hy2) и сохраняет его в `/etc/iptables/rules.v4`. Но восстанавливать правила после ребута должен `netfilter-persistent`, а на части нод он **не установлен** — таск `netfilter-persistent save` стоит с `changed_when: false` и не падает, если команды нет. Итог: правило есть в файле, но не в ядре.
+
+**Диагностика по флоту:**
+
+```bash
+cd infra/ansible
+ansible vpn_nodes -i inventories/prod/hosts.yml -m shell \
+  -a "iptables -t nat -S PREROUTING | grep -c hy2-port-hopping" \
+  --vault-password-file ~/.vpn_vault_pass
+# 1 — правило живо; 0 — отвалилось
+```
+
+Отличить «не применялось никогда» от «не пережило ребут» — сравнить файл и ядро:
+
+```bash
+ansible <нода> -i inventories/prod/hosts.yml -m shell \
+  -a "sed -n '/\*nat/,/COMMIT/p' /etc/iptables/rules.v4; iptables -t nat -S; which netfilter-persistent || echo NO-PERSISTENT" \
+  --vault-password-file ~/.vpn_vault_pass
+```
+
+**Починка (на каждой отвалившейся ноде):**
+
+```bash
+DEBIAN_FRONTEND=noninteractive apt-get install -y iptables-persistent
+iptables -t nat -C PREROUTING -p udp --dport 20000:40000 \
+  -m comment --comment hy2-port-hopping -j DNAT --to-destination :443 2>/dev/null \
+  || iptables -t nat -A PREROUTING -p udp --dport 20000:40000 \
+       -m comment --comment hy2-port-hopping -j DNAT --to-destination :443
+netfilter-persistent save
+```
+
+Проверка — `iptables -t nat -S PREROUTING` должен показать правило, и оно обязано пережить `reboot`.
+
+**Почему это шире, чем порт-хоппинг.** `mport=20000-40000` уезжает в hy2-URI **всем** пользователям (`_build_hysteria2_credential`). Клиент, который этот параметр читает и начинает прыгать по портам, на такой ноде получит молчащий сервер — при полностью исправном на вид конфиге. То есть это кандидат в объяснение части жалоб «hy2 не работает у меня», а не только блокер для `SUB_XRAY_HY2_HOP`.
+
+**Гейт в подписке.** Пока ноды не починены, `SUB_XRAY_HY2_HOP` держим в `off` (`group_vars/web/main.yml`): включение вслепую меняет рабочий hy2-лег на молчащий.
+
+---
+
 ## Что делать, если ничего не помогает
 
 1. **Снять снапшот:** `docker compose logs > /tmp/vpn-logs-$(date +%s).txt`, `pg_dump`, `redis-cli -a $REDIS_PASSWORD save`.

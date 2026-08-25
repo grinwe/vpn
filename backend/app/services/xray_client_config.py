@@ -171,7 +171,35 @@ def _tls_settings(sni: str, fingerprint: str) -> dict:
     return out
 
 
-def _hysteria_outbound(u, q: dict, tag: str, hostname: str, port: int) -> dict:
+def hy2_hop_enabled(token: str) -> bool:
+    """Включать ли порт-хоппинг для hy2-легов этой подписки.
+
+    ``off`` (дефолт) / ``all`` / CSV саб-токенов — та же форма, что у
+    ``SUB_HAPP_AUTOCONNECT``. Отдельный гейт от самого JSON, потому что
+    хоппинг упирается не в клиента, а в НОДУ: пакет на порт из диапазона
+    доедет только там, где стоит DNAT-правило ``hy2-port-hopping``. На
+    2026-08-25 оно есть не на всех нодах (на части флота не переживает
+    ребут — не установлен netfilter-persistent), поэтому включать хоппинг
+    вслепую значит менять рабочий hy2-лег на молчащий.
+    """
+    raw = (os.getenv("SUB_XRAY_HY2_HOP") or "off").strip()
+    low = raw.lower()
+    if low in ("", "0", "off", "no", "false"):
+        return False
+    if low in ("all", "on", "true", "yes"):
+        return True
+    return bool(token) and token in {t.strip() for t in raw.split(",") if t.strip()}
+
+
+# Как часто клиент перескакивает на другой порт. Xray требует минимум 5 с;
+# разброс, а не фиксированное значение, чтобы смена портов не давала
+# наблюдателю ровный период.
+_HOP_INTERVAL = "10-30"
+
+
+def _hysteria_outbound(
+    u, q: dict, tag: str, hostname: str, port: int, *, hop: bool = False
+) -> dict:
     """Наш ``hy2://`` → hysteria-outbound Xray.
 
     Аутентификация у нас — пара ``логин:пароль`` в userinfo (не UUID, как у
@@ -194,16 +222,29 @@ def _hysteria_outbound(u, q: dict, tag: str, hostname: str, port: int) -> dict:
         "tlsSettings": tls,
     }
     obfs_password = q.get("obfs-password")
+    final_mask: dict = {}
     if q.get("obfs") == "salamander" and obfs_password:
-        stream["finalmask"] = {
-            "udp": [{"type": "salamander", "settings": {"password": obfs_password}}]
-        }
+        final_mask["udp"] = [
+            {"type": "salamander", "settings": {"password": obfs_password}}
+        ]
     elif q.get("obfs"):
         # Незнакомая обфускация: выразить не можем, а без неё сервер не ответит.
         logger.warning(
             "xray-json: unsupported hy2 obfs %r (tag=%s) — leg dropped", q["obfs"], tag
         )
         return {}
+
+    # Порт-хоппинг: клиент рассылает пакеты по случайным портам диапазона,
+    # чтобы блокировка одного порта не убивала канал. На ноде это ловит
+    # DNAT-правило ``hy2-port-hopping``; там, где правила нет, включение
+    # хоппинга превращает рабочий лег в молчащий — отсюда отдельный гейт.
+    if hop and q.get("mport"):
+        final_mask["quicParams"] = {
+            "udpHop": {"ports": q["mport"], "interval": _HOP_INTERVAL}
+        }
+
+    if final_mask:
+        stream["finalmask"] = final_mask
 
     return {
         "tag": tag,
@@ -215,13 +256,15 @@ def _hysteria_outbound(u, q: dict, tag: str, hostname: str, port: int) -> dict:
     }
 
 
-def uri_to_outbound(uri: str, tag: str) -> dict | None:
+def uri_to_outbound(uri: str, tag: str, *, hy2_hop: bool = False) -> dict | None:
     """Один наш URI → один outbound Xray, или None если лег не выразим.
 
     Разбираем то, что реально минтим (``provisioning.py``, секция Credential
     builders): reality поверх tcp, tls поверх xhttp и ws, плюс hysteria2 с
     salamander-обфускацией. Неизвестный транспорт — None: лучше потерять лег,
     чем собрать outbound наугад и отдать сервер, который не подключается.
+
+    ``hy2_hop`` — добавлять ли порт-хоппинг hy2-легам (см. ``hy2_hop_enabled``).
     """
     # ``.port`` и ``.hostname`` у SplitResult — ленивые свойства: они бросают
     # ValueError уже ПОСЛЕ разбора, на кривом порту («:abc», «:99999»). Поэтому
@@ -239,7 +282,7 @@ def uri_to_outbound(uri: str, tag: str) -> dict | None:
     q = dict(parse_qsl(u.query))
 
     if u.scheme == "hy2":
-        return _hysteria_outbound(u, q, tag, hostname, port) or None
+        return _hysteria_outbound(u, q, tag, hostname, port, hop=hy2_hop) or None
 
     security = q.get("security", "")
     network = q.get("type", "")
@@ -414,7 +457,7 @@ def _auto_profile(outbounds: list[dict]) -> dict:
     }
 
 
-def build_profiles(configs) -> list[dict] | None:
+def build_profiles(configs, token: str = "") -> list[dict] | None:
     """Список профилей для клиента — или None, если JSON тут не уместен.
 
     ``configs`` — те же ``SubLinkConfig``, что идут в плоское тело, в том же
@@ -425,11 +468,12 @@ def build_profiles(configs) -> list[dict] | None:
     не из чего собрать. Решение принимается ЗДЕСЬ, а не на вызывающей стороне,
     чтобы гейт нельзя было обойти мимо этой функции.
     """
+    hop = hy2_hop_enabled(token)
     outbounds: list[dict] = []
     remarks: list[str] = []
     for cfg in configs:
         tag = _LEG_TAG if not outbounds else f"{_LEG_TAG}-{len(outbounds) + 1}"
-        ob = uri_to_outbound(cfg.uri, tag)
+        ob = uri_to_outbound(cfg.uri, tag, hy2_hop=hop)
         if ob is None:
             continue
         outbounds.append(ob)
@@ -449,9 +493,9 @@ def build_profiles(configs) -> list[dict] | None:
     return profiles
 
 
-def build_body(configs) -> str | None:
+def build_body(configs, token: str = "") -> str | None:
     """Готовое тело ответа — JSON-массив профилей. None = отдать плоский список."""
-    profiles = build_profiles(configs)
+    profiles = build_profiles(configs, token)
     if profiles is None:
         return None
     return json.dumps(profiles, ensure_ascii=False)
