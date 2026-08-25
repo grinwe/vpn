@@ -26,7 +26,7 @@ from .. import models
 from ..db import SessionLocal
 from ..security import compute_client_id_hmac, decrypt, encrypt
 from ..version import app_version
-from . import leg_scheme, sub_links
+from . import config_ready, leg_scheme, sub_links
 from .ansible_runner import (
     AnsibleCancelled,
     build_inventory_for_exit_node,
@@ -2174,48 +2174,27 @@ class ProvisioningOrchestrator:
             # старому девайсу отсекает гонку с ещё живым failover'ом.
             if device.pending_swap_from is not None:
                 self._finish_deferred_swap(device)
-            self._notify_bot_config_ready(device)
+            # Пуш «конфиг готов» — только по флагу из payload. Его ставит
+            # ТОЛЬКО cold-ветка provision_subscription; failover / migrate /
+            # swap / unfreeze / add-device идут через reprovision_subscription
+            # без флага, так что «конфиг готов» юзеру с уже живой ссылкой
+            # прийти не может структурно (инцидент 2026-08-25: канал был
+            # мёртв, см. services/config_ready.py).
+            if task_payload.get("notify_config_ready") is True:
+                self._notify_bot_config_ready(device)
 
     def _notify_bot_config_ready(self, device: models.Device) -> None:
-        """Push a notification to the bot that config is ready for delivery.
+        """Поставить в очередь бота пуш «конфиг готов» (cold-путь).
 
-        We POST to the backend's internal /api/bot/notify_config endpoint,
-        which the bot polls or which triggers a direct Telegram message.
-        Instead of coupling worker→bot, we write a lightweight callback
-        record that the bot's polling loop picks up.
+        Имя и сигнатура сохранены — тесты (test_device_failover,
+        test_leg_scheme) глушат хук по имени. До 2026-08-25 тело писало
+        ``_notify`` в ``ProvisioningTask.result``, который никто не читал:
+        поллер бота смотрит только в audit_logs, и канал config_ready был
+        мёртв с рождения. Теперь — обычная строка очереди, гейт и дедуп в
+        ``services/config_ready.py``. Коммитим сразу: девайс уже durable
+        (commit выше в _handle_task_outcome), уведомление — отдельная запись.
         """
-        try:
-            sub = device.subscription
-            if not sub:
-                return
-            user = sub.user
-            if not user or not user.telegram_id:
-                return
-            # Store the notification in the task result so the bot can read it
-            # via the existing task polling mechanism, or via the new callback API.
-            task_result = (
-                self.db.query(models.ProvisioningTask)
-                .filter(
-                    models.ProvisioningTask.target_type == "device",
-                    models.ProvisioningTask.target_id == device.id,
-                    models.ProvisioningTask.action == "apply",
-                    models.ProvisioningTask.status == models.ProvisioningTaskStatus.success,
-                )
-                .order_by(models.ProvisioningTask.id.desc())
-                .first()
-            )
-            if task_result and task_result.result:
-                result = dict(task_result.result)
-                result["_notify"] = {
-                    "telegram_id": user.telegram_id,
-                    "subscription_id": sub.id,
-                    "device_id": device.id,
-                }
-                task_result.result = result
-                self.db.add(task_result)
-                self.db.commit()
-        except Exception:  # noqa: BLE001
-            logger.exception("Failed to store bot notification for device %s", device.id)
+        config_ready.notify_config_ready(self.db, device, source="cold", commit=True)
 
     def _execute_task(
         self, task: models.ProvisioningTask, node: models.VPNNode | None = None
@@ -2436,9 +2415,15 @@ class ProvisioningOrchestrator:
                 # материализован) — отдаём соединение из пула на время
                 # provision_device.yml, см. site.yml-ветку.
                 self.db.commit()
+                # notify_config_ready — маркер для _handle_task_outcome (читает
+                # его из task.payload), а не переменная плейбука: в extra_vars
+                # ему делать нечего, ansible такого ключа не ждёт.
+                extra_vars = {
+                    k: v for k, v in payload.items() if k != "notify_config_ready"
+                }
                 result = run_playbook(
                     "playbooks/provision_device.yml",
-                    inventory, limit=node_name, extra_vars=payload,
+                    inventory, limit=node_name, extra_vars=extra_vars,
                 )
             else:
                 raise RuntimeError(f"Unsupported target type {task.target_type}")
@@ -3182,6 +3167,14 @@ class ProvisioningOrchestrator:
                 self.db.refresh(subscription)
                 self._maybe_attach_diverse(subscription, device, plan, node)
                 self._apply_leg_scheme(device)
+                # Warm-хит минует _handle_task_outcome (Ansible не бежит,
+                # девайс сразу active) — пуш «конфиг готов» ставим здесь.
+                # Без commit: вызывающие (activate_trial_full, webapp_activate,
+                # _create_subscription_for_user) коммитят подписку сами, и
+                # строка уходит в той же транзакции. Никогда не бросает.
+                config_ready.notify_config_ready(
+                    self.db, device, source="warm", commit=False
+                )
                 return subscription, task
             except Exception:
                 # If wiring blew up after we marked the bundle assigned,
@@ -3302,6 +3295,11 @@ class ProvisioningOrchestrator:
             "password": password,
             "protocols": protocols_payload,
             "state": "present",
+            # Маркер «первая выдача подписки»: по нему _handle_task_outcome
+            # ставит в очередь бота пуш «конфиг готов». Ставится ТОЛЬКО здесь —
+            # reprovision_subscription (failover/migrate/swap/unfreeze/
+            # add-device) его не несёт, см. services/config_ready.py.
+            "notify_config_ready": True,
         }
         # G.6: tell provision_device.yml which wgN the new user must
         # egress through on multi-link relays. manage_vless_*_user.sh

@@ -568,11 +568,13 @@ def test_reconcile_alerts_on_sale_for_already_paid_invoice(db_session, monkeypat
     db_session.commit()
 
     alerts: list[str] = []
+    # window_sec обязателен в сигнатуре: _alert_stale_lava_sale передаёт
+    # суточное окно дедупа (кейс 3dfdc4c1, 2026-08-24), а _notify_admins_safe
+    # глотает TypeError от фейка — тест молча видел пустой список алертов.
     monkeypatch.setattr(
         "app.services.admin_notify.notify_admins",
-        lambda db, *, kind, text, dedup_key=None, extra=None, autocommit=False: (
-            alerts.append(kind)
-        ),
+        lambda db, *, kind, text, dedup_key=None, extra=None, window_sec=None,
+        autocommit=False: alerts.append(kind),
     )
     _patch_lava(monkeypatch, [
         {"invoice_id": inv.id, "amount": 100.0, "currency": "RUB",

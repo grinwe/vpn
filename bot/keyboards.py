@@ -155,9 +155,21 @@ def webapp_inline_keyboard() -> types.InlineKeyboardMarkup | None:
 
 
 def welcome_action_keyboard(
-    *, trial_available: bool = False, is_new: bool = False
+    *, trial_available: bool = False, is_new: bool = False, has_link: bool = False
 ) -> types.InlineKeyboardMarkup:
     """Inline-меню под приветствием.
+
+    ``has_link=True`` (есть подписка active/frozen ИЛИ живые устройства —
+    handlers считает из ``has_subscription or has_devices``) добавляет
+    «🔗 Ссылка для подключения» (``go:config``): у возвращающегося — второй
+    строкой после ЛК, у новичка с незабранным подарком — после кнопки подарка.
+    Это способ забрать ссылку ПОТОМ, если сразу её не отдало (инцидент
+    2026-08-25: выдача после триала упала, а с главного экрана к ссылке не
+    вело ничего). Гейт по подписке, а не только по девайсам: на cold-пути
+    девайс ~минуту pending, у замороженного девайсов нет — путь к ссылке и
+    статусу им всё равно нужен. Платный юзер с незабранным подарком тоже не
+    должен терять путь к ссылке. ЛК остаётся основным местом, нативная
+    выдача — фолбэк для тех, у кого ЛК не открывается.
 
     Онбординг-роадмап E1.1/E1.5. Раньше здесь всегда висели 6 кнопок, и вместе
     с нижней reply-клавиатурой первый экран давал 12 кликабельных вариантов без
@@ -194,6 +206,12 @@ def welcome_action_keyboard(
                 web_app=types.WebAppInfo(url=WEBAPP_URL),
             )
         ])
+    if has_link:
+        rows.append([
+            types.InlineKeyboardButton(
+                text="🔗 Ссылка для подключения", callback_data="go:config"
+            )
+        ])
     if onboarding:
         # Один экран — одно действие. Тарифы оставляем вторым, ненавязчивым
         # рядом: кому подарок не нужен, тот всё равно найдёт цены.
@@ -227,9 +245,22 @@ def welcome_action_keyboard(
 
 
 def onboarding_keyboard() -> types.InlineKeyboardMarkup:
-    """Inline keyboard with setup instructions per platform."""
+    """Inline keyboard with setup instructions per platform.
+
+    Первой строкой — ЛК (если WebApp по https, как в webapp_inline_keyboard).
+    Клавиатура висит на всех экранах выдачи ссылки: /config, «Оплата
+    получена» после Stars, пуш ``config_ready`` в поллере (bot.py) — и это
+    единый «акцент на личный кабинет»: там ссылка лежит всегда, даже если в
+    чат её прислать не удалось (инцидент 2026-08-25).
+    """
+    rows: list[list[types.InlineKeyboardButton]] = []
+    if WEBAPP_BASE_URL.startswith("https://"):
+        rows.append([types.InlineKeyboardButton(
+            text="🔐 Открыть личный кабинет",
+            web_app=types.WebAppInfo(url=WEBAPP_URL),
+        )])
     return types.InlineKeyboardMarkup(
-        inline_keyboard=[
+        inline_keyboard=rows + [
             [types.InlineKeyboardButton(
                 text="Android (v2rayNG)",
                 callback_data="onboard:android",

@@ -1770,6 +1770,25 @@ def register_user(
             .first()
             is not None
         ),
+        # Ревью инцидента 2026-08-25: путь к ссылке (кнопка go:config, строка
+        # «у тебя уже есть подписка» в /plans) бот гейтил по has_devices, а
+        # тот считается только по ACTIVE-девайсам. На cold-пути девайс
+        # ~минуту pending (или failed), у замороженного девайсов нет вовсе —
+        # и такие юзеры видели голый прайс без пути к ссылке/статусу. Считаем
+        # по подписке: active или frozen. has_devices остаётся для «🆘 VPN не
+        # работает» — чинить можно только выданное устройство.
+        "has_subscription": (
+            db.query(models.Subscription.id)
+            .filter(
+                models.Subscription.user_id == user.id,
+                models.Subscription.status.in_([
+                    models.SubscriptionStatus.active,
+                    models.SubscriptionStatus.frozen,
+                ]),
+            )
+            .first()
+            is not None
+        ),
     }
 
 
@@ -2401,10 +2420,17 @@ def get_pending_notifications(
                 "Продли сейчас через /renew, иначе VPN отключится."
             )
         elif log.action == "config_ready":
+            # Продюсер — services/config_ready.py (первая выдача подписки,
+            # warm и cold). sub_uri кладётся только абсолютный http(s); без
+            # SUB_LINK_BASE_URL ссылки в пуше нет — текст ведёт в личный
+            # кабинет, где она лежит всегда (инцидент 2026-08-25: бот
+            # пообещал ссылку и не прислал, юзер упёрся в тупик).
             sub_uri = extra.get("sub_uri")
             text = (
-                "✅ Конфиг VPN готов!\n"
+                "✅ Конфиг VPN готов, можно подключаться!\n"
                 + (f"Ссылка: {sub_uri}\n" if sub_uri else "")
+                + "Ссылка всегда лежит в личном кабинете "
+                "(кнопка «Личный кабинет» внизу) и по команде /config."
             )
         elif log.action == "referral_invite":
             # Шлётся один раз — после того, как человек впервые скачал конфиг.

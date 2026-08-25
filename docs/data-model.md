@@ -421,7 +421,7 @@ class AuditLog(Base):
 
 **Важно**: column на диске называется `metadata` (чтобы не конфликтовать с SQLAlchemy reserved `Base.metadata`), в Python-модели — `extra`. См. `models.py:526`.
 
-Особенность: тот же audit log используется как «очередь уведомлений боту» — воркер пишет строки с `action in ('renewal_reminder', 'config_ready', 'migration_notice', …)`, бот опрашивает их через `/api/notifications/pending` (`backend/app/api_extensions.py:359`) и помечает delivered добавлением `:delivered` в `action`.
+Особенность: тот же audit log используется как «очередь уведомлений боту» — воркер пишет строки с `action in ('renewal_reminder', 'config_ready', 'migration_notice', …)`, бот опрашивает их через `/api/notifications/pending` (`backend/app/api_extensions.py:359`) и помечает delivered добавлением `:delivered` в `action`. `config_ready` пишет провижининг (`services/config_ready.py`): `actor='provisioning'`, `target_type='subscription'`, `target_id=sub.id`, `extra={telegram_id, subscription_id, device_id, source: 'warm'|'cold', sub_uri?}` — по одной строке на подписку (дедуп по `config_ready`/`config_ready:delivered` на том же target).
 
 Из-за этой hot-path роли на таблице объявлены индексы `ix_audit_logs_action_created_at (action, created_at)` (под поллер уведомлений и worker-тики, фильтрующие по `action`) и `ix_audit_logs_created_at (created_at)` (под дашборды/выборки по времени). DESC-вариант не нужен — btree читается в обе стороны.
 

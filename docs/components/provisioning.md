@@ -14,7 +14,9 @@
                     ┌─────────────────────────────────────┐
                     │   warm_pool.try_assign_bundle(...)  │ ── hit ──► _wire_warm_bundle
                     └─────────────────────────────────────┘              (DB only, no ansible)
-                                          │ miss
+                                          │ miss                                │
+                                          │              config_ready.notify_config_ready(source="warm")
+                                          │                        → audit log "config_ready" (коммитит вызывающий)
                                           ▼
                              cold path: build creds, ProvisioningTask,
                              run_task_async → RQ → ansible-playbook
@@ -23,7 +25,8 @@
                               _handle_task_outcome → device.status=active
                                           │
                                           ▼
-                          _notify_bot_config_ready → audit log "config_ready"
+                _notify_bot_config_ready (только если payload.notify_config_ready)
+                → config_ready.notify_config_ready(source="cold") → audit log "config_ready"
                                           │
                                           ▼
                               bot notification poller доставляет
@@ -151,7 +154,8 @@ branch on returncode
     │            если action=revoke → device.status=revoked, creds.is_active=False
     │                                (строка Device СОХРАНЯЕТСЯ — см. Sub-link invariant)
     │            если target=node   → promote registering→active
-    │            если success       → _notify_bot_config_ready
+    │            если success и action=apply и payload.notify_config_ready
+    │                                → _notify_bot_config_ready (пуш «конфиг готов», см. ниже)
     │
     └─ ≠0 ──► tail = last 20 lines of (stderr || stdout)
               _mark_task(failed, error=tail) → _handle_task_outcome(success=False)
@@ -212,7 +216,14 @@ all:
 
 ### Bot notification hook
 
-`_notify_bot_config_ready(device)` (`provisioning.py:651-690`). После **успешного** `apply`-task'а orchestrator ищет последний успешный apply-task для того же device'а и рассчитывает, что воркер уведомлений (`worker.run_renewal_check` и коллеги) подберёт его. Реализация — **нестандартная**: уведомление не кладётся в отдельную таблицу, а инкорпорируется в результат task'а, который потом прочтут через notification poller на стороне бота (`bot/bot.py:14-69`). Детали очереди уведомлений через `audit_logs` — в `components/backend-api.md` и `components/bot.md`.
+Пуш «✅ Конфиг VPN готов» — строка `AuditLog(action='config_ready', target_type='subscription', target_id=sub.id)` в очереди бота (`/api/notifications/pending`, тот же механизм, что `sublink_rotated`/`trial_expiry_warning`). Единственный продюсер — `services/config_ready.py::notify_config_ready(db, device, source=, commit=)`; вызывается из двух мест:
+
+- **warm** — в `provision_subscription` сразу после warm-hit (`_wire_warm_bundle` → девайс уже `active`, `_handle_task_outcome` не проходит). `commit=False`: строка уходит в той же транзакции, что и подписка (коммитят `activate_trial_full`, `webapp_activate`, `_create_subscription_for_user`). Осознанно: юзер из бота на warm-хите получает ссылку дважды — inline сразу (`cmd_config`) и пушем `config_ready` через ≤10 с как подтверждение «готово, можно подключаться»; это страховка на случай провала inline-выдачи (инцидент 2026-08-25), не баг.
+- **cold** — `_handle_task_outcome` (apply-ветка, после активации кредов, `_apply_leg_scheme` и `_finish_deferred_swap`) зовёт `_notify_bot_config_ready(device)` **только если `task.payload['notify_config_ready'] is True`**. Флаг ставит ТОЛЬКО cold-ветка `provision_subscription`; `reprovision_subscription` (failover, migrate, swap, unfreeze, add-device, health-миграция, refresh_reality_dest) его не несёт — структурный гейт, «конфиг готов» юзеру с уже живой ссылкой не приходит. `_notify_bot_config_ready` сохранено по имени/сигнатуре (тесты глушат его), тело — вызов хелпера с `commit=True`.
+
+Гейт внутри хелпера (все условия И, иначе `False` без побочек): `sub.status == active` (после 402-отката в `activate_trial_full` подписка `expired`, а cold-таска уже в очереди — пуш по мёртвой подписке не шлём; `blocked` — так же); `user.telegram_id` — строка из цифр (`legacy-user`/`unknown` не проходят); `device.status == active` и хотя бы один `cred.is_active`; **первый рабочий девайс подписки** — нет других `Device` этой подписки со статусом вне `pending/failed` (revoked/disabled строки не удаляются по sub-link invariant, так что любой предшественник блокирует); `sub.created_at` не старше 24 ч (защита от ретраев старых тасок/бэклога); дедуп по `action IN ('config_ready','config_ready:delivered')` на `target_id=sub.id`. `extra`: `telegram_id`, `subscription_id`, `device_id`, `source`, и `sub_uri` — только если `sub_links.sub_url_for(sub.sub_token)` дал абсолютный http(s) (без `SUB_LINK_BASE_URL` ссылки в пуше нет, текст ведёт в личный кабинет). Строка пишется под SAVEPOINT (`db.begin_nested()`): выход из контекста делает flush (SessionLocal `autoflush=False`), а сбой вставки откатывает только savepoint — внешняя транзакция вызывающего (warm-путь с незакоммиченными подпиской/девайсом) остаётся рабочей. Исключения ловятся и логируются — сбой пуша не роняет провижн. Флаг `notify_config_ready` из `task.payload` вырезается из `extra_vars` перед `provision_device.yml` (`_execute_task`) — это маркер для `_handle_task_outcome`, не переменная плейбука. Тесты: `backend/tests/test_config_ready_notify.py`.
+
+История: до 2026-08-25 хук клал `_notify` в `ProvisioningTask.result`, который никто не читал, — канал `config_ready` был мёртв с рождения (инцидент: бот пообещал «сейчас пришлю ссылку», ссылка не пришла, повторный тап упёрся в «подарок уже использован»). Детали очереди уведомлений через `audit_logs` — в `components/backend-api.md` и `components/bot.md`.
 
 ## Warm-pool fast path
 
@@ -333,7 +344,7 @@ else:
 
 Подписка без живых устройств (incident tail: Device без `sub_token` или полностью revoked sub) получает один свежий Device.
 
-**Защита от resurrection.** Если у старого устройства был ещё не доехавший `apply`-таск (backlog серийного воркера), его поздний успех НЕ должен воскресить `disabled`-строку. Guard в `_handle_task_outcome` (apply-ветка): если устройство уже `disabled`/`revoked` — реактивация пропускается (`return` до `status=active` и до `_notify_bot_config_ready`). Это же чинит латентный баг во freeze/migrate-флоу.
+**Защита от resurrection.** Если у старого устройства был ещё не доехавший `apply`-таск (backlog серийного воркера), его поздний успех НЕ должен воскресить `disabled`-строку. Guard в `_handle_task_outcome` (apply-ветка): если устройство уже `disabled`/`revoked` — реактивация пропускается (`return` до `status=active` и до `_notify_bot_config_ready`). Это же чинит латентный баг во freeze/migrate-флоу. Пуш `config_ready` через `reprovision_subscription` и так невозможен — apply-таска без `payload.notify_config_ready`.
 
 **Почему старый UUID реально живёт, а не «best-effort»** (ключевой факт, проверен по коду):
 
@@ -364,7 +375,7 @@ Per-node метрик провижининга нет — есть только 
 - **`_execute_task` timeout = 300s жёсткий.** Если ansible `site.yml` на новой ноде с нестабильным сетевым линком физически не успевает за 5 минут, task становится failed без возможности продлить окно через env. Worker re-enqueue сработает с такой же 5-минуткой.
 - **Cold path credential'ы записываются с `is_active = False`.** `_handle_task_outcome` ставит их в `True` только после success. Но между commit'ом credential-row и проходом success/failure есть окно, в течение которого активная подписка имеет *неактивные* credentials. Для warm fast path этого окна нет (creds сразу активные), так что UI/sub-link отдают credentials по-разному в зависимости от пути провижининга — см. фильтрацию `is_active` в `api_extensions.dynamic_sub_link`.
 - **`revoke_device` устанавливает `device.status=disabled`, а не `revoked`.** Терминальный статус «revoked» достигается только после удаления строки из БД. Каждый другой код (admin UI, фильтры capacity) вынужден считать `disabled` и `revoked` эквивалентными — дублирование логики.
-- **`_notify_bot_config_ready` не изолирует ошибки на уровне БД.** Она ловит `Exception` широко (`provisioning.py:689-690`), но **после** `success`-commit'а; то есть если не получилось записать уведомление — task всё равно success, пользователь будет ждать без уведомления до следующего notification-poll'а... которого может и не быть, если bot в этот момент был down.
+- **`_notify_bot_config_ready` — уведомление отдельной транзакцией после `success`-commit'а** (осознанно): если запись строки `config_ready` упала, таска остаётся success, ошибка в логе, пуша нет. Это намеренно — уведомление не должно ронять провижн; ссылка при этом всегда доступна в личном кабинете и по `/config`. Недоступность бота в момент записи не важна: строка ждёт в `audit_logs`, пока поллер её не заберёт (см. `services/config_ready.py`).
 - **`access_username` с timestamp suffix только в `reprovision_subscription`.** Cold path reprovision добавляет `-<epoch_second>` к username, чтобы избежать TTL collision на ноде (старый username может ещё жить в кэше ansible/xray после state=absent). Обычный `provision_subscription` такого suffix'а не делает — предполагается, что первый username на ноде всегда свежий.
 
 > ⚠️ См. audit/... — subprocess ansible-playbook с расшифрованными секретами в CLI `--extra-vars`.

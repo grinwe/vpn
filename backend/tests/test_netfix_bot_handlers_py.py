@@ -13,147 +13,25 @@
 * Finding #7 — `_poll_ops_exec`: N подряд сетевых провалов → маркер
   `unreachable` вместо оптимистичного «executing»; успех сбрасывает счётчик.
 
-В backend-тест-образе нет ни aiogram, ни aiohttp (это зависимости bot-стека),
-а импорт bot.handlers на уровне модуля выполняет десятки @router-декораторов и
-аннотаций. Поэтому все внешние модули заглушаются через sys.modules
-(monkeypatch авто-откатывает), а bot.handlers перечитывается поверх заглушек.
+Стабы aiogram/aiohttp/bot.* — общие, в ``tests/_bot_stubs.py`` (раньше
+копия жила здесь и отстала от импортов handlers.py после 9cec853/8e0eff0 —
+семь ERROR на сборе).
 """
 from __future__ import annotations
 
 import asyncio
-import os
 import sys
-import types as _pytypes
 
 import pytest
 
-# Корень репозитория (там лежит пакет `bot/`) на sys.path.
-_REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
-if _REPO_ROOT not in sys.path:
-    sys.path.insert(0, _REPO_ROOT)
+from tests._bot_stubs import bot_sources_available, install_bot_stubs
 
-if not os.path.isfile(os.path.join(_REPO_ROOT, "bot", "handlers.py")):
+if not bot_sources_available():
     pytest.skip(
         "bot/handlers.py недоступен (backend-only тест-образ) — проверяется в "
         "полном чекауте/CI",
         allow_module_level=True,
     )
-
-
-class _Any:
-    """Всеядная заглушка: поддерживает произвольный доступ к атрибутам, вызовы,
-    сравнения, `|` (для аннотаций `X | None`) и `.startswith` — этого хватает,
-    чтобы @router-декораторы и magic-фильтры aiogram (`F.text == ...`) прошли на
-    импорте."""
-
-    __hash__ = object.__hash__
-
-    def __getattr__(self, _n):
-        return self
-
-    def __call__(self, *a, **k):
-        return self
-
-    def __eq__(self, _o):
-        return self
-
-    def __or__(self, _o):
-        return self
-
-    def __ror__(self, _o):
-        return self
-
-    def startswith(self, *a, **k):
-        return self
-
-
-_ANY = _Any()
-
-
-def _install_stubs(monkeypatch):
-    def _mod(name, **attrs):
-        m = _pytypes.ModuleType(name)
-        for k, v in attrs.items():
-            setattr(m, k, v)
-        monkeypatch.setitem(sys.modules, name, m)
-        return m
-
-    class _Router:
-        def _dec(self, *a, **k):
-            def wrap(fn):
-                return fn
-
-            return wrap
-
-        message = _dec
-        callback_query = _dec
-        pre_checkout_query = _dec
-
-    class _ClientTimeout:
-        def __init__(self, total=None, connect=None):
-            self.total = total
-            self.connect = connect
-
-    class _ClientError(Exception):
-        pass
-
-    class _TelegramBadRequest(Exception):
-        pass
-
-    _mod("aiogram", F=_ANY, Router=_Router, types=_ANY)
-    _mod("aiogram.exceptions", TelegramBadRequest=_TelegramBadRequest)
-    _any_factory = lambda *a, **k: _ANY  # noqa: E731
-    _mod(
-        "aiogram.filters",
-        Command=_any_factory,
-        CommandObject=_ANY,
-        CommandStart=_any_factory,
-    )
-    _mod("aiogram.fsm")
-    _mod("aiogram.fsm.context", FSMContext=_ANY)
-    _mod(
-        "aiohttp",
-        ClientTimeout=_ClientTimeout,
-        ClientError=_ClientError,
-        ClientSession=object,
-    )
-
-    _kb = lambda *a, **k: None  # noqa: E731
-    _mod(
-        "bot.config",
-        ADMIN_API_TOKEN="tok",
-        ADMIN_IDS=set(),
-        BACKEND_URL="http://backend",
-        PAYMENT_PROVIDER="stub",
-        # Stage 9b (61217f7) добавил этот импорт в handlers.py, а стаб не
-        # обновили — тест валился ImportError'ом на СБОРЕ, т.е. падал весь
-        # bot-срез в CI. Держим стаб в синхроне со списком импортов handlers.
-        PAYMENT_PROVIDER_CHOICES=(),
-        SUB_LINK_BASE_URL="",
-        TELEGRAM_STARS_WEBHOOK_SECRET="secret",
-    )
-    _mod(
-        "bot.keyboards",
-        BTN_BUY="Купить",
-        BTN_HELP="Помощь",
-        BTN_INVITE="Пригласить",
-        BTN_MAIN_MENU="Меню",
-        BTN_TOPUP="Пополнить",
-        BTN_VPN_BROKEN="VPN не работает",
-        WEBAPP_BASE_URL="",
-        WEBAPP_URL="",
-        help_back_keyboard=_kb,
-        help_keyboard=_kb,
-        onboarding_keyboard=_kb,
-        start_keyboard=_kb,
-        webapp_inline_keyboard=_kb,
-        welcome_action_keyboard=_kb,
-    )
-
-    monkeypatch.delitem(sys.modules, "bot.handlers", raising=False)
-    import importlib
-
-    return importlib.import_module("bot.handlers")
 
 
 # ── Фейки сессий/ответов ──
@@ -202,7 +80,7 @@ class _ScriptSession:
 
 @pytest.fixture()
 def handlers(monkeypatch):
-    mod = _install_stubs(monkeypatch)
+    mod = install_bot_stubs(monkeypatch)
     # Мгновенный sleep — не ждём реальные backoff/poll паузы.
     orig_sleep = asyncio.sleep
 

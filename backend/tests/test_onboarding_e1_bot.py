@@ -81,9 +81,10 @@ def test_new_user_sees_single_gift_button(kb):
     texts = _texts(markup)
 
     assert texts[0] == "🎁 Забрать бесплатный месяц"
-    # Кэшбастер ?v=<версия> обязателен: без него Telegram-webview может
-    # открыть mini app из протухшего HTTP-кэша (белый лист после выката).
-    assert markup.inline_keyboard[0][0].web_app.url == "https://example.test/app/?v=9.9.9"
+    # Активация нативная (trial:activate), а не web_app: ЛК у части юзеров не
+    # открывается вовсе (аудит 2026-08-21, паритет A).
+    assert markup.inline_keyboard[0][0].callback_data == "trial:activate"
+    assert markup.inline_keyboard[0][0].web_app is None
     # Один экран — одно действие: тарифы допустимы, «поломочные» пункты — нет.
     assert "❓ Проблема с ЛК" not in texts
     assert len(texts) <= 2, f"первый экран новичка перегружен: {texts}"
@@ -110,13 +111,17 @@ def test_bottom_keyboard_hides_broken_button_without_devices(kb):
     assert kb.BTN_MAIN_MENU in without and kb.BTN_HELP in without
 
 
-def test_gift_button_absent_without_https_webapp(kb, monkeypatch):
-    """Без валидного WebApp-URL кнопки подарка быть не может — иначе оффер
-    остаётся обещанием без адреса."""
+def test_gift_button_stays_without_https_webapp(kb, monkeypatch):
+    """Подарок не зависит от ЛК: активация нативная, поэтому без валидного
+    WebApp-URL кнопка подарка ОСТАЁТСЯ (раньше она была web_app и без https
+    пропадала — оффер без адреса). Исчезает только кнопка самого ЛК."""
     monkeypatch.setenv("WEBAPP_BASE_URL", "")
     mod = importlib.reload(kb)
     texts = _texts(mod.welcome_action_keyboard(trial_available=True, is_new=True))
-    assert "🎁 Забрать бесплатный месяц" not in texts
+    assert "🎁 Забрать бесплатный месяц" in texts
+    assert "🔐 Открыть личный кабинет" not in texts
+    returning = _texts(mod.welcome_action_keyboard(trial_available=False, is_new=False))
+    assert "🔐 Открыть личный кабинет" not in returning
 
 
 # ── Троттл переноса: не предлагать выбор, которым нельзя воспользоваться ──

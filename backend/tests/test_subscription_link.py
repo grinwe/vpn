@@ -9,10 +9,24 @@ from __future__ import annotations
 import base64
 from datetime import datetime, timedelta
 
+import pytest
+
 from app import models
+from app.services import provisioning_throttle
 from app.services.provisioning import ProvisioningOrchestrator
 
 from .factories import make_config, make_node, make_plan, make_user
+
+
+@pytest.fixture(autouse=True)
+def _reset_cold_throttle():
+    """Cold-path троттл — глобальный in-memory bucket на процесс: после
+    провижининг-тяжёлых файлов (test_trial_activate_full, test_warm_pool,
+    test_config_ready_notify) бюджет исчерпан, и provision_subscription
+    здесь падал ColdPathThrottled в зависимости от порядка файлов."""
+    provisioning_throttle.reset_for_tests()
+    yield
+    provisioning_throttle.reset_for_tests()
 
 
 def _node_with_two_protocols(db):

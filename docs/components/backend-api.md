@@ -143,6 +143,8 @@ POST /api/notifications/{id}/ack                ← require_admin (ack от бо
 
 `optional_admin` значит: токен не обязателен, но если прислан — проверяется как admin. Это оставлено для совместимости со старыми бот-сборками, которые ходили без заголовка; сейчас бот всегда подкладывает admin-token, поэтому `optional` фактически совпадает с `required`.
 
+`POST /api/users/register` идемпотентен и служит боту read-API входных экранов (`_fetch_user_flags`). Ответ: `id`, `telegram_id`, `created`, `trial_available` (триал ещё не активирован), `has_devices` (есть ACTIVE-девайс — гейт «🆘 VPN не работает»: чинить можно только выданное), `has_subscription` (есть подписка `active` или `frozen` — гейт пути к ссылке `go:config` и строки «у тебя уже есть подписка» в `/plans`; отдельно от `has_devices`, потому что на cold-пути девайс ~минуту `pending`, а у замороженного девайсов нет вовсе — ревью инцидента 2026-08-25), `referral_bonus_credited` (всегда `false`, legacy).
+
 ### `/api/sub/{token}` — единственный анонимный роут бэкенда
 
 ```python
@@ -263,6 +265,8 @@ POST приходит по URL, и защита в слое отображени
 ### Notification queue-через-AuditLog
 
 Уведомления бота живут не в отдельной таблице, а в `audit_logs` со специальными `action` ('renewal_reminder', 'config_ready', 'migration_notice', 'low_balance_warning', 'trial_expiry_warning'). Бот опрашивает `/api/notifications/pending`, получает человекочитаемый текст (собранный бэкендом из `extra`-полей) и ack'ит через `/api/notifications/{id}/ack`, который просто дописывает `:delivered` в `log.action`. Детали — `api_extensions.py:359-458`.
+
+**`config_ready`** — продюсер `services/config_ready.py::notify_config_ready` (из `provisioning.provision_subscription`: warm-hit сразу, cold — из `_handle_task_outcome` по флагу `payload.notify_config_ready`). Пишется ОДИН раз на первый рабочий девайс свежей (<24 ч) подписки с числовым `telegram_id`; `target_type='subscription'`, `target_id=sub.id`; дедуп по `config_ready`/`config_ready:delivered`. `extra.sub_uri` — абсолютная ссылка от `sub_links.sub_url_for(sub.sub_token)` (та же 50/50-раскладка доменов, что у бота и ЛК); без `SUB_LINK_BASE_URL` ключа нет. Рендер: «✅ Конфиг VPN готов, можно подключаться!», строка `Ссылка: …` только при `sub_uri`, и всегда хвост про личный кабинет (кнопка «Личный кабинет» внизу) и `/config` — чтобы юзер без ссылки в пуше не упёрся в тупик. До 2026-08-25 этот `action` никто не писал (хук клал `_notify` в `ProvisioningTask.result`), канал был мёртв. Гейт целиком — в `docs/components/provisioning.md`, «Bot notification hook».
 
 **Приоритет + FIFO на выборке (сетевой аудит).** `get_pending_notifications` делит `action` на два класса и выбирает **priority-строки первыми** (всё, кроме `admin_broadcast`), добивая свободные слоты `limit` массовой рассылкой. Внутри выборка — `order_by(created_at.asc())` (FIFO), а не прежний `.desc()` (LIFO). Раньше диспетчер рассылки наполнял очередь батчами по 50/тик, поллер сливал 20/тик, и из-за DESC-сортировки более свежие `admin_broadcast` вытесняли срочные транзакционные пуши (`config_ready`, `expiry_reminder_1d`, `migration_notice`, `health_ping_request`) в хвост на десятки минут. Теперь рассылка не может вытеснить срочный пуш из окна доставки. Это серверная страховка в дополнение к within-tick сортировке на стороне бота (см. `docs/components/bot.md`).
 

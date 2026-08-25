@@ -78,7 +78,15 @@ def _install_stubs(monkeypatch):
     _mod("aiogram.fsm")
     _mod("aiogram.fsm.storage")
     _mod("aiogram.fsm.storage.memory", MemoryStorage=object)
-    _mod("aiogram.types", ErrorEvent=object)
+    # bot/bot.py импортит и MenuButtonWebApp/WebAppInfo (кнопка «Личный
+    # кабинет» у поля ввода, set_chat_menu_button) — без них ImportError на
+    # сборе всех трёх тестов поллера.
+    _mod(
+        "aiogram.types",
+        ErrorEvent=object,
+        MenuButtonWebApp=lambda **kw: None,
+        WebAppInfo=lambda **kw: None,
+    )
 
     # --- aiohttp ---
     # Поллер строит таймаут через ``__import__("aiohttp").ClientTimeout(total=5)``
@@ -100,16 +108,21 @@ def _install_stubs(monkeypatch):
         BOT_WEBHOOK_PORT=0,
     )
     _kb = lambda *a, **k: None  # noqa: E731
+    # Держать в синхроне с ``from .handlers import (...)`` в bot/bot.py:
+    # devices_router появился с экраном «Устройства» (9cec853), без него
+    # ImportError на сборе.
     _mod(
         "bot.handlers",
         close_session=lambda *a, **k: None,
         router=object(),
+        devices_router=object(),
         get_session=lambda *a, **k: None,
         onboarding_keyboard=_kb,
         health_ping_keyboard=_kb,
         node_diagnosis_keyboard=_kb,
     )
-    _mod("bot.keyboards", DEFAULT_COMMANDS=[])
+    # WEBAPP_URL — кнопка «Личный кабинет» у поля ввода (set_chat_menu_button).
+    _mod("bot.keyboards", DEFAULT_COMMANDS=[], WEBAPP_URL="")
     _mod("bot.middleware", BanGuard=object)
     _mod("bot.support", support_router=object())
 
@@ -144,7 +157,13 @@ class _FakeSession:
     * GET /pending каждый тик возвращает `notifications`; на `stop_after_get`
       вызове бросает CancelledError → поллер штатно выходит.
     * POST /ack: при ack_ok=False бросает ConnectionError (симуляция
-      недоступного backend'а), иначе отдаёт 200.
+      недоступного backend'а), иначе отдаёт 200 — и, как настоящий бэкенд,
+      после этого /pending запись больше не возвращает. Без этого фейк
+      отдавал бы ACK-нутую запись снова в том же тике, где фоновая ACK-таска
+      только что завершилась: её done_callback ещё не снял id с реестра
+      ``_ack_tasks``, ``_spawn_ack`` дедупил повторную отправку как «в
+      полёте», и id зависал в ``_sent_unacked`` — артефакт фейка, в проде
+      /pending ACK-нутое не отдаёт.
     """
 
     def __init__(self, notifications, stop_after_get=3, ack_ok=False):
@@ -153,18 +172,23 @@ class _FakeSession:
         self.ack_ok = ack_ok
         self.get_calls = 0
         self.post_calls = 0
+        self.acked: set[int] = set()
 
     def get(self, url, **kw):
         self.get_calls += 1
         if self.get_calls >= self.stop_after_get:
             raise asyncio.CancelledError()
         # Возвращаем свежую копию — код мог бы мутировать список.
-        return _FakeResp(200, list(self.notifications))
+        return _FakeResp(
+            200, [n for n in self.notifications if n.get("id") not in self.acked]
+        )
 
     def post(self, url, **kw):
         self.post_calls += 1
         if not self.ack_ok:
             raise ConnectionError("ack backend down")
+        # .../api/notifications/{id}/ack
+        self.acked.add(int(url.rstrip("/").rsplit("/", 2)[-2]))
         return _FakeResp(200)
 
 
@@ -197,6 +221,15 @@ async def _run_poller(mod, monkeypatch, session, poll_interval=0.001):
     return fake_bot
 
 
+async def _drain_acks(mod) -> None:
+    """ACK ушёл в фон (сетевой аудит: ``_spawn_ack`` + реестр ``_ack_tasks``),
+    поллер выходит по CancelledError, не дожидаясь его. Ассерты про
+    ``_sent_unacked`` / число POST'ов без этого гонятся с фоновой таской."""
+    pending = list(mod._ack_tasks.values())
+    if pending:
+        await asyncio.gather(*pending, return_exceptions=True)
+
+
 @pytest.mark.asyncio
 async def test_failed_ack_does_not_resend_next_tick(monkeypatch):
     """Главный кейс #208: ACK падает — второй тик НЕ шлёт дубль."""
@@ -208,13 +241,16 @@ async def test_failed_ack_does_not_resend_next_tick(monkeypatch):
     session = _FakeSession([notif], stop_after_get=3, ack_ok=False)
 
     fake_bot = await _run_poller(mod, monkeypatch, session)
+    await _drain_acks(mod)
 
     # Несмотря на два тика, сообщение ушло в Telegram РОВНО один раз.
     assert len(fake_bot.sends) == 1, fake_bot.sends
     # ACK так и не прошёл — id остаётся в дедуп-наборе.
     assert 42 in mod._sent_unacked
-    # ACK ретраился: 3 попытки на первом тике + 3 на втором (до-ACK).
-    assert session.post_calls >= 4
+    # ACK ретраился: 3 попытки фоновой таски первого тика. Второй тик НЕ
+    # плодит параллельный ACK, пока первый в полёте (дедуп _ack_tasks), но
+    # если первый уже отработал — до-ACKнет ещё тремя попытками: 3..6.
+    assert 3 <= session.post_calls <= 6, session.post_calls
 
 
 @pytest.mark.asyncio
@@ -227,6 +263,7 @@ async def test_successful_ack_clears_dedup(monkeypatch):
     session = _FakeSession([notif], stop_after_get=3, ack_ok=True)
 
     fake_bot = await _run_poller(mod, monkeypatch, session)
+    await _drain_acks(mod)
 
     # На втором тике /pending уже не должен возвращать эту запись в реале;
     # но даже если вернёт — важно, что после успешного ACK id снят.

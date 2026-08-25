@@ -320,7 +320,7 @@ ONBOARDING_INSTRUCTIONS = {
     "android": (
         "<b>Настройка на Android (v2rayNG):</b>\n\n"
         "1. Установите <b>v2rayNG</b> из Google Play или GitHub\n"
-        "2. Скопируйте ссылку конфига (команда /config)\n"
+        "2. Скопируйте ссылку подписки: она в личном кабинете или по команде /config\n"
         "3. Откройте v2rayNG → нажмите <b>+</b> → <b>Импорт из буфера</b>\n"
         "4. Нажмите кнопку ▶️ для подключения\n\n"
         "Альтернатива: <b>Hiddify</b> (Google Play) — автоимпорт по ссылке."
@@ -328,21 +328,21 @@ ONBOARDING_INSTRUCTIONS = {
     "ios": (
         "<b>Настройка на iOS (Hiddify / Streisand):</b>\n\n"
         "1. Установите <b>Hiddify</b> или <b>Streisand</b> из App Store\n"
-        "2. Скопируйте ссылку конфига (команда /config)\n"
+        "2. Скопируйте ссылку подписки: она в личном кабинете или по команде /config\n"
         "3. Откройте приложение → <b>+</b> → <b>Добавить из буфера</b>\n"
         "4. Нажмите <b>Подключить</b>"
     ),
     "windows": (
         "<b>Настройка на Windows (Hiddify / Nekoray):</b>\n\n"
         "1. Скачайте <b>Hiddify</b> с hiddify.com или <b>Nekoray</b> с GitHub\n"
-        "2. Скопируйте ссылку конфига (команда /config)\n"
+        "2. Скопируйте ссылку подписки: она в личном кабинете или по команде /config\n"
         "3. В программе: <b>Добавить профиль из буфера</b>\n"
         "4. Активируйте системный прокси и подключитесь"
     ),
     "macos": (
         "<b>Настройка на macOS (Hiddify):</b>\n\n"
         "1. Скачайте <b>Hiddify</b> с hiddify.com\n"
-        "2. Скопируйте ссылку конфига (команда /config)\n"
+        "2. Скопируйте ссылку подписки: она в личном кабинете или по команде /config\n"
         "3. Добавьте профиль из буфера обмена\n"
         "4. Подключитесь"
     ),
@@ -353,17 +353,24 @@ ONBOARDING_INSTRUCTIONS = {
 
 _TRIAL_LINE = (
     "🎁 Первый месяц — бесплатно, карта не нужна.\n"
-    "Один тап в кабинете: получишь ссылку и инструкцию, как подключиться.\n\n"
+    "Один тап по кнопке ниже: получишь ссылку и инструкцию, как подключиться.\n\n"
 )
 
 
-async def _fetch_user_flags(telegram_id: int) -> tuple[bool, bool]:
-    """``(trial_available, has_devices)`` для юзера — общий хелпер входных экранов.
+async def _fetch_user_flags(telegram_id: int) -> tuple[bool, bool, bool]:
+    """``(trial_available, has_devices, has_subscription)`` — общий хелпер входных экранов.
 
     Нужен там, где приветствие/тарифы рисуются НЕ из ``/start`` (главное меню,
     список тарифов): раньше эти экраны хардкодили ``trial_available=False`` и
     подарок из них пропадал. Регистрация идемпотентна, поэтому переиспользуем
     её же эндпоинт вместо отдельного read-API.
+
+    Два флага про подписку — нарочно разные. ``has_devices`` бэкенд считает
+    по ACTIVE-девайсам и им гейтится «🆘 VPN не работает» (чинить можно только
+    выданное). ``has_subscription`` — есть подписка active/frozen, и им
+    гейтится путь к ссылке (go:config): у юзера на cold-пути девайс ~минуту
+    pending (или failed), у замороженного девайсов нет вовсе — но подписка
+    есть, и ссылку/статус ему показывать надо (ревью инцидента 2026-08-25).
 
     Fail-safe в сторону новичка (как в ``cmd_start``): не достучались — считаем,
     что подарок ещё доступен. Показать оффер лишний раз безопасно, бэкенд
@@ -378,10 +385,14 @@ async def _fetch_user_flags(telegram_id: int) -> tuple[bool, bool]:
             timeout=aiohttp.ClientTimeout(total=_REGISTER_TIMEOUT_S),
         )
         if data:
-            return bool(data.get("trial_available")), bool(data.get("has_devices"))
+            return (
+                bool(data.get("trial_available")),
+                bool(data.get("has_devices")),
+                bool(data.get("has_subscription")),
+            )
     except Exception:  # noqa: BLE001
         logger.warning("_fetch_user_flags: бэкенд недоступен, показываем оффер")
-    return True, False
+    return True, False, False
 
 
 def format_welcome(name: str, is_new: bool, trial_available: bool) -> str:
@@ -493,6 +504,7 @@ async def cmd_start(message: types.Message, state: FSMContext):
     is_new = True
     trial_available = True
     has_devices = False
+    has_subscription = False
     try:
         _status, data = await _fetch_json(
             "POST",
@@ -505,6 +517,7 @@ async def cmd_start(message: types.Message, state: FSMContext):
             is_new = bool(data.get("created"))
             trial_available = bool(data.get("trial_available"))
             has_devices = bool(data.get("has_devices"))
+            has_subscription = bool(data.get("has_subscription"))
         # Быстрый таймаут мог оборваться раньше, чем метка/реферал доехали до
         # бэка. Если не достучались, но атрибуция была — до-регистрируем в фоне
         # полным таймаутом, чтобы не потерять источник конверсии.
@@ -524,7 +537,9 @@ async def cmd_start(message: types.Message, state: FSMContext):
     await message.answer(
         welcome,
         reply_markup=welcome_action_keyboard(
-            trial_available=trial_available, is_new=is_new
+            trial_available=trial_available,
+            is_new=is_new,
+            has_link=has_subscription or has_devices,
         ),
     )
     # E1.5: новичку не сообщаем про поломки до того, как он что-то получил —
@@ -596,7 +611,11 @@ async def list_plans(
     # нижней клавиатуре, поэтому на прайс попадает половина новичков — и до
     # этого фикса видела просьбу заплатить без единого упоминания подарка,
     # который ей уже пообещали на первом экране.
-    trial_available, _has_devices = await _fetch_user_flags(uid)
+    trial_available, has_devices, has_subscription = await _fetch_user_flags(uid)
+    # Путь к ссылке показываем по подписке, а не только по живым девайсам:
+    # на cold-пути девайс ~минуту pending, у замороженного девайсов нет —
+    # оба иначе видели бы голый прайс.
+    has_link = has_subscription or has_devices
 
     lines: list[str] = []
     if trial_available:
@@ -605,6 +624,15 @@ async def list_plans(
             "Он уже ждёт в личном кабинете: один тап, карта не нужна.",
             "",
             "Ниже — тарифы, если захочешь больше устройств или сразу на год.",
+            "",
+        ]
+    elif has_link:
+        # Инцидент 2026-08-25: после провала выдачи ссылки юзер тапал
+        # «💎 Подписка» и упирался в голый прайс — ни слова о том, что подписка
+        # у него уже есть и где взять ссылку. Прайс остаётся (апгрейд/год),
+        # но путь к ссылке — первым.
+        lines += [
+            "У тебя уже есть подписка. Ссылка и всё по ней лежат в личном кабинете.",
             "",
         ]
     lines += [
@@ -655,8 +683,75 @@ async def list_plans(
             text="🎁 Забрать бесплатный месяц",
             callback_data="trial:activate",
         )])
+    elif has_link:
+        # Тому, у кого подписка уже есть, первой строкой — путь к ссылке:
+        # ЛК (основное место) и нативная выдача (go:config) как фолбэк на
+        # случай, когда ЛК не открывается.
+        link_row = []
+        if WEBAPP_BASE_URL.startswith("https://"):
+            link_row.append(types.InlineKeyboardButton(
+                text="🔐 Личный кабинет",
+                web_app=types.WebAppInfo(url=WEBAPP_URL),
+            ))
+        link_row.append(types.InlineKeyboardButton(
+            text="🔗 Ссылка для подключения", callback_data="go:config"
+        ))
+        rows.insert(0, link_row)
     keyboard = types.InlineKeyboardMarkup(inline_keyboard=rows)
     await _say("\n".join(lines), reply_markup=keyboard)
+
+
+# Текст 409 бэкенда, когда подарок уже отработан и подписка жива (в т.ч.
+# заморожена) — см. api_extensions.activate_trial_full. Любой ДРУГОЙ detail
+# в 409 — это str(RuntimeError) провижининга: бонус уже зачислен, а подписку
+# собрать не вышло (нет нод / лимит устройств). Тексты бота должны эти два
+# случая различать: во втором прайс бесполезен, нужна поддержка.
+_TRIAL_409_LIVE_DETAIL = "User already has a live subscription"
+
+# Фолбэк, когда ссылку в чат прислать не удалось. Обещание ссылки никогда не
+# должно обрываться молча (инцидент 2026-08-25): юзер должен знать, где её
+# забрать самому — ЛК как основное место, /config как нативный путь.
+_SUB_LINK_FALLBACK_TEXT = (
+    "Ссылку не удалось прислать сюда. Забери её в личном кабинете "
+    "(кнопка внизу) или напиши /config чуть позже."
+)
+_SUB_LINK_MISSING_HINT = (
+    "Если ссылка не пришла, она всегда есть в личном кабинете (кнопка "
+    "внизу). Или напиши /config через минуту."
+)
+
+
+async def _try_send_sub_link(callback_query: types.CallbackQuery, uid: int, chat_id: int) -> str:
+    """Ссылка подписки из callback-пути через тот же ``cmd_config``, что и /config.
+
+    Возвращает ``"sent"`` (ссылка ушла), ``"missing"`` (ссылки нет: cmd_config
+    в тихом режиме либо промолчал, либо сказал «ещё создаётся») или
+    ``"failed"`` (cmd_config упал — фолбэк на ЛК уже отправлен здесь).
+
+    Инцидент 2026-08-25 (user 1000054): RecursionError внутри cmd_config
+    улетел в глобальный errors-хендлер, и после «Сейчас пришлю ссылку» юзер
+    не получил ничего; повторный тап дал 409 → «подарок уже использован» +
+    прайс. Поэтому любое исключение тут ловим и отвечаем фолбэком, а не
+    тишиной. ``message`` может быть InaccessibleMessage (>48ч) — тогда путь
+    через bot/chat_id.
+    """
+    bot = callback_query.bot
+    try:
+        if isinstance(callback_query.message, types.Message):
+            delivered = await cmd_config(
+                callback_query.message, user_id=uid, quiet_if_missing=True
+            )
+        else:
+            delivered = await cmd_config(
+                None, user_id=uid, bot=bot, chat_id=chat_id, quiet_if_missing=True
+            )
+    except Exception:  # noqa: BLE001 — любой сбой выдачи → фолбэк, не тишина
+        logger.exception("sub-link delivery failed for user %s", uid)
+        await bot.send_message(
+            chat_id, _SUB_LINK_FALLBACK_TEXT, reply_markup=webapp_inline_keyboard()
+        )
+        return "failed"
+    return "sent" if delivered else "missing"
 
 
 @router.callback_query(F.data == "trial:activate")
@@ -703,24 +798,56 @@ async def trial_activate_cb(callback_query: types.CallbackQuery):
                 expires = ""
         await bot.send_message(
             chat_id,
-            f"🎉 Готово! Бесплатный месяц активирован{expires}.\n"
-            "Сейчас пришлю ссылку для подключения. Конфиг может собираться "
-            "около минуты, если ссылка не заработает сразу, подожди чуть-чуть "
-            "и обнови подписку в приложении.",
+            f"🎉 Готово! Бесплатный месяц активирован{expires}.\n\n"
+            "Сейчас пришлю ссылку для подключения. Конфиг собирается около "
+            "минуты: если ссылка не заработает сразу, подожди чуть-чуть и "
+            "обнови подписку в приложении.\n\n"
+            "Ссылка всегда лежит в личном кабинете (кнопка «Личный кабинет» "
+            "внизу) и приходит по команде /config.",
         )
-        # Ссылку выдаёт тот же код, что /config: единая точка правды.
-        # message может быть InaccessibleMessage (>48ч) — путь через
-        # bot/chat_id, иначе обещание ссылки обрывалось бы молча.
-        if isinstance(callback_query.message, types.Message):
-            await cmd_config(callback_query.message, user_id=uid)
-        else:
-            await cmd_config(None, user_id=uid, bot=bot, chat_id=chat_id)
+        # Ссылку выдаёт тот же код, что /config: единая точка правды. Тихий
+        # режим: «нет активных подписок / /plans» сразу после «Готово!» был
+        # бы ложью — вместо него подсказка про ЛК и /config.
+        outcome = await _try_send_sub_link(callback_query, uid, chat_id)
+        if outcome == "missing":
+            await bot.send_message(
+                chat_id, _SUB_LINK_MISSING_HINT, reply_markup=webapp_inline_keyboard()
+            )
         return
     if status_code == 409:
+        detail = str(data.get("detail") or "") if isinstance(data, dict) else ""
+        if detail == _TRIAL_409_LIVE_DETAIL:
+            # Подписка уже есть — юзеру нужна ссылка, а не прайс. Ровно этот
+            # экран видел user 1000054 после провала первой выдачи: «подарок
+            # уже использован» + тарифы, хотя месяц у него уже активирован.
+            await bot.send_message(chat_id, "У тебя уже есть подписка 😉")
+            outcome = await _try_send_sub_link(callback_query, uid, chat_id)
+            if outcome == "missing":
+                await bot.send_message(
+                    chat_id,
+                    "Если ссылка не пришла, она есть в личном кабинете (кнопка "
+                    "внизу). Статус подписки: /status, ссылка позже: /config.",
+                    reply_markup=webapp_inline_keyboard(),
+                )
+            return
+        if detail:
+            # str(RuntimeError) провижининга: бонус зачислен, подписки нет.
+            # Прайс тут бесполезен — покупка упрётся в то же самое.
+            await bot.send_message(
+                chat_id,
+                "Подарок зачислен на баланс, но собрать подписку сейчас не "
+                "удалось 😔 Напиши /help, разберёмся и всё выдадим.",
+            )
+            return
+        # detail неизвестен (не-JSON ответ и т.п.) — безопасный дефолт:
+        # сначала пробуем отдать ссылку, прайс только если её нет.
+        if await _try_send_sub_link(callback_query, uid, chat_id) != "missing":
+            return
         await bot.send_message(
             chat_id,
             "Подарок уже был использован, либо у тебя уже есть активная "
-            "подписка 😉 Ссылка для подключения: /config. Тарифы:",
+            "подписка 😉 Ссылка для подключения лежит в личном кабинете (кнопка "
+            "внизу) и приходит по команде /config. Тарифы:",
         )
         if isinstance(callback_query.message, types.Message):
             await list_plans(callback_query.message, user_id=uid)
@@ -999,7 +1126,8 @@ async def _stars_successful_payment(message: types.Message) -> None:
 
     await message.answer(
         "✅ Оплата получена! Конфиг будет готов через минуту.\n"
-        "Используй /config чтобы получить ссылку для подключения.",
+        "Ссылка для подключения: в личном кабинете (кнопка ниже) или по "
+        "команде /config.",
         reply_markup=onboarding_keyboard(),
     )
 
@@ -1014,9 +1142,26 @@ async def cmd_config(
     *,
     bot: "types.Bot | None" = None,
     chat_id: int | None = None,
-):
-    """Ссылка подписки. ``bot``/``chat_id`` — путь для callback'ов на
-    сообщениях старше 48ч (InaccessibleMessage без ``.answer``)."""
+    quiet_if_missing: bool = False,
+) -> bool:
+    """Ссылка подписки. Возвращает True, если ссылка отправлена.
+
+    ``bot``/``chat_id`` — путь для callback'ов на сообщениях старше 48ч
+    (InaccessibleMessage без ``.answer``).
+
+    ``quiet_if_missing=True`` — НЕ слать «нет активных подписок / /plans»,
+    только вернуть False: вызывающий сам решает, что показать
+    (trial_activate_cb: после «Готово!» такой текст был бы ложью, после 409 —
+    прайс уместен только если ссылки правда нет). «⏳ ещё создаётся»,
+    «❄️ заморожена» и «сервис недоступен» шлём всегда: это честный статус
+    подписки, а не отсылка к покупке.
+
+    Инцидент 2026-08-25 (user 1000054): вложенный ``_say`` при живом
+    ``message`` звал САМ СЕБЯ вместо ``message.answer`` (внесено 5d696f6) →
+    RecursionError → /config, «Мой конфиг» и ссылка после триала не приходили
+    никому. Структурный тест на самовызов вложенных хелперов —
+    ``backend/tests/test_bot_sublink_delivery.py``.
+    """
     if message is not None:
         bot = message.bot
         chat_id = message.chat.id
@@ -1024,7 +1169,7 @@ async def cmd_config(
 
     async def _say(text: str, **kwargs):
         if message is not None:
-            await _say(text, **kwargs)
+            await message.answer(text, **kwargs)
         else:
             await bot.send_message(chat_id, text, **kwargs)
 
@@ -1039,13 +1184,14 @@ async def cmd_config(
         # видит ложное «у тебя нет подписок».
         if status_code == 0:
             await _say("Сервис временно недоступен. Попробуй позже.")
-            return
+            return False
         if status_code != 200:
-            await _say("У тебя пока нет активных подписок. Используй /plans для покупки.")
-            return
+            if not quiet_if_missing:
+                await _say("У тебя пока нет активных подписок. Используй /plans для покупки.")
+            return False
     except aiohttp.ClientError:
         await _say("Бэкенд недоступен. Попробуйте позже.")
-        return
+        return False
 
     # Find the latest active subscription with active credentials
     active_sub = None
@@ -1063,9 +1209,20 @@ async def cmd_config(
                         await _say(
                             "⏳ Твой конфиг ещё создаётся. Подожди минуту и попробуй снова."
                         )
-                        return
+                        return False
+        if any(sub.get("status") == "frozen" for sub in data):
+            # Замороженному раньше писали «нет активных подписок» — ложь,
+            # уводившая в прайс: подписка есть, её надо разморозить. Это
+            # статус, а не отсылка к покупке, поэтому идёт и в тихом режиме.
+            await _say(
+                "❄️ Подписка заморожена. Разморозь её через /status, "
+                "и ссылка снова заработает."
+            )
+            return False
+        if quiet_if_missing:
+            return False
         await _say("У тебя нет активных подписок с готовыми конфигами. Используй /plans.")
-        return
+        return False
 
     # /config отдаёт ОДНУ подписочную ссылку, а не список vless://.
     # Клиенты (Hiddify / V2rayNG / Streisand) сами разворачивают её в
@@ -1084,13 +1241,18 @@ async def cmd_config(
         await _say(
             "Не удалось собрать ссылку подписки. Напиши в поддержку."
         )
-        return
+        return False
 
+    # Акцент на ЛК: ссылка там лежит всегда, чат — лишь один из способов её
+    # получить. Кнопка «Личный кабинет» у поля ввода стоит в любом чате
+    # (bot.py: set_chat_menu_button), поэтому на неё и ссылаемся.
     await _say(
         "🔗 <b>Твоя ссылка подписки</b>\n"
         "Импортируй её в VPN-клиент (Hiddify / V2rayNG / Streisand) один раз — "
         "при смене сервера клиент сам подтянет новые настройки по этой ссылке.\n\n"
         "⬇️ Ссылка следующим сообщением, тапни чтобы скопировать.\n\n"
+        "Ссылка всегда лежит в личном кабинете (кнопка «Личный кабинет» внизу, "
+        "у поля ввода). Если потеряешь, забери её там или командой /config.\n\n"
         "Не знаешь как настроить? Нажми кнопку с твоей платформой ниже 👇",
         reply_markup=onboarding_keyboard(),
         parse_mode="HTML",
@@ -1100,6 +1262,7 @@ async def cmd_config(
         parse_mode="HTML",
         disable_web_page_preview=True,
     )
+    return True
 
 
 # ── Onboarding instructions callbacks ──
@@ -1211,8 +1374,8 @@ async def unfreeze_cb(callback_query: types.CallbackQuery):
         await callback_query.bot.send_message(
             chat_id,
             "🔥 Разморозил! VPN оживёт через минуту-две, ссылка прежняя "
-            "(/config). Учти: заморозка даётся один раз в год, и эта "
-            "попытка уже использована.",
+            "(в личном кабинете или /config). Учти: заморозка даётся один "
+            "раз в год, и эта попытка уже использована.",
         )
         return
     if status_code == 409:
@@ -2542,7 +2705,8 @@ async def cmd_new_config(message: types.Message):
 
     if status_code == 200:
         await message.answer(
-            "🔄 Конфиг перегенерирован. Через минуту используй /config для получения нового конфига."
+            "🔄 Конфиг перегенерирован. Через минуту забери новую ссылку "
+            "в личном кабинете или командой /config."
         )
     elif status_code == 404:
         await message.answer("Нет активных подписок.")
@@ -2718,7 +2882,8 @@ async def mark_invoice_paid(callback_query: types.CallbackQuery):
         else:
             await bot.send_message(
                 chat_id=user_id,
-                text="✅ Счет оплачен! Конфиг будет готов через минуту. Используй /config.",
+                text="✅ Счёт оплачен! Конфиг будет готов через минуту. "
+                "Ссылка для подключения: в личном кабинете или по команде /config.",
             )
     except Exception as exc:  # noqa: BLE001 — блокировка бота, битый HTML и т.п.
         logger.error(
@@ -2838,11 +3003,16 @@ async def go_start(callback_query: types.CallbackQuery):
     # E1.6: раньше флаги были захардкожены False — вернувшись в главное меню,
     # юзер терял строку про подарок, хотя подарок не забран. Оффер, который то
     # есть, то нет, читается как «предложение истекло».
-    trial_available, has_devices = await _fetch_user_flags(callback_query.from_user.id)
+    trial_available, has_devices, has_subscription = await _fetch_user_flags(
+        callback_query.from_user.id
+    )
     welcome = format_welcome(first_name, is_new=False, trial_available=trial_available)
     await callback_query.message.answer(
         welcome,
-        reply_markup=welcome_action_keyboard(trial_available=trial_available),
+        reply_markup=welcome_action_keyboard(
+            trial_available=trial_available,
+            has_link=has_subscription or has_devices,
+        ),
     )
     await callback_query.message.answer(
         "⌨️ Кнопки внизу всегда под рукой.",
@@ -2864,6 +3034,27 @@ async def go_plans(callback_query: types.CallbackQuery):
         await list_plans(msg, user_id=callback_query.from_user.id)
     else:
         await list_plans(
+            None,
+            user_id=callback_query.from_user.id,
+            bot=callback_query.bot,
+            chat_id=callback_query.from_user.id,
+        )
+
+
+@router.callback_query(F.data == "go:config")
+async def go_config(callback_query: types.CallbackQuery):
+    """Inline-шорткат к /config («🔗 Ссылка для подключения»).
+
+    Кнопка стоит на welcome/прайсе у юзера с устройствами — чтобы ссылку
+    можно было забрать ПОТОМ, если сразу не отдало (инцидент 2026-08-25).
+    telegram_id инициатора передаём явно: ``message.from_user`` тут — бот.
+    """
+    await callback_query.answer()
+    msg = callback_query.message
+    if isinstance(msg, types.Message):
+        await cmd_config(msg, user_id=callback_query.from_user.id)
+    else:
+        await cmd_config(
             None,
             user_id=callback_query.from_user.id,
             bot=callback_query.bot,
@@ -3356,7 +3547,8 @@ async def _send_devices(bot: "types.Bot", chat_id: int, uid: int) -> None:
     if not live:
         lines.append("Живых устройств нет.")
     lines.append(
-        "\nОдно устройство — одна строка. Ссылка подписки общая: /config"
+        "\nОдно устройство, одна строка. Ссылка подписки общая: "
+        "она в личном кабинете или по команде /config."
     )
     rows.append([
         types.InlineKeyboardButton(
@@ -3408,7 +3600,8 @@ async def device_add_cb(callback_query: types.CallbackQuery):
         await callback_query.bot.send_message(
             chat_id,
             f"✅ Устройство добавлено (всего {data.get('device_count')})."
-            f"{fee_note}\nИмпортни ту же ссылку на новом устройстве: /config",
+            f"{fee_note}\nИмпортни ту же ссылку на новом устройстве: она в "
+            "личном кабинете или по команде /config.",
         )
         await _send_devices(callback_query.bot, chat_id, uid)
         return
@@ -3589,7 +3782,7 @@ async def cmd_cancel_global(message: types.Message, state: FSMContext):
     (он подключён раньше) — сюда доходит только «отменять нечего».
     """
     await state.clear()
-    _trial, has_devices = await _fetch_user_flags(message.from_user.id)
+    _trial, has_devices, _has_sub = await _fetch_user_flags(message.from_user.id)
     await message.answer(
         "Ок, отменил. Выбери действие кнопкой ниже 👇",
         reply_markup=start_keyboard(has_devices=has_devices),
@@ -3606,7 +3799,7 @@ async def fallback_unknown(message: types.Message, state: FSMContext):
     чистим: живой стейт до сюда не доходит (support_router раньше).
     """
     await state.clear()
-    _trial, has_devices = await _fetch_user_flags(message.from_user.id)
+    _trial, has_devices, _has_sub = await _fetch_user_flags(message.from_user.id)
     await message.answer(
         "Не понял 🤔 Выбери действие кнопкой ниже.\n"
         "Если писал в поддержку и видишь это, нажми «❓ Помощь» и отправь "
