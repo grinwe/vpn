@@ -13,20 +13,26 @@ Xray-JSON закрывает ровно эту дыру без собствен�
 это большинство базы. Разбор партнёрской подписки (Remnawave, 2026-08-25)
 подтвердил формат на живом сервисе.
 
-Что НЕ переносится и почему
-───────────────────────────
-**Hysteria2.** У Xray нет штатного hysteria-outbound; ядра, которые его
-понимают, описывают лег как ``protocol: "hysteria"`` + ``hysteriaSettings``,
-и в этой схеме НЕТ места для obfs. Наши hy2-леги поднимаются с
-``obfs=salamander`` (см. ``node_spawner``: obfs-пароль генерится на ноду), то
-есть перенос дал бы синтаксически валидный, но заведомо не подключающийся
-outbound. Поэтому hy2 в JSON не идёт вовсе — ни в балансировщик, ни отдельным
-профилем: молча отдать нерабочий сервер хуже, чем не отдать его совсем.
+Hysteria2 — отдельным профилем, но не в балансировщике
+──────────────────────────────────────────────────────
+Xray 26.x умеет hy2 нативно: `proxy/hysteria` + `transport/internet/hysteria`,
+а obfs живёт не в настройках протокола, а в ``streamSettings.finalmask.udp``
+как маска ``salamander`` — то есть наш ``obfs=salamander`` выражается полностью.
+Проверено на живом леге: подключается, трафик идёт.
 
-Практическое следствие: пока лег-набор не переедет на hy2 без obfs, JSON-режим
-показывает МЕНЬШЕ серверов, чем плоский список. Ради этого гейт
-``MIN_BALANCER_LEGS``: профиль с одним vless-легом не даёт ни автовыбора, ни
-запасного варианта, и такому устройству честнее отдать обычную подписку.
+Но ``finalmask`` — свежее поле (в него же в 26.x переехали congestion/up/down/
+udphop), и ядро постарше о нём не знает. Незнакомое поле в streamSettings — не
+мягкая деградация «лег не отвечает», а риск отказа ВСЕГО профиля при разборе
+конфига. Поэтому hy2 отдаётся отдельными профилями и НЕ попадает в
+балансировщик: если ядро клиента его не переварит, человек теряет один пункт
+списка, а автовыбор на vless-легах продолжает работать.
+
+Когда обкатка подтвердит, что ядра целевых клиентов hy2 понимают, лег можно
+будет завести и в ``selector`` балансировщика — это правка одной функции.
+
+Гейт ``MIN_BALANCER_LEGS`` про другое: профиль автовыбора с одним vless-легом
+не даёт ни выбора, ни запасного варианта, и такому устройству честнее отдать
+обычный плоский список.
 
 **Роутинг.** Наш RU-split живёт на ноде (xray routing + hysteria acl), поэтому
 клиенту правил не передаём: всё, кроме приватных сетей, уходит в туннель — так
@@ -153,20 +159,64 @@ def _tls_settings(sni: str, fingerprint: str) -> dict:
     return out
 
 
-def uri_to_outbound(uri: str, tag: str) -> dict | None:
-    """Один наш ``vless://`` → один outbound Xray. Не-vless → None.
+def _hysteria_outbound(u, q: dict, tag: str, hostname: str, port: int) -> dict:
+    """Наш ``hy2://`` → hysteria-outbound Xray.
 
-    Разбираем только то, что реально минтим (``provisioning.py``, секция
-    Credential builders): reality поверх tcp, tls поверх xhttp и tls поверх ws.
-    Неизвестный транспорт — тоже None: лучше потерять лег, чем собрать
-    outbound наугад и получить профиль, который не подключается.
+    Аутентификация у нас — пара ``логин:пароль`` в userinfo (не UUID, как у
+    большинства панелей), и в конфиг она уезжает одной строкой.
+
+    obfs живёт НЕ в настройках протокола, а в ``finalmask.udp``: salamander —
+    это маска UDP-пакетов, накладываемая поверх транспорта. Без неё сервер
+    просто не ответит — на ноде obfs включён.
+    """
+    auth = unquote(u.netloc.split("@", 1)[0])
+    tls: dict = {"serverName": q.get("sni") or hostname, "allowInsecure": False}
+    # h3 обязателен: hysteria2 ходит поверх QUIC, и без явного alpn часть
+    # серверных стеков рвёт хендшейк.
+    tls["alpn"] = ["h3"]
+
+    stream: dict = {
+        "network": "hysteria",
+        "hysteriaSettings": {"version": 2, "auth": auth},
+        "security": "tls",
+        "tlsSettings": tls,
+    }
+    obfs_password = q.get("obfs-password")
+    if q.get("obfs") == "salamander" and obfs_password:
+        stream["finalmask"] = {
+            "udp": [{"type": "salamander", "settings": {"password": obfs_password}}]
+        }
+    elif q.get("obfs"):
+        # Незнакомая обфускация: выразить не можем, а без неё сервер не ответит.
+        logger.warning(
+            "xray-json: unsupported hy2 obfs %r (tag=%s) — leg dropped", q["obfs"], tag
+        )
+        return {}
+
+    return {
+        "tag": tag,
+        "protocol": "hysteria",
+        "settings": {
+            "address": hostname, "port": port, "version": 2, "auth": auth,
+        },
+        "streamSettings": stream,
+    }
+
+
+def uri_to_outbound(uri: str, tag: str) -> dict | None:
+    """Один наш URI → один outbound Xray, или None если лег не выразим.
+
+    Разбираем то, что реально минтим (``provisioning.py``, секция Credential
+    builders): reality поверх tcp, tls поверх xhttp и ws, плюс hysteria2 с
+    salamander-обфускацией. Неизвестный транспорт — None: лучше потерять лег,
+    чем собрать outbound наугад и отдать сервер, который не подключается.
     """
     # ``.port`` и ``.hostname`` у SplitResult — ленивые свойства: они бросают
     # ValueError уже ПОСЛЕ разбора, на кривом порту («:abc», «:99999»). Поэтому
     # в try завёрнут не только urlsplit, но и первое обращение к ним.
     try:
         u = urlsplit(uri)
-        if u.scheme != "vless" or not u.hostname or not u.username:
+        if u.scheme not in ("vless", "hy2") or not u.hostname or not u.username:
             return None
         port = u.port or 443
         hostname = u.hostname
@@ -175,6 +225,10 @@ def uri_to_outbound(uri: str, tag: str) -> dict | None:
         return None
 
     q = dict(parse_qsl(u.query))
+
+    if u.scheme == "hy2":
+        return _hysteria_outbound(u, q, tag, hostname, port) or None
+
     security = q.get("security", "")
     network = q.get("type", "")
     sni = q.get("sni") or hostname
@@ -359,27 +413,45 @@ def build_profiles(configs) -> list[dict] | None:
     не из чего собрать. Решение принимается ЗДЕСЬ, а не на вызывающей стороне,
     чтобы гейт нельзя было обойти мимо этой функции.
     """
-    outbounds: list[dict] = []
-    remarks: list[str] = []
+    # Два ведра: в балансировщик идут только леги, чей синтаксис понимают и
+    # старые ядра (vless), hy2 достаётся отдельным профилем — см. шапку модуля.
+    balanced: list[dict] = []
+    balanced_remarks: list[str] = []
+    solo: list[tuple[dict, str]] = []
+
     for cfg in configs:
-        tag = _LEG_TAG if not outbounds else f"{_LEG_TAG}-{len(outbounds) + 1}"
+        is_hy2 = cfg.uri.startswith("hy2://")
+        # Тег важен только внутри балансировщика (селектор матчит по префиксу);
+        # одиночный профиль всё равно переименует свой outbound в "proxy".
+        tag = (
+            "solo" if is_hy2
+            else (_LEG_TAG if not balanced else f"{_LEG_TAG}-{len(balanced) + 1}")
+        )
         ob = uri_to_outbound(cfg.uri, tag)
         if ob is None:
             continue
-        outbounds.append(ob)
-        remarks.append(_remark_of(cfg.uri, tag))
+        remark = _remark_of(cfg.uri, tag)
+        if is_hy2:
+            solo.append((ob, remark))
+        else:
+            balanced.append(ob)
+            balanced_remarks.append(remark)
 
-    if len(outbounds) < MIN_BALANCER_LEGS:
+    if len(balanced) < MIN_BALANCER_LEGS:
         logger.info(
-            "xray-json: only %d usable leg(s) of %d — falling back to plain list",
-            len(outbounds), len(configs),
+            "xray-json: only %d balanceable leg(s) of %d — falling back to plain list",
+            len(balanced), len(configs),
         )
         return None
 
-    profiles = [_auto_profile(outbounds)]
+    profiles = [_auto_profile(balanced)]
     profiles += [
-        _single_profile(ob, remark) for ob, remark in zip(outbounds, remarks)
+        _single_profile(ob, remark)
+        for ob, remark in zip(balanced, balanced_remarks)
     ]
+    # hy2 — в конец: он вне автовыбора, и в списке это «попробуй, если первые
+    # не пошли», а не равноправный пункт наверху.
+    profiles += [_single_profile(ob, remark) for ob, remark in solo]
     return profiles
 
 

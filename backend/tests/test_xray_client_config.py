@@ -107,10 +107,36 @@ def test_ws_leg_carries_host_in_both_supported_forms():
     assert ws["headers"] == {"Host": "1dfa66176137387f.wgse.info"}
 
 
-def test_hysteria2_leg_is_refused():
-    """hy2 у нас с obfs, а формат hysteria-outbound его не выражает — перенос
-    дал бы неподключающийся сервер, поэтому лег отбрасывается целиком."""
-    assert xj.uri_to_outbound(HY2, "main") is None
+def test_hysteria2_leg_carries_obfs_in_finalmask():
+    """obfs у hy2 живёт не в настройках протокола, а в finalmask.udp как маска
+    salamander. Без неё сервер не ответит — на ноде обфускация включена."""
+    ob = xj.uri_to_outbound(HY2, "solo")
+    assert ob["protocol"] == "hysteria"
+    assert ob["settings"]["address"] == "171.22.134.124"
+    assert ob["settings"]["port"] == 443
+    assert ob["settings"]["version"] == 2
+    # auth — наша пара логин:пароль, а не UUID
+    assert ob["settings"]["auth"] == "warm-13-abc:pass"
+
+    stream = ob["streamSettings"]
+    assert stream["network"] == "hysteria"
+    assert stream["hysteriaSettings"] == {"version": 2, "auth": "warm-13-abc:pass"}
+    assert stream["tlsSettings"]["serverName"] == "9a2fbbafb4f83a30.wgse.info"
+    # hysteria2 ходит поверх QUIC — без явного h3 часть стеков рвёт хендшейк
+    assert stream["tlsSettings"]["alpn"] == ["h3"]
+    assert stream["finalmask"] == {
+        "udp": [{
+            "type": "salamander",
+            "settings": {"password": "scTH7VM7r5G4e47S0bxqmOdtGd5GsmlE"},
+        }],
+    }
+
+
+def test_hysteria2_with_unknown_obfs_is_refused():
+    """Незнакомую обфускацию выразить нечем, а без неё сервер молчит — такой
+    лег честнее не отдать, чем отдать неподключающимся."""
+    weird = HY2.replace("obfs=salamander", "obfs=нечто-новое")
+    assert xj.uri_to_outbound(weird, "solo") is None
 
 
 @pytest.mark.parametrize("uri", [
@@ -133,15 +159,27 @@ def test_unparseable_legs_return_none(uri):
 
 def test_profiles_start_with_autoselect_then_one_per_leg():
     profiles = xj.build_profiles(FULL_SET)
-    # 3 vless-лега (hy2 отброшен) + профиль автовыбора
-    assert len(profiles) == 4
+    # автовыбор + 3 vless + hy2 в конце
+    assert len(profiles) == 5
     assert profiles[0]["remarks"] == "\U0001f3af Автовыбор"
-    # имена одиночных профилей берутся из #fragment, где уже стоит роль
+    # имена одиночных профилей берутся из #fragment, где уже стоит роль;
+    # hy2 уходит в конец — он вне автовыбора
     assert [p["remarks"] for p in profiles[1:]] == [
         "⚡ Основной",
         "\U0001f6e1️ Запасной",
         "☁️ Резервный",
+        "\U0001f680 Быстрый 1",
     ]
+
+
+def test_hysteria2_stays_out_of_the_balancer():
+    """finalmask — свежее поле Xray; ядро постарше может отвергнуть ВЕСЬ
+    профиль, а не просто не подключиться. Поэтому hy2 не в автовыборе:
+    цена ошибки — один пункт списка, а не сломанный автовыбор."""
+    auto = xj.build_profiles(FULL_SET)[0]
+    protocols = {o["protocol"] for o in auto["outbounds"]}
+    assert "hysteria" not in protocols
+    assert protocols == {"vless", "freedom", "blackhole"}
 
 
 def test_autoselect_balancer_covers_every_leg_by_prefix():
@@ -208,7 +246,9 @@ def test_no_client_side_routing_rules_beyond_private_nets():
         assert "dns" not in profile
 
 
-def test_one_usable_leg_falls_back_to_plain_list():
+def test_one_balanceable_leg_falls_back_to_plain_list():
+    """Считаем леги, которые реально попадут в автовыбор: hy2 в него не входит,
+    поэтому reality + hy2 — это всё ещё «балансировать нечем»."""
     only_one = [_Cfg("vless-reality", REALITY), _Cfg("hysteria2", HY2)]
     assert xj.build_profiles(only_one) is None
     assert xj.build_body(only_one) is None
@@ -217,7 +257,7 @@ def test_one_usable_leg_falls_back_to_plain_list():
 def test_body_is_json_array_of_profiles():
     body = xj.build_body(FULL_SET)
     parsed = json.loads(body)
-    assert isinstance(parsed, list) and len(parsed) == 4
+    assert isinstance(parsed, list) and len(parsed) == 5
     # кириллица и эмодзи должны ехать как есть, а не \uXXXX
     assert "Автовыбор" in body
 
