@@ -159,36 +159,39 @@ def test_unparseable_legs_return_none(uri):
 
 def test_profiles_start_with_autoselect_then_one_per_leg():
     profiles = xj.build_profiles(FULL_SET)
-    # автовыбор + 3 vless + hy2 в конце
+    # автовыбор + по профилю на каждый лег, в исходном порядке
     assert len(profiles) == 5
     assert profiles[0]["remarks"] == "\U0001f3af Автовыбор"
-    # имена одиночных профилей берутся из #fragment, где уже стоит роль;
-    # hy2 уходит в конец — он вне автовыбора
+    # имена одиночных профилей берутся из #fragment, где уже стоит роль
     assert [p["remarks"] for p in profiles[1:]] == [
         "⚡ Основной",
+        "\U0001f680 Быстрый 1",
         "\U0001f6e1️ Запасной",
         "☁️ Резервный",
-        "\U0001f680 Быстрый 1",
     ]
 
 
-def test_hysteria2_stays_out_of_the_balancer():
-    """finalmask — свежее поле Xray; ядро постарше может отвергнуть ВЕСЬ
-    профиль, а не просто не подключиться. Поэтому hy2 не в автовыборе:
-    цена ошибки — один пункт списка, а не сломанный автовыбор."""
+def test_hysteria2_participates_in_the_balancer():
+    """hy2 — равноправный лег автовыбора: проверено вживую, что при мёртвых
+    vless балансировщик уводит трафик на hysteria."""
     auto = xj.build_profiles(FULL_SET)[0]
     protocols = {o["protocol"] for o in auto["outbounds"]}
-    assert "hysteria" not in protocols
-    assert protocols == {"vless", "freedom", "blackhole"}
+    assert "hysteria" in protocols
+
+    # и она должна попадать под префиксный селектор, иначе не пингуется
+    selector = auto["routing"]["balancers"][0]["selector"][0]
+    hy2_tags = [o["tag"] for o in auto["outbounds"] if o["protocol"] == "hysteria"]
+    assert hy2_tags and all(t.startswith(selector) for t in hy2_tags)
 
 
 def test_autoselect_balancer_covers_every_leg_by_prefix():
     auto = xj.build_profiles(FULL_SET)[0]
     tags = [o["tag"] for o in auto["outbounds"] if o["tag"].startswith("main")]
-    assert tags == ["main", "main-2", "main-3"]
+    # все четыре лега набора, включая hy2 — ни один не теряется по дороге
+    assert tags == ["main", "main-2", "main-3", "main-4"]
 
     balancer = auto["routing"]["balancers"][0]
-    # селектор матчит по префиксу: один "main" обязан накрыть все три лега
+    # селектор матчит по префиксу: один "main" обязан накрыть весь набор
     assert balancer["selector"] == ["main"]
     assert all(t.startswith(balancer["selector"][0]) for t in tags)
     assert balancer["strategy"] == {"type": "leastPing"}
@@ -246,12 +249,33 @@ def test_no_client_side_routing_rules_beyond_private_nets():
         assert "dns" not in profile
 
 
-def test_one_balanceable_leg_falls_back_to_plain_list():
-    """Считаем леги, которые реально попадут в автовыбор: hy2 в него не входит,
-    поэтому reality + hy2 — это всё ещё «балансировать нечем»."""
-    only_one = [_Cfg("vless-reality", REALITY), _Cfg("hysteria2", HY2)]
+def test_single_leg_falls_back_to_plain_list():
+    """Автовыбор из одного элемента — тот же сервер, но без запасного."""
+    only_one = [_Cfg("vless-reality", REALITY)]
     assert xj.build_profiles(only_one) is None
     assert xj.build_body(only_one) is None
+
+
+def test_client_allowlist_narrows_the_rollout(monkeypatch):
+    """«Формат клиент понимает» и «мы проверили на живом устройстве» — разные
+    утверждения; рычаг позволяет катить только на проверенных."""
+    monkeypatch.setenv("SUB_XRAY_JSON", "on")
+
+    monkeypatch.setenv("SUB_XRAY_JSON_CLIENTS", "happ")
+    assert xj.wants_xray_json("happ", "tok") is True
+    assert xj.wants_xray_json("v2raytun", "tok") is False
+
+    monkeypatch.setenv("SUB_XRAY_JSON_CLIENTS", "happ, v2raytun")
+    assert xj.wants_xray_json("v2raytun", "tok") is True
+
+    # Пусто или мусор — все умеющие, а не «никто»: рычаг не должен молча
+    # выключать фичу из-за опечатки в group_vars.
+    monkeypatch.setenv("SUB_XRAY_JSON_CLIENTS", "")
+    assert xj.wants_xray_json("happ", "tok") is True
+    monkeypatch.setenv("SUB_XRAY_JSON_CLIENTS", "нечто")
+    assert xj.wants_xray_json("happ", "tok") is True
+    # но клиент вне списка умеющих не получает JSON ни при каких значениях
+    assert xj.wants_xray_json("hiddify", "tok") is False
 
 
 def test_body_is_json_array_of_profiles():

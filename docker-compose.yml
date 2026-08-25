@@ -143,6 +143,7 @@ services:
       # бага, что выше: без строк здесь правка .env молча не доедет.
       SUB_XRAY_JSON: ${SUB_XRAY_JSON:-off}
       SUB_XRAY_JSON_TOKENS: ${SUB_XRAY_JSON_TOKENS:-}
+      SUB_XRAY_JSON_CLIENTS: ${SUB_XRAY_JSON_CLIENTS:-}
       SUB_XRAY_PROBE_INTERVAL_S: ${SUB_XRAY_PROBE_INTERVAL_S:-300}
       # Stage 4 — balance billing. Backend reads these for the
       # WebApp endpoints (freeze caps, min topup, referral bonus).

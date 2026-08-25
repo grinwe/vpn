@@ -29,12 +29,12 @@ GUARDED_PREFIX = "SUB_"
 
 def _template_keys() -> set[str]:
     text = ENV_TEMPLATE.read_text(encoding="utf-8")
-    return set(re.findall(rf"^({GUARDED_PREFIX}[A-Z0-9_]+)=", text, re.M))
+    return set(re.findall(rf"^({GUARDED_PREFIX}[A-Z0-9_]+)=", text, re.MULTILINE))
 
 
 def _compose_keys() -> set[str]:
     text = COMPOSE.read_text(encoding="utf-8")
-    return set(re.findall(rf"^\s+({GUARDED_PREFIX}[A-Z0-9_]+):", text, re.M))
+    return set(re.findall(rf"^\s+({GUARDED_PREFIX}[A-Z0-9_]+):", text, re.MULTILINE))
 
 
 @pytest.mark.skipif(

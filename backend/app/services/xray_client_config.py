@@ -13,26 +13,21 @@ Xray-JSON закрывает ровно эту дыру без собствен�
 это большинство базы. Разбор партнёрской подписки (Remnawave, 2026-08-25)
 подтвердил формат на живом сервисе.
 
-Hysteria2 — отдельным профилем, но не в балансировщике
-──────────────────────────────────────────────────────
-Xray 26.x умеет hy2 нативно: `proxy/hysteria` + `transport/internet/hysteria`,
-а obfs живёт не в настройках протокола, а в ``streamSettings.finalmask.udp``
-как маска ``salamander`` — то есть наш ``obfs=salamander`` выражается полностью.
-Проверено на живом леге: подключается, трафик идёт.
+Hysteria2 — наравне с остальными
+───────────────────────────────
+Xray 26.x умеет hy2 нативно (``proxy/hysteria``), а obfs живёт не в настройках
+протокола, а в ``streamSettings.finalmask.udp`` как маска ``salamander`` —
+наш ``obfs=salamander`` выражается полностью. Обкатка на живом устройстве
+(2026-08-25) подтвердила, что ядро Happ это читает, а балансировщик пингует
+hy2-леги наравне с vless: при мёртвых vless трафик уходит на hysteria.
 
-Но ``finalmask`` — свежее поле (в него же в 26.x переехали congestion/up/down/
-udphop), и ядро постарше о нём не знает. Незнакомое поле в streamSettings — не
-мягкая деградация «лег не отвечает», а риск отказа ВСЕГО профиля при разборе
-конфига. Поэтому hy2 отдаётся отдельными профилями и НЕ попадает в
-балансировщик: если ядро клиента его не переварит, человек теряет один пункт
-списка, а автовыбор на vless-легах продолжает работать.
+Историческая заметка на случай регрессии: первая версия исключала hy2 с
+обоснованием «формат не выражает obfs». Обоснование было ошибочным — вывод
+делался по чужому конфигу, где obfs просто не включён. Если hy2 когда-нибудь
+снова начнёт выпадать, ищите не в протоколе, а в ``finalmask``.
 
-Когда обкатка подтвердит, что ядра целевых клиентов hy2 понимают, лег можно
-будет завести и в ``selector`` балансировщика — это правка одной функции.
-
-Гейт ``MIN_BALANCER_LEGS`` про другое: профиль автовыбора с одним vless-легом
-не даёт ни выбора, ни запасного варианта, и такому устройству честнее отдать
-обычный плоский список.
+Гейт ``MIN_BALANCER_LEGS``: профиль автовыбора с одним легом не даёт ни выбора,
+ни запасного варианта, и такому устройству честнее отдать плоский список.
 
 **Роутинг.** Наш RU-split живёт на ноде (xray routing + hysteria acl), поэтому
 клиенту правил не передаём: всё, кроме приватных сетей, уходит в туннель — так
@@ -54,9 +49,26 @@ from urllib.parse import parse_qsl, unquote, urlsplit
 
 logger = logging.getLogger(__name__)
 
-# Клиенты, которые читают Xray-JSON вместо списка ссылок. Остальные (Hiddify,
-# Streisand, v2rayNG, unknown) получают прежнее base64-тело.
+# Клиенты, которые ПО ФОРМАТУ способны читать Xray-JSON вместо списка ссылок.
+# Остальные (Hiddify, Streisand, v2rayNG, unknown) получают прежнее base64-тело.
 XRAY_JSON_CLIENTS = ("happ", "v2raytun")
+
+
+def _enabled_clients() -> tuple[str, ...]:
+    """Кому из умеющих реально отдаём — ``SUB_XRAY_JSON_CLIENTS``.
+
+    Отдельный рычаг от режима: «формат клиент понимает» и «мы проверили это на
+    живом устройстве» — разные утверждения. На выкатке 2026-08-25 обкатан был
+    только Happ, поэтому в проде список сужен до него; v2rayTun добавляется
+    строкой в group_vars, когда кто-нибудь подтвердит его на своём телефоне.
+
+    Пусто = все умеющие (поведение по умолчанию, если рычаг не трогали).
+    """
+    raw = (os.getenv("SUB_XRAY_JSON_CLIENTS") or "").strip().lower()
+    if not raw:
+        return XRAY_JSON_CLIENTS
+    picked = tuple(c.strip() for c in raw.split(",") if c.strip() in XRAY_JSON_CLIENTS)
+    return picked or XRAY_JSON_CLIENTS
 
 # Балансировать нечего, если лег один: автовыбор из одного элемента — это
 # просто тот же сервер, зато без запасного. Гейт защищает от «включили флаг и
@@ -142,7 +154,7 @@ def wants_xray_json(client: str, token: str) -> bool:
     включён, и (в режиме обкатки) токен в списке. Любое несовпадение —
     прежнее поведение до байта.
     """
-    if client not in XRAY_JSON_CLIENTS:
+    if client not in _enabled_clients():
         return False
     mode = xray_json_mode()
     if mode == "on":
@@ -413,45 +425,27 @@ def build_profiles(configs) -> list[dict] | None:
     не из чего собрать. Решение принимается ЗДЕСЬ, а не на вызывающей стороне,
     чтобы гейт нельзя было обойти мимо этой функции.
     """
-    # Два ведра: в балансировщик идут только леги, чей синтаксис понимают и
-    # старые ядра (vless), hy2 достаётся отдельным профилем — см. шапку модуля.
-    balanced: list[dict] = []
-    balanced_remarks: list[str] = []
-    solo: list[tuple[dict, str]] = []
-
+    outbounds: list[dict] = []
+    remarks: list[str] = []
     for cfg in configs:
-        is_hy2 = cfg.uri.startswith("hy2://")
-        # Тег важен только внутри балансировщика (селектор матчит по префиксу);
-        # одиночный профиль всё равно переименует свой outbound в "proxy".
-        tag = (
-            "solo" if is_hy2
-            else (_LEG_TAG if not balanced else f"{_LEG_TAG}-{len(balanced) + 1}")
-        )
+        tag = _LEG_TAG if not outbounds else f"{_LEG_TAG}-{len(outbounds) + 1}"
         ob = uri_to_outbound(cfg.uri, tag)
         if ob is None:
             continue
-        remark = _remark_of(cfg.uri, tag)
-        if is_hy2:
-            solo.append((ob, remark))
-        else:
-            balanced.append(ob)
-            balanced_remarks.append(remark)
+        outbounds.append(ob)
+        remarks.append(_remark_of(cfg.uri, tag))
 
-    if len(balanced) < MIN_BALANCER_LEGS:
+    if len(outbounds) < MIN_BALANCER_LEGS:
         logger.info(
-            "xray-json: only %d balanceable leg(s) of %d — falling back to plain list",
-            len(balanced), len(configs),
+            "xray-json: only %d usable leg(s) of %d — falling back to plain list",
+            len(outbounds), len(configs),
         )
         return None
 
-    profiles = [_auto_profile(balanced)]
+    profiles = [_auto_profile(outbounds)]
     profiles += [
-        _single_profile(ob, remark)
-        for ob, remark in zip(balanced, balanced_remarks)
+        _single_profile(ob, remark) for ob, remark in zip(outbounds, remarks)
     ]
-    # hy2 — в конец: он вне автовыбора, и в списке это «попробуй, если первые
-    # не пошли», а не равноправный пункт наверху.
-    profiles += [_single_profile(ob, remark) for ob, remark in solo]
     return profiles
 
 
