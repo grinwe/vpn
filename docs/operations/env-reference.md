@@ -229,6 +229,8 @@
 | `SUB_HAPP_AUTOCONNECT` | `off` | backend | Phase B — HAPP авто-выбор сервера. `""`/`0`/`off` → никому; `all`/`on`/`true`/`yes` → всем (заголовки `subscription-autoconnect: true` + `subscription-autoconnect-type: lowestdelay`: HAPP на реконнекте берёт ноду с лучшим пингом, дохлые мимо); иначе — CSV `user_id` (обкатка). ⚠️ **`"1"` = ЮЗЕР 1, НЕ «всем»** (коллизия исправлена 2026-07-22 — для «всем» используй `all`). ⚠️ **Обязан быть проброшен в backend через docker-compose.yml** (иначе .env-значение не доедет — был мёртв 5 недель). |
 | `SUB_HAPP_AUTOCONNECT_SINCE` | `""` | backend | Опц. ISO-метка: autoconnect только для девайсов с `created_at >= метки` («только новые девайсы» — тест без путаницы со старыми/primary). Пусто = без фильтра. |
 | `SUB_LINK_FALLBACK_BASE_URL` | `""` | backend | Заголовок `fallback-url` — запасной домен ИСТОЧНИКА сабы (`<fallback>/<token>`), когда основной саб-URL режет РКН. Дормант, пока не задан. |
+| `SUB_XRAY_JSON` | `off` | backend | Отдавать Happ/v2rayTun **Xray-JSON** вместо списка ссылок — даёт фейловер внутри сессии (`observatory` + `balancers`/`leastPing`), которого заголовок autoconnect не умеет. `off` → все получают прежнее base64-тело; `allowlist` → только токенам из `SUB_XRAY_JSON_TOKENS`; `on` → всем умеющим клиентам. Прочие клиенты (Hiddify, Streisand, v2rayNG, unknown) не затрагиваются никогда. ⚠️ Формат подменяет **весь** профиль в клиенте — выкатывать пер-токенно. ⚠️ hy2-леги в JSON **не переносятся** (`obfs=salamander` в формате невыразим), при менее чем двух vless-легах ветка сама падает на плоский список. |
+| `SUB_XRAY_JSON_TOKENS` | `""` | backend | CSV саб-токенов для режима `allowlist`. Пустой список при `allowlist` = JSON не едет никому. |
 
 ## Warm credential pool
 

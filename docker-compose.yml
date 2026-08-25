@@ -138,6 +138,12 @@ services:
       # ничего не делает, а рубильник недоступен ровно тогда, когда нужен.
       SUB_FILTER_TUNNEL_BLIND: ${SUB_FILTER_TUNNEL_BLIND:-0}
       SUB_FILTER_UNHEALTHY_NODES: ${SUB_FILTER_UNHEALTHY_NODES:-1}
+      # Xray-JSON вместо списка ссылок для Happ/v2rayTun (фейловер внутри
+      # сессии). off/allowlist/on + CSV токенов для обкатки. Тот же класс
+      # бага, что выше: без строк здесь правка .env молча не доедет.
+      SUB_XRAY_JSON: ${SUB_XRAY_JSON:-off}
+      SUB_XRAY_JSON_TOKENS: ${SUB_XRAY_JSON_TOKENS:-}
+      SUB_XRAY_PROBE_INTERVAL_S: ${SUB_XRAY_PROBE_INTERVAL_S:-300}
       # Stage 4 — balance billing. Backend reads these for the
       # WebApp endpoints (freeze caps, min topup, referral bonus).
       FREEZE_DAYS: ${FREEZE_DAYS:-7}

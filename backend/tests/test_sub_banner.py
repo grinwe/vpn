@@ -456,13 +456,24 @@ def test_subinfo_rides_in_headers_base64_wrapped(monkeypatch):
 def test_banner_date_matches_client_msk_rendering():
     """Срок хранится как 23:59:59 UTC — UTC-дата всегда на день раньше
     московской, и рядом с клиентским «Истекает: 15.08» наш текст «до 14.08»
-    выглядел багом. Рендерим по МСК."""
-    from datetime import datetime as dt
+    выглядел багом. Рендерим по МСК.
 
+    Дата берётся ОТНОСИТЕЛЬНОЙ, а не прибитой: с зашитым 2026-08-14 тест начал
+    падать 15 августа 2026 — истёкшая подписка получает текст «Подписка
+    закончилась», и до проверки рендера даты дело уже не доходило.
+    """
     sub = _Sub(None)
-    sub.expires_at = dt(2026, 8, 14, 23, 59, 59)
+    # 23:59:59 UTC + 3 ч МСК = почти три часа ночи СЛЕДУЮЩИХ суток, то есть
+    # UTC-дата и московская гарантированно разъезжаются на день.
+    expires_utc = (utcnow() + timedelta(days=30)).replace(
+        hour=23, minute=59, second=59, microsecond=0, tzinfo=None
+    )
+    sub.expires_at = expires_utc
     banner = _sub_status_banner(sub)
-    assert "15.08.2026" in banner["sub-info-text"]
+    msk_date = (expires_utc + timedelta(hours=3)).strftime("%d.%m.%Y")
+    assert msk_date in banner["sub-info-text"]
+    # И это именно СДВИГ, а не совпадение: UTC-даты в тексте быть не должно
+    assert expires_utc.strftime("%d.%m.%Y") not in banner["sub-info-text"]
 
 
 def test_fix_entrypoints_point_at_the_page(monkeypatch):

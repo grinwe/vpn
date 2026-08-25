@@ -34,7 +34,7 @@ from .api._common import get_db  # единый источник FastAPI-зав�
 from .config import get_settings
 from .rate_limit import limiter
 from .security import decrypt as _decrypt
-from .services import sub_links
+from .services import sub_links, xray_client_config
 from .services.admin_notify import notify_admins
 from .time_utils import utcnow
 
@@ -311,6 +311,36 @@ def _sub_body(
     lines = _sub_body_directives(sub, token, client) + [c.uri for c in configs]
     body = "\n".join(lines)
     return body if plain else base64.b64encode(body.encode()).decode()
+
+
+def _sub_payload(
+    configs, sub, *, plain: bool, token: str, client: str
+) -> tuple[str, str]:
+    """Тело ответа и его media_type: Xray-JSON или прежний плоский список.
+
+    JSON едет только когда сошлись все условия сразу (умеющий клиент, режим,
+    токен в списке обкатки) И из легов удалось собрать автовыбор — иначе
+    ``build_body`` возвращает None и мы отдаём ровно то же, что отдавали
+    всегда. Диагностический ``?fmt=plain`` формат не переключает: он про
+    чтение директив из тела, и подменять им ветку JSON значило бы прятать
+    две разные вещи за одним параметром.
+    """
+    if not plain and xray_client_config.wants_xray_json(client, token):
+        # Fail-open осознанно: этот роут — единственный источник конфигов, и
+        # исключение здесь означало бы 500 вместо подписки, то есть человека
+        # без интернета из-за украшательства. Любая поломка сборки JSON —
+        # повод отдать проверенный временем плоский список, а не упасть.
+        try:
+            body = xray_client_config.build_body(configs)
+        except Exception:
+            logger.exception(
+                "xray-json: build failed for token=%s sub=%s — serving plain list",
+                token, sub.id,
+            )
+            body = None
+        if body is not None:
+            return body, "application/json"
+    return _sub_body(configs, sub, plain=plain, token=token, client=client), "text/plain"
 
 
 def _renew_link() -> str | None:
@@ -1351,6 +1381,15 @@ def dynamic_sub_link(
 
         _mark_first_config_fetch(db, sub)
 
+        # Тело собираем ДО аудита: в JSON-ветке уезжают не все протоколы из
+        # configs (hy2 в Xray-JSON невыразим), и запись «какие протоколы
+        # получил юзер» без пометки формата вводила бы в заблуждение ровно
+        # там, где по ней потом разбирают жалобу.
+        encoded, media_type = _sub_payload(
+            configs, sub, plain=(fmt == "plain"), token=token,
+            client=_client_kind(request.headers.get("user-agent")),
+        )
+
         # Read-путь ничего, кроме audit-строки, не пишет — при сэмплировании
         # (SUB_FETCH_AUDIT_SAMPLE>1) просто пропускаем и INSERT, и COMMIT.
         if _should_log_sub_fetch():
@@ -1363,6 +1402,7 @@ def dynamic_sub_link(
                     target_id=device.id,
                     extra={
                         "protocols": [c.protocol for c in configs],
+                        "body_format": media_type,
                         "device_token": True,
                         "aliased_to_device_id": (
                             source_device.id if source_device.id != device.id else None
@@ -1372,13 +1412,9 @@ def dynamic_sub_link(
             )
             db.commit()
 
-        encoded = _sub_body(
-            configs, sub, plain=(fmt == "plain"), token=token,
-            client=_client_kind(request.headers.get("user-agent")),
-        )
         return PlainTextResponse(
             content=encoded,
-            media_type="text/plain",
+            media_type=media_type,
             # device = владелец токена (для гейта «только новые девайсы» по created_at)
             headers=_sub_response_headers(
                 sub, token, device,
@@ -1427,7 +1463,7 @@ def dynamic_sub_link(
             headers={"Retry-After": _retry_after_sec()},
         )
 
-    encoded = _sub_body(
+    encoded, media_type = _sub_payload(
             configs, sub, plain=(fmt == "plain"), token=token,
             client=_client_kind(request.headers.get("user-agent")),
         )
@@ -1443,14 +1479,18 @@ def dynamic_sub_link(
                 action="subscription_fetch",
                 target_type="subscription",
                 target_id=sub.id,
-                extra={"protocols": [c.protocol for c in configs], "legacy_token": True},
+                extra={
+                    "protocols": [c.protocol for c in configs],
+                    "body_format": media_type,
+                    "legacy_token": True,
+                },
             )
         )
         db.commit()
 
     return PlainTextResponse(
         content=encoded,
-        media_type="text/plain",
+        media_type=media_type,
         headers=_sub_response_headers(
             sub, token, userinfo_expire_only=(userinfo == "expire"),
             user_agent=request.headers.get("user-agent"),
