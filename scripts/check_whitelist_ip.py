@@ -87,29 +87,42 @@ def main() -> int:
     total = len({n for nets in index.values() for n in nets})
     print(f"список загружен ({total} префиксов)\n")
 
-    missing = 0
+    # Три исхода, а не два. «Не в списке» — это НЕ «адрес плохой»: список ловит
+    # лишь малую часть разрешённых префиксов (из девяти доказанно рабочих
+    # адресов конкурента в нём нашлись два). Отбраковывать по нему купленный
+    # адрес — значит выбрасывать хорошее; см. docs/operations/whitelist_counters.md §3.1.
+    hit = unknown = junk_cnt = bad = 0
     for ip in targets:
         try:
             hits = match(index, ip)
         except ValueError:
             print(f"  {ip:18} ошибка: не IP-адрес")
-            missing += 1
+            bad += 1
             continue
         if not hits:
-            print(f"  {ip:18} — не в списке")
-            missing += 1
+            print(f"  {ip:18} не определено — списку неизвестен (НЕ значит «плохой»)")
+            unknown += 1
             continue
         junk = all(any(h.subnet_of(j) for j in JUNK) for h in hits)
-        mark = "мусор скана" if junk else "В СПИСКЕ"
-        print(f"  {ip:18} {mark}: {', '.join(str(h) for h in hits)}")
         if junk:
-            missing += 1
+            print(f"  {ip:18} мусор скана: {', '.join(str(h) for h in hits)}")
+            junk_cnt += 1
+        else:
+            print(f"  {ip:18} В СПИСКЕ: {', '.join(str(h) for h in hits)}")
+            hit += 1
 
     print(
-        "\nПопадание в список — только предварительный фильтр кандидата.\n"
-        "Доступность подтверждает пробер из целевого региона, не этот скрипт."
+        f"\nитого: в списке {hit}, не определено {unknown}, мусор скана {junk_cnt}"
+        + (f", не IP {bad}" if bad else "")
     )
-    return 1 if missing else 0
+    print(
+        "Попадание — дешёвый ПОЛОЖИТЕЛЬНЫЙ сигнал, годный как цель для ролла адреса.\n"
+        "Непопадание не значит ничего: у списка плохой recall (обновлён 24.07.2026).\n"
+        "Настоящая проверка — открыть адрес с мобильной SIM в затронутом регионе."
+    )
+    # Ненулевой код только на том, что реально плохо: не-IP и мусорные диапазоны.
+    # «Не определено» — нормальный исход, скриптом не отбраковывается.
+    return 1 if (bad or junk_cnt) else 0
 
 
 if __name__ == "__main__":
