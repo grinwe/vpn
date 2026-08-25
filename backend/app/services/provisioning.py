@@ -2169,6 +2169,11 @@ class ProvisioningOrchestrator:
             # Переприменяем после активации; идемпотентно — текущие пары
             # роль→нода держатся в preferred, собранный набор не тасуется.
             self._apply_leg_scheme(device)
+            # Отложенный failover-своп (сухой warm-пул): замена дозрела —
+            # доделываем ревок старого и перенос токена. Advisory-лок по
+            # старому девайсу отсекает гонку с ещё живым failover'ом.
+            if device.pending_swap_from is not None:
+                self._finish_deferred_swap(device)
             self._notify_bot_config_ready(device)
 
     def _notify_bot_config_ready(self, device: models.Device) -> None:
@@ -5010,7 +5015,8 @@ class ProvisioningOrchestrator:
         # Свежая primary, исключая весь битый набор. RuntimeError если нет.
         target = choose_node(self.db, plan, exclude_node_ids=list(blocked))
 
-        reuse_token = device.sub_token
+        # sub_token старого читает _complete_device_swap в момент свапа —
+        # локальная копия больше не нужна.
         reuse_uri = device.connection_uri
         reuse_uuid = _device_vless_uuid(device)
 
@@ -5037,6 +5043,29 @@ class ProvisioningOrchestrator:
                 f"failover for device {device.id} is already in progress"
             )
         try:
+            # Гейт повторного failover в отложенном окне (ревью 2026-08-25):
+            # при сухом пуле старый девайс остаётся active до конца ansible,
+            # и второй тап успевал создать ВТОРУЮ замену — проигравшая
+            # оставалась вечным active-девайсом со слотом лимита. Живая
+            # незавершённая замена уже есть → это «уже чиним».
+            in_flight = (
+                self.db.query(models.Device.id)
+                .filter(
+                    models.Device.pending_swap_from == device.id,
+                    models.Device.status.notin_(
+                        [
+                            models.DeviceStatus.disabled,
+                            models.DeviceStatus.revoked,
+                        ]
+                    ),
+                )
+                .first()
+            )
+            if in_flight is not None:
+                raise RuntimeError(
+                    f"replacement device {in_flight.id} is already in flight "
+                    f"for device {device.id}"
+                )
             # sub_token у нового пока временный: reuse-токен занят старым
             # (UNIQUE-пара sub_token/client_id_hmac), своп — последним шагом.
             new_device, task = self.reprovision_subscription(
@@ -5046,6 +5075,13 @@ class ProvisioningOrchestrator:
                 reuse_connection_uri=reuse_uri,
                 reuse_uuid=reuse_uuid,
             )
+            # Журнал намерения (миграция 0068): replacement уже закоммичен
+            # reprovision'ом — фиксируем «кого он меняет» немедленно, чтобы
+            # смерть процесса на любом следующем шаге оставила не сироту,
+            # а незавершённый своп, который доделает жнец-тик.
+            new_device.pending_swap_from = device.id
+            self.db.add(new_device)
+            self.db.commit()
             try:
                 # Перетряхиваем диверс-набор ТОЛЬКО этого device на свежие,
                 # исключая весь битый набор (reprovision с reuse_uuid НЕ
@@ -5061,14 +5097,12 @@ class ProvisioningOrchestrator:
                 # Активация при живых легах: sibling-alias отдаёт только
                 # status=active девайсы, а тёплые диверс-креды физически
                 # живы на нодах — активируем сразу, чтобы alias подхватил
-                # замену в момент ревока старого. При СУХОМ warm-пуле
-                # активных легов нет: активацию сделает _handle_task_outcome
-                # после ansible, и остаточное окно (длиной в apply-таску)
-                # признаём — прежний код давал его же плюс пустую БД-сборку.
-                if any(
+                # замену в момент ревока старого.
+                has_live_legs = any(
                     c.is_active and c.leg_published
                     for c in new_device.credentials
-                ):
+                )
+                if has_live_legs:
                     new_device.status = models.DeviceStatus.active
                     self.db.add(new_device)
                     self.db.commit()
@@ -5076,9 +5110,12 @@ class ProvisioningOrchestrator:
                 # Компенсация сироты: replacement уже закоммичен
                 # reprovision'ом — без ревока он навсегда занял бы слот
                 # лимита плана (старый девайс мы ещё не трогали, юзер
-                # остаётся на нём).
+                # остаётся на нём). Маркер снимаем тем же commit'ом, что
+                # делает revoke_device.
                 self.db.rollback()
                 try:
+                    new_device.pending_swap_from = None
+                    self.db.add(new_device)
                     self.revoke_device(
                         new_device,
                         reason="failover compensation: replacement build failed",
@@ -5091,25 +5128,42 @@ class ProvisioningOrchestrator:
                     )
                 raise
 
-            # Замена собрана и опубликована — теперь гасим старый. С этого
-            # commit'а и до токен-свопа старый токен отдаёт набор нового
-            # девайса через sibling-alias (замена уже active, см. выше).
-            self.revoke_device(
-                device,
-                reason=f"device-failover {old_primary}->{target.id}",
-                background=True,
-            )
-            if reuse_token:
-                # Byte-identical ссылки клиента и админки: переносим старый
-                # sub_token на новый девайс. Пара sub_token/client_id_hmac
-                # под UNIQUE — сначала NULL+flush у старого, затем
-                # присвоение. Сбой здесь безопасен: rollback вернёт токен
-                # ревокнутому старому, и alias продолжит вести на замену.
-                self._release_sub_token(device)
-                new_device.sub_token = reuse_token
-                new_device.client_id_hmac = compute_client_id_hmac(reuse_token)
-                self.db.add(new_device)
-                self.db.commit()
+            if has_live_legs:
+                # Замена собрана, опубликована и активна — гасим старый и
+                # переносим токен одним заходом.
+                self._complete_device_swap(
+                    device,
+                    new_device,
+                    reason=f"device-failover {old_primary}->{target.id}",
+                )
+            else:
+                # СУХОЙ warm-пул: замена целиком cold и до ansible мертва.
+                # Старый девайс НЕ трогаем — юзер продолжает жить на его
+                # наборе; своп доделает _handle_task_outcome по факту
+                # активации (маркер pending_swap_from уже стоит), а при
+                # смерти процесса — жнец run_device_swap_reaper_tick.
+                #
+                # Микрогонка (ревью 2026-08-25): очень быстрый ansible мог
+                # активировать креды, ПОКА мы держим лок — его
+                # _finish_deferred_swap увидел busy и вышел, потеряв
+                # единственную попытку доделки. Перечитываем креды: уже
+                # активны → доделываем своп сами (лок наш).
+                self.db.expire(new_device)
+                if any(c.is_active for c in new_device.credentials):
+                    self._complete_device_swap(
+                        device,
+                        new_device,
+                        reason=(
+                            f"device-failover {old_primary}->{target.id} "
+                            f"(raced activation)"
+                        ),
+                    )
+                else:
+                    logger.warning(
+                        "failover: device %s — warm-пул сухой, своп %s->%s "
+                        "отложен до активации замены",
+                        device.id, device.id, new_device.id,
+                    )
             return target, new_device, task, old_primary
         finally:
             try:
@@ -5134,6 +5188,133 @@ class ProvisioningOrchestrator:
                         "failover: connection invalidate failed for device %s",
                         device.id,
                     )
+
+    def _finish_deferred_swap(self, new_device: models.Device) -> None:
+        """Доделать отложенный failover-своп под advisory-локом.
+
+        Зовётся из ``_handle_task_outcome`` (активация замены) и жнеца.
+        Лок занят → живой failover сам доделает, тихо выходим. Best-effort:
+        сбой здесь не должен ронять вызывающего — маркер останется, и жнец
+        доделает на следующем тике.
+        """
+        old_id = new_device.pending_swap_from
+        if old_id is None:
+            return
+        try:
+            got = self.db.execute(
+                sql_text("SELECT pg_try_advisory_lock(4001, :dev)"),
+                {"dev": old_id},
+            ).scalar()
+            if not got:
+                # Живой failover сам доделает (или потеряет попытку в
+                # микрогонке — тогда доделает его пост-чек либо жнец).
+                logger.info(
+                    "deferred swap: lock busy for old device %s — skip "
+                    "(replacement %s)",
+                    old_id, new_device.id,
+                )
+                return
+            try:
+                old = self.db.get(models.Device, old_id)
+                if old is not None:
+                    self._complete_device_swap(
+                        old,
+                        new_device,
+                        reason=f"deferred failover swap {old_id}->{new_device.id}",
+                    )
+                else:
+                    new_device.pending_swap_from = None
+                    self.db.add(new_device)
+                    self.db.commit()
+            finally:
+                try:
+                    self.db.rollback()
+                    self.db.execute(
+                        sql_text("SELECT pg_advisory_unlock(4001, :dev)"),
+                        {"dev": old_id},
+                    )
+                    self.db.commit()
+                except Exception:  # noqa: BLE001
+                    logger.exception(
+                        "deferred swap: advisory unlock failed for device %s",
+                        old_id,
+                    )
+                    try:
+                        self.db.invalidate()
+                    except Exception:  # noqa: BLE001
+                        pass
+        except Exception:  # noqa: BLE001
+            logger.exception(
+                "deferred failover swap failed for replacement %s", new_device.id
+            )
+
+    def _complete_device_swap(
+        self,
+        old_device: models.Device,
+        new_device: models.Device,
+        *,
+        reason: str,
+    ) -> None:
+        """Финал failover-свапа: ревок старого + перенос sub_token + маркер.
+
+        Общая точка для трёх путей: немедленный своп в failover_device
+        (тёплый пул), отложенный в _handle_task_outcome (сухой пул) и
+        жнец run_device_swap_reaper_tick (прерванный failover). Перенос
+        токена и снятие pending_swap_from — в одном commit'е: частичного
+        состояния «токен ничей» не существует.
+        """
+        reuse_token = old_device.sub_token
+        old_terminal = old_device.status in (
+            models.DeviceStatus.disabled,
+            models.DeviceStatus.revoked,
+        )
+        if old_terminal and not reuse_token:
+            # Старый уже погашен И без токена — почти наверняка проигранная
+            # гонка свопа (токен забрала другая замена). Гейт in-flight в
+            # failover_device делает это теоретическим, поэтому не рубим
+            # замену автоматически, а снимаем маркер и зовём человека.
+            logger.warning(
+                "swap: old device %s терминален и без токена — возможная "
+                "проигранная гонка, замена %s оставлена как есть",
+                old_device.id, new_device.id,
+            )
+            try:
+                from .admin_notify import notify_admins
+
+                notify_admins(
+                    self.db,
+                    kind="device_swap_race_suspected",
+                    text=(
+                        f"⚠️ Своп девайсов: старый {old_device.id} погашен и "
+                        f"без токена, замена {new_device.id} осталась со своим "
+                        f"токеном. Похоже на проигранную гонку — проверить "
+                        f"руками."
+                    ),
+                    dedup_key={"device_id": new_device.id},
+                    extra={
+                        "old_device_id": old_device.id,
+                        "new_device_id": new_device.id,
+                    },
+                    autocommit=False,
+                )
+            except Exception:  # noqa: BLE001
+                logger.exception("swap race alert failed")
+            new_device.pending_swap_from = None
+            self.db.add(new_device)
+            self.db.commit()
+            return
+        if not old_terminal:
+            self.revoke_device(old_device, reason=reason, background=True)
+        if reuse_token:
+            # Пара sub_token/client_id_hmac под UNIQUE: NULL+flush у
+            # старого, затем присвоение. Сбой безопасен: rollback вернёт
+            # токен старому, alias продолжит вести на активную замену.
+            self._release_sub_token(old_device)
+            new_device.sub_token = reuse_token
+            new_device.client_id_hmac = compute_client_id_hmac(reuse_token)
+        new_device.pending_swap_from = None
+        self.db.add(new_device)
+        self.db.commit()
 
     def revoke_device(
         self, device: models.Device, *, reason: str | None = None, background: bool = True

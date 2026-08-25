@@ -390,6 +390,190 @@ def _alert_stale_lava_sale(session, invoice, sale: dict) -> None:
     )
 
 
+def run_device_swap_reaper_tick() -> dict:
+    """Завершитель прерванных failover-свапов (миграция 0068).
+
+    ``devices.pending_swap_from`` — журнал намерения: failover пишет его
+    при создании замены и снимает атомарно со свапом токена. Ненулевой
+    маркер старше порога и без живой apply-таски = процесс умер посреди
+    failover'а. Жнец не «убийца», а завершитель: старый девайс уже
+    погашен → доделать своп (юзер получает замену); старый жив →
+    ревокнуть недособранную замену (юзер остаётся на старом). Оба
+    исхода — с алертом: событие должно быть редким.
+    """
+    from datetime import timedelta
+
+    from sqlalchemy import text as sql_text
+
+    from . import models
+    from .db import SessionLocal
+    from .queue import schedule_tick
+    from .services.provisioning import ProvisioningOrchestrator
+    from .time_utils import utcnow
+
+    # Перепланируем ДО работы (как остальные тики): schedule_tick — one-shot,
+    # без этого жнец сработал бы ровно один раз за жизнь воркера (ревью
+    # 2026-08-25, critical).
+    interval = _env_int("DEVICE_SWAP_REAPER_INTERVAL", 300)
+    if interval > 0:
+        try:
+            schedule_tick(
+                "app.worker.run_device_swap_reaper_tick",
+                interval,
+                tick_id="tick-device-swap-reaper",
+                replace=True,
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("swap_reaper: failed to re-enqueue tick (at start)")
+
+    min_age = _env_int("DEVICE_SWAP_REAPER_MIN_AGE_MIN", 30)
+    cutoff = utcnow() - timedelta(minutes=min_age)
+    finished = 0
+    reaped = 0
+    skipped = 0
+    session = SessionLocal()
+    try:
+        stale = (
+            session.query(models.Device)
+            .filter(
+                models.Device.pending_swap_from.isnot(None),
+                models.Device.created_at < cutoff,
+            )
+            .limit(20)
+            .all()
+        )
+        for dev in stale:
+            pending_apply = (
+                session.query(models.ProvisioningTask.id)
+                .filter(
+                    models.ProvisioningTask.target_type == "device",
+                    models.ProvisioningTask.target_id == dev.id,
+                    models.ProvisioningTask.action == "apply",
+                    models.ProvisioningTask.status.in_(
+                        [
+                            models.ProvisioningTaskStatus.pending,
+                            models.ProvisioningTaskStatus.running,
+                        ]
+                    ),
+                )
+                .first()
+            )
+            if pending_apply is not None:
+                skipped += 1
+                continue  # ansible ещё в пути — не прерван, просто долгий
+
+            old_id = dev.pending_swap_from
+            orch = ProvisioningOrchestrator(session)
+            # Весь разбор — строго под advisory-локом старого девайса и на
+            # СВЕЖИХ чтениях (ревью 2026-08-25): без лока гонка с
+            # _handle_task_outcome гасила ОБА девайса (жнец ревокал замену,
+            # которая только что получила токен юзера) или воскрешала
+            # зомби. Лок занят → живой процесс сам доделает, пропускаем.
+            got = session.execute(
+                sql_text("SELECT pg_try_advisory_lock(4001, :dev)"),
+                {"dev": old_id},
+            ).scalar()
+            if not got:
+                skipped += 1
+                continue
+            try:
+                session.expire_all()
+                dev = session.get(
+                    models.Device, dev.id, populate_existing=True
+                )
+                if dev is None or dev.pending_swap_from != old_id:
+                    skipped += 1  # своп уже доделан параллельным процессом
+                    continue
+                old = (
+                    session.get(models.Device, old_id, populate_existing=True)
+                    if old_id
+                    else None
+                )
+                old_gone = old is None or old.status in (
+                    models.DeviceStatus.disabled,
+                    models.DeviceStatus.revoked,
+                )
+                replacement_alive = dev.status == models.DeviceStatus.active and any(
+                    c.is_active for c in dev.credentials
+                )
+                if old_gone or replacement_alive:
+                    # Старый погашен ЛИБО замена уже полностью жива (это
+                    # прерванный deferred-swap, а не сирота — ревокать её
+                    # значило бы оставить юзера на битом наборе навсегда):
+                    # доделываем своп в пользу замены.
+                    if old is not None:
+                        orch._complete_device_swap(
+                            old,
+                            dev,
+                            reason="swap reaper: finish interrupted failover",
+                        )
+                    else:
+                        dev.pending_swap_from = None
+                        session.add(dev)
+                        session.commit()
+                    if dev.status == models.DeviceStatus.pending and any(
+                        c.is_active for c in dev.credentials
+                    ):
+                        dev.status = models.DeviceStatus.active
+                        session.add(dev)
+                        session.commit()
+                    outcome = "finished"
+                    finished += 1
+                else:
+                    # Старый жив, замена не дозрела — сирота: ревокаем её,
+                    # юзер остаётся на рабочем старом наборе.
+                    dev.pending_swap_from = None
+                    session.add(dev)
+                    orch.revoke_device(
+                        dev,
+                        reason="swap reaper: orphan replacement",
+                        background=True,
+                    )
+                    outcome = "reaped"
+                    reaped += 1
+            except Exception:  # noqa: BLE001
+                session.rollback()
+                logger.exception(
+                    "swap_reaper: device %s (old %s) — не удалось обработать",
+                    dev.id if dev else "?", old_id,
+                )
+                continue
+            finally:
+                try:
+                    session.rollback()
+                    session.execute(
+                        sql_text("SELECT pg_advisory_unlock(4001, :dev)"),
+                        {"dev": old_id},
+                    )
+                    session.commit()
+                except Exception:  # noqa: BLE001
+                    logger.exception(
+                        "swap_reaper: advisory unlock failed for %s", old_id
+                    )
+                    try:
+                        session.invalidate()
+                    except Exception:  # noqa: BLE001
+                        pass
+            logger.warning(
+                "swap_reaper: device %s (old %s) — %s", dev.id, old_id, outcome
+            )
+            _notify_admins_safe(
+                session,
+                kind="device_swap_reaped",
+                text=(
+                    f"🧹 Жнец свапов: замена {dev.id} (старый {old_id}) — "
+                    f"{'своп доделан' if outcome == 'finished' else 'сирота ревокнута'}. "
+                    f"Это след прерванного failover'а — стоит глянуть логи."
+                ),
+                dedup_key={"device_id": dev.id},
+                extra={"device_id": dev.id, "old_device_id": old_id, "outcome": outcome},
+                window_sec=86400,
+            )
+    finally:
+        session.close()
+    return {"finished": finished, "reaped": reaped, "skipped": skipped}
+
+
 def run_lava_reconcile_tick() -> dict:
     """Webhook-independent reconcile для карточных платежей lava.top.
 
@@ -4014,6 +4198,24 @@ def main() -> None:
             )
         except Exception:  # noqa: BLE001
             logger.exception("Failed to schedule lava reconcile tick")
+
+    # Жнец прерванных failover-свапов (миграция 0068): доделывает или
+    # компенсирует свопы, брошенные умершим процессом. 0 = off.
+    swap_reaper_interval = _env_int("DEVICE_SWAP_REAPER_INTERVAL", 300)
+    if do_bootstrap and swap_reaper_interval > 0:
+        try:
+            schedule_tick(
+                "app.worker.run_device_swap_reaper_tick",
+                min(swap_reaper_interval, 120),
+                tick_id="tick-device-swap-reaper",
+                replace=True,
+            )
+            logger.info(
+                "Device swap reaper tick bootstrapped (interval=%ss)",
+                swap_reaper_interval,
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("Failed to schedule device swap reaper tick")
 
     # Schedule operator-report watcher (Phase 1 operator-aware routing) —
     # resolves «VPN не работает» reports by observed reconnect. Default 5 min.

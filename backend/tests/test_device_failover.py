@@ -164,9 +164,14 @@ def test_failover_builds_replacement_before_revoking_old(
     нажавший «не работает», получал пустую выдачу («ошибка конфигурации»
     в Happ) ровно пока его чинили. Порядок обязан быть: собрать замену →
     разложить → ревокнуть старый → перенести токен."""
-    orch, sub, dev, cfg_fresh, _fresh = _failover_fixture(db_session, monkeypatch, "ord")
+    orch, sub, dev, cfg_fresh, fresh = _failover_fixture(db_session, monkeypatch, "ord")
     new_dev = make_device(db_session, sub, cfg_fresh, access_username="O-ord-new")
     new_dev.sub_token = "tok-new-tmp"
+    # Живой published-лег — тёплый путь: своп происходит немедленно.
+    _cred(db_session, fresh, new_dev, "O-ord-new-a")
+    for c in new_dev.credentials:
+        c.leg_published = True
+        c.leg_role = "primary"
     db_session.commit()
 
     events: list[str] = []
@@ -189,10 +194,132 @@ def test_failover_builds_replacement_before_revoking_old(
     assert events == ["reprovision", "diverse", "apply", "revoke"], (
         "замена обязана быть собрана и разложена ДО ревока старого девайса"
     )
-    # Токен клиента переехал на новый девайс (byte-identical ссылки).
+    # Токен клиента переехал на новый девайс (byte-identical ссылки),
+    # журнал намерения снят той же транзакцией.
     db_session.expire_all()
-    assert db_session.get(models.Device, new_dev.id).sub_token == "tok-old-ord"
+    refreshed_new = db_session.get(models.Device, new_dev.id)
+    assert refreshed_new.sub_token == "tok-old-ord"
+    assert refreshed_new.pending_swap_from is None
     assert db_session.get(models.Device, dev.id).sub_token is None
+
+
+def test_failover_dry_pool_defers_swap(
+    db_session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Сухой warm-пул: замена целиком cold — старый девайс НЕ трогается,
+    токен остаётся у него, а замена помечена pending_swap_from. Своп
+    доделает _handle_task_outcome после активации (или жнец)."""
+    orch, sub, dev, cfg_fresh, _fresh = _failover_fixture(
+        db_session, monkeypatch, "dry"
+    )
+    new_dev = make_device(db_session, sub, cfg_fresh, access_username="O-dry-new")
+    new_dev.sub_token = "tok-new-dry"
+    db_session.commit()  # ни одного published-крема: сухой путь
+
+    revoked: list[int] = []
+    monkeypatch.setattr(orch, "revoke_device", lambda d, **k: revoked.append(d.id))
+    monkeypatch.setattr(
+        orch, "reprovision_subscription", lambda *a, **k: (new_dev, None)
+    )
+    monkeypatch.setattr(orch, "_maybe_attach_diverse", lambda *a, **k: None)
+    monkeypatch.setattr(orch, "_apply_leg_scheme", lambda device: None)
+
+    orch.failover_device(dev)
+
+    assert not revoked, "при сухом пуле старый девайс не должен ревокаться"
+    db_session.expire_all()
+    old = db_session.get(models.Device, dev.id)
+    new = db_session.get(models.Device, new_dev.id)
+    assert old.status == models.DeviceStatus.active
+    assert old.sub_token == "tok-old-dry"
+    assert new.pending_swap_from == dev.id
+
+
+def test_task_outcome_finishes_deferred_swap(
+    db_session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Успешная apply-таска замены с маркером обязана доделать своп:
+    активировать креды, ревокнуть старый, перенести токен, снять маркер."""
+    from app.services import provisioning as prov_mod2  # noqa: F401
+
+    orch, sub, dev, cfg_fresh, fresh = _failover_fixture(
+        db_session, monkeypatch, "fin"
+    )
+    new_dev = make_device(db_session, sub, cfg_fresh, access_username="O-fin-new")
+    new_dev.status = models.DeviceStatus.pending
+    new_dev.sub_token = "tok-new-fin"
+    new_dev.pending_swap_from = dev.id
+    db_session.add(
+        models.Credential(
+            node_id=fresh.id, device_id=new_dev.id, access_username="O-fin-new-a",
+            is_active=False, proto="vless-reality", config_text="enc",
+            pool_state=models.CredentialPoolState.assigned,
+        )
+    )
+    db_session.commit()
+
+    task = orch.create_task(
+        "device",
+        new_dev.id,
+        "apply",
+        {"node_id": fresh.id, "protocols": [{"proto": "vless-reality"}]},
+    )
+    db_session.commit()
+
+    monkeypatch.setattr(
+        type(orch), "_notify_bot_config_ready", lambda self, d: None
+    )
+    orch._handle_task_outcome(task, success=True)
+
+    db_session.expire_all()
+    old = db_session.get(models.Device, dev.id)
+    new = db_session.get(models.Device, new_dev.id)
+    assert new.pending_swap_from is None, "маркер обязан сняться"
+    assert new.sub_token == "tok-old-fin", "токен обязан переехать"
+    assert old.status in (
+        models.DeviceStatus.disabled,
+        models.DeviceStatus.revoked,
+    ), "старый девайс обязан погаснуть"
+
+
+def test_swap_reaper_finishes_and_reaps(
+    db_session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Жнец: старый погашен → доделать своп; старый жив → ревокнуть сироту."""
+    from datetime import datetime, timedelta
+
+    from app.worker import run_device_swap_reaper_tick
+
+    orch, sub, dev, cfg_fresh, fresh = _failover_fixture(
+        db_session, monkeypatch, "reap"
+    )
+    # Кейс 1: старый погашен, свап не доделан.
+    dead_old = make_device(db_session, sub, cfg_fresh, access_username="R-old")
+    dead_old.status = models.DeviceStatus.disabled
+    dead_old.sub_token = "tok-dead-old"
+    repl = make_device(db_session, sub, cfg_fresh, access_username="R-repl")
+    repl.pending_swap_from = dead_old.id
+    repl.created_at = datetime.utcnow() - timedelta(hours=1)
+    # Кейс 2: старый жив — замена-сирота.
+    orphan = make_device(db_session, sub, cfg_fresh, access_username="R-orph")
+    orphan.pending_swap_from = dev.id  # dev — active из фикстуры
+    orphan.created_at = datetime.utcnow() - timedelta(hours=1)
+    db_session.commit()
+
+    result = run_device_swap_reaper_tick()
+
+    assert result["finished"] >= 1 and result["reaped"] >= 1, result
+    db_session.expire_all()
+    assert db_session.get(models.Device, repl.id).sub_token == "tok-dead-old"
+    assert db_session.get(models.Device, repl.id).pending_swap_from is None
+    orph = db_session.get(models.Device, orphan.id)
+    assert orph.pending_swap_from is None
+    assert orph.status in (
+        models.DeviceStatus.disabled,
+        models.DeviceStatus.revoked,
+    )
+    # Старый живой девайс не тронут.
+    assert db_session.get(models.Device, dev.id).status == models.DeviceStatus.active
 
 
 def test_failover_keeps_old_device_when_reprovision_fails(
@@ -327,3 +454,28 @@ def test_failover_activates_replacement_with_live_legs(
         db_session.get(models.Device, new_dev.id).status
         == models.DeviceStatus.active
     ), "замена с живым published-легом обязана стать active до ревока старого"
+
+
+def test_failover_rejects_second_while_replacement_in_flight(
+    db_session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Ревью 2026-08-25: в отложенном окне (сухой пул) старый девайс жив,
+    и второй тап запускал ВТОРОЙ failover — проигравшая замена оставалась
+    вечным active-девайсом. Живая незавершённая замена = «уже чиним»."""
+    orch, sub, dev, cfg_fresh, _fresh = _failover_fixture(
+        db_session, monkeypatch, "gate"
+    )
+    repl = make_device(db_session, sub, cfg_fresh, access_username="G-repl")
+    repl.pending_swap_from = dev.id
+    db_session.commit()
+
+    called: list[str] = []
+    monkeypatch.setattr(
+        orch, "reprovision_subscription",
+        lambda *a, **k: called.append("reprovision"),
+    )
+
+    with pytest.raises(RuntimeError, match="already in flight"):
+        orch.failover_device(dev)
+
+    assert not called, "второй failover не должен дойти до reprovision"

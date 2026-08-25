@@ -702,6 +702,16 @@ class Subscription(Base):
 
 class Device(Base):
     __tablename__ = "devices"
+    # Partial-индекс под скан жнеца свапов (миграция 0068). Имя и WHERE
+    # обязаны точно совпадать с миграцией, иначе alembic-drift; дубль в
+    # модели нужен, чтобы create_all на свежей БД тоже его создал.
+    __table_args__ = (
+        Index(
+            "ix_devices_pending_swap_from",
+            "pending_swap_from",
+            postgresql_where=text("pending_swap_from IS NOT NULL"),
+        ),
+    )
 
     id = Column(Integer, primary_key=True)
     user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
@@ -746,6 +756,16 @@ class Device(Base):
     # Device по индексу. sub_token не передаётся в plain. Подробнее —
     # docs/operations/control_channel_roadmap.md §4.3.
     client_id_hmac = Column(String(24), unique=True, index=True, nullable=True)
+    # Журнал намерения failover-свапа (миграция 0068): id старого девайса,
+    # который эта замена должна сменить. Ставится при создании замены,
+    # снимается атомарно со свапом sub_token. Ненулевой маркер старше
+    # порога = прерванный failover — его доделывает (или компенсирует)
+    # жнец-тик run_device_swap_reaper_tick. NULL у всех обычных девайсов.
+    pending_swap_from = Column(
+        Integer,
+        ForeignKey("devices.id", ondelete="SET NULL"),
+        nullable=True,
+    )
     created_at = Column(DateTime, default=utcnow)
     updated_at = Column(DateTime, default=utcnow, onupdate=utcnow)
     last_seen_at = Column(DateTime, nullable=True)
