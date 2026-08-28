@@ -189,7 +189,7 @@ deploy_app_stack_sub_xray_hy2_hop: "all"
 # На relay-нодах видимой разницы нет (там split уже делала нода).
 # Эффект — на рефреше сабы, переустанавливать ничего не нужно.
 # Откат: вернуть "off" + прокат. После пилота — "all".
-deploy_app_stack_sub_xray_ru_direct: "RGm4SjoM-YuC-yoMybFm3owaJKECfa7VEfHsU9ulzFQ"
+deploy_app_stack_sub_xray_ru_direct: "off"
 
 # Phase B — HAPP auto-select (subscription-autoconnect + lowestdelay) в заголовках
 # сабы. По умолчанию "off" (прод-поведение не меняется). Обкатка: выставить user_id
