@@ -145,6 +145,10 @@ services:
       SUB_XRAY_JSON_TOKENS: ${SUB_XRAY_JSON_TOKENS:-}
       SUB_XRAY_JSON_CLIENTS: ${SUB_XRAY_JSON_CLIENTS:-}
       SUB_XRAY_HY2_HOP: ${SUB_XRAY_HY2_HOP:-off}
+      # Клиентское правило ru-direct в Xray-JSON: РУ-домены мимо VPN с
+      # реального IP юзера — закрывает direct-ноды без туннеля и hy2, где
+      # серверный split невозможен. off / all / CSV саб-токенов.
+      SUB_XRAY_RU_DIRECT: ${SUB_XRAY_RU_DIRECT:-off}
       SUB_XRAY_PROBE_INTERVAL_S: ${SUB_XRAY_PROBE_INTERVAL_S:-300}
       # Stage 4 — balance billing. Backend reads these for the
       # WebApp endpoints (freeze caps, min topup, referral bonus).

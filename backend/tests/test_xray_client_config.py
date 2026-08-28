@@ -290,13 +290,96 @@ def test_single_leg_profile_has_no_balancer():
     assert single["outbounds"][0]["tag"] == "proxy"
 
 
-def test_no_client_side_routing_rules_beyond_private_nets():
-    """RU-split у нас на ноде. Если сюда once приедут доменные списки — это
-    расхождение с серверной раскладкой, а не фича."""
-    for profile in xj.build_profiles(FULL_SET):
+def test_no_client_side_routing_rules_beyond_private_nets(monkeypatch):
+    """С выключенным ``SUB_XRAY_RU_DIRECT`` — как до него: ровно два правила
+    (приватные сети, catch-all), доменных списков и dns нет. Это базовая
+    выдача, на которую откатываемся значением ``off``."""
+    monkeypatch.delenv("SUB_XRAY_RU_DIRECT", raising=False)
+    profiles = xj.build_profiles(FULL_SET)
+    for profile in profiles:
         for rule in profile["routing"]["rules"]:
             assert "domain" not in rule
         assert "dns" not in profile
+    auto, single = profiles[0], profiles[1]
+    assert [r["ruleTag"] for r in auto["routing"]["rules"] if "ruleTag" in r] == [
+        "private-direct"
+    ]
+    assert len(auto["routing"]["rules"]) == 2
+    assert auto["routing"]["rules"][-1]["balancerTag"] == "auto"
+    assert len(single["routing"]["rules"]) == 2
+    assert single["routing"]["rules"][-1]["outboundTag"] == "proxy"
+
+
+# ── клиентское правило ru-direct ───────────────────────────────────────
+
+
+def _rule_tags(profile):
+    return [r.get("ruleTag") for r in profile["routing"]["rules"]]
+
+
+def test_ru_direct_rule_sits_between_private_and_catch_all(monkeypatch):
+    """На direct-нодах без туннеля серверный split невозможен, поэтому РУ-домены
+    уводятся ещё на клиенте. Порядок несущий: private → ru-direct → catch-all
+    (first-match-wins) — ниже catch-all правило не сработает никогда."""
+    monkeypatch.setenv("SUB_XRAY_RU_DIRECT", "all")
+    profiles = xj.build_profiles(FULL_SET)
+    auto, singles = profiles[0], profiles[1:]
+
+    assert _rule_tags(auto) == ["private-direct", "ru-direct", None]
+    assert auto["routing"]["rules"][-1]["balancerTag"] == "auto"
+    for single in singles:
+        assert _rule_tags(single) == ["private-direct", "ru-direct", None]
+        assert single["routing"]["rules"][-1]["outboundTag"] == "proxy"
+
+    ru = auto["routing"]["rules"][1]
+    assert ru["outboundTag"] == "direct"
+    # Зоны — regexp с экранированной точкой, бренды — domain: (суффикс).
+    assert "regexp:\\.ru$" in ru["domain"]
+    assert "domain:vk.com" in ru["domain"]
+    # geoip:ru на клиенте нет намеренно — зависимость от geoip.dat в ядре.
+    assert "ip" not in ru
+    # dns по-прежнему нет: РУ-домен резолвит сам клиент и идёт напрямую.
+    assert "dns" not in auto
+
+
+def test_ru_direct_rule_serialises_with_single_backslash(monkeypatch):
+    """В JSON должно уехать ``"regexp:\\\\.ru$"`` — ровно как в конфиге ноды;
+    двойное экранирование сделало бы regexp матчем литерального бэкслеша."""
+    monkeypatch.setenv("SUB_XRAY_RU_DIRECT", "all")
+    body = xj.build_body(FULL_SET)
+    assert '"regexp:\\\\.ru$"' in body
+    assert '"regexp:\\\\\\\\.ru$"' not in body
+
+
+def test_ru_direct_gate_is_per_token(monkeypatch):
+    """CSV токенов — правило только у перечисленных, остальные как раньше."""
+    monkeypatch.setenv("SUB_XRAY_RU_DIRECT", "тот-самый-токен, ещё-один")
+
+    def has_rule(profiles):
+        return all("ru-direct" in _rule_tags(p) for p in profiles)
+
+    assert has_rule(xj.build_profiles(FULL_SET, "тот-самый-токен")) is True
+    assert has_rule(xj.build_profiles(FULL_SET, "ещё-один")) is True
+    assert has_rule(xj.build_profiles(FULL_SET, "чужой-токен")) is False
+    assert has_rule(xj.build_profiles(FULL_SET)) is False
+    # и не «у части профилей»: либо во всех, либо ни в одном
+    assert not any(
+        "ru-direct" in _rule_tags(p) for p in xj.build_profiles(FULL_SET, "чужой")
+    )
+
+
+@pytest.mark.parametrize("value,token,expected", [
+    ("off", "tok", False),
+    ("", "tok", False),
+    ("all", "tok", True),
+    ("on", "tok", True),
+    ("tok-a,tok-b", "tok-a", True),
+    ("tok-a,tok-b", "tok-c", False),
+    ("tok-a", "", False),
+])
+def test_ru_direct_gate_accepts_off_all_or_token_list(monkeypatch, value, token, expected):
+    monkeypatch.setenv("SUB_XRAY_RU_DIRECT", value)
+    assert xj.ru_direct_enabled(token) is expected
 
 
 def test_single_leg_falls_back_to_plain_list():

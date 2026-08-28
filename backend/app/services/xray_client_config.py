@@ -30,14 +30,35 @@ hy2-леги наравне с vless: при мёртвых vless трафик �
 ни запасного варианта, и такому устройству честнее отдать плоский список.
 
 **Роутинг.** Наш RU-split живёт на ноде (xray routing + hysteria acl), поэтому
-клиенту правил не передаём: всё, кроме приватных сетей, уходит в туннель — так
-же, как в плоском списке. Единственное правило — приватные подсети напрямую,
-иначе роутер и принтеры в локалке уезжают в туннель. CIDR перечислены явно, а
-не ``geoip:private``, чтобы не зависеть от наличия geoip.dat у клиента.
+базово клиенту правил не передаём: всё, кроме приватных сетей, уходит в
+туннель — так же, как в плоском списке. Приватные подсети — напрямую, иначе
+роутер и принтеры в локалке уезжают в туннель. CIDR перечислены явно, а не
+``geoip:private``, чтобы не зависеть от наличия geoip.dat у клиента.
+
+**Правило ``ru-direct`` (гейт ``SUB_XRAY_RU_DIRECT``).** Серверный split
+работает только там, где у ноды есть WG-туннель к exit'у: РУ — с IP ноды,
+остальное — в туннель. На direct-нодах без туннеля (vsin-nl-01, 4vds-dk-01)
+разделять нечего — ВСЁ уходит с IP самой ноды, и когда клиент сидит на таком
+леге, Wildberries/Яндекс/Тинькофф видят датский или голландский адрес и
+ломаются. Это не редкий угол: диверс-раскладка кладёт лег на direct-ноду
+43 из 52 активных устройств (срез 2026-08-29), а access-лог 4vds-dk-01 показал
+137 соединений к WB, ушедших direct-local с датского IP. Балансировщик
+``leastPing`` выбирает лег по пингу и о географии не знает.
+
+Поэтому РУ-домены уводим ещё на КЛИЕНТЕ: тот же список зон и доменов, что в
+роли ``ru_direct_list`` (копия в ``ru_direct_list.py``, паритет держит тест),
+и outbound ``direct`` — то есть реальный IP человека мимо VPN, на любом леге,
+включая hy2 (где per-user split на ноде и не существует). ``geoip:ru`` на
+клиент не кладём: это зависимость от geoip.dat в клиентском ядре; IP-хвост
+(прямые коннекты без SNI) по-прежнему ловят ноды своим ``geoip:ru`` там, где
+у них есть туннель. Порядок несущий: private → ru-direct → балансировщик,
+first-match-wins.
 
 **DNS.** Секции ``dns`` нет намеренно: при ``domainStrategy: "AsIs"`` домен
 уходит на сервер как есть и резолвит его нода — ровно то же поведение, что у
-плоских ссылок. Своя dns-секция здесь может только сломать резолв.
+плоских ссылок. Для ``ru-direct`` это тоже нужно: РУ-домен матчится по имени
+без резолва, клиент резолвит его системным резолвером и идёт напрямую. Своя
+dns-секция здесь может только сломать резолв.
 """
 
 from __future__ import annotations
@@ -46,6 +67,8 @@ import json
 import logging
 import os
 from urllib.parse import parse_qsl, unquote, urlsplit
+
+from .ru_direct_list import xray_client_domain_rules
 
 logger = logging.getLogger(__name__)
 
@@ -182,7 +205,26 @@ def hy2_hop_enabled(token: str) -> bool:
     ребут — не установлен netfilter-persistent), поэтому включать хоппинг
     вслепую значит менять рабочий hy2-лег на молчащий.
     """
-    raw = (os.getenv("SUB_XRAY_HY2_HOP") or "off").strip()
+    return _token_gate("SUB_XRAY_HY2_HOP", token)
+
+
+def ru_direct_enabled(token: str) -> bool:
+    """Класть ли в профили этой подписки клиентское правило ``ru-direct``.
+
+    ``off`` (дефолт) / ``all`` / CSV саб-токенов — та же форма, что у
+    ``SUB_XRAY_HY2_HOP``. Отдельный гейт, потому что правило меняет
+    поведение, которое человек ВИДИТ: РУ-сайты начинают открываться с его
+    домашнего IP вместо IP ноды. На relay-нодах это ничего не меняет (там
+    split уже делала нода), а на direct-нодах и hy2 — чинит; но проверить
+    надо на живом телефоне, а не выкатывать всем сразу. Подробно — «Правило
+    ``ru-direct``» в модульном докстринге.
+    """
+    return _token_gate("SUB_XRAY_RU_DIRECT", token)
+
+
+def _token_gate(env_name: str, token: str) -> bool:
+    """Общий разбор пер-подписочных рычагов: off / all / CSV саб-токенов."""
+    raw = (os.getenv(env_name) or "off").strip()
     low = raw.lower()
     if low in ("", "0", "off", "no", "false"):
         return False
@@ -404,7 +446,35 @@ def _private_rule() -> dict:
     }
 
 
-def _single_profile(outbound: dict, remark: str) -> dict:
+def _ru_direct_rule() -> dict:
+    """РУ-домены — мимо VPN, с реального IP человека (см. ``ru_direct_enabled``).
+
+    Список — байт-в-байт тот же, что ноды рендерят из роли ``ru_direct_list``
+    (``regexp:\\.<зона>$`` + ``domain:<домен>``). Матч по имени: для TLS/QUIC
+    это SNI из sniffing на inbound'е, для HTTP — Host; резолв не нужен.
+    """
+    return {
+        "type": "field",
+        "ruleTag": "ru-direct",
+        "domain": xray_client_domain_rules(),
+        "outboundTag": "direct",
+    }
+
+
+def _head_rules(ru_direct: bool) -> list[dict]:
+    """Правила ПЕРЕД catch-all, общие для обоих типов профилей.
+
+    Порядок несущий (first-match-wins): приватные сети первыми — иначе
+    ``ru-direct`` не при чём, но локалка утекает; ``ru-direct`` вторым —
+    ниже catch-all оно никогда не сработает.
+    """
+    rules = [_private_rule()]
+    if ru_direct:
+        rules.append(_ru_direct_rule())
+    return rules
+
+
+def _single_profile(outbound: dict, remark: str, *, ru_direct: bool = False) -> dict:
     """Профиль на один лег — ручной выбор конкретного сервера, как сейчас."""
     proxy = dict(outbound, tag="proxy")
     return {
@@ -414,15 +484,14 @@ def _single_profile(outbound: dict, remark: str) -> dict:
         "outbounds": [proxy] + _tail_outbounds(),
         "routing": {
             "domainStrategy": "AsIs",
-            "rules": [
-                _private_rule(),
+            "rules": _head_rules(ru_direct) + [
                 {"type": "field", "network": "tcp,udp", "outboundTag": "proxy"},
             ],
         },
     }
 
 
-def _auto_profile(outbounds: list[dict]) -> dict:
+def _auto_profile(outbounds: list[dict], *, ru_direct: bool = False) -> dict:
     """Профиль автовыбора: ядро пингует все леги и берёт самый быстрый живой."""
     first = outbounds[0]["tag"]
     return {
@@ -432,8 +501,7 @@ def _auto_profile(outbounds: list[dict]) -> dict:
         "outbounds": list(outbounds) + _tail_outbounds(),
         "routing": {
             "domainStrategy": "AsIs",
-            "rules": [
-                _private_rule(),
+            "rules": _head_rules(ru_direct) + [
                 {"type": "field", "network": "tcp,udp", "balancerTag": "auto"},
             ],
             "balancers": [
@@ -469,6 +537,7 @@ def build_profiles(configs, token: str = "") -> list[dict] | None:
     чтобы гейт нельзя было обойти мимо этой функции.
     """
     hop = hy2_hop_enabled(token)
+    ru_direct = ru_direct_enabled(token)
     outbounds: list[dict] = []
     remarks: list[str] = []
     for cfg in configs:
@@ -486,9 +555,10 @@ def build_profiles(configs, token: str = "") -> list[dict] | None:
         )
         return None
 
-    profiles = [_auto_profile(outbounds)]
+    profiles = [_auto_profile(outbounds, ru_direct=ru_direct)]
     profiles += [
-        _single_profile(ob, remark) for ob, remark in zip(outbounds, remarks)
+        _single_profile(ob, remark, ru_direct=ru_direct)
+        for ob, remark in zip(outbounds, remarks)
     ]
     return profiles
 

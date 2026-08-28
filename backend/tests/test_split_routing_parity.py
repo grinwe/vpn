@@ -303,6 +303,50 @@ def test_brand_rules_do_not_catch_foreign_domains() -> None:
         assert matches(host), f"{host} НЕ попал в RU-обход"
 
 
+# ── Клиентское правило ru-direct (Xray-JSON) ─────────────────────────────
+# Пятый потребитель списка — не нода, а КЛИЕНТ: backend кладёт в Xray-JSON
+# правило ru-direct, чтобы РУ-домены уходили с реального IP человека и на тех
+# легах, где нода split сделать не может (direct-ноды без туннеля, hy2).
+# Образ backend не содержит infra/, поэтому список там — копия в python.
+# Копия обязана совпадать с ролью до элемента и до порядка, а её рендер —
+# байт-в-байт с тем, что нода кладёт в свой routing.
+
+
+def test_backend_copy_of_ru_list_matches_role() -> None:
+    """``ru_direct_list.py`` == ``ru_direct_list/defaults/main.yml``.
+
+    Порядок тоже сверяется: первый элемент домен-массива у ноды и у клиента
+    должен быть одним и тем же, иначе diff конфигов читать неудобно.
+    """
+    from app.services.ru_direct_list import RU_DIRECT_DOMAINS, RU_DIRECT_ZONES
+
+    assert RU_DIRECT_ZONES == RU_LIST_VARS["ru_direct_list_zones"], (
+        "зоны в backend/app/services/ru_direct_list.py разошлись с ролью"
+    )
+    assert RU_DIRECT_DOMAINS == RU_LIST_VARS["ru_direct_list_domains"], (
+        "домены в backend/app/services/ru_direct_list.py разошлись с ролью: "
+        f"лишние {set(RU_DIRECT_DOMAINS) - set(RU_LIST_VARS['ru_direct_list_domains'])}, "
+        f"недостающие {set(RU_LIST_VARS['ru_direct_list_domains']) - set(RU_DIRECT_DOMAINS)}"
+    )
+
+
+def test_client_ru_rule_renders_like_node_rule() -> None:
+    """Домен-массив клиентского правила == домен-массив RU-правила ноды.
+
+    Сверяется результат рендера, а не входные списки: у ноды зоны проходят
+    через ``regex_replace`` с экранированием, и именно там легко получить
+    ``regexp:\\\\.ru$`` вместо ``regexp:\\.ru$``.
+    """
+    from app.services.ru_direct_list import xray_client_domain_rules
+
+    rules = _render("reality", "single-link-relay")["routing"]["rules"]
+    node_domains = next(r["domain"] for r in rules if r.get("domain"))
+    client_domains = xray_client_domain_rules()
+    assert client_domains == node_domains
+    # И на уровне байтов JSON: одна экранированная точка, как у ноды.
+    assert json.dumps(client_domains[0]) == json.dumps(node_domains[0]) == '"regexp:\\\\.ru$"'
+
+
 # ── hysteria2 ────────────────────────────────────────────────────────────
 # Другой формат (YAML + ACL вместо JSON + routing.rules), те же инварианты:
 # РУ — мимо туннеля, всё остальное — в туннель, приватные сети закрыты.
