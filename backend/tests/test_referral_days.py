@@ -134,6 +134,67 @@ def test_referral_invite_is_deliverable(db_session):
     assert "referral_invite" in ADMIN_NOTIFICATION_ACTIONS
 
 
+def _invite_row(db_session, telegram_id: str, *, age_hours: float):
+    from datetime import timedelta
+
+    from app.time_utils import utcnow
+
+    log = models.AuditLog(
+        actor="system",
+        actor_type=models.AuditActor.system,
+        action="referral_invite",
+        target_type="user",
+        target_id=1,
+        created_at=utcnow() - timedelta(hours=age_hours),
+        extra={"telegram_id": telegram_id, "share_url": "https://t.me/x?start=ref_1",
+               "reward_days": 10},
+    )
+    db_session.add(log)
+    db_session.commit()
+    return log
+
+
+def _pending_invite_ids(client) -> set[int]:
+    # Лимит с запасом: БД сессии общая, в очереди лежат чужие недоставленные
+    # строки, а FIFO ставит свежие в хвост.
+    resp = client.get("/api/notifications/pending?limit=1000")
+    assert resp.status_code == 200, resp.text
+    return {n["id"] for n in resp.json() if n["type"] == "referral_invite"}
+
+
+def test_referral_invite_is_delayed_by_default(client, db_session, monkeypatch):
+    """Запись мгновенная, ДОСТАВКА через REFERRAL_INVITE_DELAY_H (дефолт 24):
+    сразу после ссылки приглашение было третьим-четвёртым сообщением подряд и
+    тонуло в шуме; через сутки человеку есть что рекомендовать."""
+    monkeypatch.delenv("REFERRAL_INVITE_DELAY_H", raising=False)
+    fresh = _invite_row(db_session, "ri-fresh", age_hours=1)
+    ripe = _invite_row(db_session, "ri-ripe", age_hours=25)
+
+    ids = _pending_invite_ids(client)
+    assert ripe.id in ids
+    assert fresh.id not in ids
+
+
+def test_referral_invite_delay_zero_delivers_immediately(client, db_session, monkeypatch):
+    monkeypatch.setenv("REFERRAL_INVITE_DELAY_H", "0")
+    fresh = _invite_row(db_session, "ri-now", age_hours=0)
+
+    assert fresh.id in _pending_invite_ids(client)
+
+
+def test_referral_invite_text_asks_how_it_goes(client, db_session, monkeypatch):
+    """Через сутки «Готово, VPN работает» неуместно — текст начинается с
+    вопроса и без длинного тире."""
+    monkeypatch.setenv("REFERRAL_INVITE_DELAY_H", "0")
+    row = _invite_row(db_session, "ri-text", age_hours=0)
+
+    resp = client.get("/api/notifications/pending?limit=1000")
+    item = next(n for n in resp.json() if n["id"] == row.id)
+    assert item["text"].startswith("Как VPN?")
+    assert "10 дней" in item["text"] and "https://t.me/x?start=ref_1" in item["text"]
+    assert "Готово" not in item["text"] and "—" not in item["text"]
+
+
 def test_one_referral_code_per_user(db_session):
     """Бот и мини-апп минтили коды разного формата, и человек видел две разные
     ссылки. Хелпер должен отдавать один и тот же код."""

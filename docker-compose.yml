@@ -150,6 +150,10 @@ services:
       # WebApp endpoints (freeze caps, min topup, referral bonus).
       FREEZE_DAYS: ${FREEZE_DAYS:-7}
       REFERRAL_BONUS_KOPECKS: ${REFERRAL_BONUS_KOPECKS:-5000}
+      # Задержка доставки пуша «приведи друга» (часы) после первого
+      # скачивания конфига; 0 = сразу. Только backend: очередь бота
+      # (/api/notifications/pending) отдаёт он, worker её не читает.
+      REFERRAL_INVITE_DELAY_H: ${REFERRAL_INVITE_DELAY_H:-24}
       MIN_TOPUP_KOPECKS: ${MIN_TOPUP_KOPECKS:-10000}
       EXTRA_DEVICE_KOPECKS_PER_MONTH: ${EXTRA_DEVICE_KOPECKS_PER_MONTH:-10000}
       # Stage 8 — public base URL for the dynamic sub link. When set,

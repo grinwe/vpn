@@ -314,6 +314,62 @@ def test_warm_provision_stages_push_before_caller_commits(
         other.close()
 
 
+def test_warm_provision_with_notify_off_stages_nothing(
+    db_session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """notify_config_ready=False — вызывающий (бот после activate_trial_full,
+    ЛК в webapp_activate) отдаёт ссылку сам и сразу; warm-пуш с той же ссылкой
+    через 10 с был бы дублем (жалоба владельца 28.08)."""
+    monkeypatch.setattr(
+        warm_pool, "run_playbook",
+        lambda *a, **k: SimpleNamespace(returncode=0, stdout="", stderr=""),
+    )
+    monkeypatch.setattr(warm_pool, "build_inventory_for_node", lambda node: None)
+    node = _fresh_node(db_session, name="cr-e2e-warm-off", host="10.9.0.5")
+    assert warm_pool.warm_one_bundle(db_session, node) is not None
+    plan = make_plan(db_session, name="cr-e2e-warm-off-plan")
+    user = make_user(db_session, telegram_id=TG)
+
+    orch = ProvisioningOrchestrator(db_session)
+    sub, task = orch.provision_subscription(
+        user, plan, node_id=node.id, notify_config_ready=False
+    )
+    db_session.commit()
+
+    assert task.action == "assign_warm"
+    staged = (
+        db_session.query(models.AuditLog)
+        .filter_by(action="config_ready", target_type="subscription", target_id=sub.id)
+        .all()
+    )
+    assert staged == []
+
+
+def test_cold_provision_with_notify_off_keeps_payload_flag(db_session: Session) -> None:
+    """Флаг вызывающего гасит только warm-пуш. На cold-пути девайс pending,
+    ссылка в момент ответа ещё не рабочая (бот честно пишет «ещё создаётся»),
+    и пуш по завершении Ansible нужен всегда — маркер в payload остаётся."""
+    node = _fresh_node(db_session, name="cr-e2e-cold-off", host="10.9.0.6")
+    plan = make_plan(db_session, name="cr-e2e-cold-off-plan")
+    user = make_user(db_session, telegram_id=TG)
+
+    orch = ProvisioningOrchestrator(db_session)
+    sub, task = orch.provision_subscription(
+        user, plan, node_id=node.id, notify_config_ready=False
+    )
+    db_session.commit()
+
+    assert warm_pool.pool_depth(db_session, node.id) == 0
+    assert task.action == "apply"
+    assert task.payload["notify_config_ready"] is True
+    assert (
+        db_session.query(models.AuditLog)
+        .filter_by(action="config_ready", target_type="subscription", target_id=sub.id)
+        .count()
+        == 0
+    )
+
+
 # ── warm-путь: прямой вызов хелпера без commit ───────────────────────────
 
 
@@ -406,9 +462,12 @@ def test_sub_uri_omitted_without_base(db_session: Session) -> None:
 # ── доставка через /api/notifications/pending ────────────────────────────
 
 
-def test_pending_renders_config_ready_with_cabinet_hint(
+def test_pending_renders_config_ready_with_link_and_platform_prompt(
     client, db_session: Session, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """Со ссылкой абзаца про ЛК/config в тексте нет: кнопка ЛК первой строкой
+    в onboarding_keyboard, которую бот вешает на этот тип, — текстом это
+    повторялось до четырёх раз за один тап (жалоба владельца 28.08)."""
     monkeypatch.setenv("SUB_LINK_BASE_URL", PRIMARY)
     sub, device = _warm_fixture(db_session)
     assert notify_config_ready(db_session, device, source="warm", commit=True)
@@ -419,14 +478,17 @@ def test_pending_renders_config_ready_with_cabinet_hint(
     assert len(items) == 1
     item = items[0]
     assert item["telegram_id"] == TG
-    assert f"{PRIMARY}/{sub.sub_token}" in item["text"]
-    assert "личном кабинете" in item["text"]
-    assert "/config" in item["text"]
+    assert item["text"].startswith("✅ Конфиг VPN готов")
+    assert f"Ссылка: {PRIMARY}/{sub.sub_token}" in item["text"]
+    assert "Выбери платформу" in item["text"]
+    assert "личном кабинете" not in item["text"]
+    assert "/config" not in item["text"]
 
 
 def test_pending_without_link_still_points_to_cabinet(
     client, db_session: Session
 ) -> None:
+    """Без ссылки единственный путь к ней — ЛК: одна строка про него остаётся."""
     sub, device = _warm_fixture(db_session)
     assert notify_config_ready(db_session, device, source="warm", commit=True)
 
@@ -435,3 +497,4 @@ def test_pending_without_link_still_points_to_cabinet(
     assert len(items) == 1
     assert "Ссылка: " not in items[0]["text"]
     assert "личном кабинете" in items[0]["text"]
+    assert "Выбери платформу" in items[0]["text"]

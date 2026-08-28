@@ -12,9 +12,11 @@
 * ``cmd_config`` шлёт два сообщения (шапка + голый URL) тем же путём, что
   пришёл запрос (``message.answer`` / ``bot.send_message``), возвращает True;
   честные статусы «ещё создаётся» / «заморожена»; ``quiet_if_missing`` —
-  молчит и отдаёт False.
-* ``trial_activate_cb``: после «Готово!» ссылка ДОХОДИТ; падение выдачи →
-  фолбэк на ЛК, а не тишина; 409 с живой подпиской → ссылка без прайса;
+  молчит и отдаёт False. ``intro`` клеится к первому сообщению, каким бы оно
+  ни было; шапка без абзаца про ЛК (28.08: 7 сообщений за один тап).
+* ``trial_activate_cb``: «месяц активирован» и ссылка — ОДНИМ сообщением
+  (+ голый URL), итого два; падение выдачи → фолбэк на ЛК с тем же
+  заголовком, а не тишина; 409 с живой подпиской → ссылка без прайса;
   409 без подписки → прайс; 409 после провала провижининга → честный текст.
 * ``go:config`` зовёт ``cmd_config`` от имени инициатора.
 * Клавиатуры: «🔗 Ссылка для подключения» у юзера с подпиской (active/frozen)
@@ -131,14 +133,60 @@ async def test_cmd_config_with_message_sends_header_and_link(handlers, monkeypat
 
     assert len(msg.sent) == 2, msg.sent
     header, header_kw = msg.sent[0]
-    assert "ссылка подписки" in header.lower()
-    # Акцент на ЛК прямо в шапке: ссылку всегда можно забрать там.
-    assert "личном кабинете" in header
+    assert header.startswith("🔗 Твоя ссылка для подключения")
+    assert "Выбери платформу" in header
+    # Без intro шапка начинается со ссылки, а не с «🎉».
+    assert "🎉" not in header
+    # Абзац про ЛК/config из шапки убран: кнопка ЛК первой строкой в
+    # onboarding_keyboard, menu-button ЛК у поля ввода; текстом это повторялось
+    # до четырёх раз за один тап (жалоба владельца 28.08). «Один раз, потом
+    # клиент сам подтянет» уехало в платформенные инструкции.
+    assert "личном кабинете" not in header and "/config" not in header
+    assert "один раз" not in header
     assert isinstance(header_kw.get("reply_markup"), KeyboardMarker)
     assert header_kw["reply_markup"].name == "onboarding_keyboard"
     assert LINK in msg.sent[1][0]
     # Путь message!=None → только message.answer, bot.send_message не трогаем.
     assert bot.sent == []
+
+
+@pytest.mark.asyncio
+async def test_cmd_config_intro_is_glued_to_header(handlers, monkeypatch):
+    _script_fetch(handlers, monkeypatch, {"/api/users/by_telegram/100": (200, _ACTIVE_SUBS)})
+    msg = FakeMessage(FakeBot())
+
+    assert await handlers.cmd_config(msg, intro="🎉 Заголовок.") is True
+
+    assert len(msg.sent) == 2
+    header = msg.sent[0][0]
+    assert header.startswith("🎉 Заголовок.\n\n🔗 Твоя ссылка для подключения")
+    assert LINK in msg.sent[1][0] and "🎉" not in msg.sent[1][0]
+
+
+@pytest.mark.asyncio
+async def test_cmd_config_intro_is_glued_to_pending_status(handlers, monkeypatch):
+    """Cold-путь после триала: «месяц активирован» + «ещё создаётся» одним
+    сообщением, а не «ещё создаётся» перед «активирован»."""
+    _script_fetch(handlers, monkeypatch, {"/api/users/by_telegram/100": (200, _PENDING_SUBS)})
+    msg = FakeMessage(FakeBot())
+
+    assert await handlers.cmd_config(msg, quiet_if_missing=True, intro="🎉 Заголовок.") is False
+
+    texts = _msg_texts(msg)
+    assert len(texts) == 1
+    assert texts[0].startswith("🎉 Заголовок.\n\n") and "ещё создаётся" in texts[0]
+
+
+@pytest.mark.asyncio
+async def test_cmd_config_intro_alone_when_quiet_has_nothing_to_say(handlers, monkeypatch):
+    """Тихий режим без подписок: слать нечего, но факт активации юзер должен
+    увидеть — заголовок уходит сам по себе."""
+    _script_fetch(handlers, monkeypatch, {"/api/users/by_telegram/100": (200, [])})
+    msg = FakeMessage(FakeBot())
+
+    assert await handlers.cmd_config(msg, quiet_if_missing=True, intro="🎉 Заголовок.") is False
+
+    assert _msg_texts(msg) == ["🎉 Заголовок."]
 
 
 @pytest.mark.asyncio
@@ -231,13 +279,68 @@ async def test_trial_activate_200_delivers_link(handlers, monkeypatch):
     await handlers.trial_activate_cb(cb)
 
     assert cb.answered == 1
-    done = [t for t in _bot_texts(bot) if "Готово" in t]
-    assert done and "25.09.2026" in done[0]
-    assert "личном кабинете" in done[0] and "/config" in done[0]
+    # Отдельного «Готово!» нет: заголовок приклеен к шапке со ссылкой.
+    assert bot.sent == [], bot.sent
+    assert len(msg.sent) == 2, msg.sent
+    header, header_kw = msg.sent[0]
+    assert header.startswith("🎉 Бесплатный месяц активирован до 25.09.2026.")
+    assert "Твоя ссылка" in header
+    assert header_kw["reply_markup"].name == "onboarding_keyboard"
+    # Ни «около минуты» (правда только на cold-пути, там свой текст), ни
+    # абзаца про ЛК/config (кнопки уже в клавиатуре).
+    assert "минут" not in header and "личном кабинете" not in header
     # Обещанная ссылка ДОЛЖНА прийти (до фикса — RecursionError в _say).
-    assert any(LINK in t for t in _msg_texts(msg)), (bot.sent, msg.sent)
+    assert LINK in msg.sent[1][0]
     # Прайс после успешной активации не показываем.
     assert not any("тариф" in t.lower() for t in _msg_texts(msg) + _bot_texts(bot))
+
+
+@pytest.mark.asyncio
+async def test_trial_activate_200_cold_path_glues_done_to_wait_status(handlers, monkeypatch):
+    """Cold-путь: девайс pending, ссылка ещё не рабочая. Юзер получает
+    «активирован + ещё создаётся» одним сообщением и подсказку, где забрать."""
+    _script_fetch(handlers, monkeypatch, {
+        "/api/trial/activate_full": (200, {"expires_at": "2026-09-25T00:00:00"}),
+        "/api/users/by_telegram/100": (200, _PENDING_SUBS),
+    })
+    bot = FakeBot()
+    msg = FakeMessage(bot)
+    cb = FakeCallback(bot, msg)
+
+    await handlers.trial_activate_cb(cb)
+
+    texts = _msg_texts(msg)
+    assert len(texts) == 1 and texts[0].startswith("🎉 Бесплатный месяц активирован")
+    assert "ещё создаётся" in texts[0]
+    hint = _bot_texts(bot)
+    assert len(hint) == 1 and "личном кабинете" in hint[0] and "активирован" not in hint[0]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "activate_resp",
+    [
+        (200, {"expires_at": "2026-09-25T00:00:00"}),
+        (409, {"detail": LIVE_DETAIL}),
+    ],
+    ids=["200", "409-live"],
+)
+async def test_successful_delivery_is_exactly_two_messages(handlers, monkeypatch, activate_resp):
+    """Инвариант 28.08: за тап по подарку при успешной выдаче приходят ровно
+    два сообщения (заголовок + шапка со ссылкой, голый URL). Было семь."""
+    _script_fetch(handlers, monkeypatch, {
+        "/api/trial/activate_full": activate_resp,
+        "/api/users/by_telegram/100": (200, _ACTIVE_SUBS),
+    })
+    bot = FakeBot()
+    msg = FakeMessage(bot)
+    cb = FakeCallback(bot, msg)
+
+    await handlers.trial_activate_cb(cb)
+
+    total = len(bot.sent) + len(msg.sent)
+    assert total == 2, (bot.sent, msg.sent)
+    assert LINK in msg.sent[-1][0]
 
 
 @pytest.mark.asyncio
@@ -254,6 +357,7 @@ async def test_trial_activate_200_inaccessible_message_goes_via_bot(handlers, mo
 
     assert any(LINK in t for t in _bot_texts(bot)), bot.sent
     assert all(c == 100 for c, _t, _k in bot.sent)
+    assert len(bot.sent) == 2 and bot.sent[0][1].startswith("🎉 Бесплатный месяц активирован")
 
 
 @pytest.mark.asyncio
@@ -275,9 +379,11 @@ async def test_trial_activate_200_delivery_crash_falls_back_to_cabinet(handlers,
     await handlers.trial_activate_cb(cb)  # не должно бросить
 
     texts = _bot_texts(bot)
-    assert any("Готово" in t for t in texts)
     fallback = [(t, k) for _c, t, k in bot.sent if "не удалось прислать" in t]
     assert fallback, texts
+    # Заголовок «месяц активирован» едет вместе с фолбэком: cmd_config упал,
+    # сам его не отправил, а факт активации юзер должен увидеть.
+    assert fallback[0][0].startswith("🎉 Бесплатный месяц активирован до 25.09.2026.")
     assert "личном кабинете" in fallback[0][0] and "/config" in fallback[0][0]
     assert isinstance(fallback[0][1].get("reply_markup"), KeyboardMarker)
     assert fallback[0][1]["reply_markup"].name == "webapp_inline_keyboard"
@@ -297,9 +403,12 @@ async def test_trial_activate_200_without_link_yet_points_to_cabinet(handlers, m
 
     await handlers.trial_activate_cb(cb)
 
-    assert msg.sent == []
-    texts = _bot_texts(bot)
-    assert len(texts) == 2 and "личном кабинете" in texts[1]
+    texts = _msg_texts(msg) + _bot_texts(bot)
+    # Заголовок ушёл сам по себе (cmd_config в тихом режиме ничего не сказал),
+    # затем подсказка про ЛК — и ничего про /plans.
+    assert len(texts) == 2, texts
+    assert texts[0] == "🎉 Бесплатный месяц активирован до 25.09.2026."
+    assert "личном кабинете" in texts[1]
     assert not any("/plans" in t for t in texts)
 
 
@@ -318,13 +427,12 @@ async def test_trial_activate_409_live_subscription_sends_link_not_prices(handle
 
     await handlers.trial_activate_cb(cb)
 
-    texts = _bot_texts(bot)
-    assert any("уже есть подписка" in t for t in texts), texts
-    # Шапка не обещает ссылку: следующим сообщением может прийти и «ещё
-    # создаётся», и «заморожена» — обещание было бы ложью.
-    assert not any("Вот ссылка" in t for t in texts), texts
-    assert any(LINK in t for t in _msg_texts(msg)), msg.sent
-    assert not any("тариф" in t.lower() for t in _msg_texts(msg) + texts)
+    texts = _msg_texts(msg)
+    # «Уже есть подписка» — заголовок шапки со ссылкой, не отдельное сообщение.
+    assert bot.sent == [], bot.sent
+    assert len(texts) == 2 and texts[0].startswith("У тебя уже есть подписка 😉\n\n🔗")
+    assert LINK in texts[1]
+    assert not any("тариф" in t.lower() for t in texts)
     assert not any("Подарок уже был использован" in t for t in texts)
     assert ("GET", "http://backend/api/plans") not in calls
 

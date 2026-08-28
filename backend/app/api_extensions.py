@@ -25,7 +25,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from .auth import optional_admin, require_admin  # noqa: F401 — re-exported for legacy imports
 from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel
-from sqlalchemy import func
+from sqlalchemy import func, or_
 from sqlalchemy.orm import Session
 
 from . import models
@@ -2191,7 +2191,12 @@ def activate_trial_full(
 
     orchestrator = ProvisioningOrchestrator(db)
     try:
-        sub, _task = orchestrator.provision_subscription(user, plan)
+        # notify_config_ready=False: бот отдаёт ссылку сам сразу после 200
+        # (trial_activate_cb → cmd_config), warm-пуш с той же ссылкой через
+        # 10 с был бы дублем. Cold-путь (девайс pending) пуш шлёт по-прежнему.
+        sub, _task = orchestrator.provision_subscription(
+            user, plan, notify_config_ready=False
+        )
     except ColdPathThrottled as exc:
         # Наплыв триальщиков мимо warm-пула: честный 503 с Retry-After
         # вместо 500 — бот скажет «попробуй через минуту».
@@ -2338,6 +2343,23 @@ ADMIN_NOTIFICATION_ACTIONS = [
 ]
 
 
+def _referral_invite_delay() -> timedelta | None:
+    """Задержка доставки referral_invite (env REFERRAL_INVITE_DELAY_H, часы).
+
+    Дефолт 24: приглашение приходит через сутки после первого скачивания
+    конфига, когда человек уже попользовался VPN и ему есть что рекомендовать.
+    ``0`` (или мусор в env) отключает задержку — строка отдаётся сразу, как
+    было до 28.08. Читается на каждый запрос, чтобы переключение не требовало
+    рестарта и легко глушилось в тестах.
+    """
+    raw = os.getenv("REFERRAL_INVITE_DELAY_H", "24")
+    try:
+        hours = float(raw)
+    except ValueError:
+        hours = 24.0
+    return timedelta(hours=hours) if hours > 0 else None
+
+
 @ext_router.get("/notifications/pending", response_model=list[NotificationOut])
 
 
@@ -2368,17 +2390,28 @@ def get_pending_notifications(
     # на десятки минут. Разделяем на priority + bulk и доставляем FIFO (asc):
     # сперва все срочные (до limit), остаток добиваем broadcast'ом.
     bulk_actions = ["admin_broadcast"]
+    invite_delay = _referral_invite_delay()
 
     def _fetch(actions: list[str], lim: int) -> list[models.AuditLog]:
         if lim <= 0:
             return []
-        return (
-            db.query(models.AuditLog)
-            .filter(
-                models.AuditLog.action.in_(actions),
-                models.AuditLog.actor_type == models.AuditActor.system,
+        q = db.query(models.AuditLog).filter(
+            models.AuditLog.action.in_(actions),
+            models.AuditLog.actor_type == models.AuditActor.system,
+        )
+        if invite_delay is not None:
+            # Отложенная ДОСТАВКА referral_invite (запись остаётся мгновенной,
+            # см. _mark_first_config_fetch): строка созревает и только потом
+            # попадает в выборку. Отдельный фильтр, а не отдельный класс —
+            # FIFO и приоритеты остальных пушей не меняются.
+            q = q.filter(
+                or_(
+                    models.AuditLog.action != "referral_invite",
+                    models.AuditLog.created_at <= utcnow() - invite_delay,
+                )
             )
-            .order_by(models.AuditLog.created_at.asc())  # FIFO — честный порядок
+        return (
+            q.order_by(models.AuditLog.created_at.asc())  # FIFO — честный порядок
             .limit(lim)
             .all()
         )
@@ -2425,15 +2458,26 @@ def get_pending_notifications(
             # SUB_LINK_BASE_URL ссылки в пуше нет — текст ведёт в личный
             # кабинет, где она лежит всегда (инцидент 2026-08-25: бот
             # пообещал ссылку и не прислал, юзер упёрся в тупик).
+            # Абзаца про ЛК/config при наличии ссылки нет: бот вешает на этот
+            # тип onboarding_keyboard с кнопкой ЛК первой строкой, текстом это
+            # было бы повтором (жалоба владельца 28.08). Без ссылки единственный
+            # путь к ней — ЛК, и тогда одна строка про него уместна.
             sub_uri = extra.get("sub_uri")
             text = (
                 "✅ Конфиг VPN готов, можно подключаться!\n"
-                + (f"Ссылка: {sub_uri}\n" if sub_uri else "")
-                + "Ссылка всегда лежит в личном кабинете "
-                "(кнопка «Личный кабинет» внизу) и по команде /config."
+                + (
+                    f"Ссылка: {sub_uri}\n"
+                    if sub_uri
+                    else "Ссылка ждёт в личном кабинете (кнопка ниже).\n"
+                )
+                + "Не знаешь, как настроить? Выбери платформу 👇"
             )
         elif log.action == "referral_invite":
-            # Шлётся один раз — после того, как человек впервые скачал конфиг.
+            # Шлётся один раз — после того, как человек впервые скачал конфиг,
+            # но с задержкой REFERRAL_INVITE_DELAY_H (см. _referral_invite_delay):
+            # сразу после ссылки это было третьим-четвёртым сообщением подряд и
+            # тонуло в шуме, а через сутки у человека есть что рекомендовать.
+            # Поэтому текст начинается с вопроса «Как VPN?», а не с «Готово».
             #
             # Ссылку зовём отправить лично, а не постить публично: публикация
             # ссылки на VPN-бота — состав по ч.18 ст.14.3 КоАП (в январе 2026
@@ -2443,13 +2487,13 @@ def get_pending_notifications(
             ref_url = extra.get("share_url")
             reward_days = extra.get("reward_days")
             reward_line = (
-                f"Если приведёшь друга — получишь {_plural_days(reward_days)} "
+                f"Если приведёшь друга, получишь {_plural_days(reward_days)} "
                 "подписки, когда он оплатит.\n\n"
                 if reward_days
                 else ""
             )
             text = (
-                "Готово, VPN работает 🎉\n\n"
+                "Как VPN? "
                 + reward_line
                 + (f"Ссылка для друзей:\n{ref_url}" if ref_url else "")
             )

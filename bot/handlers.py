@@ -316,6 +316,14 @@ async def _delete_message_after(
 
 # ── Onboarding instructions ──────────────────────────────────────────
 
+# Раньше эта мысль жила в шапке /config и приходила каждому вместе со
+# ссылкой (шум: жалоба владельца 28.08 на 7 сообщений за один тап). Она
+# нужна только тому, кто реально настраивает клиент, — то есть здесь.
+_SUB_LINK_ONCE_NOTE = (
+    "Ссылку достаточно добавить один раз: при смене сервера клиент сам "
+    "подтянет новые настройки."
+)
+
 ONBOARDING_INSTRUCTIONS = {
     "android": (
         "<b>Настройка на Android (v2rayNG):</b>\n\n"
@@ -323,28 +331,32 @@ ONBOARDING_INSTRUCTIONS = {
         "2. Скопируйте ссылку подписки: она в личном кабинете или по команде /config\n"
         "3. Откройте v2rayNG → нажмите <b>+</b> → <b>Импорт из буфера</b>\n"
         "4. Нажмите кнопку ▶️ для подключения\n\n"
-        "Альтернатива: <b>Hiddify</b> (Google Play) — автоимпорт по ссылке."
+        "Альтернатива: <b>Hiddify</b> (Google Play) — автоимпорт по ссылке.\n\n"
+        + _SUB_LINK_ONCE_NOTE
     ),
     "ios": (
         "<b>Настройка на iOS (Hiddify / Streisand):</b>\n\n"
         "1. Установите <b>Hiddify</b> или <b>Streisand</b> из App Store\n"
         "2. Скопируйте ссылку подписки: она в личном кабинете или по команде /config\n"
         "3. Откройте приложение → <b>+</b> → <b>Добавить из буфера</b>\n"
-        "4. Нажмите <b>Подключить</b>"
+        "4. Нажмите <b>Подключить</b>\n\n"
+        + _SUB_LINK_ONCE_NOTE
     ),
     "windows": (
         "<b>Настройка на Windows (Hiddify / Nekoray):</b>\n\n"
         "1. Скачайте <b>Hiddify</b> с hiddify.com или <b>Nekoray</b> с GitHub\n"
         "2. Скопируйте ссылку подписки: она в личном кабинете или по команде /config\n"
         "3. В программе: <b>Добавить профиль из буфера</b>\n"
-        "4. Активируйте системный прокси и подключитесь"
+        "4. Активируйте системный прокси и подключитесь\n\n"
+        + _SUB_LINK_ONCE_NOTE
     ),
     "macos": (
         "<b>Настройка на macOS (Hiddify):</b>\n\n"
         "1. Скачайте <b>Hiddify</b> с hiddify.com\n"
         "2. Скопируйте ссылку подписки: она в личном кабинете или по команде /config\n"
         "3. Добавьте профиль из буфера обмена\n"
-        "4. Подключитесь"
+        "4. Подключитесь\n\n"
+        + _SUB_LINK_ONCE_NOTE
     ),
 }
 
@@ -419,9 +431,41 @@ def format_welcome(name: str, is_new: bool, trial_available: bool) -> str:
         body = f"👋 Рад снова видеть, {name}!\n\n"
     if trial_available:
         body += _TRIAL_LINE
-        return body.rstrip("\n")
-    body += "Выбери действие ниже 👇"
-    return body
+    # Без «Выбери действие ниже 👇»: приглашение к действию теперь несёт
+    # второе, короткое сообщение с inline-кнопками (см. _send_welcome_pair),
+    # и повторять его здесь — тот самый шум, на который жаловался владелец.
+    return body.rstrip("\n")
+
+
+async def _send_welcome_pair(
+    send,
+    *,
+    welcome: str,
+    trial_available: bool,
+    is_new: bool,
+    has_devices: bool,
+    has_link: bool,
+) -> None:
+    """Приветствие двумя сообщениями: текст + нижняя reply-клавиатура, затем
+    короткий вопрос + inline-кнопки действий.
+
+    Telegram даёт один ``reply_markup`` на сообщение, а нам нужны обе
+    клавиатуры: reply (всегда внизу) и inline (подарок / тарифы / ЛК). До
+    28.08 порядок был обратным: приветствие с inline-кнопками, а reply-
+    клавиатура ехала на отдельной строке «⌨️ Кнопки внизу всегда под рукой»,
+    у которой не было никакой функции, кроме как везти клавиатуру. Теперь
+    второе сообщение — вопрос-приглашение: у него есть смысл (это и есть
+    призыв к действию из приветствия), а кнопки действий оказываются
+    последним, что юзер видит на экране. Итог те же два сообщения, но без
+    пустой строки. ``send`` — ``message.answer`` либо ``callback.message.answer``.
+    """
+    await send(welcome, reply_markup=start_keyboard(has_devices=has_devices))
+    await send(
+        "Начнём? 👇" if trial_available else "Что дальше? 👇",
+        reply_markup=welcome_action_keyboard(
+            trial_available=trial_available, is_new=is_new, has_link=has_link
+        ),
+    )
 
 
 @router.message(F.text == BTN_MAIN_MENU)
@@ -529,23 +573,17 @@ async def cmd_start(message: types.Message, state: FSMContext):
     first_name = message.from_user.first_name or "друг"
     welcome = format_welcome(first_name, is_new, trial_available)
 
-    # Telegram allows only one reply_markup per message, so we send two:
-    #   1) Welcome + inline action keyboard (WebApp button + quick actions)
-    #   2) Tiny nudge + persistent reply keyboard (always at the bottom,
-    #      for both new and returning users — returning users complained
-    #      the bottom buttons disappeared).
-    await message.answer(
-        welcome,
-        reply_markup=welcome_action_keyboard(
-            trial_available=trial_available,
-            is_new=is_new,
-            has_link=has_subscription or has_devices,
-        ),
-    )
     # E1.5: новичку не сообщаем про поломки до того, как он что-то получил —
-    # «если что-то сломалось» на первом экране читается как «тут всё ломается».
-    hint = "⌨️ Кнопки внизу всегда под рукой."
-    await message.answer(hint, reply_markup=start_keyboard(has_devices=has_devices))
+    # «если что-то сломалось» на первом экране читается как «тут всё ломается»
+    # (has_devices прячет «🆘 VPN не работает» в нижней клавиатуре).
+    await _send_welcome_pair(
+        message.answer,
+        welcome=welcome,
+        trial_available=trial_available,
+        is_new=is_new,
+        has_devices=has_devices,
+        has_link=has_subscription or has_devices,
+    )
 
 
 # ── /plans ──
@@ -721,12 +759,25 @@ _SUB_LINK_MISSING_HINT = (
 )
 
 
-async def _try_send_sub_link(callback_query: types.CallbackQuery, uid: int, chat_id: int) -> str:
+async def _try_send_sub_link(
+    callback_query: types.CallbackQuery,
+    uid: int,
+    chat_id: int,
+    *,
+    intro: str | None = None,
+) -> str:
     """Ссылка подписки из callback-пути через тот же ``cmd_config``, что и /config.
 
     Возвращает ``"sent"`` (ссылка ушла), ``"missing"`` (ссылки нет: cmd_config
     в тихом режиме либо промолчал, либо сказал «ещё создаётся») или
     ``"failed"`` (cmd_config упал — фолбэк на ЛК уже отправлен здесь).
+
+    ``intro`` — заголовок («🎉 Бесплатный месяц активирован…», «У тебя уже
+    есть подписка 😉»), который cmd_config клеит к своему первому сообщению:
+    «готово» и ссылка приходят одним сообщением, а не двумя. При падении
+    выдачи заголовок уходит вместе с фолбэком: юзер должен узнать, что месяц
+    активирован, даже если ссылку прислать не вышло (возможный повтор
+    заголовка на этом редком пути дешевле, чем его потеря).
 
     Инцидент 2026-08-25 (user 1000054): RecursionError внутри cmd_config
     улетел в глобальный errors-хендлер, и после «Сейчас пришлю ссылку» юзер
@@ -739,16 +790,18 @@ async def _try_send_sub_link(callback_query: types.CallbackQuery, uid: int, chat
     try:
         if isinstance(callback_query.message, types.Message):
             delivered = await cmd_config(
-                callback_query.message, user_id=uid, quiet_if_missing=True
+                callback_query.message, user_id=uid, quiet_if_missing=True, intro=intro
             )
         else:
             delivered = await cmd_config(
-                None, user_id=uid, bot=bot, chat_id=chat_id, quiet_if_missing=True
+                None, user_id=uid, bot=bot, chat_id=chat_id,
+                quiet_if_missing=True, intro=intro,
             )
     except Exception:  # noqa: BLE001 — любой сбой выдачи → фолбэк, не тишина
         logger.exception("sub-link delivery failed for user %s", uid)
+        fallback = f"{intro}\n\n{_SUB_LINK_FALLBACK_TEXT}" if intro else _SUB_LINK_FALLBACK_TEXT
         await bot.send_message(
-            chat_id, _SUB_LINK_FALLBACK_TEXT, reply_markup=webapp_inline_keyboard()
+            chat_id, fallback, reply_markup=webapp_inline_keyboard()
         )
         return "failed"
     return "sent" if delivered else "missing"
@@ -796,19 +849,19 @@ async def trial_activate_cb(callback_query: types.CallbackQuery):
                 expires = " до " + _dt.fromisoformat(raw).strftime("%d.%m.%Y")
             except (ValueError, TypeError):
                 expires = ""
-        await bot.send_message(
-            chat_id,
-            f"🎉 Готово! Бесплатный месяц активирован{expires}.\n\n"
-            "Сейчас пришлю ссылку для подключения. Конфиг собирается около "
-            "минуты: если ссылка не заработает сразу, подожди чуть-чуть и "
-            "обнови подписку в приложении.\n\n"
-            "Ссылка всегда лежит в личном кабинете (кнопка «Личный кабинет» "
-            "внизу) и приходит по команде /config.",
-        )
+        # «Готово» не шлём отдельным сообщением: это заголовок к ссылке (или
+        # к честному «ещё создаётся» на cold-пути), cmd_config клеит его к
+        # своему первому сообщению. Абзацы про «около минуты» и ЛК/config
+        # убраны: первое верно только на cold-пути и там уже есть, второе
+        # дублировало кнопки клавиатуры (жалоба владельца 28.08: 7 сообщений
+        # за один тап).
         # Ссылку выдаёт тот же код, что /config: единая точка правды. Тихий
         # режим: «нет активных подписок / /plans» сразу после «Готово!» был
         # бы ложью — вместо него подсказка про ЛК и /config.
-        outcome = await _try_send_sub_link(callback_query, uid, chat_id)
+        outcome = await _try_send_sub_link(
+            callback_query, uid, chat_id,
+            intro=f"🎉 Бесплатный месяц активирован{expires}.",
+        )
         if outcome == "missing":
             await bot.send_message(
                 chat_id, _SUB_LINK_MISSING_HINT, reply_markup=webapp_inline_keyboard()
@@ -820,8 +873,10 @@ async def trial_activate_cb(callback_query: types.CallbackQuery):
             # Подписка уже есть — юзеру нужна ссылка, а не прайс. Ровно этот
             # экран видел user 1000054 после провала первой выдачи: «подарок
             # уже использован» + тарифы, хотя месяц у него уже активирован.
-            await bot.send_message(chat_id, "У тебя уже есть подписка 😉")
-            outcome = await _try_send_sub_link(callback_query, uid, chat_id)
+            # Шапка едет заголовком первого сообщения cmd_config, не отдельно.
+            outcome = await _try_send_sub_link(
+                callback_query, uid, chat_id, intro="У тебя уже есть подписка 😉"
+            )
             if outcome == "missing":
                 await bot.send_message(
                     chat_id,
@@ -1143,11 +1198,19 @@ async def cmd_config(
     bot: "types.Bot | None" = None,
     chat_id: int | None = None,
     quiet_if_missing: bool = False,
+    intro: str | None = None,
 ) -> bool:
     """Ссылка подписки. Возвращает True, если ссылка отправлена.
 
     ``bot``/``chat_id`` — путь для callback'ов на сообщениях старше 48ч
     (InaccessibleMessage без ``.answer``).
+
+    ``intro`` — заголовок от вызывающего («🎉 Бесплатный месяц активирован…»),
+    который клеится к ПЕРВОМУ отправленному сообщению, каким бы оно ни было:
+    шапка со ссылкой, «⏳ ещё создаётся», «❄️ заморожена», «сервис недоступен».
+    Так «готово» и ссылка приходят одним сообщением вместо двух. Если в тихом
+    режиме слать нечего, заголовок уходит сам по себе — факт активации юзер
+    должен увидеть в любом случае.
 
     ``quiet_if_missing=True`` — НЕ слать «нет активных подписок / /plans»,
     только вернуть False: вызывающий сам решает, что показать
@@ -1166,8 +1229,13 @@ async def cmd_config(
         bot = message.bot
         chat_id = message.chat.id
     uid = user_id if user_id is not None else message.from_user.id
+    # Ячейка «заголовок ещё не ушёл»: список вместо nonlocal, чтобы вложенный
+    # хелпер мог её опустошить без объявления.
+    intro_pending: list[str] = [intro] if intro else []
 
     async def _say(text: str, **kwargs):
+        if intro_pending:
+            text = f"{intro_pending.pop()}\n\n{text}"
         if message is not None:
             await message.answer(text, **kwargs)
         else:
@@ -1188,6 +1256,8 @@ async def cmd_config(
         if status_code != 200:
             if not quiet_if_missing:
                 await _say("У тебя пока нет активных подписок. Используй /plans для покупки.")
+            elif intro_pending:
+                await _say(intro_pending.pop())
             return False
     except aiohttp.ClientError:
         await _say("Бэкенд недоступен. Попробуйте позже.")
@@ -1220,6 +1290,8 @@ async def cmd_config(
             )
             return False
         if quiet_if_missing:
+            if intro_pending:
+                await _say(intro_pending.pop())
             return False
         await _say("У тебя нет активных подписок с готовыми конфигами. Используй /plans.")
         return False
@@ -1243,17 +1315,14 @@ async def cmd_config(
         )
         return False
 
-    # Акцент на ЛК: ссылка там лежит всегда, чат — лишь один из способов её
-    # получить. Кнопка «Личный кабинет» у поля ввода стоит в любом чате
-    # (bot.py: set_chat_menu_button), поэтому на неё и ссылаемся.
+    # Шапка коротко: где ссылка и что с ней делать. Абзацы про импорт «один
+    # раз» (теперь в платформенных инструкциях, где он по делу) и про ЛК/config
+    # убраны — кнопка ЛК первой строкой в onboarding_keyboard, а menu-button ЛК
+    # стоит у поля ввода в любом чате (bot.py: set_chat_menu_button); текстом
+    # это повторялось до четырёх раз за один тап (жалоба владельца 28.08).
     await _say(
-        "🔗 <b>Твоя ссылка подписки</b>\n"
-        "Импортируй её в VPN-клиент (Hiddify / V2rayNG / Streisand) один раз — "
-        "при смене сервера клиент сам подтянет новые настройки по этой ссылке.\n\n"
-        "⬇️ Ссылка следующим сообщением, тапни чтобы скопировать.\n\n"
-        "Ссылка всегда лежит в личном кабинете (кнопка «Личный кабинет» внизу, "
-        "у поля ввода). Если потеряешь, забери её там или командой /config.\n\n"
-        "Не знаешь как настроить? Нажми кнопку с твоей платформой ниже 👇",
+        "🔗 Твоя ссылка для подключения. Тапни по ней ниже, чтобы скопировать.\n\n"
+        "Не знаешь, как настроить? Выбери платформу 👇",
         reply_markup=onboarding_keyboard(),
         parse_mode="HTML",
     )
@@ -3007,16 +3076,13 @@ async def go_start(callback_query: types.CallbackQuery):
         callback_query.from_user.id
     )
     welcome = format_welcome(first_name, is_new=False, trial_available=trial_available)
-    await callback_query.message.answer(
-        welcome,
-        reply_markup=welcome_action_keyboard(
-            trial_available=trial_available,
-            has_link=has_subscription or has_devices,
-        ),
-    )
-    await callback_query.message.answer(
-        "⌨️ Кнопки внизу всегда под рукой.",
-        reply_markup=start_keyboard(has_devices=has_devices),
+    await _send_welcome_pair(
+        callback_query.message.answer,
+        welcome=welcome,
+        trial_available=trial_available,
+        is_new=False,
+        has_devices=has_devices,
+        has_link=has_subscription or has_devices,
     )
 
 

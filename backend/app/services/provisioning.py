@@ -3105,7 +3105,22 @@ class ProvisioningOrchestrator:
         node_id: int | None = None,
         device_name: str | None = None,
         expires_at_override: datetime | None = None,
+        notify_config_ready: bool = True,
     ) -> tuple[models.Subscription, models.ProvisioningTask]:
+        """Первая выдача подписки: warm-hit (мгновенно) или cold-путь (Ansible).
+
+        ``notify_config_ready`` управляет ТОЛЬКО warm-пушем «конфиг готов»
+        (services/config_ready.py). На warm-хите ссылка рабочая уже в момент
+        ответа, и вызывающие, у которых есть свой канал к юзеру, отдают её
+        сами и сразу: бот (``activate_trial_full`` → ``cmd_config``) и ЛК
+        (``webapp_activate`` → карточка подписки) передают ``False``, иначе
+        через ≤10 с приходил пуш с той же ссылкой (жалоба владельца 28.08:
+        ссылка дважды за один тап). Оплата картой (``_create_subscription_for_user``
+        из lava-вебхука) оставляет ``True``: там бот сам ничего не шлёт, и
+        warm-пуш — единственная доставка. Cold-путь флаг НЕ трогает: девайс
+        pending, ссылка на момент ответа ещё не рабочая, бот честно пишет
+        «ещё создаётся», и пуш по завершении Ansible нужен всегда.
+        """
         # audit #55: сериализуем проверку лимита устройств per-user. Без
         # row-lock два конкурентных запроса (даблклик в webapp, ретрай
         # бота при таймауте) оба видят active_device_count < max_devices и
@@ -3168,13 +3183,15 @@ class ProvisioningOrchestrator:
                 self._maybe_attach_diverse(subscription, device, plan, node)
                 self._apply_leg_scheme(device)
                 # Warm-хит минует _handle_task_outcome (Ansible не бежит,
-                # девайс сразу active) — пуш «конфиг готов» ставим здесь.
-                # Без commit: вызывающие (activate_trial_full, webapp_activate,
-                # _create_subscription_for_user) коммитят подписку сами, и
-                # строка уходит в той же транзакции. Никогда не бросает.
-                config_ready.notify_config_ready(
-                    self.db, device, source="warm", commit=False
-                )
+                # девайс сразу active) — пуш «конфиг готов» ставим здесь, но
+                # только если вызывающий не отдаёт ссылку сам (см. docstring).
+                # Без commit: вызывающий (_create_subscription_for_user)
+                # коммитит подписку сам, и строка уходит в той же транзакции.
+                # Никогда не бросает.
+                if notify_config_ready:
+                    config_ready.notify_config_ready(
+                        self.db, device, source="warm", commit=False
+                    )
                 return subscription, task
             except Exception:
                 # If wiring blew up after we marked the bundle assigned,

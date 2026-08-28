@@ -1115,7 +1115,12 @@ def webapp_activate(
 
     orchestrator = ProvisioningOrchestrator(db)
     try:
-        sub, _task = orchestrator.provision_subscription(user, plan)
+        # notify_config_ready=False: ЛК показывает ссылку сразу в ответе
+        # (TrialSuccess / SubscriptionCard), warm-пуш с той же ссылкой через
+        # 10 с был бы дублем. Cold-путь пуш шлёт по-прежнему.
+        sub, _task = orchestrator.provision_subscription(
+            user, plan, notify_config_ready=False
+        )
     except RuntimeError as exc:
         raise HTTPException(status_code=409, detail=str(exc))
 
