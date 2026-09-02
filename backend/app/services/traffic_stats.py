@@ -626,6 +626,53 @@ def _apply_user_traffic(session, node, user_bytes: dict[str, int]) -> int:
     return len(per_sub)
 
 
+def _touch_devices_last_seen(session, node, user_bytes: dict[str, int]) -> int:
+    """Проштамповать ``Device.last_seen_at`` девайсам, чьи креды двигали байты.
+
+    ``user_bytes`` уже содержит только положительные дельты (нулевые каунтеры
+    выброшены при парсинге), поэтому каждое имя здесь — «девайс был подключён
+    и гнал трафик в этом интервале». Резолв тот же, что в начислении:
+    username → Credential (по node_id), но дальше через ``device_id`` —
+    warm-креды без девайса отсеиваются сами (device_id IS NULL).
+
+    Намеренно НЕ под гейтом TRAFFIC_USER_ACCOUNTING: гейт — аварийный стоп
+    НАЧИСЛЕНИЯ байтов, а признак активности читает админка («активен за
+    24ч» в списке юзеров и воронке) и терять его вместе с выключенным
+    начислением нельзя.
+
+    Возвращает число проштампованных девайсов.
+    """
+    from .. import models  # local import — как у соседей по модулю
+    from ..time_utils import utcnow
+
+    if not user_bytes:
+        return 0
+
+    device_ids = [
+        device_id
+        for (device_id,) in session.query(models.Credential.device_id)
+        .filter(
+            models.Credential.node_id == node.id,
+            models.Credential.access_username.in_(user_bytes.keys()),
+            models.Credential.device_id.isnot(None),
+        )
+        .distinct()
+        .all()
+    ]
+    if not device_ids:
+        return 0
+    # sorted — тот же приём, что в _apply_user_traffic: детерминированный
+    # порядок блокировок против deadlock'а с параллельным писателем девайса.
+    return (
+        session.query(models.Device)
+        .filter(models.Device.id.in_(sorted(device_ids)))
+        .update(
+            {models.Device.last_seen_at: utcnow()},
+            synchronize_session=False,
+        )
+    )
+
+
 def _persist_node_result(session, node, result: NodeStatsResult, interval_seconds: int) -> dict[str, Any]:
     """Записать уже собранный ``NodeStatsResult`` одной ноды в сессию.
 
@@ -661,6 +708,17 @@ def _persist_node_result(session, node, result: NodeStatsResult, interval_second
         logger.exception(
             "traffic accounting failed for node %s — sample kept, deltas of "
             "this interval lost", node.id,
+        )
+
+    # Отдельный SAVEPOINT: штамп активности и начисление байтов — разные
+    # заботы (см. докстринг _touch_devices_last_seen про гейт), падение
+    # одного не должно топить другое, а сэмпл — дороже обоих.
+    try:
+        with session.begin_nested():
+            _touch_devices_last_seen(session, node, result.merged_user_bytes())
+    except Exception:  # noqa: BLE001
+        logger.exception(
+            "last_seen stamping failed for node %s — sample kept", node.id,
         )
 
     # Ingest sharing violations into AuditLog for admin visibility

@@ -1032,6 +1032,10 @@ class UserOut(BaseModel):
     subscription_count: int = 0
     balance_kopecks: int = 0
     banned_at: UTCDateTime | None = None
+    # max(Device.last_seen_at) по девайсам юзера — момент, когда его трафик
+    # видели в последний раз. Заполняется только админским /users (кабинет
+    # юзера это поле не получает); None = активности не видели ни разу.
+    last_active_at: UTCDateTime | None = None
 
     class Config:
         from_attributes = True

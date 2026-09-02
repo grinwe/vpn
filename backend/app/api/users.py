@@ -6,6 +6,8 @@ response shape for the user-facing webapp history view).
 """
 from __future__ import annotations
 
+from datetime import datetime
+
 from fastapi import APIRouter, Depends, Header, HTTPException, Query
 from pydantic import BaseModel, Field
 from sqlalchemy import func
@@ -261,6 +263,21 @@ def list_users(
     counts: dict[int, int] = {}
     for uid, _sid in counts_rows:
         counts[uid] = counts.get(uid, 0) + 1
+    # Последняя видимая активность юзера = max по его девайсам; last_seen_at
+    # штампует тик traffic_stats. UI красит индикатор «активен за 24ч» сам —
+    # отдаём момент, а не bool, чтобы тултип мог показать точное время.
+    last_active: dict[int, datetime] = dict(
+        db.query(
+            models.Device.user_id,
+            func.max(models.Device.last_seen_at),
+        )
+        .filter(
+            models.Device.user_id.in_(user_ids),
+            models.Device.last_seen_at.isnot(None),
+        )
+        .group_by(models.Device.user_id)
+        .all()
+    )
     return [
         schemas.UserOut(
             id=u.id,
@@ -270,6 +287,7 @@ def list_users(
             subscription_count=counts.get(u.id, 0),
             balance_kopecks=u.balance_kopecks or 0,
             banned_at=u.banned_at,
+            last_active_at=last_active.get(u.id),
         )
         for u in users
     ]

@@ -413,11 +413,11 @@ class User(Base):
     email = Column(String, unique=True, index=True, nullable=True)
     created_at = Column(DateTime, default=utcnow)
     referred_by_id = Column(Integer, ForeignKey("users.id"), nullable=True)
-    # Когда пользователь ВПЕРВЫЕ скачал конфиг по саб-ссылке. Единственный
-    # доступный признак «человек дошёл до рабочего VPN»: Device.last_seen_at в
-    # модели объявлен, но никем не пишется, per-user трафик не собирается, а
-    # hysteria2 вообще невидим для статистики. Материализуем в колонку, потому
-    # что вычислять на лету из audit_logs нельзя — их чистит ретеншен (90 дней).
+    # Когда пользователь ВПЕРВЫЕ скачал конфиг по саб-ссылке — признак «человек
+    # дошёл до рабочего VPN» (текущую активность с 2026-09 несёт
+    # Device.last_seen_at, который штампует тик traffic_stats). Материализуем в
+    # колонку, потому что вычислять на лету из audit_logs нельзя — их чистит
+    # ретеншен (90 дней).
     first_config_fetch_at = Column(DateTime, nullable=True)
     # Рекламный источник (first-touch): метка из deep-link старт-параметра
     # ``t.me/bot?start=<tag>`` (не ``ref_``-префикс — те идут в referred_by_id).
@@ -768,6 +768,11 @@ class Device(Base):
     )
     created_at = Column(DateTime, default=utcnow)
     updated_at = Column(DateTime, default=utcnow, onupdate=utcnow)
+    # Последний интервал, в котором креды девайса гнали байты через ноду.
+    # Штампует тик traffic_stats (_touch_devices_last_seen) с точностью до
+    # TRAFFIC_STATS_INTERVAL; NULL = активности не видели ни разу (либо
+    # последняя была раньше окна бэкфилла миграции 0069 — 30 дней).
+    # Кормит «активен за 24ч» в админке (список юзеров + воронка).
     last_seen_at = Column(DateTime, nullable=True)
 
     user = relationship("User", back_populates="devices")

@@ -208,7 +208,10 @@ class Device(Base):
     access_username,                    # 'warm-<node_id>-<hex>' или аналогичный
     connection_uri,                     # Fernet-encrypted
     sub_token (unique, indexed),        # per-device dynamic sub-link token
-    last_seen_at
+    last_seen_at                        # последний интервал с трафиком девайса; штампует
+                                        # тик traffic_stats (2026-09, бэкфилл 0069);
+                                        # NULL = активности не видели. Кормит «активен
+                                        # за 24ч» в админке (max по девайсам юзера)
 ```
 
 `sub_token` — уникальный токен на уровне устройства (не подписки). `/sub/{token}` сначала ищет `Device.sub_token` и возвращает только credentials этого устройства. Если не найден — fallback на `Subscription.sub_token` (backward compat для старых клиентов). Это предотвращает sharing: поделившись ссылкой, пользователь раскрывает только один device, а не всю подписку.

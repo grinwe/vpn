@@ -120,6 +120,9 @@ export interface UserOut {
   subscription_count: number;
   balance_kopecks: number;
   banned_at: string | null;
+  // max(Device.last_seen_at) — когда трафик юзера видели в последний раз;
+  // null = ни разу. Красит светофор «активен за 24ч» в таблице юзеров.
+  last_active_at: string | null;
 }
 
 export interface AdminTopupResponse {

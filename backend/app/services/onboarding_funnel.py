@@ -93,6 +93,16 @@ def compute(db: Session, days: int | None = 7) -> dict:
                 models.Invoice.status == models.InvoiceStatus.paid)
         .distinct().all()
     }
+    # «Живы сейчас»: трафик за последние 24 часа. Device.last_seen_at штампует
+    # тик traffic_stats — в отличие от остальных шагов это не этап онбординга,
+    # а срез текущего состояния: сколько из когорты реально пользуются VPN
+    # (на когорте «всё время» — грубый ретеншн).
+    active_24h = {
+        uid for (uid,) in db.query(models.Device.user_id)
+        .filter(models.Device.user_id.in_(ids),
+                models.Device.last_seen_at >= utcnow() - timedelta(hours=24))
+        .distinct().all()
+    }
 
     steps = [
         _step("started", "Пришли в бота", total, total),
@@ -103,6 +113,7 @@ def compute(db: Session, days: int | None = 7) -> dict:
         # параллельные, а не вложенные.
         _step("device", "Получили ссылку", len(with_device), total),
         _step("paid", "Оплатили", len(paid), total),
+        _step("active_24h", "Активны за 24ч", len(active_24h), total),
     ]
     losses = [
         _step("never_opened", "Не открыли кабинет",
@@ -111,6 +122,11 @@ def compute(db: Session, days: int | None = 7) -> dict:
               len(opened - claimed), cohort, measurable=cohort > 0),
         _step("trial_no_device", "Забрали триал, но без ссылки",
               len(claimed - with_device), total),
+        # Знаменатель — забравшие триал: вопрос этой строки — «сколько из
+        # попробовавших уже отвалилось», а не доля от всей когорты.
+        _step("trial_inactive", "Забрали триал, но не активны 24ч",
+              len(claimed - active_24h), len(claimed),
+              measurable=len(claimed) > 0),
     ]
 
     return {

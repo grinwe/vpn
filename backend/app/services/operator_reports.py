@@ -104,7 +104,8 @@ def report_reconnected(db: Session, report: models.OperatorNodeReport) -> bool:
     ``inconclusive`` НЕ равно «провал»: это отсутствие позитивного трафик-
     подтверждения, а не негативный сигнал (в отличие от явного ``fail`` из
     «всё равно не работает»). Отдельного online-без-трафика сигнала пока
-    нет (``Device.last_seen_at`` не пишется, xray online-list не собирается)
+    нет (``Device.last_seen_at`` с 2026-09 пишется тиком traffic_stats, но он
+    трафик-основан и несёт то же ограничение; xray online-list не собирается)
     — устранение остатка требует правок вне этого файла (см. StructuredOutput).
 
     Используется и watcher'ом (исход для матрицы), и on-demand ботом для

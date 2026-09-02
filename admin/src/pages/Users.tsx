@@ -43,6 +43,30 @@ const PAGE_SIZE = 50;
 type BannedFilter = "all" | "active" | "banned";
 
 // Человекочитаемый текст сетевой ошибки для показа в существующем слоте UI.
+/** Светофор «активен за 24ч»: зелёный — трафик юзера видели за последние
+ *  сутки (Device.last_seen_at, штампует тик traffic_stats), красный — нет,
+ *  в том числе «не подключался ни разу». Точное время — в тултипе. */
+function ActivityDot({ lastActiveAt }: { lastActiveAt: string | null }) {
+  const active =
+    lastActiveAt !== null &&
+    Date.now() - new Date(lastActiveAt).getTime() < 24 * 60 * 60 * 1000;
+  return (
+    <span
+      className={`inline-block w-2.5 h-2.5 rounded-full ${
+        active ? "bg-green-500" : "bg-red-500"
+      }`}
+      title={
+        lastActiveAt
+          ? `Последняя активность: ${new Date(lastActiveAt).toLocaleString(
+              "ru-RU",
+              { dateStyle: "short", timeStyle: "short" },
+            )}`
+          : "Активности не было"
+      }
+    />
+  );
+}
+
 function errText(e: unknown): string {
   return e instanceof Error ? e.message : String(e);
 }
@@ -898,6 +922,7 @@ export default function Users() {
                   <th>Telegram</th>
                   <th>Email</th>
                   <th>Subs</th>
+                  <th title="Был ли трафик юзера за последние 24 часа">24ч</th>
                   <th>Баланс</th>
                   <th>Создан</th>
                 </tr>
@@ -940,6 +965,9 @@ export default function Users() {
                     </td>
                     <td>{u.email ?? "—"}</td>
                     <td>{u.subscription_count}</td>
+                    <td>
+                      <ActivityDot lastActiveAt={u.last_active_at} />
+                    </td>
                     <td>{(u.balance_kopecks / 100).toFixed(2)} ₽</td>
                     <td>
                       {new Date(u.created_at).toLocaleString("ru-RU", {
