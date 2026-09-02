@@ -95,6 +95,17 @@ def test_failover_applies_leg_scheme_to_the_new_device(
     строк вместо четырёх — чинилка на его глазах ломает список серверов.
     Поймано на живом проде 2026-07-29.
     """
+    from sqlalchemy import text as sql_text
+
+    from app.db import engine
+
+    # Тот же экзорцизм advisory-локов, что в _failover_fixture (см. её
+    # докстринг): без него в ПОЛНОМ прогоне сьюта тест стабильно ловил
+    # «already in progress» от лока (4001, id), залипшего на idle-коннекте
+    # чужого теста, — а изолированно был вечно зелёным.
+    engine.dispose()
+    db_session.execute(sql_text("SELECT pg_advisory_unlock_all()"))
+    db_session.commit()
     plan = make_plan(db_session, name="fd-legs-plan")
     user = make_user(db_session, telegram_id="fd-legs")
     node = make_node(db_session, name="fd-legs-a", region="ru", host="10.0.1.1")
