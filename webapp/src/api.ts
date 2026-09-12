@@ -496,28 +496,78 @@ export async function fetchReferral() {
   return request<ReferralInfo>("/api/webapp/referral");
 }
 
-// ── Self-report «VPN не работает» ────────────────────────────────────
+// ── Self-repair «VPN не работает» ────────────────────────────────────
 //
-// Запись в тот же AuditLog, что и плановые health-ping'и бота, но с
-// extra.source = "self_reported" — админка выделяет такие жалобы
-// отдельной красной карточкой как более сильный сигнал.
+// Кабинет ходит в то же ядро починки, что бот и страница на саб-домене
+// (backend/app/services/self_repair.py): единый action, единый троттл и
+// суточный потолок. Контракт — WebappRepairResponse в api_webapp.py.
 
-export interface HealthPingReportResponse {
+// Исход одного шага починки. migrated / reshuffled / duplicated — что-то
+// поменяли (дальше спрашиваем оператора и «помогло ли»); остальные —
+// честный отказ с причиной.
+export type RepairAction =
+  | "migrated"
+  | "reshuffled"
+  | "duplicated"
+  | "throttled"
+  | "daily_limit"
+  | "no_target"
+  | "no_subscription"
+  | "not_ready";
+
+// device — тронули одно устройство, subscription — всю подписку
+// («🔁 Все мои устройства»).
+export type RepairScope = "device" | "subscription";
+
+export interface RepairResponse {
   ok: boolean;
-  subscription_id: number | null;
-  node_id: number | null;
-  // operator-routing P1: если переселили — id репорта + новая нода, чтобы
-  // спросить оператора одним тапом.
-  migrated?: boolean;
-  report_id?: number | null;
-  target_node_name?: string | null;
+  action: RepairAction;
+  report_id: number | null;
+  new_node_name: string | null;
+  new_node_region: string | null;
+  task_id: number | null;
+  // throttled / daily_limit: через сколько секунд можно снова.
+  retry_after_sec: number | null;
+  device_name: string | null;
+  scope: RepairScope;
+  // Совместимость: true для migrated / reshuffled / duplicated.
+  migrated: boolean;
 }
 
-export async function reportVpnBroken() {
-  return request<HealthPingReportResponse>(
-    "/api/webapp/health-ping-report",
-    { method: "POST" },
-  );
+export interface RepairDevice {
+  id: number;
+  name: string;
+  status: string;
+}
+
+// Пре-чек перед кнопкой: живые устройства первой активной подписки и надо
+// ли ждать по единой политике повторов. subscription_id есть, а устройств
+// нет — все они ещё pending (собираются).
+export interface RepairState {
+  devices: RepairDevice[];
+  retry_after_sec: number | null;
+  wait_reason: "throttled" | "daily_limit" | null;
+  subscription_id: number | null;
+}
+
+export async function fetchRepairState() {
+  return request<RepairState>("/api/webapp/repair-state");
+}
+
+// «Это устройство не работает» — один шаг лестницы для устройства
+// (перетасовка протоколов → перенос → дубль), соседние не трогаем.
+export async function reportBrokenDevice(deviceId: number) {
+  return request<RepairResponse>("/api/webapp/report-broken-device", {
+    method: "POST",
+    body: JSON.stringify({ device_id: deviceId }),
+  });
+}
+
+// «Все мои устройства» — перенос всей подписки.
+export async function reportBrokenAll() {
+  return request<RepairResponse>("/api/webapp/report-broken", {
+    method: "POST",
+  });
 }
 
 // Мобильные операторы (таксономия operator_routing_roadmap.md). value идёт
@@ -540,11 +590,19 @@ export async function setReportOperator(reportId: number, operator: string) {
   );
 }
 
-// Per-device «это устройство не работает» (multi-device юзер выбрал одно).
-// Перетряхивает ноды ТОЛЬКО этого устройства, соседние не трогает.
-export async function reportBrokenDevice(deviceId: number) {
-  return request<HealthPingReportResponse>(
-    "/api/webapp/report-broken-device",
-    { method: "POST", body: JSON.stringify({ device_id: deviceId }) },
+// Обратная связь после шага починки. «Всё равно не работает» → target-нода
+// тоже fail (самый весомый сигнал для матрицы оператор×нода); «всё
+// работает» → ok. Оба — по report_id, чужой репорт бэк отдаст 404.
+export async function reportStillBroken(reportId: number) {
+  return request<{ report_id: number; outcome: string }>(
+    "/api/webapp/report-still-broken",
+    { method: "POST", body: JSON.stringify({ report_id: reportId }) },
+  );
+}
+
+export async function reportOk(reportId: number) {
+  return request<{ report_id: number; outcome: string }>(
+    "/api/webapp/report-ok",
+    { method: "POST", body: JSON.stringify({ report_id: reportId }) },
   );
 }

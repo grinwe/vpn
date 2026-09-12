@@ -4,7 +4,8 @@
 оплата живут в Telegram-боте, а Telegram без VPN бывает недоступен. Домен
 саб-ссылки доступен без VPN по определению (с него клиент и так тянет
 конфиги), поэтому на нём же отдаём страницу, которая по sub_token умеет
-ровно два действия: шаг лестницы ротации и счёт на продление картой.
+три действия: шаг лестницы ротации, счёт на продление картой и обратную
+связь по сделанной починке (оператор связи, «помогло / не помогло»).
 
 Решения, которые здесь важны:
 
@@ -27,6 +28,7 @@ import hashlib
 import hmac
 import html
 import logging
+import math
 import os
 import re
 import time
@@ -71,17 +73,19 @@ def wants_html(request: Request) -> bool:
 
 
 def _throttle_sec() -> int:
-    try:
-        return int(os.getenv("SUB_FIX_THROTTLE_SEC") or "120")
-    except ValueError:
-        return 120
+    """Окно повторов — тонкая обёртка над единой политикой ядра.
+
+    Своих настроек у страницы больше нет: SUB_FIX_THROTTLE_SEC /
+    SUB_FIX_DAILY_MAX ядро читает само как fallback к SELF_REPAIR_*, и окно
+    одно на бот, кабинет и страницу. Обёртки оставлены ради текста «через
+    N мин.» и тестов, которые на них ссылаются.
+    """
+    return self_repair.default_throttle_sec()
 
 
 def _daily_max() -> int:
-    try:
-        return int(os.getenv("SUB_FIX_DAILY_MAX") or "5")
-    except ValueError:
-        return 5
+    """Суточный потолок починок — см. ``_throttle_sec``."""
+    return self_repair.default_daily_max()
 
 
 def pay_provider() -> str:
@@ -273,7 +277,7 @@ def _support_url() -> str | None:
     return f"https://t.me/{bot}?start=support" if bot else None
 
 
-def _help_button(*, enabled: bool) -> str:
+def _help_button(*, enabled: bool, label: str = "Не помогло? Напишите нам") -> str:
     """Кнопка «Написать в поддержку» — активная только после починки.
 
     Порядок намеренный: сначала человек жмёт «Починить», получает новый набор
@@ -293,7 +297,7 @@ def _help_button(*, enabled: bool) -> str:
         )
     return (
         f'<a class="btn secondary" href="{html.escape(url)}">'
-        "Не помогло? Напишите нам</a>"
+        f"{html.escape(label)}</a>"
     )
 
 
@@ -397,36 +401,98 @@ def _renew_button(sub, token: str) -> str:
     return button
 
 
-def render_outcome(outcome, sub, token: str) -> HTMLResponse:
-    """Экран результата починки — текст зависит от шага лестницы."""
-    refresh_hint = (
-        "<ol>"
-        "<li>Откройте ваш VPN-клиент</li>"
-        "<li>Нажмите 🔄 (обновить подписку) на профиле</li>"
-        "<li>Подключитесь заново</li>"
-        "</ol>"
-        '<p class="muted">Без обновления клиент ещё какое-то время будет '
-        "показывать старые серверы.</p>"
+# Подписи операторов — те же, что в боте (_OPERATOR_LABELS) и кабинете
+# (VPN_OPERATORS): человек видит одни и те же слова во всех трёх каналах.
+# Значения — ключи self_repair.OPERATORS; порядок = порядок кнопок.
+_OPERATOR_LABELS = (
+    ("mts", "МТС"),
+    ("beeline", "Билайн"),
+    ("megafon", "МегаФон (Yota)"),
+    ("tele2", "Tele2 (Т-Мобайл)"),
+    ("home_wifi", "Домашний Wi-Fi"),
+    ("other", "Другое"),
+)
+
+_REFRESH_HINT = (
+    "<ol>"
+    "<li>Откройте ваш VPN-клиент</li>"
+    "<li>Нажмите 🔄 (обновить подписку) на профиле</li>"
+    "<li>Подключитесь заново</li>"
+    "</ol>"
+    '<p class="muted">Без обновления клиент ещё какое-то время будет '
+    "показывать старые серверы.</p>"
+)
+
+
+def _retry_button(token: str, *, secondary: bool = False) -> str:
+    """«Попробовать ещё раз» — обычная починка. Клиентских блокировок нет
+    намеренно: сервер сам ответит «уже чиним», если окно не вышло."""
+    return _button_form(token, "Попробовать ещё раз", secondary=secondary)
+
+
+def _retry_minutes(outcome) -> int:
+    """Через сколько минут звать снова — из ``retry_after_sec`` ядра,
+    вверх: «через 0 мин.» человек прочитает как «прямо сейчас»."""
+    sec = outcome.retry_after_sec or _throttle_sec()
+    return max(1, math.ceil(sec / 60))
+
+
+def _operator_block(token: str, report_id: int) -> str:
+    """Вопрос об операторе — шесть кнопок и «Пропустить».
+
+    Ответ ложится в ``OperatorNodeReport.operator`` и идёт в крауд-матрицу
+    node×operator: по ней видно «легло у МТС, а у Билайна живо», то есть
+    блокировку, а не смерть ноды. «Пропустить» ведёт на тот же экран
+    обратной связи, что и ответ: вопрос не должен быть шлагбаумом.
+    """
+    forms = "".join(
+        _button_form(token, label, extra=f"&report={report_id}&op={value}")
+        for value, label in _OPERATOR_LABELS
     )
-    if outcome.action == "reshuffled":
-        title, body = "Готово", (
-            '<p class="ok">Переключили вас на другой способ связи.</p>' + refresh_hint
+    return forms + _button_form(
+        token, "Пропустить", extra=f"&report={report_id}&op=skip", secondary=True
+    )
+
+
+def render_outcome(outcome, sub, token: str) -> HTMLResponse:
+    """Экран результата починки — текст зависит от шага лестницы.
+
+    Семантика исходов и тексты едины с ботом и кабинетом (унификация
+    2026-09-12), отличие только в «вы». После успешного шага — вопрос об
+    операторе, затем экран «помогло / не помогло»; на любом неуспехе —
+    повтор и живой человек, тупиковых экранов нет.
+    """
+    if outcome.repaired:
+        if outcome.action == "reshuffled":
+            lead = '<p class="ok">Переключили вас на другой способ связи.</p>'
+        elif outcome.action == "migrated":
+            node = html.escape(outcome.new_node_name or "новый сервер")
+            lead = f'<p class="ok">Перевели на другой сервер ({node}).</p>'
+        else:  # duplicated
+            lead = (
+                '<p class="ok">Добавили запасной сервер. В клиенте появится ещё '
+                "одна строка.</p>"
+            )
+        body = lead + _REFRESH_HINT
+        if outcome.report_id is None:
+            # Репорта нет — ни оператора, ни «помогло/не помогло» привязать
+            # не к чему. Каждый шаг лестницы репорт пишет, так что это
+            # страховка, но экран без действий недопустим.
+            actions = _retry_button(token, secondary=True) + _help_button(enabled=True)
+            return _render(title="Готово", body=body, actions=actions)
+        body += (
+            "<p>Чтобы мы быстрее ловили блокировки, подскажите: "
+            "какой у вас интернет?</p>"
         )
-    elif outcome.action == "migrated":
-        node = html.escape(outcome.new_node_name or "новый сервер")
-        title, body = "Готово", (
-            f'<p class="ok">Перевели на другой сервер ({node}).</p>' + refresh_hint
-        )
-    elif outcome.action == "duplicated":
-        title, body = "Готово", (
-            '<p class="ok">Добавили запасной сервер. В клиенте появится ещё '
-            "одна строка.</p>" + refresh_hint
-        )
-    elif outcome.action == "throttled":
+        actions = _operator_block(token, outcome.report_id) + _help_button(enabled=True)
+        return _render(title="Готово", body=body, actions=actions)
+
+    if outcome.action == "throttled":
         title, body = "Уже чиним", (
-            '<p class="warn">Мы переключили вас пару минут назад.</p>'
-            "<p>Откройте клиент и нажмите 🔄, новые серверы уже там. "
-            "Если не помогло, попробуйте ещё раз через несколько минут.</p>"
+            '<p class="warn">Мы переключали вас пару минут назад.</p>'
+            "<p>Откройте клиент и нажмите 🔄: новые серверы уже там. "
+            "Если не помогло, попробуйте ещё раз через "
+            f"{_retry_minutes(outcome)} мин.</p>"
         )
     elif outcome.action == "daily_limit":
         title, body = "Слишком часто", (
@@ -438,21 +504,78 @@ def render_outcome(outcome, sub, token: str) -> HTMLResponse:
             '<p class="warn">Свободного сервера нет прямо сейчас.</p>'
             "<p>Попробуйте через 10 минут: они освобождаются постоянно.</p>"
         )
+    elif outcome.action == "not_ready":
+        # Устройство pending: кредов ещё нет, перетасовывать нечего, а
+        # перенос запустил бы второй провижн поверх первого.
+        title, body = "Ещё настраивается", (
+            '<p class="warn">Устройство ещё настраивается.</p>'
+            "<p>Подождите пару минут, нажмите 🔄 в клиенте и попробуйте снова.</p>"
+        )
     else:  # no_subscription
         # Сюда попадает и «только что починили»: свежепровиженное устройство
         # какое-то время pending, и alias его ещё не видит. Текст обязан это
         # учитывать — иначе человек, у которого починка СРАБОТАЛА, читает
         # «ничего не нашли» и идёт жаловаться второй раз.
         title, body = "Проверьте клиент", (
-            "<p>Похоже, серверы уже переключены.</p>" + refresh_hint
+            "<p>Похоже, серверы уже переключены.</p>" + _REFRESH_HINT
         )
-    actions = ""
-    if outcome.action in ("no_target", "throttled"):
-        actions = _button_form(token, "Попробовать ещё раз")
-    # Автоматика отработала (или упёрлась в потолок) — теперь живой человек
-    # уместен, и кнопка активна.
-    actions += _help_button(enabled=True)
+    # Автоматика отработала (или упёрлась в потолок) — живой человек
+    # уместен, кнопка активна. При суточном потолке она идёт первой: текст
+    # выше прямо говорит, что дальше нужен человек.
+    if outcome.action == "daily_limit":
+        actions = _help_button(enabled=True) + _retry_button(token, secondary=True)
+    else:
+        actions = _retry_button(token) + _help_button(enabled=True)
     return _render(title=title, body=body, actions=actions)
+
+
+def render_feedback_prompt(token: str, report_id: int) -> HTMLResponse:
+    """«Помогло?» сразу после вопроса об операторе.
+
+    Бот дожимает этот вопрос отложенным сообщением через 15 минут; страница
+    пуш не умеет, поэтому спрашивает сразу и оставляет вкладку открытой:
+    человек идёт в клиент, пробует подключиться и возвращается нажать одну
+    из двух кнопок.
+    """
+    body = (
+        '<p class="ok">Готово. Откройте клиент, нажмите 🔄 и подключитесь '
+        "заново.</p><p>Получилось?</p>"
+    )
+    actions = (
+        _button_form(token, "✅ Всё работает", extra=f"&report={report_id}&ok=1")
+        + _button_form(
+            token, "❌ Всё равно не работает",
+            extra=f"&report={report_id}&still=1", secondary=True,
+        )
+        + _retry_button(token, secondary=True)
+        + _help_button(enabled=True)
+    )
+    return _render(title="Проверьте подключение", body=body, actions=actions)
+
+
+def render_still_broken(token: str) -> HTMLResponse:
+    """«Всё равно не работает»: репорт закрыт как fail, зовём человека."""
+    body = (
+        "<p>Передаём в поддержку: напишите нам, опишите проблему и "
+        "приложите модель устройства.</p>"
+    )
+    actions = _help_button(enabled=True, label="Написать в поддержку") + _retry_button(
+        token, secondary=True
+    )
+    return _render(title="Жаль, что не помогло", body=body, actions=actions)
+
+
+def render_all_good() -> HTMLResponse:
+    """«Всё работает»: репорт закрыт как ok."""
+    body = (
+        '<p class="ok">Отлично, рады, что заработало!</p>'
+        "<p>Если снова сломается, эта страница всегда под рукой.</p>"
+    )
+    return _render(
+        title="Всё работает",
+        body=body,
+        actions=_help_button(enabled=True, label="Написать в поддержку"),
+    )
 
 
 def render_expired(sub, token: str) -> HTMLResponse:
@@ -483,15 +606,27 @@ def render_rate_limited() -> HTMLResponse:
     )
 
 
-def render_inactive(sub, token: str) -> HTMLResponse:
-    """Пауза/блокировка — объясняем и уводим к человеку."""
-    if sub.status == models.SubscriptionStatus.frozen:
+def render_inactive(sub, token: str, *, banned: bool = False) -> HTMLResponse:
+    """Пауза, блокировка или бан — объясняем и уводим к человеку.
+
+    ``banned`` — глобальный бан владельца (``User.banned_at``): подписка
+    может быть формально active, но чинить и платить ему нельзя, как в боте,
+    где мидлвара дропает его апдейты. Причину на страницу не выносим.
+    """
+    actions = ""
+    if banned:
+        title = "Доступ приостановлен"
+        body = "<p>Доступ к сервису ограничен. Разобраться поможет поддержка.</p>"
+        actions = _help_button(enabled=True, label="Написать в поддержку")
+    elif sub.status == models.SubscriptionStatus.frozen:
         title = "Подписка на паузе"
         body = "<p>Вы поставили подписку на паузу. Снять её можно в личном кабинете.</p>"
     else:
         title = "Доступ приостановлен"
         body = "<p>Подписка заблокирована. Разобраться поможет поддержка.</p>"
-    return _render(title=title, body=body + _telegram_link())
+        # Текст зовёт в поддержку — кнопка обязана быть, иначе это тупик.
+        actions = _help_button(enabled=True, label="Написать в поддержку")
+    return _render(title=title, body=body + _telegram_link(), actions=actions)
 
 
 def render_pay_pending(invoice_id: int, token: str, *, paid: bool) -> HTMLResponse:
@@ -525,35 +660,102 @@ def render_pay_pending(invoice_id: int, token: str, *, paid: bool) -> HTMLRespon
 # ── Действия ────────────────────────────────────────────────────────────
 
 
+def _start_again(found, token: str) -> HTMLResponse:
+    """Стартовый экран для POST, которому нечего выполнять (битый или чужой
+    репорт). Молча, без «не найдено»: разница в ответе была бы оракулом для
+    перебора id репортов по утёкшему токену."""
+    # Ленивый импорт: api_extensions импортирует этот модуль.
+    from ..api_extensions import _device_label
+
+    return render_start(
+        found.sub, token,
+        device_name=_device_label(found),
+        repairable=not found.is_legacy,
+    )
+
+
 def do_repair(db: Session, found, token: str) -> HTMLResponse:
     """POST-починка: шаг лестницы через общее ядро."""
     from .client_control import COMPLAINT_DEDUP_SEC
 
     sub = found.sub
+    user = db.get(models.User, sub.user_id)
+    if user is None:
+        return camo_response()
+    if not self_repair.user_may_repair(user):
+        # Ядро ответило бы no_subscription («проверьте клиент») — для
+        # забаненного это ложь: чинить ему нельзя вовсе, как и на GET.
+        return render_inactive(sub, token, banned=True)
     device = found.serve_device or found.token_device
     if device is None:
         # Legacy-подписочный токен: устройства за ним нет, чинить нечего.
         return render_outcome(
             self_repair.RepairOutcome(action="no_subscription"), sub, token
         )
-    user = db.get(models.User, sub.user_id)
-    if user is None:
-        return camo_response()
 
+    # Окно повторов и суточный потолок не передаём: единая политика ядра
+    # (SELF_REPAIR_* с fallback на SUB_FIX_*), одна на все каналы.
     outcome = self_repair.handle_broken_device(
         db,
         device.id,
         user=user,
         dedup_sec=COMPLAINT_DEDUP_SEC,
         source="sub_page",
-        throttle_sec=_throttle_sec(),
-        daily_max=_daily_max(),
     )
     logger.info(
         "sub-fix page: repair sub=%s device=%s -> %s",
         sub.id, device.id, outcome.action,
     )
     return render_outcome(outcome, sub, token)
+
+
+def do_feedback(
+    db: Session,
+    found,
+    token: str,
+    *,
+    report_id: str,
+    operator: str | None,
+    still: bool,
+    ok: bool,
+) -> HTMLResponse:
+    """POST-обратная связь по сделанной починке: оператор, «помогло / нет».
+
+    Зеркало бот-эндпоинтов report-operator / report-ok / report-still-broken,
+    но без admin-токена: право даёт сам sub_token, поэтому репорт обязан
+    принадлежать ЭТОЙ подписке — иначе утёкшая ссылка позволяла бы
+    переписывать чужие репорты перебором id. Порядок шагов: сначала
+    оператор (он может прийти вместе с ответом), потом исход.
+    """
+    sub = found.sub
+    try:
+        rid = int(report_id)
+    except (TypeError, ValueError):
+        return _start_again(found, token)
+    report = db.get(models.OperatorNodeReport, rid)
+    if report is None or report.subscription_id != sub.id:
+        return _start_again(found, token)
+
+    if operator and operator != "skip":
+        # Мусор вне списка = «не указан»: поле идёт в крауд-матрицу
+        # node×operator, и произвольная строка портила бы статистику.
+        report.operator = operator if operator in self_repair.OPERATORS else "unknown"
+        db.commit()
+    if still:
+        report.outcome = "fail"
+        report.resolved_at = utcnow()
+        db.commit()
+        logger.info("sub-fix page: report %s still broken (sub=%s)", report.id, sub.id)
+        return render_still_broken(token)
+    if ok:
+        # Как в боте: закрытый репорт (ok/fail) не переписываем — «ok» после
+        # «fail» уже ушёл в поддержку, а watcher мог закрыть его сам.
+        if report.outcome not in ("ok", "fail"):
+            report.outcome = "ok"
+            report.resolved_at = utcnow()
+            db.commit()
+        return render_all_good()
+    return render_feedback_prompt(token, report.id)
 
 
 def do_pay(db: Session, found, token: str) -> HTMLResponse | RedirectResponse:

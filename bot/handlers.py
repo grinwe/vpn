@@ -2,6 +2,7 @@ import asyncio
 import hashlib
 import html
 import logging
+import math
 import os
 import re
 from urllib.parse import urlparse
@@ -272,16 +273,6 @@ def _admin_headers(actor_id: int) -> dict[str, str]:
     headers["X-Admin-Actor"] = str(actor_id)
     return headers
 
-
-# ── Self-report VPN breakage debounce ──
-#
-# In-memory {telegram_id: monotonic seconds} — last time this user pressed
-# «🆘 VPN не работает». Не сохраняется между рестартами бота, и это ОК:
-# задача cooldown — защитить от случайного двойного тапа и спама, не от
-# долгосрочного злоупотребления. Бэкенд всё равно принимает повтор —
-# 2-3 лишние строчки в AuditLog не страшны.
-_SELF_REPORT_COOLDOWN_S = 300  # 5 минут
-_self_report_last: dict[int, float] = {}
 
 # ── /ops debounce ──
 # /ops запускает полный агентный прогон Claude (дорого, ~до минуты). Кулдаун на
@@ -1685,7 +1676,7 @@ async def health_ping_response(callback_query: types.CallbackQuery):
     if sub_id is not None:
         payload["subscription_id"] = sub_id
     try:
-        status_code, _ = await _fetch_json(
+        status_code, data = await _fetch_json(
             "POST",
             f"{BACKEND_URL}/api/users/health-ping-response",
             json=payload,
@@ -1698,6 +1689,10 @@ async def health_ping_response(callback_query: types.CallbackQuery):
         await callback_query.answer("Не удалось сохранить", show_alert=True)
         return
 
+    # Ответ бэка на answer=bad по контракту ReportBrokenResponse (action и т.д.),
+    # если он тут же починил через ядро self_repair; без активной подписки —
+    # просто {ok: true}.
+    repair: dict | None = None
     if action == "ok":
         await callback_query.answer("Спасибо! 💛")
         ack_text = (
@@ -1706,19 +1701,26 @@ async def health_ping_response(callback_query: types.CallbackQuery):
         )
     else:
         await callback_query.answer("Спасибо! Чиним.")
-        ack_text = (
-            "🛠 Спасибо! Мы получили сигнал и проверяем ваш сервер.\n"
-            "Если проблема не уйдёт за 10 минут — напишите в /help, "
-            "приложите модель устройства."
-        )
+        if isinstance(data, dict) and data.get("action"):
+            # Исход починки уйдёт отдельным (не удаляемым) сообщением ниже —
+            # тем же, что у кнопки «🆘 VPN не работает»: с вопросом об
+            # операторе и отложенным нуджем. Ack остаётся коротким.
+            repair = data
+            ack_text = "🛠 Спасибо! Чиним."
+        else:
+            ack_text = (
+                "🛠 Спасибо! Мы получили сигнал и проверяем ваш сервер.\n"
+                "Если проблема не уйдёт за 10 минут — напишите в /help, "
+                "приложите модель устройства."
+            )
     try:
         await callback_query.message.edit_text(ack_text)
     except Exception:
         pass
     # Авто-удаление ack-сообщения через HEALTH_PING_ACK_DELETE_DELAY_S.
-    # Применяется к обоим веткам (ok/bad) — для bad важная инфа продублирована
-    # в toast `callback_query.answer("Спасибо! Чиним.")` и админы уже
-    # оповещены через notify_admins, повторное чтение бабла юзеру не нужно.
+    # Применяется к обоим веткам (ok/bad): для bad всё важное (что именно
+    # сделали, оператор, нудж) живёт в отдельном сообщении исхода
+    # (_send_repair_outcome), а не в этом бабле.
     if HEALTH_PING_ACK_DELETE_DELAY_S > 0:
         _spawn(
             _delete_message_after(
@@ -1727,6 +1729,10 @@ async def health_ping_response(callback_query: types.CallbackQuery):
                 callback_query.message.message_id,
                 HEALTH_PING_ACK_DELETE_DELAY_S,
             )
+        )
+    if repair is not None:
+        await _send_repair_outcome(
+            callback_query.bot, callback_query.message.chat.id, repair
         )
 
 
@@ -1738,9 +1744,13 @@ async def health_ping_response(callback_query: types.CallbackQuery):
 # жалобы красным как более сильный сигнал, чем ответ на плановый пинг.
 @router.message(F.text == BTN_VPN_BROKEN)
 async def self_report_vpn_broken(message: types.Message) -> None:
-    # Operator-aware routing P1 + per-device picker: тянем живые устройства
-    # юзера. >1 → спрашиваем, КАКОЕ перенести (рабочие устройства не трогаем);
-    # ==1 → переносим сразу (один тап, как раньше). Через делей
+    # Порядок: пре-чек повторов → пикер устройств → починка. Повторы ограничивает
+    # ТОЛЬКО бэкенд — единая политика ядра self_repair (троттл + суточный потолок
+    # по подписке), одна на бот, кабинет и страницу. Клиентского кулдауна в боте
+    # больше нет: он был мёртв (серверный пре-чек ниже срабатывал раньше него) и
+    # к тому же терялся при рестарте. Живые устройства (active+failed) тянем с
+    # бэка: >1 → спрашиваем, КАКОЕ перенести (рабочие не трогаем); ==1 → чиним
+    # сразу. Исход показывает _send_repair_outcome; через делей
     # (_STILL_BROKEN_DELAY_S), если бэкенд НЕ видит переподключения, шлём нудж
     # «всё ещё не работает?» → поддержка. Исход для операторской матрицы
     # проставляет backend-watcher (resolve_pending_reports).
@@ -1753,9 +1763,7 @@ async def self_report_vpn_broken(message: types.Message) -> None:
             headers=_admin_headers(tg_id),
         )
     except aiohttp.ClientError:
-        await message.answer(
-            "Не получилось обработать — попробуй ещё раз через минуту."
-        )
+        await message.answer(_REPAIR_RETRY_TEXT)
         return
     if status_code != 200 or not isinstance(data, dict):
         # 4xx/5xx/0 здесь = сбой контракта или недоступность бэка. _fetch_json
@@ -1765,79 +1773,208 @@ async def self_report_vpn_broken(message: types.Message) -> None:
             "self_report devices-by-telegram failed: tg_id=%s status=%s data=%.300s",
             tg_id, status_code, data,
         )
-        await message.answer(
-            "Не получилось обработать — попробуй ещё раз через минуту."
+        await message.answer(_REPAIR_RETRY_TEXT)
+        return
+
+    # Пре-чек ДО пикера: если только что уже чинили (throttled) или суточный
+    # потолок исчерпан (daily_limit), бэкенд отдаёт retry_after_sec + wait_reason,
+    # а жалобу уже записал сам (complaint_received) — здесь только текст для
+    # человека. Показываем независимо от числа устройств: раньше бот сначала
+    # спрашивал «какое не работает?», а потом отвечал «уже перекидывали недавно»
+    # — для человека это выглядело как противоречие (репорт 2026-07-26). Тексты
+    # те же, что у исхода починки: один источник в _send_repair_outcome.
+    retry_after = data.get("retry_after_sec")
+    wait_reason = data.get("wait_reason")
+    if retry_after or wait_reason:
+        await _send_repair_outcome(
+            message.bot,
+            message.chat.id,
+            {"action": wait_reason or "throttled", "retry_after_sec": retry_after},
         )
         return
 
     devices = data.get("devices") or []
-    # Троттл проверяем ДО пикера: бэкенд отклонит перенос, если предыдущий был
-    # меньше 5 минут назад, и раньше юзер узнавал об этом только ПОСЛЕ выбора
-    # устройства — бот сначала спрашивал «какое не работает?», а потом отвечал
-    # «уже перекидывали недавно». Для человека это выглядит как противоречие
-    # (репорт 2026-07-26).
-    retry_after = data.get("retry_after_sec")
-    if devices and retry_after:
-        # Жалобу бэкенд уже зафиксировал сам (devices-by-telegram пишет
-        # complaint_received, когда отвечает троттлом) — здесь только текст для
-        # человека. Раньше на этом месте сигнал терялся совсем: бот молча
-        # показывал «уже перенесли» и на сервер ничего не отправлял.
-        mins = max(1, int(retry_after) // 60)
-        await message.answer(
-            f"👍 Мы уже перенесли тебя на другой сервер пару минут назад.\n\n"
-            f"Подписка обновляется в приложении сама — нажми 🔄 рядом с профилем "
-            f"и попробуй подключиться.\n\n"
-            f"Если через {mins} мин. всё ещё не работает — жми /help, разберёмся.",
-        )
-        return
-
     if not devices:
-        # E1.3: команды /buy в боте нет (ни хендлера, ни в списке команд) —
-        # раньше человек, который уже жалуется на проблему, упирался в тупик.
-        await message.answer(
-            "У тебя нет активной подписки — чинить пока нечего.",
-            reply_markup=types.InlineKeyboardMarkup(inline_keyboard=[[
-                types.InlineKeyboardButton(text="💎 Выбрать тариф", callback_data="go:plans"),
-            ]]),
-        )
+        if data.get("subscription_id"):
+            # Подписка есть, живых устройств нет — все ещё pending (собираются);
+            # чинить пока нечего, но и «нет подписки» говорить нельзя.
+            await message.answer(
+                "⏳ Устройства ещё настраиваются — подожди пару минут и нажми 🔄 "
+                "рядом с профилем. Если через 10 минут не заработает — нажми "
+                "кнопку ещё раз."
+            )
+        else:
+            await _send_repair_outcome(
+                message.bot, message.chat.id, {"action": "no_subscription"}
+            )
         return
 
     if len(devices) > 1:
         # Несколько устройств — спрашиваем, какое перенести (имена = как у
-        # юзера записаны). Показ пикера НЕ троттлим: выбор бесплатен, а саму
-        # миграцию защищает проверка статуса устройства на бэке.
+        # юзера записаны). Показ пикера бесплатен: повторы ограничит бэкенд.
         await message.answer(
             "У тебя несколько устройств. Какое не работает? Перенесём только "
-            "его на другой сервер — остальные не тронем.",
+            "его — остальные не тронем.",
             reply_markup=broken_device_keyboard(devices),
         )
         return
 
-    # Ровно одно устройство — переносим сразу, с прежним per-user cooldown
-    # против спама кнопкой.
-    now_mono = asyncio.get_event_loop().time()
-    last = _self_report_last.get(tg_id)
-    if last is not None and (now_mono - last) < _SELF_REPORT_COOLDOWN_S:
-        await message.answer(
-            "👍 Мы уже перекинули тебя на другой сервер недавно. Дай минуту "
-            "переподключиться. Если через 10 минут не работает — /help."
-        )
-        return
-    action = await _do_device_failover(
+    await _do_device_failover(
         message.bot, message.chat.id, tg_id, int(devices[0]["device_id"])
     )
-    if action == "migrated":
-        _self_report_last[tg_id] = now_mono
+
+
+# Транспортная ошибка / не-200 от бэка — один текст на все входы починки.
+_REPAIR_RETRY_TEXT = "Не получилось обработать — попробуй ещё раз через минуту."
+
+# Хвост успешного исхода: вопрос об операторе (operator-aware routing P1).
+_OPERATOR_QUESTION = (
+    "\n\nЧтобы мы быстрее ловили блокировки — подскажи, какой у тебя интернет?"
+)
+
+
+def _retry_minutes(retry_after_sec) -> int:
+    """retry_after_sec бэка → минуты для «попробуй через N мин.» (вверх, не
+    меньше 1). Если бэк число не прислал — 2 мин., как дефолтный троттл ядра
+    (SELF_REPAIR_THROTTLE_SEC=120)."""
+    try:
+        sec = int(retry_after_sec or 0)
+    except (TypeError, ValueError):
+        sec = 0
+    return max(1, math.ceil(sec / 60)) if sec > 0 else 2
+
+
+def _plans_keyboard() -> types.InlineKeyboardMarkup:
+    """«Выбрать тариф» для исхода no_subscription. E1.3: команды /buy в боте нет
+    (ни хендлера, ни в списке команд) — человек, который уже жалуется на
+    проблему, не должен упираться в тупик."""
+    return types.InlineKeyboardMarkup(inline_keyboard=[[
+        types.InlineKeyboardButton(text="💎 Выбрать тариф", callback_data="go:plans"),
+    ]])
+
+
+async def _send_repair_outcome(bot, chat_id: int, data: dict) -> str | None:
+    """Показать человеку исход починки — ЕДИНСТВЕННОЕ место с текстами исходов
+    для всех входов бота: «🆘 VPN не работает» (одно устройство, пикер, «все
+    устройства»), «не работает» на плановый опрос (hping:bad) и /newconfig.
+
+    ``data`` — ответ бэка по контракту ReportBrokenResponse (action, report_id,
+    device_name, scope, retry_after_sec). Семантика исходов общая с кабинетом и
+    страницей (docs/operations/vpn_broken_channels_parity_2026_09_12.md), поэтому
+    тексты тут и там должны совпадать по смыслу. После успешного шага
+    (migrated/reshuffled/duplicated) спрашиваем оператора (operator_keyboard) и
+    ставим отложенный нудж «всё ещё не работает?» (_delayed_still_broken_prompt)
+    — если бэк вернул report_id. Возвращает action (None, если его нет)."""
+    action = data.get("action")
+    report_id = data.get("report_id")
+
+    if action in ("migrated", "reshuffled", "duplicated"):
+        if action == "migrated":
+            if data.get("scope") == "subscription":
+                head = "🔄 Поменяли сервер для всех устройств."
+            else:
+                # Имя устройства задаёт юзер в webapp — экранируем перед вставкой
+                # в HTML-сообщение (default parse_mode=HTML), иначе '<' /
+                # несбалансированный тег → 400 «can't parse entities», и юзер не
+                # получит ни клавиатуры, ни нуджа.
+                dev_name = html.escape(data.get("device_name") or "устройство")
+                head = f"🔄 Поменяли сервер для «{dev_name}»."
+            text = (
+                f"{head} Подписка обновится в приложении сама — нажми 🔄 рядом "
+                "с профилем и попробуй подключиться через пару минут."
+            )
+        elif action == "reshuffled":
+            # Первый шаг лестницы: ноды те же, протоколы другие. Человеку про
+            # протоколы знать незачем — ему важно «поменяли способ связи и надо
+            # обновить подписку».
+            text = (
+                "🔀 Переключили тебя на другой способ подключения — чаще всего "
+                "не работает именно он, а не сам сервер.\n\n"
+                "Нажми 🔄 рядом с профилем в приложении и попробуй подключиться."
+            )
+        else:
+            # Третий шаг: человеку с единственным живым протоколом дали второй
+            # сервер по нему же — страховка на случай падения его ноды.
+            text = (
+                "➕ Добавили тебе запасной сервер по тому способу связи, который "
+                "у тебя работает.\n\n"
+                "Нажми 🔄 рядом с профилем — в списке появится ещё один вариант."
+            )
+        if report_id:
+            await bot.send_message(
+                chat_id,
+                text + _OPERATOR_QUESTION,
+                reply_markup=operator_keyboard(int(report_id)),
+            )
+            _spawn(_delayed_still_broken_prompt(bot, chat_id, int(report_id)))
+        else:
+            # Без report_id оператора не к чему привязать, а нудж не проверить
+            # (report-status) — оставляем человеку выход в поддержку.
+            await bot.send_message(chat_id, text, reply_markup=help_keyboard())
+        return action
+
+    if action == "throttled":
+        # Штатный троттл — не отказ сервиса: раньше он проваливался в «не смогли
+        # подобрать сервер, напиши в поддержку» и гнал человека в поддержку
+        # (репорт 2026-07-26). Кнопка доступна сразу — сервер сам ответит
+        # throttled, никаких клиентских блокировок.
+        mins = _retry_minutes(data.get("retry_after_sec"))
+        await bot.send_message(
+            chat_id,
+            "👍 Мы уже переключали тебя пару минут назад. Нажми 🔄 рядом с "
+            "профилем и попробуй подключиться. "
+            f"Если через {mins} мин. всё ещё не работает — нажми кнопку ещё раз.",
+        )
+    elif action == "daily_limit":
+        await bot.send_message(
+            chat_id,
+            "Сегодня мы уже несколько раз меняли тебе серверы — дальше нужна "
+            "помощь человека. Напиши в поддержку.",
+            reply_markup=help_keyboard(),
+        )
+    elif action == "not_ready":
+        # Устройство pending — ещё собирается; переносить нечего.
+        await bot.send_message(
+            chat_id,
+            "⏳ Устройство ещё настраивается — подожди пару минут и нажми 🔄 "
+            "рядом с профилем. Если через 10 минут не заработает — нажми кнопку "
+            "ещё раз.",
+        )
+    elif action == "no_subscription":
+        # Нет активной подписки / устройство отключено / бан — ядро отвечает
+        # одинаково, деталей человеку не раскрываем.
+        await bot.send_message(
+            chat_id,
+            "Чинить нечего: подписка не активна или это устройство уже "
+            "отключено. Проверь подписку в кабинете.",
+            reply_markup=_plans_keyboard(),
+        )
+    elif action == "user_not_found":
+        await bot.send_message(chat_id, "Не нашли твой аккаунт — нажми /start.")
+    elif action == "no_target":
+        await bot.send_message(
+            chat_id,
+            "Не смогли автоматически подобрать другой сервер. Попробуй через "
+            "10 минут — серверы освобождаются постоянно. Если срочно — напиши "
+            "в поддержку.",
+            reply_markup=help_keyboard(),
+        )
+    else:
+        # Неизвестный action / сбой контракта — как транспортная ошибка, но с
+        # выходом в поддержку (аудит №12: юзер со сломанным VPN и сбоящим бэком
+        # не должен оставаться без единого выхода).
+        logger.warning("repair outcome: unknown action=%r data=%.300s", action, data)
+        await bot.send_message(chat_id, _REPAIR_RETRY_TEXT, reply_markup=help_keyboard())
+    return action
 
 
 async def _do_device_failover(
     bot, chat_id: int, tg_id: int, device_id: int
 ) -> str | None:
-    """Перенести ОДНО устройство на свободный сервер + спросить оператора.
-
-    Зовёт per-device бэкенд (report-broken-device → failover_device): соседние
-    устройства не трогаются, нода user-wide не банится. Возвращает action для
-    вызывающего (single-device путь по нему ставит cooldown)."""
+    """Починить ОДНО устройство (report-broken-device → ядро self_repair
+    per-device): соседние устройства не трогаются, нода user-wide не банится.
+    Исход показывает _send_repair_outcome; возвращает action (None при
+    транспортной ошибке / не-200)."""
     try:
         status_code, data = await _fetch_json(
             "POST",
@@ -1846,11 +1983,9 @@ async def _do_device_failover(
             headers=_admin_headers(tg_id),
         )
     except aiohttp.ClientError:
-        await bot.send_message(
-            chat_id,
-            "Не получилось обработать — попробуй ещё раз через минуту.",
-            reply_markup=help_keyboard(),
-        )
+        # Аудит №12: юзер со сломанным VPN и сбоящим бэком не должен
+        # оставаться без единого выхода — даём клавиатуру помощи.
+        await bot.send_message(chat_id, _REPAIR_RETRY_TEXT, reply_markup=help_keyboard())
         return None
     if status_code != 200 or not isinstance(data, dict):
         # Персистентный 4xx (баг контракта/рассинхрон устройств) иначе гнал бы
@@ -1859,100 +1994,17 @@ async def _do_device_failover(
             "report-broken-device failed: tg_id=%s device_id=%s status=%s data=%.300s",
             tg_id, device_id, status_code, data,
         )
-        await bot.send_message(
-            chat_id,
-            # Аудит №12: юзер со сломанным VPN и сбоящим бэком не должен
-            # оставаться без единого выхода.
-            "Не получилось обработать — попробуй ещё раз через минуту.",
-            reply_markup=help_keyboard(),
-        )
+        await bot.send_message(chat_id, _REPAIR_RETRY_TEXT, reply_markup=help_keyboard())
         return None
-
-    action = data.get("action")
-    if action == "migrated":
-        report_id = data.get("report_id")
-        # Имя устройства задаёт юзер в webapp — экранируем перед вставкой в
-        # HTML-сообщение (default parse_mode=HTML), иначе '<' / несбалансированный
-        # тег → 400 «can't parse entities», и юзер не получит ни клавиатуры, ни нуджа.
-        dev_name = html.escape(data.get("device_name") or "устройство")
-        await bot.send_message(
-            chat_id,
-            f"🔄 Поменяли сервер для «{dev_name}». Подписка обновится в "
-            "приложении сама — нажми 🔄 рядом с профилем и попробуй подключиться "
-            "через пару минут.\n\n"
-            "Чтобы мы быстрее ловили блокировки — подскажи, какой у тебя интернет?",
-            reply_markup=(
-                operator_keyboard(int(report_id)) if report_id else help_keyboard()
-            ),
-        )
-        if report_id:
-            _spawn(
-                _delayed_still_broken_prompt(bot, chat_id, int(report_id))
-            )
-    elif action == "reshuffled":
-        # Первый шаг лестницы: ноды те же, протоколы другие. Человеку про
-        # протоколы знать незачем — ему важно «мы поменяли способ связи и надо
-        # обновить подписку».
-        report_id = data.get("report_id")
-        await bot.send_message(
-            chat_id,
-            "🔀 Переключили тебя на другой способ подключения — чаще всего "
-            "не работает именно он, а не сам сервер.\n\n"
-            "Нажми 🔄 рядом с профилем в приложении и попробуй подключиться.\n\n"
-            "Чтобы мы быстрее ловили блокировки — подскажи, какой у тебя интернет?",
-            reply_markup=(
-                operator_keyboard(int(report_id)) if report_id else help_keyboard()
-            ),
-        )
-        if report_id:
-            _spawn(_delayed_still_broken_prompt(bot, chat_id, int(report_id)))
-    elif action == "duplicated":
-        # Третий шаг: человеку с единственным живым протоколом дали второй
-        # сервер по нему же — страховка на случай падения его ноды.
-        report_id = data.get("report_id")
-        await bot.send_message(
-            chat_id,
-            "➕ Добавили тебе запасной сервер по тому способу связи, который у "
-            "тебя работает.\n\n"
-            "Нажми 🔄 рядом с профилем — в списке появится ещё один вариант.\n\n"
-            "Если и после этого не заработает — жми /help, разберёмся руками.",
-            reply_markup=(
-                operator_keyboard(int(report_id)) if report_id else help_keyboard()
-            ),
-        )
-        if report_id:
-            _spawn(_delayed_still_broken_prompt(bot, chat_id, int(report_id)))
-    elif action == "throttled":
-        # Ветки не было: throttled проваливался в else и юзер получал «Не смогли
-        # автоматически подобрать другой сервер. Напиши в поддержку» — то есть
-        # штатный пятиминутный троттл выглядел как отказ сервиса и гнал человека в
-        # поддержку (репорт 2026-07-26).
-        await bot.send_message(
-            chat_id,
-            "👍 Мы уже перенесли тебя на другой сервер пару минут назад.\n\n"
-            "Подписка обновляется в приложении сама — нажми 🔄 рядом с профилем "
-            "и попробуй подключиться.\n\n"
-            "Если через 10 минут всё ещё не работает — жми /help, разберёмся.",
-        )
-    elif action == "no_subscription":
-        await bot.send_message(
-            chat_id,
-            "Это устройство уже перенесли или оно отключено. Обнови список "
-            "устройств в приложении.",
-        )
-    else:  # no_target / user_not_found / прочее
-        await bot.send_message(
-            chat_id,
-            "Не смогли автоматически подобрать другой сервер. Напиши в "
-            "поддержку — разберёмся вручную.",
-            reply_markup=help_keyboard(),
-        )
-    return action
+    return await _send_repair_outcome(bot, chat_id, data)
 
 
-async def _do_whole_sub_failover(bot, chat_id: int, tg_id: int) -> None:
-    """«Все устройства» — старый whole-sub путь (report-broken): мигрирует всю
-    подписку + бан старой ноды user-wide. У него свой per-user троттл на бэке."""
+async def _do_whole_sub_failover(bot, chat_id: int, tg_id: int) -> str | None:
+    """«🔁 Все мои устройства» и /newconfig — whole-sub путь (report-broken →
+    handle_broken_subscription): переезжает вся подписка, старая нода банится
+    user-wide. Повторы ограничивает та же единая политика ядра, что и
+    per-device (троттл + суточный потолок по подписке). Исход показывает
+    _send_repair_outcome (scope="subscription" → «для всех устройств»)."""
     try:
         status_code, data = await _fetch_json(
             "POST",
@@ -1961,60 +2013,16 @@ async def _do_whole_sub_failover(bot, chat_id: int, tg_id: int) -> None:
             headers=_admin_headers(tg_id),
         )
     except aiohttp.ClientError:
-        await bot.send_message(
-            chat_id, "Не получилось обработать — попробуй ещё раз через минуту."
-        )
-        return
+        await bot.send_message(chat_id, _REPAIR_RETRY_TEXT, reply_markup=help_keyboard())
+        return None
     if status_code != 200 or not isinstance(data, dict):
         logger.warning(
             "report-broken (whole-sub) failed: tg_id=%s status=%s data=%.300s",
             tg_id, status_code, data,
         )
-        await bot.send_message(
-            chat_id, "Не получилось обработать — попробуй ещё раз через минуту."
-        )
-        return
-
-    action = data.get("action")
-    if action == "migrated":
-        report_id = data.get("report_id")
-        await bot.send_message(
-            chat_id,
-            "🔄 Поменяли сервер для всех устройств. Подписка обновится в "
-            "приложении сама — нажми 🔄 рядом с профилем и попробуй подключиться "
-            "через пару минут.\n\n"
-            "Чтобы мы быстрее ловили блокировки — подскажи, какой у тебя интернет?",
-            reply_markup=(
-                operator_keyboard(int(report_id)) if report_id else help_keyboard()
-            ),
-        )
-        if report_id:
-            _spawn(
-                _delayed_still_broken_prompt(bot, chat_id, int(report_id))
-            )
-    elif action == "throttled":
-        await bot.send_message(
-            chat_id,
-            "👍 Мы уже перенесли тебя на другой сервер пару минут назад.\n\n"
-            "Подписка обновляется в приложении сама — нажми 🔄 рядом с профилем "
-            "и попробуй подключиться.\n\n"
-            "Если через 10 минут всё ещё не работает — жми /help, разберёмся.",
-        )
-    elif action == "no_subscription":
-        await bot.send_message(
-            chat_id,
-            "У тебя нет активной подписки — чинить пока нечего.",
-            reply_markup=types.InlineKeyboardMarkup(inline_keyboard=[[
-                types.InlineKeyboardButton(text="💎 Выбрать тариф", callback_data="go:plans"),
-            ]]),
-        )
-    else:  # no_target / user_not_found / прочее
-        await bot.send_message(
-            chat_id,
-            "Не смогли автоматически подобрать другой сервер. Напиши в "
-            "поддержку — разберёмся вручную.",
-            reply_markup=help_keyboard(),
-        )
+        await bot.send_message(chat_id, _REPAIR_RETRY_TEXT, reply_markup=help_keyboard())
+        return None
+    return await _send_repair_outcome(bot, chat_id, data)
 
 
 # «Всё равно не работает» показываем не сразу, а через этот делей — даём
@@ -2117,8 +2125,8 @@ def broken_device_keyboard(devices: list[dict]) -> types.InlineKeyboardMarkup:
     """Пикер «какое устройство не работает» (multi-device юзер). Текст кнопок =
     Device.name (как записал юзер); callback несёт только device_id (умещается
     в 64-байтный лимит Telegram, длинные имена идут в text — безопасно). Плюс
-    «🔁 Все мои устройства» — старый whole-sub перенос для тех, у кого лёг
-    весь пул."""
+    «🔁 Все мои устройства» — whole-sub перенос всей подписки для тех, у кого
+    лёг весь пул (_do_whole_sub_failover)."""
     rows = [
         [
             types.InlineKeyboardButton(
@@ -2761,26 +2769,14 @@ async def cmd_referral(message: types.Message):
 
 @router.message(Command("newconfig"))
 async def cmd_new_config(message: types.Message):
-    """Regenerate VPN config on a different node (self-service migration)."""
-    try:
-        status_code, data = await _fetch_json(
-            "POST",
-            f"{BACKEND_URL}/api/users/by_telegram/{message.from_user.id}/regenerate",
-            headers=_admin_headers(message.from_user.id),
-        )
-    except aiohttp.ClientError:
-        await message.answer("Бэкенд недоступен.")
-        return
-
-    if status_code == 200:
-        await message.answer(
-            "🔄 Конфиг перегенерирован. Через минуту забери новую ссылку "
-            "в личном кабинете или командой /config."
-        )
-    elif status_code == 404:
-        await message.answer("Нет активных подписок.")
-    else:
-        await message.answer("Не удалось перегенерировать конфиг. Попробуй позже.")
+    """/newconfig — «переселить всё»: тот же whole-sub путь, что «🔁 Все мои
+    устройства» в пикере кнопки «🆘 VPN не работает» (единые тексты исходов,
+    вопрос об операторе, отложенный нудж, единая политика повторов). Раньше
+    команда дёргала отдельный regenerate-эндпоинт со своими текстами
+    («Конфиг перегенерирован») мимо всего этого."""
+    await _do_whole_sub_failover(
+        message.bot, message.chat.id, message.from_user.id
+    )
 
 
 # ── Admin commands ──
@@ -3793,11 +3789,28 @@ async def device_rename_cancel(message: types.Message, state: FSMContext):
 
 @devices_router.message(StateFilter(DeviceStates.waiting_rename), F.text)
 async def device_rename_finish(message: types.Message, state: FSMContext):
-    if message.text.startswith("/"):
+    text = message.text.strip()
+    if text.startswith("/"):
         # Любая команда в стейте (роутер стоит раньше главного) — выход
         # из переименования; юзер повторит команду уже вне стейта.
         await state.clear()
         await message.answer("Ок, переименование отменено. Повтори команду.")
+        return
+    # Кнопки главного меню — тоже не имя устройства: devices_router стоит
+    # раньше главного, и «🆘 VPN не работает», нажатая в стейте переименования,
+    # молча становилась именем устройства, а жалоба терялась. Выходим из стейта;
+    # жалобу на VPN обрабатываем сразу — человек с нерабочим VPN не должен
+    # жать дважды. Импорт ленивый, как SupportStates в cmd_start: модульный
+    # импорт bot.support тянет aiogram.exceptions.TelegramForbiddenError,
+    # которого нет в тестовых заглушках aiogram (backend/tests/_bot_stubs.py).
+    from .support import _MENU_TEXTS
+
+    if text in _MENU_TEXTS:
+        await state.clear()
+        if text == BTN_VPN_BROKEN:
+            await self_report_vpn_broken(message)
+            return
+        await message.answer("Ок, переименование отменено. Нажми кнопку ещё раз.")
         return
     data = await state.get_data()
     dev_id = data.get("rename_device_id")
@@ -3810,7 +3823,7 @@ async def device_rename_finish(message: types.Message, state: FSMContext):
         status_code, resp = await _fetch_json(
             "POST",
             f"{BACKEND_URL}/api/bot/devices/{dev_id}/rename",
-            json={"telegram_id": str(uid), "name": message.text.strip()[:64]},
+            json={"telegram_id": str(uid), "name": text[:64]},
             headers=_admin_headers(uid),
         )
     except aiohttp.ClientError:
