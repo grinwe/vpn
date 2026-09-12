@@ -423,6 +423,12 @@ def _do_failover(
     client_ts: int | None = None,
     client_node_id: int | None = None,
     apply_fail_count_gate: bool = False,
+    # Единое ядро (self_repair.handle_broken_subscription) применяет свой
+    # троттл и передаёт 0; control-channel/админка живут с прежними 5 мин.
+    throttle_sec: int | None = None,
+    actor_type: models.AuditActor = models.AuditActor.system,
+    source: str | None = None,
+    operator: str | None = None,
 ) -> ReportFailureResponse:
     """Shared body для client/admin триггеров — select target + migrate.
 
@@ -452,23 +458,25 @@ def _do_failover(
                 action="deferred",
             )
 
-    recent_migrate_cutoff = utcnow() - timedelta(minutes=5)
-    # Троттл по operator_node_reports (reported_at индексирован) вместо
-    # скана audit_logs: каждый успешный failover пишет ровно один
-    # OperatorNodeReport по этой подписке, так что сигнал тот же, но без
-    # полного скана таблицы аудита внутри клиентского запроса.
-    recent_migrate = (
-        db.query(models.OperatorNodeReport.id)
-        .filter(models.OperatorNodeReport.subscription_id == sub.id)
-        .filter(models.OperatorNodeReport.reported_at >= recent_migrate_cutoff)
-        .first()
-    )
-    if recent_migrate:
-        return ReportFailureResponse(
-            ok=True,
-            retry_after_sec=300,
-            action="throttled",
+    throttle = 300 if throttle_sec is None else throttle_sec
+    if throttle > 0:
+        recent_migrate_cutoff = utcnow() - timedelta(seconds=throttle)
+        # Троттл по operator_node_reports (reported_at индексирован) вместо
+        # скана audit_logs: каждый успешный failover пишет ровно один
+        # OperatorNodeReport по этой подписке, так что сигнал тот же, но без
+        # полного скана таблицы аудита внутри клиентского запроса.
+        recent_migrate = (
+            db.query(models.OperatorNodeReport.id)
+            .filter(models.OperatorNodeReport.subscription_id == sub.id)
+            .filter(models.OperatorNodeReport.reported_at >= recent_migrate_cutoff)
+            .first()
         )
+        if recent_migrate:
+            return ReportFailureResponse(
+                ok=True,
+                retry_after_sec=throttle,
+                action="throttled",
+            )
 
     # Нода-виновник для АТРИБУЦИИ (крауд-хелс + OperatorNodeReport.failed_node):
     # берём присланную клиентом current_node_id, если она валидна по кредам
@@ -549,7 +557,7 @@ def _do_failover(
         user_id=sub.user_id,
         subscription_id=sub.id,
         device_id=new_device.id if new_device else None,
-        operator=None,
+        operator=operator if operator in _OPERATORS else None,
         failed_node_id=old_node_id,
         target_node_id=new_node.id,
         target_access_username=(
@@ -561,24 +569,30 @@ def _do_failover(
     db.flush()  # нужен report.id для ответа (set-operator привяжется к нему)
     report_id = report.id
 
+    audit_meta = {
+        "kind": kind,
+        "fail_count": fail_count,
+        "current_node_id": old_node_id,
+        "failed_node_id": old_node_id,
+        "target_node_id": new_node.id,
+        "target_node_name": new_node.name,
+        "banned_old_node": banned_old,
+        "task_id": task_id,
+        "device_id": device_id,
+        "client_ts": client_ts,
+        "report_id": report_id,
+        "scope": "subscription",
+    }
+    if source:
+        audit_meta["source"] = source
     _audit(
         db,
         actor=actor,
         action="client_reported_failure",
         target_type="subscription",
         target_id=sub.id,
-        metadata={
-            "kind": kind,
-            "fail_count": fail_count,
-            "current_node_id": old_node_id,
-            "target_node_id": new_node.id,
-            "target_node_name": new_node.name,
-            "banned_old_node": banned_old,
-            "task_id": task_id,
-            "device_id": device_id,
-            "client_ts": client_ts,
-        },
-        actor_type=models.AuditActor.system,
+        metadata=audit_meta,
+        actor_type=actor_type,
     )
 
     # Краудсорс здоровья ноды: каждый user-report «не работает» на старой
@@ -666,10 +680,6 @@ def admin_report_failure(
 # починки); здесь re-export — имя импортирует api_webapp и соседние хендлеры.
 _OPERATORS = self_repair.OPERATORS
 
-# Анти-абьюз: один report-broken на юзера в это окно — иначе тапами
-# юзер вычерпает себе пул нод через авто-баны.
-_REPORT_BROKEN_THROTTLE_MIN = 5
-
 
 class ReportBrokenRequest(BaseModel):
     telegram_id: str
@@ -677,26 +687,52 @@ class ReportBrokenRequest(BaseModel):
     operator: str | None = None
 
 
+# Единый контракт исхода починки — его отдают ВСЕ каналы (бот через
+# admin-эндпоинты, кабинет через /api/webapp/*, ответ на плановый пинг).
+# Значения ``action`` = self_repair.RepairAction + user_not_found.
+RepairActionLiteral = Literal[
+    "migrated",
+    # Первый шаг ротационной лестницы: те же ноды, другие протоколы.
+    "reshuffled",
+    # Третий шаг: выдан второй лег по работающему протоколу.
+    "duplicated",
+    "throttled",
+    "daily_limit",
+    "no_subscription",
+    "no_target",
+    # Устройство ещё собирается (pending).
+    "not_ready",
+    "user_not_found",
+]
+
+
 class ReportBrokenResponse(BaseModel):
-    action: Literal[
-        "migrated",
-        # Первый шаг ротационной лестницы: те же ноды, другие протоколы.
-        "reshuffled",
-        # Третий шаг: выдан второй лег по работающему протоколу.
-        "duplicated",
-        "throttled",
-        "no_subscription",
-        "no_target",
-        "user_not_found",
-    ]
+    action: RepairActionLiteral
     report_id: int | None = None
     new_node_name: str | None = None
     new_node_region: str | None = None
     task_id: int | None = None
+    # throttled / daily_limit: сколько секунд ждать до следующей попытки.
     retry_after_sec: int | None = None
     # Для per-device миграции — имя перенесённого устройства (как записал юзер),
     # чтобы бот показал «Поменяли сервер для «<имя>»». None для whole-sub пути.
     device_name: str | None = None
+    # Что чинили: одно устройство или всю подписку.
+    scope: Literal["device", "subscription"] = "device"
+
+
+def outcome_response(outcome: self_repair.RepairOutcome) -> ReportBrokenResponse:
+    """RepairOutcome ядра → ответ API (один маппинг на все каналы)."""
+    return ReportBrokenResponse(
+        action=outcome.action,
+        report_id=outcome.report_id,
+        new_node_name=outcome.new_node_name,
+        new_node_region=outcome.new_node_region,
+        task_id=outcome.task_id,
+        retry_after_sec=outcome.retry_after_sec,
+        device_name=outcome.device_name,
+        scope=outcome.scope,
+    )
 
 
 @router.post(
@@ -708,13 +744,12 @@ def report_broken_by_telegram(
     db: Session = Depends(get_db),
     admin_token: str = Depends(require_admin),  # noqa: ARG001 — bot shared token
 ) -> ReportBrokenResponse:
-    """Юзер тапнул «VPN не работает» в боте → мигрируем + заводим репорт.
+    """«🔁 Все мои устройства» в боте → перенос всей подписки.
 
-    Resolve user по telegram_id, берём первую активную подписку, гоним
-    ``migrate_subscription_to_free_node`` (свободная нода + бан старой) и
-    пишем ``OperatorNodeReport(outcome=pending)`` со снапшотом
-    access_username новой ноды — watcher по нему проставит исход. Оператор
-    приходит отдельным тапом (report-operator).
+    От Telegram зависит ровно resolve юзера; всё остальное (жалоба, единый
+    троттл и суточный потолок, whole-sub миграция с баном старой ноды,
+    OperatorNodeReport) — общее ядро ``self_repair.handle_broken_subscription``,
+    которым пользуется и кабинет (/api/webapp/report-broken).
     """
 
     user = (
@@ -723,103 +758,18 @@ def report_broken_by_telegram(
         .first()
     )
     if user is None:
-        return ReportBrokenResponse(action="user_not_found")
+        return ReportBrokenResponse(action="user_not_found", scope="subscription")
 
-    cutoff = utcnow() - timedelta(minutes=_REPORT_BROKEN_THROTTLE_MIN)
-    recent = (
-        db.query(models.OperatorNodeReport)
-        .filter(models.OperatorNodeReport.user_id == user.id)
-        .filter(models.OperatorNodeReport.reported_at >= cutoff)
-        .first()
-    )
-    if recent is not None:
-        return ReportBrokenResponse(
-            action="throttled",
-            retry_after_sec=_REPORT_BROKEN_THROTTLE_MIN * 60,
-        )
-
-    sub = (
-        db.query(models.Subscription)
-        .filter(
-            models.Subscription.user_id == user.id,
-            models.Subscription.status == models.SubscriptionStatus.active,
-        )
-        .order_by(models.Subscription.id)
-        .first()
-    )
-    if sub is None or sub.node is None or sub.plan is None:
-        return ReportBrokenResponse(action="no_subscription")
-
-    old_node = sub.node
-
-    # Анти-«выжигание пула»: протухшие авто-баны снимаем, при потолке —
-    # мигрируем без нового бана (NODE_USER_BAN_TTL_HOURS / _MAX_PER_USER).
-    _prune_stale_auto_bans(db, user.id)
-    auto_ban = _should_auto_ban(db, user.id)
-
-    orchestrator = ProvisioningOrchestrator(db)
-    try:
-        new_node, device, task, _banned = (
-            orchestrator.migrate_subscription_to_free_node(
-                sub,
-                auto_ban_old_node=auto_ban,
-                ban_reason="user reported VPN broken (operator-routing)",
-                banned_by=f"user:{user.telegram_id}",
-            )
-        )
-    except RuntimeError:
-        # Нет свободной ноды (пул пуст / нездоровы / все в бан-листе) → бот
-        # отправит в чат с админом.
-        return ReportBrokenResponse(action="no_target")
-
-    operator = body.operator if body.operator in _OPERATORS else None
-    report = models.OperatorNodeReport(
-        user_id=user.id,
-        subscription_id=sub.id,
-        device_id=device.id,
-        operator=operator,
-        failed_node_id=old_node.id,
-        target_node_id=new_node.id,
-        target_access_username=device.access_username,
-        outcome="pending",
-    )
-    db.add(report)
-    db.commit()
-    db.refresh(report)
-    _audit(
+    sub = self_repair.first_active_subscription(db, user)
+    outcome = self_repair.handle_broken_subscription(
         db,
-        f"user:{user.telegram_id}",
-        "client_reported_failure",
-        "subscription",
-        sub.id,
-        metadata={
-            "report_id": report.id,
-            "failed_node_id": old_node.id,
-            # Дублируем под ключом current_node_id — по нему крауд-счётчик
-            # (_escalate_node_failure_reports) фильтрует окно репортов, иначе
-            # бот-жалобы не участвуют в пороге NODE_FAILURE_BAN_THRESHOLD.
-            "current_node_id": old_node.id,
-            "target_node_id": new_node.id,
-            "source": "bot_vpn_broken",
-        },
-        actor_type=models.AuditActor.user,
+        sub,
+        user=user,
+        dedup_sec=COMPLAINT_DEDUP_SEC,
+        operator=body.operator,
+        source="bot_vpn_broken",
     )
-    # Краудсорс здоровья ноды: бот-репорты голосуют наравне с
-    # webapp/control-channel (_do_failover). Best-effort — не ломаем flow.
-    try:
-        _escalate_node_failure_reports(db, old_node.id)
-    except Exception:  # noqa: BLE001
-        logger.exception(
-            "report-broken: crowd-health escalation failed for node %s",
-            old_node.id,
-        )
-    return ReportBrokenResponse(
-        action="migrated",
-        report_id=report.id,
-        new_node_name=new_node.name,
-        new_node_region=new_node.region,
-        task_id=task.id if task else None,
-    )
+    return outcome_response(outcome)
 
 
 # ── Per-device failover (bot multi-device picker) ────────────────────────
@@ -843,8 +793,43 @@ class DevicesByTelegramResponse(BaseModel):
     # переносить прямо сейчас). Нужно боту, чтобы НЕ показывать пикер «какое
     # устройство перенести», если перенос всё равно будет отклонён: юзер
     # выбирал устройство и только потом узнавал «уже перекидывали недавно» —
-    # выглядело как противоречие бота самому себе (репорт юзера 2026-07-26).
+    # выглядело как противоречие бота самому себе (репорт 2026-07-26).
     retry_after_sec: int | None = None
+    # Почему ждать: throttled (окно повтора) или daily_limit (суточный потолок).
+    wait_reason: Literal["throttled", "daily_limit"] | None = None
+    subscription_id: int | None = None
+
+
+def repair_state_for_user(db: Session, user) -> DevicesByTelegramResponse:
+    """Пре-чек пикера — один на бот и кабинет.
+
+    Живые устройства первой активной подписки (``self_repair.live_devices``)
+    + сколько ждать по единой политике (``self_repair.repair_wait``). Внутри
+    окна ожидания жалоба фиксируется здесь же: раньше бот показывал «уже
+    перенесли пару минут назад» и дальше не шёл — сама ЖАЛОБА нигде не
+    оседала, а это самый частый сценарий («не помогло, жму ещё раз») и
+    главный сигнал для эскалации.
+    """
+    sub = self_repair.first_active_subscription(db, user)
+    if sub is None:
+        return DevicesByTelegramResponse(devices=[])
+    live = [
+        DeviceMini(
+            device_id=d.id,
+            name=d.name or "Устройство",
+            status=getattr(d.status, "value", str(d.status)),
+        )
+        for d in self_repair.live_devices(sub)
+    ]
+    retry_after, reason = self_repair.repair_wait(db, sub)
+    if retry_after:
+        _record_complaint(db, user)
+    return DevicesByTelegramResponse(
+        devices=live,
+        retry_after_sec=retry_after,
+        wait_reason=reason,
+        subscription_id=sub.id,
+    )
 
 
 @router.get(
@@ -866,53 +851,7 @@ def devices_by_telegram(
     )
     if user is None:
         return DevicesByTelegramResponse(devices=[])
-    sub = (
-        db.query(models.Subscription)
-        .filter(
-            models.Subscription.user_id == user.id,
-            models.Subscription.status == models.SubscriptionStatus.active,
-        )
-        .order_by(models.Subscription.id)
-        .first()
-    )
-    if sub is None:
-        return DevicesByTelegramResponse(devices=[])
-    live = [
-        DeviceMini(
-            device_id=d.id,
-            name=d.name or "Устройство",
-            status=getattr(d.status, "value", str(d.status)),
-        )
-        for d in sub.devices
-        if d.status
-        not in (models.DeviceStatus.disabled, models.DeviceStatus.revoked)
-    ]
-    live.sort(key=lambda x: x.device_id)  # стабильный порядок кнопок
-
-    # Троттл общий для обоих путей (per-device и whole-sub) — обе ветки
-    # смотрят на свежие OperatorNodeReport, поэтому и считаем по ним же,
-    # по самому строгому из двух окон.
-    throttle_min = max(_REPORT_BROKEN_THROTTLE_MIN, 5)
-    recent = (
-        db.query(models.OperatorNodeReport.reported_at)
-        .filter(models.OperatorNodeReport.user_id == user.id)
-        .order_by(models.OperatorNodeReport.reported_at.desc())
-        .first()
-    )
-    retry_after: int | None = None
-    if recent is not None and recent[0] is not None:
-        elapsed = (utcnow() - recent[0]).total_seconds()
-        left = throttle_min * 60 - elapsed
-        if left > 0:
-            retry_after = int(left) + 1
-    if retry_after:
-        # Внутри троттла бот показывает «уже перенесли пару минут назад» и
-        # дальше не идёт — то есть сама ЖАЛОБА раньше нигде не оседала. А это
-        # самый частый сценарий («не помогло, жму ещё раз») и главный сигнал
-        # для эскалации: человеку, который жалуется повторно, нужен другой
-        # протокол, а не повторный перенос.
-        _record_complaint(db, user)
-    return DevicesByTelegramResponse(devices=live, retry_after_sec=retry_after)
+    return repair_state_for_user(db, user)
 
 
 # Дребезг ≠ повторная жалоба. Троттл ограничивает ДЕЙСТВИЕ (не переносить чаще
@@ -963,12 +902,9 @@ def report_broken_device_by_telegram(
     """Починить ОДНО выбранное устройство (кнопка «VPN не работает» в боте).
 
     От Telegram здесь зависит ровно resolve юзера — всё остальное делает
-    общее ядро ``services/self_repair.py`` (жалоба → лестница ротации →
-    перенос ноды), которым пользуются и WebApp, и страница на саб-домене.
-
-    Троттла нет намеренно: перенесённое устройство сразу становится
-    ``revoked`` → повторный тап по нему отсекается проверкой статуса внутри
-    ядра; а раз user-wide бана нет — спам не выжигает пул нод.
+    общее ядро ``services/self_repair.py`` (жалоба → единый троттл/потолок →
+    лестница ротации → перенос ноды), которым пользуются и WebApp, и
+    страница на саб-домене.
     """
     user = (
         db.query(models.User)
@@ -986,14 +922,7 @@ def report_broken_device_by_telegram(
         operator=body.operator,
         source="bot_vpn_broken",
     )
-    return ReportBrokenResponse(
-        action=outcome.action,
-        report_id=outcome.report_id,
-        new_node_name=outcome.new_node_name,
-        new_node_region=outcome.new_node_region,
-        task_id=outcome.task_id,
-        device_name=outcome.device_name,
-    )
+    return outcome_response(outcome)
 
 
 class SetOperatorRequest(BaseModel):

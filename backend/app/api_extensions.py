@@ -1217,8 +1217,17 @@ def sub_fix_action(
     fix: str | None = None,
     n: str | None = None,
     pay: str | None = None,
+    # Обратная связь после починки (зеркало бот-кнопок): ``report`` — id
+    # OperatorNodeReport, ``op`` — оператор связи, ``still=1`` — «всё равно не
+    # работает», ``ok=1`` — «всё работает». Строки, не int: типизированный
+    # параметр отвечал бы 422-JSON на горячем роуте.
+    report: str | None = None,
+    op: str | None = None,
+    still: str | None = None,
+    ok: str | None = None,
 ):
-    """Действие со страницы починки: шаг лестницы или счёт на продление.
+    """Действие со страницы починки: шаг лестницы, счёт на продление или
+    обратная связь по уже сделанной починке.
 
     POST, а не GET, намеренно: GET дёргают префетчеры браузера, антивирусы и
     превью-фетчеры, и каждый такой вызов сжигал бы конечный шаг лестницы.
@@ -1246,6 +1255,11 @@ def sub_fix_action(
                 found.sub, token, device_name=_device_label(found)
             )
         return sub_fix.do_pay(db, found, token)
+    if report is not None:
+        return sub_fix.do_feedback(
+            db, found, token,
+            report_id=report, operator=op, still=still == "1", ok=ok == "1",
+        )
     return sub_fix.do_repair(db, found, token)
 
 
@@ -1307,6 +1321,11 @@ def dynamic_sub_link(
             return sub_fix.render_expired(sub, token)
         if sub.status != models.SubscriptionStatus.active:
             return sub_fix.render_inactive(sub, token)
+        owner = db.get(models.User, sub.user_id) if sub.user_id else None
+        if owner is not None and getattr(owner, "banned_at", None) is not None:
+            # Глобальный бан — как у бота (мидлвара дропает апдейты):
+            # чинить и платить со страницы забаненному нельзя.
+            return sub_fix.render_inactive(sub, token, banned=True)
         return sub_fix.render_start(
             sub, token,
             device_name=_device_label(found),
@@ -2711,34 +2730,44 @@ def submit_health_ping_response(
                 "notify_admins не отработал для health-ping-response"
             )
 
-        # «Не работает» от юзера → сразу делаем ему то же, что админская
-        # кнопка «обновить подписку»: переселяем на свободную ноду +
-        # БАНИМ проблемную для него (NodeUserBan), плюс краудсорс-эскалация
-        # «плохости» ноды. Только если sub валидна, принадлежит юзеру и
-        # active. 5-мин throttle внутри _do_failover не даёт спамить
-        # миграциями. Best-effort — не ломаем user-facing ответ.
-        if (
-            sub is not None
-            and sub.user_id == user.id
-            and sub.status == models.SubscriptionStatus.active
-        ):
-            from .api.client_control import _do_failover
-
-            try:
-                _do_failover(db, sub, kind="user_reported", actor=f"user:{user.id}")
-            except Exception:  # noqa: BLE001
-                # Roll back so a mid-migration failure can't be flushed by the
-                # trailing db.commit() as a half-migrated sub (inner commits
-                # already persisted the audit/migration rows we care about).
-                if db.is_active:
-                    db.rollback()
-                logger.exception(
-                    "health-ping-response: failover for sub %s failed",
-                    body.subscription_id,
-                )
-
+    # Ответ и алерт фиксируем ДО починки: у ядра свои коммиты/откаты, и
+    # строка опроса не должна пропасть, если перенос упадёт.
     db.commit()
-    return {"ok": True}
+
+    # «Не работает» от юзера → та же починка, что по кнопке «🆘 VPN не
+    # работает» в боте, кабинете и на странице: единое ядро self_repair
+    # (жалоба → единый троттл/потолок → лестница либо whole-sub перенос).
+    # Ровно одно живое устройство → per-device лестница; иначе → перенос всей
+    # подписки. Ответ несёт action, чтобы бот показал человеку, что именно
+    # сделали (раньше: «мы получили сигнал», хотя подписка уже переехала).
+    resp: dict = {"ok": True}
+    if body.answer == "bad" and sub is not None and sub.user_id == user.id:
+        from .api.client_control import COMPLAINT_DEDUP_SEC, outcome_response
+        from .services import self_repair
+
+        try:
+            live = self_repair.live_devices(sub)
+            if len(live) == 1:
+                outcome = self_repair.handle_broken_device(
+                    db, live[0].id, user=user,
+                    dedup_sec=COMPLAINT_DEDUP_SEC, source="bot_health_ping",
+                )
+            else:
+                outcome = self_repair.handle_broken_subscription(
+                    db, sub, user=user,
+                    dedup_sec=COMPLAINT_DEDUP_SEC, source="bot_health_ping",
+                )
+            db.commit()
+            resp.update(outcome_response(outcome).model_dump())
+        except Exception:  # noqa: BLE001
+            # Откат обязателен: полусделанный перенос нельзя дофлашить.
+            db.rollback()
+            logger.exception(
+                "health-ping-response: repair for sub %s failed",
+                body.subscription_id,
+            )
+            resp["action"] = "no_target"
+    return resp
 
 
 class HealthPingOptOutRequest(BaseModel):

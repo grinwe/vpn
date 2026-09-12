@@ -1887,48 +1887,104 @@ def webapp_referral(
     )
 
 
-class HealthPingReportResponse(BaseModel):
-    ok: bool
-    subscription_id: int | None
-    node_id: int | None
-    # operator-routing P1 (operator_routing_roadmap.md): если юзера переселили,
-    # отдаём report_id + инфо о новой ноде, чтобы webapp показал «поменяли
-    # сервер» и спросил мобильного оператора (POST /webapp/report-operator).
-    migrated: bool = False
+class WebappRepairResponse(BaseModel):
+    """Единый ответ починки для кабинета.
+
+    Тот же контракт, что у бота (``client_control.ReportBrokenResponse``:
+    ``action`` + report_id / new_node_name / retry_after_sec / device_name /
+    scope), плюс поля старого ``HealthPingReportResponse``: бандл кабинета
+    кэшируется вебвью Telegram, и старый фронт ещё какое-то время читает
+    ``migrated`` / ``target_node_name``.
+    """
+
+    ok: bool = True
+    action: str
     report_id: int | None = None
+    new_node_name: str | None = None
+    new_node_region: str | None = None
+    task_id: int | None = None
+    retry_after_sec: int | None = None
+    device_name: str | None = None
+    scope: Literal["device", "subscription"] = "device"
+    # ── совместимость со старым фронтом ──
+    migrated: bool = False
+    subscription_id: int | None = None
+    node_id: int | None = None
     target_node_name: str | None = None
 
 
-@webapp_router.post("/health-ping-report", response_model=HealthPingReportResponse)
-def webapp_health_ping_report(
+def _repair_response(outcome, *, sub_id: int | None, node_id: int | None = None):
+    from .api.client_control import outcome_response
+
+    base = outcome_response(outcome)
+    return WebappRepairResponse(
+        **base.model_dump(),
+        migrated=outcome.repaired,
+        subscription_id=sub_id,
+        node_id=node_id,
+        target_node_name=outcome.new_node_name,
+    )
+
+
+class RepairDeviceMini(BaseModel):
+    id: int
+    name: str
+    status: str
+
+
+class RepairStateResponse(BaseModel):
+    """Пре-чек перед кнопкой «VPN не работает» — зеркало бот-эндпоинта
+    devices-by-telegram: живые устройства первой активной подписки и сколько
+    ждать по единой политике повторов. Фронт по нему решает, показывать ли
+    пикер устройств, и не спрашивает «какое?», если действие всё равно будет
+    отклонено."""
+
+    devices: list[RepairDeviceMini]
+    retry_after_sec: int | None = None
+    wait_reason: Literal["throttled", "daily_limit"] | None = None
+    subscription_id: int | None = None
+
+
+@webapp_router.get("/repair-state", response_model=RepairStateResponse)
+def webapp_repair_state(
     user: models.User = Depends(require_webapp_user),
     db: Session = Depends(get_db),
 ):
-    """User pressed 'VPN doesn't work' in the webapp.
+    from .api.client_control import repair_state_for_user
 
-    Records a self-reported bad answer in AuditLog so the admin
-    `/health-pings` dashboard picks it up alongside prompted ones
-    (from the scheduled bot ping). We attach it to the user's first
-    active subscription if they have one, so per-node aggregation
-    works; if not, we still persist the complaint without node_id.
-
-    No rate-limit beyond the standard SlowAPI middleware — users
-    clicking their own 'SOS' button are the ones we *want* to hear
-    from. Legitimate spam is handled client-side (5-min disable
-    after click).
-    """
-    sub = (
-        db.query(models.Subscription)
-        .filter(
-            models.Subscription.user_id == user.id,
-            models.Subscription.status == models.SubscriptionStatus.active,
-        )
-        .order_by(models.Subscription.id.asc())
-        .first()
+    state = repair_state_for_user(db, user)
+    return RepairStateResponse(
+        devices=[
+            RepairDeviceMini(id=d.device_id, name=d.name, status=d.status)
+            for d in state.devices
+        ],
+        retry_after_sec=state.retry_after_sec,
+        wait_reason=state.wait_reason,
+        subscription_id=state.subscription_id,
     )
-    node_id = sub.node_id if sub else None
-    sub_id = sub.id if sub else None
 
+
+def _health_ping_audit(
+    db: Session,
+    user: models.User,
+    *,
+    sub_id: int | None,
+    node_id: int | None,
+    scope: str,
+    device_id: int | None = None,
+) -> None:
+    """Строка «человек ответил, что плохо» — отдельно от жалобы-триггера
+    лестницы (``complaint_received`` пишет ядро): на ней стоит воронка
+    health-ping'а и админ-дашборд ``/health-pings``."""
+    extra = {
+        "telegram_id": user.telegram_id,
+        "answer": "bad",
+        "node_id": node_id,
+        "source": "self_reported",
+        "scope": scope,
+    }
+    if device_id is not None:
+        extra["device_id"] = device_id
     db.add(
         models.AuditLog(
             actor=str(user.id),
@@ -1936,58 +1992,131 @@ def webapp_health_ping_report(
             action="health_ping_response",
             target_type="subscription",
             target_id=sub_id,
-            extra={
-                "telegram_id": user.telegram_id,
-                "answer": "bad",
-                "node_id": node_id,
-                "source": "self_reported",
-            },
+            extra=extra,
         )
     )
+    db.flush()
 
-    # «Не работает» → сразу делаем юзеру то же, что админская «обновить
-    # подписку»: переселяем на свободную ноду + БАНИМ проблемную для него +
-    # краудсорс-эскалация «плохости» ноды. _do_failover сам throttle'ит
-    # (5 мин/sub). Best-effort — не ломаем user-facing ответ.
-    migrated = False
-    report_id: int | None = None
-    target_node_name: str | None = None
-    if sub is not None:
-        from .api.client_control import _do_failover
 
-        try:
-            res = _do_failover(db, sub, kind="user_reported", actor=f"user:{user.id}")
-            if res.action == "migrated":
-                # _do_failover уже закоммитил миграцию + OperatorNodeReport
-                # (через внутренний _audit). Прокидываем report_id наверх,
-                # чтобы webapp одним тапом проставил оператора.
-                migrated = True
-                report_id = res.report_id
-                target_node_name = res.target_node_name
-        except Exception:  # noqa: BLE001
-            # Roll back a mid-migration failure so the trailing db.commit()
-            # can't flush a half-migrated sub (inner commits already persisted
-            # the audit/migration rows we care about).
-            if db.is_active:
-                db.rollback()
-            logger.exception(
-                "webapp health-ping-report: failover for sub %s failed", sub.id
-            )
+def _repair_device(
+    db: Session, user: models.User, device_id: int, *, source: str
+) -> WebappRepairResponse:
+    """Per-device починка через общее ядро (то же, что бот и страница)."""
+    from .api.client_control import COMPLAINT_DEDUP_SEC
+    from .services import self_repair
 
-    db.commit()
-    return HealthPingReportResponse(
-        ok=True,
-        subscription_id=sub_id,
-        node_id=node_id,
-        migrated=migrated,
-        report_id=report_id,
-        target_node_name=target_node_name,
+    device = db.get(models.Device, device_id)
+    if device is None or device.user_id != user.id:
+        # Anti-forge — тот же исход, что у бота (ядро отвечает no_subscription),
+        # а не 404: фронт показывает единый честный текст.
+        return _repair_response(
+            self_repair.RepairOutcome(action="no_subscription"), sub_id=None
+        )
+    sub_id = device.subscription_id
+    _health_ping_audit(
+        db, user, sub_id=sub_id, node_id=None, scope="device", device_id=device.id
     )
+    outcome = self_repair.handle_broken_device(
+        db,
+        device.id,
+        user=user,
+        dedup_sec=COMPLAINT_DEDUP_SEC,
+        source=source,
+    )
+    db.commit()
+    return _repair_response(outcome, sub_id=sub_id)
+
+
+def _repair_subscription(
+    db: Session, user: models.User, *, source: str
+) -> WebappRepairResponse:
+    """«Все мои устройства» — whole-sub перенос через общее ядро."""
+    from .api.client_control import COMPLAINT_DEDUP_SEC
+    from .services import self_repair
+
+    sub = self_repair.first_active_subscription(db, user)
+    sub_id = sub.id if sub else None
+    node_id = sub.node_id if sub else None
+    _health_ping_audit(db, user, sub_id=sub_id, node_id=node_id, scope="subscription")
+    outcome = self_repair.handle_broken_subscription(
+        db,
+        sub,
+        user=user,
+        dedup_sec=COMPLAINT_DEDUP_SEC,
+        source=source,
+    )
+    db.commit()
+    return _repair_response(outcome, sub_id=sub_id, node_id=node_id)
+
+
+class ReportBrokenDeviceRequest(BaseModel):
+    device_id: int
+
+
+@webapp_router.post("/report-broken-device", response_model=WebappRepairResponse)
+def webapp_report_broken_device(
+    body: ReportBrokenDeviceRequest,
+    user: models.User = Depends(require_webapp_user),
+    db: Session = Depends(get_db),
+):
+    """«ЭТО устройство не работает» — один шаг лестницы для устройства.
+
+    Работу делает общее ядро ``services/self_repair.py`` — то же самое, что у
+    бота и у страницы на саб-домене: жалоба → единый троттл и суточный
+    потолок → лестница (перетасовка протоколов → перенос → дубль).
+    Anti-forge (устройство принадлежит юзеру) и защиту от двойного тапа
+    (FOR UPDATE) тоже делает ядро. Ответ — единый ``action``, как у бота.
+    """
+    return _repair_device(db, user, body.device_id, source="webapp_report_broken")
+
+
+@webapp_router.post("/report-broken", response_model=WebappRepairResponse)
+def webapp_report_broken(
+    user: models.User = Depends(require_webapp_user),
+    db: Session = Depends(get_db),
+):
+    """«Все мои устройства не работают» — перенос всей подписки.
+
+    Зеркало бот-кнопки «🔁 Все мои устройства» (admin report-broken): то же
+    ядро ``handle_broken_subscription`` — жалоба, единый троттл, whole-sub
+    миграция с user-wide баном старой ноды.
+    """
+    return _repair_subscription(db, user, source="webapp_report_broken")
+
+
+@webapp_router.post("/health-ping-report", response_model=WebappRepairResponse)
+def webapp_health_ping_report(
+    user: models.User = Depends(require_webapp_user),
+    db: Session = Depends(get_db),
+):
+    """Совместимость со старым бандлом кабинета (кэш вебвью Telegram).
+
+    До унификации (2026-09-12) кнопка «VPN не работает» при одном устройстве
+    шла сюда и получала whole-sub миграцию мимо лестницы. Теперь эндпоинт
+    ведёт себя как новая кнопка: ровно одно живое устройство → per-device
+    ядро, иначе → перенос всей подписки. Новый фронт сюда не ходит.
+    """
+    from .services import self_repair
+
+    sub = self_repair.first_active_subscription(db, user)
+    live = self_repair.live_devices(sub)
+    if len(live) == 1:
+        return _repair_device(db, user, live[0].id, source="webapp_report_broken")
+    return _repair_subscription(db, user, source="webapp_report_broken")
 
 
 class WebappSetOperatorRequest(BaseModel):
     report_id: int
     operator: str
+
+
+def _own_report(db: Session, user: models.User, report_id: int) -> models.OperatorNodeReport:
+    """Репорт обязан принадлежать ЭТОМУ юзеру (anti-forge: чужой report_id
+    не прокатит)."""
+    report = db.get(models.OperatorNodeReport, report_id)
+    if report is None or report.user_id != user.id:
+        raise HTTPException(status_code=404, detail="Report not found")
+    return report
 
 
 @webapp_router.post("/report-operator")
@@ -1998,89 +2127,52 @@ def webapp_set_operator(
 ):
     """Юзер выбрал свой мобильный оператор после «VPN не работает» →
     проставляем его на OperatorNodeReport (operator-routing P1, см.
-    operator_routing_roadmap.md). Репорт обязан принадлежать ЭТОМУ юзеру
-    (anti-forge: чужой report_id не прокатит). Карьер вне таксономии → unknown.
+    operator_routing_roadmap.md). Карьер вне таксономии → unknown.
     """
     from .api.client_control import _OPERATORS
 
-    report = db.get(models.OperatorNodeReport, body.report_id)
-    if report is None or report.user_id != user.id:
-        raise HTTPException(status_code=404, detail="Report not found")
+    report = _own_report(db, user, body.report_id)
     report.operator = body.operator if body.operator in _OPERATORS else "unknown"
     db.commit()
     return {"report_id": report.id, "operator": report.operator}
 
 
-class ReportBrokenDeviceRequest(BaseModel):
-    device_id: int
+class WebappReportIdRequest(BaseModel):
+    report_id: int
 
 
-@webapp_router.post("/report-broken-device", response_model=HealthPingReportResponse)
-def webapp_report_broken_device(
-    body: ReportBrokenDeviceRequest,
+@webapp_router.post("/report-still-broken")
+def webapp_report_still_broken(
+    body: WebappReportIdRequest,
     user: models.User = Depends(require_webapp_user),
     db: Session = Depends(get_db),
 ):
-    """Per-device «ЭТО устройство не работает» (multi-device юзер выбрал одно).
+    """«Всё равно не работает» после починки → target-нода тоже fail.
 
-    Работу делает общее ядро ``services/self_repair.py`` — то же самое, что у
-    бота и у страницы на саб-домене. До 2026-07-29 этот путь звал
-    ``failover_device`` напрямую, МИМО лестницы ротации: человек из кабинета
-    всегда получал самый дорогой шаг (смену ноды) и никогда не доходил до
-    перетасовки протоколов или дубля. Вдобавок его жалобы писались как
-    ``health_ping_response`` и не считались счётчиком эскалации — то есть
-    лестница для него вообще не двигалась.
-
-    Anti-forge (устройство принадлежит юзеру) и защиту от двойного тапа
-    (FOR UPDATE) тоже делает ядро.
+    Зеркало бот-кнопки (admin report-still-broken): самый весомый негативный
+    сигнал для матрицы оператор×нода. Раньше из кабинета outcome=fail не
+    возникал никогда.
     """
-    from .api.client_control import COMPLAINT_DEDUP_SEC
-    from .services import self_repair
+    report = _own_report(db, user, body.report_id)
+    report.outcome = "fail"
+    report.resolved_at = utcnow_aware()
+    db.commit()
+    return {"report_id": report.id, "outcome": report.outcome}
 
-    device = db.get(models.Device, body.device_id)
-    if device is None or device.user_id != user.id:
-        raise HTTPException(status_code=404, detail="Device not found")
-    if device.status in (models.DeviceStatus.disabled, models.DeviceStatus.revoked):
-        raise HTTPException(status_code=400, detail="device is not active")
 
-    sub_id = device.subscription_id
-    # Отдельная запись «человек ответил, что плохо» остаётся: на ней стоит
-    # воронка health-ping'а, и она не то же самое, что жалоба-триггер
-    # лестницы (её пишет ядро как complaint_received).
-    db.add(
-        models.AuditLog(
-            actor=str(user.id),
-            actor_type=models.AuditActor.user,
-            action="health_ping_response",
-            target_type="subscription",
-            target_id=sub_id,
-            extra={
-                "telegram_id": user.telegram_id,
-                "answer": "bad",
-                "source": "self_reported",
-                "scope": "device",
-                "device_id": device.id,
-            },
-        )
-    )
-    db.flush()
-
-    outcome = self_repair.handle_broken_device(
-        db,
-        body.device_id,
-        user=user,
-        dedup_sec=COMPLAINT_DEDUP_SEC,
-        source="webapp_report_broken",
-    )
-
-    return HealthPingReportResponse(
-        ok=True,
-        subscription_id=sub_id,
-        node_id=None,
-        # ОБЯЗАТЕЛЬНО по всем трём успешным шагам лестницы: фронт
-        # (webapp/src/pages/Help.tsx) читает булев флаг, и без reshuffled/
-        # duplicated он показал бы «не смогли починить» на успешной починке.
-        migrated=outcome.repaired,
-        report_id=outcome.report_id,
-        target_node_name=outcome.new_node_name,
-    )
+@webapp_router.post("/report-ok")
+def webapp_report_ok(
+    body: WebappReportIdRequest,
+    user: models.User = Depends(require_webapp_user),
+    db: Session = Depends(get_db),
+):
+    """«Всё работает» после починки → target-нода ok. Явно разрешённый
+    исход (ok/fail) не перетираем — апгрейдим только pending/inconclusive;
+    идемпотентно к двойному тапу (как admin report-ok)."""
+    report = _own_report(db, user, body.report_id)
+    if report.outcome in ("ok", "fail"):
+        return {"report_id": report.id, "outcome": report.outcome}
+    report.outcome = "ok"
+    report.resolved_at = utcnow_aware()
+    db.commit()
+    return {"report_id": report.id, "outcome": report.outcome}

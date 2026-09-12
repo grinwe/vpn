@@ -117,6 +117,11 @@ services:
       SUB_FIX_ENTRYPOINTS: ${SUB_FIX_ENTRYPOINTS:-off}
       SUB_FIX_THROTTLE_SEC: ${SUB_FIX_THROTTLE_SEC:-120}
       SUB_FIX_DAILY_MAX: ${SUB_FIX_DAILY_MAX:-5}
+      # Единая политика повторов «VPN не работает» для ВСЕХ каналов (бот,
+      # кабинет, страница по токену, ответ на плановый пинг). Пусто →
+      # fallback на SUB_FIX_THROTTLE_SEC / SUB_FIX_DAILY_MAX, затем 120 / 5.
+      SELF_REPAIR_THROTTLE_SEC: ${SELF_REPAIR_THROTTLE_SEC:-}
+      SELF_REPAIR_DAILY_MAX: ${SELF_REPAIR_DAILY_MAX:-}
       # Провайдер оплаты СО СТРАНИЦЫ. Пинится явно: общая ротация по
       # умолчанию даёт cryptobot, а сюда приходит человек без Telegram —
       # платить он будет картой.
