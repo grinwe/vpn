@@ -1704,9 +1704,13 @@ async def health_ping_response(callback_query: types.CallbackQuery):
         if isinstance(data, dict) and data.get("action"):
             # Исход починки уйдёт отдельным (не удаляемым) сообщением ниже —
             # тем же, что у кнопки «🆘 VPN не работает»: с вопросом об
-            # операторе и отложенным нуджем. Ack остаётся коротким.
+            # операторе и отложенным нуджем. Ack остаётся коротким и не
+            # противоречит исходу: «чиним» только когда реально починили.
             repair = data
-            ack_text = "🛠 Спасибо! Чиним."
+            if data.get("action") in ("migrated", "reshuffled", "duplicated"):
+                ack_text = "🛠 Спасибо! Чиним."
+            else:
+                ack_text = "🛠 Спасибо, сигнал получили."
         else:
             ack_text = (
                 "🛠 Спасибо! Мы получили сигнал и проверяем ваш сервер.\n"
@@ -1740,8 +1744,9 @@ async def health_ping_response(callback_query: types.CallbackQuery):
 # Плановый health-ping приходит юзеру раз в 7-14 дней (random jitter),
 # только в обеденное окно МСК (11–14) —
 # self-report закрывает эту дыру и позволяет пожаловаться прямо сейчас.
-# source="self_reported" помечает запись, чтобы админка выделяла такие
-# жалобы красным как более сильный сигнал, чем ответ на плановый пинг.
+# Бэкенд-вход тот же, что у кабинета и страницы: devices-by-telegram (пре-чек)
+# → report-broken-device / report-broken → ядро self_repair (source=
+# bot_vpn_broken); health-ping-response отсюда НЕ шлётся.
 @router.message(F.text == BTN_VPN_BROKEN)
 async def self_report_vpn_broken(message: types.Message) -> None:
     # Порядок: пре-чек повторов → пикер устройств → починка. Повторы ограничивает

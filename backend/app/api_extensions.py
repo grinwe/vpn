@@ -1209,7 +1209,11 @@ def _sub_fix_key(request: Request) -> str:
 
 
 @ext_router.post("/sub/{token}")
-@limiter.limit("2/minute;6/hour", key_func=_sub_fix_key)
+# Бюджет под 3-шаговый сценарий (починка → оператор → «помогло/не помогло»,
+# плюс «попробовать ещё раз»): прежние 2/minute;6/hour резали штатный флоу на
+# третьем тапе. Это защита от флуда по токену, а не политика повторов —
+# частоту починок держит ядро (SELF_REPAIR_THROTTLE_SEC / _DAILY_MAX).
+@limiter.limit("6/minute;30/hour", key_func=_sub_fix_key)
 def sub_fix_action(
     request: Request,  # noqa: ARG001 — нужен slowapi key_func
     token: str,
@@ -1242,17 +1246,31 @@ def sub_fix_action(
     found = resolve_sub_token(db, token)
     if found is None:
         return sub_fix.camo_response()
-    # CSRF: без валидного nonce действие не выполняем и в БД не пишем.
-    if not sub_fix.nonce_valid(token, n):
+    if report is not None:
+        # Обратная связь: человек ушёл в клиент переподключаться и вернулся
+        # позже — nonce принимаем шире (час), а протухший не превращаем в
+        # стартовый экран: перерисовываем тот же экран со свежим nonce.
+        # Пишется только свой репорт, CSRF-риск нулевой.
+        if not sub_fix.nonce_valid(token, n, buckets=4):
+            return sub_fix.render_feedback_again(db, found, token, report)
+    elif not sub_fix.nonce_valid(token, n):
+        # CSRF: без валидного nonce действие не выполняем и в БД не пишем.
         return sub_fix.render_start(
             found.sub, token,
             device_name=_device_label(found),
             repairable=not found.is_legacy,
         )
+    owner = db.get(models.User, found.sub.user_id) if found.sub.user_id else None
+    if owner is not None and getattr(owner, "banned_at", None) is not None:
+        # Глобальный бан закрывает ВСЕ действия страницы, включая оплату и
+        # обратную связь — как у бота (мидлвара дропает апдейты).
+        return sub_fix.render_inactive(found.sub, token, banned=True)
     if pay == "1":
         if not sub_fix.pay_enabled():
             return sub_fix.render_start(
-                found.sub, token, device_name=_device_label(found)
+                found.sub, token,
+                device_name=_device_label(found),
+                repairable=not found.is_legacy,
             )
         return sub_fix.do_pay(db, found, token)
     if report is not None:
@@ -1306,6 +1324,13 @@ def dynamic_sub_link(
         if found is None:
             return sub_fix.camo_response()
         sub = found.sub
+        owner = db.get(models.User, sub.user_id) if sub.user_id else None
+        if owner is not None and getattr(owner, "banned_at", None) is not None:
+            # Глобальный бан — как у бота (мидлвара дропает апдейты): ни
+            # чинить, ни платить, ни ждать оплату. Стоит ПЕРЕД экранами
+            # expired/paid — иначе забаненный с истёкшей подпиской получал
+            # бы кнопку продления.
+            return sub_fix.render_inactive(sub, token, banned=True)
         if paid is not None:
             # str, а не int: типизированный параметр заставлял бы FastAPI
             # отвечать 422-JSON на ЛЮБОЙ нечисловой ?paid= — на горячем
@@ -1321,11 +1346,6 @@ def dynamic_sub_link(
             return sub_fix.render_expired(sub, token)
         if sub.status != models.SubscriptionStatus.active:
             return sub_fix.render_inactive(sub, token)
-        owner = db.get(models.User, sub.user_id) if sub.user_id else None
-        if owner is not None and getattr(owner, "banned_at", None) is not None:
-            # Глобальный бан — как у бота (мидлвара дропает апдейты):
-            # чинить и платить со страницы забаненному нельзя.
-            return sub_fix.render_inactive(sub, token, banned=True)
         return sub_fix.render_start(
             sub, token,
             device_name=_device_label(found),

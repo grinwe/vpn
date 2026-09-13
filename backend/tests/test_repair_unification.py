@@ -1033,3 +1033,229 @@ def test_page_uses_core_policy_not_its_own_env(monkeypatch):
     outcome = _types.SimpleNamespace(retry_after_sec=None)
     assert sub_fix._retry_minutes(outcome) == 1
     assert sub_fix._retry_minutes(_types.SimpleNamespace(retry_after_sec=61)) == 2
+
+
+# ── 6. Фиксы по адверсарному ревью (2026-09-13) ──────────────────────────
+
+
+def test_ladder_ignores_throttled_complaints(db_session):
+    """Жалобы, по которым ничего не делали (throttled=true), ступень не
+    двигают: два нетерпеливых тапа внутри окна иначе перепрыгивали смену
+    ноды и сразу давали дубль. Старые строки без ключа — считаются."""
+    from app.services import rotation
+
+    user = make_user(db_session, telegram_id="ladder-thr")
+
+    def row(extra):
+        db_session.add(
+            models.AuditLog(
+                actor=str(user.id),
+                actor_type=models.AuditActor.user,
+                action="complaint_received",
+                target_type="user",
+                target_id=user.id,
+                extra=extra,
+            )
+        )
+
+    row({"throttled": False, "proto": None})
+    row({"throttled": True, "proto": None})
+    row({"throttled": True, "proto": None})
+    row(None)  # legacy-строка без extra
+    db_session.commit()
+
+    assert rotation.complaints_in_window(db_session, user.id) == 2
+
+
+def test_whole_sub_all_pending_is_not_ready(db_session, monkeypatch):
+    """Все устройства ещё собираются → not_ready, а не whole-sub перенос
+    поверх незавершённого провижна (тот же гейт, что у per-device пути)."""
+    user, sub, device, _node = _plain_sub(db_session, "wsp")
+    device.status = models.DeviceStatus.pending
+    db_session.commit()
+
+    def boom(self, *a, **k):
+        raise AssertionError("миграция не должна вызываться")
+
+    monkeypatch.setattr(ProvisioningOrchestrator, "migrate_subscription_to_free_node", boom)
+    out = self_repair.handle_broken_subscription(
+        db_session, sub, user=user, dedup_sec=60, source="test"
+    )
+    assert out.action == "not_ready"
+    assert out.scope == "subscription"
+    assert _complaints(db_session, user.id) == 0
+
+
+def test_whole_sub_parallel_tap_is_blocked_by_advisory_lock(db_session, monkeypatch):
+    """Второй параллельный whole-sub тап упирается в advisory-лок 4002 и
+    получает throttled, а не вторую миграцию + второй бан ноды."""
+    from sqlalchemy import text
+
+    user, sub, _device, _node = _plain_sub(db_session, "wsl")
+
+    def boom(self, *a, **k):
+        raise AssertionError("миграция под чужим локом не должна вызываться")
+
+    monkeypatch.setattr(ProvisioningOrchestrator, "migrate_subscription_to_free_node", boom)
+
+    bind = db_session.get_bind()
+    engine = getattr(bind, "engine", bind)
+    other = engine.connect()
+    try:
+        got = other.execute(
+            text("SELECT pg_try_advisory_lock(4002, :s)"), {"s": sub.id}
+        ).scalar()
+        assert got is True
+        out = self_repair.handle_broken_subscription(
+            db_session, sub, user=user, dedup_sec=60, source="test"
+        )
+    finally:
+        other.execute(text("SELECT pg_advisory_unlock(4002, :s)"), {"s": sub.id})
+        other.close()
+    assert out.action == "throttled"
+    assert out.scope == "subscription"
+    assert out.retry_after_sec == 30
+
+
+def test_daily_cap_scales_with_live_devices(db_session, monkeypatch):
+    """Потолок «на устройство» считается по подписке → умножаем на число
+    живых устройств: двум устройствам с daily_max=2 положено 4 шага."""
+    user, sub, device, node = _plain_sub(db_session, "dcap")
+    cfg = _cfg(db_session, node)
+    make_device(db_session, sub, cfg, access_username="dcap-second")
+    monkeypatch.setenv("SELF_REPAIR_DAILY_MAX", "2")
+    for i in range(3):
+        _report(db_session, user, sub, ago_sec=600 + i, node=node)
+    monkeypatch.setenv("SELF_REPAIR_THROTTLE_SEC", "0")
+    assert self_repair.repair_wait(db_session, sub) == (None, None)
+    _report(db_session, user, sub, ago_sec=590, node=node)
+    wait, reason = self_repair.repair_wait(db_session, sub)
+    assert reason == "daily_limit"
+    assert wait and wait > 0
+
+
+def test_page_ban_gate_covers_pay_and_feedback_and_precedes_expired(
+    client, db_session, page, monkeypatch
+):
+    """Бан закрывает ВСЕ действия страницы (оплату и обратную связь тоже) и
+    стоит раньше экрана expired — иначе забаненный с истёкшей подпиской
+    получал кнопку продления."""
+    user, sub, _device, _nodes = page
+    monkeypatch.setenv("SUB_FIX_PAY", "1")
+    user.banned_at = utcnow()
+    db_session.commit()
+
+    before = db_session.query(models.Invoice).count()
+    resp = _post(client, "&pay=1")
+    assert resp.status_code == 200
+    assert "Доступ приостановлен" in resp.text
+    assert db_session.query(models.Invoice).count() == before
+
+    resp = _post(client, "&report=1&ok=1")
+    assert "Доступ приостановлен" in resp.text
+
+    sub.expires_at = utcnow() - timedelta(days=1)
+    db_session.commit()
+    resp = client.get(f"/api/sub/{TOKEN}?fix=1", headers=HTML)
+    assert "Доступ приостановлен" in resp.text
+    assert "Продлить" not in resp.text
+
+
+def test_page_feedback_accepts_older_nonce_and_rerenders_on_stale(
+    client, db_session, page
+):
+    """Человек ушёл в клиент и вернулся через полчаса-час: nonce формы
+    обратной связи принимаем шире; совсем протухший — перерисовываем тот же
+    экран со свежим nonce, ничего не записывая."""
+    from app.rate_limit import limiter
+
+    _user, sub, _device, _nodes = page
+    _post(client)
+    report = _latest_report(db_session, sub.id)
+    assert report is not None
+
+    limiter.reset()
+    old = sub_fix.make_nonce(TOKEN, offset=3)  # 45–60 мин назад
+    resp = client.post(
+        f"/api/sub/{TOKEN}?fix=1&n={old}&report={report.id}&ok=1", headers=HTML
+    )
+    assert resp.status_code == 200
+    db_session.expire_all()
+    assert db_session.get(models.OperatorNodeReport, report.id).outcome == "ok"
+
+    limiter.reset()
+    stale = sub_fix.make_nonce(TOKEN, offset=8)
+    resp = client.post(
+        f"/api/sub/{TOKEN}?fix=1&n={stale}&report={report.id}&still=1", headers=HTML
+    )
+    assert resp.status_code == 200
+    db_session.expire_all()
+    assert db_session.get(models.OperatorNodeReport, report.id).outcome == "ok"
+    assert f"report={report.id}&ok=1" in resp.text
+    assert f"report={report.id}&still=1" in resp.text
+    assert "Что-то не работает?" not in resp.text
+
+
+def test_page_rate_limited_screen_has_exits(monkeypatch):
+    """Экран 429 — не тупик: ссылка обратно (GET вне лимита) и поддержка."""
+    monkeypatch.setenv("BOT_USERNAME", "GV8_vpn_bot")
+    resp = sub_fix.render_rate_limited()
+    assert resp.status_code == 429
+    body = resp.body.decode()
+    assert 'href="?fix=1"' in body
+    assert "?start=support" in body
+
+
+def test_page_repair_after_expiry_shows_renewal(client, db_session, page):
+    """Подписка истекла между GET и POST → экран продления, а не «проверьте
+    клиент»."""
+    _user, sub, _device, _nodes = page
+    sub.expires_at = utcnow() - timedelta(hours=1)
+    db_session.commit()
+    resp = _post(client)
+    assert resp.status_code == 200
+    assert "Подписка закончилась" in resp.text
+
+
+def test_page_migrated_text_hides_node_name():
+    out = self_repair.RepairOutcome(
+        action="migrated", report_id=None, new_node_name="ufo-ru-01"
+    )
+    sub = _types.SimpleNamespace(expires_at=None, plan=None, extra_device_slots=0)
+    body = sub_fix.render_outcome(out, sub, TOKEN).body.decode()
+    assert "ufo-ru-01" not in body
+    assert "Перевели вас на другой сервер" in body
+
+
+def test_webapp_health_ping_row_has_node_id_and_survives_no_target(
+    client, db_session, ladder, monkeypatch
+):
+    """Строка опроса коммитится ДО починки (откат no_target её не уносит) и
+    несёт node_id устройства — на нём стоит админ-дашборд /health-pings."""
+    from app.services import rotation
+
+    user, sub, device, nodes = ladder("hpnode")
+    monkeypatch.setattr(rotation, "reshuffle_legs", lambda db, dev: None)
+
+    def boom(self, dev):
+        raise RuntimeError("no free node")
+
+    monkeypatch.setattr(ProvisioningOrchestrator, "failover_device", boom)
+    resp = client.post(
+        "/api/webapp/report-broken-device",
+        json={"device_id": device.id},
+        headers=_auth(user.id),
+    )
+    assert resp.status_code == 200
+    assert resp.json()["action"] == "no_target"
+    assert resp.json()["node_id"] == nodes[0].id
+
+    db_session.expire_all()
+    rows = (
+        db_session.query(models.AuditLog)
+        .filter_by(action="health_ping_response", target_id=sub.id)
+        .all()
+    )
+    assert len(rows) == 1
+    assert rows[0].extra["node_id"] == nodes[0].id
+    assert rows[0].extra["scope"] == "device"

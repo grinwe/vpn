@@ -108,13 +108,19 @@ def make_nonce(token: str, *, offset: int = 0) -> str:
     return digest.hexdigest()[:16]
 
 
-def nonce_valid(token: str, nonce: str | None) -> bool:
+def nonce_valid(token: str, nonce: str | None, *, buckets: int = 2) -> bool:
     """Текущее окно и предыдущее: страница, открытая 14 минут назад, обязана
-    работать — иначе человек с плохой связью не успеет нажать кнопку."""
+    работать — иначе человек с плохой связью не успеет нажать кнопку.
+
+    ``buckets`` — сколько 15-минутных окон принимать (2 = 15–30 мин). Формы
+    обратной связи просят шире: человек уходит в клиент переподключаться и
+    возвращается через полчаса-час.
+    """
     if not nonce:
         return False
     return any(
-        hmac.compare_digest(nonce, make_nonce(token, offset=off)) for off in (0, 1)
+        hmac.compare_digest(nonce, make_nonce(token, offset=off))
+        for off in range(max(1, buckets))
     )
 
 
@@ -466,8 +472,9 @@ def render_outcome(outcome, sub, token: str) -> HTMLResponse:
         if outcome.action == "reshuffled":
             lead = '<p class="ok">Переключили вас на другой способ связи.</p>'
         elif outcome.action == "migrated":
-            node = html.escape(outcome.new_node_name or "новый сервер")
-            lead = f'<p class="ok">Перевели на другой сервер ({node}).</p>'
+            # Без имени ноды: внутренние имена (ufo-ru-01) — разговор с
+            # инженером, а не с пользователем; бот и кабинет их не показывают.
+            lead = '<p class="ok">Перевели вас на другой сервер.</p>'
         else:  # duplicated
             lead = (
                 '<p class="ok">Добавили запасной сервер. В клиенте появится ещё '
@@ -596,12 +603,22 @@ def render_expired(sub, token: str) -> HTMLResponse:
 
 
 def render_rate_limited() -> HTMLResponse:
-    """429 в человеческом виде (см. обработчик в main.py)."""
+    """429 в человеческом виде (см. обработчик в main.py).
+
+    Не тупик: кнопка поддержки и ссылка обратно на страницу (GET под лимит
+    не попадает). Форму «Попробовать ещё раз» здесь ставить нельзя — она
+    упёрлась бы в тот же лимит.
+    """
+    actions = (
+        '<a class="btn secondary" href="?fix=1">Открыть страницу заново</a>'
+        + _help_button(enabled=True, label="Написать в поддержку")
+    )
     return _render(
         title="Слишком часто",
         body="<p>Вы нажимали кнопку несколько раз подряд.</p>"
         "<p>Подождите минуту и попробуйте снова. Предыдущее нажатие могло "
         "уже сработать: откройте клиент и нажмите 🔄.</p>" + _telegram_link(),
+        actions=actions,
         status_code=429,
     )
 
@@ -706,7 +723,30 @@ def do_repair(db: Session, found, token: str) -> HTMLResponse:
         "sub-fix page: repair sub=%s device=%s -> %s",
         sub.id, device.id, outcome.action,
     )
+    if outcome.action == "no_subscription":
+        # Подписка могла истечь/замёрзнуть между GET и POST — тогда честные
+        # экраны продления/паузы, как на GET, а не «проверьте клиент».
+        if sub.status == models.SubscriptionStatus.expired or (
+            sub.expires_at and sub.expires_at < utcnow()
+        ):
+            return render_expired(sub, token)
+        if sub.status != models.SubscriptionStatus.active:
+            return render_inactive(sub, token)
     return render_outcome(outcome, sub, token)
+
+
+def render_feedback_again(db: Session, found, token: str, report_id: str) -> HTMLResponse:
+    """Протухший nonce на форме обратной связи: перерисовать тот же экран со
+    свежим nonce, ничего не записывая. Стартовый экран здесь сбивал бы с
+    толку («я же только что нажимал ✅»)."""
+    try:
+        rid = int(report_id)
+    except (TypeError, ValueError):
+        return _start_again(found, token)
+    report = db.get(models.OperatorNodeReport, rid)
+    if report is None or report.subscription_id != found.sub.id:
+        return _start_again(found, token)
+    return render_feedback_prompt(token, report.id)
 
 
 def do_feedback(

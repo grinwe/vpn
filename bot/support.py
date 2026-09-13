@@ -91,6 +91,14 @@ async def forward_to_admin(message: types.Message, state: FSMContext):
     text = (message.text or "").strip()
     if text.startswith("/") or text in _MENU_TEXTS:
         await state.clear()
+        if text == "🆘 VPN не работает":
+            # Человек в диалоге поддержки нажал SOS — это не текст обращения,
+            # а починка: запускаем её сразу, а не просим нажать ещё раз
+            # (ленивый импорт: handlers импортирует этот модуль).
+            from .handlers import self_report_vpn_broken
+
+            await self_report_vpn_broken(message)
+            return
         await message.answer(
             "Ок, вышел из диалога поддержки. Повтори действие ещё раз."
         )

@@ -69,8 +69,17 @@ def ladder_window_sec() -> int:
 
 
 def complaints_in_window(db: Session, user_id: int) -> int:
-    """Сколько жалоб человек подал за окно (дребезг уже схлопнут дедупом)."""
+    """Сколько жалоб человек подал за окно (дребезг уже схлопнут дедупом).
+
+    Жалобы, по которым ничего не делали (``extra.throttled = true`` — человек
+    упёрся в окно повторов или суточный потолок), ступень НЕ двигают: иначе
+    два нетерпеливых тапа внутри окна перепрыгивали смену ноды и сразу
+    давали дубль. В телеметрии они остаются (ревью 2026-09-13).
+    """
+    from sqlalchemy import or_
+
     cutoff = utcnow() - timedelta(seconds=ladder_window_sec())
+    throttled = models.AuditLog.extra["throttled"].astext
     return (
         db.query(models.AuditLog.id)
         .filter(
@@ -78,6 +87,7 @@ def complaints_in_window(db: Session, user_id: int) -> int:
             models.AuditLog.target_type == "user",
             models.AuditLog.target_id == user_id,
             models.AuditLog.created_at >= cutoff,
+            or_(throttled.is_(None), throttled != "true"),
         )
         .count()
     )

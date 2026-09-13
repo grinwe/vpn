@@ -1995,7 +1995,9 @@ def _health_ping_audit(
             extra=extra,
         )
     )
-    db.flush()
+    # commit, не flush: у ядра свои откаты (no_target делает rollback), и
+    # строка опроса не должна пропасть вместе с полусделанной починкой.
+    db.commit()
 
 
 def _repair_device(
@@ -2013,8 +2015,15 @@ def _repair_device(
             self_repair.RepairOutcome(action="no_subscription"), sub_id=None
         )
     sub_id = device.subscription_id
+    # Нода устройства — для админ-дашборда /health-pings (агрегация по нодам):
+    # primary-нода устройства, иначе нода подписки.
+    node_id = (
+        device.config.node_id
+        if device.config is not None
+        else (device.subscription.node_id if device.subscription else None)
+    )
     _health_ping_audit(
-        db, user, sub_id=sub_id, node_id=None, scope="device", device_id=device.id
+        db, user, sub_id=sub_id, node_id=node_id, scope="device", device_id=device.id
     )
     outcome = self_repair.handle_broken_device(
         db,
@@ -2024,7 +2033,7 @@ def _repair_device(
         source=source,
     )
     db.commit()
-    return _repair_response(outcome, sub_id=sub_id)
+    return _repair_response(outcome, sub_id=sub_id, node_id=node_id)
 
 
 def _repair_subscription(

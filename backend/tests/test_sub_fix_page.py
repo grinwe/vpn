@@ -199,7 +199,9 @@ def test_repeat_posts_are_rate_limited(client, sub_with_token):
     nonce = sub_fix.make_nonce(device.sub_token)
     url = f"/api/sub/{device.sub_token}?fix=1&n={nonce}"
 
-    codes = [client.post(url).status_code for _ in range(4)]
+    # Лимит 6/minute (с 2026-09-13; под сценарий починка → оператор →
+    # «помогло?» + повтор): 429 приходит на седьмом POST.
+    codes = [client.post(url).status_code for _ in range(8)]
     assert 429 in codes, codes
     # GET-выдача конфигов при этом не задета — она на своём роуте.
     assert client.get(f"/api/sub/{device.sub_token}").status_code == 200
@@ -328,7 +330,7 @@ def test_rate_limit_answers_html_not_json(client, sub_with_token):
     nonce = sub_fix.make_nonce(device.sub_token)
     url = f"/api/sub/{device.sub_token}?fix=1&n={nonce}"
     last = None
-    for _ in range(4):
+    for _ in range(8):
         last = client.post(url, headers=HTML)
     assert last.status_code == 429
     assert "text/html" in last.headers["content-type"]

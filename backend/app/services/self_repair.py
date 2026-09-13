@@ -28,6 +28,7 @@ from dataclasses import dataclass
 from datetime import timedelta
 from typing import Literal
 
+from sqlalchemy import text as sql_text
 from sqlalchemy.orm import Session
 
 from .. import models
@@ -381,11 +382,16 @@ def repair_wait(
     now = now or utcnow()
     throttle_sec, daily_max = _resolve_policy(throttle_sec, daily_max)
     if daily_max > 0:
+        # Потолок задан «на устройство», а считается по ПОДПИСКЕ (перенос
+        # пересоздаёт Device, счётчик по device_id обнулялся бы). Поэтому
+        # масштабируем на число живых устройств: человеку с тремя
+        # устройствами по два шага на каждое иначе не хватало бы пяти.
+        daily_cap = daily_max * max(1, len(live_devices(sub)))
         times = _repair_times(db, sub.id, since=now - timedelta(hours=24))
-        if len(times) >= daily_max:
+        if len(times) >= daily_cap:
             # Окно освободится, когда самая старая из «лишних» починок
             # выйдет за сутки.
-            oldest = times[daily_max - 1]
+            oldest = times[daily_cap - 1]
             left = (oldest + timedelta(hours=24) - now).total_seconds()
             return max(1, int(left) + 1), "daily_limit"
     if throttle_sec > 0:
@@ -686,7 +692,69 @@ def handle_broken_subscription(
     now = utcnow()
     if not _sub_is_repairable(sub, now=now):
         return RepairOutcome(action="no_subscription", scope="subscription")
+    if not live_devices(sub) and any(
+        d.status == models.DeviceStatus.pending for d in (sub.devices or [])
+    ):
+        # Все устройства ещё собираются — тот же гейт, что у per-device пути:
+        # whole-sub перенос запустил бы второй холодный провижн поверх первого.
+        return RepairOutcome(action="not_ready", scope="subscription")
 
+    # Гард двойного тапа — как advisory-лок 4001 в failover_device: FOR UPDATE
+    # умер бы на первом commit'е внутри миграции, а два параллельных
+    # whole-sub переноса — это две миграции подписки и два бана нод.
+    #
+    # Лок берём на ОТДЕЛЬНОМ коннекте, выделенном на время операции, а не на
+    # сессии: session-level лок живёт на коннекте, а сессия после каждого
+    # commit'а возвращает свой коннект в пул и следующий statement может
+    # уйти в другой — unlock тогда промахивался бы, и лок залипал бы на
+    # idle-коннекте до pool_recycle (так флакали тесты с локом 4001). Свой
+    # коннект гарантирует lock и unlock на одном сокете; умрёт процесс —
+    # умрёт и лок.
+    bind = db.get_bind()
+    engine = getattr(bind, "engine", bind)
+    lock_conn = engine.connect()
+    try:
+        got = lock_conn.execute(
+            sql_text("SELECT pg_try_advisory_lock(4002, :sub)"), {"sub": sub.id}
+        ).scalar()
+        if not got:
+            return RepairOutcome(
+                action="throttled", retry_after_sec=30, scope="subscription"
+            )
+        try:
+            return _repair_subscription_locked(
+                db, sub, user=user, now=now, dedup_sec=dedup_sec,
+                operator=operator, source=source,
+                throttle_sec=throttle_sec, daily_max=daily_max,
+            )
+        finally:
+            try:
+                lock_conn.execute(
+                    sql_text("SELECT pg_advisory_unlock(4002, :sub)"),
+                    {"sub": sub.id},
+                )
+            except Exception:  # noqa: BLE001
+                logger.exception(
+                    "self-repair: advisory unlock failed for subscription %s",
+                    sub.id,
+                )
+    finally:
+        lock_conn.close()
+
+
+def _repair_subscription_locked(
+    db: Session,
+    sub,
+    *,
+    user,
+    now,
+    dedup_sec: int,
+    operator: str | None,
+    source: str,
+    throttle_sec: int | None,
+    daily_max: int | None,
+) -> RepairOutcome:
+    """Тело whole-sub починки под advisory-локом (см. handle_broken_subscription)."""
     gated = _policy_gate(
         db, user, sub,
         now=now, dedup_sec=dedup_sec,
