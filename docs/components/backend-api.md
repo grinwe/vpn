@@ -2,7 +2,7 @@
 
 FastAPI-приложение из `backend/app/main.py`. Три роутера, собранные в один ASGI-процесс, делят PostgreSQL-сессию, Redis-очередь и общий набор сервисов под `backend/app/services/`.
 
-Видимость health-ping телеметрии: модуль `api/health_pings.py` (см. таблицу ниже) агрегирует `AuditLog` по `action IN (health_ping_request|response|opt_out)` в три admin-endpoint'а (`/health-pings/summary`, `/health-pings/recent-bad`, `/nodes/{id}/health-pings`). Webapp отдельным endpoint'ом `POST /api/webapp/health-ping-report` даёт юзеру кнопку «🆘 VPN не работает» без ожидания планового пинга. `HealthPingResponseRequest` в `api_extensions.py` носит опциональное `source: "prompted" | "self_reported"` (default — `"prompted"`, чтобы не ломать bot-клиентов) — админка отдельно подсвечивает self-reported как более сильный сигнал.
+Видимость health-ping телеметрии: модуль `api/health_pings.py` (см. таблицу ниже) агрегирует `AuditLog` по `action IN (health_ping_request|response|opt_out)` в три admin-endpoint'а (`/health-pings/summary`, `/health-pings/recent-bad`, `/nodes/{id}/health-pings`). Кнопка «🆘 VPN не работает» без ожидания планового пинга есть во всех трёх юзерских каналах — см. «Самопочинка «VPN не работает»» ниже. `HealthPingResponseRequest` в `api_extensions.py` носит опциональное `source: "prompted" | "self_reported"` (default — `"prompted"`, чтобы не ломать bot-клиентов) — админка отдельно подсвечивает self-reported как более сильный сигнал.
 
 ## Сборка приложения
 
@@ -108,6 +108,13 @@ PATCH /api/webapp/devices/{id}             переименование
 DELETE /api/webapp/devices/{id}            revoke
 GET  /api/webapp/transactions              постраничный BalanceTransaction
 GET  /api/webapp/referral                  реферальный код + stats
+GET  /api/webapp/repair-state              пре-чек кнопки «VPN не работает»
+POST /api/webapp/report-broken-device      починить одно устройство
+POST /api/webapp/report-broken             починить всю подписку
+POST /api/webapp/report-operator           оператор связи на репорт
+POST /api/webapp/report-ok                 «всё работает» → outcome=ok
+POST /api/webapp/report-still-broken       «не помогло» → outcome=fail
+POST /api/webapp/health-ping-report        legacy-вход починки (старый бандл)
 ```
 
 ### Ownership checks
@@ -136,7 +143,7 @@ POST /api/subscriptions/{id}/auto_renew         ← require_admin
 POST /api/referral/code                         ← optional_admin
 POST /api/users/register                        ← optional_admin
 POST /api/trial/activate                        ← optional_admin
-POST /api/users/by_telegram/{tg}/regenerate     ← require_admin
+POST /api/users/by_telegram/{tg}/regenerate     ← require_admin (вызывающих нет с 2026-09-12: /newconfig переехал на report-broken)
 GET  /api/notifications/pending                 ← require_admin (polls бот)
 POST /api/notifications/{id}/ack                ← require_admin (ack от бота)
 ```
@@ -243,13 +250,26 @@ HTML-страница «починить и продлить», иначе (VPN-
   окно 15 мин); лимит `2/minute;6/hour` по ТОКЕНУ (не по IP — CGNAT).
 * POST `…&pay=1` — счёт на продление (провайдер пинится `SUB_FIX_PROVIDER`)
   и 303 на оплату; возврат — на `?fix=1&paid=<invoice_id>`.
+* POST `…&report=<report_id>[&op=<оператор|skip>][&still=1][&ok=1]` —
+  обратная связь по уже сделанной починке (`sub_fix.do_feedback`): оператор
+  связи, «✅ всё работает» (`outcome=ok`) и «❌ всё равно не работает»
+  (`outcome=fail`). Всё в query, потому что тело POST CF Worker не форвардит;
+  admin-токена здесь нет, право даёт сам `sub_token` — поэтому репорт обязан
+  принадлежать ЭТОЙ подписке (`report.subscription_id == sub.id`), иначе
+  утёкшая ссылка позволяла бы переписывать чужие репорты перебором id.
+  Несовпадение или битый id → стартовый экран, без «не найдено».
 * Неизвестный токен → тот же camo-лендинг, что на корне домена, с тем же
   кодом 200: иначе код ответа сам становится оракулом для пробера.
 
 Право на починку проверяет ЯДРО (`handle_broken_device`), а не экран:
-POST приходит по URL, и защита в слое отображения его не покрывает.
+POST приходит по URL, и защита в слое отображения его не покрывает. Глобально
+забаненный владелец (`User.banned_at`) получает экран «Доступ приостановлен» и
+на GET, и на POST — как в боте, где мидлвара молча дропает его апдейты.
 
-Флаги: `SUB_FIX_PAGE`, `SUB_FIX_PAY`, `SUB_FIX_ENTRYPOINTS`,
+Окно повторов и суточный потолок страница больше не задаёт сама: `_throttle_sec`
+/ `_daily_max` — тонкие обёртки над общей политикой ядра
+(`SELF_REPAIR_THROTTLE_SEC` / `SELF_REPAIR_DAILY_MAX` с fallback на `SUB_FIX_*`),
+одной на все каналы. Флаги: `SUB_FIX_PAGE`, `SUB_FIX_PAY`, `SUB_FIX_ENTRYPOINTS`,
 `SUB_FIX_THROTTLE_SEC`, `SUB_FIX_DAILY_MAX`, `SUB_FIX_PROVIDER` — см.
 `operations/env-reference.md` и эпик `operations/sub_fix_epic_2026_07_29.md`.
 
@@ -274,6 +294,67 @@ POST приходит по URL, и защита в слое отображени
 **`referral_invite` — отложенная доставка.** Строка пишется сразу при первом скачивании конфига (`_mark_first_config_fetch`), но `get_pending_notifications` отдаёт её только когда `created_at` старше `REFERRAL_INVITE_DELAY_H` (env, default 24 ч; `0` = сразу). Реализовано отдельным фильтром в `_fetch` (`or_(action != 'referral_invite', created_at <= now - delay)`), а не отдельным классом — FIFO и приоритеты остальных пушей не меняются. Текст: «Как VPN? Если приведёшь друга, получишь N дней подписки, когда он оплатит. Ссылка для друзей: …» (без «Готово, VPN работает»: через сутки это неуместно). Мотивация: сразу после выдачи ссылки приглашение было третьим-четвёртым сообщением подряд (2026-08-28).
 
 **Приоритет + FIFO на выборке (сетевой аудит).** `get_pending_notifications` делит `action` на два класса и выбирает **priority-строки первыми** (всё, кроме `admin_broadcast`), добивая свободные слоты `limit` массовой рассылкой. Внутри выборка — `order_by(created_at.asc())` (FIFO), а не прежний `.desc()` (LIFO). Раньше диспетчер рассылки наполнял очередь батчами по 50/тик, поллер сливал 20/тик, и из-за DESC-сортировки более свежие `admin_broadcast` вытесняли срочные транзакционные пуши (`config_ready`, `expiry_reminder_1d`, `migration_notice`, `health_ping_request`) в хвост на десятки минут. Теперь рассылка не может вытеснить срочный пуш из окна доставки. Это серверная страховка в дополнение к within-tick сортировке на стороне бота (см. `docs/components/bot.md`).
+
+## Самопочинка «VPN не работает» — один контракт на четыре входа
+
+Ядро — `services/self_repair.py`; каналы-адаптеры отличаются ровно тем, как
+резолвят юзера (`telegram_id` / webapp-JWT / `sub_token`). Унифицировано
+2026-09-12, разбор расхождений до унификации —
+[operations/vpn_broken_channels_parity_2026_09_12.md](../operations/vpn_broken_channels_parity_2026_09_12.md).
+
+| Вход | Кто | Эндпоинт |
+|---|---|---|
+| Бот, кнопка «🆘 VPN не работает» / пикер / `/newconfig` | `api/client_control.py` (shared admin-token) | `GET /api/admin/client-control/devices-by-telegram`, `POST …/report-broken-device`, `POST …/report-broken` |
+| Кабинет, страница «Помощь» | `api_webapp.py` (Bearer JWT) | `GET /api/webapp/repair-state`, `POST /api/webapp/report-broken-device`, `POST /api/webapp/report-broken` |
+| Страница по саб-токену | `api/sub_fix.py` (sub_token + CSRF-nonce) | `POST /api/sub/{token}?fix=1&n=…` |
+| Ответ «плохо» на плановый health-ping | `api_extensions.py` (admin-token из бота) | `POST /api/users/health-ping-response` |
+
+### Единый ответ
+
+`ReportBrokenResponse` (`client_control.py`) и `WebappRepairResponse`
+(`api_webapp.py`) — один и тот же набор полей; маппинг `RepairOutcome → ответ`
+живёт в одном хелпере `client_control.outcome_response()`, webapp лишь
+дописывает legacy-поля для закэшированного бандла (`migrated`, `subscription_id`,
+`node_id`, `target_node_name`).
+
+| Поле | Смысл |
+|---|---|
+| `action` | `migrated` (переехало на другую ноду) · `reshuffled` (те же ноды, другие протоколы) · `duplicated` (добавлен запасной лег) · `throttled` (окно повтора) · `daily_limit` (суточный потолок) · `no_target` (свободной ноды нет) · `no_subscription` (нет активной подписки / устройство отключено / юзер забанен) · `not_ready` (устройство ещё `pending`) · `user_not_found` (только бот-канал) |
+| `retry_after_sec` | сколько ждать; заполнен для `throttled` / `daily_limit` |
+| `scope` | `device` (чинили одно устройство) или `subscription` (всю подписку) |
+| `device_name` | имя устройства для per-device `migrated` (как записал юзер) |
+| `report_id`, `new_node_name`, `new_node_region`, `task_id` | как было |
+
+Клиенты обязаны ветвиться по `action`, а не по «переехал / не переехал»: до
+унификации кабинет схлопывал ВСЕ неуспехи в «свободного сервера нет — напиши в
+поддержку», и человек, упёршийся в двухминутный троттл, читал это как аварию.
+
+### Единая политика повторов
+
+`SELF_REPAIR_THROTTLE_SEC` (120 с) и `SELF_REPAIR_DAILY_MAX` (5/сутки) с fallback
+на `SUB_FIX_*` — считаются **по подписке** по `OperatorNodeReport` и действуют на
+ВСЕ каналы (раньше окно и потолок были только у страницы, у whole-sub путей —
+свои 5 минут, а у per-device не было ничего). `self_repair.repair_wait()` — чистый
+пре-чек той же арифметикой, поэтому пикер и действие не расходятся.
+Жалоба (`complaint_received`) пишется даже когда человек упёрся в лимит: «не
+помогло, жму ещё раз» — главный сигнал для эскалации.
+
+### `GET /api/admin/client-control/devices-by-telegram`
+
+Пре-чек бота (общая реализация с кабинетом — `repair_state_for_user`):
+`{devices: [{device_id, name, status}], retry_after_sec, wait_reason, subscription_id}`.
+`devices` = `self_repair.live_devices` (`active` + `failed`; `pending` исключён,
+он отвечает `not_ready`) — один набор для пикеров бота и кабинета.
+`wait_reason` — `throttled` | `daily_limit` | `null`.
+
+### `POST /api/users/health-ping-response`
+
+При `answer=bad` не только пишет телеметрию, но и чинит тем же ядром (ровно одно
+живое устройство → per-device лестница, иначе → перенос подписки) и возвращает
+`{ok: true, action, report_id, …}` — тот же контракт. Исключение упирается в
+`action: "no_target"`. Если в колбэке нет `subscription_id` или подписка чужая,
+чинить нечего — ответ остаётся `{ok: true}` без `action`, и бот показывает старый
+текст «получили сигнал».
 
 ## Модели доверия — сводно
 

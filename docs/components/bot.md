@@ -2,7 +2,7 @@
 
 Живёт в `bot/`. Стек — aiogram 3, один процесс, один poll-loop, в контейнере.
 
-Self-report: в `bot/keyboards.py::start_keyboard()` есть шестая reply-кнопка «🆘 VPN не работает» (константа `BTN_VPN_BROKEN`). Message-handler `self_report_vpn_broken` в `bot/handlers.py` шлёт `POST /api/users/health-ping-response` с `answer=bad`, `source=self_reported`. Нужно потому, что плановый `run_user_health_ping_tick` **приходит юзеру не чаще раза в сутки** (дефолты: `USER_HEALTH_PING_INTERVAL=1800` — интервал самого тика, `USER_HEALTH_PING_DEBOUNCE_HOURS=24` — per-user debounce, плюс окно МСК 11–14) — ждать сутки, чтобы пожаловаться на сломанный VPN, абсурд. Плановый тик воркера **не затронут**; self-report — это дополнительный канал, не замена. Admin-видимость всей телеметрии (plan + self-report) — страница `/health-pings` в админке + компактный виджет в expand-row карточки ноды (`admin/src/pages/Nodes.tsx::NodeHealthPings`). Бэкенд различает два типа в `AuditLog.extra.source` (`"prompted"` vs `"self_reported"`).
+Self-report: в `bot/keyboards.py::start_keyboard()` есть шестая reply-кнопка «🆘 VPN не работает» (константа `BTN_VPN_BROKEN`). Message-handler `self_report_vpn_broken` в `bot/handlers.py` не «шлёт сигнал», а **чинит**: пре-чек → выбор устройства → шаг починки через общее ядро `backend/app/services/self_repair.py` (см. «Флоу «🆘 VPN не работает»» ниже). Нужно потому, что плановый `run_user_health_ping_tick` **приходит юзеру не чаще раза в сутки** (дефолты: `USER_HEALTH_PING_INTERVAL=1800` — интервал самого тика, `USER_HEALTH_PING_DEBOUNCE_HOURS=24` — per-user debounce, плюс окно МСК 11–14) — ждать сутки, чтобы пожаловаться на сломанный VPN, абсурд. Плановый тик воркера **не затронут**; self-report — это дополнительный канал, не замена. Admin-видимость всей телеметрии (plan + self-report) — страница `/health-pings` в админке + компактный виджет в expand-row карточки ноды (`admin/src/pages/Nodes.tsx::NodeHealthPings`). Бэкенд различает два типа в `AuditLog.extra.source` (`"prompted"` vs `"self_reported"`).
 
 ## Структура модулей
 
@@ -58,7 +58,7 @@ dp.errors.register(on_dispatch_error)  # глобальная страховка
 /start [ref_XXXXX | support]   — onboarding, регистрация с реферальным кодом; два сообщения: приветствие + reply-клавиатура, затем «Начнём? 👇»/«Что дальше? 👇» + inline-кнопки (см. «/start: два сообщения» ниже)
 /plans                          — список тарифов (через /api/plans)
 /config                         — одна саб-ссылка двумя сообщениями (короткая шапка + голый URL); тот же cmd_config зовут trial:activate и go:config (с intro-заголовком)
-/newconfig                      — регенерация (/api/users/by_telegram/{id}/regenerate)
+/newconfig                      — «переселить всё»: тот же whole-sub ремонт, что «🔁 Все мои устройства» (POST /api/admin/client-control/report-broken)
 /status                         — статусы всех подписок
 /renew                          — продлить
 /balance                        — показать balance_kopecks + runway
@@ -124,6 +124,98 @@ Telegram Stars — единственный способ принять опла
 Stars-хэндлеры в `handlers.py` в webhook-режиме не вызываются (backend перехватывает payment-update'ы до пересылки боту). Хэндлеры остаются в коде для backward compat с polling-режимом.
 
 Endpoint: `POST /tg-webhook` (`app/telegram_webhook.py`). Детали — `components/payments.md`.
+
+## Флоу «🆘 VPN не работает»
+
+Унифицирован 2026-09-12: бот, кабинет и страница по токену ходят в одно ядро
+(`backend/app/services/self_repair.py`) и говорят одно и то же. Разбор расхождений
+до унификации — [operations/vpn_broken_channels_parity_2026_09_12.md](../operations/vpn_broken_channels_parity_2026_09_12.md).
+
+В боте у флоу **четыре входа, и все они кончаются одной функцией**
+`_send_repair_outcome(bot, chat_id, data)` — единственным местом с текстами исходов:
+
+1. reply-кнопка «🆘 VPN не работает» (`self_report_vpn_broken`);
+2. кнопка пикера «какое устройство» (`brk:<device_id>` / `brk:all`);
+3. ответ «не работает» на плановый health-ping (`hping:bad`);
+4. `/newconfig`.
+
+### Шаги кнопки «🆘 VPN не работает»
+
+1. **Пре-чек** — `GET /api/admin/client-control/devices-by-telegram?telegram_id=`
+   отдаёт `{devices, retry_after_sec, wait_reason, subscription_id}`.
+   `wait_reason` (`throttled` / `daily_limit`) → сразу текст ожидания и выход,
+   **независимо от числа устройств**: раньше бот сначала спрашивал «какое не
+   работает?», а потом отвечал «уже перекидывали недавно» — для человека это
+   выглядело как противоречие бота самому себе. Жалобу (`complaint_received`)
+   в этом случае пишет сам бэкенд, боту делать ничего не нужно.
+2. **Выбор объекта.** `devices` пусто, но `subscription_id` есть → «⏳ Устройства
+   ещё настраиваются» (все девайсы pending). Пусто и подписки нет → текст
+   `no_subscription` + inline-кнопка «💎 Выбрать тариф» (`go:plans`; команды
+   `/buy` в боте нет, тупик недопустим). Ровно одно → чиним сразу. Больше
+   одного → пикер `broken_device_keyboard`: кнопка на каждое живое устройство
+   (`Device.name`, как записал юзер) + «🔁 Все мои устройства».
+3. **Действие.** Одно устройство → `POST /api/admin/client-control/report-broken-device`
+   `{telegram_id, device_id}` (`_do_device_failover`) — лестница ротации для
+   этого устройства, соседей не трогаем, ноду user-wide не баним.
+   «Все мои устройства» и `/newconfig` → `POST /api/admin/client-control/report-broken`
+   `{telegram_id}` (`_do_whole_sub_failover`) — переезд всей подписки с баном
+   старой ноды.
+4. **Исход** — `_send_repair_outcome` по полю `action` ответа.
+
+### Тексты исходов (`_send_repair_outcome`)
+
+| `action` | Что показываем | Что дальше |
+|---|---|---|
+| `migrated` | «🔄 Поменяли сервер для «{device_name}»» (при `scope="subscription"` — «для всех устройств») + «нажми 🔄 рядом с профилем» | вопрос об операторе + нудж |
+| `reshuffled` | «🔀 Переключили тебя на другой способ подключения» | вопрос об операторе + нудж |
+| `duplicated` | «➕ Добавили тебе запасной сервер» | вопрос об операторе + нудж |
+| `throttled` | «👍 Мы уже переключали тебя пару минут назад… если через {M} мин. всё ещё не работает — нажми кнопку ещё раз», `M = ceil(retry_after_sec/60)` | кнопка доступна сразу |
+| `daily_limit` | «Сегодня мы уже несколько раз меняли тебе серверы — дальше нужна помощь человека» | `help_keyboard()` |
+| `not_ready` | «⏳ Устройство ещё настраивается» (устройство pending — чинить нечего) | повтор через пару минут |
+| `no_subscription` | «Чинить нечего: подписка не активна или это устройство уже отключено» | «💎 Выбрать тариф» |
+| `user_not_found` | «Не нашли твой аккаунт — нажми /start» | — |
+| `no_target` | «Не смогли автоматически подобрать другой сервер. Попробуй через 10 минут» | `help_keyboard()` |
+| нет `action` / не-200 / сеть | «Не получилось обработать — попробуй ещё раз через минуту» | `help_keyboard()` |
+
+Имя устройства приходит от юзера, поэтому идёт через `html.escape` — parse_mode
+у бота HTML, и `<` в имени иначе валит отправку целиком (юзер не получил бы ни
+клавиатуры оператора, ни нуджа).
+
+После `migrated` / `reshuffled` / `duplicated` с `report_id`: `operator_keyboard(report_id)`
+(шесть операторов, ответ необязателен) и отложенный `_delayed_still_broken_prompt`
+через `_STILL_BROKEN_DELAY_S = 900` — если бэкенд НЕ видит переподключения,
+прилетает «всё ещё не работает?» с кнопками «✅ Всё работает» (`report-ok`) /
+«❌ Всё равно не работает» (`report-still-broken`).
+
+### Повторы ограничивает только бэкенд
+
+Клиентского кулдауна в боте нет: `_SELF_REPORT_COOLDOWN_S` удалён (он был мёртв —
+серверный пре-чек срабатывал раньше — и терялся при рестарте процесса). Единая
+политика живёт в ядре: `SELF_REPAIR_THROTTLE_SEC` (120 с) и `SELF_REPAIR_DAILY_MAX`
+(5/сутки), обе **по подписке**, с fallback на `SUB_FIX_*` (см.
+[operations/env-reference.md](../operations/env-reference.md)). Повторный тап
+разрешён всегда — сервер сам ответит `throttled`.
+
+### Ответ «плохо» на плановый пинг (`hping:bad`)
+
+`POST /api/users/health-ping-response` с `answer=bad` теперь не только пишет
+телеметрию, но и чинит тем же ядром (одно живое устройство → per-device лестница,
+иначе → переезд подписки) и возвращает тот же контракт с `action`. Бот показывает
+короткий ack «🛠 Спасибо! Чиним.» (он автоудаляется через
+`HEALTH_PING_ACK_DELETE_DELAY_S`), а затем отдельным сообщением — полноценный
+исход через `_send_repair_outcome` с вопросом об операторе и нуджем. Если `action`
+в ответе нет (в колбэке не было `subscription_id` — чинить нечего), остаётся старый
+текст «получили сигнал… /help».
+
+### FSM переименования больше не глотает кнопки меню
+
+`devices_router` подключён раньше главного, и `DeviceStates.waiting_rename` ловил
+любой текст: тап «🆘 VPN не работает» в состоянии переименования становился
+**именем устройства**, а жалоба пропадала. Теперь `device_rename_finish` сверяет
+текст с `_MENU_TEXTS` (из `bot/support.py`): совпало → `state.clear()`, и если это
+был `BTN_VPN_BROKEN` — сразу вызывается `self_report_vpn_broken` (человек с
+нерабочим VPN не должен жать дважды), иначе «Ок, переименование отменено. Нажми
+кнопку ещё раз».
 
 ## X-Admin-Actor — кто дёргает backend от имени бота
 

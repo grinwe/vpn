@@ -2,9 +2,7 @@
 
 Single source of truth по `/api/webapp/*` — что фронт ([webapp/src/pages/](../webapp/src/pages/)) реально дёргает, какие pydantic-модели возвращаются, какие 4xx ждать. Если расходится с кодом — прав [api_webapp.py](../backend/app/api_webapp.py).
 
-Self-report: `POST /api/webapp/health-ping-report` (без тела) под webapp-JWT — юзер жмёт красную кнопку «🆘 VPN не работает» на Home; бэкенд находит первую `active` подписку юзера и пишет `AuditLog` с `action=health_ping_response`, `extra.answer="bad"`, `extra.source="self_reported"`, `extra.node_id=<denorm>`. Если активной подписки нет, row всё равно пишется, но с `node_id=null`. Rate-limit серверный пока не делаем; клиент (webapp/src/pages/Home.tsx) сам блокирует кнопку на 5 минут после успешной отправки. Функция `reportVpnBroken()` в `webapp/src/api.ts`. Ответ: `{ ok, subscription_id, node_id, migrated?, report_id?, target_node_name? }`. Эти события едут в тот же дашборд, что и плановые пинги бота, — админка (`/health-pings`) отдельной карточкой выделяет self-reported как более сильный сигнал.
-
-Кнопка живёт в `webapp/src/pages/Help.tsx` (не Home). Исход показывается ЧЕСТНО (синхрон с ботом `handlers.py`): `migrated=true` → «поменяли сервер» + опрос оператора одним тапом; переселения не было → НЕ рапортуем ложное «жалоба отправлена», а зовём в поддержку (нет свободной ноды) либо просим подождать (недавно уже перекидывали). ⚠️ Тонкое различие «нет свободной ноды» vs «троттл» на фронте пока схлопнуто в «зови в поддержку», т.к. бэк отдаёт только `migrated:bool` без поля исхода — Help.tsx уже готов к опциональному `outcome:'migrated'|'no_target'|'throttled'|'no_subscription'` (forward-compatible), но `api_webapp.py` его пока не заполняет (см. аудит сети, находка #2).
+Самопочинка «VPN не работает» живёт на странице «Помощь» (`webapp/src/pages/Help.tsx`, не Home) и с 2026-09-12 ходит в **то же ядро**, что бот и страница по саб-токену (`backend/app/services/self_repair.py`): `GET /api/webapp/repair-state` → `POST /report-broken-device` либо `POST /report-broken` → `POST /report-operator` → `POST /report-ok` / `POST /report-still-broken`. Полный контракт — раздел «Самопочинка «VPN не работает»» ниже. Телеметрия при этом не потерялась: на каждый шаг починки (`/report-broken-device`, `/report-broken`) бэкенд по-прежнему пишет `AuditLog` с `action=health_ping_response`, `extra.answer="bad"`, `extra.source="self_reported"`, `extra.scope` (`device` / `subscription`) и `extra.node_id` (заполнен только для whole-sub — у per-device ноду выбирает лестница) — эти события едут в тот же дашборд, что и плановые пинги бота, а админка (`/health-pings`) отдельной карточкой выделяет self-reported как более сильный сигнал.
 
 Отдельная от admin API дорожка: здесь нет `X-Admin-Token`, вместо него — JWT, выданный по Telegram initData. Авторизован только юзер на себя самого, admin-скоупы не применимы.
 
@@ -231,13 +229,134 @@ Res: `{ code, bonus_kopecks, invited_count, earned_kopecks, share_url }`.
 - `earned_kopecks` = сумма всех positive `kind=bonus` транзакций юзера. Включает trial-бонус самого юзера — технически шумно, но для UI «сколько ты заработал реферальных» это overinclusive rather than misleading, и пока никто не жаловался.
 - `share_url` = `https://t.me/<BOT_USERNAME>?start=ref_<code>` или `null`, если `BOT_USERNAME` env не выставлен. Если null — фронт показывает только код как текст, copy-button без share.
 
+## Самопочинка «VPN не работает» (Help)
+
+Унифицирована 2026-09-12: кабинет, бот и страница по саб-токену используют одно
+ядро и один набор исходов. Разбор расхождений до унификации —
+[operations/vpn_broken_channels_parity_2026_09_12.md](operations/vpn_broken_channels_parity_2026_09_12.md).
+
+### `GET /api/webapp/repair-state`
+
+Пре-чек **до** кнопки, зеркало бот-эндпоинта `devices-by-telegram`. Ничего не
+чинит; если человек внутри окна повторов — фиксирует жалобу (`complaint_received`),
+чтобы «жму ещё раз, не помогло» не терялся.
+
+Res (`RepairStateResponse`):
+
+```
+{
+  devices: [{ id, name, status }],   // active + failed первой active-подписки
+  retry_after_sec: number | null,
+  wait_reason: "throttled" | "daily_limit" | null,
+  subscription_id: number | null
+}
+```
+
+`devices` — `self_repair.live_devices(sub)`: `pending` исключён (устройство ещё
+собирается), `disabled`/`revoked` — уже не живые. Один и тот же набор у бота и
+кабинета, поэтому «сколько у меня устройств» больше не зависит от канала.
+`subscription_id != null` при пустом `devices` = все устройства pending.
+
+### `POST /api/webapp/report-broken-device` `{device_id}`
+
+Один шаг лестницы для ОДНОГО устройства (перетасовка протоколов → перенос ноды →
+дубль лега). Соседние устройства не трогаются, нода user-wide не банится.
+Чужое/несуществующее устройство → **не 404**, а `action="no_subscription"`:
+фронт показывает тот же честный текст, что и при отсутствии подписки.
+
+### `POST /api/webapp/report-broken` (без тела)
+
+«🔁 Все мои устройства» — перенос ВСЕЙ подписки на другую ноду + user-wide бан
+старой (`self_repair.handle_broken_subscription`). Зеркало одноимённой бот-кнопки.
+Лестница ротации здесь не применяется намеренно: человек сказал, что легла вся
+подписка, а не транспорт одного устройства.
+
+### Ответ обоих — `WebappRepairResponse`
+
+```
+{
+  ok: true,
+  action: "migrated" | "reshuffled" | "duplicated" | "throttled" |
+          "daily_limit" | "no_target" | "no_subscription" | "not_ready",
+  report_id, new_node_name, new_node_region, task_id,
+  retry_after_sec,          // throttled / daily_limit
+  device_name,              // для per-device migrated
+  scope: "device" | "subscription",
+  // совместимость со старым бандлом:
+  migrated: boolean,        // true для migrated/reshuffled/duplicated
+  subscription_id, node_id, target_node_name
+}
+```
+
+Поля `action`…`scope` — ровно те же, что в бот-контракте
+`client_control.ReportBrokenResponse` (один хелпер `outcome_response` на оба).
+`migrated`/`target_node_name` оставлены потому, что бандл кабинета кэшируется
+вебвью Telegram и старый фронт ещё какое-то время читает именно их.
+
+### `POST /api/webapp/health-ping-report` — только совместимость
+
+Старый бандл при одном устройстве ходил сюда и получал whole-sub миграцию мимо
+лестницы. Эндпоинт жив, но теперь ведёт себя как новая кнопка: ровно одно живое
+устройство → per-device ядро, иначе → перенос подписки. **Новый фронт его не
+вызывает** (`reportVpnBroken()` из `api.ts` удалён).
+
+### Обратная связь
+
+| Эндпоинт | Тело | Что делает |
+|---|---|---|
+| `POST /api/webapp/report-operator` | `{report_id, operator}` | оператор связи в `OperatorNodeReport.operator`; значение вне таксономии → `unknown` |
+| `POST /api/webapp/report-still-broken` | `{report_id}` | `outcome="fail"` + `resolved_at` — самый весомый негативный сигнал для матрицы «нода × оператор». До унификации из кабинета `fail` не приходил никогда |
+| `POST /api/webapp/report-ok` | `{report_id}` | `outcome="ok"`, идемпотентно: уже закрытый `ok`/`fail` не перетирается |
+
+Все три проверяют владельца (`report.user_id == user.id`) и отвечают **404** на
+чужой `report_id`.
+
+### Машина состояний Help.tsx
+
+```
+idle ──тап──> pending ──GET /repair-state──┬─ wait_reason ───────────> outcome (throttled | daily_limit)
+                                           ├─ devices = 0 ──────────> outcome (not_ready, если есть subscription_id; иначе no_subscription + «💎 Выбрать тариф»)
+                                           ├─ devices = 1 ──POST /report-broken-device──> outcome
+                                           └─ devices > 1 ─────────> pick_device ──┬── устройство → POST /report-broken-device ──> outcome
+                                                                                   ├── «🔁 Все мои устройства» → POST /report-broken ──> outcome
+                                                                                   └── «Отмена» → idle
+outcome (migrated | reshuffled | duplicated, есть report_id)
+   → pick_operator (6 операторов + «Пропустить») → feedback («✅ Всё работает» / «❌ Всё равно не работает»)
+   → done_ok | done_fail (в done_fail — ссылка в поддержку)
+```
+
+Правила:
+
+* **Клиентских кулдаунов нет.** После любого неуспешного исхода кнопка активна
+  сразу — повторы ограничивает сервер единой политикой (`SELF_REPAIR_THROTTLE_SEC`
+  120 с и `SELF_REPAIR_DAILY_MAX` 5/сутки, обе по подписке). Единственный таймер —
+  5 с на тексте транспортной ошибки. Прежний React-state на 5 минут после
+  `no_target`/`throttled` убран.
+* **Тексты исходов совпадают с ботом** (`outcomeText()` в Help.tsx против
+  `_send_repair_outcome` в `bot/handlers.py`): `migrated` различает «для «{имя}»»
+  и «для всех устройств» по `scope`, `throttled` показывает
+  `M = ceil(retry_after_sec / 60)` минут. Технические имена устройств
+  (`primary`, `device-6`) прячутся регуляркой `TECH_NAME_RE` — зеркало
+  `_TECH_NAME_RE` на странице по токену.
+* **«Пропустить» у вопроса об операторе** — вопрос не шлагбаум; ответ уходит
+  best-effort, сбой запроса человека не блокирует.
+* Кабинет пуш не умеет, поэтому спрашивает «получилось?» сразу после шага
+  оператора (у бота это отложенный нудж через 15 минут).
+* Хинт под кнопкой честный: «Кнопка переключит тебя на другой способ связи или
+  другой сервер. Это не замена поддержке — для диалога используй кнопку выше»
+  (раньше было «пошлёт маячок админам»). В FAQ «VPN не подключается / медленный»
+  первым пунктом стоит отсылка к этой же кнопке.
+* `App.tsx` устройства в Help больше не передаёт — страница берёт их сама из
+  `repair-state` в момент тапа (раньше список приходил пропом из `/me` и мог быть
+  протухшим).
+
 ## Status codes cheat sheet
 
 | Код | Когда |
 |-----|-------|
 | 401 | initData не валидируется / JWT протух / не передан Bearer |
 | 402 | Нет баланса — `/subscriptions/activate`, `/subscriptions/{id}/devices`, `/change_plan`. Тело несёт `code`, `balance_kopecks`, `required_kopecks`, `suggested_topup_kopecks`. |
-| 404 | Plan / subscription / invoice не найден **или** не принадлежит юзеру (не различаем, чтобы не утекало existence) |
+| 404 | Plan / subscription / invoice / `report_id` не найден **или** не принадлежит юзеру (не различаем, чтобы не утекало existence). Исключение — `report-broken-device`: чужое устройство отдаёт 200 с `action="no_subscription"`, чтобы человек видел человеческий текст, а не ошибку |
 | 409 | Trial уже активирован / слишком много активных subs на плане |
 | 400 | Legacy плана через `/activate` / freeze нельзя / plan без daily_rate / `Already on this plan` на `/subscriptions/activate` |
 | 503 | Нет trial-плана / провайдер не настроен / `/migrate_node` не нашёл альтернативную ноду в пуле тарифа |
@@ -255,3 +374,4 @@ Res: `{ code, bonus_kopecks, invited_count, earned_kopecks, share_url }`.
 | Plans | [Plans.tsx](../webapp/src/pages/Plans.tsx) | `/plans`, `/checkout`, `/subscriptions/activate`, `/topup` |
 | CheckoutPending | [CheckoutPending.tsx](../webapp/src/pages/CheckoutPending.tsx) | `/invoices/{id}` (poll) |
 | History | [History.tsx](../webapp/src/pages/History.tsx) | `/transactions` |
+| Help | [Help.tsx](../webapp/src/pages/Help.tsx) | `/repair-state`, `/report-broken-device`, `/report-broken`, `/report-operator`, `/report-ok`, `/report-still-broken` |

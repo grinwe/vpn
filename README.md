@@ -56,7 +56,7 @@ docker-compose logs -f backend
 | `/status` | Show subscription status |
 | `/renew` | Renew subscription (legacy invoice flow) |
 | `/referral` | Get referral link (see Referral program below for payout mechanics) |
-| `/newconfig` | Self-service: regenerate config on a different node |
+| `/newconfig` | Self-service repair: moves the whole subscription to another node (same path as the «all my devices» button, `POST /api/admin/client-control/report-broken`) |
 
 ## Payment Providers
 

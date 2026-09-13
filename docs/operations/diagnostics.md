@@ -229,14 +229,21 @@ WINDOW_SEC`, default 30m) и кладёт `target_kind`/`target_id` в `extra`.
 
 ### 6. Краудсорс здоровья нод (user-report-driven)
 
-Юзер жмёт «🆘 VPN не работает» (бот `hping:bad` → `/users/health-ping-
-response`, или webapp Help → `/webapp/health-ping-report`) — и backend
-сразу делает ему **то же, что админская «обновить подписку»**: через
-`_do_failover` → `migrate_subscription_to_free_node` переселяет на
-свободную healthy-ноду (sub_token сохраняется) И **банит проблемную ноду
+Юзер жмёт «🆘 VPN не работает» (бот, кабинет Help, страница по саб-токену
+или ответ `hping:bad` на плановый пинг) — и backend сразу его **чинит**
+через общее ядро `services/self_repair.py` (унификация 2026-09-12,
+[vpn_broken_channels_parity_2026_09_12.md](vpn_broken_channels_parity_2026_09_12.md)).
+Основной путь — per-device лестница (перетасовка протоколов → перенос ноды →
+дубль лега): sub_token сохраняется, соседние устройства не трогаются, ноду
+user-wide НЕ банит. Whole-sub переезд («🔁 Все мои устройства», `/newconfig`,
+ответ «плохо» при нескольких устройствах) делает **то же, что админская
+«обновить подписку»**: `_do_failover` → `migrate_subscription_to_free_node`
+переселяет всю подписку на свободную healthy-ноду И **банит проблемную ноду
 для этого юзера** (`NodeUserBan`), чтобы auto-pick не вернул его назад.
-5-мин per-sub throttle (по свежему `OperatorNodeReport` этой подписки,
-`reported_at` индексирован) не даёт спамить миграциями.
+Спам ограничивает единая политика повторов — `SELF_REPAIR_THROTTLE_SEC=120`
+и `SELF_REPAIR_DAILY_MAX=5` **по подписке** (по свежим `OperatorNodeReport`,
+`reported_at` индексирован), одна на все каналы вместо прежних разрозненных
+5-минутных окон.
 
 Плюс **краудсорс «плохости»** (`_escalate_node_failure_reports`): считаем
 DISTINCT подписки, пожаловавшиеся на ноду за окно; по порогу — нода
@@ -247,11 +254,12 @@ admin-push. Идемпотентно: уже cooled-нода повторно н
 Счётчик берётся из `operator_node_reports` по `failed_node_id` (btree-
 индекс), а не JSONB-containment'ом по `audit_logs` — это user-facing путь
 под нагрузкой на аварии ноды, полный скан таблицы аудита внутри запроса
-недопустим. Голосуют ВСЕ user-driven каналы: webapp/control-channel
-(`_do_failover`) **и бот-флоу operator-routing** (`report-broken` /
-`report-broken-device`) — каждый успешный failover пишет
-`OperatorNodeReport` с `failed_node_id` = старая нода, и после миграции
-зовёт ту же эскалацию.
+недопустим. Голосуют ВСЕ user-driven каналы: бот, кабинет, страница по саб-токену и
+control-channel — каждый успешный ПЕРЕНОС (`migrated`) пишет
+`OperatorNodeReport` с `failed_node_id` = старая нода и после миграции
+зовёт ту же эскалацию. Шаги `reshuffled` / `duplicated` голоса против ноды
+не дают намеренно (`failed_node_id=None`): они отвечают на «режут
+транспорт», а не «нода мертва».
 
 Авто-баны `NodeUserBan` при этом не вечные: перед каждым user-driven
 failover'ом протухшие авто-баны юзера снимаются (TTL, env
