@@ -95,6 +95,16 @@ checkout'а с `PAYMENT_PROVIDER`. Callback `payvia:{new|ren}:{invoice_id}:{prov
 показывается как есть. Пустой/одиночный `PAYMENT_PROVIDER_CHOICES` — старое
 поведение без меню. Детали провайдеров — `components/payments.md`.
 
+Прод-набор с 2026-09-19 — `telegram_stars,lava_top_sbp,lava_top`
+(`group_vars/web/main.yml`), то есть три кнопки: «⭐ Telegram Stars»,
+«🏦 СБП», «💳 Карта РФ». Раньше их было две, и lava-кнопка называлась
+«💳 Карта РФ / СБП» — один счёт через агрегатор PAY2ME, где человек выбирал
+способ уже на платёжной странице. lava закрыл у PAY2ME карту (счета стали
+падать с 400 «Restricted payment method type»), поэтому способ выбирается
+до создания счёта: `lava_top_sbp` = СБП, `lava_top` = карта, обе кнопки —
+одна и та же интеграция lava. Подробности — `docs/PLAN_LAVA_TOP.md`,
+«Инцидент 2026-09-19».
+
 ### 2.6. Inline-callback'и навигации
 
 ```

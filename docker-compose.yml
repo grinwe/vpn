@@ -65,7 +65,8 @@ services:
       LAVA_TOP_API_BASE: ${LAVA_TOP_API_BASE:-}
       # Эквайрер lava: PAY2ME = карта+СБП на одной странице; пусто = дефолт
       # lava (SMART_GLOCAL, только карта).
-      LAVA_TOP_PAYMENT_PROVIDER: ${LAVA_TOP_PAYMENT_PROVIDER:-PAY2ME}
+      LAVA_TOP_CARD_PROVIDER: ${LAVA_TOP_CARD_PROVIDER:-SMART_GLOCAL}
+      LAVA_TOP_SBP_PROVIDER: ${LAVA_TOP_SBP_PROVIDER:-PAY2ME}
       TRIBUTE_API_KEY: ${TRIBUTE_API_KEY:-}
       TRIBUTE_ORDER_TITLE: ${TRIBUTE_ORDER_TITLE:-}
       TRIBUTE_ORDER_DESCRIPTION: ${TRIBUTE_ORDER_DESCRIPTION:-}
@@ -126,6 +127,8 @@ services:
       # умолчанию даёт cryptobot, а сюда приходит человек без Telegram —
       # платить он будет картой.
       SUB_FIX_PROVIDER: ${SUB_FIX_PROVIDER:-lava_top}
+      # Кнопка «Продлить по СБП» на странице (&pay=sbp).
+      SUB_FIX_SBP_PROVIDER: ${SUB_FIX_SBP_PROVIDER:-lava_top_sbp}
       # Прямая ссылка на мини-апп для кнопок в VPN-клиенте (пусто = deep-link
       # в бота с кнопкой входа).
       TELEGRAM_MINIAPP_SHORT_NAME: ${TELEGRAM_MINIAPP_SHORT_NAME:-}
@@ -296,7 +299,8 @@ services:
       LAVA_TOP_WEBHOOK_SECRET: ${LAVA_TOP_WEBHOOK_SECRET:-}
       LAVA_TOP_EMAIL_DOMAIN: ${LAVA_TOP_EMAIL_DOMAIN:-}
       LAVA_TOP_API_BASE: ${LAVA_TOP_API_BASE:-}
-      LAVA_TOP_PAYMENT_PROVIDER: ${LAVA_TOP_PAYMENT_PROVIDER:-PAY2ME}
+      LAVA_TOP_CARD_PROVIDER: ${LAVA_TOP_CARD_PROVIDER:-SMART_GLOCAL}
+      LAVA_TOP_SBP_PROVIDER: ${LAVA_TOP_SBP_PROVIDER:-PAY2ME}
       ANSIBLE_PLAYBOOK_TIMEOUT: ${ANSIBLE_PLAYBOOK_TIMEOUT:-300}
       RENEWAL_CHECK_INTERVAL: ${RENEWAL_CHECK_INTERVAL:-300}
       RENEWAL_GRACE_HOURS: ${RENEWAL_GRACE_HOURS:-24}

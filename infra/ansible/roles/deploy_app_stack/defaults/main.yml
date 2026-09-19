@@ -61,8 +61,12 @@ deploy_app_stack_lava_top_offer_id: ""
 deploy_app_stack_lava_top_webhook_secret: ""
 deploy_app_stack_lava_top_email_domain: ""
 deploy_app_stack_lava_top_api_base: ""
-# Эквайрер lava: PAY2ME = карта+СБП; пусто = дефолт SMART_GLOCAL (карта).
-deploy_app_stack_lava_top_payment_provider: "PAY2ME"
+# Одна интеграция lava — два имени провайдера (2026-09-19): lava_top = карта
+# (эквайрер SMART_GLOCAL, метод CARD), lava_top_sbp = СБП (PAY2ME, метод SBP).
+deploy_app_stack_lava_top_card_provider: "SMART_GLOCAL"
+deploy_app_stack_lava_top_sbp_provider: "PAY2ME"
+# Провайдер кнопки «Продлить по СБП» на странице ?fix=1 (&pay=sbp).
+deploy_app_stack_sub_fix_sbp_provider: "lava_top_sbp"
 # Авто-сверка карточных платежей lava (вебхук-независимо). Воркер раз в N
 # секунд опрашивает /api/v2/invoices и зачисляет pending-счета. 0 = выкл.
 deploy_app_stack_lava_top_reconcile_interval: 60

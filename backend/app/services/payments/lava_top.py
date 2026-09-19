@@ -86,8 +86,21 @@ def _sale_amount(item: dict) -> tuple[float | None, str | None]:
     return None, None
 
 
+# Одна интеграция lava — два имени провайдера в нашей системе. Имя живёт в
+# ``Payment.provider`` и в меню выбора способа оплаты:
+#   * ``lava_top``     — карта РФ (эквайрер SMART_GLOCAL, paymentMethod CARD);
+#   * ``lava_top_sbp`` — СБП (агрегатор PAY2ME, paymentMethod SBP).
+# До 2026-09-19 была одна кнопка «Карта РФ / СБП» через PAY2ME без
+# paymentMethod — агрегатор сам давал выбрать на своей странице. Потом lava
+# закрыл карту у PAY2ME, а без метода PAY2ME берёт карту по умолчанию →
+# каждый счёт падал с 400 «Restricted payment method type». Вебхук и сверка
+# по API-ключу общие для обоих имён (LAVA_FAMILY).
+LAVA_FAMILY = ("lava_top", "lava_top_sbp")
+
+
 class LavaTopProvider:
     name = "lava_top"
+    family = LAVA_FAMILY
 
     def __init__(
         self,
@@ -98,16 +111,21 @@ class LavaTopProvider:
         email_domain: str,
         api_base: str | None = None,
         payment_provider: str | None = None,
+        payment_method: str | None = None,
+        name: str | None = None,
     ) -> None:
         self._api_key = api_key
         self._offer_id = offer_id
         self._webhook_secret = webhook_secret
         self._email_domain = email_domain
         self._api_base = (api_base or DEFAULT_API_BASE).rstrip("/")
-        # paymentProvider у lava выбирает эквайрера. SMART_GLOCAL (дефолт
-        # платформы) — только карта; PAY2ME — агрегатор с картой И СБП на
-        # одной странице виджета. Пусто → не шлём (дефолт lava = карта).
+        # paymentProvider у lava выбирает эквайрера (SMART_GLOCAL — карта,
+        # PAY2ME — СБП), paymentMethod — способ (CARD / SBP). Пусто → не шлём
+        # (дефолт lava: SMART_GLOCAL + карта).
         self._payment_provider = (payment_provider or "").strip().upper() or None
+        self._payment_method = (payment_method or "").strip().upper() or None
+        if name:
+            self.name = name
         self._session = requests.Session()
 
     # ---------- create ----------
@@ -139,9 +157,11 @@ class LavaTopProvider:
             "clientUtm": {"utm_content": str(invoice_id)},
         }
         if self._payment_provider:
-            # paymentMethod намеренно НЕ шлём: без него агрегатор (PAY2ME)
-            # даёт выбрать карту или СБП на своей странице → одна кнопка.
             body["paymentProvider"] = self._payment_provider
+        if self._payment_method:
+            # Способ шлём ЯВНО: у PAY2ME без paymentMethod дефолт — карта, а
+            # она у него закрыта (2026-09-19, «Restricted payment method type»).
+            body["paymentMethod"] = self._payment_method
         try:
             resp = self._session.post(
                 f"{self._api_base}/api/v3/invoice",
@@ -297,8 +317,13 @@ class LavaTopProvider:
         )
 
 
-def load_lava_top_env() -> dict:
+def load_lava_top_env(kind: str = "card") -> dict:
     """Read LAVA_TOP_* env vars and return constructor kwargs.
+
+    ``kind`` — какое из двух имён поднимаем: ``card`` (``lava_top``:
+    эквайрер ``LAVA_TOP_CARD_PROVIDER``, дефолт SMART_GLOCAL, метод CARD) или
+    ``sbp`` (``lava_top_sbp``: ``LAVA_TOP_SBP_PROVIDER``, дефолт PAY2ME, метод
+    SBP). Ключ, offerId, секрет вебхука и домен общие.
 
     Raises ``ProviderError`` listing the missing vars (pattern of
     ``load_sbp_instance``) — checkout с недонастроенным провайдером
@@ -315,10 +340,23 @@ def load_lava_top_env() -> dict:
         raise ProviderError(
             f"lava_top provider requires env vars: {', '.join(missing)}"
         )
+    if kind == "sbp":
+        method = {
+            "payment_provider": os.getenv("LAVA_TOP_SBP_PROVIDER", "PAY2ME"),
+            "payment_method": "SBP",
+            "name": "lava_top_sbp",
+        }
+    else:
+        # Пустой LAVA_TOP_CARD_PROVIDER = дефолт lava (SMART_GLOCAL). Старый
+        # LAVA_TOP_PAYMENT_PROVIDER (=PAY2ME в проде) сюда намеренно НЕ
+        # читаем — с ним карта и сломалась.
+        method = {
+            "payment_provider": os.getenv("LAVA_TOP_CARD_PROVIDER", "SMART_GLOCAL"),
+            "payment_method": "CARD",
+            "name": "lava_top",
+        }
     return {
         **values,
         "api_base": os.getenv("LAVA_TOP_API_BASE"),
-        # По умолчанию PAY2ME — карта + СБП на одной странице виджета.
-        # Задать пустым, чтобы вернуться к дефолту lava (SMART_GLOCAL, карта).
-        "payment_provider": os.getenv("LAVA_TOP_PAYMENT_PROVIDER", "PAY2ME"),
+        **method,
     }

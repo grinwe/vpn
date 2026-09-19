@@ -55,6 +55,61 @@
 > Тесты на все фиксы — в `test_payments_lava_top.py` /
 > `test_auditfix_api_payments_py.py`.
 
+## Инцидент 2026-09-19: карта у PAY2ME закрыта → две кнопки вместо одной
+
+**Симптом.** Все счета lava падали: create отвечал HTTP 400 «Restricted
+payment method type», человек в кабинете видел «Не удалось создать счёт:
+502». Последний успешный платёж lava — **24.08**, за весь сентябрь платежей
+картой/СБП нет ни одного.
+
+**Причина.** Мы слали единый счёт «Карта РФ / СБП»: `paymentProvider=PAY2ME`
+и намеренно **без** `paymentMethod` — агрегатор сам давал выбрать способ на
+своей странице. lava закрыл у PAY2ME приём карт, а без явного метода PAY2ME
+берёт карту по умолчанию → отбой на каждом счёте, включая тех, кто хотел СБП.
+
+**Матрица, снятая живыми запросами с прод-ключом:**
+
+| тело create | ответ |
+|---|---|
+| `paymentProvider=PAY2ME`, метод не указан | 400 «Restricted payment method type» |
+| `PAY2ME` + `paymentMethod=CARD` | 400 «Restricted payment method type» |
+| `PAY2ME` + `paymentMethod=SBP` | 201 |
+| `SMART_GLOCAL` (+ `paymentMethod=CARD`) | 201 |
+
+**Решение (вариант владельца «две кнопки»).** Интеграция lava остаётся одна —
+один API-ключ, один `offerId`, один секрет и один вебхук-URL
+`/api/payments/webhook/lava_top`. Разведены только **имена провайдера**, и
+способ теперь шлётся ЯВНО:
+
+| имя провайдера | эквайрер (env) | `paymentMethod` | подпись кнопки |
+|---|---|---|---|
+| `lava_top` | `LAVA_TOP_CARD_PROVIDER`, дефолт `SMART_GLOCAL` | `CARD` | 💳 Карта РФ |
+| `lava_top_sbp` | `LAVA_TOP_SBP_PROVIDER`, дефолт `PAY2ME` | `SBP` | 🏦 СБП |
+
+Что из этого следует по коду:
+
+- `get_provider` (`services/payments/base.py`) знает оба имени и поднимает
+  один и тот же `LavaTopProvider` через `load_lava_top_env("card"|"sbp")`;
+  имя инстанса подменяется на выбранное (`Payment.provider`).
+- `LAVA_TOP_PAYMENT_PROVIDER` **больше не читается** — удалена из
+  `docker-compose.yml` и `env.j2`. Старые строки `Payment` с именем
+  `lava_top` остаются валидными: имя карточной кнопки не менялось.
+- Вебхук приходит на `/webhook/lava_top`, а строка СБП-платежа записана как
+  `lava_top_sbp` → `api/payments.py` ищет pending-платежи по **семейству**
+  имён `LavaTopProvider.family = ("lava_top", "lava_top_sbp")`, а тик сверки
+  в `worker.py` фильтрует по тому же кортежу (`_LAVA_PROVIDERS`).
+- Точки выбора способа: бот — `PAYMENT_PROVIDER_CHOICES`
+  (`telegram_stars,lava_top_sbp,lava_top`, `group_vars/web/main.yml`);
+  кабинет — `TopupModal` (`Home.tsx`) и `TopupHintSheet` (`Plans.tsx`);
+  страница `?fix=1` — «Продлить по СБП…» (`&pay=sbp` → `SUB_FIX_SBP_PROVIDER`,
+  дефолт `lava_top_sbp`) и «Продлить картой…» (`&pay=1` → `SUB_FIX_PROVIDER`,
+  дефолт `lava_top`).
+
+**Диагностика на будущее** (runbook, §6): 400 «Restricted payment method
+type» = у эквайрера закрыт этот способ, а не проблема ключа/суммы. Проверять
+`POST /api/v3/invoice` прод-ключом с ЯВНЫМ `paymentMethod` по каждому
+эквайреру и смотреть, какая пара ещё отвечает 201.
+
 ## Контекст
 
 Платёжная подсистема уже принимает автоматические платежи: CryptoBot (USDT),
@@ -80,7 +135,7 @@ Lava.top не ложится в generic_sbp (другая схема create: `of
 |---|---|
 | Оператор | LAVALANE LTD, Кипр (HE 387079); продавец-физлицо ок, ИП/самозанятость не нужны; KYC по паспорту для вывода |
 | Комиссия | 8% с продажи |
-| Валюты/методы | RUB: карты МИР/Visa/MC банков РФ + СБП (провайдеры SMART_GLOCAL, PAY2ME); USD/EUR: зарубежные карты/PayPal |
+| Валюты/методы | RUB: карты МИР/Visa/MC банков РФ + СБП (провайдеры SMART_GLOCAL, PAY2ME); USD/EUR: зарубежные карты/PayPal. **2026-09: карта у PAY2ME закрыта — см. «Инцидент 2026-09-19»** |
 | Динамическая сумма | POST `/api/v3/invoice` с полем `amount` — только для продукта с включённым в кабинете режимом **«Цена по запросу через API»** (`offerId` обязателен всегда). Лимиты: 50–1 000 000 ₽ |
 | Auth API | Заголовок `X-Api-Key` (кабинет → Интеграции → Public API); rate limit 50 rps |
 | Вебхук | **HMAC-подписи НЕТ.** Basic или свой статический секрет в заголовке `X-Api-Key` (настраивается в кабинете). Payload: `eventType, contractId, amount, currency, status, buyer.email, clientUtm`. Успех: `payment.success` + `status=completed`. До 20 попыток доставки (1s/5s/15s, ~11×1мин, 5×1ч). Исходящий IP `158.160.60.174` |

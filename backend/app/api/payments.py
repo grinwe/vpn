@@ -374,7 +374,10 @@ async def payment_webhook(
         #      последнюю любую, сохраняя прежнее поведение.
         base_q = db.query(models.Payment).filter(
             models.Payment.invoice_id == invoice_id,
-            models.Payment.provider == provider.name,
+            # Семейство имён (lava_top / lava_top_sbp делят один вебхук-URL и
+            # один API-ключ): вебхук приходит на /webhook/lava_top, а строка
+            # СБП-платежа записана как lava_top_sbp.
+            models.Payment.provider.in_(getattr(provider, "family", (provider.name,))),
         )
         pending_payments = (
             base_q.filter(models.Payment.status == models.PaymentStatus.pending)
@@ -383,26 +386,48 @@ async def payment_webhook(
         )
         prov_ext_id = _provider_invoice_id_from_event(event)
         pending_payment = None
+        # Пришёл ли платёж по контракту, которого у нас нет ни в одной строке
+        # (при известном id провайдера). Для уже оплаченного счёта это и есть
+        # вторая оплата.
+        unknown_contract = False
         if prov_ext_id:
             pending_payment = next(
                 (p for p in pending_payments if p.external_id == prov_ext_id), None
             )
-        if pending_payment is None:
+            if pending_payment is None:
+                # Id провайдера известен, но среди pending его нет: это либо
+                # ретрай уже зачтённого платежа (строка paid) — берём ЕЁ, либо
+                # неизвестный контракт — тогда чужую строку не трогаем. Раньше
+                # здесь падали на «последнюю pending», и с двумя именами lava
+                # (lava_top / lava_top_sbp на одном счёте) ретрай помечал paid
+                # неоплаченную строку соседнего способа (ревью 2026-09-19).
+                pending_payment = (
+                    base_q.filter(models.Payment.external_id == prov_ext_id)
+                    .order_by(models.Payment.id.desc())
+                    .first()
+                )
+                unknown_contract = pending_payment is None
+        else:
+            # Id провайдера из события не извлёкся — прежнее поведение:
+            # последняя pending, иначе последняя любая (ретрай).
             pending_payment = pending_payments[0] if pending_payments else None
-        if pending_payment is None:
-            pending_payment = base_q.order_by(models.Payment.id.desc()).first()
+            if pending_payment is None:
+                pending_payment = base_q.order_by(models.Payment.id.desc()).first()
         payment_id = pending_payment.id if pending_payment else None
 
-        # Детект двойной оплаты: счёт уже paid, но пришёл НОВЫЙ платёж
-        # (свежая pending-строка — обычно другой способ из меню Stage 9b,
-        # оплаченный вторым). _mark_invoice_paid_core молча зачтёт его без
-        # повторного провижининга — деньги списаны дважды за один счёт,
-        # поэтому зовём оператора на возврат. Ретрай того же вебхука сюда не
-        # попадает: он матчит уже-paid строку (не pending) → case 3.
-        if (
-            invoice.status == models.InvoiceStatus.paid
-            and pending_payment is not None
-            and pending_payment.status == models.PaymentStatus.pending
+        # Детект двойной оплаты: счёт уже paid, но пришёл НОВЫЙ платёж —
+        # по ещё живой pending-строке (обычно другой способ из меню Stage 9b,
+        # оплаченный вторым) или по контракту, которого у нас нет вовсе.
+        # _mark_invoice_paid_core молча зачтёт его без повторного
+        # провижининга — деньги списаны дважды за один счёт, поэтому зовём
+        # оператора на возврат. Ретрай того же вебхука сюда не попадает: он
+        # матчит уже-paid строку по external_id.
+        if invoice.status == models.InvoiceStatus.paid and (
+            unknown_contract
+            or (
+                pending_payment is not None
+                and pending_payment.status == models.PaymentStatus.pending
+            )
         ):
             from ..services.admin_notify import notify_admins
 

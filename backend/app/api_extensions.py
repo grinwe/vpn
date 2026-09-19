@@ -1265,14 +1265,17 @@ def sub_fix_action(
         # Глобальный бан закрывает ВСЕ действия страницы, включая оплату и
         # обратную связь — как у бота (мидлвара дропает апдейты).
         return sub_fix.render_inactive(found.sub, token, banned=True)
-    if pay == "1":
+    if pay in ("1", "sbp"):
         if not sub_fix.pay_enabled():
             return sub_fix.render_start(
                 found.sub, token,
                 device_name=_device_label(found),
                 repairable=not found.is_legacy,
             )
-        return sub_fix.do_pay(db, found, token)
+        # pay=1 — карта (lava_top), pay=sbp — СБП (lava_top_sbp).
+        return sub_fix.do_pay(
+            db, found, token, method="sbp" if pay == "sbp" else "card"
+        )
     if report is not None:
         return sub_fix.do_feedback(
             db, found, token,

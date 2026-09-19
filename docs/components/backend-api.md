@@ -63,7 +63,7 @@ Middleware порядок:
 Большинство роутов сидят под `Depends(require_admin)`. Исключения:
 
 - **Scoped endpoints** под `require_scope(...)` — всё, что касается probe/traffic: `/api/nodes/{id}/probes` (write), `/api/probes/targets` (read), `/api/nodes/{id}/traffic` (write). Эти вызываются с нод c помощью `X-Api-Token`.
-- **Webhooks** `/api/payments/webhook/{provider_name}` — НЕ требуют admin-token, они авторизуются самим провайдером через HMAC-подпись. См. `components/payments.md`.
+- **Webhooks** `/api/payments/webhook/{provider_name}` — НЕ требуют admin-token, они авторизуются самим провайдером через HMAC-подпись. Pending-платёж ищется по **семейству** имён провайдера (`provider.family`, фолбэк — одно `provider.name`): у lava одна интеграция и один вебхук-URL `/webhook/lava_top`, но два имени в `Payment.provider` — `lava_top` (карта) и `lava_top_sbp` (СБП). См. `components/payments.md`.
 - **`/api/healthz`** — public (liveness/readiness).
 
 Ключевая вспомогательная функция — `_mark_invoice_paid_core` (`api/invoices.py:61`). Именно её дёргают и admin, и webhook'и; она берёт `SELECT FOR UPDATE` на `Invoice`, проверяет статус, при `kind='topup'` идёт в `services.balance.topup()`, при `kind='subscription'` — в `ProvisioningOrchestrator`. Webhook из `api/payments.py` импортирует её напрямую (`from .invoices import _mark_invoice_paid_core`).
@@ -248,8 +248,13 @@ HTML-страница «починить и продлить», иначе (VPN-
   `services/self_repair.py`. POST, а не GET, чтобы префетчеры браузера не
   жгли конечный шаг лестницы; nonce = CSRF (HMAC от `APP_SECRET_KEY`,
   окно 15 мин); лимит `6/minute;30/hour` по ТОКЕНУ (не по IP — CGNAT; до 2026-09-13 было `2/minute;6/hour`, не хватало на трёхшаговый сценарий починка → оператор → «помогло?»).
-* POST `…&pay=1` — счёт на продление (провайдер пинится `SUB_FIX_PROVIDER`)
-  и 303 на оплату; возврат — на `?fix=1&paid=<invoice_id>`.
+* POST `…&pay=1` — счёт на продление **картой** (провайдер пинится
+  `SUB_FIX_PROVIDER`, дефолт `lava_top`) и 303 на оплату; возврат — на
+  `?fix=1&paid=<invoice_id>`.
+* POST `…&pay=sbp` — то же самое, но **по СБП** (`SUB_FIX_SBP_PROVIDER`,
+  дефолт `lava_top_sbp`). Две кнопки вместо одной «Карта РФ / СБП» с
+  2026-09-19: lava закрыл карту у агрегатора PAY2ME, способ приходится
+  выбирать до создания счёта (`docs/PLAN_LAVA_TOP.md`).
 * POST `…&report=<report_id>[&op=<оператор|skip>][&still=1][&ok=1]` —
   обратная связь по уже сделанной починке (`sub_fix.do_feedback`): оператор
   связи, «✅ всё работает» (`outcome=ok`) и «❌ всё равно не работает»
@@ -270,7 +275,8 @@ POST приходит по URL, и защита в слое отображени
 / `_daily_max` — тонкие обёртки над общей политикой ядра
 (`SELF_REPAIR_THROTTLE_SEC` / `SELF_REPAIR_DAILY_MAX` с fallback на `SUB_FIX_*`),
 одной на все каналы. Флаги: `SUB_FIX_PAGE`, `SUB_FIX_PAY`, `SUB_FIX_ENTRYPOINTS`,
-`SUB_FIX_THROTTLE_SEC`, `SUB_FIX_DAILY_MAX`, `SUB_FIX_PROVIDER` — см.
+`SUB_FIX_THROTTLE_SEC`, `SUB_FIX_DAILY_MAX`, `SUB_FIX_PROVIDER`,
+`SUB_FIX_SBP_PROVIDER` — см.
 `operations/env-reference.md` и эпик `operations/sub_fix_epic_2026_07_29.md`.
 
 ### ⚠️ Sub-link invariant (НЕ ТРОГАТЬ)

@@ -104,20 +104,37 @@ def test_lava_top_create_invoice_happy_path() -> None:
     assert body["amount"] == 299.0
     # round-trip нашего invoice_id — единственный сквозной канал.
     assert body["clientUtm"] == {"utm_content": "42"}
-    # По умолчанию paymentProvider не задан (дефолт lava) в этом фикстуре.
+    # Голый конструктор (без payment_provider/payment_method) — ничего не
+    # шлём: дефолт lava (SMART_GLOCAL + карта). Прод-имена собираются через
+    # get_provider(...) — см. секцию «две сущности одной интеграции» ниже.
     assert "paymentProvider" not in body
+    assert "paymentMethod" not in body
 
 
-def test_lava_top_create_sends_payment_provider_for_sbp() -> None:
-    # PAY2ME даёт карту+СБП; paymentMethod НЕ шлём (пусть агрегатор
-    # предложит выбор на своей странице → одна кнопка «Карта РФ / СБП»).
-    prov = _lava(payment_provider="pay2me")
+def test_lava_top_create_sends_payment_provider_and_method_for_sbp() -> None:
+    # 2026-09-19: lava закрыл карту у PAY2ME, а без paymentMethod агрегатор
+    # берёт карту по умолчанию → 400 «Restricted payment method type».
+    # Поэтому способ шлём ЯВНО вместе с эквайрером (оба нормализованы к upper).
+    prov = _lava(payment_provider="pay2me", payment_method="sbp")
     prov._session = _FakeSession(  # type: ignore[assignment]
         _FakeResponse({"id": "c1", "paymentUrl": "https://p"}, status_code=201)
     )
     prov.create_invoice(invoice_id=7, amount=100.0, currency="RUB")
     body = prov._session.last_call["json"]  # type: ignore[attr-defined]
-    assert body["paymentProvider"] == "PAY2ME"  # нормализован к upper
+    assert body["paymentProvider"] == "PAY2ME"
+    assert body["paymentMethod"] == "SBP"
+
+
+def test_lava_top_create_omits_method_when_not_given() -> None:
+    # Пустой/отсутствующий payment_method → ключа в теле нет вовсе (а не
+    # paymentMethod=None/""): lava на такое отвечает 400.
+    prov = _lava(payment_provider="smart_glocal", payment_method="  ")
+    prov._session = _FakeSession(  # type: ignore[assignment]
+        _FakeResponse({"id": "c1", "paymentUrl": "https://p"}, status_code=201)
+    )
+    prov.create_invoice(invoice_id=7, amount=100.0, currency="RUB")
+    body = prov._session.last_call["json"]  # type: ignore[attr-defined]
+    assert body["paymentProvider"] == "SMART_GLOCAL"
     assert "paymentMethod" not in body
 
 
@@ -467,23 +484,148 @@ def test_tribute_webhook_non_object_body_raises_not_crashes() -> None:
 # ===========================================================================
 
 
-def test_get_provider_lava_top_requires_env(monkeypatch) -> None:
-    for var in (
-        "LAVA_TOP_API_KEY",
-        "LAVA_TOP_OFFER_ID",
-        "LAVA_TOP_WEBHOOK_SECRET",
-        "LAVA_TOP_EMAIL_DOMAIN",
-    ):
-        monkeypatch.delenv(var, raising=False)
-    with pytest.raises(ProviderError, match="LAVA_TOP_API_KEY"):
-        get_provider("lava_top")
+_LAVA_REQUIRED_ENV = (
+    "LAVA_TOP_API_KEY",
+    "LAVA_TOP_OFFER_ID",
+    "LAVA_TOP_WEBHOOK_SECRET",
+    "LAVA_TOP_EMAIL_DOMAIN",
+)
+# Переменные, выбирающие эквайрера: новые (по способу) и старая единая.
+_LAVA_ACQUIRER_ENV = (
+    "LAVA_TOP_CARD_PROVIDER",
+    "LAVA_TOP_SBP_PROVIDER",
+    "LAVA_TOP_PAYMENT_PROVIDER",
+)
 
+
+def _lava_env(monkeypatch) -> None:
+    """Полный набор обязательных LAVA_TOP_* и чистые переменные эквайрера."""
     monkeypatch.setenv("LAVA_TOP_API_KEY", "k")
     monkeypatch.setenv("LAVA_TOP_OFFER_ID", "o")
     monkeypatch.setenv("LAVA_TOP_WEBHOOK_SECRET", "s")
     monkeypatch.setenv("LAVA_TOP_EMAIL_DOMAIN", "d.example")
+    for var in _LAVA_ACQUIRER_ENV:
+        monkeypatch.delenv(var, raising=False)
+
+
+def _create_body(prov) -> dict:
+    """Тело POST /api/v3/invoice, которое провайдер отправил бы в lava."""
+    prov._session = _FakeSession(
+        _FakeResponse({"id": "c1", "paymentUrl": "https://p"}, status_code=201)
+    )
+    prov.create_invoice(invoice_id=7, amount=100.0, currency="RUB")
+    return prov._session.last_call["json"]
+
+
+@pytest.mark.parametrize("name", ["lava_top", "lava_top_sbp"])
+def test_get_provider_lava_top_requires_env(monkeypatch, name) -> None:
+    # Оба имени — одна интеграция: ключ, offerId, секрет и домен общие, и
+    # недонастроенный провайдер падает сразу на get_provider, а не на вебхуке.
+    for var in _LAVA_REQUIRED_ENV:
+        monkeypatch.delenv(var, raising=False)
+    with pytest.raises(ProviderError, match="LAVA_TOP_API_KEY"):
+        get_provider(name)
+
+    _lava_env(monkeypatch)
+    prov = get_provider(name)
+    assert prov.name == name
+
+
+# ===========================================================================
+# Две сущности одной интеграции: lava_top (карта) и lava_top_sbp (СБП)
+# ===========================================================================
+#
+# 2026-09-19: lava закрыл карту у агрегатора PAY2ME, единая кнопка
+# «Карта РФ / СБП» (PAY2ME без paymentMethod) стала падать с 400 «Restricted
+# payment method type». Теперь имени два, и каждое шлёт эквайрера И способ.
+
+
+def test_get_provider_lava_top_is_card_via_smart_glocal(monkeypatch) -> None:
+    from app.services.payments.lava_top import LAVA_FAMILY
+
+    _lava_env(monkeypatch)
     prov = get_provider("lava_top")
     assert prov.name == "lava_top"
+    assert prov.family == LAVA_FAMILY == ("lava_top", "lava_top_sbp")
+
+    body = _create_body(prov)
+    assert body["paymentProvider"] == "SMART_GLOCAL"
+    assert body["paymentMethod"] == "CARD"
+    # Общие реквизиты интеграции.
+    assert body["offerId"] == "o"
+    assert prov._session.last_call["headers"]["X-Api-Key"] == "k"
+
+
+def test_get_provider_lava_top_sbp_is_sbp_via_pay2me(monkeypatch) -> None:
+    _lava_env(monkeypatch)
+    prov = get_provider("lava_top_sbp")
+    assert prov.name == "lava_top_sbp"
+    # Семейство общее с картой: по нему вебхук/сверка находят Payment-строки
+    # обоих имён (вебхук-URL у lava один — /webhook/lava_top).
+    assert prov.family == get_provider("lava_top").family
+    assert "lava_top" in prov.family and "lava_top_sbp" in prov.family
+
+    body = _create_body(prov)
+    assert body["paymentProvider"] == "PAY2ME"
+    assert body["paymentMethod"] == "SBP"
+    assert body["offerId"] == "o"
+    assert prov._session.last_call["headers"]["X-Api-Key"] == "k"
+    # Секрет вебхука тоже общий: СБП-провайдер верифицирует тот же вебхук.
+    ev = prov.verify_webhook(_lava_webhook_body(), {"x-api-key": "s"})
+    assert ev.status == "paid"
+
+
+def test_lava_top_acquirer_env_overrides_are_per_method(monkeypatch) -> None:
+    _lava_env(monkeypatch)
+    monkeypatch.setenv("LAVA_TOP_CARD_PROVIDER", "some_card_acq")
+    monkeypatch.setenv("LAVA_TOP_SBP_PROVIDER", "some_sbp_acq")
+
+    card = _create_body(get_provider("lava_top"))
+    sbp = _create_body(get_provider("lava_top_sbp"))
+    assert card["paymentProvider"] == "SOME_CARD_ACQ"  # upper-нормализация
+    assert card["paymentMethod"] == "CARD"
+    assert sbp["paymentProvider"] == "SOME_SBP_ACQ"
+    assert sbp["paymentMethod"] == "SBP"
+
+
+def test_lava_top_card_provider_env_empty_falls_back_to_lava_default(monkeypatch) -> None:
+    # Пустая переменная = «не слать paymentProvider» (дефолт lava —
+    # SMART_GLOCAL); способ при этом всё равно шлём.
+    _lava_env(monkeypatch)
+    monkeypatch.setenv("LAVA_TOP_CARD_PROVIDER", "")
+    body = _create_body(get_provider("lava_top"))
+    assert "paymentProvider" not in body
+    assert body["paymentMethod"] == "CARD"
+
+
+def test_legacy_lava_top_payment_provider_env_is_ignored(monkeypatch) -> None:
+    # В проде годами стояло LAVA_TOP_PAYMENT_PROVIDER=PAY2ME — именно с ним
+    # карта и сломалась. Старую переменную больше НЕ читаем: карта остаётся
+    # на SMART_GLOCAL, СБП — на PAY2ME, что бы там ни лежало.
+    _lava_env(monkeypatch)
+    monkeypatch.setenv("LAVA_TOP_PAYMENT_PROVIDER", "PAY2ME")
+    card = _create_body(get_provider("lava_top"))
+    assert card["paymentProvider"] == "SMART_GLOCAL"
+    assert card["paymentMethod"] == "CARD"
+
+    monkeypatch.setenv("LAVA_TOP_PAYMENT_PROVIDER", "SMART_GLOCAL")
+    sbp = _create_body(get_provider("lava_top_sbp"))
+    assert sbp["paymentProvider"] == "PAY2ME"
+    assert sbp["paymentMethod"] == "SBP"
+
+
+def test_lava_top_instances_do_not_share_name(monkeypatch) -> None:
+    # name переопределяется на экземпляре, а не на классе: СБП-экземпляр не
+    # должен переименовать карточный (и наоборот) — иначе Payment.provider
+    # у следующего checkout'а получил бы чужое имя.
+    from app.services.payments.lava_top import LavaTopProvider
+
+    _lava_env(monkeypatch)
+    sbp = get_provider("lava_top_sbp")
+    card = get_provider("lava_top")
+    assert sbp.name == "lava_top_sbp"
+    assert card.name == "lava_top"
+    assert LavaTopProvider.name == "lava_top"
 
 
 def test_get_provider_tribute_requires_env(monkeypatch) -> None:

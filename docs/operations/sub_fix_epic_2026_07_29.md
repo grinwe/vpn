@@ -28,7 +28,8 @@ default-deny, whitelist-сценарии). Разрыв круга: домен �
 |---|---|---|---|
 | GET | `https://grn-ssync.pro/<token>?fix=1` | GET /api/sub/{token}?fix=1 | HTML-страница, ничего не пишет в БД |
 | POST | `…?fix=1&n=<nonce>` | POST /api/sub/{token} | шаг лестницы → HTML с результатом |
-| POST | `…?fix=1&n=<nonce>&pay=1` | POST /api/sub/{token} | счёт lava.top → редирект на оплату |
+| POST | `…?fix=1&n=<nonce>&pay=1` | POST /api/sub/{token} | счёт lava.top **картой** → редирект на оплату |
+| POST | `…?fix=1&n=<nonce>&pay=sbp` | POST /api/sub/{token} | счёт lava.top **по СБП** → редирект на оплату (с 2026-09-19) |
 | GET | `…?fix=1&paid=<invoice_id>` | GET /api/sub/{token} | ожидание подтверждения (meta-refresh 5с, без JS) |
 
 **Инфраструктурные посылки — ПРОВЕРЕНЫ вживую 2026-07-29:**
@@ -216,6 +217,8 @@ def handle_broken_device(db, device, *, operator=None, source="bot_vpn_broken",
 | SUB_FIX_PAY | 0 | блок продления на странице |
 | SUB_FIX_THROTTLE_SEC | 120 | окно «уже переключили» для повторного POST |
 | SUB_FIX_DAILY_MAX | 5 | потолок починок source=sub_page на устройство/сутки |
+| SUB_FIX_PROVIDER | lava_top | провайдер кнопки «Продлить картой…» (`&pay=1`) |
+| SUB_FIX_SBP_PROVIDER | lava_top_sbp | провайдер кнопки «Продлить по СБП…» (`&pay=sbp`); env.j2/compose, ansible `deploy_app_stack_sub_fix_sbp_provider` |
 
 ## Верификация
 
@@ -305,6 +308,15 @@ Telegram.** Именно у истёкшей подписки родное пр�
 `t.me`-ссылку CryptoBot — ровно в тот Telegram, недоступность которого и есть
 причина существования страницы. Провайдер теперь пинится (`SUB_FIX_PROVIDER`,
 дефолт `lava_top`).
+
+**Апдейт 2026-09-19: кнопок продления две.** Блок продления рисует «Продлить
+по СБП на N дн. за X ₽» (`&pay=sbp` → `SUB_FIX_SBP_PROVIDER`, дефолт
+`lava_top_sbp`) и «Продлить картой на N дн. за X ₽» (`&pay=1` →
+`SUB_FIX_PROVIDER`, дефолт `lava_top`) — как в боте и кабинете. Единой кнопки
+«карта / СБП» больше нет: lava закрыл карту у агрегатора PAY2ME, счета стали
+падать с 400 «Restricted payment method type», и способ приходится выбирать
+ДО создания счёта (`docs/PLAN_LAVA_TOP.md`, «Инцидент 2026-09-19»). Счёт при
+этом один и тот же, различается только имя провайдера в `Payment.provider`.
 
 🔴 **`db.commit()` в ветке «нет свободной ноды» фиксировал ПОЛУСДЕЛАННЫЙ
 failover** — включая снятый `sub_token`, то есть ломал seamless-alias

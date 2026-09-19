@@ -126,9 +126,27 @@ SBP_<SLUG>_PAID_STATUSES         ← default "paid,success,succeeded"
 Карты РФ (МИР/Visa/MC) + СБП через lava.top (LAVALANE LTD). Полный
 контекст выбора и рисков — `docs/PLAN_LAVA_TOP.md`.
 
-- `create_invoice`: POST `{LAVA_TOP_API_BASE}/api/v3/invoice`, auth-заголовок `X-Api-Key`. Динамическая сумма работает только у продукта с включённым в кабинете режимом «Цена по запросу через API» (`LAVA_TOP_OFFER_ID`); лимиты платформы 50–1 000 000 ₽. Metadata-поля у платформы нет — наш `invoice_id` едет в `clientUtm.utm_content`, а обязательный email покупателя синтезируется как `inv{invoice_id}@{LAVA_TOP_EMAIL_DOMAIN}`. Из ответа: `id` (contractId) → `external_id`, `paymentUrl` → `pay_url`.
+**Одна интеграция — два имени провайдера (2026-09-19).** Драйвер один, но
+`get_provider` поднимает его под двумя именами, и каждое пишется в
+`Payment.provider`:
+
+| имя | эквайрер (`paymentProvider`) | `paymentMethod` | подпись кнопки |
+|---|---|---|---|
+| `lava_top` | `LAVA_TOP_CARD_PROVIDER`, дефолт `SMART_GLOCAL` | `CARD` | 💳 Карта РФ |
+| `lava_top_sbp` | `LAVA_TOP_SBP_PROVIDER`, дефолт `PAY2ME` | `SBP` | 🏦 СБП |
+
+Ключ, `offerId`, секрет вебхука и email-домен общие; вебхук-URL тоже один —
+`/api/payments/webhook/lava_top`. До 2026-09-19 кнопка была одна («Карта РФ /
+СБП»): `paymentProvider=PAY2ME` **без** `paymentMethod`, способ человек
+выбирал на странице агрегатора. lava закрыл у PAY2ME карту, а без метода
+PAY2ME берёт её по умолчанию → create падал с 400 «Restricted payment method
+type» (в кабинете — «Не удалось создать счёт: 502»), и весь сентябрь платежей
+картой/СБП не было. Поэтому способ теперь шлётся ЯВНО, а имена разведены.
+
+- `create_invoice`: POST `{LAVA_TOP_API_BASE}/api/v3/invoice`, auth-заголовок `X-Api-Key`. В теле — `paymentProvider` (эквайрер) и `paymentMethod` (`CARD`/`SBP`) выбранного имени; пустой эквайрер = поле не шлём. Динамическая сумма работает только у продукта с включённым в кабинете режимом «Цена по запросу через API» (`LAVA_TOP_OFFER_ID`); лимиты платформы 50–1 000 000 ₽. Metadata-поля у платформы нет — наш `invoice_id` едет в `clientUtm.utm_content`, а обязательный email покупателя синтезируется как `inv{invoice_id}@{LAVA_TOP_EMAIL_DOMAIN}`. Из ответа: `id` (contractId) → `external_id`, `paymentUrl` → `pay_url`.
 - `verify_webhook`: HMAC у платформы **нет** — она шлёт наш статический секрет `LAVA_TOP_WEBHOOK_SECRET` в заголовке `X-Api-Key` (настраивается в кабинете при добавлении вебхука, тип «API key»). `paid` = `eventType=payment.success` **и** `status ∈ {completed, subscription-active}`; `payment.failed`/`subscription.recurring.payment.failed` → `failed`; остальное → `other`. Событие без `clientUtm.utm_content` (покупка не из нашего backend'а) — warning + `other`/`external_id="0"`, чтобы платформа не ретраила вечно (до 20 попыток).
-- Env-цепочка: `LAVA_TOP_API_KEY`/`_OFFER_ID`/`_WEBHOOK_SECRET` из vault (`vault_lava_top_*`), `LAVA_TOP_EMAIL_DOMAIN` — открытый (default: домен фронта).
+- **Матчинг Payment-строки по семейству имён.** Вебхук приходит на `/webhook/lava_top`, но строка СБП-платежа записана как `lava_top_sbp` — поэтому `api/payments.py` ищет pending-платежи не по `provider == provider.name`, а по `provider.family` (`LavaTopProvider.family = ("lava_top", "lava_top_sbp")`). Тик сверки в `worker.py` фильтрует по тому же кортежу (`_LAVA_PROVIDERS`). Провайдеры без атрибута `family` работают по-старому (одно имя). Порядок выбора строки: при известном `contractId` — только точное совпадение `external_id` (среди pending, иначе среди всех статусов: paid-строка = ретрай, без алерта); контракт, которого нет ни в одной строке, на уже оплаченном счёте = двойная оплата (алерт). Фолбэк «последняя pending» — только когда `contractId` из события не извлёкся. То же правило в сверке воркера (`_alert_stale_lava_sale` и матчинг в `run_lava_reconcile_tick`): брошенная pending-строка второго способа на одном счёте — штатная ситуация, а не «двойная оплата» (ревью 2026-09-19).
+- Env-цепочка: `LAVA_TOP_API_KEY`/`_OFFER_ID`/`_WEBHOOK_SECRET` из vault (`vault_lava_top_*`), `LAVA_TOP_EMAIL_DOMAIN` — открытый (default: домен фронта), `LAVA_TOP_CARD_PROVIDER`/`LAVA_TOP_SBP_PROVIDER` — эквайреры двух имён (дефолты `SMART_GLOCAL`/`PAY2ME`). Старая `LAVA_TOP_PAYMENT_PROVIDER` удалена и не читается.
 - **Авто-сверка (вебхук-независимо).** Доставка вебхуков lava — best-effort (до 20 ретраев по докам; в проде наблюдалось, что POST не приходит вовсе — счёт остаётся pending, деньги списаны). Воркер-тик `run_lava_reconcile_tick` (`worker.py`, интервал `LAVA_TOP_RECONCILE_INTERVAL`, default 60с; TICK_IDS/TIMEOUTS в `queue.py`) раз в минуту зовёт `LavaTopProvider.list_recent_invoices()` (`GET /api/v2/invoices`) и зачисляет любой pending-счёт, чья продажа у lava `COMPLETED` (матч по `clientUtm.utm_content` = наш invoice_id), через тот же `_mark_invoice_paid_core`. Идемпотентно: уже-paid счета пропускаются, а если вебхук всё-таки долетит — дедуп по `reference=invoice:{id}`. **Сверка fail-closed (аудит 2026-07-25):** продажа должна покрывать счёт, валюта продажи обязана совпасть с валютой счёта, а `offerId` — с `LAVA_TOP_OFFER_ID`; если сумму распарсить не удалось (пустой ещё фискальный `receipt`, строковое поле, смена формы ответа — `_sale_amount` пробует `receipt.amount`, `amountTotal`, `amount`), счёт **не зачисляется**, а поднимается `notify_admins(kind="payment_amount_unverified")` — раньше `amount=None` означал «сверка пройдена» и кредитовал счёт целиком. Payment-строка матчится по `contract_id` ↔ `Payment.external_id` (фолбэк — последняя pending), а не слепо «последняя по id DESC». Счёт **не** в статусе `pending` больше не пропускается молча: при живой pending-строке lava это `payment_double_paid` (человек заплатил дважды), иначе `payment_for_inactive_invoice` — при неработающем вебхуке сверка единственный канал, который вообще видит карточные платежи. Так карта пополняет баланс даже при полностью нерабочем вебхуке. No-op без `LAVA_TOP_API_KEY`. **Воркеру для этого прокинуты все `LAVA_TOP_*` в `worker-env`** (docker-compose), иначе `get_provider("lava_top")` в тике вернёт not_configured.
 
 ### Tribute (`tribute.py`, Stage 9b)
@@ -142,7 +160,7 @@ Tribute Shop API (tribute.tg, TRBT Limited): карты (браузерная с
 
 ### Выбор способа оплаты в боте (Stage 9b)
 
-`PAYMENT_PROVIDER_CHOICES` (env бота, comma-separated имена провайдеров): при 2+ значениях бот после создания счёта показывает меню способов («⭐ Telegram Stars / 💳 Карта РФ / …»), checkout происходит в callback'е `payvia:{kind}:{invoice_id}:{provider}` выбранным провайдером. Кнопки способов остаются в клавиатуре после выдачи pay-ссылки — неудавшийся способ (антифрод агрегатора) можно сменить, каждый выбор создаёт свою Payment-строку (#117 матчит оплаченную). Пусто/одно имя — старое поведение (`PAYMENT_PROVIDER` без меню).
+`PAYMENT_PROVIDER_CHOICES` (env бота, comma-separated имена провайдеров): при 2+ значениях бот после создания счёта показывает меню способов (прод 2026-09-19: «⭐ Telegram Stars / 🏦 СБП / 💳 Карта РФ» — `telegram_stars,lava_top_sbp,lava_top`), checkout происходит в callback'е `payvia:{kind}:{invoice_id}:{provider}` выбранным провайдером. Кнопки способов остаются в клавиатуре после выдачи pay-ссылки — неудавшийся способ (антифрод агрегатора) можно сменить, каждый выбор создаёт свою Payment-строку (#117 матчит оплаченную). Пусто/одно имя — старое поведение (`PAYMENT_PROVIDER` без меню).
 
 ## Единый чекаут — `services/payments/checkout.py`
 

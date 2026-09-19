@@ -332,6 +332,8 @@ export interface TopupResponse {
   currency: string;
 }
 
+// provider: "telegram_stars" | "lava_top" (карта РФ) | "lava_top_sbp" (СБП).
+// Бэкенд принимает любое имя провайдера — новые добавляются без правки здесь.
 export async function createTopup(amountKopecks: number, provider = "telegram_stars") {
   return request<TopupResponse>("/api/webapp/topup", {
     method: "POST",
@@ -340,9 +342,10 @@ export async function createTopup(amountKopecks: number, provider = "telegram_st
 }
 
 // Поллит /me, пока баланс не превысит baseline (платёж зачислён вебхуком),
-// либо пока не выйдут попытки. Нужно для внешних платёжных страниц (карта
-// lava_top), у которых — в отличие от Telegram Stars openInvoice — нет
-// синхронного callback. Возвращает true, если зачисление поймано.
+// либо пока не выйдут попытки. Нужно для внешних платёжных страниц (карта РФ
+// lava_top / СБП lava_top_sbp), у которых — в отличие от Telegram Stars
+// openInvoice — нет синхронного callback. Возвращает true, если зачисление
+// поймано.
 export async function pollBalanceIncrease(
   baselineKopecks: number,
   {

@@ -137,7 +137,7 @@
 | Telegram WebApp        | Mini App UX                                        | initData HMAC в `api_webapp.py`                   |
 | CryptoBot              | криптовалютные платежи                             | HTTP + HMAC webhook                               |
 | Generic SBP (bank)     | СБП через банк-агрегатор                           | HTTP + HMAC webhook, конфиг на slug               |
-| Lava.top               | карты РФ (МИР) + СБП, Stage 9b                     | HTTP (`X-Api-Key`) + webhook со статическим секретом; `docs/PLAN_LAVA_TOP.md` |
+| Lava.top               | карты РФ (МИР) + СБП, Stage 9b; одна интеграция — два имени провайдера (`lava_top` = карта, `lava_top_sbp` = СБП) | HTTP (`X-Api-Key`) + webhook со статическим секретом; `docs/PLAN_LAVA_TOP.md` |
 | Tribute                | карты/СБП/Stars через Telegram-экосистему, Stage 9b | Shop API (`Api-Key`) + HMAC webhook (`trbt-signature`) |
 | Hetzner / Vultr / DO / Aeza | provisioning VPN-нод через cloud API          | `backend/app/services/cloud/*.py` — raw `requests`|
 | Cloudflare             | DNS для `grinwer.online`, TLS terminator перед nginx | CF в режиме Full (strict)                         |

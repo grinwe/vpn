@@ -1019,7 +1019,9 @@ function TopupModal({
     }
   }
 
-  async function payCard(amountKopecks: number) {
+  // Внешняя оплата через lava.top: СБП (`lava_top_sbp`) и карта РФ
+  // (`lava_top`). Оба — страница без callback → открываем и поллим баланс.
+  async function payExternal(amountKopecks: number, provider: string) {
     const tg = getTg();
     setBusy(true);
     try {
@@ -1033,7 +1035,7 @@ function TopupModal({
         /* /me не ответил — используем проп-baseline (реальное число) */
       }
       baselineUsedRef.current = baseline;
-      const res = await createTopup(amountKopecks, "lava_top");
+      const res = await createTopup(amountKopecks, provider);
       // Модалку могли закрыть во время await — не открываем внешнюю страницу
       // и не стартуем поллинг постфактум.
       if (!mountedRef.current) return;
@@ -1153,10 +1155,17 @@ function TopupModal({
             </button>
             <button
               disabled={busy}
-              onClick={() => payCard(amount)}
-              className="btn-primary w-full"
+              onClick={() => payExternal(amount, "lava_top_sbp")}
+              className="btn-primary w-full mb-2"
             >
-              💳 Карта РФ / СБП
+              🏦 СБП
+            </button>
+            <button
+              disabled={busy}
+              onClick={() => payExternal(amount, "lava_top")}
+              className="btn-ghost w-full"
+            >
+              💳 Карта РФ
             </button>
             <button
               onClick={() => setAmount(null)}

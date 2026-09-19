@@ -48,7 +48,10 @@ from .keyboards import (
 _PROVIDER_LABELS = {
     "telegram_stars": "⭐ Telegram Stars",
     "stars": "⭐ Telegram Stars",
-    "lava_top": "💳 Карта РФ / СБП",
+    # Одна интеграция lava — два способа (2026-09-19: карта у агрегатора
+    # PAY2ME закрыта, единой кнопки «карта / СБП» больше нет).
+    "lava_top_sbp": "🏦 СБП",
+    "lava_top": "💳 Карта РФ",
     "tribute": "💳 Карта (Tribute)",
     "cryptobot": "🪙 Крипта (USDT)",
 }

@@ -219,6 +219,32 @@ docker compose exec db psql -U vpn -d vpn -c \
   - `docker compose logs backend | grep setWebhook` — webhook зарегистрировался на startup?
 - **Telegram Stars (polling legacy):** Если `BOT_WEBHOOK_PORT=0` — старый поток, webhook форвардится ботом. Смотреть `bot` логи на `successful_payment` event. Проверить `TELEGRAM_STARS_WEBHOOK_SECRET` одинаково в обоих env.
 - **SBP (generic):** webhook может не прийти, если провайдер кладёт его на URL, закрытый nginx'ом или CF WAF'ом. Смотреть `/var/log/nginx/access.log` на хосте — есть ли вообще POST на `/api/payments/webhook/<slug>`.
+- **lava.top (карта `lava_top` / СБП `lava_top_sbp`):** вебхук здесь и так best-effort — основной денежный путь это тик сверки `run_lava_reconcile_tick`, он ищет платёж по ОБОИМ именам. Прежде чем копать вебхук, проверь, что счета вообще СОЗДАЮТСЯ: человек видит «Не удалось создать счёт: 502», в логах бэка — 400 от lava.
+
+**Счёт не создаётся: 400 «Restricted payment method type».** Это не ключ и не
+сумма — у эквайрера закрыт тот способ оплаты, который ушёл в create (так
+2026-09-19 умерла карта у агрегатора PAY2ME и вместе с ней ВСЕ платежи lava,
+включая СБП: без явного `paymentMethod` PAY2ME берёт карту по умолчанию).
+Диагностика — прощупать пары «эквайрер × способ» прод-ключом с ЯВНЫМ
+`paymentMethod`:
+
+```bash
+# amount 50 — минимум платформы; счёт можно не оплачивать
+curl -sS -o /dev/null -w '%{http_code}\n' -X POST https://gate.lava.top/api/v3/invoice \
+  -H "X-Api-Key: ${LAVA_TOP_API_KEY}" -H 'Content-Type: application/json' \
+  -d '{"email":"probe@example.org","offerId":"'"${LAVA_TOP_OFFER_ID}"'","currency":"RUB",
+       "amount":50,"paymentProvider":"PAY2ME","paymentMethod":"SBP"}'
+# 201 — пара живая; 400 «Restricted payment method type» — способ закрыт
+```
+
+Живая пара задаётся переменными `LAVA_TOP_CARD_PROVIDER` /
+`LAVA_TOP_SBP_PROVIDER`. Сейчас в `group_vars/web/main.yml` они не заданы —
+работают дефолты шаблона (`SMART_GLOCAL` / `PAY2ME`, `env.j2`); чтобы сменить
+эквайрера, добавить `deploy_app_stack_lava_top_card_provider` /
+`…_sbp_provider` в `main.yml` и выкатить `--tags app`. Если закрыт весь
+способ — убрать его имя из `deploy_app_stack_payment_provider_choices`, иначе
+кнопка в боте/кабинете ведёт в 502. Контекст — `docs/PLAN_LAVA_TOP.md`,
+«Инцидент 2026-09-19».
 
 **Manual mark paid:** админский путь — через бота `/invoices` → inline-кнопка, или через SPA. Это триггерит `_mark_invoice_paid_core`, который сделает branch-specific логику (topup vs renewal vs new_subscription). См. `components/payments.md`.
 

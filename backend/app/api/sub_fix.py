@@ -88,15 +88,17 @@ def _daily_max() -> int:
     return self_repair.default_daily_max()
 
 
-def pay_provider() -> str:
+def pay_provider(method: str = "card") -> str:
     """Каким провайдером платит человек СО СТРАНИЦЫ.
 
     Пинить обязательно: без явного имени ``get_provider`` берёт провайдера из
     общей ротации, а её дефолт в проде — cryptobot. Страница существует ровно
     для того, у кого нет Telegram и, скорее всего, нет криптокошелька: он
-    пришёл платить картой. Дефолт lava.top — единственный карточный провайдер
-    без Telegram (Stars внутри Telegram платить нельзя по определению).
+    пришёл платить картой или по СБП. ``card`` → ``SUB_FIX_PROVIDER``
+    (дефолт lava_top), ``sbp`` → ``SUB_FIX_SBP_PROVIDER`` (дефолт lava_top_sbp).
     """
+    if method == "sbp":
+        return (os.getenv("SUB_FIX_SBP_PROVIDER") or "lava_top_sbp").strip() or "lava_top_sbp"
     return (os.getenv("SUB_FIX_PROVIDER") or "lava_top").strip() or "lava_top"
 
 
@@ -391,8 +393,17 @@ def _renew_button(sub, token: str) -> str:
     days = sub.plan.duration_days if sub.plan else 0
     if rub <= 0:
         return ""
-    label = f"Продлить на {days} дн. за {rub:g} ₽"
-    button = _button_form(token, label, extra="&pay=1", secondary=True)
+    # Две кнопки, как в кабинете и боте: СБП (lava_top_sbp) и карта
+    # (lava_top). Единой «карта / СБП» больше нет — lava закрыл карту у
+    # агрегатора PAY2ME (2026-09-19).
+    button = _button_form(
+        token, f"Продлить по СБП на {days} дн. за {rub:g} ₽",
+        extra="&pay=sbp", secondary=True,
+    )
+    button += _button_form(
+        token, f"Продлить картой на {days} дн. за {rub:g} ₽",
+        extra="&pay=1", secondary=True,
+    )
     # Сумма выше цены плана — значит в ней доплата за дополнительные
     # устройства. Без расшифровки человек видит цифру, не совпадающую с
     # тарифом, и решает, что мы ошиблись.
@@ -798,11 +809,15 @@ def do_feedback(
     return render_feedback_prompt(token, report.id)
 
 
-def do_pay(db: Session, found, token: str) -> HTMLResponse | RedirectResponse:
+def do_pay(
+    db: Session, found, token: str, *, method: str = "card"
+) -> HTMLResponse | RedirectResponse:
     """POST-продление: счёт у провайдера и редирект на оплату.
 
     Всё денежное — в общем хелпере (services/payments/checkout.py): сумма со
-    слотами, конвертация валют, реюз pay_url при повторном тапе.
+    слотами, конвертация валют, реюз pay_url при повторном тапе. ``method`` —
+    ``card`` (``?pay=1``) или ``sbp`` (``?pay=sbp``); счёт на продление один,
+    Payment-строка у каждого способа своя.
     """
     from ..services.balance import total_renewal_cost_kopecks
     from ..services.payments import ProviderError
@@ -840,7 +855,7 @@ def do_pay(db: Session, found, token: str) -> HTMLResponse | RedirectResponse:
     try:
         result = checkout_pending_invoice(
             db, invoice,
-            provider_name=pay_provider(),
+            provider_name=pay_provider(method),
             # Куда провайдер вернёт человека после оплаты. Без этого экран
             # «проверяем оплату» был бы недостижим: страница ждёт
             # подтверждения (вебхуки lava не долетают, работает тик сверки),

@@ -7,8 +7,11 @@ external_id; раньше paid всегда получала последняя,
 провайдером по external_id расходилась.
 
 Матчинг идёт по provider invoice id, извлечённому из ``event.raw``
-(``event.external_id`` — это НАШ внутренний invoice id, а не id провайдера),
-с фолбэком на «последнюю pending».
+(``event.external_id`` — это НАШ внутренний invoice id, а не id провайдера).
+Фолбэк на «последнюю pending» — только когда id провайдера из события
+извлечь не удалось: при известном id без совпадения чужую строку не трогаем
+(ревью 2026-09-19 — с двумя именами lava на одном счёте ретрай помечал paid
+неоплаченную строку соседнего способа).
 """
 from __future__ import annotations
 
@@ -110,9 +113,11 @@ def test_webhook_marks_the_actually_paid_payment(client, db_session, monkeypatch
     assert other_p.status == models.PaymentStatus.pending
 
 
-def test_webhook_falls_back_to_latest_pending(client, db_session, monkeypatch):
-    """Если provider invoice id из события не совпал ни с одной строкой,
-    берём последнюю pending (прежнее поведение)."""
+def test_webhook_unmatched_provider_id_marks_no_row(client, db_session, monkeypatch):
+    """Provider invoice id из события известен, но не совпал ни с одной
+    строкой: счёт зачисляем (деньги пришли, подпись валидна), а pending-строки
+    НЕ трогаем — у них другие контракты, и «последняя pending» была бы
+    неоплаченной строкой другого способа (до 2026-09-19 брали именно её)."""
     fake = _CryptoLikeProvider("cryptobot")
     monkeypatch.setattr("app.api.payments.get_provider", lambda name=None: fake)
 
@@ -129,6 +134,30 @@ def test_webhook_falls_back_to_latest_pending(client, db_session, monkeypatch):
             "status": "paid",
             "provider_invoice_id": "ZZZ",  # не совпадает ни с одной
         },
+    )
+    assert resp.status_code == 200, resp.text
+
+    db_session.expire_all()
+    assert invoice.status == models.InvoiceStatus.paid
+    assert latest_p.status == models.PaymentStatus.pending
+    assert first_p.status == models.PaymentStatus.pending
+
+
+def test_webhook_falls_back_to_latest_pending_without_provider_id(client, db_session, monkeypatch):
+    """Provider invoice id из события извлечь не удалось — различить строки
+    нечем, берём последнюю pending (прежнее поведение)."""
+    fake = _CryptoLikeProvider("cryptobot")
+    monkeypatch.setattr("app.api.payments.get_provider", lambda name=None: fake)
+
+    user = make_user(db_session)
+    invoice = _make_invoice(db_session, user, amount=150.0, currency="RUB")
+
+    first_p = _make_payment(db_session, invoice, external_id="AAA")
+    latest_p = _make_payment(db_session, invoice, external_id="BBB")
+
+    resp = client.post(
+        "/api/payments/webhook/cryptobot",
+        json={"invoice_id": invoice.id, "status": "paid"},  # без provider_invoice_id
     )
     assert resp.status_code == 200, resp.text
 

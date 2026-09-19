@@ -295,8 +295,8 @@ export default function Plans({ onActivated, subLinkBase, me, changeSubscription
       // будущие топапы (`if(topupState)return`).
       if (payGenRef.current !== myGen) return;
       if (provider !== "telegram_stars") {
-        // Карта: внешняя страница без callback — открываем и поллим баланс,
-        // пока вебхук lava_top не зачислит (карта дольше Stars).
+        // Карта/СБП: внешняя страница без callback — открываем и поллим баланс,
+        // пока вебхук lava_top / lava_top_sbp не зачислит (дольше Stars).
         openExternalUrl(tg, res.pay_url);
         setTopupState("crediting");
         const credited = await pollBalanceIncrease(baseline, {
@@ -628,11 +628,18 @@ function TopupHintSheet({
               ⭐ Telegram Stars
             </button>
             <button
+              onClick={() => onPay(suggested, "lava_top_sbp")}
+              disabled={busy}
+              className="btn-primary w-full mb-2"
+            >
+              🏦 СБП
+            </button>
+            <button
               onClick={() => onPay(suggested, "lava_top")}
               disabled={busy}
-              className="btn-primary w-full"
+              className="btn-ghost w-full"
             >
-              💳 Карта РФ / СБП
+              💳 Карта РФ
             </button>
           </>
         )}

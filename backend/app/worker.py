@@ -335,30 +335,54 @@ def _notify_admins_safe(
         logger.exception("lava_reconcile: не удалось отправить алерт %s", kind)
 
 
+# Имена Payment.provider одной интеграции lava: карта и СБП (2026-09-19).
+from .services.payments.lava_top import LAVA_FAMILY as _LAVA_PROVIDERS  # noqa: E402
+
+
 def _alert_stale_lava_sale(session, invoice, sale: dict) -> None:
     """COMPLETED-продажа по счёту, который уже НЕ pending.
 
     Два разных случая, и оба до 2026-07-25 были невидимы:
-    * счёт уже ``paid``, а по нему висит ЖИВАЯ pending-строка lava-платежа —
-      значит человек заплатил второй раз (двойная оплата, деньги надо вернуть);
+    * счёт уже ``paid``, а продажа — по контракту, который мы НЕ зачитывали
+      (его строка ещё pending или его у нас нет вовсе) — значит человек
+      заплатил второй раз (двойная оплата, деньги надо вернуть);
     * счёт ``cancelled``/``expired``, а платёж прошёл — деньги списаны за
       неактивный счёт.
+
+    Дискриминатор — контракт продажи, а не «любая живая pending-строка»:
+    с двумя именами lava (карта и СБП) на одном счёте штатно висит
+    брошенная pending-строка второго способа, и по ней прежняя проверка
+    слала ложный «двойная оплата» раз в сутки (ревью 2026-09-19).
     """
     from . import models
 
     contract_id = str(sale.get("contract_id") or "").strip()
     if invoice.status == models.InvoiceStatus.paid:
-        duplicate = (
-            session.query(models.Payment)
-            .filter(
-                models.Payment.invoice_id == invoice.id,
-                models.Payment.provider == "lava_top",
-                models.Payment.status == models.PaymentStatus.pending,
+        if contract_id:
+            own = (
+                session.query(models.Payment)
+                .filter(
+                    models.Payment.invoice_id == invoice.id,
+                    models.Payment.provider.in_(_LAVA_PROVIDERS),
+                    models.Payment.external_id == contract_id,
+                )
+                .order_by(models.Payment.id.desc())
+                .first()
             )
-            .first()
-        )
-        if duplicate is None:
-            return  # штатная идемпотентность: наш же платёж уже зачтён
+            if own is not None and own.status != models.PaymentStatus.pending:
+                return  # штатная идемпотентность: наш же платёж уже зачтён
+        else:
+            duplicate = (
+                session.query(models.Payment)
+                .filter(
+                    models.Payment.invoice_id == invoice.id,
+                    models.Payment.provider.in_(_LAVA_PROVIDERS),
+                    models.Payment.status == models.PaymentStatus.pending,
+                )
+                .first()
+            )
+            if duplicate is None:
+                return  # штатная идемпотентность: наш же платёж уже зачтён
         text = (
             f"⚠️ lava.top: счёт #{invoice.id} уже оплачен, но пришла ещё одна "
             f"завершённая продажа {contract_id or '?'} — похоже на ДВОЙНУЮ оплату. "
@@ -699,18 +723,21 @@ def run_lava_reconcile_tick() -> dict:
                     session.query(models.Payment)
                     .filter(
                         models.Payment.invoice_id == inv_id,
-                        models.Payment.provider == "lava_top",
+                        models.Payment.provider.in_(_LAVA_PROVIDERS),
                         models.Payment.external_id == contract_id,
                     )
                     .order_by(models.Payment.id.desc())
                     .first()
                 )
-            if pending_payment is None:
+            if pending_payment is None and not contract_id:
+                # Фолбэк «последняя pending» — только когда контракта в
+                # продаже нет вовсе. При известном contract_id без совпадения
+                # чужую строку (другой способ того же счёта) не трогаем.
                 pending_payment = (
                     session.query(models.Payment)
                     .filter(
                         models.Payment.invoice_id == inv_id,
-                        models.Payment.provider == "lava_top",
+                        models.Payment.provider.in_(_LAVA_PROVIDERS),
                         models.Payment.status == models.PaymentStatus.pending,
                     )
                     .order_by(models.Payment.id.desc())
