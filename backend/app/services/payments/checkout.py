@@ -31,6 +31,55 @@ from . import ProviderError, get_provider
 logger = logging.getLogger("app.services.payments.checkout")
 
 
+# Что видит человек, когда провайдер не смог выписать счёт. Сырой текст
+# провайдера («HTTP 400: Restricted payment method type», «non-JSON response:
+# no available server») раньше уходил в диалог кабинета как есть — юзеру он
+# бесполезен, а админ его не видел вовсе: карта лежала три недели, пока
+# владелец не прислал скриншот (2026-09-19). Теперь наоборот: человеку —
+# понятная фраза, админу — пуш с сырой ошибкой.
+PROVIDER_UNAVAILABLE_MESSAGE = (
+    "Платёжный сервис временно недоступен. Попробуй через минуту или "
+    "другой способ оплаты."
+)
+
+
+def report_provider_failure(
+    db: Session,
+    exc: Exception,
+    *,
+    provider_name: str | None,
+    invoice_id: int | None,
+) -> str:
+    """Залогировать и запушить админам сбой создания счёта; вернуть текст
+    для пользователя.
+
+    Дедуп пуша — час на провайдера: один секундный провал балансировщика =
+    один пуш, а не по пушу на каждый тап всех пользователей.
+    """
+    from ..admin_notify import notify_admins
+
+    name = provider_name or "?"
+    logger.warning(
+        "checkout: provider %s failed for invoice %s: %s", name, invoice_id, exc
+    )
+    try:
+        notify_admins(
+            db,
+            kind="payment_provider",
+            text=(
+                f"⚠️ Платёжный провайдер {name} не смог выписать счёт"
+                f"{f' #{invoice_id}' if invoice_id else ''}: {str(exc)[:300]}"
+            ),
+            dedup_key={"provider": name},
+            extra={"provider": name, "invoice_id": invoice_id, "error": str(exc)[:500]},
+            window_sec=3600,
+            autocommit=True,
+        )
+    except Exception:  # noqa: BLE001
+        logger.exception("checkout: admin alert for provider %s failed", name)
+    return PROVIDER_UNAVAILABLE_MESSAGE
+
+
 class ProviderApiError(ProviderError):
     """Ошибка ПОХОДА к провайдеру (сеть/HTTP-ответ).
 

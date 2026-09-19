@@ -243,6 +243,25 @@ async function reauth(): Promise<boolean> {
   }
 }
 
+// Текст ошибки для человека из того, что бросил request(): "502: {\"detail\":
+// \"Платёжный сервис временно недоступен…\"}" → сама фраза. Коды и JSON
+// пользователю не нужны; если detail не строка — общая формулировка.
+export function humanError(e: unknown, fallback = "Не удалось выполнить операцию. Попробуй ещё раз или напиши в поддержку."): string {
+  const raw = e instanceof Error ? e.message : String(e ?? "");
+  const m = /^\d+:\s*([\s\S]+)$/.exec(raw);
+  const body = (m ? m[1] : raw).trim();
+  if (body.startsWith("{")) {
+    try {
+      const parsed = JSON.parse(body) as { detail?: unknown };
+      if (typeof parsed.detail === "string" && parsed.detail.trim()) return parsed.detail;
+    } catch {
+      /* не JSON */
+    }
+    return fallback;
+  }
+  return body || fallback;
+}
+
 async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
   let res = await rawFetch(path, init);
 

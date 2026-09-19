@@ -21,6 +21,7 @@ from ..services.payments import ProviderError, get_provider
 from ..services.payments.checkout import (
     ProviderApiError,
     checkout_pending_invoice,
+    report_provider_failure,
     convert_for_provider,
 )
 from ._common import ADMIN_ACTOR_HEADER, _audit, _resolve_admin_actor, get_db, logger
@@ -157,7 +158,15 @@ def checkout_invoice(
             return_url=(body.return_url if body else None),
         )
     except ProviderApiError as exc:
-        raise HTTPException(status_code=502, detail=f"payment provider error: {exc}") from exc
+        # Человеку — понятная фраза, админу — пуш с сырой ошибкой провайдера.
+        raise HTTPException(
+            status_code=502,
+            detail=report_provider_failure(
+                db, exc,
+                provider_name=(body.provider if body else None),
+                invoice_id=invoice.id,
+            ),
+        ) from exc
     except ProviderError as exc:
         # Конфигурация (нет провайдера / нет курса) — 503, как и раньше.
         raise HTTPException(status_code=503, detail=str(exc)) from exc

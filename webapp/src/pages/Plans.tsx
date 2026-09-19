@@ -53,8 +53,19 @@ function friendlyActivateError(raw: string): string {
   if (/^503/.test(raw) || /no.*node/i.test(raw) || /no trial plan/i.test(raw)) {
     return "Сейчас нет свободных серверов. Мы уже знаем — попробуй чуть позже или напиши в поддержку через раздел «Помощь».";
   }
-  // 502/504 — бэкенд/воркер недоступен
+  // 502/504 — бэкенд/воркер/платёжный провайдер недоступен. Если бэкенд
+  // прислал человеческий detail (например «Платёжный сервис временно
+  // недоступен…»), показываем его, иначе общую фразу.
   if (/^(502|504)/.test(raw)) {
+    const d = /^\d+:\s*(\{[\s\S]*\})$/.exec(raw);
+    if (d) {
+      try {
+        const parsed = JSON.parse(d[1]) as { detail?: unknown };
+        if (typeof parsed.detail === "string" && parsed.detail.trim()) return parsed.detail;
+      } catch {
+        /* не JSON */
+      }
+    }
     return "Сервис временно недоступен. Попробуй ещё раз через минуту.";
   }
   // 500 — необработанная ошибка

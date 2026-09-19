@@ -25,6 +25,7 @@ import hmac
 import json
 import logging
 import os
+import time
 
 import requests
 
@@ -162,19 +163,7 @@ class LavaTopProvider:
             # Способ шлём ЯВНО: у PAY2ME без paymentMethod дефолт — карта, а
             # она у него закрыта (2026-09-19, «Restricted payment method type»).
             body["paymentMethod"] = self._payment_method
-        try:
-            resp = self._session.post(
-                f"{self._api_base}/api/v3/invoice",
-                json=body,
-                headers={"X-Api-Key": self._api_key},
-                timeout=15,
-            )
-        except requests.RequestException as exc:
-            raise ProviderError(f"lava_top: create failed: {exc}") from exc
-        try:
-            data = resp.json()
-        except ValueError:
-            raise ProviderError(f"lava_top: non-JSON response: {resp.text[:200]}")
+        resp, data = self._post_invoice(body)
         if resp.status_code >= 400:
             raise ProviderError(f"lava_top: HTTP {resp.status_code}: {data}")
         contract_id = data.get("id")
@@ -188,6 +177,49 @@ class LavaTopProvider:
             currency=cur,
             raw=data,
         )
+
+    # Секундные провалы балансировщика lava («no available server» текстом
+    # вместо JSON, 5xx, обрыв соединения) превращались в «Не удалось создать
+    # счёт» у человека — хотя следующий тап через пару секунд проходил
+    # (2026-09-19: три тапа подряд — 502, 502, 200). Один повтор с паузой
+    # закрывает ровно этот класс; 4xx не повторяем — это не транзиент.
+    _CREATE_ATTEMPTS = 2
+    _RETRY_DELAY_SEC = 1.5
+
+    def _post_invoice(self, body: dict) -> tuple["requests.Response", dict]:
+        """POST /api/v3/invoice с одним повтором на транзиентный сбой."""
+        last_error: ProviderError | None = None
+        for attempt in range(1, self._CREATE_ATTEMPTS + 1):
+            try:
+                resp = self._session.post(
+                    f"{self._api_base}/api/v3/invoice",
+                    json=body,
+                    headers={"X-Api-Key": self._api_key},
+                    timeout=15,
+                )
+            except requests.RequestException as exc:
+                last_error = ProviderError(f"lava_top: create failed: {exc}")
+            else:
+                try:
+                    data = resp.json()
+                except ValueError:
+                    last_error = ProviderError(
+                        f"lava_top: non-JSON response: {resp.text[:200]}"
+                    )
+                else:
+                    if resp.status_code < 500:
+                        return resp, data
+                    last_error = ProviderError(
+                        f"lava_top: HTTP {resp.status_code}: {data}"
+                    )
+            if attempt < self._CREATE_ATTEMPTS:
+                logger.warning(
+                    "lava_top: create attempt %s failed (%s) — retrying",
+                    attempt, last_error,
+                )
+                time.sleep(self._RETRY_DELAY_SEC)
+        assert last_error is not None
+        raise last_error
 
     # ---------- reconcile (webhook-independent) ----------
 

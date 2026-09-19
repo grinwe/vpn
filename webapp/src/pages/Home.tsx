@@ -23,6 +23,7 @@ import {
   freezeSubscription,
   unfreezeSubscription,
   toggleAutoRenew,
+  humanError,
 } from "../api";
 import { navigate } from "../router";
 import { getTg, openExternalUrl } from "../telegram";
@@ -985,7 +986,10 @@ function TopupModal({
       });
     } catch (e) {
       if (mountedRef.current) setBusy(false);
-      alert(`Не удалось создать счёт: ${(e as Error).message}`);
+      // Сырой "502: {json}" человеку бесполезен — показываем detail бэкенда
+      // («Платёжный сервис временно недоступен…»), сырую ошибку админ
+      // получает пушем.
+      alert(`Не удалось создать счёт: ${humanError(e)}`);
     }
   }
 
@@ -1047,7 +1051,10 @@ function TopupModal({
         setBusy(false);
         setWaiting(false);
       }
-      alert(`Не удалось создать счёт: ${(e as Error).message}`);
+      // Сырой "502: {json}" человеку бесполезен — показываем detail бэкенда
+      // («Платёжный сервис временно недоступен…»), сырую ошибку админ
+      // получает пушем.
+      alert(`Не удалось создать счёт: ${humanError(e)}`);
     }
   }
 

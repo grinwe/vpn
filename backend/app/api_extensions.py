@@ -2381,6 +2381,11 @@ ADMIN_NOTIFICATION_ACTIONS = [
     # (services/xray_releases.py). Без строки в этом списке пуш молча
     # оседал бы в audit_logs и до админа не доезжал.
     "admin_alert_xray_version_drift",
+    # Провайдер не смог выписать счёт (services/payments/checkout.py
+    # report_provider_failure): сырая ошибка провайдера, дедуп час на
+    # провайдера. Без этого «Restricted payment method type» три недели
+    # видели только пользователи (2026-09-19).
+    "admin_alert_payment_provider",
     "admin_alert_leg_gap",
 ]
 

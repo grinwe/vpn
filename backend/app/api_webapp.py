@@ -35,7 +35,11 @@ from .config import get_settings
 from .db import SessionLocal
 from .rate_limit import limiter
 from .services.payments.base import ProviderError
-from .services.payments.checkout import ProviderApiError, checkout_pending_invoice
+from .services.payments.checkout import (
+    ProviderApiError,
+    checkout_pending_invoice,
+    report_provider_failure,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -710,7 +714,12 @@ def webapp_checkout(
     try:
         result = checkout_pending_invoice(db, invoice, provider_name=body.provider)
     except ProviderApiError as exc:
-        raise HTTPException(status_code=502, detail=f"payment provider error: {exc}")
+        raise HTTPException(
+            status_code=502,
+            detail=report_provider_failure(
+                db, exc, provider_name=body.provider, invoice_id=invoice.id
+            ),
+        )
     except ProviderError as exc:
         raise HTTPException(status_code=503, detail=str(exc))
 
@@ -857,7 +866,12 @@ def webapp_topup(
             pay_amount=amount, pay_currency=currency,
         )
     except ProviderApiError as exc:
-        raise HTTPException(status_code=502, detail=f"payment provider error: {exc}")
+        raise HTTPException(
+            status_code=502,
+            detail=report_provider_failure(
+                db, exc, provider_name=body.provider, invoice_id=invoice.id
+            ),
+        )
     except ProviderError as exc:
         raise HTTPException(status_code=503, detail=str(exc))
 
