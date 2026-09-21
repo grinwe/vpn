@@ -103,7 +103,9 @@ def test_lava_top_create_invoice_happy_path() -> None:
     assert body["currency"] == "RUB"
     assert body["amount"] == 299.0
     # round-trip нашего invoice_id — единственный сквозной канал.
-    assert body["clientUtm"] == {"utm_content": "42"}
+    # utm_content — round-trip invoice_id; utm_source — честный канал продажи
+    # (без return_url = бот/кабинет в Telegram).
+    assert body["clientUtm"] == {"utm_content": "42", "utm_source": "telegram_bot"}
     # Голый конструктор (без payment_provider/payment_method) — ничего не
     # шлём: дефолт lava (SMART_GLOCAL + карта). Прод-имена собираются через
     # get_provider(...) — см. секцию «две сущности одной интеграции» ниже.
@@ -653,3 +655,17 @@ def test_provider_invoice_id_extraction_for_new_drivers() -> None:
         external_id="42", status="paid", raw={"name": "shop_order", "payload": {"uuid": "u-1"}}
     )
     assert _provider_invoice_id_from_event(ev) == "u-1"
+
+
+def test_lava_top_create_marks_sub_page_source_when_return_url() -> None:
+    """Со страницы по саб-токену приходит return_url → utm_source=sub_page."""
+    prov = _lava()
+    prov._session = _FakeSession(  # type: ignore[assignment]
+        _FakeResponse({"id": "c-43", "status": "new", "paymentUrl": "https://w"}, status_code=201)
+    )
+    prov.create_invoice(
+        invoice_id=43, amount=100, currency="RUB",
+        return_url="https://grn-ssync.pro/tok?fix=1&paid=43",
+    )
+    body = prov._session.last_call["json"]  # type: ignore[attr-defined]
+    assert body["clientUtm"] == {"utm_content": "43", "utm_source": "sub_page"}

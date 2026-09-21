@@ -155,7 +155,14 @@ class LavaTopProvider:
             # Лимиты платформы: 50–1 000 000 ₽ (5–10 000 $/€) — суммы вне
             # диапазона отклонит сам API, отдельно не дублируем.
             "amount": round(float(amount), 2),
-            "clientUtm": {"utm_content": str(invoice_id)},
+            # utm_content — round-trip нашего invoice_id (вебхук/сверка матчат
+            # по нему). utm_source — честный канал продажи: платформа ждёт в
+            # нём источник трафика (анкета службы безопасности, 2026-09-21);
+            # return_url приходит только со страницы по саб-токену.
+            "clientUtm": {
+                "utm_content": str(invoice_id),
+                "utm_source": "sub_page" if return_url else "telegram_bot",
+            },
         }
         if self._payment_provider:
             body["paymentProvider"] = self._payment_provider
