@@ -3398,6 +3398,24 @@ class ProvisioningOrchestrator:
         """
         self._apply_leg_scheme_reporting(device)
 
+    def _apply_leg_scheme_pinned(self, device: models.Device, node_id: int) -> None:
+        """Раскладка 4×1, у которой primary-лег (⚡ основной, reality) стоит на
+        ``node_id`` — primary-ноде устройства.
+
+        Автораскладка (паросочетание) ставит основной лег на любую ноду набора;
+        при прицельном переезде «на ноду X» человек ждёт, что основной сервер
+        в списке — именно X. Остальные роли распределяются как обычно.
+        Best-effort, как и обычная раскладка.
+        """
+        try:
+            active = {c.node_id for c in device.credentials if c.is_active and c.node_id}
+            forbid = {("primary", n) for n in active if n != node_id}
+            leg_scheme.apply_leg_scheme(self.db, device, commit=True, forbid=forbid)
+        except Exception:  # noqa: BLE001
+            logger.exception(
+                "leg-scheme: pinned раскладка для device %s не удалась", device.id
+            )
+
     def _maybe_attach_diverse(
         self,
         subscription: models.Subscription,
@@ -4855,19 +4873,10 @@ class ProvisioningOrchestrator:
                 "target_node_id matches device's current node"
             )
 
-        # Диверс-гард: legacy-миграция гасит ВЕСЬ device и реподнимает на одной
-        # ноде → схлопнула бы N-нодный набор до одной. Для диверс-девайсов это
-        # запрещено — оператор должен использовать per-node replace
-        # (swap_node_out), который меняет одну ноду, не трогая остальные.
         active_nodes = {
             c.node_id for c in device.credentials if c.is_active and c.node_id
         }
-        if len(active_nodes) > 1:
-            raise RuntimeError(
-                f"device держит {len(active_nodes)} нод (диверсная подписка) — "
-                "миграция схлопнула бы набор до одной. Используй per-node replace "
-                "(POST /api/devices/{id}/nodes/{node_id}/swap), он меняет одну ноду."
-            )
+        diverse = len(active_nodes) > 1
 
         target = choose_node(self.db, plan, node_id=target_node_id)
 
@@ -4882,6 +4891,50 @@ class ProvisioningOrchestrator:
         reuse_token = device.sub_token
         reuse_uri = device.connection_uri
         reuse_uuid = _device_vless_uuid(device)
+
+        # ── Тёплый путь (диверс-aware, 2026-09-21) ────────────────────────
+        # Раньше миграция диверс-девайса была запрещена гардом: холодный
+        # legacy-путь гасит ВЕСЬ набор и реподнимает на одной ноде. Теперь
+        # переезд идёт как тёплый reprovision: бандл с ЦЕЛЕВОЙ ноды → новый
+        # device с тем же sub_token → случайный диверс-добор остальных нод →
+        # раскладка 4×1 с primary-легом на целевой ноде. Без ansible и без
+        # окна пустой выдачи (старый device ревокается фоном, новый уже
+        # живой). VLESS-uuid при этом новый (тёплый бандл несёт свой) —
+        # клиент подтягивает по саб-ссылке.
+        from . import warm_pool
+
+        bundle = warm_pool.try_assign_bundle(self.db, target.id, sub.id)
+        if bundle:
+            user = sub.user or self.db.get(models.User, sub.user_id)
+            self.revoke_device(
+                device,
+                reason=f"device-migrate {old_node.id}->{target.id} (warm)",
+                background=True,
+            )
+            if reuse_token:
+                self._release_sub_token(device)
+            new_device, task = self._wire_warm_bundle(
+                user,
+                sub,
+                bundle,
+                device.name,
+                reuse_sub_token=reuse_token,
+                reuse_connection_uri=reuse_uri,
+            )
+            self.db.refresh(sub)
+            self._maybe_attach_diverse(sub, new_device, plan, target)
+            self._apply_leg_scheme_pinned(new_device, target.id)
+            return target, new_device, task
+
+        if diverse:
+            # Холодный путь схлопнул бы N-нодный набор до одной ноды — для
+            # диверс-девайса без тёплого бандла честно отказываем: пул на
+            # ноде наполняет тик run_warm_pool_check (WARM_POOL_TARGET).
+            raise RuntimeError(
+                f"на ноде {target.name} нет тёплого бандла, а device держит "
+                f"{len(active_nodes)} нод (диверсная подписка) — холодный перенос "
+                "схлопнул бы набор. Повтори через пару минут, пул наполняется."
+            )
 
         self.revoke_device(
             device,

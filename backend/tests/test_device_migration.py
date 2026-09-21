@@ -488,3 +488,125 @@ def test_migrate_subscriptions_off_clears_client_id_hmac(db_session, monkeypatch
     reused = db_session.get(models.Device, did)
     assert reused.sub_token is None
     assert reused.client_id_hmac is None
+
+
+# ── migrate_device_to_node: диверс-aware тёплый путь (2026-09-21) ────────
+
+
+def _warm_bundle(db, node, username: str) -> list[models.Credential]:
+    """Тёплый бандл на ноде: 4 протокола, без подписки/устройства."""
+    from app.security import encrypt as _enc
+
+    creds = []
+    by_proto = {c.protocol.value: c for c in node.configs}
+    for proto in ("vless-reality", "hysteria2", "vless-xhttp", "vless-ws-cdn"):
+        cfg = by_proto.get(proto)
+        if cfg is None:
+            cfg = make_config(db, node, protocol=proto)
+        creds.append(
+            models.Credential(
+                node_id=node.id, config_id=cfg.id, proto=proto,
+                config_text=_enc(f"{proto}://warm@{node.host}"),
+                access_username=username, is_active=False,
+                pool_state=models.CredentialPoolState.warm,
+            )
+        )
+    db.add_all(creds)
+    db.commit()
+    return creds
+
+
+def _diverse_device(db, nodes):
+    """Устройство с активными кредами на нескольких нодах (диверсный набор)."""
+    sub, device = _sub_with_device_on(db, nodes[0])
+    # Фабрика не выдаёт sub_token — а переезд проверяем именно на нём.
+    device.sub_token = f"tok-diverse-{device.id}"
+    for node in nodes:
+        for proto in ("vless-reality", "hysteria2"):
+            db.add(
+                models.Credential(
+                    subscription_id=sub.id, device_id=device.id, node_id=node.id,
+                    proto=proto, config_text=encrypt("x"),
+                    access_username=device.access_username, is_active=True,
+                )
+            )
+    db.commit()
+    db.refresh(device)
+    return sub, device
+
+
+def test_migrate_diverse_device_uses_warm_bundle_and_pins_primary(db_session, monkeypatch):
+    """Диверс-девайс + тёплый бандл на цели: новый device на цели с тем же
+    sub_token, старый — disabled-алиас без токена, основной лег на цели."""
+    monkeypatch.setenv("SUB_LEG_SCHEME", "4x1")
+    a = make_node(db_session, name="dv-a", host="10.0.1.1")
+    b = make_node(db_session, name="dv-b", host="10.0.1.2")
+    target = make_node(db_session, name="dv-t", host="10.0.1.3")
+    for n in (a, b, target):
+        make_config(db_session, n)
+    sub, device = _diverse_device(db_session, [a, b])
+    token = device.sub_token
+    old_id = device.id
+    _warm_bundle(db_session, target, "warm-t-1")
+
+    orch = ProvisioningOrchestrator(db_session)
+    got_target, new_device, task = orch.migrate_device_to_node(
+        device, target_node_id=target.id,
+    )
+    db_session.refresh(device)
+    db_session.refresh(new_device)
+
+    assert got_target.id == target.id
+    assert new_device.id != old_id
+    assert new_device.status == models.DeviceStatus.active
+    assert new_device.config.node_id == target.id
+    assert new_device.sub_token == token, "sub_token переезжает на новый device"
+    assert device.sub_token is None and device.status == models.DeviceStatus.disabled
+    assert task.status == models.ProvisioningTaskStatus.success  # synthetic, без ansible
+    primary = [
+        c for c in new_device.credentials
+        if c.is_active and c.leg_published and c.leg_role == "primary"
+    ]
+    assert len(primary) == 1 and primary[0].node_id == target.id
+    # Старые креды на a/b принадлежат старому device и ревокнуты фоном —
+    # у нового device активные креды только с целевой ноды (диверс-добор в
+    # тестах выключен: DIVERSE_SUB_NODES не задан).
+    assert {c.node_id for c in new_device.credentials if c.is_active} == {target.id}
+
+
+def test_migrate_diverse_device_without_warm_bundle_refuses(db_session):
+    a = make_node(db_session, name="dw-a", host="10.0.2.1")
+    b = make_node(db_session, name="dw-b", host="10.0.2.2")
+    target = make_node(db_session, name="dw-t", host="10.0.2.3")
+    for n in (a, b, target):
+        make_config(db_session, n)
+    _sub, device = _diverse_device(db_session, [a, b])
+    token = device.sub_token
+
+    orch = ProvisioningOrchestrator(db_session)
+    with pytest.raises(RuntimeError, match="тёплого бандла"):
+        orch.migrate_device_to_node(device, target_node_id=target.id)
+    db_session.refresh(device)
+    assert device.status == models.DeviceStatus.active
+    assert device.sub_token == token, "отказ ничего не меняет"
+
+
+def test_migrate_single_device_prefers_warm_bundle(db_session):
+    """Однонодовый девайс тоже едет тёплым путём, если бандл есть: без
+    ansible, синтетическая success-таска, новый device сразу active."""
+    old_node = make_node(db_session, name="sw-a", host="10.0.3.1")
+    target = make_node(db_session, name="sw-t", host="10.0.3.2")
+    make_config(db_session, target)
+    sub, device = _sub_with_device_on(db_session, old_node)
+    device.sub_token = f"tok-single-{device.id}"
+    db_session.commit()
+    token = device.sub_token
+    _warm_bundle(db_session, target, "warm-sw-1")
+
+    orch = ProvisioningOrchestrator(db_session)
+    _t, new_device, task = orch.migrate_device_to_node(device, target_node_id=target.id)
+    db_session.refresh(new_device)
+    assert new_device.status == models.DeviceStatus.active
+    assert new_device.sub_token == token
+    assert new_device.config.node_id == target.id
+    assert task.status == models.ProvisioningTaskStatus.success

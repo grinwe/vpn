@@ -334,8 +334,10 @@ def test_migrate_device_blocked_for_diverse(
     _active_cred_on(db_session, b, dev, "u-b")  # 2 ноды → диверсный
 
     orch = ProvisioningOrchestrator(db_session)
-    # legacy-миграция диверс-девайса должна быть запрещена (иначе схлопнет до 1)
-    with pytest.raises(RuntimeError, match="диверсная"):
+    # Диверс-девайс без тёплого бандла на целевой ноде: холодный legacy-путь
+    # схлопнул бы набор до одной ноды — отказ с подсказкой «повтори позже».
+    # С тёплым бандлом переезд идёт (см. test_device_migration.py).
+    with pytest.raises(RuntimeError, match="тёплого бандла"):
         orch.migrate_device_to_node(dev, target_node_id=target.id)
 
 

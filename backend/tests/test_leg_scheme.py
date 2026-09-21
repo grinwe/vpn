@@ -393,8 +393,12 @@ def test_every_diverse_attach_is_followed_by_leg_layout():
         diverse = call_lines(fn, "_maybe_attach_diverse")
         if not diverse:
             continue
-        layout = call_lines(fn, "_apply_leg_scheme") + call_lines(
-            fn, "_apply_leg_scheme_reporting"
+        layout = (
+            call_lines(fn, "_apply_leg_scheme")
+            + call_lines(fn, "_apply_leg_scheme_reporting")
+            # Прицельный переезд (migrate_device_to_node): раскладка с primary
+            # на целевой ноде — та же раскладка, только с forbid-парами.
+            + call_lines(fn, "_apply_leg_scheme_pinned")
         )
         if not any(line > max(diverse) for line in layout):
             offenders.append(f"{fn.name} (строка {max(diverse)})")

@@ -1509,10 +1509,18 @@ function DeviceNodeSet({
     );
   }
 
-  // Диверс-набор (>1 ноды): список нод + точечная замена. Legacy-миграцию не
-  // показываем — она схлопнула бы набор (бэк её для таких device запрещает).
+  // Диверс-набор (>1 ноды): список нод + точечная замена + прицельный переезд.
+  // С 2026-09-21 бэк переносит и диверс-девайс: primary-нода → выбранная
+  // (тёплый бандл), остальные ноды набора добираются заново случайно,
+  // sub_token сохраняется, основной лег в списке — на выбранной ноде.
   return (
     <div className="pt-1 border-t border-slate-700/60 space-y-1">
+      <MigrateDeviceControl
+        device={device}
+        nodes={nodes}
+        mutation={migrateDevice}
+        diverse
+      />
       <div className="text-[11px] text-slate-400">
         Ноды подписки ({set.length}):
       </div>
@@ -1564,6 +1572,7 @@ function MigrateDeviceControl({
   device,
   nodes,
   mutation,
+  diverse = false,
 }: {
   device: DeviceOut;
   nodes: VPNNodeOut[] | undefined;
@@ -1571,6 +1580,10 @@ function MigrateDeviceControl({
     mutate: (args: { deviceId: number; targetNodeId: number }) => void;
     isPending: boolean;
   };
+  // Диверс-девайс (>1 ноды): бэк едет тёплым путём — primary на выбранную
+  // ноду, остальные ноды набора добираются заново случайно, sub_token
+  // сохраняется, основной лег в списке — на выбранной ноде.
+  diverse?: boolean;
 }) {
   const [targetId, setTargetId] = useState<string>("");
   const candidates = (nodes ?? []).filter(
@@ -1599,7 +1612,9 @@ function MigrateDeviceControl({
           if (
             confirm(
               `Перевести устройство #${device.id} с ноды «${device.node_name ?? "—"}» на «${target.name}» (#${target.id}, ${target.region})?\n\n` +
-                `Остальные устройства подписки остаются на текущей ноде. Пул/health/cooldown НЕ проверяются — ручной override. Старое устройство revoke'нется в фоне, новое поднимется через ansible.`,
+                (diverse
+                  ? `Основной сервер станет «${target.name}», остальные ноды набора доберутся заново случайно. sub_token сохраняется, клиенту достаточно обновить подписку. Нужен тёплый бандл на целевой ноде — если его нет, бэк откажет, повтори через пару минут.`
+                  : `Остальные устройства подписки остаются на текущей ноде. Пул/health/cooldown НЕ проверяются — ручной override. Если на целевой ноде есть тёплый бандл — переезд мгновенный; иначе старое устройство revoke'нется в фоне, новое поднимется через ansible.`),
             )
           )
             mutation.mutate({
