@@ -543,6 +543,12 @@ export interface InvoiceListItem {
   status: string;
   action: string;
   created_at: string;
+  // Платёж по счёту: провайдер и его идентификатор (contractId у lava.top),
+  // статус платежа и момент оплаты. null — платежа ещё не было.
+  payment_provider?: string | null;
+  payment_external_id?: string | null;
+  payment_status?: string | null;
+  paid_at?: string | null;
 }
 
 export interface NodeExitLinkHealthMini {

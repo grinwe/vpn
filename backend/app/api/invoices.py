@@ -586,8 +586,25 @@ def list_invoices(
         query = query.filter(models.Invoice.status == invoice_status)
 
     invoices = query.offset(offset).limit(limit).all()
+    # Платёж по счёту одним запросом на страницу: paid — приоритетнее, среди
+    # равных — самый свежий. Провайдер + external_id (contractId у lava)
+    # нужны админу для сверки с кабинетом партнёра.
+    ids = [inv.id for inv in invoices]
+    best_payment: dict[int, models.Payment] = {}
+    if ids:
+        for pay in (
+            db.query(models.Payment)
+            .filter(models.Payment.invoice_id.in_(ids))
+            .order_by(models.Payment.id.asc())
+            .all()
+        ):
+            cur = best_payment.get(pay.invoice_id)
+            paid = pay.status == models.PaymentStatus.paid
+            if cur is None or paid or cur.status != models.PaymentStatus.paid:
+                best_payment[pay.invoice_id] = pay
     result: list[schemas.InvoiceListItem] = []
     for inv in invoices:
+        pay = best_payment.get(inv.id)
         result.append(
             schemas.InvoiceListItem(
                 id=inv.id,
@@ -602,6 +619,12 @@ def list_invoices(
                 action=inv.action.value,
                 kind=inv.kind or "subscription",
                 created_at=inv.created_at,
+                payment_provider=pay.provider if pay else None,
+                payment_external_id=pay.external_id if pay else None,
+                payment_status=(
+                    pay.status.value if pay and hasattr(pay.status, "value") else (pay.status if pay else None)
+                ),
+                paid_at=(pay.updated_at or pay.created_at) if pay and pay.status == models.PaymentStatus.paid else None,
             )
         )
     return result

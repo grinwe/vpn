@@ -733,6 +733,14 @@ class InvoiceListItem(BaseModel):
     action: str
     kind: str = "subscription"
     created_at: UTCDateTime
+    # Последний платёж по счёту (paid приоритетнее pending): провайдер и его
+    # идентификатор (для lava.top — contractId). Нужно админу для сверки с
+    # кабинетом платёжного партнёра и для доказательств оказания услуги
+    # (проверка СБ lava.top, 2026-09-22).
+    payment_provider: str | None = None
+    payment_external_id: str | None = None
+    payment_status: str | None = None
+    paid_at: UTCDateTime | None = None
 
 
 class InvoicePaidOut(InvoiceListItem):
