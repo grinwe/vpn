@@ -192,6 +192,20 @@
     mode: "0644"
   notify: reload nginx
 
+# Публичные документы сервиса (оферта / возвраты / ПД) — статические страницы
+# под camo-root/legal/: location / уже отдаёт файлы по $uri, отдельного
+# location не нужно. Источник — docs/legal/*.md, HTML рендерит
+# scripts/render_legal.py (коммитится). Их запросила СБ lava.top (22.09.2026);
+# ссылки ведут из кнопки «О сервисе» в боте (LEGAL_BASE_URL).
+- name: Deploy legal pages (offer, refund, privacy)
+  copy:
+    src: legal/
+    dest: "{{ deploy_web_frontend_camo_root }}/legal/"
+    owner: root
+    group: root
+    mode: "0644"
+    directory_mode: "0755"
+
 # ── Render and enable the real vhost (TLS-aware) ────────────────────
 - name: Render nginx vhost
   template:

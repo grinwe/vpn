@@ -470,6 +470,8 @@ services:
       # Stage 9b — меню выбора способа оплаты в боте (comma-separated
       # имена провайдеров). Пусто/одно имя = старое поведение.
       PAYMENT_PROVIDER_CHOICES: ${PAYMENT_PROVIDER_CHOICES:-}
+      # Ссылки на оферту/возвраты/ПД в «О сервисе» (пусто = кнопок нет).
+      LEGAL_BASE_URL: ${LEGAL_BASE_URL:-}
       TELEGRAM_STARS_WEBHOOK_SECRET: ${TELEGRAM_STARS_WEBHOOK_SECRET:-}
       SUB_LINK_BASE_URL: ${SUB_LINK_BASE_URL:-}
       # Запасной фронт саб-ссылки (мимо CF) + доля токенов на нём, 0..100.

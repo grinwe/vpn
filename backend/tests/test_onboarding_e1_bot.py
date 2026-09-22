@@ -177,3 +177,27 @@ def test_devices_by_telegram_reports_active_throttle(client, db_session):
         f"/api/admin/client-control/devices-by-telegram?telegram_id={user.telegram_id}"
     )
     assert again.json()["retry_after_sec"] is None
+
+
+def test_about_keyboard_links_legal_pages_only_with_base_url(monkeypatch):
+    """«О сервисе»: три URL-кнопки на документы + «Назад»; без LEGAL_BASE_URL —
+    только «Назад» (битых ссылок не шлём)."""
+    import sys
+
+    from tests._bot_stubs import load_keyboards
+
+    kb_mod = load_keyboards(monkeypatch)
+    try:
+        kb = kb_mod.about_keyboard("https://example.test/legal/")
+        rows = kb.inline_keyboard
+        urls = [getattr(b, "url", None) for row in rows for b in row]
+        assert [u for u in urls if u] == [
+            "https://example.test/legal/terms.html",
+            "https://example.test/legal/refund.html",
+            "https://example.test/legal/privacy.html",
+        ]
+        assert rows[-1][0].callback_data == "help:back"
+        only_back = kb_mod.about_keyboard("").inline_keyboard
+        assert [b.callback_data for row in only_back for b in row] == ["help:back"]
+    finally:
+        sys.modules.pop("bot.keyboards", None)

@@ -204,6 +204,7 @@ def install_bot_stubs(
         SUB_LINK_ALT_SHARE="0",  # 8e0eff0 (два фронта саб-ссылки)
         SUB_LINK_BASE_URL=sub_link_base_url,
         SUB_LINK_BASE_URL_ALT="",  # 8e0eff0
+        LEGAL_BASE_URL="",  # «О сервисе и документы» (2026-09-22)
         TELEGRAM_STARS_WEBHOOK_SECRET="secret",
     )
 
@@ -221,6 +222,7 @@ def install_bot_stubs(
         WEBAPP_BASE_URL=webapp_base_url,
         WEBAPP_URL=f"{webapp_base_url}/" if webapp_base_url else "",
         help_back_keyboard=_kb("help_back_keyboard"),
+        about_keyboard=_kb("about_keyboard"),
         help_keyboard=_kb("help_keyboard"),
         onboarding_keyboard=_kb("onboarding_keyboard"),
         start_keyboard=_kb("start_keyboard"),
@@ -236,10 +238,12 @@ def install_bot_stubs(
 
 
 class Btn:
-    def __init__(self, text=None, callback_data=None, web_app=None, **kw):
+    def __init__(self, text=None, callback_data=None, web_app=None, url=None, **kw):
         self.text = text
         self.callback_data = callback_data
         self.web_app = web_app
+        # URL-кнопки (ссылки на документы в «О сервисе», 2026-09-22).
+        self.url = url
 
 
 class Markup:

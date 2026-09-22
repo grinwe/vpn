@@ -393,6 +393,9 @@ export interface DeviceOut {
   is_relay?: boolean;
   exit_id?: number | null;
   exit_name?: string | null;
+  // Когда трафик устройства видели в последний раз (Device.last_seen_at);
+  // null = не подключалось ни разу.
+  last_seen_at?: string | null;
 }
 
 export interface SubscriptionOut {

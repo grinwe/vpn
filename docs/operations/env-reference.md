@@ -41,6 +41,7 @@
 | `TELEGRAM_BOT_TOKEN` | — | backend (fallback) | Legacy alias для `BOT_TOKEN`, читается только `services/payments/telegram_stars.py`, если `BOT_TOKEN` не задан. Обычно не нужен. |
 | `ADMIN_IDS` | `""` | bot | Comma-separated Telegram user-id с админскими командами (`/invoices`, support-forwards). **Не** валидируется backend'ом — только бот фильтрует по ним. |
 | `BOT_USERNAME` | `""` | backend, bot | Username бота (без `@`) для построения t.me/<bot>?start=... в referral flow. Без этого `/api/webapp/referral` возвращает `share_url=None`. |
+| `LEGAL_BASE_URL` | `https://<deploy_web_frontend_domain>/legal` | bot | База ссылок кнопки «ℹ️ О сервисе и документы» в /help: `terms.html`, `refund.html`, `privacy.html` (роль deploy_web_frontend кладёт их в camo-root/legal/ из `docs/legal/*.md` через `scripts/render_legal.py`). Пусто → в «О сервисе» только текст с реквизитами, без ссылок. Ansible: `deploy_app_stack_legal_base_url`. |
 | `BACKEND_URL` | `http://localhost:8000` | bot | Куда бот ходит за API. Внутри docker compose — `http://backend:8000`. |
 | `NOTIFICATION_POLL_INTERVAL` | `10` | bot | Интервал (секунды) между опросами `/api/notifications/pending`. `<=0` — отключить поллер. |
 | `NOTIFICATION_BROADCAST_PER_TICK` | `50` | bot | Максимум `admin_broadcast`, отправляемых поллером за один тик. Срочные типы (`config_ready`/`health_ping_request`/`admin_alert_*`) сортируются в начало тика и не режутся; хвост рассылки сверх лимита переносится на следующие тики (защита от head-of-line). |

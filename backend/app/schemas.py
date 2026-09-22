@@ -70,6 +70,9 @@ class DeviceOut(BaseModel):
     # per-device cards in the admin UI stay self-contained).
     exit_id: int | None = None
     exit_name: str | None = None
+    # Когда трафик устройства видели в последний раз (штампует тик
+    # traffic_stats). Админке нужна точная отметка, а не только «за 24 ч».
+    last_seen_at: UTCDateTime | None = None
 
     class Config:
         from_attributes = True
@@ -101,6 +104,7 @@ class DeviceOut(BaseModel):
             is_relay=is_relay,
             exit_id=exit_id,
             exit_name=exit_name,
+            last_seen_at=getattr(obj, "last_seen_at", None),
         )
 
 

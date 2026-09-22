@@ -22,6 +22,11 @@ PAYMENT_PROVIDER_CHOICES = [
 ]
 
 # Dynamic subscription link base URL (e.g. https://vpn.example.com/sub/)
+# Публичные документы сервиса (оферта / возвраты / ПД) — статические страницы
+# на домене кабинета (роль deploy_web_frontend кладёт их в camo-root/legal/).
+# Пусто → кнопки «О сервисе» не показывают ссылки на документы.
+LEGAL_BASE_URL = os.getenv("LEGAL_BASE_URL", "").rstrip("/")
+
 SUB_LINK_BASE_URL = os.getenv("SUB_LINK_BASE_URL", "")
 
 # Запасной фронт саб-ссылки (идёт мимо Cloudflare, прямо на origin) и доля

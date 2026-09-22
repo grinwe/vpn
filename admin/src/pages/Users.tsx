@@ -46,6 +46,18 @@ type BannedFilter = "all" | "active" | "banned";
 /** Светофор «активен за 24ч»: зелёный — трафик юзера видели за последние
  *  сутки (Device.last_seen_at, штампует тик traffic_stats), красный — нет,
  *  в том числе «не подключался ни разу». Точное время — в тултипе. */
+/** «22.09 09:41» / «3 ч назад» — точное время последней активности текстом,
+ *  а не только тултипом: на телефоне тултипа нет, а именно «когда именно был
+ *  онлайн» и нужно оператору (поддержка, проверки платёжек). */
+export function lastSeenLabel(iso: string | null | undefined): string {
+  if (!iso) return "не подключался";
+  const t = new Date(iso).getTime();
+  const diffMin = Math.max(0, Math.round((Date.now() - t) / 60000));
+  if (diffMin < 60) return `${diffMin} мин назад`;
+  if (diffMin < 24 * 60) return `${Math.round(diffMin / 60)} ч назад`;
+  return new Date(iso).toLocaleString("ru-RU", { dateStyle: "short", timeStyle: "short" });
+}
+
 function ActivityDot({ lastActiveAt }: { lastActiveAt: string | null }) {
   const active =
     lastActiveAt !== null &&
@@ -965,8 +977,11 @@ export default function Users() {
                     </td>
                     <td>{u.email ?? "—"}</td>
                     <td>{u.subscription_count}</td>
-                    <td>
+                    <td className="whitespace-nowrap">
                       <ActivityDot lastActiveAt={u.last_active_at} />
+                      <span className="ml-1.5 text-[11px] text-slate-400 align-middle">
+                        {lastSeenLabel(u.last_active_at)}
+                      </span>
                     </td>
                     <td>{(u.balance_kopecks / 100).toFixed(2)} ₽</td>
                     <td>
@@ -1393,7 +1408,9 @@ function DeviceCard({
       <div className="flex items-center justify-between gap-2">
         <span className="truncate">
           #{d.id}
-          {d.name ? ` · ${d.name}` : ""} · {d.status}
+          {d.name ? ` · ${d.name}` : ""} · {d.status}{d.status !== "revoked" && d.status !== "disabled" && (
+            <span className="text-slate-400"> · онлайн: {lastSeenLabel(d.last_seen_at)}</span>
+          )}
           {d.is_relay && (
             <span className="ml-1 px-1 rounded bg-red-900/60 text-red-300">
               relay
@@ -1742,7 +1759,9 @@ function DeviceList({
               >
                 <span className="truncate">
                   #{d.id}
-                  {d.name ? ` · ${d.name}` : ""} · {d.status}
+                  {d.name ? ` · ${d.name}` : ""} · {d.status}{d.status !== "revoked" && d.status !== "disabled" && (
+            <span className="text-slate-400"> · онлайн: {lastSeenLabel(d.last_seen_at)}</span>
+          )}
                 </span>
               </div>
             ))}

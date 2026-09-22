@@ -102,8 +102,35 @@ def help_keyboard() -> types.InlineKeyboardMarkup:
                 text="💬 Связаться с поддержкой",
                 callback_data="help:support",
             )],
+            # Оферта / возвраты / ПД + реквизиты: документы лежат на сайте,
+            # бот только ведёт к ним (их запросила СБ lava.top, 22.09.2026).
+            [types.InlineKeyboardButton(
+                text="ℹ️ О сервисе и документы",
+                callback_data="help:about",
+            )],
         ]
     )
+
+
+def about_keyboard(legal_base_url: str) -> types.InlineKeyboardMarkup:
+    """«О сервисе»: ссылки на публичные документы + назад. Без базового URL
+    (env LEGAL_BASE_URL пуст) — только «назад», чтобы не слать битые ссылки."""
+    rows: list[list[types.InlineKeyboardButton]] = []
+    if legal_base_url:
+        base = legal_base_url.rstrip("/")
+        rows.extend([
+            [types.InlineKeyboardButton(
+                text="📄 Пользовательское соглашение", url=f"{base}/terms.html",
+            )],
+            [types.InlineKeyboardButton(
+                text="↩️ Политика возвратов", url=f"{base}/refund.html",
+            )],
+            [types.InlineKeyboardButton(
+                text="🔒 Политика персональных данных", url=f"{base}/privacy.html",
+            )],
+        ])
+    rows.append([types.InlineKeyboardButton(text="← Назад", callback_data="help:back")])
+    return types.InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def help_back_keyboard() -> types.InlineKeyboardMarkup:

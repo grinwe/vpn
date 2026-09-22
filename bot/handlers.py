@@ -18,6 +18,7 @@ from .config import (
     ADMIN_API_TOKEN,
     ADMIN_IDS,
     BACKEND_URL,
+    LEGAL_BASE_URL,
     PAYMENT_PROVIDER,
     PAYMENT_PROVIDER_CHOICES,
     SUB_LINK_ALT_SHARE,
@@ -34,6 +35,7 @@ from .keyboards import (
     BTN_MAIN_MENU,
     BTN_TOPUP,
     BTN_VPN_BROKEN,
+    about_keyboard,
     help_back_keyboard,
     help_keyboard,
     onboarding_keyboard,
@@ -3047,6 +3049,29 @@ async def help_vpn(callback_query: types.CallbackQuery):
     await callback_query.answer()
     await callback_query.message.answer(
         _HELP_VPN, reply_markup=help_back_keyboard()
+    )
+
+
+# «О сервисе и документы»: кто мы, что продаём и где лежат оферта, политика
+# возвратов и политика ПД. Сами документы — на сайте (LEGAL_BASE_URL), бот
+# только ведёт к ним; реквизиты дублируем текстом, чтобы их было видно и без
+# перехода (это запрашивают платёжные партнёры при проверках).
+_HELP_ABOUT = (
+    "<b>V8 VPN</b> — подписка на защищённое соединение через наши серверы "
+    "за рубежом. Оплата, выдача доступа и поддержка — прямо здесь, в боте "
+    "и мини-приложении.\n\n"
+    "Исполнитель: ИП Тарадин Александр Александрович, ИНН 612105295848, "
+    "ОГРНИП 324619600014408.\n\n"
+    "Документы сервиса — по кнопкам ниже. Вопросы и возвраты — через "
+    "«Связаться с поддержкой»."
+)
+
+
+@router.callback_query(F.data == "help:about")
+async def help_about(callback_query: types.CallbackQuery):
+    await callback_query.answer()
+    await callback_query.message.answer(
+        _HELP_ABOUT, reply_markup=about_keyboard(LEGAL_BASE_URL)
     )
 
 
