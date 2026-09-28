@@ -3179,6 +3179,9 @@ class ProvisioningOrchestrator:
                 device, task = self._wire_warm_bundle(
                     user, subscription, warm_bundle, device_name
                 )
+                # Ссылка, которую бот покажет юзеру (sub_links.link_token_for).
+                subscription.link_token = device.sub_token
+                self.db.flush()
                 self.db.refresh(subscription)
                 self._maybe_attach_diverse(subscription, device, plan, node)
                 self._apply_leg_scheme(device)
@@ -3252,6 +3255,10 @@ class ProvisioningOrchestrator:
             client_id_hmac=compute_client_id_hmac(device_sub_token),
         )
         self.db.add(device)
+        # Ссылка, которую бот покажет юзеру (sub_links.link_token_for): токен
+        # финальный уже сейчас, пока девайс pending, — /config и пуш после
+        # Ansible отдают одну и ту же ссылку.
+        subscription.link_token = device_sub_token
         self.db.flush()
 
         # G.4: on a relay node, pick the least-loaded exit up front so
@@ -4378,6 +4385,10 @@ class ProvisioningOrchestrator:
                         reuse_connection_uri=reuse_connection_uri,
                     )
                     self.db.refresh(subscription)
+                    if reuse_sub_token is None and reuse_uuid is None:
+                        self._adopt_link_token(
+                            subscription, device, restore=device_name is None
+                        )
                     # add-device / unfreeze (generic case = тот же гейт, что и у
                     # warm-fast-path: target_node/reuse_uuid is None) тоже получает
                     # диверсный набор. Идемпотентно (см. _maybe_attach_diverse).
@@ -4530,6 +4541,14 @@ class ProvisioningOrchestrator:
             task_payload["exit_interface"] = exit_iface
 
         task = self.create_task("device", device.id, "apply", task_payload)
+        # Только «чистые» пересоздания (разморозка, enable, продление,
+        # reality-dest refresh, перевыпуск ссылки). Failover и миграции несут
+        # reuse_* и переносят сам токен; у failover токен замены ещё ВРЕМЕННЫЙ
+        # (своп в конце), перенос на него дал бы боту ссылку-404.
+        if reuse_sub_token is None and reuse_uuid is None:
+            self._adopt_link_token(
+                subscription, device, restore=device_name is None
+            )
         self.db.commit()
         self.run_task_async(task, node=node)
         self.db.refresh(subscription)
@@ -4547,6 +4566,53 @@ class ProvisioningOrchestrator:
         # так что уже разложенный девайс не перетасовывается.
         self._apply_leg_scheme(device)
         return device, task
+
+    def _adopt_link_token(
+        self,
+        subscription: models.Subscription,
+        device: models.Device,
+        *,
+        restore: bool = False,
+    ) -> None:
+        """Перенести ``Subscription.link_token`` на замену выведенного устройства.
+
+        Ссылка бота (services/sub_links.link_token_for) — токен конкретного
+        устройства. Разморозка, enable, продление после истечения, reality-dest
+        refresh и перевыпуск ссылки выводят его (revoked/disabled, токен
+        остаётся на строке) и создают замену тем же именем, но со СВЕЖИМ
+        токеном. Без переноса бот показывал бы ссылку всей подписки (пока
+        замена pending) или соседнего устройства родственника. Миграции и
+        failover тут ни при чём: они переносят сам токен (release+reuse), и
+        держатель либо живой, либо ещё не назначен — тогда не трогаем.
+
+        ``restore=True`` — вызов без имени устройства: разморозка, enable и
+        продление восстанавливают подписку ОДНИМ устройством «primary» после
+        вывода всех. Имя тут не показатель: юзер мог переименовать своё
+        устройство («iPhone»), поэтому переносим без сверки имени. Именованные
+        пересоздания (reality-dest refresh, перевыпуск) идут по одному на
+        каждое устройство — там только по совпадению имени, иначе ссылка
+        ушла бы к первой созданной замене, например device-2.
+        """
+        token = subscription.link_token
+        if not token or not device.sub_token or device.sub_token == token:
+            return
+        holder = (
+            self.db.query(models.Device)
+            .filter(
+                models.Device.subscription_id == subscription.id,
+                models.Device.sub_token == token,
+            )
+            .one_or_none()
+        )
+        if holder is None or holder.status not in (
+            models.DeviceStatus.revoked,
+            models.DeviceStatus.disabled,
+        ):
+            return
+        if not restore and (holder.name or "primary") != (device.name or "primary"):
+            return
+        subscription.link_token = device.sub_token
+        self.db.flush()
 
     def migrate_subscription_to_new_node(
         self,

@@ -1535,6 +1535,9 @@ def webapp_cancel_subscription(
 class AddDeviceResponse(BaseModel):
     subscription_id: int
     device_id: int
+    # Ссылка НОВОГО устройства: бот шлёт её сразу, а не «ту же из /config» —
+    # та ведёт на primary, и второй телефон сел бы на чужой логин.
+    sub_token: str | None = None
     device_count: int
     extra_device_slots: int
     charged_kopecks: int
@@ -1665,6 +1668,7 @@ def webapp_add_device(
     return AddDeviceResponse(
         subscription_id=sub.id,
         device_id=device.id,
+        sub_token=device.sub_token,
         device_count=new_device_count,
         extra_device_slots=sub.extra_device_slots or 0,
         charged_kopecks=charged,
@@ -1755,7 +1759,20 @@ def webapp_remove_device(
         )
 
     orchestrator = ProvisioningOrchestrator(db)
+    was_link_holder = bool(sub.link_token) and device.sub_token == sub.link_token
     orchestrator.revoke_device(device, reason="user_removed", background=True)
+
+    # Юзер удалил устройство, чью ссылку показывает бот: фиксируем замену сразу
+    # (link_token_for выберет живое), иначе выбор пересчитывался бы на каждый
+    # /config и после failover выбранного «переползал» бы на другое устройство.
+    if was_link_holder:
+        from .services import sub_links
+
+        db.refresh(sub)
+        chosen = sub_links.link_token_for(sub)
+        if chosen and chosen != sub.sub_token:
+            sub.link_token = chosen
+            db.add(sub)
 
     # Free a paid slot if the removed device was in the overflow zone.
     bundled = (sub.plan.max_devices if sub.plan else 1) or 1

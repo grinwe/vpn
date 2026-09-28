@@ -176,7 +176,7 @@ def notify_config_ready(
             "device_id": device.id,
             "source": source,
         }
-        sub_uri = _absolute_sub_uri(sub.sub_token)
+        sub_uri = _absolute_sub_uri(sub_links.link_token_for(sub))
         if sub_uri:
             extra["sub_uri"] = sub_uri
         # SAVEPOINT: выход из контекста делает flush (SessionLocal у нас

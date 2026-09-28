@@ -16,6 +16,7 @@ from sqlalchemy.orm import Session
 
 from .. import models, schemas
 from ..auth import require_admin
+from ..services import sub_links
 from ..services.provisioning import ProvisioningOrchestrator
 from ..time_utils import utcnow
 from ._common import ADMIN_ACTOR_HEADER, _audit, _resolve_admin_actor, get_db
@@ -173,6 +174,7 @@ def _subscriptions_for_user(user_id: int, db: Session) -> list[schemas.Subscript
             status=sub.status.value,
             auto_renew=sub.auto_renew or False,
             sub_token=sub.sub_token,
+            link_token=sub_links.link_token_for(sub),
             credentials=[schemas.CredentialOut.from_orm(c) for c in sub.credentials],
             devices=device_outs,
             sharing_blocked=_sub_sharing_blocked(db, sub),

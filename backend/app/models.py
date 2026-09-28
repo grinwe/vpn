@@ -652,6 +652,13 @@ class Subscription(Base):
     )
     # Stable token for the dynamic subscription link — survives migrations.
     sub_token = Column(String, unique=True, index=True, nullable=True)
+    # Токен устройства, чью ссылку бот показывает юзеру («конфиг готов» и
+    # /config): ставится при создании подписки = токен первого устройства.
+    # Храним ТОКЕН, а не device_id: failover/миграция переносят токен на новую
+    # строку Device, и по строке primary «терялся» бы. NULL — подписки до
+    # 0070: им показываем legacy sub_token (он уже вбит в их клиенты).
+    # См. services/sub_links.link_token_for.
+    link_token = Column(String, nullable=True)
 
     # ── Stage 4: balance billing anchor + freeze ────────────────────
     # Committed prepayment for this subscription's billing window. On

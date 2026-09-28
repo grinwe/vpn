@@ -151,6 +151,19 @@ async def test_cmd_config_with_message_sends_header_and_link(handlers, monkeypat
 
 
 @pytest.mark.asyncio
+async def test_cmd_config_prefers_device_link_token(handlers, monkeypatch):
+    """Новые подписки: бэкенд отдаёт link_token (токен primary-устройства) —
+    бот показывает его, а не токен всей подписки (user 1000076, 27.09)."""
+    subs = [dict(_ACTIVE_SUBS[0], link_token="devtok9")]
+    _script_fetch(handlers, monkeypatch, {"/api/users/by_telegram/100": (200, subs)})
+    msg = FakeMessage(FakeBot())
+
+    assert await handlers.cmd_config(msg) is True
+    assert f"{SUB_BASE}/devtok9" in msg.sent[1][0]
+    assert "tok123" not in msg.sent[1][0]
+
+
+@pytest.mark.asyncio
 async def test_cmd_config_intro_is_glued_to_header(handlers, monkeypatch):
     _script_fetch(handlers, monkeypatch, {"/api/users/by_telegram/100": (200, _ACTIVE_SUBS)})
     msg = FakeMessage(FakeBot())

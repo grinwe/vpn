@@ -1298,7 +1298,9 @@ async def cmd_config(
     # сырых vless-линков нужен был только как дебажный fallback на
     # случай, когда SUB_LINK_BASE_URL не задан — теперь fallback берём
     # из WEBAPP_BASE_URL, поэтому URL всегда есть.
-    sub_token = active_sub.get("sub_token")
+    # link_token — токен primary-устройства (у новых подписок), а не всей
+    # подписки: иначе одна ссылка отдаёт логины всех устройств (sub_links.py).
+    sub_token = active_sub.get("link_token") or active_sub.get("sub_token")
     sub_url = _build_sub_url(sub_token)
     if not sub_url:
         # Такое случается только в dev-окружении без WEBAPP_BASE_URL.
@@ -1438,8 +1440,8 @@ async def unfreeze_cb(callback_query: types.CallbackQuery):
     if status_code == 200:
         await callback_query.bot.send_message(
             chat_id,
-            "🔥 Разморозил! VPN оживёт через минуту-две, ссылка прежняя "
-            "(в личном кабинете или /config). Учти: заморозка даётся один "
+            "🔥 Разморозил! VPN оживёт через минуту-две, ссылка прежняя, "
+            "добавлять её заново не нужно. Учти: заморозка даётся один "
             "раз в год, и эта попытка уже использована.",
         )
         return
@@ -3639,9 +3641,12 @@ async def _send_devices(bot: "types.Bot", chat_id: int, uid: int) -> None:
         ])
     if not live:
         lines.append("Живых устройств нет.")
+    # Не «ссылка общая, бери из /config»: /config ведёт на первое устройство,
+    # и новый телефон сел бы на его логин. У каждого устройства своя ссылка
+    # (разбор user 1000076, 28.09.2026).
     lines.append(
-        "\nОдно устройство, одна строка. Ссылка подписки общая: "
-        "она в личном кабинете или по команде /config."
+        "\nОдно устройство, одна строка. У каждого устройства своя ссылка, "
+        "все они в личном кабинете."
     )
     rows.append([
         types.InlineKeyboardButton(
@@ -3690,12 +3695,29 @@ async def device_add_cb(callback_query: types.CallbackQuery):
         fee_note = (
             f" Списано {charged // 100} ₽ за дополнительный слот." if charged else ""
         )
-        await callback_query.bot.send_message(
-            chat_id,
-            f"✅ Устройство добавлено (всего {data.get('device_count')})."
-            f"{fee_note}\nИмпортни ту же ссылку на новом устройстве: она в "
-            "личном кабинете или по команде /config.",
-        )
+        # Ссылка именно НОВОГО устройства. Раньше бот отсылал к «той же
+        # ссылке из /config», но /config ведёт на первое устройство — второй
+        # телефон сел бы на его логин (разбор user 1000076, 28.09.2026).
+        new_url = _build_sub_url(data.get("sub_token"))
+        if new_url:
+            await callback_query.bot.send_message(
+                chat_id,
+                f"✅ Устройство добавлено (всего {data.get('device_count')})."
+                f"{fee_note}\nНа новом устройстве импортируй эту ссылку, "
+                "она только для него:",
+            )
+            await callback_query.bot.send_message(
+                chat_id,
+                f"<code>{new_url}</code>",
+                parse_mode="HTML",
+                disable_web_page_preview=True,
+            )
+        else:
+            await callback_query.bot.send_message(
+                chat_id,
+                f"✅ Устройство добавлено (всего {data.get('device_count')})."
+                f"{fee_note}\nСсылка для него лежит в личном кабинете.",
+            )
         await _send_devices(callback_query.bot, chat_id, uid)
         return
     if status_code == 402:

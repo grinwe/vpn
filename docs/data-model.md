@@ -176,6 +176,7 @@ class Subscription(Base):
     traffic_used_bytes,                      # байты за оплаченный период (тик traffic_stats), обнуляет продление
     auto_renew,
     sub_token: unique indexed String NULL,   # stable dynamic link
+    link_token: String NULL,                 # токен устройства, чью ссылку показывает бот (0070; NULL = legacy)
     # Stage 4 balance billing
     prepaid_kopecks: Integer NOT NULL DEFAULT 0,
     next_charge_at: DateTime NULL,     # NULL = legacy invoice sub
@@ -187,6 +188,7 @@ class Subscription(Base):
 
 Инварианты:
 - `sub_token` **стабильный**: миграция/freeze/unfreeze его не меняет. Все пути в `services/provisioning.py` явно это сохраняют (комментарии `:1106`, `:1239`, `services/health.py:225`).
+- `link_token` — не отдельный секрет, а КОПИЯ `Device.sub_token` первого устройства: ставится в `provision_subscription`; когда устройство-держатель выведено и создаётся одноимённая замена со свежим токеном (разморозка, enable, продление, reality-dest refresh, перевыпуск ссылки), `reprovision_subscription._adopt_link_token` переносит его на замену; failover/миграции его не трогают (токен сам переезжает на новую строку Device). Читать только через `services/sub_links.link_token_for`. NULL у подписок до 0070 — бот показывает им legacy `sub_token`.
 - `prepaid_kopecks >= 0` всегда. Списывается в `charge_subscription`, возвращается в `balance_kopecks` при ручном revoke. Expired subs теряют остаток (по конструкции ≈0).
 - `next_charge_at IS NULL` означает «legacy invoice-модель» — этот sub не попадает в `run_balance_charge_tick`.
 - `status=frozen` ⇔ `frozen_at IS NOT NULL`.

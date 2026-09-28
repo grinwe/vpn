@@ -74,3 +74,63 @@ def sub_url_for(token: str) -> str:
     """Готовая ссылка `<base>/<token>` или относительный путь без базы."""
     base = sub_base_for(token)
     return f"{base}/{token}" if base else f"/api/sub/{token}"
+
+
+
+# Ссылка, которую бот показывает юзеру («конфиг готов» и /config).
+#
+# Раньше бот отдавал токен ПОДПИСКИ, а он при нескольких устройствах отдаёт
+# креды всех устройств сразу: телефон, куда импортировали ссылку из бота,
+# занимал логины device-2/device-3, которые юзер тем временем раздавал родным
+# из кабинета (user 1000076, 27.09.2026: 12 конфигов в одном Hiddify).
+#
+# Какое устройство «главное», запоминается в Subscription.link_token при
+# создании подписки (токен первого устройства). Угадывать по строкам Device
+# нельзя: failover/миграция переносят токен на НОВУЮ строку, и «самое раннее
+# устройство» становилось device-2 — бот показал бы ссылку родственника.
+_RETIRED = ("revoked", "disabled")
+
+
+def _status(device) -> str:
+    return getattr(device.status, "value", device.status)
+
+
+def link_token_for(sub) -> str | None:
+    """Токен для показа юзеру в боте.
+
+    * ``link_token`` пуст (подписка до 0070) → legacy ``sub_token``: он уже в
+      клиентах, другая ссылка дала бы профиль-дубль.
+    * Устройство с этим токеном не выведено (или его строка не загружена) →
+      токен. Замены после разморозки/enable/refresh перенимают link_token
+      сами (provisioning._adopt_link_token), сюда доходят уже с ним.
+    * Держатель выведен (revoked/disabled), а перенос не случился — юзер сам
+      удалил устройство, либо подписку чинили до этого релиза: одноимённое
+      живое устройство → самое раннее активное → самое раннее ещё pending.
+      Не отдаём токен выведенного: саб-эндпоинт алиасил бы его на «последнее
+      обновлённое» соседнее, и оно менялось бы от тика к тику.
+    * Живых устройств нет вовсе → legacy ``sub_token``.
+    """
+    token = getattr(sub, "link_token", None)
+    if not token:
+        return sub.sub_token
+    devices = list(getattr(sub, "devices", None) or [])
+    holder = next((d for d in devices if d.sub_token == token), None)
+    if holder is None or _status(holder) not in _RETIRED:
+        return token
+    # pending_swap_from — замена в незавершённом failover-свапе: её токен
+    # временный и исчезнет при свапе (ссылка стала бы 404).
+    alive = [
+        d for d in devices
+        if d.sub_token
+        and _status(d) not in _RETIRED + ("failed",)
+        and getattr(d, "pending_swap_from", None) is None
+    ]
+    if not alive:
+        return sub.sub_token
+
+    def _key(d):
+        return (d.created_at is None, d.created_at, d.id)
+
+    same_name = [d for d in alive if (d.name or "primary") == (holder.name or "primary")]
+    active = [d for d in alive if _status(d) == "active"]
+    return min(same_name or active or alive, key=_key).sub_token

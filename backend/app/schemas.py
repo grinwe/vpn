@@ -411,6 +411,9 @@ class SubscriptionOut(BaseModel):
     status: str
     auto_renew: bool = False
     sub_token: str | None = None
+    # Что показывать юзеру в боте: токен устройства (Subscription.link_token)
+    # или legacy-токен подписки у подписок до 0070 (sub_links.link_token_for).
+    link_token: str | None = None
     credentials: List[CredentialOut]
     devices: List[DeviceOut] = []
     # True iff at least one of this subscription's live device emails
