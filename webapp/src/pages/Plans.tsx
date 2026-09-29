@@ -10,6 +10,7 @@ import {
   pollBalanceIncrease,
   MeResponse,
   WebAppPlan,
+  subLinkUrl,
 } from "../api";
 import { navigate } from "../router";
 import { getTg, openExternalUrl } from "../telegram";
@@ -103,6 +104,7 @@ export default function Plans({ onActivated, subLinkBase, me, changeSubscription
     tier: string;
     days: number;
     subToken: string | null;
+    subUrl: string | null;
   } | null>(null);
   const [toast, setToast] = useState<string | null>(null);
   // Состояние платежа-пополнения из TopupHintSheet:
@@ -236,7 +238,12 @@ export default function Plans({ onActivated, subLinkBase, me, changeSubscription
         const res = await activateSubscription(plan.id);
         const tg = getTg();
         tg?.HapticFeedback?.notificationOccurred("success");
-        setActivated({ tier: plan.tier, days: res.plan_duration_days, subToken: res.sub_token });
+        setActivated({
+          tier: plan.tier,
+          days: res.plan_duration_days,
+          subToken: res.sub_token,
+          subUrl: res.sub_url ?? null,
+        });
       }
     } catch (e) {
       const msg = (e as Error).message;
@@ -391,6 +398,7 @@ export default function Plans({ onActivated, subLinkBase, me, changeSubscription
         tier={activated.tier}
         days={activated.days}
         subToken={activated.subToken}
+        readyUrl={activated.subUrl}
         subLinkBase={subLinkBase}
         onHome={() => {
           onActivated();
@@ -680,12 +688,14 @@ function ActivatedScreen({
   tier,
   days,
   subToken,
+  readyUrl,
   subLinkBase,
   onHome,
 }: {
   tier: string;
   days: number;
   subToken: string | null;
+  readyUrl: string | null;
   subLinkBase: string;
   onHome: () => void;
 }) {
@@ -693,11 +703,7 @@ function ActivatedScreen({
   const [showQR, setShowQR] = useState(false);
   const qrRef = useRef<HTMLCanvasElement | null>(null);
 
-  const subUrl = subToken
-    ? subLinkBase
-      ? `${subLinkBase}/${subToken}`
-      : `${window.location.origin}/api/sub/${subToken}`
-    : null;
+  const subUrl = subLinkUrl(readyUrl, subToken, subLinkBase);
 
   useEffect(() => {
     if (!showQR || !subUrl || !qrRef.current) return;

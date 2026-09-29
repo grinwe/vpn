@@ -175,6 +175,11 @@ def _subscriptions_for_user(user_id: int, db: Session) -> list[schemas.Subscript
             auto_renew=sub.auto_renew or False,
             sub_token=sub.sub_token,
             link_token=sub_links.link_token_for(sub),
+            link_url=(
+                sub_links.sub_url_for(sub_links.link_token_for(sub))
+                if sub.link_token
+                else None
+            ),
             credentials=[schemas.CredentialOut.from_orm(c) for c in sub.credentials],
             devices=device_outs,
             sharing_blocked=_sub_sharing_blocked(db, sub),

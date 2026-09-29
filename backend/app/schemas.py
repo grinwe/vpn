@@ -414,6 +414,10 @@ class SubscriptionOut(BaseModel):
     # Что показывать юзеру в боте: токен устройства (Subscription.link_token)
     # или legacy-токен подписки у подписок до 0070 (sub_links.link_token_for).
     link_token: str | None = None
+    # Готовый URL этой ссылки — домен выбран как у бота (sub_links.sub_url_for,
+    # 50/50 по токену). Только у подписок с Subscription.link_token (с 0070):
+    # у старых кабинет строит URL по-старому, чтобы он не поменялся.
+    link_url: str | None = None
     credentials: List[CredentialOut]
     devices: List[DeviceOut] = []
     # True iff at least one of this subscription's live device emails

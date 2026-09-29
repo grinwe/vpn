@@ -413,8 +413,16 @@ def test_users_api_exposes_link_token(client, db_session: Session, stored, expec
     assert item["link_token"] == expected
 
 
-def test_bot_add_device_returns_new_device_token(client, db_session: Session) -> None:
-    user, sub, _device = _sub_fixture(db_session, link_token="dev-tok-dl")
+@pytest.mark.parametrize("stored", ["dev-tok-dl", None])
+def test_bot_add_device_returns_new_device_token(
+    client, db_session: Session, monkeypatch: pytest.MonkeyPatch, stored
+) -> None:
+    """sub_url = URL, который кабинет покажет в строке устройства: у новых
+    подписок домен 50/50 как у бота, у старых — один SUB_LINK_BASE_URL."""
+    monkeypatch.setenv("SUB_LINK_BASE_URL", BASE)
+    monkeypatch.setenv("SUB_LINK_BASE_URL_ALT", "https://grwr.ink")
+    monkeypatch.setenv("SUB_LINK_ALT_SHARE", "100")
+    user, sub, _device = _sub_fixture(db_session, link_token=stored)
     resp = client.post(
         f"/api/bot/subscriptions/{sub.id}/add_device",
         json={"telegram_id": user.telegram_id},
@@ -426,6 +434,91 @@ def test_bot_add_device_returns_new_device_token(client, db_session: Session) ->
     new_device = db_session.get(models.Device, data["device_id"])
     assert data["sub_token"] == new_device.sub_token
     assert data["sub_token"] not in ("dev-tok-dl", "sub-tok-dl")
+    expected_base = "https://grwr.ink" if stored else BASE
+    assert data["sub_url"] == f"{expected_base}/{new_device.sub_token}"
+
+
+# ── кабинет: та же ссылка, что у бота ──
+
+
+def _webapp_auth(user_id: int) -> dict:
+    from app.api_webapp import issue_token
+    from app.config import get_settings
+
+    token = issue_token(user_id, get_settings().webapp_jwt_secret, 600)
+    return {"Authorization": f"Bearer {token}"}
+
+
+ALT = "https://grwr.ink"
+
+
+def _all_to_mirror(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Доля зеркала 100% — URL обязан идти на ALT, как у бота/пуша.
+    monkeypatch.setenv("SUB_LINK_BASE_URL", BASE)
+    monkeypatch.setenv("SUB_LINK_BASE_URL_ALT", ALT)
+    monkeypatch.setenv("SUB_LINK_ALT_SHARE", "100")
+
+
+def test_webapp_me_exposes_link_token_and_bot_url(
+    client, db_session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Карточка кабинета берёт главную ссылку/QR из link_token (Home.tsx),
+    а не «первое живое устройство по id»: после failover primary токен
+    переезжает на строку с бОльшим id, и кабинет показал бы device-2. И URL
+    целиком (с доменом 50/50 как у бота) приходит с бэка — иначе у половины
+    юзеров бот и кабинет давали бы разные URL на один токен."""
+    _all_to_mirror(monkeypatch)
+    user, sub, _device = _sub_fixture(db_session, link_token="dev-tok-dl")
+    res = client.get("/api/webapp/me", headers=_webapp_auth(user.id))
+    assert res.status_code == 200, res.text
+    body = res.json()
+    item = next(s for s in body["subscriptions"] if s["id"] == sub.id)
+    assert item["link_token"] == "dev-tok-dl"
+    assert item["sub_token"] == "sub-tok-dl"
+    assert item["link_url"] == f"{ALT}/dev-tok-dl" == sub_links.sub_url_for("dev-tok-dl")
+    extra = next(e for e in body["subscription_extras"] if e["subscription_id"] == sub.id)
+    assert extra["devices"][0]["sub_url"] == f"{ALT}/dev-tok-dl"
+
+
+def test_webapp_me_legacy_sub_has_no_ready_urls(
+    client, db_session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Подписки до 0070: готовых URL нет — фронт строит по-старому из
+    SUB_LINK_BASE_URL, чтобы у уже импортированной ссылки не сменился домен."""
+    _all_to_mirror(monkeypatch)
+    user, sub, _device = _sub_fixture(db_session, link_token=None)
+    res = client.get("/api/webapp/me", headers=_webapp_auth(user.id))
+    body = res.json()
+    item = next(s for s in body["subscriptions"] if s["id"] == sub.id)
+    assert item["link_url"] is None
+    extra = next(e for e in body["subscription_extras"] if e["subscription_id"] == sub.id)
+    assert extra["devices"][0]["sub_url"] is None
+
+
+def test_webapp_activate_returns_bot_link_token(
+    client, db_session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from app.services import balance
+
+    _all_to_mirror(monkeypatch)
+
+    _fresh_node(db_session, name="dl-act", host="10.9.1.10")  # нода для choose_node
+    plan = make_plan(db_session, name="dl-act-plan")
+    user = make_user(db_session, telegram_id="555010")
+    balance.topup(db_session, user.id, 5000, reference="seed")
+    db_session.commit()
+
+    res = client.post(
+        "/api/webapp/subscriptions/activate",
+        json={"plan_id": plan.id},
+        headers=_webapp_auth(user.id),
+    )
+    assert res.status_code == 200, res.text
+    db_session.expire_all()
+    sub = db_session.get(models.Subscription, res.json()["subscription_id"])
+    assert sub.link_token
+    assert res.json()["sub_token"] == sub.link_token == sub_links.link_token_for(sub)
+    assert res.json()["sub_url"] == f"{ALT}/{sub.link_token}"
 
 
 # ── бот: после добавления устройства шлёт ЕГО ссылку ──
@@ -473,6 +566,30 @@ async def test_bot_add_device_sends_new_device_link(bot_handlers, monkeypatch) -
     texts = await _tap_add(bot_handlers)
     assert any("https://sub.test/s/newtok" in t for t in texts), texts
     assert not any("/config" in t for t in texts), texts
+
+
+@pytest.mark.asyncio
+async def test_bot_add_device_prefers_cabinet_url(bot_handlers, monkeypatch) -> None:
+    """Бот шлёт ровно URL, который покажет кабинет (домен тоже)."""
+    _script(
+        bot_handlers, monkeypatch,
+        (200, {"device_count": 2, "charged_kopecks": 0, "sub_token": "newtok",
+               "sub_url": "https://main.test/newtok"}),
+    )
+    texts = await _tap_add(bot_handlers)
+    assert any("https://main.test/newtok" in t for t in texts), texts
+    assert not any("https://sub.test/s/newtok" in t for t in texts), texts
+
+
+@pytest.mark.asyncio
+async def test_bot_add_device_relative_cabinet_url_falls_back(bot_handlers, monkeypatch) -> None:
+    _script(
+        bot_handlers, monkeypatch,
+        (200, {"device_count": 2, "charged_kopecks": 0, "sub_token": "newtok",
+               "sub_url": "/api/sub/newtok"}),
+    )
+    texts = await _tap_add(bot_handlers)
+    assert any("https://sub.test/s/newtok" in t for t in texts), texts
 
 
 @pytest.mark.asyncio

@@ -24,6 +24,7 @@ import {
   unfreezeSubscription,
   toggleAutoRenew,
   humanError,
+  subLinkUrl,
 } from "../api";
 import { navigate } from "../router";
 import { getTg, openExternalUrl } from "../telegram";
@@ -93,7 +94,10 @@ export default function Home({
   // просто исчезал, баланс снова показывал 0 ₽, и юзер не понимал, выдали ему
   // VPN или нет; а провал уходил в console.warn — «тапнул, ничего не
   // произошло, ушёл».
-  const [trialDone, setTrialDone] = useState<{ subToken: string | null } | null>(null);
+  const [trialDone, setTrialDone] = useState<{
+    subToken: string | null;
+    subUrl: string | null;
+  } | null>(null);
   const [trialError, setTrialError] = useState<string | null>(null);
 
   // Trial is retroactive: any user whose trial_activated_at is still
@@ -135,7 +139,7 @@ export default function Home({
           getTg()?.HapticFeedback?.notificationOccurred("success");
           // Ссылка приходит прямо в ответе — показываем экран «Готово» без
           // лишнего запроса и без ожидания рефреша /me.
-          setTrialDone({ subToken: res.sub_token ?? null });
+          setTrialDone({ subToken: res.sub_token ?? null, subUrl: res.sub_url ?? null });
         }
       } catch (actErr) {
         // Бонус на балансе, но подписка не активировалась (нет свободных нод,
@@ -269,6 +273,7 @@ export default function Home({
       {trialDone && (
         <TrialSuccess
           subToken={trialDone.subToken}
+          readyUrl={trialDone.subUrl}
           subLinkBase={me.sub_link_base_url}
           onClose={() => {
             setTrialDone(null);
@@ -443,16 +448,23 @@ function SubscriptionCard({
   const [busy, setBusy] = useState(false);
   const [showQR, setShowQR] = useState(false);
   const qrCanvasRef = useRef<HTMLCanvasElement | null>(null);
-  // Per-device sub link — use the first active device's token so the QR
-  // exposes only that device's credentials.  Falls back to the legacy
-  // subscription-level token for old subscriptions without device tokens.
+  // Per-device sub link — та же ссылка, что показывает бот (link_token):
+  // «первое живое устройство по id» после failover primary становилось
+  // device-2 (токен переезжает на новую строку с большим id), и кабинет с
+  // ботом показывали разные ссылки. link_token == sub_token бывает только у
+  // подписок до 2026-09-28 — это legacy-ссылка на ВСЕ устройства, её не
+  // показываем и остаёмся на первом устройстве, как раньше.
+  const deviceLinkToken =
+    sub.link_token && sub.link_token !== sub.sub_token ? sub.link_token : null;
   const primaryDevice = extra?.devices?.find((d) => d.sub_token);
-  const linkToken = primaryDevice?.sub_token ?? sub.sub_token;
-  const subUrl = linkToken
-    ? subLinkBase
-      ? `${subLinkBase}/${linkToken}`
-      : `${window.location.origin}/api/sub/${linkToken}`
-    : null;
+  const linkToken = deviceLinkToken ?? primaryDevice?.sub_token ?? sub.sub_token;
+  // Готовый URL (домен как у бота) — только у подписок с link_token; у
+  // старых primaryDevice.sub_url пуст, и URL строится как раньше.
+  const subUrl = subLinkUrl(
+    deviceLinkToken ? sub.link_url : primaryDevice?.sub_url,
+    linkToken,
+    subLinkBase,
+  );
 
   const isFrozen = sub.status === "frozen";
 
@@ -798,19 +810,17 @@ const CLIENT_LINKS: { label: string; url: string }[] = [
  */
 function TrialSuccess({
   subToken,
+  readyUrl,
   subLinkBase,
   onClose,
 }: {
   subToken: string | null;
+  readyUrl: string | null;
   subLinkBase: string;
   onClose: () => void;
 }) {
   const [copied, setCopied] = useState(false);
-  const subUrl = subToken
-    ? subLinkBase
-      ? `${subLinkBase}/${subToken}`
-      : `${window.location.origin}/api/sub/${subToken}`
-    : null;
+  const subUrl = subLinkUrl(readyUrl, subToken, subLinkBase);
 
   return createPortal(
     <div className="fixed inset-0 z-50 bg-black/70 flex items-end sm:items-center justify-center p-4">
@@ -1209,11 +1219,7 @@ function DeviceRow({
   const [copied, setCopied] = useState(false);
   const inputRef = useRef<HTMLInputElement>(null);
 
-  const deviceUrl = device.sub_token
-    ? subLinkBase
-      ? `${subLinkBase}/${device.sub_token}`
-      : `${window.location.origin}/api/sub/${device.sub_token}`
-    : null;
+  const deviceUrl = subLinkUrl(device.sub_url, device.sub_token, subLinkBase);
 
   useEffect(() => {
     if (editing) inputRef.current?.focus();

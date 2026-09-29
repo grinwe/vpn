@@ -17,6 +17,12 @@ export interface Subscription {
   status: string;
   auto_renew: boolean;
   sub_token: string | null;
+  // Токен устройства, чью ссылку показывает и бот (/config). У подписок до
+  // 2026-09-28 бэк кладёт сюда legacy sub_token (он отдаёт креды ВСЕХ
+  // устройств) — см. SubscriptionCard. Опционально: старый бэк поля не шлёт.
+  link_token?: string | null;
+  // Готовый URL link_token с доменом как у бота — см. subLinkUrl.
+  link_url?: string | null;
   credentials: { proto: string; config_text: string }[];
   devices: unknown[];
 }
@@ -62,6 +68,24 @@ export interface DeviceSummary {
   status: string;
   sub_token: string | null;
   created_at: string | null;
+  sub_url?: string | null;
+}
+
+// Саб-ссылка для показа. Бэк отдаёт готовый URL (домен выбран как у бота:
+// 50/50 grn-ssync/grwr по токену) только у подписок с 2026-09-28 — тогда
+// бот и кабинет показывают ОДИН И ТОТ ЖЕ URL. У старых собираем по-старому
+// из SUB_LINK_BASE_URL: смена домена у уже импортированной ссылки дала бы
+// при переимпорте профиль-дубль. Опционально: старый бэк полей не шлёт.
+export function subLinkUrl(
+  ready: string | null | undefined,
+  token: string | null | undefined,
+  base: string,
+): string | null {
+  if (ready) {
+    return ready.startsWith("/") ? `${window.location.origin}${ready}` : ready;
+  }
+  if (!token) return null;
+  return base ? `${base}/${token}` : `${window.location.origin}/api/sub/${token}`;
 }
 
 export interface SubscriptionExtra {
@@ -392,6 +416,7 @@ export async function pollBalanceIncrease(
 export interface ActivateResponse {
   subscription_id: number;
   sub_token: string | null;
+  sub_url?: string | null;
   expires_at: string;
   balance_kopecks: number;
   plan_price_kopecks: number;

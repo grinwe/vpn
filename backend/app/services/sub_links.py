@@ -76,6 +76,20 @@ def sub_url_for(token: str) -> str:
     return f"{base}/{token}" if base else f"/api/sub/{token}"
 
 
+def cabinet_url_for(sub, token: str) -> str:
+    """URL, который кабинет покажет для этого токена устройства.
+
+    У подписок с ``link_token`` (с 0070) — как у бота (``sub_url_for``, домен
+    50/50). У старых кабинет строит URL из одного SUB_LINK_BASE_URL (смена
+    домена у уже импортированной ссылки дала бы дубль профиля) — и бот,
+    присылая ссылку нового устройства, обязан дать ровно её же.
+    """
+    if getattr(sub, "link_token", None):
+        return sub_url_for(token)
+    base = _clean("SUB_LINK_BASE_URL")
+    return f"{base}/{token}" if base else f"/api/sub/{token}"
+
+
 
 # Ссылка, которую бот показывает юзеру («конфиг готов» и /config).
 #

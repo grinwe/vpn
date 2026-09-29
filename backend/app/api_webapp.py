@@ -34,6 +34,7 @@ from .api._common import _audit
 from .config import get_settings
 from .db import SessionLocal
 from .rate_limit import limiter
+from .services import sub_links
 from .services.payments.base import ProviderError
 from .services.payments.checkout import (
     ProviderApiError,
@@ -273,6 +274,9 @@ class DeviceSummary(BaseModel):
     status: str
     sub_token: str | None
     created_at: datetime | None
+    # Готовый URL с доменом как у бота (sub_links.sub_url_for) — только у
+    # подписок с link_token (с 0070); у старых фронт строит URL по-старому.
+    sub_url: str | None = None
 
 
 class SubscriptionWebAppExtra(BaseModel):
@@ -429,6 +433,11 @@ def _build_subscription_extras(
                         status=d.status.value,
                         sub_token=d.sub_token,
                         created_at=getattr(d, "created_at", None),
+                        sub_url=(
+                            sub_links.sub_url_for(d.sub_token)
+                            if sub.link_token and d.sub_token
+                            else None
+                        ),
                     )
                     for d in live_device_rows
                 ],
@@ -1011,6 +1020,8 @@ def _refund_subscription_remainder(
 class ActivateResponse(BaseModel):
     subscription_id: int
     sub_token: str | None
+    # Готовый URL (домен как у бота) — экран «Готово» показывает ровно его.
+    sub_url: str | None = None
     expires_at: datetime
     balance_kopecks: int
     plan_price_kopecks: int
@@ -1186,16 +1197,20 @@ def webapp_activate(
 
     # Return the primary device's per-device sub_token so the QR/link
     # exposes only that device's credentials (not the entire subscription).
-    # Falls back to the subscription-level token for safety.
+    # link_token — то же, что покажут бот и карточка кабинета (sub_links);
+    # fallback на первое устройство/токен подписки — на всякий случай.
     primary_device = next(
         (d for d in sub.devices if d.sub_token),
         None,
     )
-    token = primary_device.sub_token if primary_device else sub.sub_token
+    token = sub.link_token or (
+        primary_device.sub_token if primary_device else sub.sub_token
+    )
 
     return ActivateResponse(
         subscription_id=sub.id,
         sub_token=token,
+        sub_url=sub_links.sub_url_for(token) if sub.link_token and token else None,
         expires_at=sub.expires_at,
         balance_kopecks=user.balance_kopecks or 0,
         plan_price_kopecks=plan_price,
@@ -1538,6 +1553,8 @@ class AddDeviceResponse(BaseModel):
     # Ссылка НОВОГО устройства: бот шлёт её сразу, а не «ту же из /config» —
     # та ведёт на primary, и второй телефон сел бы на чужой логин.
     sub_token: str | None = None
+    # Тот же URL, что кабинет покажет в строке этого устройства (домен!).
+    sub_url: str | None = None
     device_count: int
     extra_device_slots: int
     charged_kopecks: int
@@ -1669,6 +1686,11 @@ def webapp_add_device(
         subscription_id=sub.id,
         device_id=device.id,
         sub_token=device.sub_token,
+        sub_url=(
+            sub_links.cabinet_url_for(sub, device.sub_token)
+            if device.sub_token
+            else None
+        ),
         device_count=new_device_count,
         extra_device_slots=sub.extra_device_slots or 0,
         charged_kopecks=charged,
@@ -1766,8 +1788,6 @@ def webapp_remove_device(
     # (link_token_for выберет живое), иначе выбор пересчитывался бы на каждый
     # /config и после failover выбранного «переползал» бы на другое устройство.
     if was_link_holder:
-        from .services import sub_links
-
         db.refresh(sub)
         chosen = sub_links.link_token_for(sub)
         if chosen and chosen != sub.sub_token:

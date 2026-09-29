@@ -3698,7 +3698,15 @@ async def device_add_cb(callback_query: types.CallbackQuery):
         # Ссылка именно НОВОГО устройства. Раньше бот отсылал к «той же
         # ссылке из /config», но /config ведёт на первое устройство — второй
         # телефон сел бы на его логин (разбор user 1000076, 28.09.2026).
-        new_url = _build_sub_url(data.get("sub_token"))
+        # sub_url — ровно тот URL, что кабинет покажет в строке устройства
+        # (домен тоже: у старых подписок кабинет держит один основной домен).
+        # Относительный (без SUB_LINK_BASE_URL) в Telegram не кликается.
+        ready = data.get("sub_url")
+        new_url = (
+            ready
+            if isinstance(ready, str) and ready.startswith(("https://", "http://"))
+            else _build_sub_url(data.get("sub_token"))
+        )
         if new_url:
             await callback_query.bot.send_message(
                 chat_id,
