@@ -631,14 +631,25 @@ def test_unpaid_trial_cannot_freeze(client, db_session: Session) -> None:
     assert db_session.get(models.Subscription, sub.id).status == models.SubscriptionStatus.active
 
 
-def test_trial_with_topped_up_balance_still_cannot_freeze(client, db_session: Session) -> None:
-    """Пополнил в первый день: юзер уже платил, но сама подписка ещё триал.
-    Заморозка растянула бы бесплатные дни на неделю."""
+def test_trial_with_partial_topup_still_cannot_freeze(client, db_session: Session) -> None:
+    """Пополнил, но на продление не хватает: сама подписка ещё триал —
+    заморозка растянула бы бесплатные дни на неделю."""
     user, sub = _trial_sub(db_session, "t4-topup")
-    _tx(db_session, user, SOLO_KOPECKS, models.BalanceTxKind.topup, "invoice:41")
+    _tx(db_session, user, SOLO_KOPECKS - 5000, models.BalanceTxKind.topup, "invoice:41")
 
     assert _can_freeze(client, user, sub) is False
     assert _freeze(client, user, sub).status_code == 400
+
+
+def test_trial_with_balance_covering_renewal_can_freeze(client, db_session: Session) -> None:
+    """Решение владельца 30.09 (user 1000058: 1500 ₽ на балансе на триальной
+    подписке): деньги на продление уже лежат — человек фактически купил,
+    заморозку показываем."""
+    user, sub = _trial_sub(db_session, "t4-topup-full")
+    _tx(db_session, user, SOLO_KOPECKS, models.BalanceTxKind.topup, "invoice:42")
+
+    assert _can_freeze(client, user, sub) is True
+    assert _freeze(client, user, sub).status_code == 200
 
 
 def test_old_cabinet_trial_without_payment_cannot_freeze(client, db_session: Session) -> None:

@@ -654,19 +654,29 @@ FREEZE_NEEDS_PAYMENT_DETAIL = "Заморозка станет доступна 
 def freeze_allowed_by_payment(
     db: Session, sub: models.Subscription, *, has_paid: bool | None = None
 ) -> bool:
-    """Правило заморозки по оплате: юзер платил и эта подписка не неоплаченный триал.
+    """Правило заморозки по оплате: юзер платил и эта подписка не неоплаченный
+    триал — либо на балансе уже лежит полная стоимость её продления.
 
     Правило по подписке, а не по юзеру. Без ``is_unpaid_trial`` триальщик,
     пополнивший баланс в первый день, заморозил бы сам триал: +FREEZE_DAYS к
-    сроку, и первое списание уехало бы на неделю. ``has_paid`` можно передать
-    заранее посчитанным, когда подписок у юзера несколько (кабинет, /me).
+    сроку, и первое списание уехало бы на неделю. Исключение (решение
+    владельца 30.09.2026, user 1000058 с 1500 ₽ на балансе на триальной
+    подписке): кто уже положил деньги на продление, фактически купил — ему
+    заморозку показываем; цена лазейки — до FREEZE_DAYS дней платящему.
+    ``has_paid`` можно передать заранее посчитанным, когда подписок у юзера
+    несколько (кабинет, /me).
 
     ``freeze_subscription`` это правило не проверяет: его зовёт только
     ``webapp_freeze``, и проверка стоит там (сервис покрыт тестами без журнала).
     """
     if has_paid is None:
         has_paid = user_has_paid(db, sub.user_id)
-    return bool(has_paid) and not is_unpaid_trial(db, sub)
+    if not has_paid:
+        return False
+    if not is_unpaid_trial(db, sub):
+        return True
+    user = db.get(models.User, sub.user_id)
+    return bool(user) and (user.balance_kopecks or 0) >= total_renewal_cost_kopecks(sub)
 
 
 # ── Freeze / unfreeze (V2: 1 per year, 7 days) ──────────────────────
