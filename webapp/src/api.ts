@@ -42,18 +42,35 @@ export interface BalanceInfo {
   has_active_balance_sub: boolean;
   trial_available: boolean;
   trial_amount_kopecks: number;
-  // Можно ли сразу потратить бонус на активацию плана. False, если у юзера
-  // уже есть живая подписка — /subscriptions/activate снёс бы её (сменa
-  // тарифа в single-sub модели). Опционально: старый бэк поля не отдаёт,
-  // undefined читается как «нельзя» — безопасный дефолт на время деплоя.
+  // Устаревший флаг второго шага «купить план на бонус» из браузера. Бэк
+  // всегда отдаёт false: /trial/activate сам выдаёт подписку. Новый бандл
+  // его не читает, поле держим ради совместимости типов.
   trial_autoactivate_allowed?: boolean;
+  // Бесплатные дни для баннера: всем (3) и сверху по приглашению (0 или 3).
+  // Опционально: старый бэк полей не отдаёт.
+  trial_days?: number;
+  trial_referral_days?: number;
+  // Живая подписка уже есть: тап даст только подарок на баланс (пойдёт на
+  // продление), подписку не выдаст. Баннер тогда честный: «Подарок: N ₽».
+  trial_bonus_only?: boolean;
 }
 
 export interface TrialActivateResponse {
   trial_amount_kopecks: number;
   referral_bonus_kopecks: number;
   balance_kopecks: number;
-  trial_expires_at: string;
+  // null у бонус-онли (живая подписка) и на историческом пути (старый
+  // бонус 150 ₽ потрачен на месяц).
+  trial_expires_at: string | null;
+  // Выданная подписка. Всё null, если тап дал только подарок на баланс.
+  subscription_id?: number | null;
+  sub_token?: string | null;
+  sub_url?: string | null;
+  expires_at?: string | null;
+  // Бесплатные дни (3) и дни по приглашению (0 или 3). null на историческом
+  // пути.
+  trial_days?: number | null;
+  referral_days?: number | null;
 }
 
 export async function activateTrial() {
@@ -537,6 +554,9 @@ export interface ReferralInfo {
   invited_count: number;
   earned_kopecks: number;
   share_url: string | null;
+  // Сколько бесплатных дней получит друг по этой ссылке (3 + 3).
+  // Опционально: старый бэк поля не отдаёт.
+  invitee_total_days?: number;
 }
 
 export async function fetchReferral() {

@@ -3,8 +3,6 @@ import { createPortal } from "react-dom";
 import QRCode from "qrcode";
 import {
   activateTrial,
-  activateSubscription,
-  fetchPlans,
   authWithInitData,
   fetchReferral,
   setToken,
@@ -79,6 +77,20 @@ async function fetchReferralResilient(): Promise<ReferralInfo> {
   throw lastErr;
 }
 
+// HTTP-код из ошибки request(): она бросает Error("409: {...}"), поля status
+// у неё нет. Раньше кабинет читал err.status, и 409 никогда не распознавался.
+function httpStatus(e: unknown): number | null {
+  const m = /^(\d{3}):/.exec((e as Error)?.message ?? "");
+  return m ? Number(m[1]) : null;
+}
+
+// 409 «подарок уже забран / уже использован / подписка уже есть» (другая
+// вкладка, второе устройство, гонка): это не ошибка, просто обновляем экран.
+// Другой 409 с этого эндпоинта — сборка подписки не удалась, бонус откатился,
+// и молчать там нельзя: юзер увидел бы «нажал, ничего не произошло».
+const TRIAL_TAKEN_409 =
+  /Trial already activated|Trial already used|already has a live subscription/;
+
 export default function Home({
   me,
   onRefresh,
@@ -97,6 +109,9 @@ export default function Home({
   const [trialDone, setTrialDone] = useState<{
     subToken: string | null;
     subUrl: string | null;
+    // Сколько дней бесплатно (3 или 3 + 3). null на историческом пути,
+    // когда старый бонус 150 ₽ ушёл на обычный месяц.
+    freeDays: number | null;
   } | null>(null);
   const [trialError, setTrialError] = useState<string | null>(null);
 
@@ -105,59 +120,57 @@ export default function Home({
   // the trial system existed. Activation is one-shot on the backend
   // (409 on repeat), so we just trust the flag from /me.
   const trialAvailable = me.balance.trial_available;
-  const trialAmountRub = me.balance.trial_amount_kopecks / 100;
+  const trialAmountKopecks = me.balance.trial_amount_kopecks;
+  // Бесплатные дни: всем и сверху по приглашению. Старый бэк полей не
+  // отдаёт: тогда 3 и 0, как в нынешнем оффере.
+  const trialDays = me.balance.trial_days || 3;
+  const trialRefDays = me.balance.trial_referral_days ?? 0;
+  const trialTotalDays = trialDays + trialRefDays;
+  // Живая подписка уже есть: тап даст только деньги на баланс (В3).
+  const trialBonusOnly = me.balance.trial_bonus_only ?? false;
+  // Подарок бонус-онли в рублях: бонус за 3 дня плюс подарок по приглашению
+  // по той же цене дня (15 ₽ или 30 ₽ при Solo 150 ₽).
+  const trialGiftRub = Math.round(
+    (trialAmountKopecks * trialTotalDays) / trialDays / 100,
+  );
 
   const handleActivateTrial = async () => {
     if (trialActivating) return;
     setTrialActivating(true);
     setTrialError(null);
     try {
-      await activateTrial(); // зачисляет бонус на баланс
-      // Сразу тратим бонус на подписку и провижн — «Забрать месяц» = рабочий
-      // VPN, а не деньги на балансе (иначе большинство застревает на бонусе:
-      // триал даёт только баланс, и второй шаг «активировать план» неочевиден).
-      // Бонус размерен ровно под самый дешёвый 30-дневный план (_trial_plan),
-      // а мы активируем ровно его (самый дешёвый месячный) — баланса хватает.
-      //
-      // НО только когда у юзера НЕТ живой подписки: /subscriptions/activate —
-      // это смена тарифа в single-sub модели, он отзывает все active/frozen
-      // подписки (+ревок девайсов, +проратный возврат). Для юзера с годовой
-      // подпиской, который просто не забирал триал, тихая авто-активация
-      // означала бы потерю подписки без единого подтверждения (аудит
-      // 2026-07-25). Флаг считает бэкенд; undefined (старый бэк) = «нельзя».
-      if (!me.balance.trial_autoactivate_allowed) {
-        onRefresh();
-        return;
+      // Один вызов: сервер сам тратит подарок на подписку на бесплатные дни
+      // (тот же сервис, что у бота) и отдаёт ссылку прямо в ответе. Раньше
+      // кабинет делал второй шаг «купить самый дешёвый тариф» из браузера.
+      // Живая подписка уже есть — сервер только кладёт подарок на баланс,
+      // ссылки в ответе нет, просто обновляем /me.
+      const res = await activateTrial();
+      getTg()?.HapticFeedback?.notificationOccurred("success");
+      if (res.sub_token || res.sub_url) {
+        setTrialDone({
+          subToken: res.sub_token ?? null,
+          subUrl: res.sub_url ?? null,
+          freeDays:
+            res.trial_days != null
+              ? res.trial_days + (res.referral_days ?? 0)
+              : null,
+        });
       }
-      try {
-        const plans = await fetchPlans();
-        const cheapestMonthly = plans
-          .filter((p) => p.period === "month")
-          .sort((a, b) => a.price_rub - b.price_rub)[0];
-        if (cheapestMonthly) {
-          const res = await activateSubscription(cheapestMonthly.id);
-          getTg()?.HapticFeedback?.notificationOccurred("success");
-          // Ссылка приходит прямо в ответе — показываем экран «Готово» без
-          // лишнего запроса и без ожидания рефреша /me.
-          setTrialDone({ subToken: res.sub_token ?? null, subUrl: res.sub_url ?? null });
-        }
-      } catch (actErr) {
-        // Бонус на балансе, но подписка не активировалась (нет свободных нод,
-        // таймаут провижининга). Молчать здесь нельзя: для юзера это выглядит
-        // как «нажал и ничего не случилось».
-        console.warn("trial auto-activate failed", actErr);
-        setTrialError(
-          "Бонус зачислен, но VPN не выдался — попробуй ещё раз. " +
-            "Если не выйдет, напиши в поддержку из раздела «Помощь».",
-        );
-      }
-      // Refresh /me: баннер исчезнет, появятся активная подписка + баланс.
+      // Refresh /me: баннер исчезнет, появятся подписка и баланс.
       onRefresh();
     } catch (err) {
-      // 409 = подарок уже забран (другая вкладка/устройство) — это не ошибка,
-      // просто обновляем состояние. Остальное — показываем юзеру.
-      const status = (err as { status?: number } | null)?.status;
-      if (status !== 409) {
+      const status = httpStatus(err);
+      const raw = (err as Error)?.message ?? "";
+      if (status === 409 && TRIAL_TAKEN_409.test(raw)) {
+        // Подарок уже забран: не ошибка, обновление /me уберёт баннер.
+      } else if (status === 503) {
+        // Нет плана для триала или наплыв на сборку подписок.
+        setTrialError("Сейчас много желающих, попробуй через пару минут.");
+      } else if (status === 402) {
+        setTrialError(
+          "Не получилось включить бесплатные дни. Напиши в поддержку из раздела «Помощь».",
+        );
+      } else {
         setTrialError(
           "Не получилось забрать подарок. Проверь связь и попробуй ещё раз.",
         );
@@ -240,20 +253,46 @@ export default function Home({
       {/* ── Free trial banner (E2.1: главный элемент первого экрана) ──
           Раньше самым крупным блоком была карточка баланса «0 ₽» с кнопкой
           «Пополнить» — просьба занести денег до того, как показана польза. */}
-      {trialAvailable && trialAmountRub > 0 && (
+      {trialAvailable && trialAmountKopecks > 0 && (
         <section className="card-hero mb-4">
           <div className="text-tg-hint text-xs uppercase tracking-wide">Подарок</div>
-          <div className="text-2xl font-bold mt-1">🎁 Забери бесплатный месяц</div>
-          <div className="text-sm text-tg-hint mt-2">
-            Карта не нужна. Один тап — и получишь ссылку с инструкцией,
-            как подключиться.
-          </div>
+          {trialBonusOnly ? (
+            // Подписка уже есть: тап даст только деньги на баланс. Обещать
+            // «N дней бесплатно» здесь нельзя, человек получит не подписку.
+            <>
+              <div className="text-2xl font-bold mt-1">
+                🎁 Подарок: {trialGiftRub} ₽ на баланс, это {trialTotalDays}{" "}
+                {pluralDays(trialTotalDays)} подписки
+              </div>
+              <div className="text-sm text-tg-hint mt-2">
+                Зачтётся при следующем продлении.
+              </div>
+            </>
+          ) : (
+            <>
+              <div className="text-2xl font-bold mt-1">
+                🎁 Забери {trialTotalDays} {pluralDays(trialTotalDays)} бесплатно
+              </div>
+              <div className="text-sm text-tg-hint mt-2">
+                {trialRefDays > 0 &&
+                  `Тебя пригласил друг, поэтому дней не ${trialDays}, а ${trialTotalDays}. `}
+                Карта не нужна. Один тап, и получишь ссылку с инструкцией,
+                как подключиться.
+              </div>
+            </>
+          )}
           <button
             className="btn-primary w-full mt-4 py-3 text-base"
             disabled={trialActivating}
             onClick={handleActivateTrial}
           >
-            {trialActivating ? "Включаем VPN…" : "Активировать бесплатно"}
+            {trialBonusOnly
+              ? trialActivating
+                ? "Зачисляем…"
+                : "Забрать подарок"
+              : trialActivating
+                ? "Включаем VPN…"
+                : "Активировать бесплатно"}
           </button>
           {trialError && (
             <div className="mt-3 text-sm bg-red-900/40 ring-1 ring-red-500 rounded-lg p-2 text-red-100">
@@ -274,6 +313,7 @@ export default function Home({
         <TrialSuccess
           subToken={trialDone.subToken}
           readyUrl={trialDone.subUrl}
+          freeDays={trialDone.freeDays}
           subLinkBase={me.sub_link_base_url}
           onClose={() => {
             setTrialDone(null);
@@ -319,7 +359,7 @@ export default function Home({
           <div className="card text-sm">
             <div className="text-tg-hint">
               {trialAvailable
-                ? "Подписки пока нет — забери бесплатный месяц выше."
+                ? "Подписки пока нет. Забери бесплатные дни выше."
                 : "Подписки пока нет."}
             </div>
             {!trialAvailable && (
@@ -372,8 +412,15 @@ export default function Home({
             Пригласи друга
           </div>
           <div className="text-sm mt-1">
+            {/* Сколько дней получит друг: с бэка (3 + подарок кода). «Вместо N»
+                пишем, только если подарок реально есть, иначе без сравнения. */}
+            {referral.invitee_total_days
+              ? `Друг получит ${referral.invitee_total_days} ${pluralDays(referral.invitee_total_days)} бесплатно${
+                  referral.invitee_total_days > trialDays ? ` вместо ${trialDays}` : ""
+                }. `
+              : ""}
             Получи <b>{(referral.bonus_kopecks / 100).toFixed(0)} ₽</b> на баланс,
-            когда друг пополнит счёт впервые. Бонус капает автоматически.
+            когда друг впервые оплатит. Бонус капает автоматически.
           </div>
           {referral.share_url ? (
             <>
@@ -485,7 +532,9 @@ function SubscriptionCard({
       await freezeSubscription(sub.id);
       onAction();
     } catch (e) {
-      alert(`Не удалось заморозить: ${(e as Error).message}`);
+      // Текст бэкенда без кода и JSON: например, 400 «Заморозка станет
+      // доступна после первой оплаты» у старого /me с can_freeze=true.
+      alert(`Не удалось заморозить: ${humanError(e)}`);
     } finally {
       setBusy(false);
     }
@@ -811,11 +860,15 @@ const CLIENT_LINKS: { label: string; url: string }[] = [
 function TrialSuccess({
   subToken,
   readyUrl,
+  freeDays,
   subLinkBase,
   onClose,
 }: {
   subToken: string | null;
   readyUrl: string | null;
+  // Бесплатные дни из ответа активации (3 или 6). null: исторический путь,
+  // старый бонус ушёл на обычный месяц, строку про дни не показываем.
+  freeDays: number | null;
   subLinkBase: string;
   onClose: () => void;
 }) {
@@ -828,6 +881,11 @@ function TrialSuccess({
         <div className="text-center">
           <div className="text-4xl mb-2">✅</div>
           <h2 className="text-xl font-semibold">Готово, VPN активен</h2>
+          {freeDays != null && freeDays > 0 && (
+            <div className="text-sm text-tg-hint mt-1">
+              Бесплатно на {freeDays} {pluralDays(freeDays)}
+            </div>
+          )}
         </div>
 
         {subUrl && (
@@ -931,7 +989,10 @@ function SetupSheet({ onClose }: { onClose: () => void }) {
   );
 }
 
-const TOPUP_PRESETS = [10000, 30000, 60000, 150000]; // kopecks: 100/300/600/1500 ₽
+// kopecks: 150/300/600/1500 ₽. Первый пресет не меньше цены продления Solo
+// (150 ₽): после 3 бесплатных дней пополнение на 100 ₽ молча не хватило бы
+// на автопродление.
+const TOPUP_PRESETS = [15000, 30000, 60000, 150000];
 
 function TopupModal({
   onClose,
