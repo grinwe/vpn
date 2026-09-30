@@ -80,7 +80,10 @@ def test_new_user_sees_single_gift_button(kb):
     markup = kb.welcome_action_keyboard(trial_available=True, is_new=True)
     texts = _texts(markup)
 
-    assert texts[0] == "🎁 Забрать бесплатный месяц"
+    # Число дней на кнопке: 3 по умолчанию, 3 + 3 по приглашению.
+    assert texts[0] == "🎁 Забрать 3 дня бесплатно"
+    invited = _texts(kb.welcome_action_keyboard(trial_available=True, is_new=True, trial_days=6))
+    assert invited[0] == "🎁 Забрать 6 дней бесплатно"
     # Активация нативная (trial:activate), а не web_app: ЛК у части юзеров не
     # открывается вовсе (аудит 2026-08-21, паритет A).
     assert markup.inline_keyboard[0][0].callback_data == "trial:activate"
@@ -118,7 +121,7 @@ def test_gift_button_stays_without_https_webapp(kb, monkeypatch):
     monkeypatch.setenv("WEBAPP_BASE_URL", "")
     mod = importlib.reload(kb)
     texts = _texts(mod.welcome_action_keyboard(trial_available=True, is_new=True))
-    assert "🎁 Забрать бесплатный месяц" in texts
+    assert "🎁 Забрать 3 дня бесплатно" in texts
     assert "🔐 Открыть личный кабинет" not in texts
     returning = _texts(mod.welcome_action_keyboard(trial_available=False, is_new=False))
     assert "🔐 Открыть личный кабинет" not in returning

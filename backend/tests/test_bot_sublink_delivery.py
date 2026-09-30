@@ -14,10 +14,11 @@
   честные статусы «ещё создаётся» / «заморожена»; ``quiet_if_missing`` —
   молчит и отдаёт False. ``intro`` клеится к первому сообщению, каким бы оно
   ни было; шапка без абзаца про ЛК (28.08: 7 сообщений за один тап).
-* ``trial_activate_cb``: «месяц активирован» и ссылка — ОДНИМ сообщением
+* ``trial_activate_cb``: «Готово! VPN бесплатно на N дней» и ссылка — ОДНИМ сообщением
   (+ голый URL), итого два; падение выдачи → фолбэк на ЛК с тем же
   заголовком, а не тишина; 409 с живой подпиской → ссылка без прайса;
-  409 без подписки → прайс; 409 после провала провижининга → честный текст.
+  409 без подписки → прайс; 409 после провала провижининга → честный текст
+  (бонус откатился, повтор пройдёт).
 * ``go:config`` зовёт ``cmd_config`` от имени инициатора.
 * Клавиатуры: «🔗 Ссылка для подключения» у юзера с подпиской (active/frozen)
   или устройствами — и у новичка с незабранным подарком тоже; ЛК первой
@@ -75,6 +76,9 @@ _PLANS = [
     {"id": 1, "name": "Solo", "price": 199, "max_devices": 1,
      "duration_days": 30, "is_visible": True}
 ]
+# Ответ /api/trial/activate_full на 3 дня без приглашения.
+_ACTIVATED = {"expires_at": "2026-09-25T00:00:00", "trial_days": 3, "referral_days": 0}
+_DONE = "🎉 Готово! VPN бесплатно на 3 дня."
 
 
 @pytest.fixture()
@@ -107,7 +111,11 @@ def _script_fetch(handlers, monkeypatch, routes: dict):
 
 def _flags(trial_available: bool, has_devices: bool, has_subscription: bool = False):
     async def _f(_uid):
-        return trial_available, has_devices, has_subscription
+        # Настоящий UserFlags свежего bot.handlers: хэндлеры читают поля по
+        # имени (в том числе trial_days / ref_days).
+        return sys.modules["bot.handlers"].UserFlags(
+            trial_available, has_devices, has_subscription
+        )
 
     return _f
 
@@ -178,8 +186,8 @@ async def test_cmd_config_intro_is_glued_to_header(handlers, monkeypatch):
 
 @pytest.mark.asyncio
 async def test_cmd_config_intro_is_glued_to_pending_status(handlers, monkeypatch):
-    """Cold-путь после триала: «месяц активирован» + «ещё создаётся» одним
-    сообщением, а не «ещё создаётся» перед «активирован»."""
+    """Cold-путь после триала: «Готово» + «ещё создаётся» одним сообщением,
+    а не «ещё создаётся» перед «Готово»."""
     _script_fetch(handlers, monkeypatch, {"/api/users/by_telegram/100": (200, _PENDING_SUBS)})
     msg = FakeMessage(FakeBot())
 
@@ -282,7 +290,7 @@ async def test_cmd_config_quiet_still_reports_pending(handlers, monkeypatch):
 @pytest.mark.asyncio
 async def test_trial_activate_200_delivers_link(handlers, monkeypatch):
     _script_fetch(handlers, monkeypatch, {
-        "/api/trial/activate_full": (200, {"expires_at": "2026-09-25T00:00:00"}),
+        "/api/trial/activate_full": (200, _ACTIVATED),
         "/api/users/by_telegram/100": (200, _ACTIVE_SUBS),
     })
     bot = FakeBot()
@@ -296,7 +304,10 @@ async def test_trial_activate_200_delivers_link(handlers, monkeypatch):
     assert bot.sent == [], bot.sent
     assert len(msg.sent) == 2, msg.sent
     header, header_kw = msg.sent[0]
-    assert header.startswith("🎉 Бесплатный месяц активирован до 25.09.2026.")
+    assert header.startswith(_DONE)
+    # Даты в заголовке нет: подписка идёт до конца скрытых суток, дата 4-го
+    # дня противоречила бы «3 дня».
+    assert "25.09" not in header and "до " not in header.split("\n")[0]
     assert "Твоя ссылка" in header
     assert header_kw["reply_markup"].name == "onboarding_keyboard"
     # Ни «около минуты» (правда только на cold-пути, там свой текст), ни
@@ -313,7 +324,7 @@ async def test_trial_activate_200_cold_path_glues_done_to_wait_status(handlers, 
     """Cold-путь: девайс pending, ссылка ещё не рабочая. Юзер получает
     «активирован + ещё создаётся» одним сообщением и подсказку, где забрать."""
     _script_fetch(handlers, monkeypatch, {
-        "/api/trial/activate_full": (200, {"expires_at": "2026-09-25T00:00:00"}),
+        "/api/trial/activate_full": (200, _ACTIVATED),
         "/api/users/by_telegram/100": (200, _PENDING_SUBS),
     })
     bot = FakeBot()
@@ -323,7 +334,7 @@ async def test_trial_activate_200_cold_path_glues_done_to_wait_status(handlers, 
     await handlers.trial_activate_cb(cb)
 
     texts = _msg_texts(msg)
-    assert len(texts) == 1 and texts[0].startswith("🎉 Бесплатный месяц активирован")
+    assert len(texts) == 1 and texts[0].startswith(_DONE)
     assert "ещё создаётся" in texts[0]
     hint = _bot_texts(bot)
     assert len(hint) == 1 and "личном кабинете" in hint[0] and "активирован" not in hint[0]
@@ -333,7 +344,7 @@ async def test_trial_activate_200_cold_path_glues_done_to_wait_status(handlers, 
 @pytest.mark.parametrize(
     "activate_resp",
     [
-        (200, {"expires_at": "2026-09-25T00:00:00"}),
+        (200, _ACTIVATED),
         (409, {"detail": LIVE_DETAIL}),
     ],
     ids=["200", "409-live"],
@@ -360,7 +371,7 @@ async def test_successful_delivery_is_exactly_two_messages(handlers, monkeypatch
 async def test_trial_activate_200_inaccessible_message_goes_via_bot(handlers, monkeypatch):
     """Кнопка на сообщении старше 48ч: message — не Message, путь bot/chat_id."""
     _script_fetch(handlers, monkeypatch, {
-        "/api/trial/activate_full": (200, {"expires_at": "2026-09-25T00:00:00"}),
+        "/api/trial/activate_full": (200, _ACTIVATED),
         "/api/users/by_telegram/100": (200, _ACTIVE_SUBS),
     })
     bot = FakeBot()
@@ -370,7 +381,7 @@ async def test_trial_activate_200_inaccessible_message_goes_via_bot(handlers, mo
 
     assert any(LINK in t for t in _bot_texts(bot)), bot.sent
     assert all(c == 100 for c, _t, _k in bot.sent)
-    assert len(bot.sent) == 2 and bot.sent[0][1].startswith("🎉 Бесплатный месяц активирован")
+    assert len(bot.sent) == 2 and bot.sent[0][1].startswith(_DONE)
 
 
 @pytest.mark.asyncio
@@ -378,7 +389,7 @@ async def test_trial_activate_200_delivery_crash_falls_back_to_cabinet(handlers,
     """Обещание ссылки никогда не обрывается молча: cmd_config упал → фолбэк на
     ЛК и /config, исключение наружу не вылетает."""
     _script_fetch(handlers, monkeypatch, {
-        "/api/trial/activate_full": (200, {"expires_at": "2026-09-25T00:00:00"}),
+        "/api/trial/activate_full": (200, _ACTIVATED),
     })
 
     async def _boom(*a, **k):
@@ -394,9 +405,9 @@ async def test_trial_activate_200_delivery_crash_falls_back_to_cabinet(handlers,
     texts = _bot_texts(bot)
     fallback = [(t, k) for _c, t, k in bot.sent if "не удалось прислать" in t]
     assert fallback, texts
-    # Заголовок «месяц активирован» едет вместе с фолбэком: cmd_config упал,
-    # сам его не отправил, а факт активации юзер должен увидеть.
-    assert fallback[0][0].startswith("🎉 Бесплатный месяц активирован до 25.09.2026.")
+    # Заголовок «Готово» едет вместе с фолбэком: cmd_config упал, сам его не
+    # отправил, а факт активации юзер должен увидеть.
+    assert fallback[0][0].startswith(_DONE)
     assert "личном кабинете" in fallback[0][0] and "/config" in fallback[0][0]
     assert isinstance(fallback[0][1].get("reply_markup"), KeyboardMarker)
     assert fallback[0][1]["reply_markup"].name == "webapp_inline_keyboard"
@@ -407,7 +418,7 @@ async def test_trial_activate_200_without_link_yet_points_to_cabinet(handlers, m
     """by_telegram ничего не отдал (тихий режим) → не «нет подписок / /plans»
     сразу после «Готово!», а подсказка, где ссылку забрать потом."""
     _script_fetch(handlers, monkeypatch, {
-        "/api/trial/activate_full": (200, {"expires_at": "2026-09-25T00:00:00"}),
+        "/api/trial/activate_full": (200, _ACTIVATED),
         "/api/users/by_telegram/100": (200, []),
     })
     bot = FakeBot()
@@ -420,7 +431,7 @@ async def test_trial_activate_200_without_link_yet_points_to_cabinet(handlers, m
     # Заголовок ушёл сам по себе (cmd_config в тихом режиме ничего не сказал),
     # затем подсказка про ЛК — и ничего про /plans.
     assert len(texts) == 2, texts
-    assert texts[0] == "🎉 Бесплатный месяц активирован до 25.09.2026."
+    assert texts[0] == _DONE
     assert "личном кабинете" in texts[1]
     assert not any("/plans" in t for t in texts)
 
@@ -469,13 +480,14 @@ async def test_trial_activate_409_without_subscription_shows_prices(handlers, mo
     texts = _bot_texts(bot)
     assert any("личном кабинете" in t and "/config" in t for t in texts), texts
     assert msg.sent and "тариф" in msg.sent[0][0].lower()
-    assert "Забрать бесплатный месяц" not in msg.sent[0][0]
+    assert "Забрать" not in msg.sent[0][0]
 
 
 @pytest.mark.asyncio
 async def test_trial_activate_409_provisioning_failure_is_honest(handlers, monkeypatch):
-    """409 со str(RuntimeError) — бонус зачислен, подписки нет: прайс бесполезен,
-    нужен честный текст и поддержка."""
+    """409 со str(RuntimeError): подписку собрать не вышло, бонус откатился
+    вместе с транзакцией. Прайс бесполезен; «подарок зачислен» было бы ложью,
+    нужен честный текст с повтором и поддержкой."""
     calls = _script_fetch(handlers, monkeypatch, {
         "/api/trial/activate_full": (409, {"detail": "Device limit reached"}),
         "/api/plans": (200, _PLANS),
@@ -487,7 +499,10 @@ async def test_trial_activate_409_provisioning_failure_is_honest(handlers, monke
     await handlers.trial_activate_cb(cb)
 
     texts = _bot_texts(bot)
-    assert len(texts) == 1 and "зачислен" in texts[0] and "/help" in texts[0]
+    assert texts == [
+        "Не получилось собрать подписку 😔 Подарок остаётся за тобой: "
+        "попробуй ещё раз через пару минут или напиши /help."
+    ]
     assert msg.sent == []
     assert ("GET", "http://backend/api/plans") not in calls
 
@@ -584,20 +599,24 @@ async def test_list_plans_subscription_without_active_devices_still_shows_link_p
 
 
 @pytest.mark.asyncio
-async def test_fetch_user_flags_returns_three_flags(handlers, monkeypatch):
+async def test_fetch_user_flags_returns_flags_and_trial_days(handlers, monkeypatch):
     _script_fetch(handlers, monkeypatch, {
         "/api/users/register": (200, {
             "trial_available": False, "has_devices": False, "has_subscription": True,
+            "trial_days": 3, "trial_referral_days": 3,
         }),
     })
-    assert await handlers._fetch_user_flags(100) == (False, False, True)
+    assert await handlers._fetch_user_flags(100) == (False, False, True, 3, 3)
 
-    # Fail-safe при недоступном бэкенде — как раньше: оффер показать, остальное нет.
+    # Fail-safe при недоступном бэкенде — как раньше: оффер показать, остальное
+    # нет; дни по умолчанию 3 без приглашения.
     async def _down(*a, **k):
         raise RuntimeError("backend down")
 
     monkeypatch.setattr(handlers, "_fetch_json", _down)
-    assert await handlers._fetch_user_flags(100) == (True, False, False)
+    flags = await handlers._fetch_user_flags(100)
+    assert flags == (True, False, False, 3, 0)
+    assert flags.trial_available and flags.trial_days == 3 and flags.ref_days == 0
 
 
 # ── keyboards ──

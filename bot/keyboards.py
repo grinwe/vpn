@@ -2,6 +2,8 @@ import os
 
 from aiogram import types
 
+from .plural import plural_days
+
 # Public HTTPS URL of the Telegram WebApp. Used to build the inline
 # "Личный кабинет" button on /start. The persistent entry point is the
 # Menu Button: изначально задана в BotFather, но с появлением кэшбастера
@@ -182,9 +184,17 @@ def webapp_inline_keyboard() -> types.InlineKeyboardMarkup | None:
 
 
 def welcome_action_keyboard(
-    *, trial_available: bool = False, is_new: bool = False, has_link: bool = False
+    *,
+    trial_available: bool = False,
+    is_new: bool = False,
+    has_link: bool = False,
+    trial_days: int = 3,
 ) -> types.InlineKeyboardMarkup:
     """Inline-меню под приветствием.
+
+    ``trial_days`` — сколько бесплатных дней получит юзер всего (3, по
+    приглашению 3 + 3 = 6): число пишется на кнопке подарка и должно совпасть
+    с тем, что выдаст активация (бэкенд отдаёт его в ``/users/register``).
 
     ``has_link=True`` (есть подписка active/frozen ИЛИ живые устройства —
     handlers считает из ``has_subscription or has_devices``) добавляет
@@ -202,7 +212,7 @@ def welcome_action_keyboard(
     с нижней reply-клавиатурой первый экран давал 12 кликабельных вариантов без
     единого выделенного — при том что 75% новых юзеров уходили, не сделав
     ничего. Теперь у новичка с неотобранным подарком ОДНА главная кнопка
-    (забрать месяц), а «поломочные» пункты («Проблема с ЛК») ему не
+    (забрать бесплатные дни), а «поломочные» пункты («Проблема с ЛК») ему не
     показываются: до первого действия они читаются как «тут всё ломается».
 
     Возвращающийся юзер видит прежний набор — он уже знает продукт, и урезать
@@ -222,7 +232,7 @@ def welcome_action_keyboard(
                 # строкой в тексте, а кнопка называлась «Открыть личный
                 # кабинет» — связь между офером и действием юзер должен был
                 # додумать сам.
-                text="🎁 Забрать бесплатный месяц",
+                text=f"🎁 Забрать {plural_days(trial_days)} бесплатно",
                 callback_data="trial:activate",
             )
         ])

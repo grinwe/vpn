@@ -5,6 +5,7 @@ import logging
 import math
 import os
 import re
+from typing import NamedTuple
 from urllib.parse import urlparse
 
 import aiohttp
@@ -43,6 +44,7 @@ from .keyboards import (
     webapp_inline_keyboard,
     welcome_action_keyboard,
 )
+from .plural import plural_days
 
 # Stage 9b — человекочитаемые подписи кнопок выбора способа оплаты.
 # Неизвестное имя провайдера показывается как есть (кнопка всё равно
@@ -359,14 +361,58 @@ ONBOARDING_INSTRUCTIONS = {
 
 # ── /start ──
 
-_TRIAL_LINE = (
-    "🎁 Первый месяц — бесплатно, карта не нужна.\n"
-    "Один тап по кнопке ниже: получишь ссылку и инструкцию, как подключиться.\n\n"
-)
+# Бесплатные дни триала, если бэкенд не ответил (дефолт TRIAL_DURATION_DAYS
+# на бэкенде). Точное число, в том числе 3 + 3 по приглашению, приходит из
+# /users/register: бот пишет ту же цифру, которую выдаст активация.
+_TRIAL_DAYS_DEFAULT = 3
 
 
-async def _fetch_user_flags(telegram_id: int) -> tuple[bool, bool, bool]:
-    """``(trial_available, has_devices, has_subscription)`` — общий хелпер входных экранов.
+def _trial_line(days: int, ref_days: int) -> str:
+    """Строка про подарок в приветствии: 3 дня или 3 + 3 по приглашению."""
+    if ref_days > 0:
+        head = (
+            f"🎁 Тебя пригласил друг, поэтому у тебя {plural_days(days + ref_days)} "
+            f"VPN бесплатно вместо {days}. Карта не нужна.\n"
+        )
+    else:
+        head = f"🎁 {plural_days(days)} VPN бесплатно, карта не нужна.\n"
+    return (
+        head
+        + "Один тап по кнопке ниже: получишь ссылку и инструкцию, как подключиться.\n\n"
+    )
+
+
+def _trial_days_from(data: dict | None) -> tuple[int, int]:
+    """``(бесплатные дни, дни по приглашению)`` из ответа ``/users/register``.
+
+    Старый бэкенд или мусор в поле: дефолт 3 + 0, как при недоступном бэкенде.
+    """
+    data = data or {}
+    try:
+        days = int(data.get("trial_days") or _TRIAL_DAYS_DEFAULT)
+    except (TypeError, ValueError):
+        days = _TRIAL_DAYS_DEFAULT
+    try:
+        ref_days = max(0, int(data.get("trial_referral_days") or 0))
+    except (TypeError, ValueError):
+        ref_days = 0
+    return days, ref_days
+
+
+class UserFlags(NamedTuple):
+    """Флаги входных экранов из ``/users/register``."""
+
+    trial_available: bool
+    has_devices: bool
+    has_subscription: bool
+    # Бесплатные дни триала и дни по приглашению (3 и 0 или 3): для текстов
+    # приветствия, /plans и кнопки подарка.
+    trial_days: int = _TRIAL_DAYS_DEFAULT
+    ref_days: int = 0
+
+
+async def _fetch_user_flags(telegram_id: int) -> UserFlags:
+    """Общий хелпер входных экранов: флаги ``UserFlags`` из ``/users/register``.
 
     Нужен там, где приветствие/тарифы рисуются НЕ из ``/start`` (главное меню,
     список тарифов): раньше эти экраны хардкодили ``trial_available=False`` и
@@ -393,18 +439,30 @@ async def _fetch_user_flags(telegram_id: int) -> tuple[bool, bool, bool]:
             timeout=aiohttp.ClientTimeout(total=_REGISTER_TIMEOUT_S),
         )
         if data:
-            return (
+            days, ref_days = _trial_days_from(data)
+            return UserFlags(
                 bool(data.get("trial_available")),
                 bool(data.get("has_devices")),
                 bool(data.get("has_subscription")),
+                days,
+                ref_days,
             )
     except Exception:  # noqa: BLE001
         logger.warning("_fetch_user_flags: бэкенд недоступен, показываем оффер")
-    return True, False, False
+    return UserFlags(True, False, False, _TRIAL_DAYS_DEFAULT, 0)
 
 
-def format_welcome(name: str, is_new: bool, trial_available: bool) -> str:
+def format_welcome(
+    name: str,
+    is_new: bool,
+    trial_available: bool,
+    trial_days: int = _TRIAL_DAYS_DEFAULT,
+    ref_days: int = 0,
+) -> str:
     """Приветствие. Тексты согласованы в роадмапе (E1.1/E1.1a).
+
+    ``trial_days`` / ``ref_days`` — бесплатные дни и дни по приглашению из
+    ``/users/register``: строка про подарок пишет «3 дня» или «6 дней вместо 3».
 
     Описание продукта показываем и новичку, и тому, кто ещё не забрал подарок:
     человек, вернувшийся через месяц, продукт всё равно не помнит, а «Рад снова
@@ -426,7 +484,7 @@ def format_welcome(name: str, is_new: bool, trial_available: bool) -> str:
     else:
         body = f"👋 Рад снова видеть, {name}!\n\n"
     if trial_available:
-        body += _TRIAL_LINE
+        body += _trial_line(trial_days, ref_days)
     # Без «Выбери действие ниже 👇»: приглашение к действию теперь несёт
     # второе, короткое сообщение с inline-кнопками (см. _send_welcome_pair),
     # и повторять его здесь — тот самый шум, на который жаловался владелец.
@@ -441,9 +499,13 @@ async def _send_welcome_pair(
     is_new: bool,
     has_devices: bool,
     has_link: bool,
+    trial_days: int = _TRIAL_DAYS_DEFAULT,
 ) -> None:
     """Приветствие двумя сообщениями: текст + нижняя reply-клавиатура, затем
     короткий вопрос + inline-кнопки действий.
+
+    ``trial_days`` — бесплатных дней всего (3 или 3 + 3), число для кнопки
+    подарка.
 
     Telegram даёт один ``reply_markup`` на сообщение, а нам нужны обе
     клавиатуры: reply (всегда внизу) и inline (подарок / тарифы / ЛК). До
@@ -459,7 +521,10 @@ async def _send_welcome_pair(
     await send(
         "Начнём? 👇" if trial_available else "Что дальше? 👇",
         reply_markup=welcome_action_keyboard(
-            trial_available=trial_available, is_new=is_new, has_link=has_link
+            trial_available=trial_available,
+            is_new=is_new,
+            has_link=has_link,
+            trial_days=trial_days,
         ),
     )
 
@@ -545,6 +610,7 @@ async def cmd_start(message: types.Message, state: FSMContext):
     trial_available = True
     has_devices = False
     has_subscription = False
+    trial_days, ref_days = _TRIAL_DAYS_DEFAULT, 0
     try:
         _status, data = await _fetch_json(
             "POST",
@@ -558,6 +624,9 @@ async def cmd_start(message: types.Message, state: FSMContext):
             trial_available = bool(data.get("trial_available"))
             has_devices = bool(data.get("has_devices"))
             has_subscription = bool(data.get("has_subscription"))
+            # Дни считаются после привязки реферала в этом же запросе: по
+            # ссылке друга новичок сразу видит «6 дней».
+            trial_days, ref_days = _trial_days_from(data)
         # Быстрый таймаут мог оборваться раньше, чем метка/реферал доехали до
         # бэка. Если не достучались, но атрибуция была — до-регистрируем в фоне
         # полным таймаутом, чтобы не потерять источник конверсии.
@@ -567,7 +636,9 @@ async def cmd_start(message: types.Message, state: FSMContext):
         logger.warning("cmd_start: register failed, показываем welcome как новичку")
 
     first_name = message.from_user.first_name or "друг"
-    welcome = format_welcome(first_name, is_new, trial_available)
+    welcome = format_welcome(
+        first_name, is_new, trial_available, trial_days=trial_days, ref_days=ref_days
+    )
 
     # E1.5: новичку не сообщаем про поломки до того, как он что-то получил —
     # «если что-то сломалось» на первом экране читается как «тут всё ломается»
@@ -579,6 +650,7 @@ async def cmd_start(message: types.Message, state: FSMContext):
         is_new=is_new,
         has_devices=has_devices,
         has_link=has_subscription or has_devices,
+        trial_days=trial_days + ref_days,
     )
 
 
@@ -596,7 +668,7 @@ async def list_plans(
 ):
     """Прайс. ``user_id`` обязателен при вызове из callback'ов: там
     ``message.from_user`` — сам БОТ, и триал-флаги считались бы по нему —
-    ложный оффер «бесплатный месяц» юзерам с истраченным триалом (аудит
+    ложный оффер бесплатных дней юзерам с истраченным триалом (аудит
     2026-08-21, тупик №3). ``bot``/``chat_id`` — путь для сообщений
     старше 48ч (InaccessibleMessage без ``.answer``)."""
     if message is not None:
@@ -645,19 +717,28 @@ async def list_plans(
     # нижней клавиатуре, поэтому на прайс попадает половина новичков — и до
     # этого фикса видела просьбу заплатить без единого упоминания подарка,
     # который ей уже пообещали на первом экране.
-    trial_available, has_devices, has_subscription = await _fetch_user_flags(uid)
+    flags = await _fetch_user_flags(uid)
+    trial_available = flags.trial_available
     # Путь к ссылке показываем по подписке, а не только по живым девайсам:
     # на cold-пути девайс ~минуту pending, у замороженного девайсов нет —
     # оба иначе видели бы голый прайс.
-    has_link = has_subscription or has_devices
+    has_link = flags.has_subscription or flags.has_devices
+    trial_total_days = flags.trial_days + flags.ref_days
 
     lines: list[str] = []
     if trial_available:
+        if flags.ref_days > 0:
+            offer = (
+                f"🎁 <b>Сначала {plural_days(trial_total_days)} бесплатно: "
+                "тебя пригласил друг.</b>"
+            )
+        else:
+            offer = f"🎁 <b>Сначала {plural_days(flags.trial_days)} бесплатно.</b>"
         lines += [
-            "🎁 <b>Сначала — бесплатный месяц.</b>",
-            "Он уже ждёт в личном кабинете: один тап, карта не нужна.",
+            offer,
+            "Один тап по кнопке ниже, карта не нужна.",
             "",
-            "Ниже — тарифы, если захочешь больше устройств или сразу на год.",
+            "Ниже тарифы, если захочешь больше устройств или сразу на год.",
             "",
         ]
     elif has_link:
@@ -714,7 +795,7 @@ async def list_plans(
         # текстом, а тапабельны только платные варианты. Активация нативная
         # (trial:activate), а не web_app: ЛК у части юзеров не открывается.
         rows.insert(0, [types.InlineKeyboardButton(
-            text="🎁 Забрать бесплатный месяц",
+            text=f"🎁 Забрать {plural_days(trial_total_days)} бесплатно",
             callback_data="trial:activate",
         )])
     elif has_link:
@@ -735,12 +816,19 @@ async def list_plans(
     await _say("\n".join(lines), reply_markup=keyboard)
 
 
-# Текст 409 бэкенда, когда подарок уже отработан и подписка жива (в т.ч.
-# заморожена) — см. api_extensions.activate_trial_full. Любой ДРУГОЙ detail
-# в 409 — это str(RuntimeError) провижининга: бонус уже зачислен, а подписку
-# собрать не вышло (нет нод / лимит устройств). Тексты бота должны эти два
-# случая различать: во втором прайс бесполезен, нужна поддержка.
+# Тексты 409 бэкенда на /api/trial/activate_full (services/trial.py,
+# activate_trial_full). LIVE: подписка жива (в т.ч. заморожена), юзеру нужна
+# ссылка. USED: бесплатные дни уже были, подписок живых нет, нужен /renew.
+# Любой ДРУГОЙ detail в 409 — это str(RuntimeError) провижининга: подписку
+# собрать не вышло (нет нод / лимит устройств), бонус откатился вместе с
+# транзакцией, и повтор пройдёт. Тексты бота должны эти случаи различать:
+# иначе USED попал бы в ветку провижининга с ложным «подарок зачислен».
 _TRIAL_409_LIVE_DETAIL = "User already has a live subscription"
+_TRIAL_409_USED_DETAIL = "Trial already used"
+
+# 409 бэкенда на покупку другого тарифа, когда живая подписка — неоплаченные
+# бесплатные дни (api/invoices.py, ON_TRIAL_DETAIL).
+_INVOICE_409_ON_TRIAL_DETAIL = "on trial"
 
 # Фолбэк, когда ссылку в чат прислать не удалось. Обещание ссылки никогда не
 # должно обрываться молча (инцидент 2026-08-25): юзер должен знать, где её
@@ -768,11 +856,11 @@ async def _try_send_sub_link(
     в тихом режиме либо промолчал, либо сказал «ещё создаётся») или
     ``"failed"`` (cmd_config упал — фолбэк на ЛК уже отправлен здесь).
 
-    ``intro`` — заголовок («🎉 Бесплатный месяц активирован…», «У тебя уже
+    ``intro`` — заголовок («🎉 Готово! VPN бесплатно на 3 дня.», «У тебя уже
     есть подписка 😉»), который cmd_config клеит к своему первому сообщению:
     «готово» и ссылка приходят одним сообщением, а не двумя. При падении
-    выдачи заголовок уходит вместе с фолбэком: юзер должен узнать, что месяц
-    активирован, даже если ссылку прислать не вышло (возможный повтор
+    выдачи заголовок уходит вместе с фолбэком: юзер должен узнать, что
+    бесплатные дни включены, даже если ссылку прислать не вышло (возможный повтор
     заголовка на этом редком пути дешевле, чем его потеря).
 
     Инцидент 2026-08-25 (user 1000054): RecursionError внутри cmd_config
@@ -803,14 +891,41 @@ async def _try_send_sub_link(
     return "sent" if delivered else "missing"
 
 
+def _trial_done_intro(data: dict | None) -> str:
+    """Заголовок после активации: сколько дней выдано, без даты.
+
+    Дату не пишем нарочно: подписка идёт до конца скрытых суток
+    (TRIAL_HIDDEN_HOURS), и дата 4-го дня противоречила бы «3 дня». Числа
+    берём из ответа activate_full. ``trial_days`` = null — исторический путь
+    (старый бонус 150 ₽ потрачен на обычный тариф), там дней триала нет.
+    """
+    data = data or {}
+    try:
+        days = int(data["trial_days"])
+    except (KeyError, TypeError, ValueError):
+        return "🎉 Готово! Подписка активирована."
+    try:
+        ref_days = max(0, int(data.get("referral_days") or 0))
+    except (TypeError, ValueError):
+        ref_days = 0
+    if ref_days > 0:
+        return (
+            f"🎉 Готово! VPN бесплатно на {plural_days(days + ref_days)}: "
+            f"{plural_days(days)} дарим всем и ещё {ref_days}, потому что тебя "
+            "пригласил друг."
+        )
+    return f"🎉 Готово! VPN бесплатно на {plural_days(days)}."
+
+
 @router.callback_query(F.data == "trial:activate")
 async def trial_activate_cb(callback_query: types.CallbackQuery):
-    """Нативная активация бесплатного месяца прямо в боте.
+    """Нативная активация бесплатных дней прямо в боте.
 
     Раньше единственным путём была web_app-кнопка на ЛК — а ЛК у части
-    юзеров не открывается, и обещанный «месяц одним тапом» был
+    юзеров не открывается, и обещанный подарок одним тапом был
     недостижим (аудит 2026-08-21, паритет A, критично). Эндпоинт
-    /api/trial/activate — тот же сервис, что у ЛК, дрейфа нет.
+    /api/trial/activate_full и кабинет зовут один сервис
+    (trial.activate_trial_full), дрейфа нет.
     """
     await callback_query.answer()
     uid = callback_query.from_user.id
@@ -836,15 +951,6 @@ async def trial_activate_cb(callback_query: types.CallbackQuery):
         status_code, data = 0, None
 
     if status_code == 200:
-        expires = ""
-        raw = (data or {}).get("expires_at")
-        if raw:
-            try:
-                from datetime import datetime as _dt
-
-                expires = " до " + _dt.fromisoformat(raw).strftime("%d.%m.%Y")
-            except (ValueError, TypeError):
-                expires = ""
         # «Готово» не шлём отдельным сообщением: это заголовок к ссылке (или
         # к честному «ещё создаётся» на cold-пути), cmd_config клеит его к
         # своему первому сообщению. Абзацы про «около минуты» и ЛК/config
@@ -856,7 +962,7 @@ async def trial_activate_cb(callback_query: types.CallbackQuery):
         # бы ложью — вместо него подсказка про ЛК и /config.
         outcome = await _try_send_sub_link(
             callback_query, uid, chat_id,
-            intro=f"🎉 Бесплатный месяц активирован{expires}.",
+            intro=_trial_done_intro(data if isinstance(data, dict) else None),
         )
         if outcome == "missing":
             await bot.send_message(
@@ -868,7 +974,7 @@ async def trial_activate_cb(callback_query: types.CallbackQuery):
         if detail == _TRIAL_409_LIVE_DETAIL:
             # Подписка уже есть — юзеру нужна ссылка, а не прайс. Ровно этот
             # экран видел user 1000054 после провала первой выдачи: «подарок
-            # уже использован» + тарифы, хотя месяц у него уже активирован.
+            # уже использован» + тарифы, хотя подписка у него уже была.
             # Шапка едет заголовком первого сообщения cmd_config, не отдельно.
             outcome = await _try_send_sub_link(
                 callback_query, uid, chat_id, intro="У тебя уже есть подписка 😉"
@@ -881,13 +987,24 @@ async def trial_activate_cb(callback_query: types.CallbackQuery):
                     reply_markup=webapp_inline_keyboard(),
                 )
             return
-        if detail:
-            # str(RuntimeError) провижининга: бонус зачислен, подписки нет.
-            # Прайс тут бесполезен — покупка упрётся в то же самое.
+        if detail == _TRIAL_409_USED_DETAIL:
+            # Бесплатные дни уже были, живой подписки нет (старая кнопка в
+            # чате после истечения). Новой подписки бэкенд не выдаёт: путь
+            # один, продление прежней или покупка.
             await bot.send_message(
                 chat_id,
-                "Подарок зачислен на баланс, но собрать подписку сейчас не "
-                "удалось 😔 Напиши /help, разберёмся и всё выдадим.",
+                "Бесплатные дни уже использованы. Продлить прежнюю подписку: "
+                "/renew, все тарифы: /plans.",
+            )
+            return
+        if detail:
+            # str(RuntimeError) провижининга: подписку собрать не вышло, бонус
+            # откатился вместе с транзакцией, повтор пройдёт. Прайс тут
+            # бесполезен: покупка упрётся в то же самое.
+            await bot.send_message(
+                chat_id,
+                "Не получилось собрать подписку 😔 Подарок остаётся за тобой: "
+                "попробуй ещё раз через пару минут или напиши /help.",
             )
             return
         # detail неизвестен (не-JSON ответ и т.п.) — безопасный дефолт:
@@ -908,7 +1025,7 @@ async def trial_activate_cb(callback_query: types.CallbackQuery):
     if status_code == 402:
         await bot.send_message(
             chat_id,
-            "Бонус уже потрачен, активировать месяц с него не получилось. "
+            "Бонус уже потрачен, включить бесплатные дни с него не получилось. "
             "Выбери тариф: /plans, или загляни в баланс: /balance.",
         )
         return
@@ -973,13 +1090,26 @@ async def create_invoice(callback_query: types.CallbackQuery):
         # параллельная с двойным списанием (аудит 2026-08-21, C1).
         await callback_query.answer()
         msg = callback_query.message
-        if isinstance(msg, types.Message):
-            await msg.answer(
+        detail = str(invoice.get("detail") or "") if isinstance(invoice, dict) else ""
+        if detail == _INVOICE_409_ON_TRIAL_DETAIL:
+            # Живая подписка — неоплаченные бесплатные дни: «продли через
+            # /renew» тут не к месту. Смена тарифа в кабинете идёт через
+            # confirm(), который в Telegram подавлен, поэтому /help обязателен
+            # как запасной путь.
+            text = (
+                "Сейчас у тебя бесплатные дни на Solo. Другой тариф можно взять "
+                "в личном кабинете, неиспользованные дни зачтутся, или напиши "
+                "/help, поменяем вручную."
+            )
+        else:
+            text = (
                 "У тебя уже есть активная подписка на другой тариф.\n"
                 "Продлить её: /renew\n"
                 "Сменить тариф с перерасчётом можно в личном кабинете, либо "
                 "напиши в поддержку (/help) и мы поменяем вручную."
             )
+        if isinstance(msg, types.Message):
+            await msg.answer(text)
         return
     if status != 200:
         await callback_query.answer("Ошибка при создании счета", show_alert=True)
@@ -1201,7 +1331,7 @@ async def cmd_config(
     ``bot``/``chat_id`` — путь для callback'ов на сообщениях старше 48ч
     (InaccessibleMessage без ``.answer``).
 
-    ``intro`` — заголовок от вызывающего («🎉 Бесплатный месяц активирован…»),
+    ``intro`` — заголовок от вызывающего («🎉 Готово! VPN бесплатно на 3 дня.»),
     который клеится к ПЕРВОМУ отправленному сообщению, каким бы оно ни было:
     шапка со ссылкой, «⏳ ещё создаётся», «❄️ заморожена», «сервис недоступен».
     Так «готово» и ссылка приходят одним сообщением вместо двух. Если в тихом
@@ -2730,6 +2860,36 @@ async def _get_bot_username(bot) -> str | None:
     return _bot_username
 
 
+def _referral_terms(data: dict) -> str:
+    """Условия рефералки для /referral: «Друг получит 6 дней VPN бесплатно
+    вместо 3, а тебе начислим 10 дней подписки, когда он впервые оплатит.»
+
+    Бесплатные дни без приглашения = ``invitee_total_days − bonus_days``. Если
+    поля нет или числа не сходятся (старый бэкенд, код без подарка), «вместо N»
+    не пишем: лучше без сравнения, чем с ложным.
+    """
+    def _int(key: str) -> int | None:
+        try:
+            return int(data.get(key))
+        except (TypeError, ValueError):
+            return None
+
+    total = _int("invitee_total_days")
+    bonus = _int("bonus_days")
+    reward = _int("reward_days")
+    if total and total > 0:
+        friend = f"Друг получит {plural_days(total)} VPN бесплатно"
+        if bonus and 0 < bonus < total:
+            friend += f" вместо {total - bonus}"
+    else:
+        friend = "Друг получит бесплатные дни VPN"
+    if reward and reward > 0:
+        mine = f"тебе начислим {plural_days(reward)} подписки"
+    else:
+        mine = "тебе начислим дни подписки"
+    return f"{friend}, а {mine}, когда он впервые оплатит."
+
+
 async def _send_referral(msg: types.Message, bot, user_id: int) -> None:
     """Единый флоу выдачи реферальной ссылки (общий для команды и inline-кнопки
     приветствия). Раньше был скопирован в cmd_referral и go_referral 1-в-1 —
@@ -2761,12 +2921,14 @@ async def _send_referral(msg: types.Message, bot, user_id: int) -> None:
         return
     ref_link = f"https://t.me/{username}?start=ref_{code}"
 
-    # Stage 4: реферал теперь через денежный бонус, не через дни.
-    # Сумма берётся из бэкенда (REFERRAL_BONUS_KOPECKS, дефолт 50 ₽).
+    # Числа из /api/referral/code: сколько бесплатных дней получит друг (3 + 3)
+    # и сколько дней подписки начислим пригласившему. Прежний текст «+50 ₽ /
+    # +50 ₽» был ложным: подарок другу в днях, награда платится за первую
+    # оплату друга любым способом (invoices._maybe_pay_referrer).
     await msg.answer(
         f"🎁 <b>Твоя реферальная ссылка:</b>\n\n"
         f"<code>{ref_link}</code>\n\n"
-        f"Приглашённый получает <b>+50 ₽ на баланс</b>, ты — <b>+50 ₽</b>.\n"
+        f"{_referral_terms(data)}\n"
         f"Приглашено: {uses} чел.",
         parse_mode="HTML",
     )
@@ -3103,17 +3265,22 @@ async def go_start(callback_query: types.CallbackQuery):
     # E1.6: раньше флаги были захардкожены False — вернувшись в главное меню,
     # юзер терял строку про подарок, хотя подарок не забран. Оффер, который то
     # есть, то нет, читается как «предложение истекло».
-    trial_available, has_devices, has_subscription = await _fetch_user_flags(
-        callback_query.from_user.id
+    flags = await _fetch_user_flags(callback_query.from_user.id)
+    welcome = format_welcome(
+        first_name,
+        is_new=False,
+        trial_available=flags.trial_available,
+        trial_days=flags.trial_days,
+        ref_days=flags.ref_days,
     )
-    welcome = format_welcome(first_name, is_new=False, trial_available=trial_available)
     await _send_welcome_pair(
         callback_query.message.answer,
         welcome=welcome,
-        trial_available=trial_available,
+        trial_available=flags.trial_available,
         is_new=False,
-        has_devices=has_devices,
-        has_link=has_subscription or has_devices,
+        has_devices=flags.has_devices,
+        has_link=flags.has_subscription or flags.has_devices,
+        trial_days=flags.trial_days + flags.ref_days,
     )
 
 
@@ -3924,10 +4091,10 @@ async def cmd_cancel_global(message: types.Message, state: FSMContext):
     (он подключён раньше) — сюда доходит только «отменять нечего».
     """
     await state.clear()
-    _trial, has_devices, _has_sub = await _fetch_user_flags(message.from_user.id)
+    flags = await _fetch_user_flags(message.from_user.id)
     await message.answer(
         "Ок, отменил. Выбери действие кнопкой ниже 👇",
-        reply_markup=start_keyboard(has_devices=has_devices),
+        reply_markup=start_keyboard(has_devices=flags.has_devices),
     )
 
 
@@ -3941,10 +4108,10 @@ async def fallback_unknown(message: types.Message, state: FSMContext):
     чистим: живой стейт до сюда не доходит (support_router раньше).
     """
     await state.clear()
-    _trial, has_devices, _has_sub = await _fetch_user_flags(message.from_user.id)
+    flags = await _fetch_user_flags(message.from_user.id)
     await message.answer(
         "Не понял 🤔 Выбери действие кнопкой ниже.\n"
         "Если писал в поддержку и видишь это, нажми «❓ Помощь» и отправь "
         "сообщение ещё раз.",
-        reply_markup=start_keyboard(has_devices=has_devices),
+        reply_markup=start_keyboard(has_devices=flags.has_devices),
     )
