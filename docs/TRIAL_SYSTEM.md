@@ -115,6 +115,15 @@ WHERE trial_expires_at IS NOT NULL
 
 Дедупится через `AuditLog`: перед вставкой проверяется, что для этого `target_id` нет действия `trial_expiry_warning` или `trial_expiry_warning:delivered`. Повторные тики не задвоят нотификацию.
 
+**Гейт (с 30.09.2026, `_trial_warning_not_needed`).** Юзера пропускаем, если у него есть живая (active/frozen) подписка и выполнено одно из двух: баланса хватает на её продление целиком (`total_renewal_cost_kopecks`, тариф + слоты) или она уже не неоплаченный триал (`balance.is_unpaid_trial` = false, человек платит). Пропуск дедупом не помечается, следующий тик в окне перепроверит. Юзера без живой подписки предупреждаем, как раньше. `user_has_paid` в гейт намеренно не берём: пополнение на 100 ₽ не покрывает продление за 150 ₽, и «пополни баланс» для такого триальщика правдив. Старые кабинетные триалы (`activate:{sub.id}`, без `trial-full`) под гейт попадают и этот пуш не получают, им в тот же момент приходит `renewal_reminder` 3d.
+
+`balance.is_unpaid_trial(db, sub)`: есть `spend trial-full:{sub.id}` и нет ни `spend renew:{sub.id}`, ни `spend change_plan:{sub.id}`, ни оплаченного счёта с `subscription_id = sub.id` и суммой > 0 (продление картой или СБП строк в журнал не пишет).
+
+Текст пуша (`api_extensions.py`, без числа дней и сумм, верен и для старых 30-дневных триалов):
+
+> ⏳ Бесплатные дни скоро закончатся.
+> Чтобы VPN не отключился, пополни баланс: /balance
+
 Бот забирает её через `GET /api/notifications/pending`, матчится на `action == "trial_expiry_warning"`, доставляет копию и при успехе апдейтит action до `:delivered`.
 
 ### 3b. Clawback (на истечении)
@@ -127,12 +136,12 @@ WHERE trial_expires_at IS NOT NULL
 
 Для каждого:
 
-1. **Проверка «стал ли платящим»** — есть ли хоть одна `kind=topup` транзакция у юзера. Если да → триал «отработан», просто `trial_expires_at = None`, clawback пропускается.
+1. **Проверка «стал ли платящим»**: `balance.user_has_paid(db, uid)`. Правда, если есть оплаченный счёт с суммой > 0, или `kind=topup`, или `adjust admin_topup:%` > 0, или `spend renew:%`, или у юзера нет записи `trial:{uid}` (восстановленные через `generate_restore_sql.py` журнала не имеют). Если да → триал «отработан», просто `trial_expires_at = None`, clawback пропускается. До 30.09.2026 проверялся только `kind=topup`: оплату тарифа картой и ручное зачисление эта проверка не видела.
 2. **Дедуп** по `reference=trial_expiry_clawback:{user.id}`. На всякий случай — сейчас `trial_expires_at=None` гарантирует, что мы сюда не попадаем повторно, но это подстраховка.
-3. **Списание**: `amount = min(15000, user.balance_kopecks)` — не уходим в минус даже если юзер уже частично потратил триал. Пишется как `kind=adjust` с `note="trial_expiry_clawback"`.
+3. **Списание только непотраченной части бонуса** (`_unspent_trial_bonus_kopecks`): `min(баланс, max(0, trial:{uid} + referral_signup:{uid} − |Σ всех spend юзера|))`. Вычитаются все траты, а не только `trial-full:`: старые кабинетные триалы тратили бонус через `activate:{sub.id}`. Для триалов, потративших бонус на подписку, сумма 0, таймер просто обнуляется. Пишется как `kind=adjust` с `note="trial_expiry_clawback"`, только если сумма > 0.
 4. `trial_expires_at = None` — флаг, что триал закрыт.
 
-**Что НЕ трогаем:** реферальные 50₽, которые пришли на стадии 2. Они остаются навсегда. Это цена привлечения юзера, и отбирать её нечестно.
+**Что НЕ трогаем:** деньги сверх бонуса (например, `referral_payout` за приглашённых) остаются при юзере всегда: формула снимает не больше непотраченного бонуса.
 
 ## WebApp integration
 
@@ -183,11 +192,11 @@ docker compose run --rm backend alembic upgrade head
 # 6. Clawback (не платящий)
 # → UPDATE users SET trial_expires_at = NOW() - INTERVAL '1s' WHERE id = X
 # → баланс = trial_amount, 0 топапов
-# → tick → kind=adjust reference=trial_expiry_clawback:X на -min(15000, balance)
+# → tick → kind=adjust reference=trial_expiry_clawback:X на -min(непотраченный бонус, balance)
 # → users.trial_expires_at = NULL
 
 # 7. Clawback skip (платящий)
-# → то же, но у юзера есть kind=topup → clawback не пишется, trial_expires_at обнуляется
+# → то же, но у юзера есть оплата (topup, оплаченный счёт, admin_topup, renew:) → clawback не пишется, trial_expires_at обнуляется
 ```
 
 ## Files involved

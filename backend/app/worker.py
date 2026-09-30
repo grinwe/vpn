@@ -2225,8 +2225,19 @@ def _run_trial_expiry_pass(session, stats: dict) -> None:
       * Clawbacks dedup on the ``trial_expiry_clawback:<uid>`` reference
         and additionally clear ``trial_expires_at`` so the next tick
         doesn't even enter the loop.
-    Users with at least one ``kind=topup`` are considered "earned" —
-    they keep the bonus and we just clear ``trial_expires_at``.
+
+    Гейт предупреждения (3a): «пополни баланс» не шлём, если баланса
+    хватает на продление живой подписки или живая подписка уже не
+    неоплаченный триал (человек платит). Юзера без живой подписки не
+    пропускаем. ``user_has_paid`` сюда намеренно не берём: пополнение на
+    100 ₽ не покрывает продление за 150 ₽, и предупреждение для такого
+    триальщика правдиво.
+
+    Clawback (3b): платившие (``balance.user_has_paid``) бонус оставляют,
+    таймер просто обнуляется. Остальным списываем только непотраченную
+    часть бонуса по журналу, а не текущий размер триала: иначе у старых
+    30-дневных триалов после смены размера бонуса возврат не совпал бы, а
+    у потративших бонус ушли бы чужие деньги (например, ``referral_payout``).
     """
     from datetime import timedelta
 
@@ -2263,6 +2274,11 @@ def _run_trial_expiry_pass(session, stats: dict) -> None:
         )
         if already:
             continue
+        if _trial_warning_not_needed(session, u):
+            # Не помечаем дедупом: баланс может уйти, а подписка остаться
+            # триалом. Следующий тик в окне перепроверит.
+            stats["trial_warn_skipped"] = stats.get("trial_warn_skipped", 0) + 1
+            continue
         session.add(
             models.AuditLog(
                 actor="system",
@@ -2291,14 +2307,11 @@ def _run_trial_expiry_pass(session, stats: dict) -> None:
         .all()
     )
     for u in expired:
-        # Paying customer? Keep the bonus, just clear the timer so we
-        # don't revisit this user every tick.
-        has_topup = (
-            session.query(models.BalanceTransaction)
-            .filter_by(user_id=u.id, kind=models.BalanceTxKind.topup)
-            .first()
-        )
-        if has_topup is not None:
+        # Платящий (пополнение, оплаченный счёт, admin_topup, продление с
+        # баланса)? Бонус остаётся, таймер обнуляем, чтобы не возвращаться
+        # к юзеру каждый тик. Прежняя проверка «есть kind=topup» не видела
+        # оплату тарифа картой и ручное зачисление.
+        if balance_svc.user_has_paid(session, u.id):
             u.trial_expires_at = None
             session.add(u)
             stats["trial_kept"] = stats.get("trial_kept", 0) + 1
@@ -2315,13 +2328,12 @@ def _run_trial_expiry_pass(session, stats: dict) -> None:
             session.add(u)
             continue
 
-        # Clawback sized to the trial amount that's currently live, but
-        # capped at the user's balance so we can't push them negative.
-        # adjustment() already floors at balance, but we also compute
-        # the trial amount here so the ledger note matches what we
-        # meant to take.
-        trial_amount = balance_svc_trial_amount(session)
-        take = min(trial_amount, u.balance_kopecks or 0)
+        # Возвращаем только непотраченную часть бонуса по журналу, с капом
+        # по балансу (в минус не уводим; adjustment() тоже капает, но сумма
+        # в журнале должна совпадать с тем, что хотели снять).
+        take = min(
+            _unspent_trial_bonus_kopecks(session, u.id), u.balance_kopecks or 0
+        )
         if take > 0:
             balance_svc.adjustment(
                 session,
@@ -2336,16 +2348,67 @@ def _run_trial_expiry_pass(session, stats: dict) -> None:
     session.commit()
 
 
-def balance_svc_trial_amount(session) -> int:
-    """Thin wrapper around ``services.trial.trial_amount_kopecks``.
+def _trial_warning_not_needed(session, user) -> bool:
+    """Гейт 3a: предупреждение «пополни баланс» ложно или не нужно.
 
-    Defined at module scope (rather than inlined) so mocking it in
-    tests is trivial. Imports lazily to dodge the circular-import risk
-    between ``worker`` and ``services.trial`` (both pull ``models``).
+    Правда, если у юзера есть живая (active/frozen) подписка, которая уже
+    не неоплаченный триал (человек платит), или баланса хватает на её
+    продление целиком (тариф + слоты). Без живой подписки ложь: такого юзера
+    предупреждаем, как и раньше. Бонус-онли платящим (забрали в кабинете
+    только деньги при живой подписке) тоже сюда: их подписка не триал.
     """
-    from .services import trial as trial_svc
+    from . import models
+    from .services import balance as balance_svc
 
-    return trial_svc.trial_amount_kopecks(session)
+    live = (
+        session.query(models.Subscription)
+        .filter(
+            models.Subscription.user_id == user.id,
+            models.Subscription.status.in_(
+                [models.SubscriptionStatus.active, models.SubscriptionStatus.frozen]
+            ),
+        )
+        .all()
+    )
+    wallet = user.balance_kopecks or 0
+    for sub in live:
+        if not balance_svc.is_unpaid_trial(session, sub):
+            return True
+        if wallet >= balance_svc.total_renewal_cost_kopecks(sub):
+            return True
+    return False
+
+
+def _unspent_trial_bonus_kopecks(session, user_id: int) -> int:
+    """Непотраченная часть триального бонуса по журналу.
+
+    ``trial:{uid}`` + ``referral_signup:{uid}`` минус модуль суммы ВСЕХ
+    ``spend`` юзера, не меньше нуля. Вычитаем все траты, а не только
+    ``trial-full:``: старые кабинетные триалы тратили бонус через
+    ``activate:{sub.id}``, и при вычете одного ``trial-full`` clawback снял
+    бы у них чужие деньги (например, ``referral_payout``). Для новых
+    триалов бонус целиком уходит на подписку, и результат 0.
+    """
+    from sqlalchemy import func
+
+    from . import models
+
+    tx = models.BalanceTransaction
+    bonus = (
+        session.query(func.coalesce(func.sum(tx.amount_kopecks), 0))
+        .filter(
+            tx.user_id == user_id,
+            tx.kind == models.BalanceTxKind.bonus,
+            tx.reference.in_([f"trial:{user_id}", f"referral_signup:{user_id}"]),
+        )
+        .scalar()
+    )
+    spent = (
+        session.query(func.coalesce(func.sum(tx.amount_kopecks), 0))
+        .filter(tx.user_id == user_id, tx.kind == models.BalanceTxKind.spend)
+        .scalar()
+    )
+    return max(0, int(bonus or 0) - abs(int(spent or 0)))
 
 
 def run_balance_charge_tick() -> dict:

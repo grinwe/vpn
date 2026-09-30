@@ -22,6 +22,7 @@ import os
 from datetime import timedelta
 
 from prometheus_client import Counter, Gauge
+from sqlalchemy import and_, or_
 from sqlalchemy.orm import Session
 
 from .. import models
@@ -513,6 +514,123 @@ def change_plan(
         refund, new_price, device_surcharge, overflow, user.balance_kopecks,
     )
     return {"refunded_kopecks": refund, "charged_kopecks": new_price + device_surcharge}
+
+
+# ── Платил ли юзер / неоплаченный триал ─────────────────────────────
+
+def user_has_paid(db: Session, user_id: int) -> bool:
+    """Платил ли юзер хоть раз (или триального бонуса у него нет вовсе).
+
+    Правда, если есть хоть одно из:
+      * оплаченный счёт с суммой > 0 (карта, СБП, крипта, ручной mark paid);
+      * запись ``kind=topup`` (пополнение баланса);
+      * ручное зачисление ``adjust admin_topup:%`` > 0: так проводили оплаты
+        без счёта, пока lava лежал (24.08–19.09.2026);
+      * продление с баланса ``spend renew:%``;
+      * у юзера нет записи триального бонуса ``trial:{uid}``. Подписку без
+        бонуса можно было только купить или получить от админа, а юзеры,
+        восстановленные через ``generate_restore_sql.py``, журнала не имеют
+        вовсе (баланс пишется прямо в ``users.balance_kopecks``).
+
+    Последняя ветка безопасна только для заморозки и clawback-а: в clawback
+    попадают юзеры с ``trial_expires_at``, а он ставится вместе с
+    ``trial:{uid}``. В гейт предупреждения о конце триала функция не идёт:
+    она истинна после любого пополнения, например на 100 ₽, а продление за
+    150 ₽ оно не покрывает.
+    """
+    paid_invoice = (
+        db.query(models.Invoice.id)
+        .filter(
+            models.Invoice.user_id == user_id,
+            models.Invoice.status == models.InvoiceStatus.paid,
+            models.Invoice.amount > 0,
+        )
+        .first()
+    )
+    if paid_invoice is not None:
+        return True
+
+    tx = models.BalanceTransaction
+    paid_tx = (
+        db.query(tx.id)
+        .filter(
+            tx.user_id == user_id,
+            or_(
+                tx.kind == models.BalanceTxKind.topup,
+                and_(
+                    tx.kind == models.BalanceTxKind.adjust,
+                    tx.reference.like("admin_topup:%"),
+                    tx.amount_kopecks > 0,
+                ),
+                and_(
+                    tx.kind == models.BalanceTxKind.spend,
+                    tx.reference.like("renew:%"),
+                ),
+            ),
+        )
+        .first()
+    )
+    if paid_tx is not None:
+        return True
+
+    trial_bonus_row = (
+        db.query(tx.id)
+        .filter(tx.user_id == user_id, tx.reference == f"trial:{user_id}")
+        .first()
+    )
+    return trial_bonus_row is None
+
+
+def is_unpaid_trial(db: Session, sub: models.Subscription) -> bool:
+    """Подписка выдана на бесплатные дни, и за неё ещё не платили.
+
+    Триал = есть ``spend trial-full:{sub.id}`` (подписка куплена на
+    триальный бонус). Оплатой этой подписки считается любое из:
+      * продление с баланса ``spend renew:{sub.id}``;
+      * смена тарифа в кабинете ``spend change_plan:{sub.id}`` (sub.id тот же);
+      * оплаченный счёт с ``subscription_id = sub.id`` и суммой > 0:
+        продление картой или СБП (``?fix=1``, ``/renew``, ``/plans`` на тот же
+        тариф). Такая оплата строк в журнал не пишет, только сдвигает срок.
+
+    Без последних двух условий подписка, оплаченная картой или сменившая
+    тариф, навсегда осталась бы «триалом». Старые кабинетные триалы
+    (``activate:{sub.id}``, без ``trial-full``) сюда не попадают.
+    """
+    tx = models.BalanceTransaction
+    trial_spend = (
+        db.query(tx.id)
+        .filter(
+            tx.user_id == sub.user_id,
+            tx.kind == models.BalanceTxKind.spend,
+            tx.reference == f"trial-full:{sub.id}",
+        )
+        .first()
+    )
+    if trial_spend is None:
+        return False
+
+    paid_spend = (
+        db.query(tx.id)
+        .filter(
+            tx.user_id == sub.user_id,
+            tx.kind == models.BalanceTxKind.spend,
+            tx.reference.in_([f"renew:{sub.id}", f"change_plan:{sub.id}"]),
+        )
+        .first()
+    )
+    if paid_spend is not None:
+        return False
+
+    paid_invoice = (
+        db.query(models.Invoice.id)
+        .filter(
+            models.Invoice.subscription_id == sub.id,
+            models.Invoice.status == models.InvoiceStatus.paid,
+            models.Invoice.amount > 0,
+        )
+        .first()
+    )
+    return paid_invoice is None
 
 
 # ── Freeze / unfreeze (V2: 1 per year, 7 days) ──────────────────────

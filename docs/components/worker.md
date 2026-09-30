@@ -243,7 +243,7 @@ return summary
 1. **Renew.** Active subs с `expires_at <= now` и `auto_renew=True`. Берётся `SELECT FOR UPDATE SKIP LOCKED LIMIT 500`. На каждый вызывается `balance.renew_subscription(session, sub)`. Ok → продлили, emit `_maybe_emit_low_balance_warning`. Not ok (денег нет) → status=expired.
 2. **Expire non-renewing.** Active + `auto_renew=False` + expires < now → expired. Без продления.
 3. **Auto-unfreeze.** Frozen + `frozen_until <= now` → `balance.unfreeze_subscription(session, sub, auto=True)`.
-4. **Trial expiry.** T-3 warning + clawback при истечении триала.
+4. **Trial expiry.** T-3 warning + clawback при истечении триала. Warning не шлётся, если баланса хватает на продление живой подписки или она уже не неоплаченный триал (`balance.is_unpaid_trial`). Clawback пропускает платящих (`balance.user_has_paid`) и снимает только непотраченную часть бонуса по журналу (подробно в [TRIAL_SYSTEM.md](../TRIAL_SYSTEM.md)).
 
 `_maybe_emit_low_balance_warning` (`worker.py:450-520`) — идемпотентен на календарный день: проверяет, нет ли уже `low_balance_warning` audit-лога на сегодня у этого пользователя, только тогда пишет новый. Это и есть единственный механизм дедупликации нотификаций — бот не отслеживает ack'и сверх `:delivered` маркера.
 
