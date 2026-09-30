@@ -28,11 +28,13 @@ class _FakeProvider:
 
     def __init__(self, name: str | None = None):
         self.calls = 0
+        self.last: dict | None = None
         if name:
             self.name = name
 
     def create_invoice(self, *, invoice_id, amount, currency, description=None, return_url=None):
         self.calls += 1
+        self.last = {"amount": amount, "currency": currency}
         # Имя провайдера в external_id/pay_url: у каждого способа (карта / СБП)
         # своё пространство счетов, как у настоящих эквайреров.
         return ProviderInvoice(
@@ -95,6 +97,63 @@ def test_pay_creates_invoice_with_slots_and_redirects(client, db_session, paid_e
     )
     assert float(invoice.amount) == 210.0
     assert invoice.status == models.InvoiceStatus.pending
+
+
+def test_legacy_usd_worker_invoice_is_not_reused(client, db_session, paid_env):
+    """До 1.3.7 воркер создавал pending-счёт на продление в USD на plan.price
+    без слотов, а lava.top принимает USD: «Продлить за N ₽» ушло бы как N
+    долларов. Такой счёт не переиспользуем — создаём рублёвый на полную цену."""
+    sub, device, fake = paid_env
+    sub.extra_device_slots = 1
+    legacy = models.Invoice(
+        user_id=sub.user_id, plan_id=sub.plan_id, subscription_id=sub.id,
+        amount=10.0, currency="USD", action=models.InvoiceAction.renewal,
+    )
+    db_session.add(legacy)
+    db_session.commit()
+
+    nonce = sub_fix.make_nonce(device.sub_token)
+    resp = client.post(
+        f"/api/sub/{device.sub_token}?fix=1&n={nonce}&pay=1", follow_redirects=False
+    )
+    assert resp.status_code == 303, resp.text
+    db_session.expire_all()
+    rub = (
+        db_session.query(models.Invoice)
+        .filter(models.Invoice.subscription_id == sub.id, models.Invoice.id != legacy.id)
+        .one()
+    )
+    assert rub.currency == "RUB" and float(rub.amount) == 110.0
+    assert fake.last["currency"] == "RUB" and float(fake.last["amount"]) == 110.0
+    assert db_session.get(models.Invoice, legacy.id).status == models.InvoiceStatus.pending
+
+
+def test_worker_renewal_invoice_is_rub_with_slots(db_session, monkeypatch):
+    """Воркерский 3d-счёт на продление — в рублях и со слотами."""
+    from datetime import timedelta
+
+    from app import worker
+    from app.time_utils import utcnow
+
+    node = make_node(db_session, name="wk-node", host="203.0.113.221")
+    make_config(db_session, node)
+    plan = make_plan(db_session, name="wk-plan")
+    user = make_user(db_session, telegram_id="555777")
+    sub = make_subscription_with_device(db_session, user, plan, node)
+    sub.auto_renew = True
+    sub.extra_device_slots = 2
+    sub.expires_at = utcnow() + timedelta(days=2)
+    db_session.commit()
+
+    worker.run_renewal_check()
+    db_session.expire_all()
+    inv = (
+        db_session.query(models.Invoice)
+        .filter_by(subscription_id=sub.id, action=models.InvoiceAction.renewal)
+        .one()
+    )
+    assert inv.currency == "RUB"
+    assert float(inv.amount) == 210.0
 
 
 def test_second_tap_reuses_the_same_invoice_and_url(client, db_session, paid_env):

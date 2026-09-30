@@ -832,15 +832,26 @@ def do_pay(
 
     # Дедуп: незакрытый счёт на продление этой подписки переиспользуем, иначе
     # каждый тап плодил бы счета, а человек путался бы, какой оплачивать.
-    invoice = (
-        db.query(models.Invoice)
-        .filter(
-            models.Invoice.subscription_id == sub.id,
-            models.Invoice.action == models.InvoiceAction.renewal,
-            models.Invoice.status == models.InvoiceStatus.pending,
-        )
-        .order_by(models.Invoice.id.desc())
-        .first()
+    # Только РУБЛЁВЫЙ и на ТЕКУЩУЮ стоимость: воркер до 1.3.7 создавал счета
+    # в USD на plan.price без слотов, а lava.top принимает USD — кнопка
+    # «Продлить за 150 ₽» ушла бы как 150 долларов. Старые счета не трогаем
+    # (по ним может висеть Payment), просто не берём.
+    cost_rub = total_renewal_cost_kopecks(sub) / 100
+    invoice = next(
+        (
+            inv
+            for inv in db.query(models.Invoice)
+            .filter(
+                models.Invoice.subscription_id == sub.id,
+                models.Invoice.action == models.InvoiceAction.renewal,
+                models.Invoice.status == models.InvoiceStatus.pending,
+            )
+            .order_by(models.Invoice.id.desc())
+            .all()
+            if (inv.currency or "").upper() in ("RUB", "RUR")
+            and abs(float(inv.amount or 0) - cost_rub) < 0.005
+        ),
+        None,
     )
     if invoice is None:
         invoice = models.Invoice(

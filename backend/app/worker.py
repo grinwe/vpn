@@ -1591,12 +1591,17 @@ def run_renewal_check() -> dict:
                     plan = session.get(models.Plan, sub.plan_id)
                     if not plan:
                         continue
+                    # Рубли и полная стоимость продления со слотами: счёт
+                    # переиспользует страница починки (sub_fix.do_pay) и шлёт
+                    # в lava. Был currency="USD" + plan.price без слотов —
+                    # lava.top принимает USD, «Продлить за 150 ₽» ушло бы как
+                    # 150 долларов (найдено ревью плана триала 30.09.2026).
                     invoice = models.Invoice(
                         user_id=sub.user_id,
                         plan_id=sub.plan_id,
                         subscription_id=sub.id,
-                        amount=float(plan.price),
-                        currency="USD",
+                        amount=balance_svc.total_renewal_cost_kopecks(sub) / 100,
+                        currency="RUB",
                         action=models.InvoiceAction.renewal,
                     )
                     session.add(invoice)
