@@ -91,6 +91,11 @@
       - "--exclude=.env"
       - "--exclude=.env.*"
       - "--exclude=secrets/"
+      # Выгрузки пробника выхода (scripts/egress_probe) содержат креды юзеров;
+      # rsync .gitignore не читает — страховка, данные должны жить вне репо.
+      - "--exclude=scripts/egress_probe/*.json"
+      - "--exclude=scripts/egress_probe/*.jsonl"
+      - "--exclude=scripts/egress_probe/*.out"
       # Маркер успешного build живёт внутри dest — исключаем из
       # --delete, иначе rsync стирал бы его на каждом прогоне.
       - "--exclude=.built_ok"

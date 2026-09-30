@@ -2,6 +2,8 @@
 
 Как живут VPN-ноды в системе: из каких состояний, как бэкенд выбирает конфиг, pool'ы, health, drain.
 
+> **Новая нода или exit** — сначала пройти [чек-лист приёмки](operations/node_exit_acceptance_checklist.md): стейджинга в коде нет, успешный bootstrap сразу отдаёт ноду юзерам. Реальный выход и то, какую страну видят Google/OpenAI, проверяется клиентом: [`scripts/egress_probe/`](../scripts/egress_probe/README.md).
+
 ## Lifecycle states
 
 `VPNNode.status` (enum `VPNNodeStatus`):
