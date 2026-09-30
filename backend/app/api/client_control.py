@@ -967,6 +967,9 @@ def report_still_broken(
         raise HTTPException(status_code=404, detail="Report not found")
     report.outcome = "fail"
     report.resolved_at = utcnow()
+    from ..services.repair_alerts import alert_repair_not_fixed
+
+    alert_repair_not_fixed(db, report, reason="fail")
     db.commit()
     return {"report_id": report.id, "outcome": report.outcome}
 

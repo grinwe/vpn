@@ -574,6 +574,10 @@ def handle_broken_device(
         # продвигался бы по лестнице вовсе: следующая жалоба снова считалась
         # бы первой, и он навсегда застревал на самом дешёвом шаге.
         record_complaint(db, user, dedup_sec=dedup_sec, throttled=False, commit=True)
+        # Автоматика ничего не сделала — это пуш админу (services/repair_alerts).
+        from .repair_alerts import alert_repair_no_target
+
+        alert_repair_no_target(db, user, sub, source=source, device_id=device.id)
         return RepairOutcome(action="no_target", device_id=device.id, deduped=deduped)
 
     report = models.OperatorNodeReport(
@@ -804,4 +808,7 @@ def _repair_subscription_locked(
     if res.action == "subscription_inactive":
         return RepairOutcome(action="no_subscription", scope="subscription", deduped=deduped)
     # no_target_available / error / deferred — целевой ноды сейчас нет.
+    from .repair_alerts import alert_repair_no_target
+
+    alert_repair_no_target(db, user, sub, source=source)
     return RepairOutcome(action="no_target", scope="subscription", deduped=deduped)

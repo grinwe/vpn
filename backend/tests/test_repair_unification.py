@@ -1259,3 +1259,117 @@ def test_webapp_health_ping_row_has_node_id_and_survives_no_target(
     assert len(rows) == 1
     assert rows[0].extra["node_id"] == nodes[0].id
     assert rows[0].extra["scope"] == "device"
+
+
+# ── Алерты админу (2026-09-30): пуша на саму жалобу нет, только «не помогло» ──
+
+
+def _alerts(db, action: str) -> list[models.AuditLog]:
+    db.expire_all()
+    return db.query(models.AuditLog).filter_by(action=action).all()
+
+
+def test_health_ping_bad_sends_no_admin_push(client, db_session, ladder, monkeypatch):
+    """Жалоба на пинг — только в БД: лестница чинит сама (user 1000078, 30.09:
+    пуш «жалуется» пришёл, хотя перетасовка через 14 мин всё починила)."""
+    monkeypatch.setenv("ADMIN_TELEGRAM_IDS", "111")
+    user, sub, _device, _nodes = ladder("hp-nopush")
+    r = client.post(
+        "/api/users/health-ping-response",
+        json={"telegram_id": user.telegram_id, "subscription_id": sub.id, "answer": "bad"},
+    )
+    assert r.status_code == 200 and r.json()["action"] == "reshuffled"
+    assert _alerts(db_session, "admin_alert_user_report") == []
+    assert _alerts(db_session, "admin_alert_repair_failed") == []
+    assert _complaints(db_session, user.id) == 1
+
+
+def test_watcher_inconclusive_sends_one_repair_failed_alert(
+    client, db_session, ladder, monkeypatch
+):
+    from app.services import operator_reports
+
+    monkeypatch.setenv("ADMIN_TELEGRAM_IDS", "111")
+    user, sub, _device, _nodes = ladder("hp-inconcl")
+    r = client.post(
+        "/api/users/health-ping-response",
+        json={"telegram_id": user.telegram_id, "subscription_id": sub.id, "answer": "bad"},
+    )
+    report = db_session.get(models.OperatorNodeReport, r.json()["report_id"])
+    report.reported_at = utcnow() - timedelta(minutes=30)  # окно watcher-а прошло
+    db_session.commit()
+
+    res = operator_reports.resolve_pending_reports(db_session)
+    assert res["resolved_inconclusive"] == 1
+    rows = _alerts(db_session, "admin_alert_repair_failed")
+    assert len(rows) == 1
+    assert rows[0].extra["report_id"] == report.id
+    assert rows[0].extra["reason"] == "inconclusive"
+    text = rows[0].extra["text"]
+    assert "Починка не помогла" in text and "перетасовали протоколы" in text
+    assert f"tg={user.telegram_id}" in text
+
+    # «Всё ещё не работает» по тому же репорту — та же история, второго пуша нет.
+    r2 = client.post(
+        "/api/admin/client-control/report-still-broken", json={"report_id": report.id}
+    )
+    assert r2.status_code == 200
+    assert len(_alerts(db_session, "admin_alert_repair_failed")) == 1
+
+
+def test_watcher_ok_sends_nothing(client, db_session, ladder, monkeypatch):
+    from app.services import operator_reports
+
+    monkeypatch.setenv("ADMIN_TELEGRAM_IDS", "111")
+    monkeypatch.setattr(operator_reports, "_username_in_details", lambda details, u: True)
+    user, sub, _device, _nodes = ladder("hp-ok")
+    r = client.post(
+        "/api/users/health-ping-response",
+        json={"telegram_id": user.telegram_id, "subscription_id": sub.id, "answer": "bad"},
+    )
+    report = db_session.get(models.OperatorNodeReport, r.json()["report_id"])
+    report.reported_at = utcnow() - timedelta(minutes=30)
+    db_session.commit()
+    targets = operator_reports._reconnect_targets(db_session, report)
+    for node_id in targets:
+        db_session.add(models.NodeTrafficSample(node_id=node_id, observed_at=utcnow(), details={}))
+    db_session.commit()
+
+    res = operator_reports.resolve_pending_reports(db_session)
+    assert res["resolved_ok"] == 1
+    assert _alerts(db_session, "admin_alert_repair_failed") == []
+
+
+def test_still_broken_sends_repair_failed_alert(client, db_session, ladder, monkeypatch):
+    monkeypatch.setenv("ADMIN_TELEGRAM_IDS", "111")
+    user, sub, _device, _nodes = ladder("hp-still")
+    r = client.post(
+        "/api/users/health-ping-response",
+        json={"telegram_id": user.telegram_id, "subscription_id": sub.id, "answer": "bad"},
+    )
+    rid = r.json()["report_id"]
+    r2 = client.post("/api/admin/client-control/report-still-broken", json={"report_id": rid})
+    assert r2.status_code == 200
+    rows = _alerts(db_session, "admin_alert_repair_failed")
+    assert len(rows) == 1 and rows[0].extra["reason"] == "fail"
+
+
+def test_no_target_sends_repair_failed_alert(client, db_session, ladder, monkeypatch):
+    monkeypatch.setenv("ADMIN_TELEGRAM_IDS", "111")
+    user, sub, _device, _nodes = ladder("hp-notarget")
+    monkeypatch.setattr(
+        self_repair.rotation, "decide_step", lambda db, uid: self_repair.rotation.STEP_RELOCATE
+    )
+
+    def no_node(self, device):
+        raise RuntimeError("no fresh node")
+
+    monkeypatch.setattr(ProvisioningOrchestrator, "failover_device", no_node)
+    r = client.post(
+        "/api/users/health-ping-response",
+        json={"telegram_id": user.telegram_id, "subscription_id": sub.id, "answer": "bad"},
+    )
+    assert r.json()["action"] == "no_target"
+    rows = _alerts(db_session, "admin_alert_repair_failed")
+    assert len(rows) == 1
+    assert rows[0].extra["reason"] == "no_target"

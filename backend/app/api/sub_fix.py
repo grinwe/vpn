@@ -795,6 +795,9 @@ def do_feedback(
     if still:
         report.outcome = "fail"
         report.resolved_at = utcnow()
+        from ..services.repair_alerts import alert_repair_not_fixed
+
+        alert_repair_not_fixed(db, report, reason="fail")
         db.commit()
         logger.info("sub-fix page: report %s still broken (sub=%s)", report.id, sub.id)
         return render_still_broken(token)

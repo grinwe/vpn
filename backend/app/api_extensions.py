@@ -35,7 +35,6 @@ from .config import get_settings
 from .rate_limit import limiter
 from .security import decrypt as _decrypt
 from .services import sub_links, xray_client_config
-from .services.admin_notify import notify_admins
 from .time_utils import utcnow
 
 logger = logging.getLogger(__name__)
@@ -2370,7 +2369,8 @@ ADMIN_NOTIFICATION_ACTIONS = [
     # Текст полностью рендерится на backend-е и кладётся в
     # extra["text"] — бот отдаёт as-is, без собственного
     # форматирования по kind.
-    "admin_alert_user_report",
+    "admin_alert_user_report",  # легаси: с 30.09.2026 не создаётся, держим ради недоставленных строк
+    "admin_alert_repair_failed",  # починка не помогла / не смогла (services/repair_alerts)
     "admin_alert_infra_ssh",
     "admin_alert_infra_dlq",
     # Speaking node/exit diagnosis push (diagnostics overhaul) — text is
@@ -2725,41 +2725,15 @@ def submit_health_ping_response(
         )
     )
 
-    # Плохой ответ (или self-reported «VPN не работает») → алерт
-    # админам через бота. Дедуп по (node_id, user_id) за окно
-    # ADMIN_ALERT_DEDUP_WINDOW_SEC, чтобы один юзер, жмущий кнопку
-    # 50 раз за минуту, не захламил пуши. Не коммитим внутри хелпера —
-    # db.commit() ниже положит и user-report-row, и admin-alert-rows
-    # одной транзакцией (или обе откатятся).
-    if body.answer == "bad":
-        node_label = f"#{node_id}" if node_id else "?"
-        sub_label = f"#{body.subscription_id}" if body.subscription_id else "?"
-        admin_text = (
-            f"🚨 Юзер tg={body.telegram_id} (id={user.id}) жалуется: "
-            f"VPN не работает.\n"
-            f"Нода: {node_label}, подписка: {sub_label}, источник: {source}"
-        )
-        try:
-            notify_admins(
-                db,
-                kind="user_report",
-                text=admin_text,
-                dedup_key={"node_id": node_id, "user_id": user.id},
-                extra={
-                    "source": source,
-                    "subscription_id": body.subscription_id,
-                },
-            )
-        except Exception:  # noqa: BLE001
-            # Алерт админу — best effort, не ломаем user-facing flow,
-            # если notify_admins упал (DB-race, missing ADMIN_TELEGRAM_IDS
-            # уже покрыт внутри хелпера, но мало ли).
-            logger.exception(
-                "notify_admins не отработал для health-ping-response"
-            )
+    # Пуша админу на саму жалобу больше нет (30.09.2026): лестница self_repair
+    # ниже чинит автоматически, а админ получает ОДИН пуш, только если починка
+    # не помогла или не смогла ничего сделать (services/repair_alerts: watcher
+    # inconclusive, «всё ещё не работает», no_target). Жалоба остаётся в БД —
+    # строка health_ping_response выше + complaint_received/client_reported_failure
+    # в ядре.
 
-    # Ответ и алерт фиксируем ДО починки: у ядра свои коммиты/откаты, и
-    # строка опроса не должна пропасть, если перенос упадёт.
+    # Ответ фиксируем ДО починки: у ядра свои коммиты/откаты, и строка
+    # опроса не должна пропасть, если перенос упадёт.
     db.commit()
 
     # «Не работает» от юзера → та же починка, что по кнопке «🆘 VPN не
@@ -2795,6 +2769,10 @@ def submit_health_ping_response(
                 body.subscription_id,
             )
             resp["action"] = "no_target"
+            # Ядро упало до своего no_target-алерта — иначе жалоба была бы тихой.
+            from .services.repair_alerts import alert_repair_no_target
+
+            alert_repair_no_target(db, user, sub, source="bot_health_ping")
     return resp
 
 

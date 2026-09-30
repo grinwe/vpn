@@ -2216,6 +2216,9 @@ def webapp_report_still_broken(
     report = _own_report(db, user, body.report_id)
     report.outcome = "fail"
     report.resolved_at = utcnow_aware()
+    from .services.repair_alerts import alert_repair_not_fixed
+
+    alert_repair_not_fixed(db, report, reason="fail")
     db.commit()
     return {"report_id": report.id, "outcome": report.outcome}
 

@@ -265,6 +265,8 @@ async def notification_poller(bot: Bot):
 
 Это и есть «очередь уведомлений»: воркер пишет строки в `audit_logs` со специальными `action` (`renewal_reminder`, `config_ready`, `migration_notice`, `sublink_rotated`, `low_balance_warning`, `trial_expiry_warning`, `admin_alert_node_diagnosis`), бэкенд их рендерит в человекочитаемый текст (`backend/app/api_extensions.py:359-439`), бот опрашивает и доставляет.
 
+**Алерт «починка не помогла».** `admin_alert_repair_failed` (с 2026-09-30, `backend/app/services/repair_alerts.py`) — единственный пуш по жалобам «VPN не работает»: приходит, только если автоматическая починка не помогла (watcher не увидел переподключения, юзер нажал «всё ещё не работает») или не смогла ничего сделать (нет целевой ноды). Текст: кто, что сделали (перетасовка / перенос / дубль-нога), нода, оператор, исход и канал. Пуша на саму жалобу (`admin_alert_user_report`) больше нет — строка в allowlist осталась только ради недоставленных старых записей.
+
 **Admin-диагностический пуш с кнопками.** `admin_alert_node_diagnosis` (diagnostics overhaul) — говорящий пуш «нода/exit недоступна» с резюме чек-листа (рендерит `services/admin_notify.notify_node_diagnosis`). В отличие от прочих `admin_alert_*`, несёт `target_kind`/`target_id` в `NotificationOut`, по которым `notification_poller` строит `node_diagnosis_keyboard` (`bot/handlers.py`): `👀 Вижу, работаю` / `🔕 1ч·4ч·24ч·совсем` / `📈 Следить (экспонента)`. Callback `diag:<action>:<kind>:<id>[:<hours>]` ловит admin-only `diag_control` и POST'ит в `/api/diagnostics/{kind}/{id}/{action}`. Это первый admin-пуш с интерактивом — раньше все `admin_alert_*` шли без клавиатуры.
 
 Тонкости:
