@@ -31,6 +31,13 @@ from ..time_utils import utcnow
 # Дата, с которой пишутся webapp_open / trial_activate_*.
 TELEMETRY_SINCE = datetime(2026, 7, 25)
 
+# Причины trial_activate_rejected, которые считаются провалом активации: юзер
+# хотел бесплатные дни и не получил их по нашей вине. Значения общие для бота
+# и кабинета.
+TRIAL_FAILURE_REASONS = frozenset(
+    {"no_trial_plan", "throttled", "provision_failed", "insufficient"}
+)
+
 
 def _step(key: str, label: str, count: int, denominator: int, *, measurable: bool = True) -> dict:
     return {
@@ -81,7 +88,16 @@ def compute(db: Session, days: int | None = 7) -> dict:
     # юзера (зашёл в кабинет уже после включения телеметрии) ничего не говорит
     # о его онбординге и только завышало бы картину.
     opened = _targets("webapp_open") & measurable_ids
-    trial_failed = _targets("trial_activate_rejected")
+    # Провал активации — только настоящие сбои. Отказы live / already_used /
+    # already_activated — это платящие и уже взявшие триал, которые жмут
+    # старые кнопки: они раздули бы «провалы» на Dashboard.
+    trial_failed = {
+        t for (t, extra) in db.query(models.AuditLog.target_id, models.AuditLog.extra)
+        .filter(models.AuditLog.action == "trial_activate_rejected",
+                models.AuditLog.target_id.in_(ids))
+        .all()
+        if (extra or {}).get("reason") in TRIAL_FAILURE_REASONS
+    }
     claimed = {u.id for u in users if u.trial_activated_at is not None}
     with_device = {
         uid for (uid,) in db.query(models.Device.user_id)

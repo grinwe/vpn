@@ -19,7 +19,7 @@ from __future__ import annotations
 import logging
 import math
 import os
-from datetime import timedelta
+from datetime import datetime, timedelta
 
 from prometheus_client import Counter, Gauge
 from sqlalchemy import and_, or_
@@ -44,11 +44,18 @@ REFERRAL_BONUS_KOPECKS = int(os.getenv("REFERRAL_BONUS_KOPECKS", "5000"))
 # перехода на дни, а не в увеличении расходов. Месяц в подарок (150 ₽ при
 # платеже приглашённого 150 ₽) съедал бы первый платёж целиком.
 REFERRAL_REWARD_DAYS = int(os.getenv("REFERRAL_REWARD_DAYS", "10"))
-# Подарок приглашённому при активации триала — сверх 30 дней самого триала, и
-# он ещё ничего не заплатил. Поэтому втрое меньше награды реферера: щедрость
-# здесь оплачивает фарм триалов, а не рост.
+# Подарок приглашённому при активации триала — прибавляется к бесплатным дням
+# триала (3 + 3), а он ещё ничего не заплатил. Поэтому втрое меньше награды
+# реферера: щедрость здесь оплачивает фарм триалов, а не рост.
 REFERRAL_INVITEE_DAYS = int(os.getenv("REFERRAL_INVITEE_DAYS", "3"))
-TRIAL_DURATION_DAYS = int(os.getenv("TRIAL_DURATION_DAYS", "30"))
+# Видимые бесплатные дни триала: бонус = столько дней по цене дня Solo, и он
+# сразу тратится на подписку на эти дни (services/trial.py).
+TRIAL_DURATION_DAYS = int(os.getenv("TRIAL_DURATION_DAYS", "3"))
+# Скрытый запас сверх видимых дней: подписка живёт до now + дни + эти часы, а
+# списываем только за видимые дни. Счётчики (кабинет, Happ) округляют вниз и
+# показывают ровно «3 дня», а «истекает завтра» приходит в конце обещанного
+# срока, и пополнить можно, не теряя ссылку. 0 выключает.
+TRIAL_HIDDEN_HOURS = int(os.getenv("TRIAL_HIDDEN_HOURS", "24"))
 TRIAL_EXPIRY_WARN_DAYS = int(os.getenv("TRIAL_EXPIRY_WARN_DAYS", "3"))
 MIN_TOPUP_KOPECKS = int(os.getenv("MIN_TOPUP_KOPECKS", "10000"))
 EXTRA_DEVICE_MONTHLY_KOPECKS = int(os.getenv("EXTRA_DEVICE_KOPECKS_PER_MONTH", "10000"))
@@ -317,13 +324,21 @@ def activate_subscription(
     sub: models.Subscription,
     *,
     reference: str,
+    price_kopecks: int | None = None,
+    expires_at: datetime | None = None,
 ) -> int:
     """Debit ``plan.price`` from wallet, set ``expires_at``, ``auto_renew=True``.
 
     Called at subscription activation. Raises ``ValueError`` on insufficient
     balance (callers surface 402 with topup hint).
+
+    ``price_kopecks`` и ``expires_at`` нужны только триалу
+    (``services/trial.activate_trial_full``): списать ровно зачисленный бонус
+    (N дней по цене дня, а не цену плана) и поставить срок «N дней + скрытые
+    часы». Без них поведение прежнее: полная цена плана и
+    ``now + plan.duration_days``.
     """
-    price = plan_price_kopecks(sub.plan)
+    price = plan_price_kopecks(sub.plan) if price_kopecks is None else price_kopecks
     if price <= 0:
         raise ValueError(f"plan {sub.plan_id} has no price")
 
@@ -341,7 +356,7 @@ def activate_subscription(
         note=f"activate {sub.plan.name} (sub {sub.id})",
     )
 
-    sub.expires_at = utcnow() + timedelta(days=sub.plan.duration_days)
+    sub.expires_at = expires_at or utcnow() + timedelta(days=sub.plan.duration_days)
     sub.auto_renew = True
     # Новый оплаченный период — шкала трафика начинает с нуля.
     sub.traffic_used_bytes = 0
@@ -631,6 +646,27 @@ def is_unpaid_trial(db: Session, sub: models.Subscription) -> bool:
         .first()
     )
     return paid_invoice is None
+
+
+FREEZE_NEEDS_PAYMENT_DETAIL = "Заморозка станет доступна после первой оплаты"
+
+
+def freeze_allowed_by_payment(
+    db: Session, sub: models.Subscription, *, has_paid: bool | None = None
+) -> bool:
+    """Правило заморозки по оплате: юзер платил и эта подписка не неоплаченный триал.
+
+    Правило по подписке, а не по юзеру. Без ``is_unpaid_trial`` триальщик,
+    пополнивший баланс в первый день, заморозил бы сам триал: +FREEZE_DAYS к
+    сроку, и первое списание уехало бы на неделю. ``has_paid`` можно передать
+    заранее посчитанным, когда подписок у юзера несколько (кабинет, /me).
+
+    ``freeze_subscription`` это правило не проверяет: его зовёт только
+    ``webapp_freeze``, и проверка стоит там (сервис покрыт тестами без журнала).
+    """
+    if has_paid is None:
+        has_paid = user_has_paid(db, sub.user_id)
+    return bool(has_paid) and not is_unpaid_trial(db, sub)
 
 
 # ── Freeze / unfreeze (V2: 1 per year, 7 days) ──────────────────────

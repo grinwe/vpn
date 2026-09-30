@@ -2155,6 +2155,11 @@ class TrialActivateFullResponse(BaseModel):
     subscription_id: int
     plan_name: str
     expires_at: str
+    # Бесплатные дни и дни по приглашению (3 и 0 или 3). None на историческом
+    # пути (старый бонус 150 ₽ потрачен на месяц): бот пишет «Подписка
+    # активирована» без числа дней.
+    trial_days: int | None = None
+    referral_days: int | None = None
 
 
 @ext_router.post("/trial/activate_full", response_model=TrialActivateFullResponse)
@@ -2165,115 +2170,80 @@ def activate_trial_full(
     db: Session = Depends(get_db),
     admin_token: str = Depends(require_admin),
 ):
-    """Подарок ЦЕЛИКОМ: бонус на баланс + сразу подписка (бот-путь).
+    """Подарок ЦЕЛИКОМ: бонус и сразу подписка на бесплатные дни (бот-путь).
 
-    ЛК делает это двумя шагами (activateTrial → activateSubscription
-    самого дешёвого месячного, см. Home.tsx: «иначе большинство
-    застревает на бонусе»). Бот шагов не имеет и без этого эндпоинта
-    выдавал бы деньги вместо VPN — ровно воронка-ловушка из анализа
-    2026-07 (ревью 2026-08-21, critical).
+    Тонкая обёртка над ``services.trial.activate_trial_full``: тот же сервис
+    зовёт кабинет, поэтому пути не разъедутся. Бот шагов не имеет и без
+    этого эндпоинта выдавал бы деньги вместо VPN (ревью 2026-08-21).
 
-    Идемпотентность по бонусу: если триал уже был активирован, но живой
-    подписки нет и на балансе хватает — доделываем второй шаг. Это
-    заодно чинит юзеров, застрявших на бонусе исторически.
+    Коды: 409 — живая подписка или бесплатные дни уже использованы, либо
+    провижининг не смог собрать подписку; 503 — нет плана для триала или
+    холодный путь перегружен (``Retry-After``); 402 — не хватило баланса
+    (исторический путь со старым бонусом).
     """
-    from .services import balance as balance_svc
+    from .api._common import _audit
     from .services import trial as trial_svc
-    from .services.provisioning import ProvisioningOrchestrator
+    from .services.provisioning_throttle import ColdPathThrottled
 
     user = db.query(models.User).filter_by(telegram_id=body.telegram_id).first()
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
+    user_id = user.id
 
-    # Шаг 1 — бонус. «Уже активирован» здесь не ошибка: шаг 2 может быть
-    # ещё не сделан (застрял на бонусе) — 409 отдадим ниже, только если
-    # жива и подписка.
+    def _reject(reason: str, status_code: int, detail: str, headers=None):
+        # Сначала rollback, потом аудит: _audit коммитит, а отказы live /
+        # throttled / provision_failed случаются уже после flush бонуса и
+        # trial_activated_at. Без rollback аудит закоммитил бы бонус.
+        db.rollback()
+        _audit(
+            db, f"user:{user_id}", "trial_activate_rejected", "user", user_id,
+            metadata={"reason": reason, "source": "bot"},
+            actor_type=models.AuditActor.user,
+        )
+        return HTTPException(status_code=status_code, detail=detail, headers=headers)
+
     try:
-        trial_svc.activate_trial(db, user.id)
-    except trial_svc.TrialAlreadyActivated:
-        pass
+        result = trial_svc.activate_trial_full(db, user, source="bot")
+    except trial_svc.TrialLiveSubscription:
+        raise _reject("live", 409, "User already has a live subscription")
+    except trial_svc.TrialAlreadyUsed:
+        raise _reject("already_used", 409, "Trial already used")
     except trial_svc.NoTrialPlan:
-        raise HTTPException(status_code=503, detail="No trial plan configured")
-
-    # Гонка двойного тапа: FOR UPDATE на юзере до проверки подписок,
-    # как в webapp_activate.
-    db.refresh(user, with_for_update=True)
-    live = (
-        db.query(models.Subscription)
-        .filter(
-            models.Subscription.user_id == user.id,
-            models.Subscription.status.in_(
-                [
-                    models.SubscriptionStatus.active,
-                    models.SubscriptionStatus.frozen,
-                ]
-            ),
-        )
-        .first()
-    )
-    if live is not None:
-        raise HTTPException(
-            status_code=409, detail="User already has a live subscription"
-        )
-
-    plan = (
-        db.query(models.Plan)
-        .filter(
-            models.Plan.is_visible.is_(True),
-            models.Plan.duration_days < 365,
-        )
-        .order_by(models.Plan.price.asc())
-        .first()
-    )
-    if plan is None:
-        raise HTTPException(status_code=503, detail="No trial plan configured")
-
-    from .services.provisioning_throttle import ColdPathThrottled
-
-    orchestrator = ProvisioningOrchestrator(db)
-    try:
-        # notify_config_ready=False: бот отдаёт ссылку сам сразу после 200
-        # (trial_activate_cb → cmd_config), warm-пуш с той же ссылкой через
-        # 10 с был бы дублем. Cold-путь (девайс pending) пуш шлёт по-прежнему.
-        sub, _task = orchestrator.provision_subscription(
-            user, plan, notify_config_ready=False
-        )
+        raise _reject("no_trial_plan", 503, "No trial plan configured")
     except ColdPathThrottled as exc:
         # Наплыв триальщиков мимо warm-пула: честный 503 с Retry-After
         # вместо 500 — бот скажет «попробуй через минуту».
-        raise HTTPException(
-            status_code=503,
-            detail="provisioning is busy, retry later",
+        raise _reject(
+            "throttled", 503, "provisioning is busy, retry later",
             headers={"Retry-After": str(exc.retry_after_seconds)},
         )
     except RuntimeError as exc:
-        raise HTTPException(status_code=409, detail=str(exc))
-    try:
-        balance_svc.activate_subscription(
-            db, user.id, sub, reference=f"trial-full:{sub.id}"
-        )
+        raise _reject("provision_failed", 409, str(exc))
     except ValueError as exc:
-        # Бонуса не хватило на план (или его уже потратили) — подписку,
-        # только что запровижененную, гасим, деньги не трогаем.
-        db.rollback()
-        sub.status = models.SubscriptionStatus.expired
-        db.add(sub)
-        db.commit()
-        raise HTTPException(status_code=402, detail=str(exc))
+        raise _reject("insufficient", 402, str(exc))
 
+    sub = result.sub
+    _audit(
+        db, f"user:{user_id}", "trial_activated_full", "subscription", sub.id,
+        metadata={
+            "plan_id": result.plan.id,
+            "trial_days": result.trial_days,
+            "referral_days": result.referral_days,
+            "hidden_hours": result.hidden_hours,
+            "charged_kopecks": result.charged_kopecks,
+            "source": "bot",
+        },
+        actor_type=models.AuditActor.user,
+        commit=False,
+    )
     db.commit()
     db.refresh(sub)
-    from .api._common import _audit
-
-    _audit(
-        db, f"user:{user.id}", "trial_activated_full", "subscription", sub.id,
-        metadata={"plan_id": plan.id},
-        actor_type=models.AuditActor.user,
-    )
     return TrialActivateFullResponse(
         subscription_id=sub.id,
-        plan_name=plan.name,
+        plan_name=result.plan.name,
         expires_at=sub.expires_at.isoformat(),
+        trial_days=result.trial_days,
+        referral_days=result.referral_days,
     )
 
 

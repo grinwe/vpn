@@ -434,9 +434,12 @@ class User(Base):
     # one-time trial yet — UI shows the banner, POST /api/trial/activate
     # gates on this being NULL. Set to now() on successful activation.
     trial_activated_at = Column(DateTime, nullable=True)
-    # Set alongside trial_activated_at to activated_at + TRIAL_DURATION_DAYS.
-    # Worker tick reads this to send the 3-day warning and, at expiry,
-    # clawback the unspent trial bonus iff the user never made a real topup.
+    # Конец бесплатного доступа: activated_at + TRIAL_DURATION_DAYS (+ дни по
+    # приглашению) + TRIAL_HIDDEN_HOURS, у триальной подписки совпадает с её
+    # expires_at. NULL у бонус-онли (бонус забран при живой подписке): возвращать
+    # нечего, предупреждать не о чем.
+    # Worker tick reads this to send the warning and, at expiry, clawback the
+    # unspent trial bonus iff the user never paid (balance.user_has_paid).
     # Cleared (set to NULL) after clawback so the tick doesn't revisit.
     trial_expires_at = Column(DateTime, nullable=True)
     # Per-user notification preferences. Each controls a group of

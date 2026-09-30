@@ -11,6 +11,7 @@ from __future__ import annotations
 from datetime import timedelta
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request
+from sqlalchemy import and_, or_
 from sqlalchemy.orm import Session, joinedload
 
 from .. import models, schemas
@@ -29,6 +30,10 @@ from ._common import (
 )
 
 router = APIRouter()
+
+# detail 409 «другой тариф» при живой подписке на неоплаченных бесплатных днях.
+# Бот сверяет его строкой (bot/handlers.py), не менять без правки бота.
+ON_TRIAL_DETAIL = "on trial"
 
 
 def _invoice_with_credentials(
@@ -170,74 +175,10 @@ def _mark_invoice_paid_core(
             db.refresh(invoice)
             return _invoice_with_credentials(invoice, [])
 
-        # Referrer payout: runs strictly BEFORE we write the user's own
-        # topup row so "first kind=topup" detection is unambiguous. If
-        # the user was attributed to a referrer (via /users/register)
-        # and has never completed a real topup before, credit
-        # REFERRAL_BONUS_KOPECKS to the referrer. Idempotent by
-        # reference — a retried webhook can't double-pay.
-        #
-        # Блокируем строку пополняемого пользователя (SELECT ... FOR UPDATE)
-        # ДО проверок prior/already: два одновременных вебхука по двум
-        # разным topup-инвойсам одного юзера лочат разные Invoice-строки и
-        # без этой блокировки оба прошли бы дедуп до коммита друг друга →
-        # двойная выплата бонуса. Блокировка сериализует их по одному
-        # пользователю: второй увидит уже записанную topup-строку первого.
-        topup_user = (
-            db.query(models.User)
-            .filter(models.User.id == invoice.user_id)
-            .with_for_update()
-            .first()
-        )
-        if topup_user and topup_user.referred_by_id is not None:
-            prior = (
-                db.query(models.BalanceTransaction)
-                .filter_by(
-                    user_id=topup_user.id,
-                    kind=models.BalanceTxKind.topup,
-                )
-                .first()
-            )
-            if prior is None:
-                ref_key = f"referral_payout:{topup_user.id}"
-                already = (
-                    db.query(models.BalanceTransaction)
-                    .filter_by(reference=ref_key)
-                    .first()
-                )
-                if already is None:
-                    try:
-                        # Награда в ДНЯХ: сколько именно — берём из кода
-                        # реферера (там поля лежали с самой первой миграции и
-                        # до сих пор не использовались), с падением на
-                        # общий дефолт REFERRAL_REWARD_DAYS.
-                        ref_code = (
-                            db.query(models.ReferralCode)
-                            .filter_by(owner_id=topup_user.referred_by_id)
-                            .order_by(models.ReferralCode.id.desc())
-                            .first()
-                        )
-                        reward_days = (
-                            ref_code.reward_days
-                            if ref_code and ref_code.reward_days
-                            else balance_svc.REFERRAL_REWARD_DAYS
-                        )
-                        balance_svc.referral_bonus(
-                            db,
-                            topup_user.referred_by_id,
-                            reference=ref_key,
-                            days=reward_days,
-                            note=f"referral reward: {reward_days}d",
-                        )
-                    except Exception:
-                        # Don't fail the whole topup over a referral
-                        # bonus write — log and move on. Payout will
-                        # be retried by a nightly reconciliation if we
-                        # ever add one; for now it's fire-and-forget.
-                        logger.exception(
-                            "referral payout failed for user=%s",
-                            topup_user.id,
-                        )
+        # Награда рефереру за ПЕРВУЮ оплату приглашённого. Строго ДО записи
+        # его собственной topup-строки: иначе хелпер увидел бы её и счёл
+        # оплату не первой.
+        _maybe_pay_referrer(db, invoice)
 
         try:
             balance_svc.topup(
@@ -371,6 +312,12 @@ def _mark_invoice_paid_core(
         logger.exception("Failed to process invoice %s", invoice_id)
         raise HTTPException(status_code=500, detail="Failed to create or update subscription") from exc
 
+    # Первая оплата приглашённого бывает и не пополнением: счёт за тариф или
+    # продление картой/СБП (/plans, /renew, ?fix=1). При трёх бесплатных днях
+    # это самый частый первый платёж, и награду он тоже приносит. Проверки
+    # «первая оплата» и дедуп те же, что в topup-ветке.
+    _maybe_pay_referrer(db, invoice)
+
     invoice.status = models.InvoiceStatus.paid
     db.add(invoice)
     db.commit()
@@ -386,6 +333,107 @@ def _mark_invoice_paid_core(
         metadata={"subscription_id": invoice.subscription_id},
     )
     return _invoice_with_credentials(invoice, credentials, subscription=subscription, task=task)
+
+
+def _maybe_pay_referrer(db: Session, invoice: models.Invoice) -> None:
+    """Награда рефереру, если этот оплаченный счёт — первая оплата приглашённого.
+
+    Зовут обе ветки ``_mark_invoice_paid_core`` (пополнение и счёт за тариф
+    или продление) до того, как счёт помечен paid и до собственной
+    topup-строки юзера. Первая оплата = у приглашённого нет ни других
+    оплаченных счетов с суммой > 0, ни строк ``topup``, ни ручных зачислений
+    ``adjust admin_topup:%`` > 0 (так проводили оплаты, пока lava лежал).
+
+    Одного дедупа ``referral_payout:{uid}`` мало: ``/users/register``
+    привязывает реферера любому юзеру с пустым ``referred_by_id``, даже давно
+    платящему. Без условия «первая оплата» его следующая оплата принесла бы
+    награду владельцу чужой ссылки, а исторические приглашённые дали бы её
+    задним числом.
+
+    Строка приглашённого блокируется (SELECT ... FOR UPDATE) ДО проверок: два
+    одновременных вебхука по разным счетам одного юзера лочат разные
+    Invoice-строки и без этого оба прошли бы дедуп до коммита друг друга.
+    Второй дождётся коммита первого и увидит его оплату.
+
+    Ошибка начисления не валит оплату: запись идёт в SAVEPOINT, при сбое
+    откатывается только она.
+    """
+    from ..services import balance as balance_svc
+
+    amount_kopecks = int(round(float(invoice.amount or 0) * 100))
+    if amount_kopecks <= 0:
+        return
+
+    payer = (
+        db.query(models.User)
+        .filter(models.User.id == invoice.user_id)
+        .with_for_update()
+        .first()
+    )
+    if payer is None or payer.referred_by_id is None:
+        return
+
+    earlier_invoice = (
+        db.query(models.Invoice.id)
+        .filter(
+            models.Invoice.user_id == payer.id,
+            models.Invoice.id != invoice.id,
+            models.Invoice.status == models.InvoiceStatus.paid,
+            models.Invoice.amount > 0,
+        )
+        .first()
+    )
+    if earlier_invoice is not None:
+        return
+    tx = models.BalanceTransaction
+    earlier_payment = (
+        db.query(tx.id)
+        .filter(
+            tx.user_id == payer.id,
+            or_(
+                tx.kind == models.BalanceTxKind.topup,
+                and_(
+                    tx.kind == models.BalanceTxKind.adjust,
+                    tx.reference.like("admin_topup:%"),
+                    tx.amount_kopecks > 0,
+                ),
+            ),
+        )
+        .first()
+    )
+    if earlier_payment is not None:
+        return
+
+    ref_key = f"referral_payout:{payer.id}"
+    if db.query(tx.id).filter(tx.reference == ref_key).first() is not None:
+        return
+
+    # Награда в ДНЯХ: сколько именно — из кода реферера, с падением на общий
+    # дефолт REFERRAL_REWARD_DAYS.
+    ref_code = (
+        db.query(models.ReferralCode)
+        .filter_by(owner_id=payer.referred_by_id)
+        .order_by(models.ReferralCode.id.desc())
+        .first()
+    )
+    reward_days = (
+        ref_code.reward_days
+        if ref_code and ref_code.reward_days
+        else balance_svc.REFERRAL_REWARD_DAYS
+    )
+    try:
+        with db.begin_nested():
+            balance_svc.referral_bonus(
+                db,
+                payer.referred_by_id,
+                reference=ref_key,
+                days=reward_days,
+                note=f"referral reward: {reward_days}d",
+            )
+    except Exception:  # noqa: BLE001 — оплата важнее награды
+        logger.exception(
+            "referral payout failed for user=%s invoice=%s", payer.id, invoice.id
+        )
 
 
 @router.post("/invoices/topup", response_model=schemas.InvoiceOut)
@@ -521,6 +569,13 @@ def create_invoice(
                 .first()
             )
             if other is not None:
+                from ..services import balance as balance_svc
+
+                # Живая подписка — неоплаченные бесплатные дни: бот отвечает на
+                # этот detail своим текстом (другой тариф через кабинет или
+                # /help), а не «продли через /renew».
+                if balance_svc.is_unpaid_trial(db, other):
+                    raise HTTPException(status_code=409, detail=ON_TRIAL_DETAIL)
                 raise HTTPException(
                     status_code=409,
                     detail="user already has an active subscription on another plan",

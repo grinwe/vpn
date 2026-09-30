@@ -359,6 +359,9 @@ def _build_subscription_extras(
 
     extras: list[SubscriptionWebAppExtra] = []
     min_days: int | None = None
+    # Заморозка только после первой оплаты (правило по подписке, см.
+    # balance.freeze_allowed_by_payment). «Платил ли» считаем один раз на юзера.
+    has_paid = balance_svc.user_has_paid(db, user.id) if subs else False
     for sub in subs:
         plan = sub.plan
         live_device_rows = (
@@ -391,6 +394,7 @@ def _build_subscription_extras(
             sub.status == models.SubscriptionStatus.active
             and sub.auto_renew
             and not already_froze
+            and balance_svc.freeze_allowed_by_payment(db, sub, has_paid=has_paid)
         )
 
         bundled = (plan.max_devices if plan else 1) or 1
@@ -1458,6 +1462,14 @@ def webapp_freeze(
     sub = db.get(models.Subscription, subscription_id)
     if not sub or sub.user_id != user.id:
         raise HTTPException(status_code=404, detail="Subscription not found")
+
+    # Единственная точка входа в заморозку. Кнопку прячет can_freeze в /me, а
+    # здесь то же правило для прямого вызова и старого бандла: неоплаченный
+    # триал заморозкой растянул бы бесплатные дни на неделю.
+    if not balance_svc.freeze_allowed_by_payment(db, sub):
+        raise HTTPException(
+            status_code=400, detail=balance_svc.FREEZE_NEEDS_PAYMENT_DETAIL
+        )
 
     try:
         balance_svc.freeze_subscription(db, sub)
