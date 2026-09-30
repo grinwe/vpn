@@ -123,7 +123,7 @@ curl -sI http://<mgmt>:8090/hysteria/hysteria-linux-amd64-<ver> | head -n1
 `roles/install_hysteria2/defaults/main.yml`. Хэш берётся из `hashes.txt` релиза:
 
 ```bash
-curl -sSL https://github.com/apernet/hysteria/releases/download/app%2Fv2.10.0/hashes.txt \
+curl -sSL https://github.com/apernet/hysteria/releases/download/app%2Fv2.12.3/hashes.txt \
   | grep 'hysteria-linux-amd64$'
 ```
 
