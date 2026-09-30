@@ -46,7 +46,7 @@ class User(Base):
     id, telegram_id (unique, indexed), email,
     balance_kopecks: Integer NOT NULL DEFAULT 0,
     trial_activated_at: DateTime NULL,   # NULL = триал ещё доступен
-    trial_expires_at: DateTime NULL,     # момент клоубэка бонуса
+    trial_expires_at: DateTime NULL,     # конец бесплатного доступа (момент клоубэка); NULL у бонус-онли
     referred_by_id: FK → users.id NULL,
     banned_at: DateTime NULL,            # user-level бан, ставится из админки
     created_at
@@ -54,7 +54,8 @@ class User(Base):
 
 Инварианты:
 - `balance_kopecks` должен сходиться с `SUM(balance_transactions.amount_kopecks) WHERE user_id = x`. Это не enforced — BalanceTransaction — append-only ledger, column обновляется в коде. Комментарий в модели явно это фиксирует как «trust the column for reads, reconcile nightly» (`models.py:551-562`).
-- `trial_activated_at IS NULL` ⇔ пользователь ещё может дёрнуть `/api/trial/activate`.
+- `trial_activated_at IS NULL` ⇔ пользователь ещё может взять бесплатные дни. Точки входа: бот `POST /api/trial/activate_full` и кабинет `POST /api/webapp/trial/activate` (оба через `services.trial.activate_trial_full`: бонус и сразу подписка), legacy `POST /api/trial/activate` (только бонус, вызывающих в коде нет). Повторно после истечения — 409 «Trial already used», если подписка у юзера уже была.
+- `trial_expires_at` (с 2026-09-30) = `activated_at + TRIAL_DURATION_DAYS (+ дни по приглашению) + TRIAL_HIDDEN_HOURS`, у триальной подписки совпадает с её `expires_at` (конец доступа, а не видимых дней). У бонус-онли (платящий с живой подпиской забрал в кабинете только деньги) — NULL: возвращать нечего, пуша «бесплатные дни скоро закончатся» не будет. Воркер обнуляет поле после clawback. Отдельного флага «триальная подписка» нет: признак — строка журнала `spend trial-full:{sub.id}` (`balance.is_unpaid_trial`).
 - `banned_at IS NOT NULL` ⇒ бот молча дропает все апдейты от этого Telegram-аккаунта (без ACK, чтобы не кормить DDoS-ботов обратной связью). Ортогонально `Subscription.status=blocked`: бан юзера не трогает его подписки, а `/users/{id}/disable` не ставит `banned_at`. Ставится `POST /api/users/{id}/ban`, снимается `/unban`.
 
 ### `plans`

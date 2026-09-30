@@ -272,7 +272,7 @@ POST /api/payments/webhook/sbp:robokassa
 
 Внутри есть три ветки (по `invoice.kind` и `invoice.action`):
 
-1. **`kind = "topup"`** (`api.py:1845-1917`) — кредитнуть `balance_kopecks`, никакого провижининга. Дополнительно срабатывает **referral payout**: если это первый `kind=topup` у пользователя, и у него есть `referred_by_id`, — начисляем `REFERRAL_BONUS_KOPECKS` реферреру. Защита от double-pay — по `BalanceTransaction.reference = "referral_payout:{user_id}"`. Referral-payout wrapped в `try/except` (`api.py:1882-1890`): если начисление упало, топап пользователя всё равно пройдёт.
+1. **`kind = "topup"`** (`api.py:1845-1917`) — кредитнуть `balance_kopecks`, никакого провижининга. Дополнительно срабатывает **referral payout** (`_maybe_pay_referrer` в `api/invoices.py`, до записи самого топапа): если это первая оплата пользователя (нет других оплаченных счетов с суммой > 0, строк `topup` и `adjust admin_topup:%` > 0) и у него есть `referred_by_id`, — начисляем рефереру `reward_days` кода (по умолчанию 10 дней = 50 ₽). Защита от double-pay — по `BalanceTransaction.reference = "referral_payout:{user_id}"` и лок строки плательщика. Начисление в SAVEPOINT: если оно упало, топап пользователя всё равно пройдёт. С 2026-09-30 тот же хелпер зовут и ветки 2–3 (счёт за продление или тариф): первая оплата приглашённого часто бывает именно renewal-счётом.
 
 2. **`action = "renewal"`** — продлить существующую подписку: `expires_at += plan.duration_days`, статус → `active`. Провижининг не нужен — credential'ы уже есть.
 

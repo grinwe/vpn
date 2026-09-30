@@ -50,7 +50,7 @@
 Список инвойсов с фильтром по статусу (default: `pending`) и лимиту (20/50/100/200). Поллится раз в 10 секунд. `GET /api/invoices?status=…&limit=…`.
 
 Действия:
-- **mark paid** на `pending` → `POST /api/invoices/{id}/mark_paid`. Триггерит тот же `_mark_invoice_paid_core` что и вебхуки: для `kind=topup` начисляет баланс (и при первом топапе — реферер payout, см. [TRIAL_SYSTEM.md](TRIAL_SYSTEM.md)); для `kind=subscription` создаёт/продлевает подписку и enqueue'ит провижининг.
+- **mark paid** на `pending` → `POST /api/invoices/{id}/mark_paid`. Триггерит тот же `_mark_invoice_paid_core` что и вебхуки: для `kind=topup` начисляет баланс; для `kind=subscription` создаёт/продлевает подписку и enqueue'ит провижининг. В обеих ветках, если это первая оплата приглашённого, — реферер payout (с 2026-09-30 и за счёт на тариф/продление, раньше только за топап; см. [TRIAL_SYSTEM.md](TRIAL_SYSTEM.md)).
 - **mark unpaid** на `paid` → `POST /api/invoices/{id}/mark_unpaid`. **Только bookkeeping** — подписка/девайсы НЕ отзываются. Нужен, если руками помеченный инвойс оказался ошибкой; снятие денег/ревок делать отдельно. **`kind=topup` откатить нельзя** (400): баланс уже зачислен, для коррекции — balance adjustment. Batch-вариант такие инвойсы пропускает (`skipped`).
 
 ### `/admin/plans` — Plans ([Plans.tsx](../admin/src/pages/Plans.tsx))
@@ -62,7 +62,7 @@ CRUD по тарифам. Поля: `name`, `duration_days`, `max_devices`, `pri
 - Удаление: `DELETE /api/plans/{id}` — 409, если есть живые подписки (алерт всплывает над формой)
 - Toggle visibility — отдельный shortcut, тоже `PUT /api/plans/{id}` с `{is_visible}`
 
-**Критично:** trial-система читает цену самого дешёвого `is_visible` 30-day плана как сумму trial-бонуса (см. [TRIAL_SYSTEM.md](TRIAL_SYSTEM.md#activation-flow)). Если у тебя нет ни одного 30-day visible плана — trial-баннер в WebApp не рендерится, активация отдаёт 503.
+**Критично:** trial-система берёт самый дешёвый `is_visible` 30-day план: по его цене дня считается trial-бонус (3 дня, у Solo 150 ₽ это 15 ₽), и на него же оформляется подписка на бесплатные дни (см. [TRIAL_SYSTEM.md](TRIAL_SYSTEM.md#activation-flow)). Если у тебя нет ни одного 30-day visible плана — trial-баннер в WebApp не рендерится, активация отдаёт 503.
 
 ### `/admin/nodes` — Nodes ([Nodes.tsx](../admin/src/pages/Nodes.tsx))
 
@@ -111,8 +111,8 @@ CRUD по тарифам. Поля: `name`, `duration_days`, `max_devices`, `pri
 
 | Что нажал | Что уходит | Side effects |
 |-----------|-----------|--------------|
-| `mark paid` на subscription-инвойсе | `POST /api/invoices/{id}/mark_paid` | провижининг в worker → ansible на ноде, юзер получает config в боте |
-| `mark paid` на topup-инвойсе | то же | `balance_kopecks += amount`; если это первый топап и есть referrer — payout рефереру ([TRIAL_SYSTEM.md](TRIAL_SYSTEM.md#stage-3)) |
+| `mark paid` на subscription-инвойсе | `POST /api/invoices/{id}/mark_paid` | провижининг в worker → ansible на ноде, юзер получает config в боте; если это первая оплата приглашённого — payout рефереру ([TRIAL_SYSTEM.md](TRIAL_SYSTEM.md#stage-3--referrer-payout-on-referees-first-payment-of-any-kind)) |
+| `mark paid` на topup-инвойсе | то же | `balance_kopecks += amount`; если это первая оплата приглашённого (любым способом) и есть referrer — payout рефереру ([TRIAL_SYSTEM.md](TRIAL_SYSTEM.md#stage-3--referrer-payout-on-referees-first-payment-of-any-kind)) |
 | `revoke now` на подписке | `POST /api/subscriptions/{id}/disable` | subscription → `blocked`, ansible-таска снимает девайсы с ноды |
 | `enable` на подписке | `POST /api/subscriptions/{id}/enable` | `frozen` → `unfreeze_subscription`; `blocked/expired` → `active` + reprovision одного девайса |
 | `+ add device` на подписке | `POST /api/subscriptions/{id}/devices` | Создаёт новый `Device`, ставит ansible-таску. Обходит prepaid-гейт (админский override). |

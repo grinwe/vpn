@@ -99,7 +99,7 @@ GET  /api/webapp/plans                     видимые планы
 POST /api/webapp/checkout                  создать инвойс (subscription) + pay_url
 POST /api/webapp/topup                     создать инвойс (topup)
 GET  /api/webapp/invoices/{id}             опрос статуса инвойса
-POST /api/webapp/trial/activate            активация триала
+POST /api/webapp/trial/activate            бесплатные дни целиком (бонус + подписка; при живой подписке только бонус)
 POST /api/webapp/subscriptions/activate    списать с баланса → создать sub
 POST /api/webapp/subscriptions/{id}/freeze заморозка
 POST /api/webapp/subscriptions/{id}/unfreeze
@@ -140,9 +140,10 @@ if not target_subscription or target_subscription.user_id != user.id:
 ```
 GET  /api/sub/{token}                          ← public, anonymous polling
 POST /api/subscriptions/{id}/auto_renew         ← require_admin
-POST /api/referral/code                         ← optional_admin
+POST /api/referral/code                         ← optional_admin (+ invitee_total_days)
 POST /api/users/register                        ← optional_admin
-POST /api/trial/activate                        ← optional_admin
+POST /api/trial/activate                        ← require_admin (legacy: только бонус, вызывающих нет)
+POST /api/trial/activate_full                   ← require_admin (бот: бесплатные дни целиком)
 POST /api/users/by_telegram/{tg}/regenerate     ← require_admin (вызывающих нет с 2026-09-12: /newconfig переехал на report-broken)
 GET  /api/notifications/pending                 ← require_admin (polls бот)
 POST /api/notifications/{id}/ack                ← require_admin (ack от бота)
@@ -150,7 +151,11 @@ POST /api/notifications/{id}/ack                ← require_admin (ack от бо
 
 `optional_admin` значит: токен не обязателен, но если прислан — проверяется как admin. Это оставлено для совместимости со старыми бот-сборками, которые ходили без заголовка; сейчас бот всегда подкладывает admin-token, поэтому `optional` фактически совпадает с `required`.
 
-`POST /api/users/register` идемпотентен и служит боту read-API входных экранов (`_fetch_user_flags`). Ответ: `id`, `telegram_id`, `created`, `trial_available` (триал ещё не активирован), `has_devices` (есть ACTIVE-девайс — гейт «🆘 VPN не работает»: чинить можно только выданное), `has_subscription` (есть подписка `active` или `frozen` — гейт пути к ссылке `go:config` и строки «у тебя уже есть подписка» в `/plans`; отдельно от `has_devices`, потому что на cold-пути девайс ~минуту `pending`, а у замороженного девайсов нет вовсе — ревью инцидента 2026-08-25), `referral_bonus_credited` (всегда `false`, legacy).
+`POST /api/users/register` идемпотентен и служит боту read-API входных экранов (`_fetch_user_flags`). Ответ: `id`, `telegram_id`, `created`, `trial_available` (триал ещё не активирован), `has_devices` (есть ACTIVE-девайс — гейт «🆘 VPN не работает»: чинить можно только выданное), `has_subscription` (есть подписка `active` или `frozen` — гейт пути к ссылке `go:config` и строки «у тебя уже есть подписка» в `/plans`; отдельно от `has_devices`, потому что на cold-пути девайс ~минуту `pending`, а у замороженного девайсов нет вовсе — ревью инцидента 2026-08-25), `referral_bonus_credited` (всегда `false`, legacy), `trial_days` (бесплатные дни всем, `TRIAL_DURATION_DAYS` = 3) и `trial_referral_days` (0 или `bonus_days` кода реферера, по умолчанию 3). Дни считаются `trial_svc.trial_days_for` **после** привязки реферала в том же запросе, поэтому `/start ref_…` сразу пишет «6 дней», и цифра совпадает с выданной при активации (с 2026-09-30).
+
+`POST /api/referral/code` помимо `code`, `uses`, `bonus_days`, `reward_days` отдаёт `invitee_total_days` = `TRIAL_DURATION_DAYS + bonus_days` кода (3 + 3 = 6): бот пишет в `/referral` «Друг получит 6 дней VPN бесплатно вместо 3, а тебе начислим 10 дней подписки, когда он впервые оплатит.»
+
+`POST /api/trial/activate_full` — тонкая обёртка над `services.trial.activate_trial_full(..., source="bot")`: бонус 3 дня (+3 по приглашению) и сразу подписка на них. Ответ `{subscription_id, plan_name, expires_at, trial_days, referral_days}` (`trial_days`/`referral_days` = null на историческом пути). Коды: 409 `User already has a live subscription`, 409 `Trial already used`, 409 `str(RuntimeError)` провижининга, 402 (исторический путь), 503 (нет плана / наплыв с `Retry-After`). Отказы после `db.rollback()` пишутся в аудит `trial_activate_rejected`. Подробно — [TRIAL_SYSTEM.md](../TRIAL_SYSTEM.md#activation-flow).
 
 ### `/api/sub/{token}` — единственный анонимный роут бэкенда
 

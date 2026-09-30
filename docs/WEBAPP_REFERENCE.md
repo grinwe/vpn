@@ -45,7 +45,10 @@ Res ([MeResponse](../backend/app/api_webapp.py#L232)):
     "has_active_balance_sub": bool,
     "trial_available": bool,
     "trial_amount_kopecks": int,
-    "trial_autoactivate_allowed": bool
+    "trial_autoactivate_allowed": false,
+    "trial_days": int,
+    "trial_referral_days": int,
+    "trial_bonus_only": bool
   },
   "subscription_extras": [SubscriptionWebAppExtra...],
   "sub_link_base_url": string
@@ -55,14 +58,16 @@ Res ([MeResponse](../backend/app/api_webapp.py#L232)):
 Полезные детали:
 
 - **`min_days_remaining`** — *минимум* по всем active balance-subs, не среднее. Это то, что отображается в header card — юзер должен видеть когда кончится его **самая ранняя** подписка, не усреднённую оптимистичную оценку.
-- **`trial_available`** — `user.trial_activated_at IS NULL`. `trial_amount_kopecks` читается каждый запрос из БД (cheapest visible 30-day plan price × 100), поэтому изменение цены через `/admin/plans` автоматически подхватывается без деплоя. Если в БД нет ни одного visible 30-day плана — `trial_amount_kopecks=0` и баннер не рендерится (см. [TRIAL_SYSTEM.md](TRIAL_SYSTEM.md)).
-- **`trial_autoactivate_allowed`** — `trial_available AND` у юзера нет живой (`active`/`frozen`) подписки. Только при `true` webapp имеет право после claim'а бонуса сразу вызвать `POST /subscriptions/activate`: этот эндпоинт в single-sub модели **меняет тариф** (отзывает все живые подписки, ревокает девайсы, делает проратный возврат), поэтому тихая авто-активация у юзера с действующей подпиской снесла бы её без подтверждения (аудит 2026-07-25). Бонус на баланс зачисляется в обоих случаях.
+- **`trial_available`** — `user.trial_activated_at IS NULL`. `trial_amount_kopecks` = `TRIAL_DURATION_DAYS` дней по цене дня самого дешёвого видимого 30-дневного плана (с 2026-09-30: 3 дня Solo = 1500 коп.), считается на каждый запрос, поэтому смена цены через `/admin/plans` подхватывается без деплоя. Кабинет использует сумму как условие `> 0` для баннера и для расчёта рублей в бонус-онли баннере. Если в БД нет ни одного visible 30-day плана — `trial_amount_kopecks=0` и баннер не рендерится (см. [TRIAL_SYSTEM.md](TRIAL_SYSTEM.md)).
+- **`trial_days` / `trial_referral_days`** — бесплатные дни всем (`TRIAL_DURATION_DAYS`, 3) и сверху по приглашению (0 или `bonus_days` кода реферера, по умолчанию 3). Считаются `trial_svc.trial_days_for`, той же функцией, что и активация, поэтому цифра в баннере («Забери 3 дня» / «6 дней») совпадает с выданной.
+- **`trial_bonus_only`** — `trial_available AND` у юзера есть живая (`active`/`frozen`) подписка. Тап по баннеру тогда даёт только деньги на баланс (пойдут на продление), подписку не выдаёт, и кабинет показывает честный баннер «🎁 Подарок: 15 ₽ на баланс, это 3 дня подписки» (или «30 ₽, 6 дней») с кнопкой «Забрать подарок» вместо «Забери 3 дня бесплатно».
+- **`trial_autoactivate_allowed`** — с 2026-09-30 **всегда `false`**. Раньше кабинет после claim'а бонуса вторым шагом из браузера покупал самый дешёвый план (`POST /subscriptions/activate`), и флаг разрешал это только без живой подписки. Теперь `/trial/activate` сам выдаёт подписку, а поле осталось в схеме ради закэшированных старых бандлов: увидев `false`, такой бандл не пойдёт во второй шаг (он отозвал бы только что выданную подписку или ответил бы 400 «Already on plan») и просто обновит `/me`.
 - **`subscription_extras[].plan_price_kopecks`** — цена плана на **один период** (месяц/год) как в `Plan.price`. Это то, что списывается при каждом renewal из кошелька (плюс опционально extra-device surcharge, см. ниже).
 - **`subscription_extras[].bundled_devices`** — `plan.max_devices` (сколько девайсов «бесплатно» идёт с тарифом).
 - **`subscription_extras[].extra_device_slots`** — платные слоты сверх бандла, **хранятся на `Subscription.extra_device_slots`** (миграция `0018_extra_device_slots`). Bumps +1 на каждом успешном add-device с платой, обнуляется только при смене тарифа или отмене. Явно **не** декрементится при remove-device — именно это чинит баг «удалил → следующий renewal дешевле», и пользовательский UI в `Home.tsx` об этом предупреждает в confirm'е.
 - **`subscription_extras[].extra_device_monthly_kopecks`** — абонплата за один платный слот, `EXTRA_DEVICE_MONTHLY_KOPECKS` из env, default **10000 kopecks = ₽100/мес**. Экспонируется в ответе специально чтобы UI не дублировал константу.
 - **`subscription_extras[].next_extra_fee_kopecks`** — prorated плата, которая спишется *прямо сейчас* если юзер нажмёт «+ Добавить устройство». 0 если `live_devices + 1 <= bundled_devices + extra_device_slots` (т.е. новый девайс ещё помещается в уже оплаченный envelope — например, юзер купил слот, потом удалил девайс, и теперь возвращает его бесплатно). Иначе — `prorated_extra_device_fee(sub)` по остатку до `sub.expires_at`. `Home.tsx` показывает это значение в confirm-диалоге add-device, чтобы юзер видел реальную сумму до тапа.
-- **`subscription_extras[].can_freeze`** — `sub.status == active AND auto_renew AND NOT has_frozen_this_year`. Кнопка «заморозить» на карточке скрывается по этому флагу; 400 от `/freeze` всё равно ловится тостом.
+- **`subscription_extras[].can_freeze`** — `sub.status == active AND auto_renew AND NOT has_frozen_this_year AND balance.freeze_allowed_by_payment(sub)`. Последнее (с 2026-09-30) = `user_has_paid(user) AND NOT is_unpaid_trial(sub)`: заморозка только после первой оплаты и не для самих бесплатных дней (правило по подписке, см. [BALANCE_REFERENCE.md § Freeze](BALANCE_REFERENCE.md#freeze--unfreeze)). `user_has_paid` считается один раз на юзера. Кнопку прячет сервер, поэтому и старый бандл её не покажет; 400 от `/freeze` кабинет показывает текстом бэкенда (`humanError`).
 - **`sub_link_base_url`** — из env `SUB_LINK_BASE_URL`. Пустая строка = используй relative `/api/sub/<token>` на том же origin'е. Нужно, потому что WebApp и sub-link могут жить на разных доменах (boring-domain proxy для обхода DPI).
 - **Какая ссылка на карточке** (`subUrl`, она же QR) — с 2026-09-28 та же, что показывает бот: `subscriptions[].link_token` (токен устройства, запомненный при создании подписки; `services/sub_links.link_token_for`). Раньше бралось «первое живое устройство по id» — после failover primary токен переезжает на строку с бОльшим id, и кабинет показывал ссылку device-2, а бот — primary. Если `link_token == sub_token` (подписки до alembic `0070`: бэк отдаёт в `link_token` legacy-ссылку на ВСЕ устройства) — остаётся прежнее поведение, первое живое устройство. Ответ `POST /subscriptions/activate` (экран «Готово») отдаёт тот же `link_token`. URL целиком тоже как у бота: у подписок с `link_token` бэк отдаёт готовые `subscriptions[].link_url`, `subscription_extras[].devices[].sub_url` и `ActivateResponse.sub_url` (`sub_links.sub_url_for` — домен 50/50 `SUB_LINK_BASE_URL`/`SUB_LINK_BASE_URL_ALT` по sha256 токена), фронт берёт их через `subLinkUrl` (`webapp/src/api.ts`). Без этого у половины новых юзеров бот давал `grwr.ink/<tok>`, а кабинет `grn-ssync.pro/<tok>` — один токен, два URL, дубль профиля при двойном импорте. У старых подписок поля пустые, URL строится по-старому из `sub_link_base_url` (смена домена у уже импортированной ссылки дала бы тот же дубль).
 - **Copy-config UI** — кнопка на карточке подписки зовёт `navigator.clipboard.writeText(subUrl)`, с fallback на `document.execCommand('copy')` для старых WebView. После успеха — тост `Скопировано ✓` на 1.5с + Telegram haptic `notificationOccurred('success')`. Это заменило старую «Показать конфиг» кнопку (которая разворачивала текст прямо на странице) — юзеры почти всегда хотят скопировать, а не разглядывать base64.
@@ -113,9 +118,11 @@ Req: `{ amount_kopecks, provider="telegram_stars" }`.
 
 Нижняя граница — `MIN_TOPUP_KOPECKS` (default 10000 = ₽100), иначе 400.
 
+Кнопки сумм в `TopupModal` (`TOPUP_PRESETS` в [Home.tsx](../webapp/src/pages/Home.tsx)): 150, 300, 600 и 1500 ₽. С 2026-09-30 первый пресет 150 ₽, а не 100 ₽: после трёх бесплатных дней человек пополнял на 100 ₽, продление Solo за 150 ₽ не проходило, и подписка молча гасла. Сервер по-прежнему принимает от `MIN_TOPUP_KOPECKS`, ручной ввод не менялся.
+
 Особенность: `Invoice.amount` **всегда в рублях**, даже если displayed currency — XTR. Это чтобы `_mark_invoice_paid_core` начислил чистое количество копеек независимо от провайдера. Displayed — отдельно в `currency`.
 
-Создаётся `Invoice(kind="topup", plan_id=NULL)` — эта pair «без плана + kind=topup» — та самая, которую хук в [api/invoices.py:132](../backend/app/api/invoices.py#L132) распознаёт и кладёт в баланс вместо провижининга, плюс тригерит referrer payout при первом топапе (см. [TRIAL_SYSTEM.md](TRIAL_SYSTEM.md#stage-3)).
+Создаётся `Invoice(kind="topup", plan_id=NULL)` — эта pair «без плана + kind=topup» — та самая, которую хук в [api/invoices.py:132](../backend/app/api/invoices.py#L132) распознаёт и кладёт в баланс вместо провижининга, плюс тригерит referrer payout, если это первая оплата приглашённого (см. [TRIAL_SYSTEM.md](TRIAL_SYSTEM.md#stage-3--referrer-payout-on-referees-first-payment-of-any-kind)). Счёт за тариф или продление даёт ту же награду.
 
 **Выбор способа оплаты (Stage 9b).** `provider` — произвольный (бэкенд диспатчит через `get_provider`), фронт передаёт выбранный юзером. UI-флоу: сначала сумма, затем «Выберите способ оплаты» — `⭐ Telegram Stars`, `🏦 СБП` (`lava_top_sbp`) или `💳 Карта РФ` (`lava_top`). Кнопок стало три 2026-09-19: до этого lava-кнопка была одна, «💳 Карта РФ / СБП», и способ человек выбирал уже на странице агрегатора PAY2ME — lava закрыл там карту, счета начали падать (400 «Restricted payment method type» → в кабинете «Не удалось создать счёт: 502»), поэтому способ выбирается ДО создания счёта (`docs/PLAN_LAVA_TOP.md`, «Инцидент 2026-09-19»). Обе lava-кнопки — одна интеграция, механика оплаты у них одинаковая. После успешной карточной оплаты (poll поймал зачисление) показывается явный экран «✅ Баланс пополнен» с суммой — lava не редиректит юзера обратно в Mini App, поэтому молча закрывать модалку нельзя. Две механики оплаты различаются:
 - **Stars** → `pay_url` это `t.me/$slug`, открывается нативно `tg.openInvoice(url, callback)` с мгновенным колбэком `paid/failed/cancelled`.
@@ -125,13 +132,21 @@ Req: `{ amount_kopecks, provider="telegram_stars" }`.
 
 ### `POST /api/webapp/trial/activate`
 
-Без тела — user_id из JWT. Thin wrapper над [services.trial.activate_trial()](../backend/app/services/trial.py) (admin-token версия в `api_extensions.py` шарит ту же функцию, чтобы логика не дрейфовала).
+Без тела — user_id из JWT. С 2026-09-30 выдаёт бесплатные дни **целиком одним вызовом** (раньше только зачислял бонус, а подписку кабинет покупал вторым запросом из браузера). Сначала `SELECT … FOR UPDATE` на юзере, потом развилка:
 
-Возвращает `{ trial_amount_kopecks, referral_bonus_kopecks, balance_kopecks, trial_expires_at }`.
+- **Живой (`active`/`frozen`) подписки нет** → [`services.trial.activate_trial_full(db, user, source="webapp")`](../backend/app/services/trial.py), тот же сервис, что у бота (`POST /api/trial/activate_full`): бонус 3 дня (+3 по приглашению), подписка на самый дешёвый видимый 30-дневный план до `now + N дней + TRIAL_HIDDEN_HOURS`, списание ровно зачисленного (`spend trial-full:{sub.id}`), `trial_expires_at` = конец подписки. Ссылка в ответе собирается как в `webapp_activate` (`link_token` → `sub_links.sub_url_for`, хелпер `_issued_sub_link`).
+- **Живая подписка есть** → только бонус: `activate_trial(..., set_expiry=False)`. 15 ₽ (30 ₽ по приглашению) ложатся на баланс и пойдут на продление, подписка не выдаётся, `trial_expires_at` остаётся NULL (ни пуша «бесплатные дни скоро закончатся», ни возврата бонуса).
 
-Ошибки:
-- `409 Trial already activated` — фронт в ответ скрывает баннер (всё равно рефрешит `/me`, чтобы actual state отразился).
-- `503 No trial plan configured` — нет visible 30-day плана; баннер не должен был вообще рендериться, но если словил — это как missing config.
+Возвращает `{ trial_amount_kopecks, referral_bonus_kopecks, balance_kopecks, trial_expires_at, subscription_id?, sub_token?, sub_url?, expires_at?, trial_days?, referral_days? }`. Поля подписки заполнены только в первой ветке: по наличию `sub_token`/`sub_url` кабинет показывает экран «Готово» со строкой «Бесплатно на N дней», иначе просто обновляет `/me`. `trial_expires_at` = null у бонус-онли; `trial_days`/`referral_days` = null на историческом пути (старый бонус 150 ₽, потраченный на месяц, см. [TRIAL_SYSTEM.md](TRIAL_SYSTEM.md)).
+
+Ошибки (каждая после `db.rollback()` пишется в аудит `trial_activate_rejected` с `reason` и `source=webapp`; rollback обязателен до аудита, потому что `_audit` коммитит, а бонус к этому моменту уже flush'нут):
+- `409 Trial already activated` (`already_activated`), `409 Trial already used` (`already_used`: триал был и подписка у юзера была), `409 User already has a live subscription` (`live`, гонка) — кабинет молча обновляет `/me`.
+- `409 <str(RuntimeError)>` (`provision_failed`) — собрать подписку не удалось, бонус откатан, можно повторить. Кабинет показывает общий текст ошибки с повтором.
+- `503 No trial plan configured` (`no_trial_plan`) — нет visible 30-day плана.
+- `503 provisioning is busy, retry later` + `Retry-After` (`throttled`) — холодный путь перегружен; кабинет: «Сейчас много желающих, попробуй через пару минут.»
+- `402` (`insufficient`) — не хватило баланса (только исторический путь или уже возвращённый бонус); кабинет отправляет в поддержку.
+
+Аудит успеха `trial_activated`: `metadata = {amount_kopecks, trial_days, referral_days, full}`, у `full=true` ещё `subscription_id, plan_id, hidden_hours, charged_kopecks`. `onboarding_funnel` считает провалами активации только `no_trial_plan`, `throttled`, `provision_failed`, `insufficient`.
 
 ### `POST /api/webapp/subscriptions/activate`
 
@@ -162,7 +177,7 @@ Res: `{ subscription_id, sub_token, expires_at, balance_kopecks, plan_price_kope
 
 ### `POST /api/webapp/subscriptions/{id}/freeze` / `unfreeze`
 
-Обёртки над [balance_svc.freeze_subscription / unfreeze_subscription](BALANCE_REFERENCE.md#freezeunfreeze). Оба — `auto=False` (то есть ручная заморозка, списывает из year budget). 404 если sub не твоя, 400 если balance_svc возражает.
+Обёртки над [balance_svc.freeze_subscription / unfreeze_subscription](BALANCE_REFERENCE.md#freeze--unfreeze). Оба — `auto=False` (то есть ручная заморозка, списывает из year budget). 404 если sub не твоя, 400 если balance_svc возражает. `freeze` с 2026-09-30 перед сервисом проверяет `balance.freeze_allowed_by_payment(sub)` и отвечает **400 «Заморозка станет доступна после первой оплаты»**, если юзер ещё не платил или подписка — неоплаченные бесплатные дни. Это единственная точка входа в заморозку; сам `balance.freeze_subscription` проверки не делает. Разморозка доступна всем уже замороженным.
 
 `freeze` Res: `{ subscription_id, status, frozen_until, freeze_days_left_in_year }`.
 `unfreeze` Res: `{ subscription_id, status, next_charge_at }`.
@@ -223,11 +238,12 @@ Res: `{ device_id, device_count, extra_device_slots, balance_kopecks }`. `extra_
 
 Создаёт реферальный код на первом вызове (lazy mint), иначе возвращает существующий активный. Код — `secrets.token_urlsafe(5)[:6].upper()`, до 5 попыток на коллизию с unique-индексом.
 
-Res: `{ code, bonus_kopecks, invited_count, earned_kopecks, share_url }`.
+Res: `{ code, bonus_kopecks, invited_count, earned_kopecks, share_url, invitee_total_days }`.
 
-- `bonus_kopecks = REFERRAL_BONUS_KOPECKS` — сумма которую получит реферер при первом топапе рефёрла.
+- `bonus_kopecks = REFERRAL_BONUS_KOPECKS` — легаси-сумма. Награда теперь в днях (`reward_days` кода, по умолчанию 10) и платится при **первой оплате** приглашённого любым способом (пополнение или счёт за тариф/продление), см. [TRIAL_SYSTEM.md § Stage 3](TRIAL_SYSTEM.md).
+- `invitee_total_days` = `TRIAL_DURATION_DAYS + bonus_days` кода (3 + 3 = 6) — сколько бесплатных дней получит друг по этой ссылке. Кабинет пишет «Друг получит 6 дней бесплатно вместо 3.»
 - `invited_count` = `COUNT(users WHERE referred_by_id = me.id)` — **атрибутированные**, не обязательно активировавшие триал и не обязательно платящие. Для точного counter «платящих» — отдельный запрос по `kind=topup`, сейчас не выставляется.
-- `earned_kopecks` = сумма всех positive `kind=bonus` транзакций юзера. Включает trial-бонус самого юзера — технически шумно, но для UI «сколько ты заработал реферальных» это overinclusive rather than misleading, и пока никто не жаловался.
+- `earned_kopecks` = сумма positive `kind=bonus` транзакций юзера с `reference LIKE 'referral_payout:%'`, то есть только награды за приглашённых. До 2026-09-30 считались все `kind=bonus`, и триальщик видел «заработано 150 ₽» за собственный триал-бонус.
 - `share_url` = `https://t.me/<BOT_USERNAME>?start=ref_<code>` или `null`, если `BOT_USERNAME` env не выставлен. Если null — фронт показывает только код как текст, copy-button без share.
 
 ## Самопочинка «VPN не работает» (Help)
@@ -358,8 +374,8 @@ outcome (migrated | reshuffled | duplicated, есть report_id)
 | 401 | initData не валидируется / JWT протух / не передан Bearer |
 | 402 | Нет баланса — `/subscriptions/activate`, `/subscriptions/{id}/devices`, `/change_plan`. Тело несёт `code`, `balance_kopecks`, `required_kopecks`, `suggested_topup_kopecks`. |
 | 404 | Plan / subscription / invoice / `report_id` не найден **или** не принадлежит юзеру (не различаем, чтобы не утекало existence). Исключение — `report-broken-device`: чужое устройство отдаёт 200 с `action="no_subscription"`, чтобы человек видел человеческий текст, а не ошибку |
-| 409 | Trial уже активирован / слишком много активных subs на плане |
-| 400 | Legacy плана через `/activate` / freeze нельзя / plan без daily_rate / `Already on this plan` на `/subscriptions/activate` |
+| 409 | Trial уже активирован / бесплатные дни уже использованы / подписку для триала собрать не удалось / слишком много активных subs на плане |
+| 400 | Legacy плана через `/activate` / freeze нельзя (в т.ч. «Заморозка станет доступна после первой оплаты») / plan без daily_rate / `Already on this plan` на `/subscriptions/activate` |
 | 503 | Нет trial-плана / провайдер не настроен / `/migrate_node` не нашёл альтернативную ноду в пуле тарифа |
 | 502 | Провайдер вернул ошибку при `create_invoice` |
 
