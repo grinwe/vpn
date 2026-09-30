@@ -1681,6 +1681,9 @@ class ReferralCodeOut(BaseModel):
     uses: int
     bonus_days: int
     reward_days: int
+    # Сколько бесплатных дней получит друг по этой ссылке: триал + подарок
+    # (3 + 3). Бот пишет в /referral ровно эту цифру.
+    invitee_total_days: int
 
 
 @ext_router.post("/referral/code", response_model=ReferralCodeOut)
@@ -1690,6 +1693,8 @@ def get_or_create_referral(
     admin_token: str | None = Depends(optional_admin),
 ):
     """Get existing referral code or create a new one for the user."""
+    from .services import trial as trial_svc
+
     user = db.query(models.User).filter_by(telegram_id=body.telegram_id).first()
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
@@ -1700,6 +1705,7 @@ def get_or_create_referral(
     return ReferralCodeOut(
         code=ref.code, uses=ref.uses,
         bonus_days=ref.bonus_days, reward_days=ref.reward_days,
+        invitee_total_days=trial_svc.invitee_total_days(ref),
     )
 
 
@@ -1755,9 +1761,9 @@ def register_user(
     # attaches the referral when the field is still NULL — this means a
     # user who accidentally /start'ed before ever getting a ref link can
     # still be attributed the next time they click one. The actual
-    # referee-side bonus is handed out on /trial/activate, and the
-    # referrer-side bonus lands on the first confirmed kind=topup (see
-    # _mark_invoice_paid_core in api.py).
+    # referee-side bonus is handed out on trial activation, and the
+    # referrer-side reward lands on the invitee's FIRST payment of any
+    # kind (_maybe_pay_referrer in api/invoices.py).
     if body.referral_code and not user.referred_by_id:
         ref = (
             db.query(models.ReferralCode)
@@ -1784,6 +1790,13 @@ def register_user(
                 user.source = cleaned
                 db.flush()
 
+    # Бесплатные дни для текстов бота (приветствие, кнопка, /plans). Считаем
+    # после привязки реферала выше: пришедший по ссылке сразу видит 3 + 3.
+    # Та же функция, что у самой активации, поэтому цифра совпадёт с выданной.
+    from .services import trial as trial_svc
+
+    trial_days, trial_referral_days = trial_svc.trial_days_for(db, user)
+
     db.commit()
     return {
         "id": user.id,
@@ -1792,11 +1805,13 @@ def register_user(
         # Always false under the trial-flow model — retained for
         # backward compat with older bot builds that still read it.
         "referral_bonus_credited": False,
-        # Bot reads this to decide whether to include the "first month
-        # on us" line in the welcome copy. True iff the user hasn't
-        # activated their trial yet — works retroactively for users
-        # who registered before this column existed.
+        # Бот по нему решает, показывать ли строку про бесплатные дни в
+        # приветствии. True, пока юзер не активировал триал (ретроактивно и
+        # для тех, кто зарегистрировался до появления колонки).
         "trial_available": user.trial_activated_at is None,
+        # Сколько бесплатных дней обещать: всем и сверху по приглашению.
+        "trial_days": trial_days,
+        "trial_referral_days": trial_referral_days,
         # Онбординг-роадмап E3.3: бот прячет кнопку «🆘 VPN не работает» у
         # тех, кому нечего чинить. Раньше она висела у всех с первого экрана
         # и вела в тупик «У тебя нет активной подписки. Оформить — /buy»

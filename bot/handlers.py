@@ -1476,11 +1476,13 @@ async def cmd_renew(message: types.Message):
         await message.answer("Бэкенд недоступен. Попробуйте позже.")
         return
 
-    # Find active or recently expired subscriptions
-    renewable = [
-        sub for sub in data
-        if sub.get("status") in ("active", "expired")
-    ]
+    # Find active or recently expired subscriptions. Бэкенд отдаёт список без
+    # ORDER BY: при старой истёкшей платной подписке и истёкшем триале
+    # продлевалась бы случайная. Сначала active, затем самая свежая по id.
+    renewable = sorted(
+        (sub for sub in data if sub.get("status") in ("active", "expired")),
+        key=lambda sub: (sub.get("status") != "active", -(sub.get("id") or 0)),
+    )
     if not renewable:
         await message.answer("Нет подписок для продления. Используй /plans для новой покупки.")
         return

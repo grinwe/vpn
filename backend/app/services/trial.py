@@ -76,6 +76,10 @@ class TrialFullResult:
     charged_kopecks: int
     # True — бонус зачислен этим же вызовом; False — доделали выданный раньше.
     fresh: bool
+    # Суммы записей trial:{uid} и referral_signup:{uid}, из которых собрана
+    # подписка (кабинет отдаёт их в прежних полях ответа).
+    trial_amount_kopecks: int = 0
+    referral_bonus_kopecks: int = 0
 
 
 def _trial_plan(db: Session) -> models.Plan | None:
@@ -107,6 +111,13 @@ def trial_amount_kopecks(db: Session) -> int:
     return balance_svc.days_to_kopecks(db, balance_svc.TRIAL_DURATION_DAYS)
 
 
+def code_bonus_days(ref_code: models.ReferralCode | None) -> int:
+    """Дни подарка по коду: ``bonus_days`` кода, иначе общий дефолт."""
+    if ref_code and ref_code.bonus_days:
+        return int(ref_code.bonus_days)
+    return balance_svc.REFERRAL_INVITEE_DAYS
+
+
 def invitee_bonus_days(db: Session, user: models.User) -> int:
     """Дни подарка приглашённому: из кода реферера, иначе общий дефолт.
 
@@ -120,9 +131,15 @@ def invitee_bonus_days(db: Session, user: models.User) -> int:
         .order_by(models.ReferralCode.id.desc())
         .first()
     )
-    if ref_code and ref_code.bonus_days:
-        return int(ref_code.bonus_days)
-    return balance_svc.REFERRAL_INVITEE_DAYS
+    return code_bonus_days(ref_code)
+
+
+def invitee_total_days(ref_code: models.ReferralCode | None) -> int:
+    """Сколько бесплатных дней получит друг по этому коду: 3 + подарок.
+
+    Для текстов реферальной ссылки (бот ``/referral``, кабинет).
+    """
+    return balance_svc.TRIAL_DURATION_DAYS + code_bonus_days(ref_code)
 
 
 def trial_days_for(db: Session, user: models.User) -> tuple[int, int]:
@@ -315,7 +332,9 @@ def activate_trial_full(
     if activation is not None:
         trial_days = activation.trial_days
         referral_days = activation.referral_days
-        charge = activation.trial_amount_kopecks + activation.referral_bonus_kopecks
+        bonus = activation.trial_amount_kopecks
+        gift = activation.referral_bonus_kopecks
+        charge = bonus + gift
     else:
         had_subscription = (
             db.query(models.Subscription.id)
@@ -388,4 +407,6 @@ def activate_trial_full(
         hidden_hours=None if historical else balance_svc.TRIAL_HIDDEN_HOURS,
         charged_kopecks=charged,
         fresh=fresh,
+        trial_amount_kopecks=bonus,
+        referral_bonus_kopecks=gift,
     )

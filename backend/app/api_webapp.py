@@ -258,14 +258,20 @@ class BalanceInfo(BaseModel):
     # change in the Plan table auto-propagates without a deploy.
     trial_available: bool
     trial_amount_kopecks: int
-    # Можно ли ПОТРАТИТЬ триальный бонус на автоматическую активацию плана
-    # сразу после claim'а. False, если у юзера уже есть живая (active/frozen)
-    # подписка: ``/subscriptions/activate`` — это НЕ «докупить», а «сменить
-    # тариф» в single-sub модели (отзывает все живые подписки + ревокает
-    # девайсы + проратный возврат), поэтому авто-активация из триал-баннера
-    # снесла бы действующую подписку без подтверждения (аудит 2026-07-25).
-    # Бонус на баланс при этом зачисляется всегда — он пойдёт на продление.
-    trial_autoactivate_allowed: bool
+    # Устаревший флаг второго шага «купить план на бонус» из браузера.
+    # Теперь ``/trial/activate`` сам выдаёт подписку на бесплатные дни, и
+    # флаг ВСЕГДА False: старый закэшированный бандл, увидев его, не пойдёт
+    # в ``/subscriptions/activate`` (это смена тарифа, он отозвал бы только
+    # что выданную подписку или ответил бы «Already on plan»), а просто
+    # обновит ``/me``. Поле держим в схеме ради таких бандлов.
+    trial_autoactivate_allowed: bool = False
+    # Бесплатные дни для баннера: всем (3) и сверху по приглашению (0 или 3).
+    trial_days: int = 0
+    trial_referral_days: int = 0
+    # Живая подписка уже есть: тап по баннеру даст только деньги на баланс
+    # (пойдут на продление), подписку не выдаст. Кабинет показывает честный
+    # баннер «Подарок: N ₽ на баланс» вместо «Забери N дней бесплатно».
+    trial_bonus_only: bool = False
 
 
 class DeviceSummary(BaseModel):
@@ -503,11 +509,11 @@ def webapp_me(
     from .services import trial as trial_svc
     trial_available = user.trial_activated_at is None
     trial_amount = trial_svc.trial_amount_kopecks(db) if trial_available else 0
-    # Живая подписка блокирует ТОЛЬКО авто-активацию плана из триал-баннера,
-    # не сам claim бонуса (см. BalanceInfo.trial_autoactivate_allowed).
-    # ``subs`` выше уже отфильтрован от blocked/expired, но статус проверяем
-    # явно: список — это то, что видит кабинет, а нам нужен именно факт
-    # «есть подписка, которую activate снесёт».
+    trial_days, trial_referral_days = trial_svc.trial_days_for(db, user)
+    # Живая подписка: тап по баннеру даст только бонус на баланс (см.
+    # webapp_activate_trial). ``subs`` выше уже отфильтрован от
+    # blocked/expired, но статус проверяем явно: нужен именно факт «есть
+    # active/frozen подписка», как в самой активации.
     has_live_sub = any(s.status in ("active", "frozen") for s in subs)
 
     balance = BalanceInfo(
@@ -517,7 +523,10 @@ def webapp_me(
         has_active_balance_sub=any(e.plan_price_kopecks > 0 for e in extras),
         trial_available=trial_available,
         trial_amount_kopecks=trial_amount,
-        trial_autoactivate_allowed=trial_available and not has_live_sub,
+        trial_autoactivate_allowed=False,
+        trial_days=trial_days,
+        trial_referral_days=trial_referral_days,
+        trial_bonus_only=trial_available and has_live_sub,
     )
     user_out = schemas.UserOut(
         id=user.id,
@@ -905,7 +914,36 @@ class TrialActivateWebAppResponse(BaseModel):
     trial_amount_kopecks: int
     referral_bonus_kopecks: int
     balance_kopecks: int
-    trial_expires_at: str
+    # Конец бесплатных дней. None у бонус-онли (живая подписка, таймера нет)
+    # и на историческом пути (старый бонус 150 ₽ потрачен на месяц).
+    trial_expires_at: str | None = None
+    # Выданная подписка. Всё None, если у юзера уже была живая подписка и
+    # тап дал только бонус на баланс: кабинет тогда просто обновляет /me.
+    subscription_id: int | None = None
+    sub_token: str | None = None
+    # Готовый URL (домен как у бота) — экран «Готово» показывает ровно его.
+    sub_url: str | None = None
+    expires_at: datetime | None = None
+    # Бесплатные дни (3) и дни по приглашению (0 или 3). None на
+    # историческом пути.
+    trial_days: int | None = None
+    referral_days: int | None = None
+
+
+def _issued_sub_link(sub: models.Subscription) -> tuple[str | None, str | None]:
+    """``(sub_token, sub_url)`` только что выданной подписки для ответа ЛК.
+
+    Отдаём per-device токен основного устройства, чтобы QR/ссылка вели на
+    его конфиги, а не на всю подписку. link_token — то же, что покажут бот и
+    карточка кабинета (sub_links); fallback на первое устройство/токен
+    подписки — на всякий случай. Общий для покупки плана и бесплатных дней.
+    """
+    primary_device = next((d for d in sub.devices if d.sub_token), None)
+    token = sub.link_token or (
+        primary_device.sub_token if primary_device else sub.sub_token
+    )
+    url = sub_links.sub_url_for(token) if sub.link_token and token else None
+    return token, url
 
 
 @webapp_router.post("/trial/activate", response_model=TrialActivateWebAppResponse)
@@ -915,42 +953,140 @@ def webapp_activate_trial(
     user: models.User = Depends(require_webapp_user),
     db: Session = Depends(get_db),
 ):
-    """Grant the one-time trial bonus to the authenticated WebApp user.
+    """Бесплатные дни из кабинета: бонус и сразу подписка на них.
 
-    Thin wrapper around :func:`services.trial.activate_trial` — the
-    admin-token entrypoint in ``api_extensions.py`` shares the same
-    service function, so WebApp and bot paths can't drift. Returns
-    409 on a repeat tap so the UI knows to hide the banner.
+    Нет живой подписки — :func:`services.trial.activate_trial_full`, тот же
+    сервис, что у бота (``/api/trial/activate_full``), поэтому пути не
+    разъедутся: подписка на N дней, ссылка прямо в ответе. Раньше кабинет
+    делал второй шаг «купить план на бонус» из браузера.
+
+    Живая подписка есть — только бонус на баланс (``set_expiry=False``):
+    деньги пойдут на продление, таймера триала нет, поэтому ни ложного
+    «бесплатные дни скоро закончатся», ни возврата бонуса.
+
+    Коды: 409 — триал уже забран или уже использован, либо появилась живая
+    подписка; 503 — нет плана для триала или холодный путь перегружен
+    (``Retry-After``); 402 — не хватило баланса (исторический путь).
     """
     from .services import trial as trial_svc
+    from .services.provisioning_throttle import ColdPathThrottled
+
+    user_id = user.id
 
     # Онбординг-телеметрия (роадмап E0.2): фиксируем ИСХОД, а не только успех.
     # Без этого «тапнул, но ничего не получил» неотличимо от «не тапал»: до
     # 2026-07-25 провал активации в webapp уходил в console.warn и нигде не
     # оседал, хотя это ровно то место, где юзер уходит навсегда.
+    def _reject(reason: str, status_code: int, detail: str, headers=None):
+        # Сначала rollback, потом аудит: _audit коммитит, а отказы live /
+        # throttled / provision_failed случаются уже после flush бонуса и
+        # trial_activated_at. Без rollback аудит закоммитил бы бонус.
+        db.rollback()
+        _audit(db, f"user:{user_id}", "trial_activate_rejected", "user", user_id,
+               metadata={"reason": reason, "source": "webapp"},
+               actor_type=models.AuditActor.user)
+        return HTTPException(status_code=status_code, detail=detail, headers=headers)
+
+    # Гонка двойного тапа: блокируем строку юзера до выбора ветки.
+    db.refresh(user, with_for_update=True)
+    has_live_sub = (
+        db.query(models.Subscription.id)
+        .filter(
+            models.Subscription.user_id == user_id,
+            models.Subscription.status.in_(
+                [
+                    models.SubscriptionStatus.active,
+                    models.SubscriptionStatus.frozen,
+                ]
+            ),
+        )
+        .first()
+        is not None
+    )
+
+    if has_live_sub:
+        try:
+            bonus = trial_svc.activate_trial(db, user_id, set_expiry=False)
+        except trial_svc.TrialAlreadyActivated:
+            raise _reject("already_activated", 409, "Trial already activated")
+        except trial_svc.NoTrialPlan:
+            # Не ошибка юзера: в БД нет видимого 30-дневного плана, т.е.
+            # оффер физически невыполним, а баннер при этом мог показываться.
+            raise _reject("no_trial_plan", 503, "No trial plan configured")
+        _audit(db, f"user:{user_id}", "trial_activated", "user", user_id,
+               metadata={
+                   "amount_kopecks": bonus.trial_amount_kopecks,
+                   "trial_days": bonus.trial_days,
+                   "referral_days": bonus.referral_days,
+                   "full": False,
+               },
+               actor_type=models.AuditActor.user, commit=False)
+        db.commit()
+        return TrialActivateWebAppResponse(
+            trial_amount_kopecks=bonus.trial_amount_kopecks,
+            referral_bonus_kopecks=bonus.referral_bonus_kopecks,
+            balance_kopecks=bonus.balance_kopecks,
+            trial_expires_at=None,
+            trial_days=bonus.trial_days,
+            referral_days=bonus.referral_days,
+        )
+
     try:
-        result = trial_svc.activate_trial(db, user.id)
-    except trial_svc.TrialAlreadyActivated:
-        _audit(db, f"user:{user.id}", "trial_activate_rejected", "user", user.id,
-               metadata={"reason": "already_activated"},
-               actor_type=models.AuditActor.user)
-        raise HTTPException(status_code=409, detail="Trial already activated")
+        result = trial_svc.activate_trial_full(db, user, source="webapp")
+    except trial_svc.TrialLiveSubscription:
+        raise _reject("live", 409, "User already has a live subscription")
+    except trial_svc.TrialAlreadyUsed:
+        raise _reject("already_used", 409, "Trial already used")
     except trial_svc.NoTrialPlan:
-        # Не ошибка юзера: в БД нет видимого 30-дневного плана, т.е. оффер
-        # физически невыполним, а баннер при этом мог показываться.
-        _audit(db, f"user:{user.id}", "trial_activate_rejected", "user", user.id,
-               metadata={"reason": "no_trial_plan"},
-               actor_type=models.AuditActor.user)
-        raise HTTPException(status_code=503, detail="No trial plan configured")
-    _audit(db, f"user:{user.id}", "trial_activated", "user", user.id,
-           metadata={"amount_kopecks": result.trial_amount_kopecks},
+        raise _reject("no_trial_plan", 503, "No trial plan configured")
+    except ColdPathThrottled as exc:
+        # Наплыв триальщиков мимо warm-пула: честный 503 с Retry-After,
+        # кабинет скажет «попробуй через пару минут».
+        raise _reject(
+            "throttled", 503, "provisioning is busy, retry later",
+            headers={"Retry-After": str(exc.retry_after_seconds)},
+        )
+    except RuntimeError as exc:
+        raise _reject("provision_failed", 409, str(exc))
+    except ValueError as exc:
+        raise _reject("insufficient", 402, str(exc))
+
+    sub = result.sub
+    _audit(db, f"user:{user_id}", "trial_activated", "user", user_id,
+           metadata={
+               "amount_kopecks": result.trial_amount_kopecks,
+               "trial_days": result.trial_days,
+               "referral_days": result.referral_days,
+               "full": True,
+               "subscription_id": sub.id,
+               "plan_id": result.plan.id,
+               "hidden_hours": result.hidden_hours,
+               "charged_kopecks": result.charged_kopecks,
+           },
            actor_type=models.AuditActor.user, commit=False)
     db.commit()
+    db.refresh(user)
+    db.refresh(sub)
+
+    token, url = _issued_sub_link(sub)
+    # На историческом пути таймер триала не трогается (там старая дата или
+    # NULL), поэтому отдаём его только для бесплатных дней.
+    trial_expires = (
+        user.trial_expires_at
+        if result.trial_days is not None and user.trial_expires_at
+        else None
+    )
     return TrialActivateWebAppResponse(
         trial_amount_kopecks=result.trial_amount_kopecks,
         referral_bonus_kopecks=result.referral_bonus_kopecks,
-        balance_kopecks=result.balance_kopecks,
-        trial_expires_at=result.trial_expires_at.isoformat(),
+        balance_kopecks=user.balance_kopecks or 0,
+        trial_expires_at=trial_expires.isoformat() if trial_expires else None,
+        subscription_id=sub.id,
+        sub_token=token,
+        sub_url=url,
+        expires_at=sub.expires_at,
+        trial_days=result.trial_days,
+        referral_days=result.referral_days,
     )
 
 
@@ -1199,22 +1335,12 @@ def webapp_activate(
     db.refresh(user)
     db.refresh(sub)
 
-    # Return the primary device's per-device sub_token so the QR/link
-    # exposes only that device's credentials (not the entire subscription).
-    # link_token — то же, что покажут бот и карточка кабинета (sub_links);
-    # fallback на первое устройство/токен подписки — на всякий случай.
-    primary_device = next(
-        (d for d in sub.devices if d.sub_token),
-        None,
-    )
-    token = sub.link_token or (
-        primary_device.sub_token if primary_device else sub.sub_token
-    )
+    token, url = _issued_sub_link(sub)
 
     return ActivateResponse(
         subscription_id=sub.id,
         sub_token=token,
-        sub_url=sub_links.sub_url_for(token) if sub.link_token and token else None,
+        sub_url=url,
         expires_at=sub.expires_at,
         balance_kopecks=user.balance_kopecks or 0,
         plan_price_kopecks=plan_price,
@@ -1880,8 +2006,12 @@ class ReferralInfoResponse(BaseModel):
     code: str | None
     bonus_kopecks: int
     invited_count: int
+    # Только награды за приглашённых (referral_payout:*), без своего
+    # триал-бонуса и подарка по чужой ссылке.
     earned_kopecks: int
     share_url: str | None
+    # Сколько бесплатных дней получит друг по этой ссылке (3 + 3).
+    invitee_total_days: int = 0
 
 
 @webapp_router.get("/referral", response_model=ReferralInfoResponse)
@@ -1894,6 +2024,7 @@ def webapp_referral(
     import secrets
 
     from .services import balance as balance_svc
+    from .services import trial as trial_svc
 
     code_row = (
         db.query(models.ReferralCode)
@@ -1923,11 +2054,14 @@ def webapp_referral(
         .filter(models.User.referred_by_id == user.id)
         .count()
     )
+    # Раньше считали все kind=bonus, и туда попадал собственный триал-бонус:
+    # триальщик видел «заработано 150 ₽», никого не пригласив.
     earned = (
         db.query(models.BalanceTransaction)
         .filter(
             models.BalanceTransaction.user_id == user.id,
             models.BalanceTransaction.kind == models.BalanceTxKind.bonus,
+            models.BalanceTransaction.reference.like("referral_payout:%"),
         )
         .with_entities(models.BalanceTransaction.amount_kopecks)
         .all()
@@ -1947,6 +2081,7 @@ def webapp_referral(
         invited_count=invited,
         earned_kopecks=earned_total,
         share_url=share_url,
+        invitee_total_days=trial_svc.invitee_total_days(code_row),
     )
 
 

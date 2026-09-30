@@ -11,7 +11,7 @@ from app import worker
 from app.api_webapp import issue_token
 from app.config import get_settings
 
-from .factories import make_node, make_plan, make_subscription, make_user
+from .factories import make_config, make_node, make_plan, make_subscription, make_user
 
 
 def _auth_headers(user_id: int) -> dict:
@@ -40,18 +40,22 @@ def test_trial_autoactivate_blocked_when_user_has_live_sub(client, db_session):
     assert balance["trial_available"] is True
     # А вот тратить его на «активировать план» автоматом — нет.
     assert balance["trial_autoactivate_allowed"] is False
+    # Баннер честно говорит, что тап даст только деньги (план триала 3 дня, В3).
+    assert balance["trial_bonus_only"] is True
 
 
-def test_trial_autoactivate_allowed_for_user_without_sub(client, db_session):
-    """Обратная сторона #1: у нового юзера (ровно та воронка, ради которой
-    авто-активацию и вводили) поведение прежнее — бонус сразу тратится."""
+def test_trial_autoactivate_always_false_for_user_without_sub(client, db_session):
+    """Обратная сторона #1. С триала 3 дня подписку на бесплатные дни выдаёт
+    сам ``/trial/activate`` на сервере, второго шага из браузера нет, и флаг
+    всегда False: старый закэшированный бандл не пойдёт в смену тарифа."""
     user = make_user(db_session, telegram_id="tg-trial-fresh")
 
     res = client.get("/api/webapp/me", headers=_auth_headers(user.id))
     assert res.status_code == 200, res.text
     balance = res.json()["balance"]
     assert balance["trial_available"] is True
-    assert balance["trial_autoactivate_allowed"] is True
+    assert balance["trial_autoactivate_allowed"] is False
+    assert balance["trial_bonus_only"] is False
 
 
 def test_trial_autoactivate_false_after_trial_claimed(client, db_session):
@@ -329,6 +333,9 @@ def test_trial_activation_outcome_is_audited(client, db_session):
 
     user = make_user(db_session, telegram_id="tg-trial-audit")
     make_plan(db_session, name="trial-plan-audit")
+    # Кабинет теперь сразу выдаёт подписку на бесплатные дни: нужна нода.
+    node = make_node(db_session, name="node-trial-audit")
+    make_config(db_session, node)
 
     res = client.post("/api/webapp/trial/activate", headers=_auth_headers(user.id))
     assert res.status_code in (200, 503), res.text

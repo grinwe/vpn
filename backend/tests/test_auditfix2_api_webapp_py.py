@@ -22,6 +22,8 @@ from app.services import balance, provisioning_throttle
 from app.services.payments.base import ProviderInvoice
 
 from .factories import (
+    make_config,
+    make_node,
     make_plan,
     make_subscription_with_device,
     make_user,
@@ -185,6 +187,9 @@ def test_trial_activate_no_plan_503(client, db_session):
 def test_trial_activate_once_then_repeat_409(client, db_session):
     """Первый запрос активирует триал, повторный → 409."""
     make_plan(db_session, name="trial-plan")  # видимый 30-дневный план
+    # Кабинет сразу выдаёт подписку на бесплатные дни: нужна нода с конфигом.
+    node = make_node(db_session, name="node-trial-ok")
+    make_config(db_session, node)
     user = make_user(db_session, telegram_id="tg-trial-ok")
     db_session.commit()
 
@@ -193,6 +198,7 @@ def test_trial_activate_once_then_repeat_409(client, db_session):
     )
     assert res1.status_code == 200, res1.text
     assert res1.json()["trial_amount_kopecks"] > 0
+    assert res1.json()["subscription_id"] is not None
 
     db_session.expire_all()
     assert db_session.get(models.User, user.id).trial_activated_at is not None
