@@ -1284,23 +1284,37 @@ def test_health_ping_bad_sends_no_admin_push(client, db_session, ladder, monkeyp
     assert _complaints(db_session, user.id) == 1
 
 
-def test_watcher_inconclusive_sends_one_repair_failed_alert(
-    client, db_session, ladder, monkeypatch
-):
-    from app.services import operator_reports
-
-    monkeypatch.setenv("ADMIN_TELEGRAM_IDS", "111")
-    user, sub, _device, _nodes = ladder("hp-inconcl")
+def _bad_ping(client, user, sub):
     r = client.post(
         "/api/users/health-ping-response",
         json={"telegram_id": user.telegram_id, "subscription_id": sub.id, "answer": "bad"},
     )
-    report = db_session.get(models.OperatorNodeReport, r.json()["report_id"])
-    report.reported_at = utcnow() - timedelta(minutes=30)  # окно watcher-а прошло
+    assert r.status_code == 200, r.text
+    return r.json()
+
+
+def test_inconclusive_alerts_only_after_delayed_recheck(
+    client, db_session, ladder, monkeypatch
+):
+    """Watcher решает на 10-15-й минуте — пушить по первому inconclusive рано
+    (у 1000078 переподключение увидели на 14-й). Пуш только после
+    перепроверки через REPAIR_ALERT_DELAY_MIN, и один на репорт."""
+    from app.services import operator_reports, repair_alerts
+
+    monkeypatch.setenv("ADMIN_TELEGRAM_IDS", "111")
+    user, sub, _device, _nodes = ladder("hp-inconcl")
+    report = db_session.get(models.OperatorNodeReport, _bad_ping(client, user, sub)["report_id"])
+    report.reported_at = utcnow() - timedelta(minutes=20)
     db_session.commit()
 
-    res = operator_reports.resolve_pending_reports(db_session)
-    assert res["resolved_inconclusive"] == 1
+    assert operator_reports.resolve_pending_reports(db_session)["resolved_inconclusive"] == 1
+    assert _alerts(db_session, "admin_alert_repair_failed") == []  # на 20-й минуте — рано
+    assert repair_alerts.alert_stale_inconclusive(db_session)["alerted"] == 0
+
+    report = db_session.get(models.OperatorNodeReport, report.id)
+    report.reported_at = utcnow() - timedelta(minutes=90)
+    db_session.commit()
+    assert repair_alerts.alert_stale_inconclusive(db_session)["alerted"] == 1
     rows = _alerts(db_session, "admin_alert_repair_failed")
     assert len(rows) == 1
     assert rows[0].extra["report_id"] == report.id
@@ -1309,12 +1323,78 @@ def test_watcher_inconclusive_sends_one_repair_failed_alert(
     assert "Починка не помогла" in text and "перетасовали протоколы" in text
     assert f"tg={user.telegram_id}" in text
 
-    # «Всё ещё не работает» по тому же репорту — та же история, второго пуша нет.
+    # Повторный проход и «всё ещё не работает» по тому же репорту — без второго пуша.
+    assert repair_alerts.alert_stale_inconclusive(db_session)["alerted"] == 0
     r2 = client.post(
         "/api/admin/client-control/report-still-broken", json={"report_id": report.id}
     )
     assert r2.status_code == 200
     assert len(_alerts(db_session, "admin_alert_repair_failed")) == 1
+
+
+def test_late_reconnect_suppresses_inconclusive_alert(
+    client, db_session, ladder, monkeypatch
+):
+    from app.services import operator_reports, repair_alerts
+
+    monkeypatch.setenv("ADMIN_TELEGRAM_IDS", "111")
+    user, sub, _device, _nodes = ladder("hp-late")
+    report = db_session.get(models.OperatorNodeReport, _bad_ping(client, user, sub)["report_id"])
+    report.outcome = "inconclusive"
+    report.reported_at = utcnow() - timedelta(minutes=90)
+    db_session.commit()
+    monkeypatch.setattr(operator_reports, "report_reconnected", lambda db, r: True)
+    res = repair_alerts.alert_stale_inconclusive(db_session)
+    assert res["alerted"] == 0 and res["reconnected_late"] == 1
+    assert _alerts(db_session, "admin_alert_repair_failed") == []
+
+
+def test_whole_sub_reconnect_counts_any_device(db_session, ladder):
+    """Перенос всей подписки: репорт хранит первое устройство, а подключиться
+    мог второй — это успех, не «не помогло»."""
+    from app.services import repair_alerts
+
+    user, sub, device, nodes = ladder("hp-wholesub")
+    node = nodes[0]
+    other = make_device(db_session, sub, _cfg(db_session, node), access_username="ws-other")
+    db_session.add(models.Credential(
+        node_id=node.id, device_id=other.id, subscription_id=sub.id,
+        access_username="ws-other", is_active=True, proto="vless-reality",
+        config_text="enc", pool_state=models.CredentialPoolState.assigned,
+    ))
+    report = models.OperatorNodeReport(
+        user_id=user.id, subscription_id=sub.id, device_id=device.id,
+        target_node_id=node.id, target_access_username="nobody-here",
+        outcome="inconclusive", reported_at=utcnow() - timedelta(minutes=90),
+    )
+    db_session.add(report)
+    db_session.add(models.NodeTrafficSample(
+        node_id=node.id, observed_at=utcnow(),
+        details={"vless-reality": {"users": ["ws-other"]}},
+    ))
+    db_session.commit()
+    assert repair_alerts._subscription_reconnected(db_session, report) is True
+
+
+def test_reports_without_self_repair_source_do_not_page(db_session, ladder, monkeypatch):
+    """Кнопка «симулировать сигнал» в админке и автоотчёты клиента source не пишут."""
+    from app.services import repair_alerts
+
+    monkeypatch.setenv("ADMIN_TELEGRAM_IDS", "111")
+    user, sub, device, _nodes = ladder("hp-admin-sim")
+    report = models.OperatorNodeReport(
+        user_id=user.id, subscription_id=sub.id, device_id=device.id,
+        outcome="inconclusive", reported_at=utcnow() - timedelta(minutes=90),
+    )
+    db_session.add(report)
+    db_session.commit()
+    db_session.add(models.AuditLog(
+        actor="admin_panel", action="client_reported_failure", target_type="subscription",
+        target_id=sub.id, extra={"report_id": report.id, "kind": "user_reported", "scope": "subscription"},
+    ))
+    db_session.commit()
+    assert repair_alerts.alert_stale_inconclusive(db_session)["alerted"] == 0
+    assert _alerts(db_session, "admin_alert_repair_failed") == []
 
 
 def test_watcher_ok_sends_nothing(client, db_session, ladder, monkeypatch):

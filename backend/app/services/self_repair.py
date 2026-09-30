@@ -808,7 +808,16 @@ def _repair_subscription_locked(
     if res.action == "subscription_inactive":
         return RepairOutcome(action="no_subscription", scope="subscription", deduped=deduped)
     # no_target_available / error / deferred — целевой ноды сейчас нет.
+    # Откат перед алертом: после ошибки внутри переноса сессия может быть в
+    # failed-состоянии, и алерт молча потерялся бы (ревью 30.09). Жалоба уже
+    # закоммичена выше (record_complaint commit=True).
+    db.rollback()
     from .repair_alerts import alert_repair_no_target
 
-    alert_repair_no_target(db, user, sub, source=source)
+    detail = (
+        "Целевой ноды для переноса нет (пул пуст или все исключены)"
+        if res.action == "no_target_available"
+        else f"Перенос подписки не удался ({res.action}) — смотреть логи backend"
+    )
+    alert_repair_no_target(db, user, sub, source=source, detail=detail)
     return RepairOutcome(action="no_target", scope="subscription", deduped=deduped)

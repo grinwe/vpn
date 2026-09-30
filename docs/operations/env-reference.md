@@ -321,3 +321,5 @@ Handler `recreate app stack` в `deploy_app_stack` делает это авто�
 - **Нет env для включения/выключения individual-провайдера.** Включение CryptoBot — только `PAYMENT_PROVIDER=cryptobot` или наличие в `PAYMENT_PROVIDERS` списке. Нет способа «оставить rotation, но временно выключить конкретно SBP» без редактирования списка.
 - **`SBP_<SLUG>_*` не валидируются на старте backend'а.** Если `PAYMENT_PROVIDERS=sbp:foo,cryptobot`, но нет `SBP_FOO_HMAC_SECRET` — ошибка всплывёт только в момент первого `/checkout` c этим провайдером. Pre-flight check для SBP не зафиксирован.
 - **`BOT_USERNAME` может быть пустым** — рефералки покажут бесшовный код вместо share-link. Warning'а backend не эмитит.
+
+| `REPAIR_ALERT_DELAY_MIN` | `60` | worker-scheduler | Через сколько минут после жалобы «VPN не работает» перепроверять `inconclusive`-репорт и слать `admin_alert_repair_failed`, если переподключения так и нет (`services/repair_alerts.py`). В compose не проброшен — работает дефолт. |

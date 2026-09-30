@@ -1251,7 +1251,17 @@ def run_operator_report_watch_tick() -> dict:
 
     session = SessionLocal()
     try:
-        return resolve_pending_reports(session)
+        result = resolve_pending_reports(session)
+        # Пуш «починка не помогла» по inconclusive — только после отложенной
+        # перепроверки (services/repair_alerts). Сбой не должен ронять watcher.
+        try:
+            from .services.repair_alerts import alert_stale_inconclusive
+
+            result["repair_alerts"] = alert_stale_inconclusive(session)
+        except Exception:  # noqa: BLE001
+            session.rollback()
+            logger.exception("operator_report_watch: repair alerts pass failed")
+        return result
     finally:
         session.close()
 

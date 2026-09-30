@@ -231,11 +231,9 @@ def resolve_pending_reports(db: Session) -> dict:
                 ok += 1
             else:
                 inconclusive += 1
-                # Починка не помогла (или человек так и не подключился) —
-                # единственный пуш админу по этой жалобе (services/repair_alerts).
-                from .repair_alerts import alert_repair_not_fixed
-
-                alert_repair_not_fixed(db, report, reason="inconclusive")
+                # Пуш админу — НЕ здесь: на 10-15-й минуте переподключение ещё
+                # не видно (трафик раз в 5 мин). Отложенная перепроверка —
+                # repair_alerts.alert_stale_inconclusive из того же тика.
 
     if pending:
         db.commit()
