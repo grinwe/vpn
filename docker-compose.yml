@@ -166,6 +166,12 @@ services:
       # скачивания конфига; 0 = сразу. Только backend: очередь бота
       # (/api/notifications/pending) отдаёт он, worker её не читает.
       REFERRAL_INVITE_DELAY_H: ${REFERRAL_INVITE_DELAY_H:-24}
+      # Бесплатные дни триала (бонус = столько дней Solo, сразу тратится на
+      # подписку) и скрытый запас сверх них в часах, за который не списываем
+      # (0 выключает). Читает только backend: триал выдают бот и кабинет
+      # через API. Без строк здесь правка .env молча не доедет.
+      TRIAL_DURATION_DAYS: ${TRIAL_DURATION_DAYS:-3}
+      TRIAL_HIDDEN_HOURS: ${TRIAL_HIDDEN_HOURS:-24}
       MIN_TOPUP_KOPECKS: ${MIN_TOPUP_KOPECKS:-10000}
       EXTRA_DEVICE_KOPECKS_PER_MONTH: ${EXTRA_DEVICE_KOPECKS_PER_MONTH:-10000}
       # Stage 8 — public base URL for the dynamic sub link. When set,
@@ -339,6 +345,10 @@ services:
       BALANCE_CHARGE_INTERVAL: ${BALANCE_CHARGE_INTERVAL:-3600}
       FREEZE_DAYS: ${FREEZE_DAYS:-7}
       REFERRAL_BONUS_KOPECKS: ${REFERRAL_BONUS_KOPECKS:-5000}
+      # За сколько дней до конца бесплатных дней воркер шлёт «⏳ Бесплатные
+      # дни скоро закончатся» (проход 3a тика списаний). Тики крутит
+      # worker-scheduler, он наследует это окружение через якорь.
+      TRIAL_EXPIRY_WARN_DAYS: ${TRIAL_EXPIRY_WARN_DAYS:-3}
       MIN_TOPUP_KOPECKS: ${MIN_TOPUP_KOPECKS:-10000}
       EXTRA_DEVICE_KOPECKS_PER_MONTH: ${EXTRA_DEVICE_KOPECKS_PER_MONTH:-10000}
       # Stage 8 — same SUB_LINK_BASE_URL the backend reads, propagated to
