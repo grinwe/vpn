@@ -438,12 +438,13 @@ async def _fetch_user_flags(telegram_id: int) -> UserFlags:
             headers=_admin_headers(telegram_id),
             timeout=aiohttp.ClientTimeout(total=_REGISTER_TIMEOUT_S),
         )
-        if data:
+        if _status == 200 and isinstance(data, dict):
             days, ref_days = _trial_days_from(data)
+            has_sub = bool(data.get("has_subscription"))
             return UserFlags(
-                bool(data.get("trial_available")),
+                bool(data.get("trial_available")) and not has_sub,
                 bool(data.get("has_devices")),
-                bool(data.get("has_subscription")),
+                has_sub,
                 days,
                 ref_days,
             )
@@ -619,11 +620,16 @@ async def cmd_start(message: types.Message, state: FSMContext):
             headers=_admin_headers(message.from_user.id),
             timeout=aiohttp.ClientTimeout(total=_REGISTER_TIMEOUT_S),
         )
-        if data:
+        # Только 200: при таймауте _fetch_json отдаёт (0, {"message": ...}) —
+        # truthy dict без полей, и вместо запасного «новичка» бот показал бы
+        # «подарок недоступен» (ревью 30.09).
+        if _status == 200 and isinstance(data, dict):
             is_new = bool(data.get("created"))
-            trial_available = bool(data.get("trial_available"))
             has_devices = bool(data.get("has_devices"))
             has_subscription = bool(data.get("has_subscription"))
+            # У кого живая подписка, тапу «забрать дни» нечего выдать (бэк
+            # отвечает 409 live) — подарок 15 ₽ таким доступен в кабинете.
+            trial_available = bool(data.get("trial_available")) and not has_subscription
             # Дни считаются после привязки реферала в этом же запросе: по
             # ссылке друга новичок сразу видит «6 дней».
             trial_days, ref_days = _trial_days_from(data)
@@ -1037,7 +1043,7 @@ async def trial_activate_cb(callback_query: types.CallbackQuery):
     if status_code == 503:
         await bot.send_message(
             chat_id,
-            "Сейчас большой наплыв — попробуй через пару минут, подарок "
+            "Сейчас много желающих, попробуй через пару минут. Подарок "
             "никуда не денется 😊",
         )
         return

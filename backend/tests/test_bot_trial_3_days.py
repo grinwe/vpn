@@ -418,3 +418,61 @@ def test_welcome_keyboard_gift_button_days(monkeypatch):
         assert invited.inline_keyboard[0][0].callback_data == "trial:activate"
     finally:
         sys.modules.pop("bot.keyboards", None)
+
+
+# ── ревью 30.09: таймаут /register и живая подписка ──
+
+
+@pytest.mark.asyncio
+async def test_cmd_start_register_timeout_defaults_to_newbie_offer(handlers, monkeypatch):
+    """_fetch_json на таймауте отдаёт (0, {"message": ...}) — truthy dict без
+    полей. Раньше бот читал его как «подарок недоступен»."""
+    async def _timeout(*a, **k):
+        return 0, {"message": "backend unreachable"}
+
+    monkeypatch.setattr(handlers, "_fetch_json", _timeout)
+    seen_kb = _capture_welcome_kb(handlers, monkeypatch)
+    msg = FakeMessage(FakeBot())
+    msg.text = "/start"
+
+    await handlers.cmd_start(msg, state=None)
+
+    assert "🎁 3 дня VPN бесплатно" in msg.sent[0][0]
+    assert seen_kb[0]["trial_available"] is True
+
+
+@pytest.mark.asyncio
+async def test_cmd_start_live_subscription_hides_days_offer(handlers, monkeypatch):
+    """Платящий с живой подпиской и незабранным триалом: тап «забрать дни»
+    дал бы 409 live — предложение не показываем (подарок 15 ₽ есть в кабинете)."""
+    async def _reg(*a, **k):
+        return 200, {"created": False, "trial_available": True, "has_devices": True,
+                     "has_subscription": True, "trial_days": 3, "referral_days": 0}
+
+    monkeypatch.setattr(handlers, "_fetch_json", _reg)
+    seen_kb = _capture_welcome_kb(handlers, monkeypatch)
+    msg = FakeMessage(FakeBot())
+    msg.text = "/start"
+
+    await handlers.cmd_start(msg, state=None)
+
+    assert "бесплатно" not in msg.sent[0][0]
+    assert seen_kb[0]["trial_available"] is False
+
+
+@pytest.mark.asyncio
+async def test_user_flags_live_subscription_and_timeout(handlers, monkeypatch):
+    async def _reg(*a, **k):
+        return 200, {"trial_available": True, "has_devices": False,
+                     "has_subscription": True, "trial_days": 3, "referral_days": 0}
+
+    monkeypatch.setattr(handlers, "_fetch_json", _reg)
+    flags = await handlers._fetch_user_flags(100)
+    assert flags[0] is False and flags[2] is True
+
+    async def _timeout(*a, **k):
+        return 0, {"message": "backend unreachable"}
+
+    monkeypatch.setattr(handlers, "_fetch_json", _timeout)
+    flags = await handlers._fetch_user_flags(100)
+    assert flags[0] is True  # fail-safe в сторону новичка

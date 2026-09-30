@@ -365,6 +365,36 @@ def test_cold_path_throttle_is_503_and_rolls_back(
     assert _rejections(db_session, user.id) == ["throttled"]
 
 
+def test_queue_down_after_cold_commit_still_charges_trial(
+    client, db_session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Ревью 30.09: очередь провижна упала ПОСЛЕ коммита cold-пути. Раньше
+    RuntimeError вылетал наружу — подписка оставалась без списания trial-full
+    и без автопродления («деньги на балансе, VPN нет»). Теперь таска остаётся
+    pending для rescue-тика, триал выдаётся целиком."""
+    _infra(db_session)
+    user = make_user(db_session, telegram_id="t9-queue")
+
+    def _queue_down(self, task, node=None):
+        raise RuntimeError("Provisioning queue is unavailable")
+
+    monkeypatch.setattr(ProvisioningOrchestrator, "run_task_async", _queue_down)
+    resp = _activate_full(client, user)
+
+    assert resp.status_code == 200, resp.text
+    db_session.expire_all()
+    sub = db_session.query(models.Subscription).filter_by(user_id=user.id).one()
+    assert sub.auto_renew is True
+    assert len(_ledger(db_session, f"trial-full:{sub.id}")) == 1
+    task = (
+        db_session.query(models.ProvisioningTask)
+        .filter(models.ProvisioningTask.action == "apply")
+        .order_by(models.ProvisioningTask.id.desc())
+        .first()
+    )
+    assert task is not None and task.status == models.ProvisioningTaskStatus.pending
+
+
 def test_live_refusal_leaves_no_bonus_for_payer(client, db_session: Session) -> None:
     """Платящий жмёт кнопку в боте: 409, и ни бонуса, ни таймера триала."""
     plan = _infra(db_session)

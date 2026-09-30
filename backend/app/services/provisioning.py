@@ -3337,7 +3337,19 @@ class ProvisioningOrchestrator:
 
         task = self.create_task("device", device.id, "apply", task_payload)
         self.db.commit()
-        self.run_task_async(task, node=node)
+        try:
+            self.run_task_async(task, node=node)
+        except RuntimeError:
+            # Подписка и девайс уже закоммичены: исключение отсюда оставило бы
+            # вызывающего (триал: списание trial-full и auto_renew идут ПОСЛЕ
+            # провижна) с несписанной подпиской без автопродления — ловушка
+            # «деньги на балансе, VPN нет» (ревью триала 30.09). Очередь
+            # недоступна — таска остаётся pending, run_pending_rescue_tick
+            # поставит её заново.
+            logger.exception(
+                "provision_subscription: task %s не поставлена в очередь, "
+                "остаётся pending для rescue-тика", task.id,
+            )
         self.db.refresh(subscription)
         self._maybe_attach_diverse(subscription, device, plan, node)
         self._apply_leg_scheme(device)
