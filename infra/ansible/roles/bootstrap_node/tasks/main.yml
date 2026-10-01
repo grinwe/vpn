@@ -19,54 +19,15 @@
     state: present
   loop: "{{ ssh_public_keys | default([]) }}"
 
-- name: Mask apt-daily timers (no auto-updates during bootstrap)
-  # Ubuntu по умолчанию ставит apt-daily.timer + apt-daily-upgrade.timer
-  # с OnBootSec=15min — после reboot'а они через 15 минут стартанут
-  # apt-get update / unattended-upgrade, конкурируя с нашим bootstrap'ом
-  # за apt/lists/lock. На свежей ноде это особенно злобно: первый
-  # bootstrap начинается одновременно с первым auto-update'ом, оба
-  # дерутся за lock, wait-task'ы попадают в бесконечный sleep-loop.
-  #
-  # Мы сам manage apt через ansible, авто-апдейты только мешают.
-  # mask блокирует FUTURE старты timer'а/сервиса (даже manual systemctl
-  # start не сработает). НЕ ставим state: stopped — apt-операция в
-  # полёте сама закончится корректно, нам важно только запретить
-  # СЛЕДУЮЩИЙ запуск. Текущий полёт дренируем через fuser wait ниже.
-  systemd:
-    name: "{{ item }}"
-    enabled: no
-    masked: yes
-  loop:
-    - apt-daily.timer
-    - apt-daily.service
-    - apt-daily-upgrade.timer
-    - apt-daily-upgrade.service
-  failed_when: false
-
-# Preseed iptables-persistent ДО его установки: пакет в postinst
-# спрашивает через debconf, сохранять ли текущие IPv4/IPv6-правила.
-# В неинтерактивном ansible-прогоне без preseed установка виснет на
-# диалоге. Ставим оба ответа в false — свои правила мы сохраним явно
-# через `netfilter-persistent save` уже ПОСЛЕ их вставки (см. ниже).
-- name: Preseed iptables-persistent (no interactive prompts)
-  ansible.builtin.debconf:
-    name: iptables-persistent
-    question: "{{ item }}"
-    vtype: boolean
-    value: "false"
-  loop:
-    - iptables-persistent/autosave_v4
-    - iptables-persistent/autosave_v6
-  failed_when: false
+- name: Wait for unattended-upgrades to finish
+  shell: >-
+    while fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1; do
+      sleep 5;
+    done
+  changed_when: false
+  timeout: 300
 
 - name: Install base packages
-  # lock_timeout=600 — apt-модуль СAM ждёт apt/dpkg lock через
-  # DPkg::Lock::Timeout, без shell-loop с fuser. Прошлая версия делала
-  # `while fuser ... sleep 5`; при ansible-таймауте sh-процесс
-  # orphan'ился под systemd (PID 1) и продолжал крутиться вечно — на
-  # ноде накапливались "сироты" с каждого неудачного bootstrap'а, и при
-  # дальнейших диагностиках они мимикрировали под "lock держится".
-  # См. POSTMORTEM § wait-storm.
   apt:
     name:
       - ufw
@@ -75,67 +36,8 @@
       - jq
       - fail2ban
       - unattended-upgrades
-      # iptables-persistent даёт netfilter-persistent, которым мы
-      # сохраняем вставленные ниже ACCEPT-правила, чтобы они пережили
-      # ребут ноды (иначе restrictive cloud-init правила вернутся и
-      # снова закроют :80/:443 — ломается certbot HTTP-01, см. ниже).
-      - iptables-persistent
     state: present
     update_cache: yes
-    cache_valid_time: 3600
-    lock_timeout: 600
-
-# ── Открыть 22/80/443 на iptables-уровне ────────────────────────────
-# У части RU-VPS-провайдеров cloud-init из коробки ставит restrictive
-# INPUT policy / нативные iptables-правила (мы видели это на
-# ru-cloud-web-02: nginx слушает локально, но certbot HTTP-01
-# challenge таймаутит — LE не может достучаться до :80 извне).
-#
-# Идемпотентно: ansible iptables module матчит правило по точному
-# совпадению параметров. Если ACCEPT уже стоит — не дублирует.
-# `action: insert` ставит правило в начало INPUT chain — даже если
-# где-то ниже есть -j DROP, наш ACCEPT срабатывает первым.
-#
-# `failed_when: false` — на минимальных образах (alpine-like) iptables
-# может быть не установлен или kernel module отсутствовать. Не валим
-# play, шаг становится best-effort.
-- name: Ensure iptables ACCEPT for SSH/HTTP/HTTPS at top of INPUT
-  ansible.builtin.iptables:
-    chain: INPUT
-    protocol: tcp
-    destination_port: "{{ item }}"
-    jump: ACCEPT
-    action: insert
-    state: present
-  loop: ["22", "80", "443"]
-  register: iptables_input_rules
-  failed_when: false
-
-# Персистим ruleset, чтобы правила пережили ребут ноды. Без этого
-# после reboot'а (ядро, ручной restart у хостера) restrictive правила
-# провайдера возвращаются, а наши ACCEPT — нет: снаружи снова закрыты
-# :80/:443, ломается certbot-renewal (HTTP-01) до следующего полного
-# ansible-прогона. netfilter-persistent save дампит текущий INPUT в
-# /etc/iptables/rules.v{4,6}, откуда он поднимается при загрузке.
-# Идемпотентно (просто дамп текущего состояния) → changed_when: false.
-# failed_when: false — на минимальных образах без iptables-persistent
-# бинарь может отсутствовать; шаг best-effort, как и вставка выше.
-- name: Persist iptables rules across reboots (netfilter-persistent)
-  ansible.builtin.command: netfilter-persistent save
-  changed_when: false
-  failed_when: false
-
-# Параллельно — ufw allow. На inactive ufw (наш текущий дефолт, см.
-# закомменченный блок ниже) команда без эффекта; но если когда-нибудь
-# ufw enable'нётся (вручную или из group_vars), эти правила уже стоят
-# и ssh/http/https не отваливается.
-- name: Ensure ufw allows SSH/HTTP/HTTPS (idempotent, no-op on inactive ufw)
-  community.general.ufw:
-    rule: allow
-    port: "{{ item }}"
-    proto: tcp
-  loop: ["22", "80", "443"]
-  failed_when: false
 
 # ВРЕМЕННО ЗАКОММЕНТИРОВАНО — ufw rate-limit на 22/tcp блокировал сам
 # ansible-раннер (6+ коннектов/30с с одного egress-IP → drop), из-за
@@ -268,36 +170,6 @@
       APT::Periodic::AutocleanInterval "7";
       Unattended-Upgrade::Automatic-Reboot "false";
 
-# ── Размаскировать apt-daily-таймеры после bootstrap ─────────────────
-# В начале роли мы замаскировали apt-daily*/apt-daily-upgrade*, чтобы
-# авто-апдейт не конкурировал с bootstrap'ом за apt/dpkg lock. Но
-# unattended-upgrade ЗАПУСКАЕТСЯ именно apt-daily-upgrade.timer'ом —
-# если оставить его masked, конфиг 20auto-upgrades выше становится
-# мёртвым (security-патчи не ставятся вовсе, хотя задача обещает
-# обратное). Возвращаем таймеры в рабочее состояние в конце роли:
-# конкуренция за lock уже позади, а lock_timeout=600 в apt-задачах
-# страхует от остаточных гонок и без маски.
-- name: Unmask apt-daily timers/services after bootstrap
-  systemd:
-    name: "{{ item }}"
-    masked: no
-  loop:
-    - apt-daily.timer
-    - apt-daily.service
-    - apt-daily-upgrade.timer
-    - apt-daily-upgrade.service
-  failed_when: false
-
-- name: Enable apt-daily timers (activate unattended-upgrades schedule)
-  systemd:
-    name: "{{ item }}"
-    enabled: yes
-    state: started
-  loop:
-    - apt-daily.timer
-    - apt-daily-upgrade.timer
-  failed_when: false
-
 - name: Set MOTD banner
   copy:
     dest: /etc/motd
@@ -335,23 +207,6 @@
           copytruncate
       }
     dest: /etc/logrotate.d/xray
-    owner: root
-    group: root
-    mode: '0644'
-
-# Mgmt-mirror URL для xray-{geoip,core}-fetch.sh wrapper'ов. Если
-# xray_mirror_url задан в group_vars/inventory — wrapper'ы пробуют
-# mgmt-mirror первым (он стабильно достижим из любой RU-ноды по
-# private/public сети), и только при его падении уходят в ghproxy
-# /jsdelivr/github fallback. Когда переменная пустая (или не задана)
-# — env-файл всё равно создаётся, но MIRROR_URL пустой → wrapper'ы
-# работают как раньше (без mirror first stage'а).
-- name: Configure xray mirror URL on node
-  copy:
-    dest: /etc/default/xray-mirror
-    content: |
-      # Managed by ansible bootstrap_node. См. infra/mgmt-mirror.
-      MIRROR_URL={{ xray_mirror_url | default('') }}
     owner: root
     group: root
     mode: '0644'

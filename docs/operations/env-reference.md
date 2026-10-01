@@ -13,15 +13,13 @@
 | `DB_POOL_SIZE` | `10` | backend, worker | SQLAlchemy pool size. Растить при `QueuePool limit reached`. |
 | `DB_MAX_OVERFLOW` | `10` | backend, worker | Допкоэффициент pool overflow. |
 | `DB_POOL_RECYCLE` | `1800` | backend, worker | Секунды, после которых соединение пересоздаётся (bypass stale-conn bug'ов за NAT'ом). |
-| `DB_POOL_TIMEOUT` | `5` | backend, worker | Секунды ожидания свободного соединения из пула перед `TimeoutError`. Короткий таймаут даёт быстрый отказ (500) вместо 30-секундной очереди под всплеском (bot flood). |
 | `SKIP_MIGRATIONS` | `0` | backend, worker | Если `1` — не запускать `alembic upgrade head` на старте. **В `docker-compose.yml` хардкод `"1"` для worker'а**, чтобы backend и worker не дрались за advisory lock (см. `docker-compose.yml:98-102`). |
 
 ## Security / Auth
 
 | переменная | default | кто читает | описание |
 |---|---|---|---|
-| `APP_SECRET_KEY` | — | backend, worker | Fernet key для шифрования credentials at rest (`security.encrypt/decrypt`). **Обязателен: без него backend и worker НЕ СТАРТУЮТ** (аудит 2026-07-25 — раньше был тихий fallback на plaintext, и одна потерянная переменная означала запись секретов в БД открытым текстом при внешне рабочем сервисе). **Ротация без re-encrypt-миграции = все зашифрованные поля нечитаемы.** Ансибл-роль требует `length >= 16`. |
-| `ALLOW_PLAINTEXT_SECRETS` | *(пусто)* | backend, worker | Явная форточка для локальной разработки: `1` разрешает работать без `APP_SECRET_KEY`, записывая секреты открытым текстом (с warning). В проде НЕ ставить. |
+| `APP_SECRET_KEY` | — | backend, worker | Fernet key для шифрования credentials at rest (`security.encrypt/decrypt`). **Ротация без re-encrypt-миграции = все зашифрованные поля нечитаемы.** Ансибл-роль требует `length >= 16`. |
 | `ADMIN_API_TOKEN` | — | backend, worker, bot | Shared secret для `X-Admin-Token` header. Используется SPA, ботом и scrape'ом Prometheus. Роль требует `length >= 20`. |
 | `ADMIN_ACTOR_HEADER` | `X-Admin-Actor` | backend | Имя header'а, откуда backend читает self-declared actor id для `AuditLog.actor`. Менять незачем. |
 | `WEBAPP_JWT_SECRET` | — | backend | HMAC-ключ hand-rolled JWT сессии Telegram Mini App. Ротация = все открытые WebApp-сессии форсят re-handshake через initData. Роль требует `length >= 32`. |
@@ -30,7 +28,6 @@
 | `LOG_LEVEL` | `INFO` | backend, worker | DEBUG/INFO/WARNING. DEBUG очень шумный на prod. |
 | `LOG_FORMAT` | `json` | backend, worker | `json` — structured JSON (для prod/log aggregators). `console` — human-readable (для local dev). Оба включают `request_id`. |
 | `SLOWAPI_STORAGE_URI` | auto (`REDIS_URL` → `memory://`) | backend | Slowapi backend. Если не задан, подхватывает `REDIS_URL` (rate limits shared через Redis). Явное `memory://` — только для offline dev. |
-| `RATE_LIMIT_TRUSTED_PROXIES` | loopback + private-сети (docker) | backend | CSV из CIDR: с каких peer-адресов rate-limiter верит `X-Real-IP`/`X-Forwarded-For` (см. `rate_limit.py`). Дефолт покрывает nginx в docker-сети. |
 | `CORS_ALLOWED_ORIGINS` | `""` | backend | Comma-separated list. Пусто → webapp на том же origin (same nginx), CORS не нужен. |
 
 ## Telegram Bot
@@ -41,10 +38,8 @@
 | `TELEGRAM_BOT_TOKEN` | — | backend (fallback) | Legacy alias для `BOT_TOKEN`, читается только `services/payments/telegram_stars.py`, если `BOT_TOKEN` не задан. Обычно не нужен. |
 | `ADMIN_IDS` | `""` | bot | Comma-separated Telegram user-id с админскими командами (`/invoices`, support-forwards). **Не** валидируется backend'ом — только бот фильтрует по ним. |
 | `BOT_USERNAME` | `""` | backend, bot | Username бота (без `@`) для построения t.me/<bot>?start=... в referral flow. Без этого `/api/webapp/referral` возвращает `share_url=None`. |
-| `LEGAL_BASE_URL` | `https://<deploy_web_frontend_domain>/legal` | bot | База ссылок кнопки «ℹ️ О сервисе и документы» в /help: `terms.html`, `refund.html`, `privacy.html` (роль deploy_web_frontend кладёт их в camo-root/legal/ из `docs/legal/*.md` через `scripts/render_legal.py`). Пусто → в «О сервисе» только текст с реквизитами, без ссылок. Ansible: `deploy_app_stack_legal_base_url`. |
 | `BACKEND_URL` | `http://localhost:8000` | bot | Куда бот ходит за API. Внутри docker compose — `http://backend:8000`. |
 | `NOTIFICATION_POLL_INTERVAL` | `10` | bot | Интервал (секунды) между опросами `/api/notifications/pending`. `<=0` — отключить поллер. |
-| `NOTIFICATION_BROADCAST_PER_TICK` | `50` | bot | Максимум `admin_broadcast`, отправляемых поллером за один тик. Срочные типы (`config_ready`/`health_ping_request`/`admin_alert_*`) сортируются в начало тика и не режутся; хвост рассылки сверх лимита переносится на следующие тики (защита от head-of-line). |
 
 ## Redis / RQ
 
@@ -54,7 +49,7 @@
 | `REDIS_URL` | — | backend, worker | Обычно `redis://:${REDIS_PASSWORD}@redis:6379/0`. |
 | `QUEUE_BACKEND` | `""` | backend, worker | `"rq"` — использовать RQ очередь. Любое другое значение переключает провижининг в in-process thread'ы (только dev/test). |
 | `RQ_QUEUE` | `vpn-provisioning` | backend, worker | Имя RQ queue. |
-| `RQ_JOB_TIMEOUT` | `1800` | worker | Hard-kill per job. **Инвариант (audit #48): строго больше самого медленного playbook-таймаута + запас на очередь/семафор/пост-обработку.** Самый долгий — `site.yml` (timeout=900с). Если job_timeout ≤ 900, RQ убивает джобу РАНЬШЕ конца плейбука → ansible-сирота продолжает конфигурить ноду, а Retry запускает второй параллельный прогон. Меняешь `site.yml` timeout — подними и это. Subprocess-таймаут ansible'а отдельный — см. `MAX_CONCURRENT_ANSIBLE`. |
+| `RQ_JOB_TIMEOUT` | `900` | worker | Hard-kill per job. Должен быть длиннее самого медленного playbook'а (bootstrap ~5 мин). Subprocess-таймаут ansible'а отдельный — см. `MAX_CONCURRENT_ANSIBLE`. |
 | `RQ_FAILED_TTL` | `604800` | worker | Сколько держать job'ы в failed registry (7 дней). |
 | `RQ_RESULT_TTL` | `86400` | worker | Сколько держать результаты успешных job'ов (1 день). |
 
@@ -65,23 +60,9 @@
 | `PROVISIONING_SSH_KEY` | **обязателен** | compose, worker volume | Путь **на хосте** к ed25519 приватнику для SSH на VPN-ноды. compose откажется стартовать без неё (`?:` required). Обычно `/opt/vpn/secrets/provisioning_key`. |
 | `ANSIBLE_PRIVATE_KEY_FILE` | — | worker | Путь **внутри контейнера** к тому же ключу (обычно `/run/secrets/provisioning_key`, туда маппится volume). |
 | `ANSIBLE_ROOT` | — | worker | Директория с `playbooks/` и `roles/`. По умолчанию `/app/infra/ansible`. |
-| `MAX_CONCURRENT_ANSIBLE` | `3` | worker | Размер `_ansible_semaphore` в `ProvisioningOrchestrator`. Каждый процесс ansible ест ~200MB. Отдельный от warm-pool семафора. **PER-PROCESS, не глобальный кап** (audit #200): при нескольких RQ-воркерах реальный параллелизм ansible = `WORKER_REPLICAS`, а не это число. |
+| `MAX_CONCURRENT_ANSIBLE` | `3` | worker | Размер `_ansible_semaphore` в `ProvisioningOrchestrator`. Каждый процесс ansible ест ~200MB. Отдельный от warm-pool семафора. |
 | `ALLOW_INPROCESS_PROVISIONING` | `""` | backend | Dev escape-hatch: `"1"` → backend выполняет ansible сам, без RQ. **Не** включать в prod — блокирует HTTP request'ы. |
 | `MIN_HEALTHY_SCORE` | `50` | backend, worker | Минимальный `health_score` ноды для попадания в `choose_node` / `_eligible_nodes`. |
-| `CHOOSE_NODE_INCLUDE_REGISTERING` | `0` | backend, worker | audit #72. По умолчанию `choose_node` НЕ выдаёт юзеров на ноду в статусе `registering` (bootstrap ещё идёт → холодный provision падает). `"1"` возвращает старое поведение (registering участвует в выборке). |
-| `REFERRAL_REWARD_DAYS` | `10` | backend·worker | Награда рефереру в ДНЯХ подписки; начисляется, когда приглашённый впервые заплатил. 10 дней = 50 ₽ по прайсу Solo — та же сумма, что платили фиксированной константой до перехода на дни. Конвертируется в копейки по самому дешёвому видимому 30-дневному плану, поэтому следует за прайсом. Перебивается `reward_days` конкретного реферального кода. |
-| `REFERRAL_INVITEE_DAYS` | `3` | backend·worker | Подарок приглашённому при активации триала, в днях. Прибавляется к бесплатным дням триала: 3 + 3 = 6 дней, подарок тратится на подписку вместе с бонусом. Втрое меньше награды реферера намеренно: приглашённый ещё ничего не заплатил, и щедрость здесь оплачивает фарм триалов. Перебивается `bonus_days` кода (дефолт колонки тоже 3), поэтому в compose/`env.j2` не проброшена: работает дефолт из кода. |
-| `REFERRAL_BONUS_KOPECKS` | `5000` | backend·worker | Легаси-сумма на случай вызова без `days` (прод-env её задаёт явно). Новые начисления идут днями. |
-| `REFERRAL_INVITE_DELAY_H` | `24` | backend | Задержка ДОСТАВКИ пуша `referral_invite` («Как VPN? Если приведёшь друга…») в часах после первого скачивания конфига. Строка в `audit_logs` пишется сразу (`_mark_first_config_fetch`), а `/api/notifications/pending` отдаёт её, только когда `created_at` старше задержки: сразу после ссылки приглашение было третьим-четвёртым сообщением подряд и тонуло в шуме. `0` = отдавать сразу, как до 2026-08-28. Читается на каждый запрос (рестарт не нужен). Только backend: очередь бота отдаёт он. |
-| `APP_VERSION` | из файла `VERSION` | backend·worker | Версия выката (семвер). Кладёт `deploy_app_stack`, читая `VERSION` в корне репозитория; отдаётся в `GET /api/version`, уезжает на ноды в extra_vars `vpn_release_version` и пишется в `/etc/vpn-node-release.json`. Не задана → `0.0.0-dev`. Фронты получают ту же строку build-arg'ом `VITE_APP_VERSION`. |
-| `NODE_VERSIONS_INTERVAL` | `3600` | worker | `run_node_versions_tick` — SSH-обход активных нод за фактическими версиями (`xray version` + маркер `/etc/vpn-node-release.json`) в колонки `vpn_nodes.xray_version` / `release_version` / `versions_checked_at`. Первый прогон после рестарта воркера — через ≤5 мин. `0` — отключить. |
-| `NODE_VERSIONS_SSH_WORKERS` | `8` | worker | Размер пула потоков для этого обхода. SSH блокирующий, ноды независимы; больше 8 упирается не в CPU, а в сеть. |
-| `XRAY_UPSTREAM_INTERVAL` | `21600` | worker | `run_xray_upstream_tick` — проверка последнего релиза XTLS/Xray-core на GitHub, кэш в `software_releases`, пуш админу при дрейфе (пин отстал от upstream / ноды отстали от пина). Апгрейд НЕ автоматический: `xray_core_sha256` меняется парой к версии. `0` — отключить. |
-| `XRAY_RELEASES_URL` | GitHub API latest | worker | Переопределение источника релизов xray (тест/зеркало). |
-| `HYSTERIA_RELEASES_URL` | GitHub API latest | worker | То же для apernet/hysteria. Тик проверяет оба продукта за один прогон. |
-| `XRAY_DRIFT_DEDUP_WINDOW_SEC` | `604800` | worker | Окно дедупа пуша про дрейф версий. Ключ дедупа — пара (upstream, пин), поэтому при неизменных версиях повторных пушей нет всю неделю. |
-| `GITHUB_TOKEN` | — | worker | Необязателен: анонимного лимита GitHub (60 запросов/час на IP) хватает для проверки раз в 6 часов. Нужен, только если IP делится с другими потребителями API. |
-| `RESTORE_HY2_AFTER_REINSTALL` | `1` | worker | audit #78. После reinstall (диск стёрт) бэкенд авто-восстанавливает пер-юзерные hysteria2-учётки через `resync_node_hysteria2_clients` (device/apply-таски). `"0"` отключает (оператор восстанавливает вручную по warning-логу). |
 
 ## Worker ticks
 
@@ -91,74 +72,28 @@
 |---|---|---|---|
 | `RENEWAL_CHECK_INTERVAL` | `300` | worker | `run_renewal_check` — находит expiring-подписки, шлёт reminder'ы, флипает expired → revoked после grace. |
 | `RENEWAL_GRACE_HOURS` | `24` | worker | Сколько часов после `expires_at` подписка висит в `expired` до hard revoke'а. |
-| `RENEWAL_WINDOW_LIMIT` | `2000` | worker | Верхняя граница подписок, обрабатываемых `run_renewal_check` за один тик в каждом окне напоминаний (ORDER BY `expires_at` ASC, хвост — следующим тиком). Не даёт тику упереться в `job_timeout` на тысячах истекающих. |
 | `BALANCE_CHARGE_INTERVAL` | `3600` | worker | `charge_subscriptions` — hourly tick, burns daily_rate × devices из `prepaid_kopecks`. Плюс trial-expiry фаза. |
 | `LOW_BALANCE_WARN_DAYS` | `3` | worker | Триггерит `low_balance_warning` notification, когда runway (balance / daily_rate) < этого. |
-| `WARM_POOL_CHECK_INTERVAL` | `120` | worker | `run_warm_pool_check` — тик warmer'а (`ensure_pool`, топит пул). Стадия 2 отзыва вынесена в отдельный тик `run_warm_pool_revoke_tick`. |
-| `WARM_POOL_REVOKE_INTERVAL` | `300` | worker | `run_warm_pool_revoke_tick` — стадия 2 отзыва warm-пула: `run_warm_pool_revoke_sweep` физически снимает `revoked`-бандлы с нод и удаляет строки (аудит-фикс #71). Gated на `WARM_POOL_ENABLED`. `0` — отключить. |
-| `RETENTION_INTERVAL` | `86400` | worker | `run_retention_tick` — раз в сутки чистит `audit_logs` (`subscription_fetch`/`*:delivered`) и `node_traffic_samples` старше N дней (аудит-фикс #247). `0` — отключить. |
-| `AUDIT_LOG_RETENTION_DAYS` | `90` | worker | Порог (дни) для удаления `subscription_fetch` + `*:delivered` из `audit_logs`. `0` — не чистить audit_logs. Прочие action'ы не трогаются. |
-| `TRAFFIC_SAMPLE_RETENTION_DAYS` | `30` | worker | Порог (дни) для удаления `node_traffic_samples`. `0` — не чистить. Детекторам/агрегатам нужны лишь последние тики. |
-| `NODE_SPAWN_SWEEP_INTERVAL` | `600` | worker | `run_spawn_sweep_tick` — подбор спавнов, застрявших в `registering` (аудит-фикс #70): достройка уходит персистентной RQ-джобой `run_spawn_finalize` на провижининг-очередь. Порог «застрял» — `NODE_SPAWN_STUCK_MINUTES` (30). `0` — отключить. |
-| `RETENTION_DELETE_BATCH` | `10000` | worker | Размер батча удаления retention-тика (id IN (SELECT … LIMIT), коммит после каждого — короткие локи). |
-| `RETENTION_MAX_BATCHES` | `200` | worker | Потолок батчей на таблицу за один retention-тик. Остаток донесётся следующим прогоном. |
+| `WARM_POOL_CHECK_INTERVAL` | `120` | worker | `run_warm_pool_check` — тик warmer'а (ensure_pool + revoke GC). |
 | `AUTOSCALE_INTERVAL` | `0` / `300` | worker | `run_autoscale_check`. `0` — отключить. `.env.example` ставит `300`. |
 | `PENDING_RESCUE_INTERVAL` | `60` | worker | `run_pending_rescue_tick` — re-enqueue `ProvisioningTask.status=pending` старше `PENDING_RESCUE_AGE`. Закрывает дыру, когда `enqueue_task` упал на Redis-hiccup'е и строка осталась без job'а. `0` отключает. |
 | `PENDING_RESCUE_AGE` | `60` | worker | Минимальный возраст (sec) pending-задачи, чтобы её подхватил rescue-tick. Меньше этого — считается «только что создана, ещё не RQ'нулась». |
-| `PENDING_RESCUE_FORCE_AGE` | `1800` | worker | Возраст (sec), после которого rescue-tick делает `enqueue_task(force=True)` — пуржит детерминированный job-ключ ПЕРЕД дедупом. Лечит зомби-`started` джоб (воркер SIGKILL'нут мид-ран, `StartedJobRegistry.cleanup` не реклеймит): обычный ре-энкью вечно возвращает id зомби и не диспатчит, а stuck `bootstrap` держит `uq_active_node_bootstrap` и вешает реконсилер ноды. Строка всё ещё `pending` ⇒ воркер её не выполняет ⇒ пурж не убьёт живой ран. |
-| `PENDING_RESCUE_ABANDON_AGE` | `86400` | worker | Возраст (sec), после которого rescue-tick помечает pending-таску `failed` вместо ре-энкью — нерасшиваемая, и опасно ре-ранить древнюю работу (напр. 2-месячный relay apply). Освобождает слоты; реконсилер пересоздаёт только нужное грязной ноде. |
 | `ANSIBLE_PLAYBOOK_TIMEOUT` | `300` | backend, worker | subprocess-таймаут (sec) на один `ansible-playbook` run. При регулярно-медленных нодах (package installs, slow SSH) можно поднять, иначе revoke/apply ловят `TimeoutExpired` и таска становится failed. |
 | `TRAFFIC_STATS_INTERVAL` | `300` | worker | `run_traffic_stats_tick` — SSH-сбор xray stats + sharing violations. Phase D `detect_traffic_drops` **отключён 2026-04-15** — теперь только сбор samples. |
-| `TRAFFIC_USER_ACCOUNTING` | `1` | worker | Per-user учёт внутри того же тика: дельты байт по `Credential.access_username` копятся в `Subscription.traffic_used_bytes` (шкала в клиенте, обнуляет продление). `0` — аварийный стоп только учёта: сбор по нодам продолжается, и штамп активности `Device.last_seen_at` («активен за 24ч» в админке) тоже ставится дальше — он намеренно не под этим гейтом. |
-| `SUB_FIX_PAGE` | `0` | backend | Страница «починить и продлить» на домене саб-ссылки (`/<token>?fix=1`). `0` — любой `?fix` отдаёт camo-лендинг, выдача конфигов не меняется. Разрывает круг «VPN сломан → чинить только в Telegram → Telegram без VPN недоступен». |
-| `SUB_FIX_PAY` | `0` | backend | Блок продления на странице: **две** кнопки — «Продлить по СБП…» (`&pay=sbp`) и «Продлить картой…» (`&pay=1`), оба счёта у lava.top. Требует `SUB_FIX_PAGE=1`. |
-| `SUB_FIX_ENTRYPOINTS` | `off` | backend | Какие кнопки VPN-клиента ведут на страницу: `off` / `support` (иконка поддержки) / `all` (плюс кнопка блока статуса «Не подключается?» и кнопка предупреждения об истечении). URL строится ТОЛЬКО от `SUB_LINK_BASE_URL`. |
-| `SELF_REPAIR_THROTTLE_SEC` | `120` (fallback `SUB_FIX_THROTTLE_SEC`) | backend | Окно, в котором повторная жалоба «VPN не работает» отвечает «уже переключали» вместо нового шага лестницы. Считается **по подписке** (по `OperatorNodeReport`) и действует на ВСЕ каналы: кнопка в боте, пикер устройств, «все мои устройства», кабинет, страница по саб-токену, ответ «плохо» на плановый пинг. Пусто → читается `SUB_FIX_THROTTLE_SEC`, затем 120. `0` выключает проверку (тесты). Ansible-переменная — `deploy_app_stack_self_repair_throttle_sec`, по умолчанию наследует `deploy_app_stack_sub_fix_throttle_sec`. |
-| `SELF_REPAIR_DAILY_MAX` | `5` (fallback `SUB_FIX_DAILY_MAX`) | backend | Потолок починок ОДНОЙ подписки за сутки, тоже общий для всех каналов: утёкший `sub_token` (или нетерпеливый человек) иначе вычерпывает пул нод. Считается по подписке, а не по устройству — успешный перенос пересоздаёт `Device`, и счётчик по `device_id` обнулялся бы после каждой миграции; поэтому значение **умножается на число живых устройств подписки** (три устройства × 5 = 15 шагов в сутки). `0` = без потолка. Ansible-переменная — `deploy_app_stack_self_repair_daily_max`, по умолчанию наследует `deploy_app_stack_sub_fix_daily_max`. |
-| `SUB_FIX_THROTTLE_SEC` | `120` | backend | **Fallback-имя для `SELF_REPAIR_THROTTLE_SEC`** (на проде настроено через него, поэтому имя оставлено). Читается, только если `SELF_REPAIR_THROTTLE_SEC` пуст; смысл тот же — окно повторов, общее для всех каналов, а не «только для страницы», как было до унификации 2026-09-12. |
-| `SUB_FIX_DAILY_MAX` | `5` | backend | **Fallback-имя для `SELF_REPAIR_DAILY_MAX`** — см. строку выше. Суточный потолок починок подписки, общий для всех каналов. |
-| `SUB_FIX_PROVIDER` | `lava_top` | backend | Провайдер кнопки «Продлить картой…» (`&pay=1`) на странице. Пинится явно: общая ротация по умолчанию даёт `cryptobot`, а на страницу приходит человек без Telegram — платить он будет картой или по СБП. |
-| `SUB_FIX_SBP_PROVIDER` | `lava_top_sbp` | backend | Провайдер кнопки «Продлить по СБП…» на странице `?fix=1` (`&pay=sbp`, 2026-09-19). Ansible-переменная — `deploy_app_stack_sub_fix_sbp_provider`. |
-| `TRAFFIC_STATS_BUDGET_SEC` | `100` | worker | Wall-clock-бюджет одного traffic-stats тика. Сэмплы коммитятся по-нодно; при исчерпании бюджета недособранный хвост нод откладывается до следующего тика (job_timeout тика = 120с, бюджет держит запас). |
-| `TRAFFIC_STATS_SSH_WORKERS` | `8` | worker | Параллелизм SSH-сбора в `collect_all_active_nodes` (ThreadPoolExecutor). Записи в БД — только из главного потока. |
-| `TRAFFIC_STATS_MAX_SKIPS` | `3` | worker | Сколько тиков подряд нода может быть отсеяна по бюджету, прежде чем поднимется отдельный error-алерт «систематически не опрашивается». Ноды сабмитятся в порядке давности последнего сэмпла (never-sampled первыми), так что отсев не бьёт всегда по одним и тем же. |
-| `TRAFFIC_STATS_SSH_CONNECT_TIMEOUT` | `15` | worker | SSH connect-таймаут сборщика (`collect_node_stats`). Паритет с `ssh_bootstrap`. |
-| `TRAFFIC_STATS_SSH_BANNER_TIMEOUT` | `20` | worker | SSH banner-таймаут сборщика. Прежние 10с давали ложные «collect failed» на нагруженных нодах. |
-| `TRAFFIC_STATS_SSH_AUTH_TIMEOUT` | `20` | worker | SSH auth-таймаут сборщика. |
-| `TRAFFIC_STATS_SSH_COMMAND_TIMEOUT` | `15` | worker | Таймаут удалённой команды `xray api statsquery` / чтения sharing-violations. |
 | ~~`TRAFFIC_DROP_ENABLED`~~ | ~~`1`~~ | worker | **Inert с 2026-04-15.** Phase D детектор отключён на уровне кода (`worker.run_traffic_stats_tick` не вызывает `detect_traffic_drops`, функция стоит no-op). Переменная оставлена для обратной совместимости env, но не читается. |
 | ~~`TRAFFIC_DROP_MIN_USERS`~~ | ~~`5`~~ | worker | **Inert с 2026-04-15.** При возврате автомиграции пороги нужно пересмотреть — прежние значения ложно-триггерили миграции в idle-окнах. |
 | ~~`TRAFFIC_DROP_CONFIRM_TICKS`~~ | ~~`1`~~ | worker | **Inert с 2026-04-15.** См. `TRAFFIC_DROP_MIN_USERS`. |
-| `NODE_REACHABILITY_STALE_MIN` | `30` | worker | Окно «голодания» reachability-тика (мин): цели без проба дольше этого попадают в гейдж `vpn_reachability_stale_targets` / `summary.stale_targets`. Стабильно >0 — бюджета `NODE_REACHABILITY_BUDGET_SEC` не хватает на весь флот (аудит-фикс #95). |
-| `NODE_VPN_PROBE_PORTS` | *(пусто → из VPNConfig)* | worker | Сетевой аудит #1: reachability-тик при живом SSH дополнительно пробит TCP VPN-порт(ы) ноды — SSH-liveness ≠ VPN-liveness. Пусто = порты берутся из enabled `VPNConfig` ноды (hysteria2/UDP исключается, чтобы не ловить ложный `degraded`). CSV (`443,8443`) — ручной override для всех нод. ЗАКРЫТЫ ВСЕ порты при живом SSH → статус `degraded` + пуш + on-host diagnose. |
-| `NODE_CONTROLLER_ANCHORS` | `1.1.1.1:443,8.8.8.8:443` | worker | Сетевой аудит #3: self-check связности контроллера ПЕРЕД пер-нодовыми пробами. CSV `host:port` внешних якорей. Хоть один ответил → сеть есть. ВСЕ молчат → воркер потерял сеть: тик пропускает пробы (не метит весь флот ложным DOWN) и шлёт один агрегированный алерт. Пусто = проверка отключена. |
-| `NODE_CONTROLLER_ANCHOR_TIMEOUT` | `5` | worker | TCP-таймаут (sec) на якорь в self-check связности контроллера. |
-| `NODE_PROBE_GAP_FACTOR` | `2` | worker | Сетевой аудит #7: если между прошлым и текущим пробом цели дыра > `NODE_REACHABILITY_INTERVAL * factor` (цель выпала в обрезанный бюджетом хвост / тик подвисал), серия DOWN перезапускается, а не эскалируется по дырявому wall-clock. |
-| `NODE_MASS_DOWN_FRACTION` | `0` | worker | Сетевой аудит #3 (доп.): доля DOWN/degraded среди пробитых целей ≥ этого (при `checked >= NODE_MASS_DOWN_MIN`) → индивидуальные алерты подавляются, шлётся один «массовая недоступность». `0` = выключено (основной механизм — `NODE_CONTROLLER_ANCHORS`). |
-| `NODE_MASS_DOWN_MIN` | `5` | worker | Минимум пробитых целей за тик, прежде чем срабатывает mass-down подавление (`NODE_MASS_DOWN_FRACTION`). |
-| `OPS_PLAN_REAPER_INTERVAL` | `300` | worker | `run_ops_plan_reaper_tick` — бэкстоп ops-агента: добивает планы, залипшие в `executing` (воркер умер / джоба убита по `job_timeout`), в `failed` с `execution.phase='crash'`. `0` — отключить (аудит-фикс #120). |
-| `OPS_PLAN_REAPER_GRACE` | `120` | worker | Запас (sec) сверх `OPS_EXECUTE_JOB_TIMEOUT` до реапа executing-плана (ожидание в очереди / clock skew). |
-| `OPS_EXECUTE_JOB_TIMEOUT` | `1800` | worker | Считается таймаутом RQ-джобы `run_ops_plan_execute` для реапера (должен совпадать с `job_timeout` enqueue'а в `api/agent.py`). |
-| `CERT_RENEWAL_INTERVAL` | `86400` | worker | `run_cert_renewal_tick` — внешняя проба TLS-expiry xhttp/ws-cdn + авто-renew LE за `CERT_RENEWAL_DAYS` до истечения (предотвращает fleet-wide cert-пожар 2026-07-22). Первый прогон после рестарта воркера — через ≤5 мин, дальше ровно этот интервал. `0` — отключить. |
-| `CERT_RENEWAL_DAYS` | `21` | worker | Порог «серт скоро истечёт» (дни до notAfter), при котором нода уходит в `renew_certs`. Держать < 30, иначе certbot откажется обновлять (`--keep-until-expiring`). |
-| `CERT_RENEWAL_MAX_PER_TICK` | `6` | worker | Cap нод на один тик, чтобы fleet-wide истечение не задогпайлило ansible. Остаток доедет следующим прогоном. |
-| `REALITY_DEST_HEALTH_INTERVAL` | `86400` | worker | `run_reality_dest_health_tick` — проба Reality-dest'ов на TLS1.3+h2 (деградировавший dest = молча мёртвый Reality, инцидент 2026-07-23). Пишет `dest_healthy`/`dest_fail_count` в `VPNConfig.settings`. `0` — отключить. |
-| `REALITY_DEST_FAIL_THRESHOLD` | `2` | worker | Сколько тиков ПОДРЯД dest должен быть битым, прежде чем он считается сломанным (и, при включённой авто-ротации, ротируется). При суточном интервале это двое суток. |
-| `REALITY_DEST_AUTO_ROTATE` | `0` | worker | Авто-ротация битого dest'а на живой из пула. Дефолт **off**: воркер пробит из NL, а geo-чувствительные dest'ы (гос-сайты) из-за границы отдают иначе → false-positive. Безопасно включать только для не-geo dest'ов или после пробы С НОДЫ. Оператор ротирует руками через `POST /nodes/{id}/refresh-reality-dest`. |
-| `REALITY_DEST_MAX_ROTATE_PER_TICK` | `3` | worker | Cap авто-ротаций за тик (действует только при `REALITY_DEST_AUTO_ROTATE=1`). |
-| `RESTORE_HY2_AFTER_REINSTALL` | `1` | backend | После полного bootstrap'а ноды перезалить hy2-учётки (роль `install_hysteria2` рендерит `auth.userpass` с нуля). Safe-default = вкл; `0` отключает. С 2026-07-25 роль ещё и сама сохраняет существующие учётки (slurp+re-inject), так что это второй пояс, а не единственный. |
 
 ## Balance billing / trial
 
 | переменная | default | кто читает | описание |
 |---|---|---|---|
-| `FREEZE_DAYS` | `7` | backend, worker | Сколько дней длится одна заморозка (1 раз в календарный год). `expires_at += FREEZE_DAYS` при freeze. |
+| `FREEZE_DAYS` | `14` | backend, worker | Сколько дней длится одна заморозка (1 раз в календарный год). `expires_at += FREEZE_DAYS` при freeze. |
 | `MIN_TOPUP_KOPECKS` | `10000` | backend, worker | Минимальная сумма пополнения (₽100). Дешевле — `/checkout` 400'ит. |
 | `EXTRA_DEVICE_KOPECKS_PER_MONTH` | `10000` | backend, worker | Надбавка per device/month сверх `plan.max_devices`. |
-| `REFERRAL_BONUS_KOPECKS` | `5000` | backend, worker | Легаси-сумма реферальных начислений, если их не во что перевести в дни (нет видимого 30-дневного плана). Сейчас обе выплаты идут днями: `REFERRAL_INVITEE_DAYS` приглашённому и `REFERRAL_REWARD_DAYS` рефереру (при первой оплате приглашённого любым способом). |
-| `TRIAL_DURATION_DAYS` | `3` | backend | Видимые бесплатные дни триала. Бонус = столько дней по цене дня самого дешёвого видимого 30-дневного плана (Solo: 15 ₽) и сразу тратится на подписку на эти дни (`services/trial.activate_trial_full`, бот и кабинет). Тексты бота и кабинета берут число из `/users/register` и `/api/webapp/me`. До 2026-09-30 дефолт был `30`. Проброшена в `backend` (compose + `env.j2`). **Откат кода без отката env опасен**: старый `activate_trial` прочтёт `3` и поставит 3-дневный таймер на 30-дневный Solo. |
-| `TRIAL_HIDDEN_HOURS` | `24` | backend | Скрытый запас сверх видимых дней: подписка на бесплатные дни живёт до `now + дни + часы`, списываем только за дни. Счётчики (кабинет, Happ) показывают ровно «3 дня», «истекает завтра» приходит в конце обещанного срока, пополнение в этот день продлевает ту же подписку с той же ссылкой. `0` выключает (подписка ровно на N дней). Проброшена в `backend`. |
-| `TRIAL_EXPIRY_WARN_DAYS` | `3` | worker | Дни до `trial_expires_at`, когда шлётся `trial_expiry_warning` («⏳ Бесплатные дни скоро закончатся»). При 3-дневном триале это T+1, в один день с `renewal_reminder` 3d; если пушей перебор, ставить `1` без правок кода. Проброшена в `worker` (`worker-scheduler` наследует через якорь `*worker-env`). |
+| `REFERRAL_BONUS_KOPECKS` | `5000` | backend, worker | Бонус реферреру при первом `kind=topup` реферрала + бонус реферралу при активации trial. |
+| `TRIAL_DURATION_DAYS` | `30` | backend | Длина trial-периода, используется при `POST /api/trial/activate`. |
+| `TRIAL_EXPIRY_WARN_DAYS` | `3` | worker | Дни до trial-expire, когда шлётся `trial_expiry_warning`. |
 
 ## Autoscale (pool-based)
 
@@ -177,8 +112,8 @@
 
 | переменная | default | кто читает | описание |
 |---|---|---|---|
-| `REALITY_SNI` | _empty_ → pool rotation | backend, worker | «Borrowed» SNI в Reality handshake. Пустое значение включает выбор из `REALITY_DEST_POOL` (`www.yandex.ru`, `vk.ru`, `mail.ru`, `rutube.ru`, `lenta.ru`) — наименее используемый домен per-node. Задайте явное значение только чтобы форснуть один SNI для всех новых нод (dev/test). |
-| `REALITY_DEST` | `<sni>:443` | backend, worker | Куда Reality проксирует трафик не-VPN клиента. **Применяется ТОЛЬКО когда задан `REALITY_SNI` (dev/test override)** — в проде (ротация SNI по пулу) dest всегда выводится из выбранного per-node SNI как `<sni>:443` (audit #81: раньше ручка читалась, но нигде не применялась). |
+| `REALITY_SNI` | `www.microsoft.com` | backend, worker | «Borrowed» SNI в Reality handshake. Должен быть real TLS 1.3 host, **не** зацензуренный в target markete. |
+| `REALITY_DEST` | `www.microsoft.com:443` | backend, worker | Куда Reality проксирует трафик не-VPN клиента (должен совпадать с SNI в 99% случаев). |
 | `REALITY_PORT` | `443` | backend, worker | Порт inbound'а. Менять только если конфликт с другим сервисом на :443. |
 
 ## Платёжные провайдеры
@@ -187,22 +122,7 @@
 |---|---|---|---|
 | `PAYMENT_PROVIDER` | `cryptobot` | backend, bot | Single-provider mode (legacy). Если `PAYMENT_PROVIDERS` задан — игнорируется. |
 | `PAYMENT_PROVIDERS` | `""` | backend, bot | Comma-separated список провайдеров. Backend при checkout'е выбирает `random.choice(list)`. |
-| `PAYMENT_PROVIDER_CHOICES` | `""` | bot | Stage 9b: меню выбора способа оплаты в боте (comma-separated имена). **Прод с 2026-09-19: `telegram_stars,lava_top_sbp,lava_top`** — «⭐ Telegram Stars», «🏦 СБП», «💳 Карта РФ» (порядок списка = порядок кнопок). При 2+ значениях бот показывает кнопки способов и делает checkout выбранным провайдером; пусто/одно имя — старое поведение с `PAYMENT_PROVIDER`. |
-| `LAVA_TOP_API_KEY` | `""` | backend | API-ключ lava.top (кабинет → Интеграции → Public API), заголовок `X-Api-Key`. |
-| `LAVA_TOP_OFFER_ID` | `""` | backend | UUID цены продукта с включённой «Ценой по запросу через API» — только у такого продукта работает произвольная сумма (лимиты 50–1 000 000 ₽). |
-| `LAVA_TOP_WEBHOOK_SECRET` | `""` | backend | Наш статический секрет вебхука (≤80 символов): дублируется в кабинете lava.top при настройке вебхука (тип «API key»), приходит в заголовке `X-Api-Key`. HMAC у платформы нет. |
-| `LAVA_TOP_EMAIL_DOMAIN` | `""` | backend | Домен синтетических email покупателей (`inv<invoice_id>@домен`) — email обязателен в API lava.top. |
-| `LAVA_TOP_API_BASE` | `https://gate.lava.top` | backend, worker | Переопределение базового URL (тесты/стейджинг). |
-| `LAVA_TOP_CARD_PROVIDER` | `SMART_GLOCAL` | backend, worker | Эквайрер (`paymentProvider` в create) для имени провайдера **`lava_top` = карта РФ**. `paymentMethod` шлём явно: `CARD`. Пусто = не шлём `paymentProvider`, т.е. дефолт платформы (он же `SMART_GLOCAL`). |
-| `LAVA_TOP_SBP_PROVIDER` | `PAY2ME` | backend, worker | Эквайрер для имени провайдера **`lava_top_sbp` = СБП**. `paymentMethod` шлём явно: `SBP`. Одна интеграция lava (ключ/offerId/секрет/вебхук общие), два имени в `Payment.provider` — см. `docs/PLAN_LAVA_TOP.md`, «Инцидент 2026-09-19». |
-| ~~`LAVA_TOP_PAYMENT_PROVIDER`~~ | ~~`PAY2ME`~~ | — | **Удалена 2026-09-19.** Была единой кнопкой «Карта РФ / СБП»: `paymentProvider=PAY2ME` без `paymentMethod`, агрегатор давал выбрать способ сам. lava закрыл карту у PAY2ME → каждый счёт падал с 400 «Restricted payment method type». Из `docker-compose.yml`/`env.j2` убрана, кодом не читается — на её месте пара `LAVA_TOP_CARD_PROVIDER`/`LAVA_TOP_SBP_PROVIDER`. |
-| `LAVA_TOP_RECONCILE_INTERVAL` | `60` | worker | Авто-сверка карточных платежей (вебхук-независимо): воркер раз в N сек опрашивает lava `GET /api/v2/invoices` и зачисляет pending-счета с COMPLETED-продажей (матч по `clientUtm.utm_content`). Страховка на случай, когда вебхук lava не долетает (best-effort доставка). `0` = выключить. Воркеру нужны и `LAVA_TOP_API_KEY`/`_OFFER_ID`/`_WEBHOOK_SECRET`/`_EMAIL_DOMAIN` (прокинуты в worker-env). |
-| `TRIBUTE_API_KEY` | `""` | backend | API-ключ Tribute (дашборд → Settings → API Keys), заголовок `Api-Key`. Им же подписываются вебхуки (`trbt-signature` = HMAC-SHA256 тела). |
-| `TRIBUTE_ORDER_TITLE` | `Пополнение баланса` | backend | Нейтральный title заказа в Tribute (обязателен у платформы, Stage 9d-нейтральность). |
-| `TRIBUTE_ORDER_DESCRIPTION` | `Пополнение баланса личного кабинета` | backend | Нейтральный description заказа. |
-| `TRIBUTE_API_BASE` | `https://tribute.tg/api/v1` | backend | Переопределение базового URL (тесты). |
 | `CRYPTOBOT_TOKEN` | `""` | backend | Bearer token к CryptoBot API. HMAC webhook-сигнатура считается от `sha256(token)` как ключа. |
-| `CRYPTOBOT_RUB_PER_USDT` | `0` | backend | Курс ₽ за 1 USDT для конвертации RUB-счетов в `/checkout` (аудит #108). `0`/не задан = RUB-счёт через cryptobot отклоняется с 503 (защита от выставления рублей как USDT 1:1). Сумма округляется вверх до цента. |
 | `TELEGRAM_STARS_WEBHOOK_SECRET` | `""` | backend, bot | **Deprecated** (#62). Shared secret для legacy polling-режима. Заменён на `TELEGRAM_WEBHOOK_SECRET_TOKEN`. |
 | `TELEGRAM_WEBHOOK_SECRET_TOKEN` | `""` | backend | Secret для native Telegram webhook (`setWebhook`). Backend проверяет `X-Telegram-Bot-Api-Secret-Token` header на каждом update. |
 | `TELEGRAM_WEBHOOK_URL` | `""` | backend | Публичный URL для `/tg-webhook` (напр. `https://grinwer.online/tg-webhook`). Если пусто — webhook не регистрируется. |
@@ -229,20 +149,7 @@
 
 | переменная | default | кто читает | описание |
 |---|---|---|---|
-| `SUB_LINK_BASE_URL` | `""` | backend, worker, bot | Base URL sub-links вида `<base>/<sub_token>`. Пусто → sub links disabled, клиенты получают raw URIs. **Зеркалится** в backend и worker, потому что обе стороны пишут `Device.connection_uri`. Указывать на «boring» CDN-домен, не на основной grinwer.online — RKN-блокировка основного не убьёт installed-клиентов. **CDN-фронт обязан отдавать HTTP/1.1**: RKN DPI на мобильных операторах режет H2 stream после TLS-handshake (headers доходят, тело — нет), H1.1 проскакивает. На Cloudflare отключение HTTP/2 требует Pro-плана (Free-план оставляет H2 включённым). Текущий фронт — `grn-ssync.pro` (CF Worker `v8-sub`, проксирует `/<token>` → `https://grinwer.online/api/sub/<token>`). От той же базы строится `extra.sub_uri` пуша `config_ready` (`services/config_ready.py`): пусто → пуш уходит без ссылки, текст ведёт в личный кабинет. |
-| `SUB_PROFILE_UPDATE_INTERVAL_H` | `2` | backend | Заголовок `profile-update-interval` (часы) в саб-ответе — как часто Hiddify/v2rayNG/HAPP сами перечитывают сабу и через sibling-alias подхватывают новую ноду после failover/миграции. Раньше было захардкожено 6ч (окно устаревания конфига до полусуток). Прод для анти-РКН профиля может ужать до `1` (компромисс свежесть failover ↔ нагрузка read-пути; write-amplification срезается `SUB_FETCH_AUDIT_SAMPLE`). |
-| `SUB_RETRY_AFTER_SEC` | `60` | backend | Значение заголовка `Retry-After` (сек) на транзиентных 503 саб-линка (пустой набор конфигов / `frozen`-подписка). Даёт корректному клиенту машиночитаемый хинт перезапросить сразу после провижининга/разморозки вместо ожидания планового `profile-update-interval`. |
-| `SUB_FILTER_UNHEALTHY_NODES` | `1` | backend | Kill-switch фильтра нездоровых нод при сборке саб-конфига: `0`/`off`/`false` — отдавать креды всех нод как раньше. При включённом (дефолт) — исключать креды нод в `cooldown`/декоммишене/с низким `health_score` (см. `MIN_HEALTHY_SCORE`), чтобы клиент не держал мёртвый эндпоинт в ротации; fallback к полному набору, если фильтр выкинул все креды. |
-| `SUB_FILTER_TUNNEL_BLIND` | `0` | backend | **Аварийный рубильник**, по умолчанию ВЫКЛЮЧЕН. Штатно каждый протокол туннелируется сам (`_SPLIT_TUNNEL_PROTOS` — все четыре: три vless-флавора через `sockopt.interface`, hysteria2 через `outbounds[].direct.bindDevice` + `acl.inline`). `1`/`on`/`true` — выкинуть из саб-конфига креды протоколов вне этого списка на нодах с `RelayExitLink`. Рычаг ПРОТОКОЛЬНЫЙ, не нодовый: он режет протоколы вне белого списка на всех relay-нодах сразу, а не конкретную ноду. Сейчас вне списка только `shadowtls+shadowsocks`, поэтому для hy2 включение рубильника — no-op. Если раскатка не прошла на КОНКРЕТНОЙ ноде, правильный рычаг — `PATCH /api/nodes/{id}` с `is_active: false` (уберёт все её креды из выдачи). Если после фильтра не осталось НИ ОДНОГО кредa — набор отдаётся нефильтрованным с `logger.error` (503 навсегда оставил бы юзера без связи). |
-| `SUB_HAPP_AUTOCONNECT` | `off` | backend | Phase B — HAPP авто-выбор сервера. `""`/`0`/`off` → никому; `all`/`on`/`true`/`yes` → всем (заголовки `subscription-autoconnect: true` + `subscription-autoconnect-type: lowestdelay`: HAPP на реконнекте берёт ноду с лучшим пингом, дохлые мимо); иначе — CSV `user_id` (обкатка). ⚠️ **`"1"` = ЮЗЕР 1, НЕ «всем»** (коллизия исправлена 2026-07-22 — для «всем» используй `all`). ⚠️ **Обязан быть проброшен в backend через docker-compose.yml** (иначе .env-значение не доедет — был мёртв 5 недель). |
-| `SUB_HAPP_AUTOCONNECT_SINCE` | `""` | backend | Опц. ISO-метка: autoconnect только для девайсов с `created_at >= метки` («только новые девайсы» — тест без путаницы со старыми/primary). Пусто = без фильтра. |
-| `SUB_LINK_FALLBACK_BASE_URL` | `""` | backend | Заголовок `fallback-url` — запасной домен ИСТОЧНИКА сабы (`<fallback>/<token>`), когда основной саб-URL режет РКН. Дормант, пока не задан. |
-| `SUB_XRAY_JSON` | `off` | backend | Отдавать Happ/v2rayTun **Xray-JSON** вместо списка ссылок — даёт фейловер внутри сессии (`observatory` + `balancers`/`leastPing`), которого заголовок autoconnect не умеет. `off` → все получают прежнее base64-тело; `allowlist` → только токенам из `SUB_XRAY_JSON_TOKENS`; `on` → всем умеющим клиентам. Прочие клиенты (Hiddify, Streisand, v2rayNG, unknown) не затрагиваются никогда. ⚠️ Формат подменяет **весь** профиль в клиенте — выкатывать через `allowlist`, а не сразу `on`. При менее чем двух легах ветка сама падает на плоский список. **Прод: `on` с 2026-08-25**, точка отката — тег `stable-2026-08-25-pre-xray-json-all`. |
-| `SUB_XRAY_JSON_TOKENS` | `""` | backend | CSV саб-токенов для режима `allowlist`. Пустой список при `allowlist` = JSON не едет никому. При `on` не читается. |
-| `SUB_XRAY_JSON_CLIENTS` | `""` | backend | Кому из **умеющих** клиентов реально отдаём: CSV из `happ`, `v2raytun`. Пусто (или мусор) = всем умеющим — рычаг не должен молча выключать фичу из-за опечатки. Отделён от режима намеренно: «формат клиент понимает» ≠ «мы проверили на живом устройстве». **Прод: пусто** — оба клиента подтверждены на живых устройствах 2026-08-25. Пригодится, когда в список умеющих добавится непроверенный клиент. |
-| `SUB_XRAY_HY2_HOP` | `off` | backend | Порт-хоппинг hy2 в Xray-JSON: `off` / `all` / CSV саб-токенов (форма как у `SUB_HAPP_AUTOCONNECT`). Кладёт в конфиг `finalmask.quicParams.udpHop` с диапазоном из `mport`. 🔴 Упирается в **ноду**, а не в клиента: пакет на порт диапазона доедет только там, где живо DNAT-правило `hy2-port-hopping`. На 2026-08-25 оно есть не на всём флоте (не переживает ребут без `netfilter-persistent`) — включение вслепую превращает рабочий hy2-лег в молчащий. Диагностика и починка: runbook §14. **Прод: саб-токен владельца** (обкатка с 2026-08-25; ufo-ru-03 починена, `aeza-ru-01` и `ufo-ru-01` ещё нет — перед `all` проверить DNAT по всему флоту). |
-| `SUB_XRAY_RU_DIRECT` | `off` | backend | Клиентское правило `ru-direct` в Xray-JSON: `off` / `all` / CSV саб-токенов (форма как у `SUB_XRAY_HY2_HOP`). Кладёт в `routing.rules` каждого профиля (между `private-direct` и балансировщиком/`proxy`) правило «РУ-зоны и домены → `direct`»: тот же список, что в роли `ru_direct_list` (копия `backend/app/services/ru_direct_list.py`, паритет держит `test_split_routing_parity.py`). РУ-сайты открываются с **реального IP человека** мимо VPN на любом леге. Зачем при серверном split: на direct-нодах без WG-туннеля (vsin-nl-01, 4vds-dk-01) split невозможен и РУ-сервисы видят IP ноды, а лег на такой ноде есть у 43/52 устройств; hy2 per-user split не умеет. `geoip:ru` на клиент не кладётся (зависимость от geoip.dat в ядре). Эффект на рефреше сабы; откат = `off` + прокат. **Прод: саб-токен владельца** (пилот с 2026-08-29). |
-| `SUB_XRAY_PROBE_INTERVAL_S` | `300` | backend | Период пинг-пробы балансировщика, секунды. Это **трафик**: ядро дёргает каждый лег раз в N секунд полноценным TLS через ноду, и с `enableConcurrency` цена множится на число легов (120 с давали ~0.5 ГБ/мес на устройство). Ниже 30 не опускается. Меньше значение — быстрее замечается упавший лег, дороже трафик. |
+| `SUB_LINK_BASE_URL` | `""` | backend, worker, bot | Base URL sub-links вида `<base>/<sub_token>`. Пусто → sub links disabled, клиенты получают raw URIs. **Зеркалится** в backend и worker, потому что обе стороны пишут `Device.connection_uri`. Указывать на «boring» CDN-домен, не на основной grinwer.online — RKN-блокировка основного не убьёт installed-клиентов. |
 
 ## Warm credential pool
 
@@ -253,9 +160,6 @@
 | `WARM_POOL_BATCH_PER_TICK` | `3` | worker | Максимум новых warm'ов за одну тику на одну ноду. Чтобы свежая нода не получила 10 последовательных ansible-runs. |
 | `WARM_POOL_MAX_CONCURRENT` | `2` | worker | Размер `_warmer_semaphore`. Отдельный от `_ansible_semaphore` ProvisioningOrchestrator'а. Process-local. |
 | `WARM_POOL_CHECK_INTERVAL` | `120` | worker | Тик warmer'а (см. секцию «Worker ticks»). |
-| `WARM_POOL_REVOKE_INTERVAL` | `300` | worker | Интервал стадии 2 отзыва (`run_warm_pool_revoke_tick`, см. секцию «Worker ticks»). |
-| `WARM_POOL_REVOKE_BATCH_PER_TICK` | `5` | worker | Сколько `revoked`-бандлов снимает с нод один revoke-sweep (по одному ansible-run на бандл). |
-| `WARM_POOL_REVOKE_MAX_ATTEMPTS` | `5` | worker | После стольких подряд провалов физического отзыва бандл откладывается (лог + ручной разбор), чтобы не молотить мёртвую ноду вечно. Process-local счётчик, сбрасывается на рестарте воркера. |
 
 ## Cold-path provisioning throttle
 
@@ -279,7 +183,6 @@ Sliding-window лимит на `ProvisioningOrchestrator.provision_subscription`
 | `FREEZE_DAYS` | backend, worker |
 | `MIN_TOPUP_KOPECKS`, `EXTRA_DEVICE_KOPECKS_PER_MONTH`, `REFERRAL_BONUS_KOPECKS` | backend, worker |
 | `PAYMENT_PROVIDER`, `PAYMENT_PROVIDERS` | backend, bot |
-| `PAYMENT_PROVIDER_CHOICES` | bot (но каждое имя из списка должно быть сконфигурировано на backend'е: `LAVA_TOP_*`/`TRIBUTE_*`/и т.д., иначе кнопка даст «способ временно недоступен») |
 | `TELEGRAM_STARS_WEBHOOK_SECRET` | backend, bot (только в legacy polling-режиме; в webhook-режиме не нужна) |
 
 ## Обязательные vs опциональные
@@ -318,9 +221,7 @@ Handler `recreate app stack` в `deploy_app_stack` делает это авто�
 - **`RENEWAL_CHECK_INTERVAL` в `.env.example` = 300, в коде default = 3600.** `worker.py` имеет `os.getenv("RENEWAL_CHECK_INTERVAL", "3600")`, а `.env.example` ставит `300`. Разница в 12×. Непонятно, какое считается правильным.
 - **`AUTOSCALE_INTERVAL` default = `0` в коде, `300` в `.env.example`.** `0` означает «отключить полностью». Чистый env без `.env.example` выключит autoscale — это может быть сюрпризом при dev-разворачивании.
 - ✅ **`PROVISIONING_SSH_KEY` теперь обязателен.** Compose использует `${PROVISIONING_SSH_KEY:?...}` — без переменной `docker-compose up` выдаст ошибку, а не сломанный mount.
-- ✅ **`FREEZE_DAYS` — единственный freeze-tunable.** `MAX_FREEZE_DAYS_PER_PERIOD` и `FREEZE_YEAR_BUDGET_DAYS` убраны (были dead code). `FREEZE_DAYS=7` по умолчанию, 1 раз в год.
+- ✅ **`FREEZE_DAYS` — единственный freeze-tunable.** `MAX_FREEZE_DAYS_PER_PERIOD` и `FREEZE_YEAR_BUDGET_DAYS` убраны (были dead code). `FREEZE_DAYS=14` по умолчанию, 1 раз в год.
 - **Нет env для включения/выключения individual-провайдера.** Включение CryptoBot — только `PAYMENT_PROVIDER=cryptobot` или наличие в `PAYMENT_PROVIDERS` списке. Нет способа «оставить rotation, но временно выключить конкретно SBP» без редактирования списка.
 - **`SBP_<SLUG>_*` не валидируются на старте backend'а.** Если `PAYMENT_PROVIDERS=sbp:foo,cryptobot`, но нет `SBP_FOO_HMAC_SECRET` — ошибка всплывёт только в момент первого `/checkout` c этим провайдером. Pre-flight check для SBP не зафиксирован.
 - **`BOT_USERNAME` может быть пустым** — рефералки покажут бесшовный код вместо share-link. Warning'а backend не эмитит.
-
-| `REPAIR_ALERT_DELAY_MIN` | `60` | worker-scheduler | Через сколько минут после жалобы «VPN не работает» перепроверять `inconclusive`-репорт и слать `admin_alert_repair_failed`, если переподключения так и нет (`services/repair_alerts.py`). В compose не проброшен — работает дефолт. |

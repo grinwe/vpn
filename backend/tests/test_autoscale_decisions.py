@@ -15,6 +15,7 @@ We assert against the returned ``PoolDecision`` plus the Prometheus
 """
 from __future__ import annotations
 
+from datetime import timedelta
 from types import SimpleNamespace
 
 import pytest
@@ -26,7 +27,6 @@ from app.services.node_spawner import NodeSpawnError
 from tests.factories import (
     make_node,
     make_plan,
-    make_provider,
     make_subscription_with_device,
     make_user,
 )
@@ -43,12 +43,6 @@ def _make_pool(
     high_watermark: float | None = 0.8,
     max_nodes: int | None = 10,
 ) -> models.ServerPool:
-    # autoscale_provider_id — enforced FK на cloud_providers.id. Когда пул
-    # ссылается на провайдера, засеваем его и берём реальный .id (после
-    # TRUNCATE ... RESTART IDENTITY первый insert получит ожидаемый id=1).
-    if provider_id is not None:
-        provider = make_provider(db, name=f"{name}-prov")
-        provider_id = provider.id
     pool = models.ServerPool(
         name=name,
         autoscale_enabled=enabled,

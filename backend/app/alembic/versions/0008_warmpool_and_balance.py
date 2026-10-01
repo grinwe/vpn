@@ -7,13 +7,6 @@ from alembic import op
 import sqlalchemy as sa
 from sqlalchemy.dialects import postgresql
 
-from app.alembic._idempotent import (
-    has_column,
-    has_foreign_key,
-    has_index,
-    has_table,
-)
-
 
 revision = "0008_warmpool_and_balance"
 down_revision = "0007_seed_plans"
@@ -35,39 +28,27 @@ def upgrade() -> None:
         "END IF; END $$;"
     )
 
-    # Каждый op.add_column обёрнут в has_column-guard. Причина — 0001
-    # делает Base.metadata.create_all() с текущим состоянием моделей, у
-    # которых эти колонки уже есть. См. app/alembic/_idempotent.py.
-    if not has_column("credentials", "pool_state"):
-        op.add_column(
-            "credentials",
-            sa.Column(
-                "pool_state",
-                pool_state,
-                nullable=False,
-                server_default="assigned",
-            ),
-        )
-    if not has_column("credentials", "warmed_at"):
-        op.add_column("credentials", sa.Column("warmed_at", sa.DateTime(), nullable=True))
-    if not has_column("credentials", "assigned_at"):
-        op.add_column("credentials", sa.Column("assigned_at", sa.DateTime(), nullable=True))
-    if not has_column("credentials", "node_id"):
-        op.add_column("credentials", sa.Column("node_id", sa.Integer(), nullable=True))
-    if not has_column("credentials", "access_username"):
-        op.add_column("credentials", sa.Column("access_username", sa.String(), nullable=True))
-    if not has_index("credentials", "ix_credentials_access_username"):
-        op.create_index("ix_credentials_access_username", "credentials", ["access_username"])
-    if not has_foreign_key("credentials", "fk_credentials_node"):
-        op.create_foreign_key(
-            "fk_credentials_node", "credentials", "vpn_nodes", ["node_id"], ["id"]
-        )
-    if not has_index("credentials", "ix_credentials_node_id"):
-        op.create_index("ix_credentials_node_id", "credentials", ["node_id"])
+    op.add_column(
+        "credentials",
+        sa.Column(
+            "pool_state",
+            pool_state,
+            nullable=False,
+            server_default="assigned",
+        ),
+    )
+    op.add_column("credentials", sa.Column("warmed_at", sa.DateTime(), nullable=True))
+    op.add_column("credentials", sa.Column("assigned_at", sa.DateTime(), nullable=True))
+    op.add_column("credentials", sa.Column("node_id", sa.Integer(), nullable=True))
+    op.add_column("credentials", sa.Column("access_username", sa.String(), nullable=True))
+    op.create_index("ix_credentials_access_username", "credentials", ["access_username"])
+    op.create_foreign_key(
+        "fk_credentials_node", "credentials", "vpn_nodes", ["node_id"], ["id"]
+    )
+    op.create_index("ix_credentials_node_id", "credentials", ["node_id"])
 
     # subscription_id needs to become nullable so warm credentials can
-    # exist without a sub. alter_column идемпотентен по природе (если
-    # уже NULL — повторное "сделай NULL" no-op).
+    # exist without a sub.
     op.alter_column(
         "credentials", "subscription_id", existing_type=sa.Integer(), nullable=True
     )
@@ -91,21 +72,19 @@ def upgrade() -> None:
     )
 
     # ── Stage 4: balance billing ─────────────────────────────────────
-    if not has_column("users", "balance_kopecks"):
-        op.add_column(
-            "users",
-            sa.Column(
-                "balance_kopecks",
-                sa.Integer(),
-                nullable=False,
-                server_default="0",
-            ),
-        )
-    if not has_column("plans", "daily_rate_kopecks"):
-        op.add_column(
-            "plans",
-            sa.Column("daily_rate_kopecks", sa.Integer(), nullable=True),
-        )
+    op.add_column(
+        "users",
+        sa.Column(
+            "balance_kopecks",
+            sa.Integer(),
+            nullable=False,
+            server_default="0",
+        ),
+    )
+    op.add_column(
+        "plans",
+        sa.Column("daily_rate_kopecks", sa.Integer(), nullable=True),
+    )
 
     tx_kind = postgresql.ENUM(
         "topup", "spend", "refund", "bonus", "adjust",
@@ -120,35 +99,32 @@ def upgrade() -> None:
         "END IF; END $$;"
     )
 
-    if not has_table("balance_transactions"):
-        op.create_table(
-            "balance_transactions",
-            sa.Column("id", sa.Integer(), primary_key=True),
-            sa.Column(
-                "user_id",
-                sa.Integer(),
-                sa.ForeignKey("users.id", ondelete="CASCADE"),
-                nullable=False,
-            ),
-            sa.Column("amount_kopecks", sa.Integer(), nullable=False),
-            sa.Column("kind", tx_kind, nullable=False),
-            sa.Column("reference", sa.String(), nullable=True),
-            sa.Column("note", sa.Text(), nullable=True),
-            sa.Column(
-                "created_at",
-                sa.DateTime(),
-                nullable=False,
-                server_default=sa.func.now(),
-            ),
-        )
-    if not has_index("balance_transactions", "ix_balance_transactions_user_id"):
-        op.create_index(
-            "ix_balance_transactions_user_id", "balance_transactions", ["user_id"]
-        )
-    if not has_index("balance_transactions", "ix_balance_transactions_created_at"):
-        op.create_index(
-            "ix_balance_transactions_created_at", "balance_transactions", ["created_at"]
-        )
+    op.create_table(
+        "balance_transactions",
+        sa.Column("id", sa.Integer(), primary_key=True),
+        sa.Column(
+            "user_id",
+            sa.Integer(),
+            sa.ForeignKey("users.id", ondelete="CASCADE"),
+            nullable=False,
+        ),
+        sa.Column("amount_kopecks", sa.Integer(), nullable=False),
+        sa.Column("kind", tx_kind, nullable=False),
+        sa.Column("reference", sa.String(), nullable=True),
+        sa.Column("note", sa.Text(), nullable=True),
+        sa.Column(
+            "created_at",
+            sa.DateTime(),
+            nullable=False,
+            server_default=sa.func.now(),
+        ),
+    )
+    op.create_index(
+        "ix_balance_transactions_user_id", "balance_transactions", ["user_id"]
+    )
+    op.create_index(
+        "ix_balance_transactions_created_at", "balance_transactions", ["created_at"]
+    )
 
 
 def downgrade() -> None:

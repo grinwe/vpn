@@ -23,8 +23,6 @@ admin override — those should not start billing the user retroactively.
 import sqlalchemy as sa
 from alembic import op
 
-from app.alembic._idempotent import has_column
-
 
 revision = "0018_extra_device_slots"
 down_revision = "0017_fix_enum_values"
@@ -33,17 +31,15 @@ depends_on = None
 
 
 def upgrade() -> None:
-    # has_column-guard: 0001 create_all() уже создаёт колонку из модели.
-    if not has_column("subscriptions", "extra_device_slots"):
-        op.add_column(
-            "subscriptions",
-            sa.Column(
-                "extra_device_slots",
-                sa.Integer(),
-                nullable=False,
-                server_default="0",
-            ),
-        )
+    op.add_column(
+        "subscriptions",
+        sa.Column(
+            "extra_device_slots",
+            sa.Integer(),
+            nullable=False,
+            server_default="0",
+        ),
+    )
 
 
 def downgrade() -> None:

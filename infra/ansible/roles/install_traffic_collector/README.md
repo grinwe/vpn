@@ -1,13 +1,5 @@
 # install_traffic_collector
 
-> ⚠️ **МЕРТВА с 2026-07-29.** Ручка `POST /api/nodes/{id}/traffic`, в которую
-> пушили скрипты роли, удалена вместе с блокирующим ингестом (`used > limit` →
-> block + ревок). Per-user учёт теперь делает тик `traffic_stats` бэкенда сам:
-> SSH-опрос xray/hysteria уже несёт разбивку по юзерам, дельты копятся в
-> `Subscription.traffic_used_bytes`. Роль в проде и так не включалась
-> (`traffic_collector_backend_url` пуст); включение теперь просто отправит
-> POST-ы в 404. Оставлена как референс iptables-учёта для ShadowTLS-стека.
-
 Разворачивает на VPN-ноде учёт трафика по пользователям и отправку его в
 backend.
 

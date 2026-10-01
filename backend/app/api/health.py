@@ -89,59 +89,6 @@ def get_stats(
         .scalar()
         or 0
     )
-
-    # «Активны за 24ч» по РЕАЛЬНОМУ трафику: distinct access_username из
-    # NodeTrafficSample.details[*]["users"] за окно → резолв в Device→User
-    # (тем же путём, что /nodes/{id}/users — xray видит имя КРЕДА, а не Device).
-    # Считаем юзеров (user_id != сирота), устройства (юзер с N девайсами ≠ 1) и
-    # активных сирот отдельно (recovery-плейсхолдер user_id=999999, инцидент
-    # 2026-05). Дороже COUNT(*): скан окна сэмплов (~сотни строк/сутки) + один
-    # IN-join по индексированному access_username — для дашборда (малый флот,
-    # поллинг 15с) приемлемо.
-    from datetime import timedelta
-
-    from ..time_utils import utcnow
-
-    orphan_owner_id = 999999  # см. api/admin_claim.py ORPHAN_OWNER_ID
-    lookback = utcnow() - timedelta(hours=24)
-    active_usernames: set[str] = set()
-    for (details,) in (
-        db.query(models.NodeTrafficSample.details)
-        .filter(models.NodeTrafficSample.observed_at >= lookback)
-        .all()
-    ):
-        if not isinstance(details, dict):
-            continue
-        for proto_data in details.values():
-            if not isinstance(proto_data, dict):
-                continue
-            users = proto_data.get("users")
-            if isinstance(users, list):  # legacy rows had bare int — пропускаем
-                for uname in users:
-                    if isinstance(uname, str) and uname:
-                        active_usernames.add(uname)
-
-    users_active_24h = devices_active_24h = orphans_active_24h = 0
-    if active_usernames:
-        real_users: set[int] = set()
-        all_devices: set[int] = set()
-        orphan_devices: set[int] = set()
-        for dev_id, uid in (
-            db.query(models.Device.id, models.Device.user_id)
-            .join(models.Credential, models.Credential.device_id == models.Device.id)
-            .filter(models.Credential.access_username.in_(list(active_usernames)))
-            .distinct()
-            .all()
-        ):
-            all_devices.add(dev_id)
-            if uid == orphan_owner_id:
-                orphan_devices.add(dev_id)
-            elif uid is not None:
-                real_users.add(uid)
-        users_active_24h = len(real_users)
-        devices_active_24h = len(all_devices)
-        orphans_active_24h = len(orphan_devices)
-
     return schemas.StatsOut(
         users_total=users_total,
         subscriptions_active=subs_active,
@@ -150,9 +97,6 @@ def get_stats(
         nodes_total=nodes_total,
         nodes_active=nodes_active,
         devices_active=devices_active,
-        users_active_24h=users_active_24h,
-        devices_active_24h=devices_active_24h,
-        orphans_active_24h=orphans_active_24h,
         provisioning_tasks_pending=tasks_pending,
         provisioning_tasks_failed=tasks_failed,
     )

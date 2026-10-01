@@ -4,8 +4,3 @@
     name: xray-ws-cdn
     state: restarted
     daemon_reload: yes
-
-- name: reload nginx ws cdn
-  systemd:
-    name: nginx
-    state: reloaded

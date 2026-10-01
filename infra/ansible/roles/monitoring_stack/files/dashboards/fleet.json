@@ -2,23 +2,16 @@
   "title": "VPN Fleet — Nodes",
   "uid": "vpn-fleet",
   "schemaVersion": 39,
-  "version": 2,
+  "version": 1,
   "refresh": "30s",
   "time": { "from": "now-6h", "to": "now" },
   "tags": ["vpn", "nodes"],
   "panels": [
     {
-      "id": 100,
-      "type": "row",
-      "title": "Relay nodes (RU)",
-      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 0 },
-      "collapsed": false
-    },
-    {
       "id": 1,
       "type": "stat",
-      "title": "Relay nodes up",
-      "gridPos": { "h": 6, "w": 6, "x": 0, "y": 1 },
+      "title": "Nodes up",
+      "gridPos": { "h": 6, "w": 6, "x": 0, "y": 0 },
       "targets": [
         { "expr": "sum(up{job=\"vpn-nodes\"})", "refId": "A", "legendFormat": "up" },
         { "expr": "count(up{job=\"vpn-nodes\"})", "refId": "B", "legendFormat": "total" }
@@ -28,8 +21,8 @@
     {
       "id": 2,
       "type": "table",
-      "title": "Relay — status",
-      "gridPos": { "h": 6, "w": 18, "x": 6, "y": 1 },
+      "title": "Nodes — status",
+      "gridPos": { "h": 6, "w": 18, "x": 6, "y": 0 },
       "targets": [
         {
           "expr": "up{job=\"vpn-nodes\"}",
@@ -44,7 +37,7 @@
       "id": 3,
       "type": "timeseries",
       "title": "CPU busy % (1 - idle)",
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 7 },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 6 },
       "targets": [
         {
           "expr": "100 * (1 - avg by (instance) (rate(node_cpu_seconds_total{mode=\"idle\",job=\"vpn-nodes\"}[5m])))",
@@ -59,7 +52,7 @@
       "id": 4,
       "type": "timeseries",
       "title": "Memory used %",
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 7 },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 6 },
       "targets": [
         {
           "expr": "100 * (1 - (node_memory_MemAvailable_bytes{job=\"vpn-nodes\"} / node_memory_MemTotal_bytes{job=\"vpn-nodes\"}))",
@@ -74,7 +67,7 @@
       "id": 5,
       "type": "timeseries",
       "title": "Network RX (bytes/s)",
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 15 },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 14 },
       "targets": [
         {
           "expr": "sum by (instance) (rate(node_network_receive_bytes_total{job=\"vpn-nodes\",device!~\"lo|docker.*|veth.*\"}[5m]))",
@@ -89,7 +82,7 @@
       "id": 6,
       "type": "timeseries",
       "title": "Network TX (bytes/s)",
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 15 },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 14 },
       "targets": [
         {
           "expr": "sum by (instance) (rate(node_network_transmit_bytes_total{job=\"vpn-nodes\",device!~\"lo|docker.*|veth.*\"}[5m]))",
@@ -104,118 +97,10 @@
       "id": 7,
       "type": "timeseries",
       "title": "Disk used %",
-      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 23 },
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 22 },
       "targets": [
         {
           "expr": "100 * (1 - (node_filesystem_avail_bytes{job=\"vpn-nodes\",fstype!~\"tmpfs|overlay|squashfs\"} / node_filesystem_size_bytes{job=\"vpn-nodes\",fstype!~\"tmpfs|overlay|squashfs\"}))",
-          "legendFormat": "{{instance}} {{mountpoint}}",
-          "refId": "A"
-        }
-      ],
-      "fieldConfig": { "defaults": { "unit": "percent", "max": 100, "min": 0 }, "overrides": [] },
-      "datasource": { "type": "prometheus", "uid": "prometheus" }
-    },
-    {
-      "id": 200,
-      "type": "row",
-      "title": "Exit nodes (WireGuard, non-RU)",
-      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 31 },
-      "collapsed": false
-    },
-    {
-      "id": 8,
-      "type": "stat",
-      "title": "Exit nodes up",
-      "gridPos": { "h": 6, "w": 6, "x": 0, "y": 32 },
-      "targets": [
-        { "expr": "sum(up{job=\"wg-exit-nodes\"})", "refId": "A", "legendFormat": "up" },
-        { "expr": "count(up{job=\"wg-exit-nodes\"})", "refId": "B", "legendFormat": "total" }
-      ],
-      "datasource": { "type": "prometheus", "uid": "prometheus" }
-    },
-    {
-      "id": 9,
-      "type": "table",
-      "title": "Exit — status",
-      "gridPos": { "h": 6, "w": 18, "x": 6, "y": 32 },
-      "targets": [
-        {
-          "expr": "up{job=\"wg-exit-nodes\"}",
-          "refId": "A",
-          "format": "table",
-          "instant": true
-        }
-      ],
-      "datasource": { "type": "prometheus", "uid": "prometheus" }
-    },
-    {
-      "id": 10,
-      "type": "timeseries",
-      "title": "Exit CPU busy %",
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 38 },
-      "targets": [
-        {
-          "expr": "100 * (1 - avg by (instance) (rate(node_cpu_seconds_total{mode=\"idle\",job=\"wg-exit-nodes\"}[5m])))",
-          "legendFormat": "{{instance}}",
-          "refId": "A"
-        }
-      ],
-      "fieldConfig": { "defaults": { "unit": "percent", "max": 100, "min": 0 }, "overrides": [] },
-      "datasource": { "type": "prometheus", "uid": "prometheus" }
-    },
-    {
-      "id": 11,
-      "type": "timeseries",
-      "title": "Exit Memory used %",
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 38 },
-      "targets": [
-        {
-          "expr": "100 * (1 - (node_memory_MemAvailable_bytes{job=\"wg-exit-nodes\"} / node_memory_MemTotal_bytes{job=\"wg-exit-nodes\"}))",
-          "legendFormat": "{{instance}}",
-          "refId": "A"
-        }
-      ],
-      "fieldConfig": { "defaults": { "unit": "percent", "max": 100, "min": 0 }, "overrides": [] },
-      "datasource": { "type": "prometheus", "uid": "prometheus" }
-    },
-    {
-      "id": 12,
-      "type": "timeseries",
-      "title": "Exit Network RX (bytes/s)",
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 46 },
-      "targets": [
-        {
-          "expr": "sum by (instance) (rate(node_network_receive_bytes_total{job=\"wg-exit-nodes\",device!~\"lo|docker.*|veth.*\"}[5m]))",
-          "legendFormat": "{{instance}}",
-          "refId": "A"
-        }
-      ],
-      "fieldConfig": { "defaults": { "unit": "Bps" }, "overrides": [] },
-      "datasource": { "type": "prometheus", "uid": "prometheus" }
-    },
-    {
-      "id": 13,
-      "type": "timeseries",
-      "title": "Exit Network TX (bytes/s)",
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 46 },
-      "targets": [
-        {
-          "expr": "sum by (instance) (rate(node_network_transmit_bytes_total{job=\"wg-exit-nodes\",device!~\"lo|docker.*|veth.*\"}[5m]))",
-          "legendFormat": "{{instance}}",
-          "refId": "A"
-        }
-      ],
-      "fieldConfig": { "defaults": { "unit": "Bps" }, "overrides": [] },
-      "datasource": { "type": "prometheus", "uid": "prometheus" }
-    },
-    {
-      "id": 14,
-      "type": "timeseries",
-      "title": "Exit Disk used %",
-      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 54 },
-      "targets": [
-        {
-          "expr": "100 * (1 - (node_filesystem_avail_bytes{job=\"wg-exit-nodes\",fstype!~\"tmpfs|overlay|squashfs\"} / node_filesystem_size_bytes{job=\"wg-exit-nodes\",fstype!~\"tmpfs|overlay|squashfs\"}))",
           "legendFormat": "{{instance}} {{mountpoint}}",
           "refId": "A"
         }

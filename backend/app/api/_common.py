@@ -15,7 +15,6 @@ import logging
 from typing import Any
 
 from fastapi import HTTPException
-from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from .. import models, schemas
@@ -50,16 +49,13 @@ def _audit(
     *,
     metadata: dict[str, Any] | None = None,
     actor_type: models.AuditActor = models.AuditActor.system,
-    commit: bool = True,
 ) -> models.AuditLog:
-    """Write an AuditLog row, committing by default.
+    """Write an AuditLog row and commit.
 
     Commits on its own because most callers just want fire-and-forget
-    audit trail writes. Pass ``commit=False`` to only *stage* the row in
-    the session — then the caller can commit the action and its audit
-    trail as a single atomic transaction (no window where the mutation
-    landed but the audit row didn't). Kept ``True`` by default so the
-    existing ~100 call sites are unaffected while handlers migrate over.
+    audit trail writes — if you need to bundle the audit row with other
+    changes into one transaction, either build the AuditLog row by hand
+    or re-order your ``db.commit()`` around this call.
     """
     log = models.AuditLog(
         actor=actor,
@@ -70,8 +66,7 @@ def _audit(
         actor_type=actor_type,
     )
     db.add(log)
-    if commit:
-        db.commit()
+    db.commit()
     return log
 
 
@@ -97,32 +92,12 @@ def _get_or_create_user(
     audit row on creation so we can trace where each user came from.
     """
     user = db.query(models.User).filter_by(telegram_id=telegram_id).first()
-    if user:
-        return user
-
-    # Создаём User и его audit-строку одной транзакцией: flush отдаёт
-    # user.id для аудита, а единственный commit гарантирует, что не
-    # останется «немой» мутации (юзер есть, следа нет — см. audit #41).
-    user = models.User(telegram_id=telegram_id, email=email)
-    db.add(user)
-    try:
-        db.flush()
-        _audit(db, telegram_id, "user_created", "user", user.id, commit=False)
+    if not user:
+        user = models.User(telegram_id=telegram_id, email=email)
+        db.add(user)
         db.commit()
-    except IntegrityError:
-        # Гонка: параллельный запрос уже создал юзера с тем же telegram_id
-        # (двойной тап «купить» в боте, ретрай сети). telegram_id уникален →
-        # откатываемся и перечитываем уже существующую строку (audit #42).
-        db.rollback()
-        user = db.query(models.User).filter_by(telegram_id=telegram_id).first()
-        if user is None:
-            raise HTTPException(
-                status_code=409,
-                detail="Конфликт при создании пользователя — повторите запрос",
-            )
-        return user
-
-    db.refresh(user)
+        db.refresh(user)
+        _audit(db, telegram_id, "user_created", "user", user.id)
     return user
 
 

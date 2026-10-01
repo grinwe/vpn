@@ -1,5 +1,0 @@
----
-# Куда писать выгруженные wg-конфиги на контроллере. Playbook
-# recover_wg_inventory.yml переопределяет на стабильный путь в
-# infra/ansible/recovered-wg/.
-recover_wg_inventory_output_dir: /tmp/wg-recovery

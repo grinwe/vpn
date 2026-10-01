@@ -45,30 +45,9 @@ vault_telegram_stars_webhook_secret: ""
 # Rotating invalidates all active webapp sessions.
 vault_webapp_jwt_secret: ""
 
-# ── Stage 9b — карты РФ/СБП: lava.top + Tribute (docs/PLAN_LAVA_TOP.md) ──
-# В проде эти четыре переменные живут в ОТДЕЛЬНОМ зашифрованном файле
-# group_vars/web/vault_payments.yml (ansible мержит все *.yml группы) —
-# основной vault.yml для их добавления перешифровывать не пришлось.
-# lava.top: ключ из кабинета (Интеграции → Public API); offerId — UUID
-# цены продукта с включённой «Ценой по запросу через API»; webhook_secret —
-# наш собственный секрет (≤80 символов), продублированный в кабинете
-# lava.top при настройке вебхука (тип авторизации «API key», URL
-# https://<домен>/api/payments/webhook/lava_top).
-# Generate secret: python -c 'import secrets; print(secrets.token_urlsafe(48))'
-vault_lava_top_api_key: ""
-vault_lava_top_offer_id: ""
-vault_lava_top_webhook_secret: ""
-
-# Tribute (tribute.tg): ключ из дашборда (Settings → API Keys). Подпись
-# вебхука — HMAC-SHA256 этим же ключом (заголовок trbt-signature),
-# отдельный секрет не нужен. Webhook URL в дашборде:
-# https://<домен>/api/payments/webhook/tribute
-vault_tribute_api_key: ""
-
-# Cloudflare API token, Zone → DNS → Edit (NOT a Global API Key). Used by
-# certbot-dns-cloudflare for the DNS-01 ACME challenge AND by the backend
-# to mint ws-cdn front records — so scope it to BOTH the grinwer.online
-# zone and the wgse.info (ws-cdn front) zone. Create at
+# Cloudflare API token used by certbot-dns-cloudflare for the DNS-01
+# ACME challenge. Scope it to Zone → DNS → Edit on the target zone
+# only (do NOT use a Global API Key). Create at
 # https://dash.cloudflare.com/profile/api-tokens.
 vault_cloudflare_api_token: "replace-me-cf-dns-edit-token"
 
@@ -76,30 +55,3 @@ vault_cloudflare_api_token: "replace-me-cf-dns-edit-token"
 # Mint via POST /api/api-tokens, then paste the returned plaintext here.
 # Leave empty to skip — probe-agent container will restart-loop on 401.
 vault_probe_agent_token: ""
-
-# Public base URL baked into Device.connection_uri. Point at a CF
-# Worker (or other CDN-fronted proxy) that forwards /<token> to
-# https://grinwer.online/api/sub/<token> — this insulates installed
-# clients from an RKN block on grinwer.online. Leave empty to fall
-# back to the backend's own domain. See Worker code in the ops notes.
-vault_sub_link_base_url: ""
-
-# Резервный базовый URL саб-ссылки: второй фронт на случай, если основной
-# (vault_sub_link_base_url) заблокируют. Пусто = фолбэка нет.
-vault_sub_link_fallback_base_url: ""
-
-# Provider ID Happ (кабинет happ-proxy.com). Привязан хешем к домену
-# саб-ссылки (vault_sub_link_base_url) — регистрировать именно его. Без
-# providerid Happ игнорирует sub-info/sub-expire/пуши об истечении.
-vault_happ_provider_id: ""
-
-# ── WS+CDN / xhttp DNS front (Cloudflare DNS-only, no proxy) ──────────
-# Front zone for ws-cdn AND xhttp SNI — a clean, dedicated domain (NOT
-# grinwer.online, which is the admin/web domain). Default wgse.info.
-# CF is used ONLY as a DNS host: the backend mints a random DNS-only
-# (grey-cloud) A-record <rand>.wgse.info → node IP, and the node serves
-# TLS itself via Let's Encrypt. CF-proxying ws/xhttp is DEAD (RKN kills
-# the CF leg) — there is no Origin CA cert anymore. vault_cloudflare_api_token
-# (above) just needs Zone.DNS:Edit on wgse.info (keep grwr.ink access too
-# until old CF-proxied records are torn down).
-vault_wscdn_front_domain: "wgse.info"

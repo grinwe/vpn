@@ -31,46 +31,21 @@ export class ApiError extends Error {
   }
 }
 
-// Дефолтный таймаут запроса. 60с покрывает синхронные тяжёлые эндпоинты
-// (migrate/bootstrap упираются в ansible/SSH), но не даёт мутации висеть в
-// isPending вечно, если бэкенд/прокси залипли — иначе кнопка остаётся
-// задизейбленной без сообщения. Переопределяется через 4-й аргумент api.*.
-const DEFAULT_TIMEOUT_MS = 60_000;
-
 async function request<T>(
   method: string,
   path: string,
-  body?: unknown,
-  timeoutMs: number = DEFAULT_TIMEOUT_MS,
+  body?: unknown
 ): Promise<T> {
   const headers: Record<string, string> = {};
   const token = getToken();
   if (token) headers["X-Admin-Token"] = token;
   if (body !== undefined) headers["Content-Type"] = "application/json";
 
-  let res: Response;
-  try {
-    res = await fetch(`/api${path}`, {
-      method,
-      headers,
-      body: body === undefined ? undefined : JSON.stringify(body),
-      signal: AbortSignal.timeout(timeoutMs),
-    });
-  } catch (e) {
-    // Сюда попадают ТОЛЬКО сетевые сбои и аборт по таймауту — HTTP-статусы
-    // 4xx/5xx fetch не реджектит, они разбираются ниже по res.ok. status=0
-    // сигналит «до бэкенда не дошло», чтобы UI не путал это с ответом сервера.
-    if (e instanceof DOMException && e.name === "TimeoutError") {
-      throw new ApiError(
-        0,
-        `таймаут запроса — бэкенд не ответил за ${Math.round(timeoutMs / 1000)}с`,
-      );
-    }
-    if (e instanceof TypeError) {
-      throw new ApiError(0, "сеть недоступна / бэкенд не отвечает");
-    }
-    throw e;
-  }
+  const res = await fetch(`/api${path}`, {
+    method,
+    headers,
+    body: body === undefined ? undefined : JSON.stringify(body),
+  });
 
   if (!res.ok) {
     let message = res.statusText;
@@ -93,20 +68,12 @@ async function request<T>(
   return (await res.json()) as T;
 }
 
-// Опциональный timeoutMs — для заведомо долгих вызовов (напр. синхронный
-// bootstrap/reinstall). undefined → DEFAULT_TIMEOUT_MS (default-параметр
-// request срабатывает именно на undefined).
 export const api = {
-  get: <T>(path: string, timeoutMs?: number) =>
-    request<T>("GET", path, undefined, timeoutMs),
-  post: <T>(path: string, body?: unknown, timeoutMs?: number) =>
-    request<T>("POST", path, body, timeoutMs),
-  put: <T>(path: string, body?: unknown, timeoutMs?: number) =>
-    request<T>("PUT", path, body, timeoutMs),
-  patch: <T>(path: string, body?: unknown, timeoutMs?: number) =>
-    request<T>("PATCH", path, body, timeoutMs),
-  del: <T>(path: string, timeoutMs?: number) =>
-    request<T>("DELETE", path, undefined, timeoutMs),
+  get: <T>(path: string) => request<T>("GET", path),
+  post: <T>(path: string, body?: unknown) => request<T>("POST", path, body),
+  put: <T>(path: string, body?: unknown) => request<T>("PUT", path, body),
+  patch: <T>(path: string, body?: unknown) => request<T>("PATCH", path, body),
+  del: <T>(path: string) => request<T>("DELETE", path),
 };
 
 // ---- Types mirrored from backend/app/schemas.py ----
@@ -120,9 +87,6 @@ export interface UserOut {
   subscription_count: number;
   balance_kopecks: number;
   banned_at: string | null;
-  // max(Device.last_seen_at) — когда трафик юзера видели в последний раз;
-  // null = ни разу. Красит светофор «активен за 24ч» в таблице юзеров.
-  last_active_at: string | null;
 }
 
 export interface AdminTopupResponse {
@@ -151,125 +115,6 @@ export function batchBanUsers(
   });
 }
 
-// Per-subscription failure entry shared by both bulk-subscription ops.
-export interface BulkUserFailure {
-  user_id: number;
-  subscription_id: number;
-  error: string;
-}
-
-// POST /subscriptions/bulk-regenerate-sublink — массовая ПЕРЕГЕНЕРАЦИЯ
-// sub-link: каждому активному устройству выбранных юзеров выдаётся новая
-// ссылка (в ЛК), старая остаётся живой, + Telegram-уведомление. sub_token
-// МЕНЯЕТСЯ. Стоимость прежняя (extra_device_slots не трогаем). Бэкенд
-// капит на 25 юзеров/запрос — UI чанкует.
-export interface BulkRegenerateResult {
-  done: number[];
-  skipped: number[];
-  not_found: number[];
-  failed: BulkUserFailure[];
-  notified: number[];
-  subscriptions_regenerated: number;
-  devices_created: number;
-}
-
-export function bulkRegenerateSublink(
-  userIds: number[],
-  notify: boolean = false,
-): Promise<BulkRegenerateResult> {
-  return api.post<BulkRegenerateResult>(
-    "/subscriptions/bulk-regenerate-sublink",
-    { user_ids: userIds, notify },
-  );
-}
-
-// POST /subscriptions/bulk-rebuild-config — ТИХАЯ пересборка config_text
-// из текущего VPNConfig: без ротации sub_token, нового устройства,
-// ansible и пуша. Чинит вшитые URI после правки конфигов (напр. xhttp
-// sni/port после DR) — клиент подтянет исправленный URI сам на рефреше.
-export interface BulkRebuildResult {
-  done: number[];
-  skipped: number[];
-  not_found: number[];
-  failed: BulkUserFailure[];
-  credentials_rebuilt: number;
-}
-
-export function bulkRebuildConfig(
-  userIds: number[],
-): Promise<BulkRebuildResult> {
-  return api.post<BulkRebuildResult>("/subscriptions/bulk-rebuild-config", {
-    user_ids: userIds,
-  });
-}
-
-// ── Operator-aware routing (Phase 1, advisory) ───────────────────────
-// Матрица «нода × оператор → ok/fail» из краудсорса юзерских «VPN не
-// работает». choose_node это пока НЕ использует. См.
-// docs/operations/operator_routing_roadmap.md.
-
-export interface OperatorMatrixCell {
-  node_id: number;
-  node_name: string | null;
-  operator: string;
-  ok: number;
-  fail: number;
-  total: number;
-  score: number | null;
-  confident: boolean;
-}
-
-export interface OperatorMatrixOut {
-  window_hours: number;
-  min_devices: number;
-  cells: OperatorMatrixCell[];
-}
-
-export function operatorRoutingMatrix(): Promise<OperatorMatrixOut> {
-  return api.get<OperatorMatrixOut>("/admin/operator-routing/matrix");
-}
-
-export interface OperatorReportOut {
-  id: number;
-  user_id: number;
-  subscription_id: number | null;
-  operator: string | null;
-  failed_node_id: number | null;
-  failed_node_name: string | null;
-  target_node_id: number | null;
-  target_node_name: string | null;
-  outcome: string;
-  reported_at: string | null;
-  resolved_at: string | null;
-}
-
-export function operatorRoutingReports(
-  limit = 200,
-): Promise<OperatorReportOut[]> {
-  return api.get<OperatorReportOut[]>(
-    `/admin/operator-routing/reports?limit=${limit}`,
-  );
-}
-
-// POST /subscriptions/bulk-migrate-auto — массовый ПЕРЕЕЗД выбранных
-// юзеров на свободные ноды (bulk-версия карточной migrate-auto). sub_token
-// СОХРАНЯЕТСЯ, уведомления нет (профиль обновляется сам через alias).
-export interface BulkMigrateResult {
-  done: number[];
-  skipped: number[];
-  not_found: number[];
-  failed: BulkUserFailure[];
-  subscriptions_migrated: number;
-}
-
-export function bulkMigrateAuto(
-  userIds: number[],
-): Promise<BulkMigrateResult> {
-  return api.post<BulkMigrateResult>("/subscriptions/bulk-migrate-auto", {
-    user_ids: userIds,
-  });
-}
-
 export function adminTopupByTelegram(
   telegramId: string,
   amountKopecks: number,
@@ -281,105 +126,6 @@ export function adminTopupByTelegram(
   );
 }
 
-// Orphan-claim — transfers a placeholder-owned Subscription/Device/Credential
-// bundle to a real user by UUID. See docs/operations/admin_claim_orphans.md
-// and POSTMORTEM_2026-05-19.md for context.
-export interface ClaimOrphanRequest {
-  user_id?: number | null;
-  telegram_id?: string | null;
-  // Bare UUID OR full vless://… URL — backend extracts the UUID.
-  uuid: string;
-  plan_id?: number | null;
-  // ISO-8601 string; null/undefined ⇒ backend uses now()+plan.duration_days.
-  expires_at?: string | null;
-  device_name?: string | null;
-}
-
-export interface ClaimedCredentialOut {
-  id: number;
-  proto: string;
-}
-
-export interface ClaimOrphanResponse {
-  subscription_id: number;
-  device_id: number;
-  old_user_id: number;
-  new_user_id: number;
-  new_expires_at: string;
-  claimed_credentials: ClaimedCredentialOut[];
-}
-
-export function claimOrphanSubscription(
-  body: ClaimOrphanRequest,
-): Promise<ClaimOrphanResponse> {
-  return api.post<ClaimOrphanResponse>("/admin/claim-orphan", body);
-}
-
-// ── Relay-link diagnostics ────────────────────────────────────────────
-// POST /exits/links/{link_id}/diagnose — структурированная проверка
-// одного relay→exit WG-линка. Backend кладёт structured `checks`
-// в task.result, UI рендерит карточками вместо raw stdout. Подробнее:
-// docs/operations/diagnostics.md.
-
-export type DiagnoseCheckStatus = "ok" | "warn" | "fail" | "skip" | "info";
-
-export interface DiagnoseCheckEntry {
-  name: string;
-  status: DiagnoseCheckStatus;
-  latency_ms?: number | null;
-  message?: string;
-  details?: Record<string, unknown>;
-}
-
-export interface DiagnoseMeta {
-  link_id: number;
-  exit_id: number;
-  relay_id: number;
-  wg_interface: string;
-  requested_checks: string[];
-  started_at?: string;
-  finished_at?: string;
-  exit_pubkey_prefix?: string;
-}
-
-export interface DiagnoseRelayLinkRequest {
-  check_types?: string[] | null;
-  xray_port?: number | null;
-}
-
-export interface DiagnoseRelayLinkResponse {
-  link_id: number;
-  relay_node_id: number;
-  exit_id: number;
-  task_id: number;
-}
-
-// Все check_types, поддерживаемые ansible-ролью diagnose_relay_link.
-// Если бэк добавит новые — допиши сюда; роль игнорирует неизвестные
-// имена молча (только запросит у себя в `when:` фильтре).
-export const RELAY_LINK_CHECKS = [
-  "peer_on_jump",
-  "handshake_age",
-  "ping_endpoint",
-  "ping_internet_through",
-  "xray_port",
-  "listening_sockets",
-  "peer_on_exit",
-  "iptables_forward",
-] as const;
-
-export type RelayLinkCheckName = (typeof RELAY_LINK_CHECKS)[number];
-
-export function diagnoseRelayLink(
-  linkId: number,
-  body?: DiagnoseRelayLinkRequest,
-): Promise<DiagnoseRelayLinkResponse> {
-  return api.post<DiagnoseRelayLinkResponse>(
-    `/exits/links/${linkId}/diagnose`,
-    body ?? {},
-  );
-}
-
 export interface DeviceOut {
   id: number;
   name: string;
@@ -387,15 +133,6 @@ export interface DeviceOut {
   config_id: number;
   access_username: string | null;
   connection_uri: string | null;
-  node_id?: number | null;
-  node_name?: string | null;
-  node_region?: string | null;
-  is_relay?: boolean;
-  exit_id?: number | null;
-  exit_name?: string | null;
-  // Когда трафик устройства видели в последний раз (Device.last_seen_at);
-  // null = не подключалось ни разу.
-  last_seen_at?: string | null;
 }
 
 export interface SubscriptionOut {
@@ -433,9 +170,6 @@ export interface SubscriptionMigrateOut {
   new_node_id: number;
   new_node_name: string;
   provisioning_task_id: number | null;
-  // Заполняется только авто-миграцией (/migrate-auto): забанили ли
-  // старую ноду для юзера. null/undefined для ручной /migrate.
-  banned_old_node?: boolean | null;
 }
 
 export interface SubscriptionSwitchExitIn {
@@ -450,71 +184,6 @@ export interface SubscriptionSwitchExitOut {
   task_ids: number[];
 }
 
-export interface DeviceMigrateIn {
-  target_node_id: number;
-}
-
-export interface DeviceMigrateOut {
-  old_device_id: number;
-  device_id: number;
-  old_node_id: number;
-  old_node_name: string;
-  new_node_id: number;
-  new_node_name: string;
-  provisioning_task_id: number | null;
-}
-
-export interface DeviceSwitchExitIn {
-  exit_id: number;
-}
-
-export interface DeviceSwitchExitOut {
-  device_id: number;
-  old_exit_id: number | null;
-  new_exit_id: number;
-  new_interface: string;
-  task_ids: number[];
-}
-
-// Диверсная подписка (DIVERSE_SUB_NODES>1): один device несёт активные
-// creds на нескольких нодах. Это — набор тех нод («на каких RU-нодах сидит
-// юзер»), по одной записи на ноду с её протоколами.
-export interface DeviceNodeOut {
-  node_id: number;
-  name: string | null;
-  region: string | null;
-  status: string | null;
-  protocols: string[];
-}
-
-export interface DeviceNodeSetOut {
-  device_id: number;
-  nodes: DeviceNodeOut[];
-}
-
-export interface DeviceNodeSwapOut {
-  device_id: number;
-  removed_node_id: number;
-  added_nodes: number;
-  nodes: DeviceNodeOut[];
-}
-
-export function getDeviceNodes(deviceId: number): Promise<DeviceNodeSetOut> {
-  return api.get<DeviceNodeSetOut>(`/devices/${deviceId}/nodes`);
-}
-
-// Diverse-rotation: убрать ноду из набора device и добрать свежую взамен
-// (sub_token не меняется). Возвращает новый набор нод.
-export function swapDeviceNode(
-  deviceId: number,
-  nodeId: number,
-): Promise<DeviceNodeSwapOut> {
-  return api.post<DeviceNodeSwapOut>(
-    `/devices/${deviceId}/nodes/${nodeId}/swap`,
-    {},
-  );
-}
-
 export interface StatsOut {
   users_total: number;
   subscriptions_active: number;
@@ -523,10 +192,6 @@ export interface StatsOut {
   nodes_total: number;
   nodes_active: number;
   devices_active: number;
-  // «Активны за 24ч» по реальному трафику (NodeTrafficSample).
-  users_active_24h: number;
-  devices_active_24h: number;
-  orphans_active_24h: number;
   provisioning_tasks_pending: number;
   provisioning_tasks_failed: number;
 }
@@ -543,12 +208,6 @@ export interface InvoiceListItem {
   status: string;
   action: string;
   created_at: string;
-  // Платёж по счёту: провайдер и его идентификатор (contractId у lava.top),
-  // статус платежа и момент оплаты. null — платежа ещё не было.
-  payment_provider?: string | null;
-  payment_external_id?: string | null;
-  payment_status?: string | null;
-  paid_at?: string | null;
 }
 
 export interface NodeExitLinkHealthMini {
@@ -571,52 +230,12 @@ export interface VPNNodeOut {
   status: string;
   is_active: boolean;
   health_score: number;
-  active_users: number;
-  // assigned_users — сколько разных юзеров держат активный cred на ноде
-  // (diverse-sub-корректно, детерминированный DB-join; не протухает как
-  // active_users из traffic-сэмпла). «Сколько людей на ноде сидит».
-  assigned_users: number;
-  // cert_expires_at — ближайшее истечение LE-серта (xhttp/ws-cdn) ноды.
-  // Пишет cert-renewal-тик (внешняя TLS-проба). null = нет сертов/не пробовано.
-  cert_expires_at: string | null;
-  // Версии софта на ноде — снимает tick-node-versions по SSH раз в час.
-  // xray_version — что реально стоит на ноде; release_version — версия НАШЕГО
-  // кода из /etc/vpn-node-release.json (пишется бутстрапом после успеха всех
-  // ролей). versions_checked_at=null → ноду ещё ни разу не опрашивали.
-  xray_version: string | null;
-  release_version: string | null;
-  // hysteria2 — отдельный демон со своим бинарём (xray его не обслуживает).
-  hysteria_version: string | null;
-  versions_checked_at: string | null;
   blocked_regions: string[];
   cooldown_until: string | null;
   suspect_since: string | null;
   has_relay_config: boolean;
   exit_links: NodeExitLinkHealthMini[];
   last_ssh_at: string | null;
-  // Reconciler: нода помечена dirty (desired > reconciled), прогон отложен на
-  // тик. reconcile_due_at — когда тик её подхватит. Дефолты false/null.
-  reconcile_pending: boolean;
-  reconcile_due_at: string | null;
-  // NULL = auto-trigger и Telegram-алёрты включены. Timestamp = mute.
-  auto_diagnose_disabled_at?: string | null;
-  // ── Diagnose-control state (см. api/diagnostics.py) ──
-  // Все timestamp'ы — ISO-8601 или null. Заполняются бэком в VPNNodeOut.
-  // disabled_at — hard-stop ВСЕХ diagnose-тасок ноды (отдельно от
-  // auto_diagnose_disabled_at, который глушит только smart-триггер+алёрты).
-  diagnostics_disabled_at?: string | null;
-  // alerts_muted_until — Telegram-алёрты заглушены до этого момента
-  // (forever = далёкое будущее). null = не заглушены.
-  alerts_muted_until?: string | null;
-  // diagnose_incident_open_at — открытый инцидент: пока стоит, бэк
-  // авто-передиагностит по follow_mode. ack снимает авто-передиагностику.
-  diagnose_incident_open_at?: string | null;
-  diagnose_follow_mode?: string | null;
-  diagnose_acked_at?: string | null;
-  last_diagnosed_at?: string | null;
-  // last_probe_* — лёгкий probe (ping/ssh), отдельно от полной диагностики.
-  last_probe_at?: string | null;
-  last_probe_status?: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -637,286 +256,6 @@ export interface VPNNodeCreateIn {
   ssh_port: number;
   pool_id: number | null;
   notes: string | null;
-}
-
-// Региональные пулы reality-dest — зеркало REALITY_DEST_POOLS в
-// backend/app/services/node_spawner.py. Suggestion'ы в refresh-dest модалке
-// показываются ПО СТРАНЕ ноды. Хардкод вместо fetch'а осознанно: пул меняется
-// редко, лишний роундтрип при открытии модалки не нужен.
-export const REALITY_DEST_POOLS_BY_CC: Record<string, readonly string[]> = {
-  ru: ["www.yandex.ru", "vk.ru", "mail.ru", "rutube.ru", "lenta.ru"],
-  de: ["www.bmw.de", "www.mercedes-benz.com", "www.zalando.de"],
-  nl: ["www.bol.com", "www.philips.com", "www.adyen.com"],
-  fr: ["www.louisvuitton.com", "www.decathlon.fr", "www.sncf-connect.com"],
-  cz: ["www.seznam.cz", "www.alza.cz"],
-  fi: ["www.nokia.com", "www.kone.com", "www.fortum.com"],
-  se: ["www.ikea.com", "www.volvocars.com"],
-  gb: ["www.bbc.co.uk", "www.gov.uk", "www.bt.com"],
-  es: ["www.zara.com", "www.bbva.es", "www.iberia.com"],
-  at: ["www.redbull.com", "www.swarovski.com", "www.erstegroup.com"],
-  pl: ["www.allegro.pl", "www.onet.pl"],
-  ch: ["www.nestle.com", "www.swatch.com"],
-  it: ["www.ferrari.com", "www.eni.com", "www.unicredit.it"],
-};
-// region (название страны) → cc. Зеркало _COUNTRY_CC на бэке.
-const REALITY_REGION_CC: Record<string, string> = {
-  russia: "ru", "россия": "ru", netherlands: "nl", "нидерланды": "nl",
-  germany: "de", "германия": "de", france: "fr", "франция": "fr",
-  czech: "cz", czechia: "cz", "czech republic": "cz", "чехия": "cz",
-  finland: "fi", "финляндия": "fi", sweden: "se", "швеция": "se",
-  "united kingdom": "gb", "great britain": "gb", britain: "gb", uk: "gb",
-  england: "gb", "великобритания": "gb", spain: "es", "испания": "es",
-  austria: "at", "австрия": "at", switzerland: "ch", "швейцария": "ch",
-  italy: "it", "италия": "it", poland: "pl", "польша": "pl",
-};
-// Пул suggestion'ов по региону ноды (фолбэк — РУ, как на бэке).
-export function realityPoolForRegion(
-  region: string | null | undefined,
-): readonly string[] {
-  const cc = REALITY_REGION_CC[(region || "").trim().toLowerCase()];
-  return REALITY_DEST_POOLS_BY_CC[cc] || REALITY_DEST_POOLS_BY_CC.ru;
-}
-
-export interface NodeRefreshDestIn {
-  // null/undefined → бэкенд автоматически выберет из пула наименее
-  // используемый домен.
-  sni?: string | null;
-}
-
-export interface NodeRefreshDestOut {
-  node_id: number;
-  old_sni: string;
-  new_sni: string;
-  sub_count: number;
-  failed_subs: number[];
-  task_ids: number[];
-}
-
-export function refreshNodeRealityDest(
-  nodeId: number,
-  payload: NodeRefreshDestIn,
-): Promise<NodeRefreshDestOut> {
-  return api.post<NodeRefreshDestOut>(
-    `/nodes/${nodeId}/refresh-reality-dest`,
-    payload,
-  );
-}
-
-// ── Cloud providers / order node (hoster API, напр. 4vps) ──
-
-export interface CloudProviderOut {
-  id: number;
-  name: string;
-  kind: string;
-  default_image: string | null;
-  default_region: string | null;
-  default_plan: string | null;
-  ssh_key_ids: string[] | null;
-  is_active: boolean;
-  created_at: string;
-}
-
-// Образ ОС внутри тарифа (у 4vps образы зависят от тарифа+ДЦ).
-export interface OfferingImage {
-  id: number | null;
-  name: string;
-}
-
-export interface OfferingPlan {
-  id: number | null;
-  name: string;
-  price?: number | null;
-  cpu?: number | null;
-  ram_mib?: number | null;
-  rom?: number | null;
-  images?: OfferingImage[];
-}
-
-export interface OfferingDatacenter {
-  id: number | null;
-  name: string;
-  flag?: string | null;
-  cpu_name?: string | null;
-}
-
-export interface ProviderOfferings {
-  datacenters: OfferingDatacenter[];
-  plans: OfferingPlan[];
-  images: OfferingImage[];
-}
-
-export interface NodeSpawnIn {
-  provider_id: number;
-  name?: string | null; // пусто → бэкенд сгенерит «<хостер>-<cc>-<NN>»
-  region: string; // datacenter id (строкой)
-  plan: string; // tariff id (строкой)
-  image?: string | null; // ostempl id (строкой)
-  pool_id?: number | null;
-  notes?: string | null;
-}
-
-export function listCloudProviders(): Promise<CloudProviderOut[]> {
-  return api.get<CloudProviderOut[]>("/cloud/providers");
-}
-
-export function getProviderOfferings(
-  providerId: number,
-): Promise<ProviderOfferings> {
-  return api.get<ProviderOfferings>(
-    `/cloud/providers/${providerId}/offerings`,
-  );
-}
-
-export function spawnNode(payload: NodeSpawnIn): Promise<VPNNodeOut> {
-  return api.post<VPNNodeOut>("/nodes/spawn", payload);
-}
-
-// Заказ облачной WG-exit-ноды — зеркало NodeSpawnIn без pool_id (exit'ы не
-// входят в choose_node-пул). Возврат не используется формой (она инвалидирует
-// список), поэтому unknown.
-export interface ExitSpawnIn {
-  provider_id: number;
-  name?: string | null; // пусто → бэкенд сгенерит «<хостер>-<cc>-<NN>»
-  region: string; // datacenter (локация) id строкой
-  plan: string; // tariff (preset) id строкой
-  image?: string | null; // ostempl id строкой
-  notes?: string | null;
-}
-
-export function spawnExit(payload: ExitSpawnIn): Promise<unknown> {
-  return api.post("/exits/spawn", payload);
-}
-
-export function reinstallNode(
-  nodeId: number,
-  image?: string | null,
-): Promise<VPNNodeOut> {
-  return api.post<VPNNodeOut>(`/nodes/${nodeId}/reinstall`, { image });
-}
-
-export function renewNode(
-  nodeId: number,
-): Promise<{ node_id: number; renewed: boolean }> {
-  return api.post<{ node_id: number; renewed: boolean }>(
-    `/nodes/${nodeId}/renew`,
-    {},
-  );
-}
-
-// Ручной re-issue LE-сертов ноды (certbot webroot force-renewal + reload
-// nginx). НЕ путать с renewNode (облачная аренда VPS). Дополняет авто-renewal
-// cert-renewal-тика. 400 если у ноды нет LE-серт-конфигов.
-export function renewNodeCerts(
-  nodeId: number,
-): Promise<{ node_id: number; task_id: number }> {
-  return api.post<{ node_id: number; task_id: number }>(
-    `/nodes/${nodeId}/renew-certs`,
-    {},
-  );
-}
-
-// Точечная доставка ядра xray целевой версии (только роль xray_core, ~30-60с
-// против 5-8 минут полного бутстрапа). config.json не трогается, клиенты ноды
-// остаются; рестарт xray рвёт живые соединения примерно на 100 мс.
-export function upgradeNodeXray(
-  nodeId: number,
-): Promise<{ node_id: number; task_id: number }> {
-  return api.post<{ node_id: number; task_id: number }>(
-    `/nodes/${nodeId}/upgrade-xray`,
-    {},
-  );
-}
-
-// Тот же апгрейд по списку нод («обновить выбранные»). Неизвестные id
-// возвращаются в skipped — батч не падает целиком из-за одной удалённой ноды.
-export function upgradeNodesXray(
-  nodeIds: number[],
-  reason?: string,
-): Promise<{
-  started: { node_id: number; task_id: number }[];
-  skipped: number[];
-}> {
-  return api.post(`/nodes/upgrade-xray`, { node_ids: nodeIds, reason });
-}
-
-// То же для бинаря hysteria: только бинарная часть роли install_hysteria2,
-// config.yaml не перерендеривается — пер-юзерные hy2-учётки не задеваются.
-// Рестарт демона рвёт активные QUIC-сессии (клиент переподключается сам).
-export function upgradeNodeHysteria(
-  nodeId: number,
-): Promise<{ node_id: number; task_id: number }> {
-  return api.post<{ node_id: number; task_id: number }>(
-    `/nodes/${nodeId}/upgrade-hysteria`,
-    {},
-  );
-}
-
-export function upgradeNodesHysteria(
-  nodeIds: number[],
-  reason?: string,
-): Promise<{
-  started: { node_id: number; task_id: number }[];
-  skipped: number[];
-}> {
-  return api.post(`/nodes/upgrade-hysteria`, { node_ids: nodeIds, reason });
-}
-
-// Сводка версий: наш код, upstream-релизы xray и hysteria, пины в ролях и дрейф
-// по нодам.
-// Upstream берётся из кэша (наполняет tick-xray-upstream) — на каждый рендер
-// в GitHub не ходим.
-export interface ProductVersionState {
-  label: string;
-  latest: string | null;
-  pinned: string | null;
-  pin_behind_upstream: boolean;
-  checked_at: string | null;
-  html_url: string | null;
-  last_error: string | null;
-}
-
-export interface VersionsOverview {
-  app_version: string;
-  xray: ProductVersionState;
-  hysteria: ProductVersionState;
-  nodes_total: number;
-  nodes_outdated_xray: string[];
-  nodes_outdated_hysteria: string[];
-  nodes_outdated_release: string[];
-  nodes_version_unknown: string[];
-  // Нода без hy2-конфига бинаря и не имеет — это норма, поэтому список
-  // отдельный от nodes_version_unknown (там «не смогли снять версию xray»).
-  nodes_hysteria_unknown: string[];
-}
-
-export function fetchVersionsOverview(): Promise<VersionsOverview> {
-  return api.get<VersionsOverview>(`/versions/overview`);
-}
-
-// Правка дисплейных/маршрутных полей ноды (name/region/pool_id/notes).
-// Бэк валидирует name как inventory-хост + уникальность; rename без
-// re-bootstrap (ansible коннектится по host, name это alias).
-export interface VPNNodeUpdateIn {
-  name?: string;
-  region?: string;
-  pool_id?: number | null;
-  notes?: string | null;
-}
-
-export function updateNode(
-  nodeId: number,
-  payload: VPNNodeUpdateIn,
-): Promise<VPNNodeOut> {
-  return api.patch<VPNNodeOut>(`/nodes/${nodeId}`, payload);
-}
-
-export interface ServerPoolMini {
-  id: number;
-  name: string;
-}
-
-export function listPools(): Promise<ServerPoolMini[]> {
-  return api.get<ServerPoolMini[]>("/pools");
 }
 
 // Протоколы должны быть в синке с VPNConfigProtocol enum в
@@ -1014,141 +353,6 @@ export interface NodeRelayLinkOut {
   wg_client_public_key: string;
   credentials_count: number;
   created_at: string;
-  // Filled by run_relay_link_health_tick → _auto_diagnose_stale_links
-  // when a stale-handshake symptom was detected for this link. UI
-  // renders a small "автодиагностика N мин назад" badge.
-  last_auto_diagnose_at?: string | null;
-  last_auto_diagnose_task_id?: number | null;
-  last_auto_diagnose_symptom?: string | null;
-}
-
-// Node-level mute (заменяет link-level в миграции 0036). Глушит:
-//   - smart-диагностику всех link'ов этой ноды
-//   - Telegram-алёрты infra_ssh с этой нодой
-//   - node-level smart-diagnose (consecutive SSH fails)
-export function disableNodeAutoDiagnose(nodeId: number) {
-  return api.post<{ node_id: number; auto_diagnose_disabled_at: string | null }>(
-    `/nodes/${nodeId}/auto-diagnose/disable`,
-    {},
-  );
-}
-
-export function enableNodeAutoDiagnose(nodeId: number) {
-  return api.post<{ node_id: number; auto_diagnose_disabled_at: string | null }>(
-    `/nodes/${nodeId}/auto-diagnose/enable`,
-    {},
-  );
-}
-
-// ── Diagnose-control (api/diagnostics.py) ──────────────────────────────
-// Унифицированный control-channel для нод и exit'ов. kind ∈ node|exit.
-// disable/enable — hard-stop ВСЕХ diagnose-тасок цели; mute — глушит
-// Telegram-алёрты на N часов (>0 N часов, <0 навсегда, 0 — снять mute).
-// Возвращают обновлённое diagnose-состояние цели (поля как в VPNNodeOut).
-
-export type DiagnosticsTargetKind = "node" | "exit";
-
-export function diagnosticsDisable(kind: DiagnosticsTargetKind, id: number) {
-  return api.post<Record<string, unknown>>(
-    `/diagnostics/${kind}/${id}/disable`,
-    {},
-  );
-}
-
-export function diagnosticsEnable(kind: DiagnosticsTargetKind, id: number) {
-  return api.post<Record<string, unknown>>(
-    `/diagnostics/${kind}/${id}/enable`,
-    {},
-  );
-}
-
-export function diagnosticsMute(
-  kind: DiagnosticsTargetKind,
-  id: number,
-  hours: number,
-) {
-  return api.post<Record<string, unknown>>(
-    `/diagnostics/${kind}/${id}/mute`,
-    { hours },
-  );
-}
-
-// Вручную закрыть открытый diagnose-инцидент (остаточный/ложный). В отличие от
-// ack (он лишь глушит ре-диагностику), снимает сам красный бейдж: зануляет
-// diagnose_incident_open_at + сбрасывает серию падений unreachable_since.
-export function diagnosticsClose(kind: DiagnosticsTargetKind, id: number) {
-  return api.post<Record<string, unknown>>(
-    `/diagnostics/${kind}/${id}/close`,
-    {},
-  );
-}
-
-// ── Client control channel (admin trigger) ────────────────────────────
-// Имитирует client report от имени оператора — юзер написал в саппорт
-// через второй канал, оператор кликает кнопку → backend мигрирует
-// сабку на другую healthy ноду. См. docs/operations/control_channel_roadmap.md.
-
-export type ClientReportKind =
-  | "connect_failed"
-  | "user_reported"
-  | "health_check_failed";
-
-export interface AdminReportFailureRequest {
-  subscription_id: number;
-  kind?: ClientReportKind;
-}
-
-export interface AdminReportFailureResponse {
-  ok: boolean;
-  subscription_id: number;
-  retry_after_sec: number;
-  target_node_id: number | null;
-  target_node_name: string | null;
-  task_id: number | null;
-  action: string;
-}
-
-export function adminReportFailureForSubscription(
-  body: AdminReportFailureRequest,
-): Promise<AdminReportFailureResponse> {
-  return api.post<AdminReportFailureResponse>(
-    "/admin/client-control/report-for-subscription",
-    body,
-  );
-}
-
-// «Обновить подписку»: авто-выбор свободного сервера из пула (исключая
-// текущую ноду и ноды из бан-листа юзера) + миграция + авто-бан старой
-// ноды. sub_token сохраняется. В будущем тот же путь — в ЛК юзера.
-export function migrateSubscriptionAuto(
-  subId: number,
-): Promise<SubscriptionMigrateOut> {
-  return api.post<SubscriptionMigrateOut>(
-    `/subscriptions/${subId}/migrate-auto`,
-    {},
-  );
-}
-
-// Per-node баны юзера — ноды, на которые авто-выбор его не селит.
-export interface NodeUserBanOut {
-  id: number;
-  user_id: number;
-  node_id: number;
-  node_name: string | null;
-  reason: string | null;
-  created_by: string | null;
-  created_at: string;
-}
-
-export function listUserNodeBans(userId: number): Promise<NodeUserBanOut[]> {
-  return api.get<NodeUserBanOut[]>(`/users/${userId}/node-bans`);
-}
-
-export function removeUserNodeBan(
-  userId: number,
-  nodeId: number,
-): Promise<{ status: string }> {
-  return api.del<{ status: string }>(`/users/${userId}/node-bans/${nodeId}`);
 }
 
 export interface PlanOut {
@@ -1188,14 +392,13 @@ export interface ProvisioningTaskOut {
   target_type: string;
   target_id: number;
   action: string;
-  status: "pending" | "running" | "success" | "failed" | "cancelled" | string;
+  status: "pending" | "running" | "success" | "failed" | string;
   payload: Record<string, unknown> | null;
   result: Record<string, unknown> | null;
   error_message: string | null;
   created_at: string;
   started_at: string | null;
   finished_at: string | null;
-  cancel_requested_at: string | null;
   telegram_id: string | null;
 }
 
@@ -1262,113 +465,4 @@ export interface NodeHealthPingStatsOut {
   bad: number;
   bad_ratio: number;
   last_bad_at: string | null;
-}
-
-// ---- Broadcasts ----
-
-export type BroadcastStatus =
-  | "queued"
-  | "sending"
-  | "completed"
-  | "cancelled"
-  | "failed";
-
-export type BroadcastTargetFilter =
-  | { type: "all" }
-  | { type: "active" }
-  | { type: "ids"; ids: number[] };
-
-export interface BroadcastOut {
-  id: number;
-  created_at: string;
-  created_by: string;
-  text: string;
-  target_filter: BroadcastTargetFilter;
-  status: BroadcastStatus;
-  total_recipients: number | null;
-  sent_count: number;
-  failed_count: number;
-  last_user_id_cursor: number;
-  started_at: string | null;
-  completed_at: string | null;
-  cancelled_reason: string | null;
-}
-
-export interface BroadcastListResponse {
-  items: BroadcastOut[];
-  total: number;
-  has_more: boolean;
-}
-
-export function listBroadcasts(
-  params: { limit?: number; offset?: number; status?: string } = {},
-) {
-  const qs = new URLSearchParams();
-  if (params.limit !== undefined) qs.set("limit", String(params.limit));
-  if (params.offset !== undefined) qs.set("offset", String(params.offset));
-  if (params.status) qs.set("status", params.status);
-  const suffix = qs.toString() ? `?${qs}` : "";
-  return api.get<BroadcastListResponse>(`/broadcasts${suffix}`);
-}
-
-export function getBroadcast(id: number) {
-  return api.get<BroadcastOut>(`/broadcasts/${id}`);
-}
-
-export function createBroadcast(body: {
-  text: string;
-  target_filter: BroadcastTargetFilter;
-}) {
-  return api.post<BroadcastOut>("/broadcasts", body);
-}
-
-export function previewBroadcast(body: {
-  target_filter: BroadcastTargetFilter;
-}) {
-  return api.post<{ recipient_count: number }>("/broadcasts/preview", body);
-}
-
-export function cancelBroadcast(id: number, reason?: string) {
-  return api.post<BroadcastOut>(`/broadcasts/${id}/cancel`, {
-    reason: reason ?? null,
-  });
-}
-
-// ── Ad links (managed campaign deep-links + воронка) ──
-// Управляемая рекламная ссылка: name (ярлык) + tag (метка в t.me/bot?start=<tag>
-// → User.source). started/trial/paid/revenue — живая воронка по метке.
-// is_active=false гасит атрибуцию новых заходов. См.
-// docs/operations/ad_source_attribution.md.
-
-export interface AdLinkOut {
-  id: number;
-  name: string;
-  tag: string;
-  is_active: boolean;
-  notes: string | null;
-  created_at: string;
-  share_url: string | null;
-  started: number;
-  trial: number;
-  paid: number;
-  revenue_kopecks: number;
-  // Затраты на размещение и производные. cac/roi = null, когда затрат нет
-  // (бесплатное размещение) или ещё никто не заплатил — делить не на что.
-  cost_kopecks: number | null;
-  cac_kopecks: number | null;
-  roi: number | null;
-}
-
-export interface AdLinkCreateIn {
-  name: string;
-  tag?: string | null; // пусто → бэкенд сгенерит ad_<random>
-  notes?: string | null;
-  cost_kopecks?: number | null;
-}
-
-export interface AdLinkUpdateIn {
-  name?: string | null;
-  is_active?: boolean | null;
-  notes?: string | null;
-  cost_kopecks?: number | null;
 }

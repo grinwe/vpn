@@ -5,47 +5,14 @@ import {
   activateSubscription,
   changePlan,
   createTopup,
-  fetchMe,
   fetchPlans,
-  pollBalanceIncrease,
   MeResponse,
   WebAppPlan,
-  subLinkUrl,
 } from "../api";
 import { navigate } from "../router";
-import { getTg, openExternalUrl } from "../telegram";
+import { getTg } from "../telegram";
 
 type Period = "month" | "year";
-
-// Ретраи загрузки тарифов на транзиентных сетевых сбоях — тот же принцип,
-// что и withRetries в App.tsx. Без них один секундный обрыв на экране
-// покупки давал тупик «Ошибка загрузки тарифов» без пути назад.
-const PLANS_LOAD_RETRIES = 2;
-const PLANS_RETRY_DELAY_MS = 800;
-
-function sleep(ms: number): Promise<void> {
-  return new Promise((r) => setTimeout(r, ms));
-}
-
-async function fetchPlansResilient(): Promise<WebAppPlan[]> {
-  let lastErr: unknown;
-  for (let attempt = 0; attempt <= PLANS_LOAD_RETRIES; attempt++) {
-    try {
-      return await fetchPlans();
-    } catch (e) {
-      lastErr = e;
-      if (attempt < PLANS_LOAD_RETRIES) await sleep(PLANS_RETRY_DELAY_MS);
-    }
-  }
-  throw lastErr;
-}
-
-// Страховочный таймаут снятия «занятости» пополнения: openInvoice в норме
-// всегда зовёт callback, но у редких клиентов/версий при закрытии окна
-// оплаты свайпом или обрыве callback может не прийти — тогда topupState
-// навсегда завис бы в "paying" и шторка «Не хватает баланса» залипала бы
-// (закрыть/оплатить нельзя). По таймауту принудительно размыкаем.
-const TOPUP_CALLBACK_TIMEOUT_MS = 90_000;
 
 // Превращает сырой текст ошибки от fetch ("503: {...}", "500: ...")
 // в человекочитаемое сообщение. Юзеру не надо видеть JSON и коды.
@@ -54,19 +21,8 @@ function friendlyActivateError(raw: string): string {
   if (/^503/.test(raw) || /no.*node/i.test(raw) || /no trial plan/i.test(raw)) {
     return "Сейчас нет свободных серверов. Мы уже знаем — попробуй чуть позже или напиши в поддержку через раздел «Помощь».";
   }
-  // 502/504 — бэкенд/воркер/платёжный провайдер недоступен. Если бэкенд
-  // прислал человеческий detail (например «Платёжный сервис временно
-  // недоступен…»), показываем его, иначе общую фразу.
+  // 502/504 — бэкенд/воркер недоступен
   if (/^(502|504)/.test(raw)) {
-    const d = /^\d+:\s*(\{[\s\S]*\})$/.exec(raw);
-    if (d) {
-      try {
-        const parsed = JSON.parse(d[1]) as { detail?: unknown };
-        if (typeof parsed.detail === "string" && parsed.detail.trim()) return parsed.detail;
-      } catch {
-        /* не JSON */
-      }
-    }
     return "Сервис временно недоступен. Попробуй ещё раз через минуту.";
   }
   // 500 — необработанная ошибка
@@ -104,14 +60,8 @@ export default function Plans({ onActivated, subLinkBase, me, changeSubscription
     tier: string;
     days: number;
     subToken: string | null;
-    subUrl: string | null;
   } | null>(null);
   const [toast, setToast] = useState<string | null>(null);
-  // Состояние платежа-пополнения из TopupHintSheet:
-  //   "paying"    — летит createTopup / открыто окно Telegram (защита от
-  //                 повторного тапа → дублей инвойсов);
-  //   "crediting" — платёж прошёл, ждём зачисления на бэке перед refetch.
-  const [topupState, setTopupState] = useState<"paying" | "crediting" | null>(null);
 
   // When changing an existing subscription, find the current plan ID
   // so we can highlight it and use changePlan API instead of activate.
@@ -121,91 +71,18 @@ export default function Plans({ onActivated, subLinkBase, me, changeSubscription
   const currentPlanId = changeSub?.plan_id ?? null;
   const isChangeMode = !!changeSub;
 
-  // Признак «сейчас показана ошибка загрузки» для слушателей ниже — читать
-  // state из их замыкания (пустые deps) нельзя, там он был бы устаревшим.
-  const erroredRef = useRef(false);
-  // Гард от параллельных повторов (online + visibilitychange могут прийти
-  // одновременно): не запускаем второй loadPlans, пока первый в полёте.
-  const loadingRef = useRef(false);
-
-  // Загрузка тарифов с ретраями. При повторе сбрасывает экран ошибки в
-  // «Загрузка…», а не оставляет юзера в тупике «Ошибка загрузки тарифов».
-  const loadPlans = useRef(async () => {
-    if (loadingRef.current) return;
-    loadingRef.current = true;
-    erroredRef.current = false;
-    setError(null);
-    setPlans(null);
-    try {
-      const data = await fetchPlansResilient();
-      setPlans(data);
-    } catch (e) {
-      erroredRef.current = true;
-      setError(friendlyActivateError((e as Error).message));
-    } finally {
-      loadingRef.current = false;
-    }
-  });
-
   useEffect(() => {
-    loadPlans.current();
-
-    // Авто-восстановление после обрыва: если тарифы не загрузились, повторяем
-    // попытку при возврате связи и при возврате в приложение — чтобы юзер не
-    // застревал на экране ошибки без единого способа повторить.
-    const retryIfFailed = () => {
-      if (erroredRef.current) loadPlans.current();
-    };
-    const onOnline = () => retryIfFailed();
-    const onVisibility = () => {
-      if (document.visibilityState === "visible") retryIfFailed();
-    };
-    window.addEventListener("online", onOnline);
-    document.addEventListener("visibilitychange", onVisibility);
-    return () => {
-      window.removeEventListener("online", onOnline);
-      document.removeEventListener("visibilitychange", onVisibility);
-    };
+    fetchPlans()
+      .then(setPlans)
+      .catch((e) => setError(friendlyActivateError((e as Error).message)));
   }, []);
 
-  // Таймер-страховка для случая, когда openInvoice не вызовет callback.
-  const topupTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const clearTopupTimer = () => {
-    if (topupTimerRef.current !== null) {
-      clearTimeout(topupTimerRef.current);
-      topupTimerRef.current = null;
-    }
-  };
-  // Токен поколения платежа: закрытие шторки / новый платёж инкрементят его,
-  // отменяя отвязанный карточный поллинг (~90с живёт вне шторки), чтобы он не
-  // дёргал onActivated/showToast/setTopupState постфактум.
-  const payGenRef = useRef(0);
-  // Снимаем страховочный таймер при размонтировании страницы.
-  useEffect(() => () => clearTopupTimer(), []);
-
-  // ВСЕ хуки объявлены выше ранних return: на первом рендере plans === null и
-  // выполнение уходит в `return <Centered>Загрузка…</Centered>`, поэтому любой
-  // хук ниже этой точки выполнялся бы только со второго рендера. React считает
-  // хуки по порядку и на такое расхождение бросает «Rendered more hooks than
-  // during the previous render» — экран тарифов падал в белый лист целиком.
-  // E2.5 — ранний return подменял всю страницу вместе с шапкой: юзер, поймавший
-  // секундный обрыв на шаге выбора тарифа, оказывался в тупике без «назад» и
-  // без «повторить».
   if (error)
     return (
       <Centered>
-        <div className="card border-red-500/40 text-red-200 max-w-sm">
-          <div className="font-semibold">Не удалось загрузить тарифы</div>
+        <div className="card border-red-500/40 text-red-200">
+          <div className="font-semibold">Ошибка загрузки тарифов</div>
           <div className="text-tg-hint text-sm mt-1">{error}</div>
-          <button className="btn-primary w-full mt-4" onClick={() => void loadPlans.current()}>
-            Повторить
-          </button>
-          <button
-            className="btn-ghost w-full mt-2"
-            onClick={() => navigate({ name: "home" })}
-          >
-            ← В кабинет
-          </button>
         </div>
       </Centered>
     );
@@ -238,12 +115,7 @@ export default function Plans({ onActivated, subLinkBase, me, changeSubscription
         const res = await activateSubscription(plan.id);
         const tg = getTg();
         tg?.HapticFeedback?.notificationOccurred("success");
-        setActivated({
-          tier: plan.tier,
-          days: res.plan_duration_days,
-          subToken: res.sub_token,
-          subUrl: res.sub_url ?? null,
-        });
+        setActivated({ tier: plan.tier, days: res.plan_duration_days, subToken: res.sub_token });
       }
     } catch (e) {
       const msg = (e as Error).message;
@@ -258,131 +130,25 @@ export default function Plans({ onActivated, subLinkBase, me, changeSubscription
     }
   }
 
-  // Поллит /me, пока баланс не превысит baseline (платёж зачислен) или пока
-  // не выйдет таймаут. Колбэк openInvoice приходит раньше, чем вебхук Stars
-  // успевает записать платёж, поэтому мгновенный refetch отдаёт старый баланс
-  // и активация снова словит 402. ~6 попыток по 1.2 с ≈ 7 с — с запасом на
-  // медленную обработку вебхука.
-  async function waitForBalance(baselineKopecks: number): Promise<void> {
-    for (let i = 0; i < 6; i++) {
-      await new Promise((r) => setTimeout(r, 1200));
-      try {
-        const fresh = await fetchMe();
-        if (fresh.balance.balance_kopecks > baselineKopecks) return;
-      } catch {
-        // Сетевой сбой при поллинге не критичен: onActivated ниже всё равно
-        // перезапросит /me.
-      }
-    }
-  }
-
-  // Закрытие шторки пополнения: всегда снимает занятость и таймер, чтобы
-  // шторка не могла залипнуть навсегда; инкремент payGenRef гасит фоновый
-  // поллинг закрытого платежа.
-  function closeTopupHint() {
-    payGenRef.current++;
-    clearTopupTimer();
-    setTopupState(null);
-    setTopupHint(null);
-  }
-
-  async function payTopup(amountKopecks: number, provider: string) {
+  async function payTopup(amountKopecks: number) {
     const tg = getTg();
     if (!tg) {
       showToast("Открой эту страницу в Telegram");
       return;
     }
-    // Защита от повторного тапа: пока платёж в работе, не создаём новый инвойс.
-    if (topupState) return;
-    const myGen = ++payGenRef.current;
-    setTopupState("paying");
-    // Баланс до пополнения — точка отсчёта для ожидания зачисления. Свежий
-    // /me с фолбэком на проп, чтобы быстрый повторный топап не сравнивал с
-    // устаревшим (меньшим) балансом и не дал ложное «зачислено».
-    let baseline = me.balance.balance_kopecks;
     try {
-      baseline = (await fetchMe()).balance.balance_kopecks;
-    } catch {
-      /* /me не ответил — используем проп-baseline */
-    }
-    try {
-      const res = await createTopup(amountKopecks, provider);
-      // Шторку могли закрыть во время await (fetchMe/createTopup) — closeTopupHint
-      // уже сбросил topupState в null; не перезаписываем его «crediting»/«paying»
-      // и не открываем платёжку, иначе состояние залипло бы и заблокировало
-      // будущие топапы (`if(topupState)return`).
-      if (payGenRef.current !== myGen) return;
-      if (provider !== "telegram_stars") {
-        // Карта/СБП: внешняя страница без callback — открываем и поллим баланс,
-        // пока вебхук lava_top / lava_top_sbp не зачислит (дольше Stars).
-        openExternalUrl(tg, res.pay_url);
-        setTopupState("crediting");
-        const credited = await pollBalanceIncrease(baseline, {
-          attempts: 30,
-          delayMs: 3000,
-          shouldStop: () => payGenRef.current !== myGen,
-        });
-        // Платёж отменён (шторка закрыта / начат новый) — молча выходим.
-        if (payGenRef.current !== myGen) return;
-        setTopupState(null);
-        if (credited) {
-          tg.HapticFeedback?.notificationOccurred("success");
-          // E2.6 — раньше юзер возвращался с оплаты и видел тот же список
-          // тарифов без единого слова: деньги списаны, VPN нет, надо было
-          // догадаться нажать «Активировать» второй раз. planId, ради которого
-          // открывали шторку, уже лежит в topupHint — активируем сами.
-          const pending = topupHint;
-          setTopupHint(null);
-          const plan = pending && plans?.find((p) => p.id === pending.planId);
-          if (plan) {
-            void activate(plan);
-          } else {
-            onActivated();
-          }
-        } else {
-          showToast(
-            "Оплата пока не подтвердилась. Если вы оплатили — баланс обновится в течение минуты.",
-          );
-        }
-        return;
-      }
+      const res = await createTopup(amountKopecks, "telegram_stars");
       tg.openInvoice(res.pay_url, (status) => {
-        // Callback пришёл — страховочный таймер больше не нужен.
-        clearTopupTimer();
-        if (payGenRef.current !== myGen) return; // платёж отменён/закрыт
         if (status === "paid") {
           tg.HapticFeedback?.notificationOccurred("success");
-          // Не полагаемся на мгновенный refetch: ждём фактического зачисления,
-          // затем закрываем подсказку и обновляем /me.
-          setTopupState("crediting");
-          waitForBalance(baseline).finally(() => {
-            if (payGenRef.current !== myGen) return;
-            setTopupState(null);
-            setTopupHint(null);
-            onActivated();
-          });
-        } else {
-          // failed / cancelled — снимаем занятость, подсказка остаётся открытой.
-          setTopupState(null);
-          if (status === "failed") {
-            tg.HapticFeedback?.notificationOccurred("error");
-            showToast("Оплата не прошла. Попробуй ещё раз.");
-          }
+          setTopupHint(null);
+          onActivated();
+        } else if (status === "failed") {
+          tg.HapticFeedback?.notificationOccurred("error");
+          showToast("Оплата не прошла. Попробуй ещё раз.");
         }
       });
-      // Если callback так и не придёт (редкие клиенты/обрыв при свайпе окна
-      // оплаты) — принудительно размыкаем занятость, чтобы шторку можно было
-      // закрыть/повторить, а не перезапускать Mini App.
-      clearTopupTimer();
-      topupTimerRef.current = setTimeout(() => {
-        topupTimerRef.current = null;
-        if (payGenRef.current !== myGen) return;
-        setTopupState((prev) => (prev === "paying" ? null : prev));
-      }, TOPUP_CALLBACK_TIMEOUT_MS);
     } catch (e) {
-      clearTopupTimer();
-      if (payGenRef.current !== myGen) return;
-      setTopupState(null);
       showToast(friendlyActivateError((e as Error).message));
     }
   }
@@ -398,7 +164,6 @@ export default function Plans({ onActivated, subLinkBase, me, changeSubscription
         tier={activated.tier}
         days={activated.days}
         subToken={activated.subToken}
-        readyUrl={activated.subUrl}
         subLinkBase={subLinkBase}
         onHome={() => {
           onActivated();
@@ -455,10 +220,8 @@ export default function Plans({ onActivated, subLinkBase, me, changeSubscription
       {topupHint && createPortal(
         <TopupHintSheet
           suggested={topupHint.suggested}
-          busy={topupState !== null}
-          crediting={topupState === "crediting"}
-          onPay={(kop, provider) => payTopup(kop, provider)}
-          onClose={closeTopupHint}
+          onPay={(kop) => payTopup(kop)}
+          onClose={() => setTopupHint(null)}
         />,
         document.body,
       )}
@@ -590,7 +353,7 @@ function HelpSheet({ onClose }: { onClose: () => void }) {
             <b>Pro</b> — 5 устройств, ~17 ₽/день.
           </li>
           <li className="pt-2 text-tg-hint">
-            После первой оплаты тариф можно <b>заморозить</b> на 7 дней, списания остановятся.
+            Можно <b>заморозить</b> тариф на 14 дней — списания остановятся.
             Не нужен VPN — просто перестань пополнять, доступ закроется когда
             баланс закончится.
           </li>
@@ -605,68 +368,32 @@ function HelpSheet({ onClose }: { onClose: () => void }) {
 
 function TopupHintSheet({
   suggested,
-  busy,
-  crediting,
   onPay,
   onClose,
 }: {
   suggested: number;
-  busy: boolean;
-  crediting: boolean;
-  onPay: (kop: number, provider: string) => void;
+  onPay: (kop: number) => void;
   onClose: () => void;
 }) {
   return (
-    <div
-      className="fixed inset-0 bg-black/60 flex items-end justify-center"
-      // Шторка всегда закрываема (карточный поллинг длится ~90с — блокировать
-      // выход на это время нельзя). Закрытие отменяет фоновый поллинг/колбэк
-      // текущего платежа (payGenRef в payTopup), но деньги всё равно зачислит
-      // вебхук на бэке — баланс появится при следующем /me.
-      onClick={onClose}
-    >
+    <div className="fixed inset-0 bg-black/60 flex items-end justify-center" onClick={onClose}>
       <div
         className="bg-tg-bg rounded-t-3xl border-t border-white/10 p-6 max-w-xl w-full"
         onClick={(e) => e.stopPropagation()}
       >
         <h2 className="text-lg font-semibold mb-2">Не хватает баланса</h2>
         <p className="text-tg-hint text-sm mb-4">
-          Чтобы активировать этот тариф, нужно пополнить баланс на{" "}
+          Чтобы активировать этот тариф, нужно пополнить баланс. Рекомендуем{" "}
           {(suggested / 100).toFixed(0)} ₽ — этого хватит примерно на месяц.
         </p>
-        {crediting ? (
-          <button disabled className="btn-primary w-full">Ждём подтверждение оплаты…</button>
-        ) : (
-          <>
-            <p className="text-tg-hint text-sm mb-2">Выберите способ оплаты</p>
-            <button
-              onClick={() => onPay(suggested, "telegram_stars")}
-              disabled={busy}
-              className="btn-ghost w-full mb-2"
-            >
-              ⭐ Telegram Stars
-            </button>
-            <button
-              onClick={() => onPay(suggested, "lava_top_sbp")}
-              disabled={busy}
-              className="btn-primary w-full mb-2"
-            >
-              🏦 СБП
-            </button>
-            <button
-              onClick={() => onPay(suggested, "lava_top")}
-              disabled={busy}
-              className="btn-ghost w-full"
-            >
-              💳 Карта РФ
-            </button>
-          </>
-        )}
+        <button onClick={() => onPay(suggested)} className="btn-primary w-full">
+          Пополнить на {(suggested / 100).toFixed(0)} ₽
+        </button>
         <button
           onClick={onClose}
           className="w-full mt-2 py-2 text-tg-hint text-sm"
         >
-          {crediting ? "Свернуть" : "Отмена"}
+          Отмена
         </button>
       </div>
     </div>
@@ -688,14 +415,12 @@ function ActivatedScreen({
   tier,
   days,
   subToken,
-  readyUrl,
   subLinkBase,
   onHome,
 }: {
   tier: string;
   days: number;
   subToken: string | null;
-  readyUrl: string | null;
   subLinkBase: string;
   onHome: () => void;
 }) {
@@ -703,7 +428,11 @@ function ActivatedScreen({
   const [showQR, setShowQR] = useState(false);
   const qrRef = useRef<HTMLCanvasElement | null>(null);
 
-  const subUrl = subLinkUrl(readyUrl, subToken, subLinkBase);
+  const subUrl = subToken
+    ? subLinkBase
+      ? `${subLinkBase}/${subToken}`
+      : `${window.location.origin}/api/sub/${subToken}`
+    : null;
 
   useEffect(() => {
     if (!showQR || !subUrl || !qrRef.current) return;

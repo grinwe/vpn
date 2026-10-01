@@ -1,10 +1,10 @@
 """Scoped API token auth — creation, scope enforcement, revocation.
 
 These tests exist because the original auth model was "admin token can
-do anything". Now probe rigs carry narrow tokens, and it's critical
-that (a) a read-only token cannot write, (b) a revoked token stops
-working immediately, (c) the admin token still short-circuits the
-scope check.
+do anything". Now probe rigs and node collectors carry narrow tokens,
+and it's critical that (a) a probe token cannot ingest traffic,
+(b) a revoked token stops working immediately, (c) the admin token
+still short-circuits the scope check.
 """
 from __future__ import annotations
 
@@ -29,18 +29,9 @@ def test_create_token_rejects_unknown_scopes(client) -> None:
     assert resp.status_code == 400
     assert "invoices:nuke" in resp.text
 
-    # traffic:write умер вместе с блокирующим ингестом (2026-07-29) и не
-    # должен молча вернуться: учёт трафика наливает тик, а не HTTP-ручка.
-    resp = client.post(
-        "/api/api-tokens",
-        json={"name": "zombie", "scopes": ["traffic:write"]},
-    )
-    assert resp.status_code == 400
-    assert "traffic:write" in resp.text
 
-
-def test_read_scope_cannot_write_probes(client) -> None:
-    token = _create_token(client, "probe-kz", ["probe:read"])
+def test_probe_scope_grants_only_probe_routes(client) -> None:
+    token = _create_token(client, "probe-kz", ["probe:read", "probe:write"])
 
     # Swap the admin header for the scoped one.
     client.headers.pop("X-Admin-Token", None)
@@ -50,17 +41,17 @@ def test_read_scope_cannot_write_probes(client) -> None:
     resp = client.get("/api/probes/targets")
     assert resp.status_code == 200
 
-    # probe:write → denied with 403 (token is authenticated but unauthorized)
+    # traffic:write → denied with 403 (token is authenticated but unauthorized)
     resp = client.post(
-        "/api/nodes/1/probes",
-        json={"source_region": "kz", "result": "ok"},
+        "/api/nodes/1/traffic",
+        json={"collected_at": "2026-04-06T00:00:00Z", "samples": []},
     )
     assert resp.status_code == 403
-    assert "probe:write" in resp.text
+    assert "traffic:write" in resp.text
 
 
-def test_write_scope_cannot_read_probes(client) -> None:
-    token = _create_token(client, "probe-writer", ["probe:write"])
+def test_traffic_scope_cannot_read_probes(client) -> None:
+    token = _create_token(client, "collector-node-1", ["traffic:write"])
     client.headers.pop("X-Admin-Token", None)
     client.headers["X-Api-Token"] = token
 

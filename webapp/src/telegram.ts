@@ -24,11 +24,6 @@ export interface TelegramWebApp {
   // Opens a t.me link inside the Telegram client without leaving the app.
   // Used by the referral block on Home.tsx to fire a forward-share sheet.
   openTelegramLink(url: string): void;
-  // Opens an external https link (in-app browser). Used for card payment
-  // pages (lava_top): unlike Stars, they return an external pay URL and have
-  // no openInvoice callback — the balance is confirmed by polling afterwards.
-  // Optional: absent on very old clients (fall back to window.open).
-  openLink?(url: string): void;
   HapticFeedback?: {
     impactOccurred(style: "light" | "medium" | "heavy" | "rigid" | "soft"): void;
     notificationOccurred(type: "error" | "success" | "warning"): void;
@@ -43,14 +38,6 @@ declare global {
 
 export function getTg(): TelegramWebApp | null {
   return window.Telegram?.WebApp ?? null;
-}
-
-// Открыть внешнюю платёжную страницу (карта lava_top). Через
-// tg.openLink — встроенный браузер Telegram; вне Telegram или на старом
-// клиенте без openLink — обычный window.open.
-export function openExternalUrl(tg: TelegramWebApp | null, url: string): void {
-  if (tg && typeof tg.openLink === "function") tg.openLink(url);
-  else window.open(url, "_blank");
 }
 
 export function applyTheme(tg: TelegramWebApp): void {

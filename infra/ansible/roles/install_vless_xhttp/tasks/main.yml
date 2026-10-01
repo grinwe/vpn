@@ -34,63 +34,19 @@
     name: [curl, unzip, jq, ca-certificates]
     state: present
     update_cache: yes
-    cache_valid_time: 3600
 
-# ── Stage-4 anti-probing front: nginx ───────────────────────────────
-#
-# До Stage-4 xray сам слушал :443 с TLS. Активный пробер ловил голый
-# 404 от Go-stack на любой не-xhttp путь — очевидный VPN-маркер.
-# Теперь поверх встаёт nginx, xray переезжает на 127.0.0.1, неизвестные
-# пути уходят на camo-landing (см. xhttp-vhost.conf.j2).
-#
-# NB: НЕ ставим headers-more / more_clear_headers — связка
-# headers-more 0.37 + nginx 1.24 сегфолтит воркер на каждом :443-запросе
-# (подтверждено на ноде). server_tokens off даёт ванильный Server: nginx
-# (без версии) — этого достаточно для камуфляжа, маркером он не является.
-- name: Install nginx
-  apt:
-    name:
-      - nginx
-    state: present
-
-- name: Ensure webroot for ACME challenge
-  file:
-    path: /var/www/acme-challenge
-    state: directory
-    owner: www-data
-    group: www-data
-    mode: '0755'
-
-- name: Ensure camo root directory
-  file:
-    path: "{{ vless_xhttp_camo_root }}"
-    state: directory
-    owner: root
-    group: root
-    mode: '0755'
-
-- name: Deploy camo landing HTML
-  copy:
-    src: camo-index.html
-    dest: "{{ vless_xhttp_camo_root }}/index.html"
-    owner: root
-    group: root
-    mode: '0644'
-  notify: reload nginx xhttp
-
-- name: Remove default nginx site
-  file:
-    path: /etc/nginx/sites-enabled/default
-    state: absent
-  notify: reload nginx xhttp
-
-# xray-core install: pinned version через ghproxy с fallback'ом на
-# github (см. xray_core role). На комбо-ноде с install_vless_reality
-# роль идемпотентна — повторный include skip'нет если та же версия
-# уже стоит.
-- name: Install xray-core (CDN-fallback)
-  include_role:
-    name: xray_core
+- name: Install xray-core (idempotent)
+  shell: |
+    set -euo pipefail
+    if command -v xray >/dev/null 2>&1; then
+      echo "xray already installed"
+      exit 0
+    fi
+    bash -c "$(curl -fsSL https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install
+  args:
+    executable: /bin/bash
+  register: xray_xhttp_install
+  changed_when: "'already installed' not in xray_xhttp_install.stdout"
 
 # Also in bootstrap_node (the authoritative one). Kept here as a
 # safety net in case bootstrap order changes.
@@ -115,65 +71,6 @@
     group: nogroup
     mode: '0750'
 
-# Единый список РУ-зон/доменов для split-tunnel — общий на все 4 протокола
-# (reality, xhttp, ws-cdn, hysteria2). Роль задач не выполняет, только
-# отдаёт переменные ru_direct_zones / ru_direct_domains, которые шаблон
-# рендерит в свой синтаксис. Без неё рендер упадёт на undefined.
-- name: Load shared RU-direct domain list
-  include_role:
-    name: ru_direct_list
-    # public: true — БЕЗ него defaults подключаемой роли не попадают в скоуп
-    # вызывающей (ansible.builtin.include_role: public=false по умолчанию), и
-    # рендер шаблона падает с AnsibleUndefinedVariable на КАЖДОЙ ноде.
-    public: true
-
-# geoip.dat нужен XHTTP так же как Reality: routing rule RU-обхода
-# `ip: ["geoip:ru", "geoip:private"]` без файла не резолвится → xray
-# падает на старте. Установка и weekly refresh — общая роль xray_geoip
-# (CDN-fallback wrapper для borderline-РФ-провайдеров). На комбо-ноде
-# роль идемпотентна: повторный include из install_vless_reality не
-# перекачивает файл (creates: guard) и не дублирует systemd unit.
-- name: Provision geoip.dat fetcher + weekly refresh timer
-  include_role:
-    name: xray_geoip
-
-# CF-fronted xhttp (auto mode): кладём Origin CA cert в ОТДЕЛЬНЫЙ файл
-# (vless_xhttp_cert_path, дефолт /etc/nginx/ssl/xhttp-origin.crt) — НЕ в
-# общий wgse-origin.crt. Иначе на combo-ноде (ws_cdn + xhttp) две роли
-# затирают cert друг друга в одном файле, и если домены/зоны xhttp и ws
-# разные (xhttp→grwr.ink, ws→wgse.info) — один из протоколов отдаёт чужой
-# cert → CF Full(strict) его отвергает. Бэкенд проставляет
-# vless_xhttp_cert_path → certbot-блок ниже скипается. Никакого HTTP-01 ада.
-- name: Install Origin CA cert for CF-fronted xhttp
-  when: (vless_xhttp_origin_cert_b64 | default('')) | length > 0
-  block:
-    - name: Ensure nginx ssl directory (xhttp CF front)
-      file:
-        path: /etc/nginx/ssl
-        state: directory
-        owner: root
-        group: root
-        mode: '0750'
-
-    - name: Install Origin CA certificate (xhttp)
-      copy:
-        content: "{{ vless_xhttp_origin_cert_b64 | b64decode }}"
-        dest: "{{ vless_xhttp_cert_path | default('/etc/nginx/ssl/xhttp-origin.crt') }}"
-        owner: root
-        group: root
-        mode: '0644'
-      notify: reload nginx xhttp
-
-    - name: Install Origin CA private key (xhttp)
-      copy:
-        content: "{{ vless_xhttp_origin_key_b64 | b64decode }}"
-        dest: "{{ vless_xhttp_key_path | default('/etc/nginx/ssl/xhttp-origin.key') }}"
-        owner: root
-        group: root
-        mode: '0600'
-      no_log: true
-      notify: reload nginx xhttp
-
 - name: Obtain TLS certificate via certbot (if no cert path provided)
   when: (vless_xhttp_cert_path | default('')) == ''
   block:
@@ -182,66 +79,13 @@
         name: [certbot]
         state: present
 
-    - name: Check for existing Let's Encrypt certificate
-      stat:
-        path: /etc/letsencrypt/live/{{ vless_xhttp_domain }}/fullchain.pem
-      register: _xhttp_le_cert
-
-    # Первичная выдача: рендерим минимальный HTTP-only vhost, через
-    # который certbot --webroot положит acme-токен. Полноценный TLS-
-    # vhost ниже требует уже существующий серт, поэтому двухфазный
-    # bootstrap неизбежен. На повторных (идемпотентных) прогонах
-    # этот блок скипается — _xhttp_le_cert.stat.exists=True.
-    - name: Render pre-cert nginx vhost (HTTP-only acme-challenge)
-      template:
-        src: xhttp-nginx-precert.conf.j2
-        dest: /etc/nginx/sites-available/xhttp-{{ vless_xhttp_domain }}.conf
-        owner: root
-        group: root
-        mode: '0644'
-      when: not _xhttp_le_cert.stat.exists
-
-    - name: Enable pre-cert vhost
-      file:
-        src: /etc/nginx/sites-available/xhttp-{{ vless_xhttp_domain }}.conf
-        dest: /etc/nginx/sites-enabled/xhttp-{{ vless_xhttp_domain }}.conf
-        state: link
-      when: not _xhttp_le_cert.stat.exists
-
-    # Если xray всё ещё висит на :80 (маловероятно, но на bootstrap'е
-    # мог занять порты под standalone) — синхронно освобождаем перед
-    # стартом nginx. На ноде, где роль отработала раньше с --standalone,
-    # xray был на :443, а :80 свободен — этот stop-safe и failed_when:
-    # false отработает noop.
-    - name: Ensure nginx is up for pre-cert issuance
-      systemd:
-        name: nginx
-        state: started
-        enabled: yes
-      when: not _xhttp_le_cert.stat.exists
-
-    - name: Reload nginx to pick up pre-cert vhost (guarded)
-      # На combo-unify первом проходе stream:443 (reality) конфликтует с ещё не
-      # переехавшим wscdn:443 → reload падал бы жёстко (reality застревал на
-      # loopback). Толерируем ТОЛЬКО на combo-unify: acme-challenge на :80 (stream
-      # :443 его не трогает), а ws-cdn-роль ниже доведёт nginx до консистентности.
-      # Вне combo-unify фейл reload остаётся ГРОМКИМ.
-      ansible.builtin.shell: nginx -t && systemctl reload nginx
-      register: _xhttp_precert_reload
-      changed_when: false
-      failed_when: >-
-        _xhttp_precert_reload.rc != 0
-        and not (reality_stream_unify | default(false)
-                 and (vless_ws_cdn_domain | default('')) | length > 0)
-      when: not _xhttp_le_cert.stat.exists
-
-    - name: Issue certificate via webroot challenge
+    - name: Issue certificate (standalone)
       command: >-
-        certbot certonly --webroot
-        -w /var/www/acme-challenge
+        certbot certonly --standalone
         --non-interactive --agree-tos
         --email {{ vless_xhttp_acme_email | default('admin@' + vless_xhttp_domain) }}
         -d {{ vless_xhttp_domain }}
+        --preferred-challenges http
       args:
         creates: /etc/letsencrypt/live/{{ vless_xhttp_domain }}/fullchain.pem
 
@@ -250,58 +94,11 @@
         _xhttp_cert_path: /etc/letsencrypt/live/{{ vless_xhttp_domain }}/fullchain.pem
         _xhttp_key_path: /etc/letsencrypt/live/{{ vless_xhttp_domain }}/privkey.pem
 
-    # Self-heal (инцидент 2026-07-22, docs/operations/xhttp cert-expiry):
-    # старые ноды выпускались с --standalone, их renewal-.conf биндит :80 и
-    # ВСЕГДА падает при `certbot renew` (там nginx) → серты тихо истекали
-    # (клиент ловит CERT_DATE_INVALID → рвёт TLS → падает на Reality → DPI
-    # режет в жёстких регионах). Мигрируем .conf на webroot (тот же, что
-    # первичная выдача): force-renewal перезаписывает authenticator=webroot.
-    # Идемпотентно — на webroot-.conf grep не сматчит.
-    - name: Migrate legacy standalone renewal config to webroot (self-heal)
-      ansible.builtin.shell: |
-        set -e
-        conf=/etc/letsencrypt/renewal/{{ vless_xhttp_domain }}.conf
-        if [ -f "$conf" ] && grep -q 'authenticator = standalone' "$conf"; then
-          certbot certonly --webroot -w /var/www/acme-challenge \
-            -d {{ vless_xhttp_domain }} --force-renewal --non-interactive \
-            --agree-tos --email {{ vless_xhttp_acme_email | default('admin@' + vless_xhttp_domain) }}
-          systemctl reload nginx || true
-          echo MIGRATED
-        else
-          echo NOCHANGE
-        fi
-      register: _xhttp_cert_migrate
-      changed_when: "'MIGRATED' in _xhttp_cert_migrate.stdout"
-
 - name: Set cert paths from variables (if provided)
   when: (vless_xhttp_cert_path | default('')) != ''
   set_fact:
     _xhttp_cert_path: "{{ vless_xhttp_cert_path }}"
     _xhttp_key_path: "{{ vless_xhttp_key_path }}"
-
-# Renewal после первичной выдачи: certbot.timer дергает deploy-hook,
-# тот делает reload nginx + restart xray-xhttp. Без hook'а свежий
-# fullchain.pem окажется на диске, но nginx продолжит отдавать старый
-# (in-memory) — через 90 дней клиенты начнут ловить CERT_DATE_INVALID.
-# Renewal — только в direct+LE режиме. Для CF-fronted (cert_path задан =
-# Origin CA) certbot не ставится и /etc/letsencrypt нет → эти таски надо
-# скипать, иначе deploy-hook copy падает на отсутствующем каталоге.
-- name: Install certbot deploy-hook for nginx + xray reload
-  copy:
-    src: xhttp-cert-reload.sh
-    dest: /etc/letsencrypt/renewal-hooks/deploy/xhttp-reload.sh
-    owner: root
-    group: root
-    mode: '0755'
-  when: (vless_xhttp_cert_path | default('')) == ''
-
-- name: Enable certbot renewal timer
-  systemd:
-    name: certbot.timer
-    state: started
-    enabled: yes
-  failed_when: false
-  when: (vless_xhttp_cert_path | default('')) == ''
 
 # Preserve clients added dynamically by manage_vless_xhttp_user.sh across
 # re-runs of this role. Without the slurp+re-inject the template's
@@ -342,32 +139,6 @@
     vless_xhttp_existing_clients: []
   when: vless_xhttp_existing_clients is not defined
 
-# ── Migration gate: direct-TLS xray → loopback xray + nginx front ───
-#
-# До Stage-4 xray держал :443 напрямую. Если мы сейчас на миграционном
-# прогоне, nginx не сможет забиндить :443 пока xray там сидит, и
-# nginx reload упадёт с EADDRINUSE. Дальнейший старт xray с новым
-# loopback-конфигом тоже был бы безопасен (он слушает 127.0.0.1), но
-# старый процесс продолжал бы висеть на :443 до ручного вмешательства.
-#
-# Детектим по текущему содержимому config_xhttp.json: наличие "0.0.0.0"
-# там означает, что vless-xhttp inbound ещё на direct-bind'е (api-in
-# всегда на 127.0.0.1, других "0.0.0.0" в шаблоне нет). На первичном
-# bootstrap'е файла нет → grep rc=2 → "still direct" ложно-срабатывает,
-# но systemd stop несуществующего сервиса покрыт failed_when:false.
-- name: Detect if xray-xhttp still bound to 0.0.0.0 (pre-Stage-4 state)
-  shell: grep -q '"0.0.0.0"' /usr/local/etc/xray/config_xhttp.json 2>/dev/null
-  register: _xray_xhttp_is_direct
-  changed_when: false
-  failed_when: false
-
-- name: Stop xray-xhttp to free :443 for nginx (direct→loopback migration)
-  systemd:
-    name: xray-xhttp
-    state: stopped
-  when: _xray_xhttp_is_direct.rc == 0
-  failed_when: false
-
 - name: Render xray XHTTP config
   template:
     src: config_xhttp.json.j2
@@ -377,63 +148,6 @@
     mode: '0640'
     backup: yes
   notify: restart xray xhttp
-
-# Ловим битый рендер (в т.ч. отсутствующий geoip.dat для RU-обхода) до
-# старта сервиса — иначе xray-xhttp молча падает в systemd 23/EXEC, а на
-# нодах с volatile journald причину потом не восстановить. -test печатает
-# реальный текст ошибки прямо в вывод ansible.
-- name: Validate xray XHTTP config before starting
-  command: /usr/local/bin/xray -test -config /usr/local/etc/xray/config_xhttp.json
-  register: xray_xhttp_config_test
-  changed_when: false
-  failed_when: xray_xhttp_config_test.rc != 0
-
-# ── Stage-4 TLS vhost ────────────────────────────────────────────────
-#
-# Перекрывает pre-cert vhost с тем же именем (если был). Включает
-# redirect HTTP→HTTPS, ACME webroot, TLS terminus, xhttp location
-# и camo-landing как fallback. reload nginx xhttp flush'ится вместе
-# с restart xray xhttp в самом конце роли.
-# Домен xhttp может меняться (direct→CF-fronted, ротация CF-сабдомена) —
-# тогда старый xhttp-<old>.conf остаётся висеть на :443 рядом с новым
-# (так на ноде и появились xhttp-ka1.grinwer.online + xhttp-<cf>.wgse.info).
-# Сносим все xhttp-*.conf, кроме текущего домена, на каждом прогоне.
-- name: Find existing xhttp vhosts
-  find:
-    paths:
-      - /etc/nginx/sites-enabled
-      - /etc/nginx/sites-available
-    patterns: 'xhttp-*.conf'
-    # file_type=any — иначе find по дефолту матчит только обычные файлы и
-    # ПРОПУСКАЕТ симлинки в sites-enabled. Тогда remove сносит лишь файл из
-    # sites-available, а битый симлинк остаётся → nginx -t → reload падает
-    # с open() ... No such file or directory.
-    file_type: any
-  register: _xhttp_existing_vhosts
-
-- name: Remove stale xhttp vhosts (keep only current domain)
-  file:
-    path: "{{ item.path }}"
-    state: absent
-  loop: "{{ _xhttp_existing_vhosts.files }}"
-  when: item.path | basename != ('xhttp-' ~ vless_xhttp_domain ~ '.conf')
-  notify: reload nginx xhttp
-
-- name: Render nginx TLS vhost for xhttp
-  template:
-    src: xhttp-vhost.conf.j2
-    dest: /etc/nginx/sites-available/xhttp-{{ vless_xhttp_domain }}.conf
-    owner: root
-    group: root
-    mode: '0644'
-  notify: reload nginx xhttp
-
-- name: Enable nginx TLS vhost
-  file:
-    src: /etc/nginx/sites-available/xhttp-{{ vless_xhttp_domain }}.conf
-    dest: /etc/nginx/sites-enabled/xhttp-{{ vless_xhttp_domain }}.conf
-    state: link
-  notify: reload nginx xhttp
 
 - name: Install VLESS XHTTP user management helper
   copy:

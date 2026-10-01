@@ -16,12 +16,14 @@ semantics, not the playbook subprocess.
 """
 from __future__ import annotations
 
+import threading
 from types import SimpleNamespace
 
 import pytest
 from sqlalchemy.orm import Session
 
 from app import models
+from app.db import SessionLocal
 from app.services import warm_pool
 from tests.factories import make_config, make_node, make_plan, make_user
 
@@ -194,30 +196,21 @@ def test_try_assign_bundle_flips_state_and_binds_subscription(
 def test_concurrent_assignment_picks_one_winner(
     db_session: Session, fake_run_playbook
 ):
-    """A single warm bundle can be handed to at most one subscription.
+    """The race the design doc explicitly calls out.
 
-    Real thread contention is not observable in this synchronous test
-    harness: all threads share the one ``db_session`` connection, so the
-    parallel version raced SQLAlchemy's own connection state
-    (``InvalidRequestError: this session is provisioning a new
-    connection``) rather than Postgres row locks. We instead drive the
-    same invariant deterministically — two *sequential* assignment
-    attempts against a depth-1 pool. The first claims the bundle
-    (winner); the second sees the pool drained and returns ``None``
-    (loser). This is exactly the "assigned at most once" guarantee that
-    ``FOR UPDATE SKIP LOCKED`` provides under real concurrency; the
-    locking itself is exercised by the query path, just without a second
-    live connection to contend with.
+    10 threads contend for a single warm bundle. Postgres's
+    ``FOR UPDATE SKIP LOCKED`` must give the bundle to exactly one
+    thread; the other nine must see ``None`` and fall back to cold.
     """
     node = _seed_node_with_one_protocol(db_session)
     warm_pool.warm_one_bundle(db_session, node)
     assert warm_pool.pool_depth(db_session, node.id) == 1
 
-    # Two subscriptions ready to contend for the one bundle.
+    # Pre-create 10 subscriptions so each thread has a target id ready.
     user = make_user(db_session)
     plan = make_plan(db_session)
     sub_ids: list[int] = []
-    for _ in range(2):
+    for _ in range(10):
         sub = models.Subscription(
             user_id=user.id, plan_id=plan.id, node_id=node.id,
             expires_at=__import__("datetime").datetime(2099, 1, 1),
@@ -227,16 +220,39 @@ def test_concurrent_assignment_picks_one_winner(
         sub_ids.append(sub.id)
     db_session.commit()
 
-    # First caller wins the only warm bundle.
-    winner = warm_pool.try_assign_bundle(db_session, node.id, sub_ids[0])
-    db_session.commit()
-    assert winner is not None, "first caller must win the bundle"
+    # Synchronisation barrier so all threads hit the lock at once.
+    barrier = threading.Barrier(len(sub_ids))
+    results: list[bool] = []
+    results_lock = threading.Lock()
 
-    # Second caller finds the pool empty → no bundle (falls back to cold).
-    loser = warm_pool.try_assign_bundle(db_session, node.id, sub_ids[1])
-    assert loser is None, "second caller must lose — pool already drained"
+    def worker(sub_id: int) -> None:
+        session = SessionLocal()
+        try:
+            barrier.wait(timeout=5)
+            bundle = warm_pool.try_assign_bundle(session, node.id, sub_id)
+            if bundle is not None:
+                session.commit()
+                with results_lock:
+                    results.append(True)
+            else:
+                session.rollback()
+                with results_lock:
+                    results.append(False)
+        finally:
+            session.close()
 
-    # Final state: exactly one credential, in ``assigned``, bound to the winner.
+    threads = [threading.Thread(target=worker, args=(sid,)) for sid in sub_ids]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=10)
+
+    winners = [r for r in results if r]
+    losers = [r for r in results if not r]
+    assert len(winners) == 1, f"expected 1 winner, got {len(winners)}: {results}"
+    assert len(losers) == 9, f"expected 9 losers, got {len(losers)}"
+
+    # Final state: exactly one credential, in ``assigned``, bound to one sub.
     db_session.expire_all()
     assigned = (
         db_session.query(models.Credential)
@@ -245,8 +261,7 @@ def test_concurrent_assignment_picks_one_winner(
         .all()
     )
     assert len(assigned) == 1
-    assert assigned[0].subscription_id == sub_ids[0]
-    assert warm_pool.pool_depth(db_session, node.id) == 0
+    assert assigned[0].subscription_id in sub_ids
 
 
 # ── Two-stage revoke ────────────────────────────────────────────────

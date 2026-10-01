@@ -49,7 +49,6 @@ from __future__ import annotations
 import json
 import logging
 import os
-from concurrent import futures as _futures
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -64,94 +63,10 @@ KNOWN_PROTOCOL_PORTS: list[tuple[str, int]] = [
 ]
 
 XRAY_BIN = "/usr/local/bin/xray"
-# hy2 — отдельный демон со своим Traffic Stats API (HTTP на loopback), поэтому
-# в KNOWN_PROTOCOL_PORTS его нет: там gRPC-порты xray. Без этого сбора человек,
-# у которого работает ТОЛЬКО hy2 (регионы с жёстким DPI), выглядел для нас
-# «не подключившимся вовсе» — ни carrying_fraction, ни watcher репортов его
-# трафик не видели.
-HYSTERIA_PROTO = "hysteria2"
-HYSTERIA_TRAFFIC_PORT = int(os.getenv("HYSTERIA_TRAFFIC_API_PORT", "10088"))
 SSH_PORT_DEFAULT = 22
 SSH_USER = "root"
-# SSH-таймауты сборщика. Держим их в паритете с ssh_bootstrap
-# (connect=15, banner=20, auth=20): на нагруженной/подсвопленной ноде
-# sshd отдаёт баннер/аутентификацию не мгновенно, и прежние 10с на все
-# три фазы давали ложные «collect failed» ровно на тех нодах, что под
-# нагрузкой и интереснее всего для мониторинга. Через env — на случай
-# особо медленных нод.
-SSH_CONNECT_TIMEOUT = int(os.getenv("TRAFFIC_STATS_SSH_CONNECT_TIMEOUT", "15"))
-SSH_BANNER_TIMEOUT = int(os.getenv("TRAFFIC_STATS_SSH_BANNER_TIMEOUT", "20"))
-SSH_AUTH_TIMEOUT = int(os.getenv("TRAFFIC_STATS_SSH_AUTH_TIMEOUT", "20"))
-SSH_COMMAND_TIMEOUT = int(os.getenv("TRAFFIC_STATS_SSH_COMMAND_TIMEOUT", "15"))
-
-# Per-tick бюджеты сборщика (см. collect_all_active_nodes). RQ-джоба
-# tick-traffic-stats имеет job_timeout=120s (queue.py::TICK_TIMEOUTS) —
-# wall-clock-бюджет держим ниже с запасом, чтобы тик успел вернуть уже
-# собранные сэмплы вместо того, чтобы быть убитым kill-horse'ом.
-TRAFFIC_STATS_BUDGET_SEC_DEFAULT = 100
-# Сколько SSH-сессий держать параллельно. paramiko-вызовы блокирующие
-# и независимы по нодам; при последовательном обходе недоступная нода
-# стоит 10-30с и хвост флота не успевает опроситься за бюджет.
-TRAFFIC_STATS_SSH_WORKERS_DEFAULT = 8
-# Сколько тиков подряд нода может быть отсеяна по бюджету, прежде чем
-# поднимем отдельный алерт «нода систематически не опрашивается». Без
-# этого стабильно медленная (то есть подозрительная) нода откладывалась
-# бы каждый тик и не давала ни одного сэмпла — молча, в общем warning'е.
-TRAFFIC_STATS_MAX_SKIPS_DEFAULT = 3
-
-# Счётчик подряд идущих отсевов по бюджету, per node_id. Живёт в памяти
-# долгоживущего RQ-воркера между тиками (миграция/схема не нужны):
-# успешный сбор обнуляет счётчик, отсев — инкрементит; по достижении
-# порога поднимается явный алерт. При рестарте воркера обнуляется — это
-# ок, алерт лишь про «систематически», не про единичный пропуск.
-_consecutive_skips: dict[int, int] = {}
-
-
-def _resolve_provisioning_key_path() -> str:
-    """Путь к provisioning-ключу (та же логика, что в collect_node_stats)."""
-    return (
-        os.getenv("ANSIBLE_PRIVATE_KEY_FILE")
-        or os.getenv("PROVISIONING_SSH_KEY")
-        or "/run/secrets/provisioning_key"
-    )
-
-
-def _load_provisioning_pkey(key_path: str):
-    """Загрузить provisioning-ключ, перебирая типы (ed25519/rsa/ecdsa).
-
-    Раньше грузился ТОЛЬКО ``Ed25519Key`` — если оператор когда-либо
-    выдаст provisioning_key как RSA/ECDSA, ``from_private_key_file``
-    бросал бы ``SSHException`` на КАЖДОЙ ноде, и весь пассивный сбор
-    молча умирал по всему флоту (детектор edge-блоков РКН слепнет).
-    Теперь перебираем те же три загрузчика, что и ssh_bootstrap, а при
-    неудаче всех бросаем один внятный ``RuntimeError`` про тип ключа.
-    """
-    import paramiko  # noqa: WPS433 — lazy import keeps it out of API
-
-    for loader in (paramiko.Ed25519Key, paramiko.RSAKey, paramiko.ECDSAKey):
-        try:
-            return loader.from_private_key_file(key_path)
-        except Exception:  # noqa: BLE001 — не тот тип / passphrase → пробуем дальше
-            continue
-    raise RuntimeError(
-        f"provisioning key type unsupported at {key_path} "
-        "(tried ed25519/rsa/ecdsa) — сбор статистики невозможен по всему флоту"
-    )
-
-
-@dataclass
-class _NodeRef:
-    """Снимок атрибутов ноды для SSH-потоков.
-
-    Per-node commit в ``collect_all_active_nodes`` экспайрит ORM-объекты
-    (expire_on_commit), и обращение к ним из воркер-потоков дёрнуло бы
-    сессию не из главного потока. Поэтому всё нужное копируем заранее.
-    """
-
-    id: int
-    name: str
-    host: str
-    ssh_port: int | None
+SSH_CONNECT_TIMEOUT = 10
+SSH_COMMAND_TIMEOUT = 15
 
 
 @dataclass
@@ -161,15 +76,7 @@ class ProtocolStats:
     uplink: int = 0
     downlink: int = 0
     users: set[str] = field(default_factory=set)
-    # Суммарные байты (uplink+downlink) по access_username за интервал.
-    # Раньше per-user разбивка, которую отдают и xray, и hysteria,
-    # выбрасывалась на месте — из-за чего шкала трафика у юзера была
-    # вечным нулём, хотя данные каждый тик проезжали через руки.
-    user_bytes: dict[str, int] = field(default_factory=dict)
     error: str | None = None
-
-    def add_user_bytes(self, username: str, value: int) -> None:
-        self.user_bytes[username] = self.user_bytes.get(username, 0) + value
 
     def to_dict(self) -> dict[str, Any]:
         # ``users`` used to be a bare count (``int``). We now persist the
@@ -184,11 +91,6 @@ class ProtocolStats:
             "users": sorted(self.users),
             "user_count": len(self.users),
         }
-        if self.user_bytes:
-            # Дополнительный ключ, читатели details обязаны его не требовать
-            # (исторические сэмплы его не имеют). Нужен для верификации
-            # per-user учёта без SSH на ноду.
-            out["user_bytes"] = dict(sorted(self.user_bytes.items()))
         if self.error:
             out["error"] = self.error
         return out
@@ -224,75 +126,6 @@ class NodeStatsResult:
         if errors:
             details["_errors"] = errors
         return details
-
-    def merged_user_bytes(self) -> dict[str, int]:
-        """Байты за интервал по access_username, слитые по протоколам.
-
-        Одно имя несёт все протоколы девайса на ноде (warm-бандл), поэтому
-        суммирование по протоколам == суммирование по юзеру.
-        """
-        merged: dict[str, int] = {}
-        for stats in self.per_protocol.values():
-            for username, value in stats.user_bytes.items():
-                merged[username] = merged.get(username, 0) + value
-        return merged
-
-
-def _parse_hysteria_traffic(payload: str) -> ProtocolStats:
-    """Разобрать ответ hysteria Traffic Stats API.
-
-    Формат: ``{"user": {"tx": <байт-от-сервера>, "rx": <байт-к-серверу>}}``.
-    ``tx``/``rx`` считаются со стороны СЕРВЕРА, поэтому tx → downlink клиента,
-    а rx → uplink: перепутать их значит показать в админке зеркальную картину.
-    """
-    stats = ProtocolStats()
-    try:
-        data = json.loads(payload or "{}")
-    except (ValueError, TypeError) as exc:
-        stats.error = f"hysteria traffic parse: {exc}"
-        return stats
-    if not isinstance(data, dict):
-        stats.error = "hysteria traffic: unexpected payload"
-        return stats
-    for user, counters in data.items():
-        if not isinstance(user, str) or not user:
-            continue
-        if user == "__sentinel__":
-            # Заглушка против краш-лупа на пустом userpass — не человек.
-            continue
-        stats.users.add(user)
-        if isinstance(counters, dict):
-            tx = int(counters.get("tx") or 0)
-            rx = int(counters.get("rx") or 0)
-            stats.downlink += tx
-            stats.uplink += rx
-            if tx + rx > 0:
-                stats.add_user_bytes(user, tx + rx)
-    return stats
-
-
-def _collect_hysteria(client: Any) -> ProtocolStats | None:
-    """Снять hy2-статистику через loopback-API ноды.
-
-    ``None`` — hy2 на ноде нет (curl не достучался до порта): это штатная
-    ситуация, а не сбой, и писать её в ``_errors`` значит завести вечный шум по
-    половине флота. А вот ответ, который не разбирается, — уже сбой, и он
-    доедет как ``error``.
-    """
-    url = f"http://127.0.0.1:{HYSTERIA_TRAFFIC_PORT}/traffic?clear=1"
-    cmd = f"curl -s --max-time 10 {url}"
-    try:
-        exit_status, stdout, stderr = _ssh_run(client, cmd)
-    except Exception as exc:  # noqa: BLE001
-        return ProtocolStats(error=f"ssh exec (hysteria): {exc}")
-    if exit_status != 0:
-        # 7 = connection refused (демона/секции нет), 28 = timeout.
-        if exit_status in (7, 28) or not (stderr or "").strip():
-            return None
-        return ProtocolStats(error=f"hysteria traffic exit {exit_status}")
-    if not (stdout or "").strip():
-        return None
-    return _parse_hysteria_traffic(stdout)
 
 
 def _parse_stat_name(name: str) -> tuple[str, str] | None:
@@ -375,7 +208,6 @@ def _parse_xray_stats_payload(raw: str) -> ProtocolStats:
         else:
             stats.downlink += value
         stats.users.add(email)
-        stats.add_user_bytes(email, value)
     return stats
 
 
@@ -406,14 +238,15 @@ def collect_node_stats(node) -> NodeStatsResult:
     except ImportError as exc:  # pragma: no cover — paramiko is in requirements.txt
         raise RuntimeError("paramiko not installed in the worker container") from exc
 
-    key_path = _resolve_provisioning_key_path()
+    key_path = (
+        os.getenv("ANSIBLE_PRIVATE_KEY_FILE")
+        or os.getenv("PROVISIONING_SSH_KEY")
+        or "/run/secrets/provisioning_key"
+    )
     if not os.path.exists(key_path):
         raise RuntimeError(f"provisioning ssh key not found at {key_path}")
 
-    # Перебор типов ключа (ed25519/rsa/ecdsa) — не глушим сбор по всему
-    # флоту, если provisioning_key окажется не ed25519. См.
-    # _load_provisioning_pkey.
-    pkey = _load_provisioning_pkey(key_path)
+    pkey = paramiko.Ed25519Key.from_private_key_file(key_path)
 
     client = paramiko.SSHClient()
     client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
@@ -424,8 +257,8 @@ def collect_node_stats(node) -> NodeStatsResult:
             username=SSH_USER,
             pkey=pkey,
             timeout=SSH_CONNECT_TIMEOUT,
-            banner_timeout=SSH_BANNER_TIMEOUT,
-            auth_timeout=SSH_AUTH_TIMEOUT,
+            banner_timeout=SSH_CONNECT_TIMEOUT,
+            auth_timeout=SSH_CONNECT_TIMEOUT,
             allow_agent=False,
             look_for_keys=False,
         )
@@ -433,16 +266,10 @@ def collect_node_stats(node) -> NodeStatsResult:
         result = NodeStatsResult()
         all_users: set[str] = set()
         for proto, port in KNOWN_PROTOCOL_PORTS:
-            # НЕ редиректим stderr в /dev/null: раньше `2>/dev/null` на
-            # удалённой команде делал paramiko-канал stderr всегда пустым,
-            # и любой сбой (xray упал / gRPC-порт залип / нода перегружена)
-            # был неотличим от штатного отсутствия протокола — оба молча
-            # писались как достоверный ноль байт. Теперь stderr доходит и
-            # мы различаем эти случаи.
             cmd = (
                 f"{XRAY_BIN} api statsquery "
                 f"--server=127.0.0.1:{port} "
-                f"--reset"
+                f"--reset 2>/dev/null"
             )
             try:
                 exit_status, stdout, stderr = _ssh_run(client, cmd)
@@ -452,25 +279,14 @@ def collect_node_stats(node) -> NodeStatsResult:
                 continue
 
             if exit_status != 0:
+                # Most common cause: this protocol isn't installed on
+                # the node, so the gRPC port doesn't exist. xray's CLI
+                # exits non-zero with a "connection refused" message.
+                # Don't surface that as a row-level error — just record
+                # an empty ProtocolStats and move on.
                 stats = ProtocolStats()
-                err_tail = (
-                    stderr.strip().splitlines()[-1][:200]
-                    if stderr.strip() else ""
-                )
-                low = err_tail.lower()
-                # «connection refused» / «no such file» = протокол не
-                # установлен на ноде (gRPC-порт отсутствует) → штатно
-                # пустой ProtocolStats БЕЗ error. Любой другой ненулевой
-                # код = реальный сбой xray/gRPC → кладём stderr в error,
-                # чтобы деградация была видна в details._errors, а не
-                # проглатывалась как «нода просто без трафика».
-                is_port_absent = (
-                    "connection refused" in low
-                    or "no such file" in low
-                    or "connection error" in low
-                )
-                if not is_port_absent:
-                    stats.error = err_tail or f"xray statsquery exit {exit_status}"
+                if stderr.strip():
+                    stats.error = stderr.strip().splitlines()[-1][:200]
                 result.per_protocol[proto] = stats
                 continue
 
@@ -479,13 +295,6 @@ def collect_node_stats(node) -> NodeStatsResult:
             result.uplink_bytes += stats.uplink
             result.downlink_bytes += stats.downlink
             all_users.update(stats.users)
-
-        hy2 = _collect_hysteria(client)
-        if hy2 is not None:
-            result.per_protocol[HYSTERIA_PROTO] = hy2
-            result.uplink_bytes += hy2.uplink
-            result.downlink_bytes += hy2.downlink
-            all_users.update(hy2.users)
 
         result.active_users = len(all_users)
 
@@ -498,20 +307,9 @@ def collect_node_stats(node) -> NodeStatsResult:
         # install_sharing_enforcer/tasks/main.yml.
         if os.getenv("SHARING_ENFORCEMENT_ENABLED", "0") == "1":
             try:
-                # Атомарный забор лога: rename в уникальное имя (в пределах
-                # одной ФС rename(2) атомарен), затем читаем уже
-                # переименованный файл и удаляем его. Прежний
-                # `cat && truncate -s 0` терял события, дописанные энфорсером
-                # между cat и truncate. После mv энфорсер пересоздаёт
-                # оригинальный путь при следующей записи — гонка сужается до
-                # одного write, попавшего между read()+rename ядра, что
-                # практически недостижимо. $$ = PID удалённого shell'а,
-                # $RANDOM защищает от коллизии перекрывающихся тиков.
                 viol_cmd = (
-                    "f=/var/log/xray/sharing_violations.jsonl; "
-                    't=$f.reading.$$.$RANDOM; '
-                    'mv "$f" "$t" 2>/dev/null && cat "$t"; '
-                    'rm -f "$t" 2>/dev/null'
+                    "cat /var/log/xray/sharing_violations.jsonl 2>/dev/null "
+                    "&& truncate -s 0 /var/log/xray/sharing_violations.jsonl 2>/dev/null"
                 )
                 v_rc, v_out, _ = _ssh_run(client, viol_cmd)
                 if v_rc == 0 and v_out.strip():
@@ -549,6 +347,8 @@ def collect_and_persist(session, node, interval_seconds: int) -> dict[str, Any] 
     detected since the last tick, writing them as AuditLog rows for
     admin visibility.
     """
+    from .. import models  # local import to avoid circular dep with services/__init__
+
     try:
         result = collect_node_stats(node)
     except Exception as exc:  # noqa: BLE001
@@ -557,131 +357,6 @@ def collect_and_persist(session, node, interval_seconds: int) -> dict[str, Any] 
             node.id, node.name, exc,
         )
         return None
-
-    return _persist_node_result(session, node, result, interval_seconds)
-
-
-def _apply_user_traffic(session, node, user_bytes: dict[str, int]) -> int:
-    """Накопить интервал-дельты в ``Subscription.traffic_used_bytes``.
-
-    Чтение с нод деструктивное (``--reset`` / ``clear=1``), поэтому каждое
-    значение — честная дельта за интервал и двойного счёта нет. Резолв
-    username → подписка через CREDENTIAL.access_username (а не Device):
-    warm-креды носят имена ``warm-<node>-<hex>``, из которых ничего не
-    распарсить, но в БД они лежат байт-в-байт (см. api/nodes.py про тот же
-    резолв). Имена без креда (неназначенный warm-пул) — норма, молча мимо.
-
-    Счётчик информационный, для шкалы в клиенте: НИКАКОЙ блокировки на нём
-    нет и быть не должно (блокирующий ингест traffic_used_mb удалён —
-    см. миграцию 0066). Гейт TRAFFIC_USER_ACCOUNTING=0 — аварийный стоп.
-
-    Возвращает число подписок, получивших дельту.
-    """
-    from .. import models  # local import — как у соседей по модулю
-
-    if not user_bytes:
-        return 0
-    if (os.getenv("TRAFFIC_USER_ACCOUNTING") or "1").strip().lower() in (
-        "0", "false", "off", "no",
-    ):
-        return 0
-
-    rows = (
-        session.query(
-            models.Credential.access_username,
-            models.Credential.subscription_id,
-        )
-        .filter(
-            models.Credential.node_id == node.id,
-            models.Credential.access_username.in_(user_bytes.keys()),
-            models.Credential.subscription_id.isnot(None),
-        )
-        .all()
-    )
-    # Одно имя → несколько кредов (по протоколу на строку), но подписка у
-    # них одна; dict схлопывает дубли.
-    sub_by_username = {username: sub_id for username, sub_id in rows}
-
-    per_sub: dict[int, int] = {}
-    for username, delta in user_bytes.items():
-        sub_id = sub_by_username.get(username)
-        if sub_id is None or delta <= 0:
-            continue
-        per_sub[sub_id] = per_sub.get(sub_id, 0) + delta
-
-    # sorted — детерминированный порядок блокировок: два конкурентных
-    # применения (тик другой ноды, ручной refresh) не встанут в deadlock.
-    for sub_id, delta in sorted(per_sub.items()):
-        # Атомарный SQL-инкремент: тик может толкаться с продлением
-        # (обнуление) и с параллельным тиком по другой ноде.
-        session.query(models.Subscription).filter(
-            models.Subscription.id == sub_id
-        ).update(
-            {
-                models.Subscription.traffic_used_bytes:
-                    models.Subscription.traffic_used_bytes + delta
-            },
-            synchronize_session=False,
-        )
-    return len(per_sub)
-
-
-def _touch_devices_last_seen(session, node, user_bytes: dict[str, int]) -> int:
-    """Проштамповать ``Device.last_seen_at`` девайсам, чьи креды двигали байты.
-
-    ``user_bytes`` уже содержит только положительные дельты (нулевые каунтеры
-    выброшены при парсинге), поэтому каждое имя здесь — «девайс был подключён
-    и гнал трафик в этом интервале». Резолв тот же, что в начислении:
-    username → Credential (по node_id), но дальше через ``device_id`` —
-    warm-креды без девайса отсеиваются сами (device_id IS NULL).
-
-    Намеренно НЕ под гейтом TRAFFIC_USER_ACCOUNTING: гейт — аварийный стоп
-    НАЧИСЛЕНИЯ байтов, а признак активности читает админка («активен за
-    24ч» в списке юзеров и воронке) и терять его вместе с выключенным
-    начислением нельзя.
-
-    Возвращает число проштампованных девайсов.
-    """
-    from .. import models  # local import — как у соседей по модулю
-    from ..time_utils import utcnow
-
-    if not user_bytes:
-        return 0
-
-    device_ids = [
-        device_id
-        for (device_id,) in session.query(models.Credential.device_id)
-        .filter(
-            models.Credential.node_id == node.id,
-            models.Credential.access_username.in_(user_bytes.keys()),
-            models.Credential.device_id.isnot(None),
-        )
-        .distinct()
-        .all()
-    ]
-    if not device_ids:
-        return 0
-    # sorted — тот же приём, что в _apply_user_traffic: детерминированный
-    # порядок блокировок против deadlock'а с параллельным писателем девайса.
-    return (
-        session.query(models.Device)
-        .filter(models.Device.id.in_(sorted(device_ids)))
-        .update(
-            {models.Device.last_seen_at: utcnow()},
-            synchronize_session=False,
-        )
-    )
-
-
-def _persist_node_result(session, node, result: NodeStatsResult, interval_seconds: int) -> dict[str, Any]:
-    """Записать уже собранный ``NodeStatsResult`` одной ноды в сессию.
-
-    Вынесено из ``collect_and_persist``, чтобы параллельный сборщик
-    (``collect_all_active_nodes``) мог собирать по SSH в потоках, а все
-    записи в сессию делать строго из главного потока. ``node`` — ORM-нода
-    либо ``_NodeRef`` (используются только ``.id`` и ``.name``).
-    """
-    from .. import models  # local import to avoid circular dep with services/__init__
 
     sample = models.NodeTrafficSample(
         node_id=node.id,
@@ -692,34 +367,6 @@ def _persist_node_result(session, node, result: NodeStatsResult, interval_second
         details=result.to_details(),
     )
     session.add(sample)
-
-    # Изоляция обязательна: счётчик — информационный, а сэмпл — нет. Ошибка
-    # здесь (миграция 0066 не применилась — воркер переживает падение
-    # run_migrations и едет дальше; транзиентный сбой БД) без изоляции
-    # утопила бы в rollback весь нодовый сэмпл и sharing-аудит, при том что
-    # счётчики на ноде уже деструктивно сброшены — интервал не восстановить.
-    # Именно SAVEPOINT (begin_nested), а не голый try/except: упавший UPDATE
-    # отравляет транзакцию Postgres, и без отката к сейвпоинту коммит сэмпла
-    # упал бы следом с InFailedSqlTransaction.
-    try:
-        with session.begin_nested():
-            _apply_user_traffic(session, node, result.merged_user_bytes())
-    except Exception:  # noqa: BLE001 — сэмпл дороже счётчика
-        logger.exception(
-            "traffic accounting failed for node %s — sample kept, deltas of "
-            "this interval lost", node.id,
-        )
-
-    # Отдельный SAVEPOINT: штамп активности и начисление байтов — разные
-    # заботы (см. докстринг _touch_devices_last_seen про гейт), падение
-    # одного не должно топить другое, а сэмпл — дороже обоих.
-    try:
-        with session.begin_nested():
-            _touch_devices_last_seen(session, node, result.merged_user_bytes())
-    except Exception:  # noqa: BLE001
-        logger.exception(
-            "last_seen stamping failed for node %s — sample kept", node.id,
-        )
 
     # Ingest sharing violations into AuditLog for admin visibility
     # and user-facing notifications (via bot notification poller).
@@ -1012,21 +659,6 @@ def collect_all_active_nodes(session, interval_seconds: int) -> list[dict[str, A
     Skips nodes in ``registering`` (xray not yet up) and ``disabled``
     (no stats to read). Draining nodes are still collected because they
     keep serving subs until the migration tick clears them.
-
-    Сбор параллельный (ThreadPoolExecutor, ``TRAFFIC_STATS_SSH_WORKERS``,
-    default 8): SSH-вызовы блокирующие и независимы по нодам, а записи в
-    сессию делаются только из главного потока. Каждый успешно собранный
-    сэмпл коммитится сразу (per-node commit) — если тик убьют по
-    job_timeout, частичный прогресс не теряется. Wall-clock-бюджет
-    ``TRAFFIC_STATS_BUDGET_SEC`` (default 100с, job_timeout тика = 120с):
-    при исчерпании недособранный хвост нод откладывается до следующего
-    тика — тот же паттерн, что в run_node_reachability_tick.
-
-    Ноды сабмитятся в порядке давности последнего успешного сэмпла
-    (давно/ни разу не собранные — первыми), чтобы отсев по бюджету не бил
-    детерминированно по одним и тем же стабильно медленным нодам. Если
-    нода отсеивается ``TRAFFIC_STATS_MAX_SKIPS`` (default 3) тиков подряд,
-    поднимается отдельный error-алерт «систематически не опрашивается».
     """
     from .. import models
 
@@ -1043,127 +675,12 @@ def collect_all_active_nodes(session, interval_seconds: int) -> list[dict[str, A
         )
         .all()
     )
-    if not nodes:
-        return []
-
-    # Preflight: грузим provisioning-ключ ОДИН раз до старта потоков. Если
-    # тип ключа не поддерживается — раньше это давало N молчаливых «collect
-    # failed» (по одному на ноду) без внятной причины; теперь один явный
-    # алерт про тип ключа, и тик не выглядит «просто медленным».
-    key_path = _resolve_provisioning_key_path()
-    if not os.path.exists(key_path):
-        logger.error(
-            "traffic_stats: provisioning ssh key not found at %s — "
-            "сбор статистики по всему флоту пропущен", key_path,
-        )
-        return []
-    try:
-        _load_provisioning_pkey(key_path)
-    except Exception as exc:  # noqa: BLE001
-        logger.error("traffic_stats: %s", exc)
-        return []
-
-    # Снимок атрибутов ДО старта потоков — см. docstring _NodeRef.
-    refs = [
-        _NodeRef(id=n.id, name=n.name, host=n.host, ssh_port=n.ssh_port)
-        for n in nodes
-    ]
-
-    # Порядок сабмита = давность последнего успешного сэмпла (давно не
-    # собранные — первыми). Раньше отсев по бюджету бил детерминированно по
-    # хвосту as_completed, то есть по стабильно медленным нодам — а это
-    # ровно перегруженные/полудохлые ноды, которые важнее всего мониторить,
-    # и они не давали НИ ОДНОГО сэмпла тик за тиком. Ротация гарантирует,
-    # что рано или поздно каждую ноду опросят первой.
-    from sqlalchemy import func as _sqlfunc  # noqa: WPS433 — локальный импорт
-    last_seen_rows = (
-        session.query(
-            models.NodeTrafficSample.node_id,
-            _sqlfunc.max(models.NodeTrafficSample.observed_at),
-        )
-        .group_by(models.NodeTrafficSample.node_id)
-        .all()
-    )
-    last_seen = {nid: ts for nid, ts in last_seen_rows}
-    # Ключ: (есть ли сэмпл, время последнего). Ни разу не собранные ноды
-    # (False) идут первыми; среди собранных — по возрастанию времени
-    # (самые старые вперёд). Второй элемент сравнивается только внутри
-    # одной группы, поэтому None и datetime не сталкиваются.
-    refs.sort(key=lambda r: (r.id in last_seen, last_seen.get(r.id)))
-
-    budget_s = int(
-        os.getenv("TRAFFIC_STATS_BUDGET_SEC", str(TRAFFIC_STATS_BUDGET_SEC_DEFAULT))
-    )
-    workers = max(
-        1,
-        int(os.getenv("TRAFFIC_STATS_SSH_WORKERS", str(TRAFFIC_STATS_SSH_WORKERS_DEFAULT))),
-    )
-    max_skips = max(
-        1,
-        int(os.getenv("TRAFFIC_STATS_MAX_SKIPS", str(TRAFFIC_STATS_MAX_SKIPS_DEFAULT))),
-    )
 
     summaries: list[dict[str, Any]] = []
-    executor = _futures.ThreadPoolExecutor(
-        max_workers=min(workers, len(refs)),
-        thread_name_prefix="traffic-stats-ssh",
-    )
-    try:
-        future_to_ref = {
-            executor.submit(collect_node_stats, ref): ref for ref in refs
-        }
-        try:
-            for fut in _futures.as_completed(future_to_ref, timeout=budget_s):
-                ref = future_to_ref[fut]
-                try:
-                    result = fut.result()
-                except Exception as exc:  # noqa: BLE001
-                    logger.warning(
-                        "traffic_stats: collect failed for node %s (%s): %s",
-                        ref.id, ref.name, exc,
-                    )
-                    continue
-                try:
-                    summary = _persist_node_result(session, ref, result, interval_seconds)
-                    # Per-node commit: kill по job_timeout не теряет уже
-                    # собранные сэмплы этого тика.
-                    session.commit()
-                except Exception:  # noqa: BLE001
-                    logger.exception(
-                        "traffic_stats: persist failed for node %s (%s)",
-                        ref.id, ref.name,
-                    )
-                    if session.is_active:
-                        session.rollback()
-                    continue
-                summaries.append(summary)
-                # Успешно собрали — обнуляем счётчик отсевов ноды.
-                _consecutive_skips.pop(ref.id, None)
-        except _futures.TimeoutError:
-            pending_refs = [r for f, r in future_to_ref.items() if not f.done()]
-            pending = [r.name for r in pending_refs]
-            logger.warning(
-                "traffic_stats: wall-clock budget %ss hit, %d node(s) deferred "
-                "to next tick: %s",
-                budget_s, len(pending), pending,
-            )
-            # Инкрементим per-node счётчик подряд идущих отсевов. Если нода
-            # отсеивается max_skips тиков подряд — она систематически не
-            # опрашивается (стабильно медленный SSH ⇒ перегруженная/
-            # деградирующая нода). Поднимаем ОТДЕЛЬНЫЙ алерт, а не прячем
-            # это в общем «deferred»-warning'е.
-            for r in pending_refs:
-                n = _consecutive_skips.get(r.id, 0) + 1
-                _consecutive_skips[r.id] = n
-                if n >= max_skips:
-                    logger.error(
-                        "traffic_stats: node %s (%s) отсеяна по бюджету %d "
-                        "тиков подряд — сэмплы не собираются; проверьте "
-                        "доступность/нагрузку SSH ноды",
-                        r.id, r.name, n,
-                    )
-    finally:
-        # Не ждём зависшие SSH-сессии: нестартовавшие фьючи отменяем,
-        # уже бегущие потоки дособерут в фоне и умрут вместе с джобой.
-        executor.shutdown(wait=False, cancel_futures=True)
+    for node in nodes:
+        summary = collect_and_persist(session, node, interval_seconds)
+        if summary is not None:
+            summaries.append(summary)
+    if summaries:
+        session.commit()
     return summaries
