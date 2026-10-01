@@ -91,32 +91,8 @@
       - "--exclude=.env"
       - "--exclude=.env.*"
       - "--exclude=secrets/"
-      # Выгрузки пробника выхода (scripts/egress_probe) содержат креды юзеров;
-      # rsync .gitignore не читает — страховка, данные должны жить вне репо.
-      - "--exclude=scripts/egress_probe/*.json"
-      - "--exclude=scripts/egress_probe/*.jsonl"
-      - "--exclude=scripts/egress_probe/*.out"
-      # Маркер успешного build живёт внутри dest — исключаем из
-      # --delete, иначе rsync стирал бы его на каждом прогоне.
-      - "--exclude=.built_ok"
   register: repo_sync
   notify: recreate app stack
-
-# Версия выката. Единственный источник правды — файл VERSION в корне репозитория
-# (семвер, бампается руками): .git из rsync исключён, образы собираются на хосте
-# без тегов, так что иначе на проде не остаётся НИКАКОГО следа ревизии. Читаем с
-# контроллера — то же дерево, что уезжает синком выше.
-- name: Read release version from VERSION file
-  ansible.builtin.slurp:
-    src: "{{ deploy_app_stack_repo_src }}/VERSION"
-  delegate_to: localhost
-  become: false
-  register: _release_version_raw
-  changed_when: false
-
-- name: Expose release version to templates
-  ansible.builtin.set_fact:
-    deploy_app_stack_release_version: "{{ (_release_version_raw.content | b64decode).strip() }}"
 
 - name: Render .env for docker-compose
   template:
@@ -142,50 +118,16 @@
   when: deploy_app_stack_provisioning_key_src | length > 0
   notify: recreate app stack
 
-# Крах-безопасная идемпотентность билда. Гейтить build только на
-# repo_sync.changed нельзя: если прогон упал ПОСЛЕ rsync, но ДО/ВО
-# ВРЕМЯ build (обрыв сети до registry, OOM, Ctrl-C), повторный запуск
-# увидит changed=false → пропустит build → `up -d` поднимет старые
-# образы, а healthcheck и assert пройдут. Поэтому «нужен rebuild»
-# делаем персистентным через маркер .built_ok: сбрасываем его при
-# любом изменении дерева и записываем заново ТОЛЬКО после успешного
-# build. Пока маркера нет — перестраиваемся.
-- name: Invalidate build marker when repo changed
-  file:
-    path: "{{ deploy_app_stack_dir }}/.built_ok"
-    state: absent
-  when: repo_sync.changed
-
-- name: Check build marker
-  stat:
-    path: "{{ deploy_app_stack_dir }}/.built_ok"
-  register: _build_marker
-
 - name: Build docker images
-  # Rebuild when the synced tree changed (marker invalidated above) or
-  # a previous build never finished (marker missing). Re-running the
-  # role against an unchanged, successfully-built repo is then free.
+  # Rebuild only when the synced tree actually changed. Re-running the
+  # role against an unchanged repo is then essentially free.
   command: docker compose build --no-cache
   args:
     chdir: "{{ deploy_app_stack_dir }}"
   when:
     - deploy_app_stack_build | bool
-    - not _build_marker.stat.exists
+    - repo_sync.changed
   changed_when: true
-
-# Пишем маркер только после успеха build. Если build упал, Ansible
-# прервёт плей до этой задачи → маркера нет → следующий прогон
-# перестроит образы даже при неизменном дереве.
-- name: Record successful build marker
-  copy:
-    dest: "{{ deploy_app_stack_dir }}/.built_ok"
-    content: "built\n"
-    owner: "{{ deploy_app_stack_owner }}"
-    group: "{{ deploy_app_stack_group }}"
-    mode: "0640"
-  when:
-    - deploy_app_stack_build | bool
-    - not _build_marker.stat.exists
 
 - name: Bring the stack up
   command: >

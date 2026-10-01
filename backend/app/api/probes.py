@@ -92,16 +92,10 @@ def list_probe_targets(
             if not cfg.is_enabled:
                 continue
             kind = "tls" if cfg.sni else "tcp"
-            # На unify-нодах (443-стрим ssl_preread) reality слушает loopback:cfg.port
-            # (напр. 9443), а СНАРУЖИ доступен на public_port (443). Пробер должен бить
-            # в публичный порт — иначе TLS-проба reality в закрытый снаружи 9443 всегда
-            # fail → health гниёт → нода выпадает из choose_node и diverse-сабов.
-            settings = cfg.settings or {}
-            public_port = settings.get("public_port") or cfg.port
             endpoints.append(
                 schemas.ProbeTargetEndpoint(
                     protocol=cfg.protocol.value if hasattr(cfg.protocol, "value") else str(cfg.protocol),
-                    port=public_port,
+                    port=cfg.port,
                     kind=kind,
                     sni=cfg.sni,
                 )

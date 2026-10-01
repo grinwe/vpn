@@ -14,9 +14,7 @@
                     ┌─────────────────────────────────────┐
                     │   warm_pool.try_assign_bundle(...)  │ ── hit ──► _wire_warm_bundle
                     └─────────────────────────────────────┘              (DB only, no ansible)
-                                          │ miss                                │
-                                          │              config_ready.notify_config_ready(source="warm")
-                                          │                        → audit log "config_ready" (коммитит вызывающий)
+                                          │ miss
                                           ▼
                              cold path: build creds, ProvisioningTask,
                              run_task_async → RQ → ansible-playbook
@@ -25,8 +23,7 @@
                               _handle_task_outcome → device.status=active
                                           │
                                           ▼
-                _notify_bot_config_ready (только если payload.notify_config_ready)
-                → config_ready.notify_config_ready(source="cold") → audit log "config_ready"
+                          _notify_bot_config_ready → audit log "config_ready"
                                           │
                                           ▼
                               bot notification poller доставляет
@@ -41,7 +38,7 @@
 1. **Pool membership** — если у плана заданы `server_pools`, нода должна принадлежать одному из них. Пустой список пулов = «любая нода подходит».
 2. **Explicit node_id** — если caller знает, какую ноду хочет (редко, только админский путь `POST /api/subscriptions` с параметром), все остальные фильтры пропускаются.
 3. **Cooldown** — `cooldown_until IS NULL OR cooldown_until < now()`. Нода, только что деградировавшая по здоровью, сидит в cooldown'е, пока воркер не снимет.
-4. **Status** — только `active` (audit #72). Раньше сюда попадала и `registering`, но у свежеспавненной ноды `is_active=True` выставляется сразу по получению IP, при этом `site.yml` на ней ещё идёт (до 15 мин) — холодный `provision_device.yml` падал на неготовой ноде, юзер получал деградированный онбординг в час пик. Теперь нода участвует в выборке только после успешного bootstrap'а (`registering→active` в `_handle_task_outcome`). Флаг `CHOOSE_NODE_INCLUDE_REGISTERING=1` возвращает старое поведение.
+4. **Status** — `active` или `registering`. `registering` попала сюда, чтобы bootstrap-task на свежевыспавнутой ноде мог ссылаться сам на себя (до промоушна в `active`).
 5. **Health score** — `health_score IS NULL OR health_score >= MIN_HEALTHY_SCORE` (default 50, env). `NULL` означает «нет данных» (нет проб за последние 15 мин или свежая нода) — такая нода считается eligible, чтобы не отваливалась из пула до первого проба. `health_score=0` ставится при fail'е site.yml на active-ноде (no-demote rail).
 6. **Exclude list** — caller может попросить «не возвращай эти node_id». Используется миграцией подписки с draining-ноды: `migrate_subscription_to_new_node` подмешивает туда текущую и соседние draining-ноды того же пула.
 7. **Exclude regions** (`exclude_regions: list[str] | None`) — caller может исключить ноды по `region`. Изначально задумывалось под Phase D traffic-drop детектор через `migrate_subscriptions_off(exclude_same_region=True)` для перенаправления при подозрении на ТСПУ-блок регионалкой. Phase D отключён 2026-04-15 (см. ниже), так что сейчас параметр используется только при явном вызове через ручной `POST /api/nodes/{id}/migrate`.
@@ -154,8 +151,7 @@ branch on returncode
     │            если action=revoke → device.status=revoked, creds.is_active=False
     │                                (строка Device СОХРАНЯЕТСЯ — см. Sub-link invariant)
     │            если target=node   → promote registering→active
-    │            если success и action=apply и payload.notify_config_ready
-    │                                → _notify_bot_config_ready (пуш «конфиг готов», см. ниже)
+    │            если success       → _notify_bot_config_ready
     │
     └─ ≠0 ──► tail = last 20 lines of (stderr || stdout)
               _mark_task(failed, error=tail) → _handle_task_outcome(success=False)
@@ -212,18 +208,11 @@ all:
 
 - `apply` success → `device.status = active`, все `device.credentials.is_active = True`, `revoked_at = None`.
 - `revoke` success → `device.status = revoked`, `cred.is_active = False`, `cred.revoked_at = now()`. **Строка Device сохраняется** — её `sub_token` продолжает резолвиться в `/api/sub/{token}` через alias на живого соседа (см. **Sub-link invariant** в `components/backend-api.md`). До 2026-04-15 здесь стоял `db.delete(device)`, что ломало все сохранённые Hiddify/v2rayN URL при каждой миграции.
-- Сбой `apply` → `device.status = failed`. **Исключение:** сбой `revoke`-таски (или сбой любой таски, когда девайс уже `disabled`/`revoked`) статус **не трогает** — списание терминально, даунгрейд в `failed` «воскрешал» бы девайс в лимите устройств (`active_device_count`), в ЛК и в live-снапшотах миграции. Типовой кейс — background-revoke на мёртвой ноде при failover/migrate. Таска остаётся `failed` для ручного retry. Регрессии: `backend/tests/test_auditfix_provisioning_py.py`.
+- Сбой любой → `device.status = failed`.
 
 ### Bot notification hook
 
-Пуш «✅ Конфиг VPN готов» — строка `AuditLog(action='config_ready', target_type='subscription', target_id=sub.id)` в очереди бота (`/api/notifications/pending`, тот же механизм, что `sublink_rotated`/`trial_expiry_warning`). Единственный продюсер — `services/config_ready.py::notify_config_ready(db, device, source=, commit=)`; вызывается из двух мест:
-
-- **warm** — в `provision_subscription` сразу после warm-hit (`_wire_warm_bundle` → девайс уже `active`, `_handle_task_outcome` не проходит), **только если `notify_config_ready=True`** (kw-параметр `provision_subscription`, default `True`). `commit=False`: строка уходит в той же транзакции, что и подписка (коммитит вызывающий). Warm-пуш только там, где вызывающий сам ссылку не отдаёт: оплата картой (`_create_subscription_for_user` из lava-вебхука, флаг по умолчанию). `services.trial.activate_trial_full` (бесплатные дни: бот → `cmd_config` сразу после 200, и ЛК с 2026-09-30 → экран «Готово» со ссылкой из ответа `/webapp/trial/activate`; раньше ЛК шёл к триалу через `webapp_activate`) и `webapp_activate` (покупка плана в ЛК → карточка подписки) передают `False`: у них ссылка уходит юзеру в момент ответа, и пуш через ≤10 с с той же ссылкой был дублем (жалоба владельца 2026-08-28: 7 сообщений за один тап). Флаг влияет ТОЛЬКО на warm-вызов; cold-маркер в payload ставится всегда — см. ниже.
-- **cold** — `_handle_task_outcome` (apply-ветка, после активации кредов, `_apply_leg_scheme` и `_finish_deferred_swap`) зовёт `_notify_bot_config_ready(device)` **только если `task.payload['notify_config_ready'] is True`**. Флаг ставит ТОЛЬКО cold-ветка `provision_subscription` — и ставит независимо от kw `notify_config_ready` вызывающего: на cold-пути девайс pending, ссылка в момент ответа ещё не рабочая (бот честно пишет «ещё создаётся»), и пуш по завершении Ansible нужен всегда; `reprovision_subscription` (failover, migrate, swap, unfreeze, add-device, health-миграция, refresh_reality_dest) его не несёт — структурный гейт, «конфиг готов» юзеру с уже живой ссылкой не приходит. `_notify_bot_config_ready` сохранено по имени/сигнатуре (тесты глушат его), тело — вызов хелпера с `commit=True`.
-
-Гейт внутри хелпера (все условия И, иначе `False` без побочек): `sub.status == active` (после 402-отката в `activate_trial_full` подписка `expired`, а cold-таска уже в очереди — пуш по мёртвой подписке не шлём; с 2026-09-30 баланс проверяется до провижининга, и сюда попадаем только при гонке; `blocked` — так же); `user.telegram_id` — строка из цифр (`legacy-user`/`unknown` не проходят); `device.status == active` и хотя бы один `cred.is_active`; **первый рабочий девайс подписки** — нет других `Device` этой подписки со статусом вне `pending/failed` (revoked/disabled строки не удаляются по sub-link invariant, так что любой предшественник блокирует); `sub.created_at` не старше 24 ч (защита от ретраев старых тасок/бэклога); дедуп по `action IN ('config_ready','config_ready:delivered')` на `target_id=sub.id`. `extra`: `telegram_id`, `subscription_id`, `device_id`, `source`, и `sub_uri` — только если `sub_links.sub_url_for(sub.sub_token)` дал абсолютный http(s) (без `SUB_LINK_BASE_URL` ссылки в пуше нет, текст ведёт в личный кабинет). Строка пишется под SAVEPOINT (`db.begin_nested()`): выход из контекста делает flush (SessionLocal `autoflush=False`), а сбой вставки откатывает только savepoint — внешняя транзакция вызывающего (warm-путь с незакоммиченными подпиской/девайсом) остаётся рабочей. Исключения ловятся и логируются — сбой пуша не роняет провижн. Флаг `notify_config_ready` из `task.payload` вырезается из `extra_vars` перед `provision_device.yml` (`_execute_task`) — это маркер для `_handle_task_outcome`, не переменная плейбука. Тесты: `backend/tests/test_config_ready_notify.py`.
-
-История: до 2026-08-25 хук клал `_notify` в `ProvisioningTask.result`, который никто не читал, — канал `config_ready` был мёртв с рождения (инцидент: бот пообещал «сейчас пришлю ссылку», ссылка не пришла, повторный тап упёрся в «подарок уже использован»). Детали очереди уведомлений через `audit_logs` — в `components/backend-api.md` и `components/bot.md`.
+`_notify_bot_config_ready(device)` (`provisioning.py:651-690`). После **успешного** `apply`-task'а orchestrator ищет последний успешный apply-task для того же device'а и рассчитывает, что воркер уведомлений (`worker.run_renewal_check` и коллеги) подберёт его. Реализация — **нестандартная**: уведомление не кладётся в отдельную таблицу, а инкорпорируется в результат task'а, который потом прочтут через notification poller на стороне бота (`bot/bot.py:14-69`). Детали очереди уведомлений через `audit_logs` — в `components/backend-api.md` и `components/bot.md`.
 
 ## Warm-pool fast path
 
@@ -310,8 +299,6 @@ else:
 
 Флаг `exclude_same_region` опционален (default `False`), так что существующие call-site'ы не меняют поведения.
 
-**Отказоустойчивость sub_token (audit-fix id96, 2026-07):** отзыв старых девайсов выполняется только ПОСЛЕ успешного репровижена всех девайсов сабки на целевой ноде (при сбое живые девайсы старой ноды остаются нетронутыми — ретрай миграции возможен). Если `reprovision_subscription` падает посреди пачки, компенсирующий блок возвращает не перенесённые `sub_token`/`client_id_hmac` на исходные строки `Device` — `/api/sub/{token}` продолжает резолвиться, инвариант «sub_token никогда не мутируется» сохраняется. Тест: `backend/tests/test_auditfix_services_health_py.py`.
-
 Возвращает dict со следующими полями:
 
 - `subscription_ids` — id успешно мигрированных подписок (legacy-контракт, читается `recompute_node_health` и ботом).
@@ -332,27 +319,6 @@ else:
 5. После успеха `_handle_task_outcome` **удалит** device и credentials полностью (`db.delete`).
 
 Есть `background=False` опция (синхронный путь) — используется только в тестах и в ручных админских операциях, когда caller хочет видеть ansible stdout сразу.
-
-## `regenerate_subscription_sublink` — перевыпуск sub-link без обрыва
-
-Примитив для **хвостов аварии 2026-05** (часть sub-link поломалась при восстановлении, см. `POSTMORTEM_2026-05-19.md`) и массовой кнопки `🔁 регенерация sub-link` в ADMIN_UI (`POST /subscriptions/bulk-regenerate-sublink`). Это **НЕ переезд** — нода та же, меняется только ссылка.
-
-Для каждого живого устройства (`status NOT IN (revoked, disabled)`), **атомарной парой** (per-iteration commit, на ошибке — rollback только этой итерации + re-raise → подписка попадёт в `failed`):
-
-1. `_disable_device_keep_on_node(old)` — старый Device в `disabled`, creds `is_active=False`, **но БЕЗ ansible-revoke**: UUID остаётся в `xray.clients[]`, юзер продолжает подключаться по старому конфигу, пока не возьмёт новую ссылку. **Делается ПЕРВЫМ** — тогда внутренний commit `reprovision_subscription` фиксирует disable старого И новый Device одной транзакцией: нет окна, где новая строка уже durable, а старая ещё live (это окно иначе транзиентно задвоило бы live-счётчик). Падение fail-safe «в минус устройство», не в дубль.
-2. `reprovision_subscription(sub)` — **новый** Device на той же ноде с fresh `sub_token`+UUID+credentials+ansible-apply (старый токен **не** переиспользуем — в этом отличие от миграции, которая токен сохраняет).
-
-Подписка без живых устройств (incident tail: Device без `sub_token` или полностью revoked sub) получает один свежий Device.
-
-**Защита от resurrection.** Если у старого устройства был ещё не доехавший `apply`-таск (backlog серийного воркера), его поздний успех НЕ должен воскресить `disabled`-строку. Guard в `_handle_task_outcome` (apply-ветка): если устройство уже `disabled`/`revoked` — реактивация пропускается (`return` до `status=active` и до `_notify_bot_config_ready`). Это же чинит латентный баг во freeze/migrate-флоу. Пуш `config_ready` через `reprovision_subscription` и так невозможен — apply-таска без `payload.notify_config_ready`.
-
-**Почему старый UUID реально живёт, а не «best-effort»** (ключевой факт, проверен по коду):
-
-- `resync_node.yml` **только `add`-ит** клиентов (идемпотентный re-add активного набора) — `del`/prune там нет, ресинк чужие UUID не трогает;
-- relay-`reconcile_xray.jq` переписывает только `outbounds`/`routing.rules`, не `inbounds[].settings.clients[]`;
-- единственное, что снимает UUID с ноды — явный `revoke`-таск, который здесь намеренно не запускается.
-
-Инвариант соблюдён: старую строку не удаляем/не мутируем, `dynamic_sub_link` алиасит старый токен на новый живой Device. **Стоимость не меняется**: `extra_device_slots` не трогаем, live-счётчик устройств сохраняется 1:1 (`balance.py::renew_subscription` считает цену от слотов, не от числа Device-строк). ЛК показывает новую ссылку, потому что `_build_subscription_extras` берёт первый live-device, а старый `disabled` из выдачи выпадает. Уведомление — system-AuditLog `sublink_rotated`, бот доставляет («возьми новую ссылку в ЛК»). Сводный bulk-эндпоинт капит на 25 юзеров/запрос (ansible-heavy через серийный воркер — тот же класс рисков, что инциденты 2026-04/05).
 
 ## Metrics
 
@@ -375,7 +341,7 @@ Per-node метрик провижининга нет — есть только 
 - **`_execute_task` timeout = 300s жёсткий.** Если ansible `site.yml` на новой ноде с нестабильным сетевым линком физически не успевает за 5 минут, task становится failed без возможности продлить окно через env. Worker re-enqueue сработает с такой же 5-минуткой.
 - **Cold path credential'ы записываются с `is_active = False`.** `_handle_task_outcome` ставит их в `True` только после success. Но между commit'ом credential-row и проходом success/failure есть окно, в течение которого активная подписка имеет *неактивные* credentials. Для warm fast path этого окна нет (creds сразу активные), так что UI/sub-link отдают credentials по-разному в зависимости от пути провижининга — см. фильтрацию `is_active` в `api_extensions.dynamic_sub_link`.
 - **`revoke_device` устанавливает `device.status=disabled`, а не `revoked`.** Терминальный статус «revoked» достигается только после удаления строки из БД. Каждый другой код (admin UI, фильтры capacity) вынужден считать `disabled` и `revoked` эквивалентными — дублирование логики.
-- **`_notify_bot_config_ready` — уведомление отдельной транзакцией после `success`-commit'а** (осознанно): если запись строки `config_ready` упала, таска остаётся success, ошибка в логе, пуша нет. Это намеренно — уведомление не должно ронять провижн; ссылка при этом всегда доступна в личном кабинете и по `/config`. Недоступность бота в момент записи не важна: строка ждёт в `audit_logs`, пока поллер её не заберёт (см. `services/config_ready.py`).
+- **`_notify_bot_config_ready` не изолирует ошибки на уровне БД.** Она ловит `Exception` широко (`provisioning.py:689-690`), но **после** `success`-commit'а; то есть если не получилось записать уведомление — task всё равно success, пользователь будет ждать без уведомления до следующего notification-poll'а... которого может и не быть, если bot в этот момент был down.
 - **`access_username` с timestamp suffix только в `reprovision_subscription`.** Cold path reprovision добавляет `-<epoch_second>` к username, чтобы избежать TTL collision на ноде (старый username может ещё жить в кэше ansible/xray после state=absent). Обычный `provision_subscription` такого suffix'а не делает — предполагается, что первый username на ноде всегда свежий.
 
 > ⚠️ См. audit/... — subprocess ansible-playbook с расшифрованными секретами в CLI `--extra-vars`.

@@ -55,75 +55,21 @@
       - ca-certificates
     state: present
     update_cache: yes
-    cache_valid_time: 3600
 
-# 443-унификация PREFLIGHT — модуль nginx-stream ОБЯЗАН стоять ДО того, как reality
-# уедет на loopback и в nginx.conf вставится stream{}. Инцидент 4vds-ru-01
-# (2026-07-23): apt-install модуля падал молча (failed_when:false), блок stream{}
-# вставлялся всё равно → nginx 'unknown directive "stream"' → nginx down + reality
-# на loopback + dpkg заклинен. Ставим ЗДЕСЬ (до config.json/xray-рестарта), с
-# ретраями и ГРОМКО: не встал модуль → падаем ДО правки reality, нода остаётся живой.
-- name: 443-unify preflight — install nginx stream module (loud, retried)
-  ansible.builtin.apt:
-    name: libnginx-mod-stream
-    state: present
-    update_cache: true
-    cache_valid_time: 3600
-  register: _reality_stream_mod
-  until: _reality_stream_mod is succeeded
-  retries: 3
-  delay: 5
-  when: reality_stream_unify | default(false)
-
-- name: 443-unify preflight — locate stream module load config
-  ansible.builtin.find:
-    paths: /etc/nginx/modules-enabled
-    patterns: "*mod-stream*.conf"
-    # file_type: any — libnginx-mod-stream кладёт 50-mod-stream.conf СИМЛИНКОМ на
-    # modules-available; find по дефолту матчит только обычные файлы → пропустил бы
-    # симлинк и ложно свалил assert ниже (модуль есть, а preflight «не нашёл»).
-    file_type: any
-  register: _reality_stream_mod_files
-  when: reality_stream_unify | default(false)
-
-- name: 443-unify preflight — fail early if stream module not enabled
-  ansible.builtin.assert:
-    that: _reality_stream_mod_files.matched | int > 0
-    fail_msg: >-
-      libnginx-mod-stream не подключён в /etc/nginx/modules-enabled — вставлять
-      stream{} в nginx.conf нельзя (nginx упадёт с 'unknown directive stream').
-      Проверь apt/репозиторий на ноде и повтори бутстрап. Reality не тронут.
-  when: reality_stream_unify | default(false)
-
-# Единый список РУ-зон/доменов для split-tunnel — общий на все 4 протокола
-# (reality, xhttp, ws-cdn, hysteria2). Роль задач не выполняет, только
-# отдаёт переменные ru_direct_zones / ru_direct_domains, которые шаблон
-# рендерит в свой синтаксис. Без неё рендер упадёт на undefined.
-- name: Load shared RU-direct domain list
-  include_role:
-    name: ru_direct_list
-    # public: true — БЕЗ него defaults подключаемой роли не попадают в скоуп
-    # вызывающей (ansible.builtin.include_role: public=false по умолчанию), и
-    # рендер шаблона падает с AnsibleUndefinedVariable на КАЖДОЙ ноде.
-    public: true
-
-# geoip.dat нужен до первого рендера config.json: routing rule
-# `ip: ["geoip:ru", "geoip:private"]` без файла данных не резолвится,
-# xray падает со "failed to load geoip" на старте. Установка + weekly
-# refresh инкапсулированы в роль xray_geoip (общая для Reality и XHTTP,
-# она же тащит CDN-fallback wrapper jsdelivr→ghproxy→github потому что
-# прямой github троттлится у части RU-провайдеров).
-- name: Provision geoip.dat fetcher + weekly refresh timer
-  include_role:
-    name: xray_geoip
-
-# xray-core install: pinned version через ghproxy с fallback'ом на
-# github. Раньше тут был inline-вызов upstream's install-release.sh,
-# но он 5-минутно SSL-timeout'ил с RU-провайдеров (см. xray_core
-# role rationale + ru-cloud-web-02 ticket).
-- name: Install xray-core (CDN-fallback)
-  include_role:
-    name: xray_core
+- name: Install xray-core from upstream (idempotent)
+  shell: |
+    set -euo pipefail
+    if command -v xray >/dev/null 2>&1; then
+      echo "xray already installed: $(xray version | head -n1)"
+      exit 0
+    fi
+    # Pinned upstream installer. Runs non-interactive; writes to
+    # /usr/local/bin/xray and installs a systemd unit.
+    bash -c "$(curl -fsSL https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install
+  args:
+    executable: /bin/bash
+  register: xray_install_result
+  changed_when: "'already installed' not in xray_install_result.stdout"
 
 # Preserve clients added dynamically by manage_vless_user.sh across
 # re-runs of this role. The template ships `clients: []` by design
@@ -270,75 +216,3 @@
     state: restarted
     daemon_reload: yes
   when: _xray_reality_active.stdout != 'active'
-
-# ── 443-унификация (nginx stream ssl_preread) — gated on reality_stream_unify ──
-# Reality слушает loopback (config.json listen=127.0.0.1), nginx stream на :443
-# роутит по SNI: reality-dest → reality loopback, else → nginx-http loopback:8443
-# (xhttp/ws-cdn vhost'ы уходят на 8443 в своих ролях). Убирает DPI-tell 9443.
-# NB: модуль nginx-stream уже поставлен+проверен в PREFLIGHT выше (до config.json),
-# поэтому здесь сразу рендерим stream-роутер — блок ниже не вставится с невалидным
-# nginx.conf, т.к. без модуля play упал бы на preflight-ассерте.
-- name: Ensure /etc/nginx/stream.d dir (443-unify)
-  ansible.builtin.file:
-    path: /etc/nginx/stream.d
-    state: directory
-    mode: '0755'
-  when: reality_stream_unify | default(false)
-
-- name: Render nginx stream ssl_preread router (443-unify)
-  ansible.builtin.template:
-    src: stream-unify.conf.j2
-    dest: /etc/nginx/stream.d/reality-unify.conf
-    mode: '0644'
-  when: reality_stream_unify | default(false)
-
-- name: Ensure top-level stream{} block in nginx.conf (443-unify)
-  ansible.builtin.blockinfile:
-    path: /etc/nginx/nginx.conf
-    marker: "# {mark} V8-443-UNIFY-STREAM"
-    block: |
-      stream {
-          include /etc/nginx/stream.d/*.conf;
-      }
-    insertafter: EOF
-  when: reality_stream_unify | default(false)
-
-# Откат: без унификации убираем stream-роутер + блок, иначе stream :443 конфликтует
-# с обычным nginx :443 после возврата vhost'ов на 443.
-- name: Remove 443-unify stream router when disabled
-  ansible.builtin.file:
-    path: /etc/nginx/stream.d/reality-unify.conf
-    state: absent
-  when: not (reality_stream_unify | default(false))
-
-# Гейт по наличию nginx.conf ОБЯЗАТЕЛЕН: blockinfile проверяет существование
-# файла ДО разбора state и валится rc=257 «Path ... does not exist !» даже при
-# state=absent. На свежей ноде nginx ещё не установлен (его тянут роли
-# install_vless_xhttp/ws_cdn, которые идут ПОСЛЕ этой), а unify там выключен
-# (reality_stream_unify = bool(settings.public_port)) — т.е. до фикса эта
-# откатная таска валила бутстрап КАЖДОЙ новой ноды (аудит 2026-07-25).
-# create: true тут нельзя: модуль создал бы пустой /etc/nginx/nginx.conf и
-# сломал последующую установку nginx.
-- name: Check nginx.conf presence before 443-unify rollback
-  ansible.builtin.stat:
-    path: /etc/nginx/nginx.conf
-  register: _reality_nginx_conf
-  when: not (reality_stream_unify | default(false))
-
-- name: Remove top-level stream{} block when 443-unify disabled
-  ansible.builtin.blockinfile:
-    path: /etc/nginx/nginx.conf
-    marker: "# {mark} V8-443-UNIFY-STREAM"
-    state: absent
-  when:
-    - not (reality_stream_unify | default(false))
-    - _reality_nginx_conf.stat.exists | default(false)
-
-# Guarded reload: на ПЕРВОМ unify-bootstrap'е xhttp/ws ещё на :443 → stream :443
-# конфликтует → nginx -t падает → НЕ релоадим (xhttp-роль ниже подвинет на 8443 и
-# релоаднёт консистентно). На последующих — reality-роль релоадит сама. Сходится.
-- name: Reload nginx after stream changes (guarded)
-  ansible.builtin.shell: nginx -t && systemctl reload nginx
-  register: _unify_reload
-  changed_when: false
-  failed_when: false

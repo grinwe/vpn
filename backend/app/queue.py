@@ -15,26 +15,14 @@ from __future__ import annotations
 
 import logging
 import os
-import threading
-import time
+from functools import lru_cache
 from typing import TYPE_CHECKING
-
-from prometheus_client import Counter
 
 logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:  # pragma: no cover
     from rq import Queue
     from redis import Redis
-
-
-# Счётчик тихих деградаций «RQ недоступен → inline-исполнение в API-процессе».
-# Рост говорит, что ansible-раны текут в API-контейнер вместо выделенного
-# worker'а (см. get_redis: раньше отрицательный результат кешировался навечно).
-INLINE_FALLBACK_COUNTER = Counter(
-    "vpn_queue_inline_fallback_total",
-    "Задачи, ушедшие в inline-исполнение из-за недоступной RQ-очереди",
-)
 
 
 QUEUE_NAME = os.getenv("RQ_QUEUE", "vpn-provisioning")
@@ -45,17 +33,7 @@ QUEUE_NAME = os.getenv("RQ_QUEUE", "vpn-provisioning")
 # на QUEUE_NAME без scheduler'а. RQScheduler держит lock per-queue,
 # дублей ticks между двумя процессами не будет.
 TICKS_QUEUE_NAME = os.getenv("RQ_TICKS_QUEUE", "vpn-ticks")
-# audit #48 — job_timeout ДОЛЖЕН быть заметно больше самого долгого ansible-
-# таймаута, иначе RQ убивает джобу сигналом РАНЬШЕ, чем завершится плейбук:
-# оставленный ansible-процесс продолжает конфигурить ноду сиротой, а Retry
-# запускает ВТОРОЙ прогон на ту же ноду параллельно с недобитым. Самый долгий
-# прогон — site.yml (провижининг ноды) с timeout=900с (см.
-# provisioning._execute_task), плюс джоба тратит время ДО run_playbook: ожидание
-# _ansible_semaphore (до 3 параллельных прогонов → соседи могут держать слот
-# минуты) и ssh-key bootstrap по паролю. Дефолт = 900(site) + 900(запас на
-# очередь/семафор/пост-обработку) = 1800с. Меняешь site.yml timeout — подними и
-# это (инвариант: RQ_JOB_TIMEOUT > max(playbook timeout) + запас).
-DEFAULT_JOB_TIMEOUT = int(os.getenv("RQ_JOB_TIMEOUT", "1800"))  # seconds
+DEFAULT_JOB_TIMEOUT = int(os.getenv("RQ_JOB_TIMEOUT", "900"))  # seconds
 # RQ keeps failed jobs in a dead-letter-ish "failed" registry; we keep them
 # around for a week so ops can inspect them.
 FAILED_TTL = int(os.getenv("RQ_FAILED_TTL", "604800"))
@@ -66,64 +44,31 @@ def _backend_enabled() -> bool:
     return os.getenv("QUEUE_BACKEND", "").lower() == "rq" and bool(os.getenv("REDIS_URL"))
 
 
-# Кулдаун между повторными попытками подключиться к Redis после неудачи.
-# КЛЮЧЕВОЙ момент: раньше get_redis был обёрнут @lru_cache — первый же
-# неуспешный ping (типично при одновременном рестарте контейнеров, когда
-# Redis поднимается на пару секунд позже backend'а) кешировал None до конца
-# жизни процесса, и весь API навсегда переключался на inline-исполнение
-# ansible. Теперь кешируем ТОЛЬКО живой клиент; при None пробуем снова, но не
-# чаще раза в REDIS_RETRY_COOLDOWN секунд, чтобы не долбить недоступный Redis
-# на каждом enqueue.
-REDIS_RETRY_COOLDOWN = float(os.getenv("REDIS_RETRY_COOLDOWN", "30"))
-
-_conn_lock = threading.Lock()
-_redis_client: "Redis | None" = None
-_redis_last_fail: float = 0.0
-# Кеш успешно созданных Queue по имени. None сюда НЕ пишем — иначе повторили бы
-# залипание lru_cache: очередь бы не пересоздалась после восстановления Redis.
-_queues: dict[str, "Queue"] = {}
-
-
+@lru_cache(maxsize=1)
 def get_redis() -> "Redis | None":
-    global _redis_client, _redis_last_fail
     if not _backend_enabled():
         return None
-    # Быстрый путь без блокировки: клиент уже есть.
-    if _redis_client is not None:
-        return _redis_client
-    with _conn_lock:
-        # Повторная проверка под локом — другой поток мог успеть подключиться.
-        if _redis_client is not None:
-            return _redis_client
-        if time.monotonic() - _redis_last_fail < REDIS_RETRY_COOLDOWN:
-            return None
-        try:
-            from redis import Redis
+    try:
+        from redis import Redis
 
-            url = os.environ["REDIS_URL"]
-            client = Redis.from_url(url)
-            client.ping()
-            _redis_client = client
-            return client
-        except Exception:  # noqa: BLE001
-            logger.exception("Failed to connect to Redis; falling back to inline execution")
-            _redis_last_fail = time.monotonic()
-            return None
+        url = os.environ["REDIS_URL"]
+        client = Redis.from_url(url)
+        client.ping()
+        return client
+    except Exception:  # noqa: BLE001
+        logger.exception("Failed to connect to Redis; falling back to inline execution")
+        return None
 
 
+@lru_cache(maxsize=4)
 def _queue_by_name(name: str) -> "Queue | None":
     redis = get_redis()
     if redis is None:
         return None
-    cached = _queues.get(name)
-    if cached is not None:
-        return cached
     try:
         from rq import Queue
 
-        queue = Queue(name, connection=redis, default_timeout=DEFAULT_JOB_TIMEOUT)
-        _queues[name] = queue
-        return queue
+        return Queue(name, connection=redis, default_timeout=DEFAULT_JOB_TIMEOUT)
     except Exception:  # noqa: BLE001
         logger.exception(
             "Failed to construct RQ Queue %s; falling back to inline execution",
@@ -142,32 +87,14 @@ def get_ticks_queue() -> "Queue | None":
     return _queue_by_name(TICKS_QUEUE_NAME)
 
 
-def enqueue_task(task_id: int, node_id: int | None, *, force: bool = False) -> str | None:
+def enqueue_task(task_id: int, node_id: int | None) -> str | None:
     """Enqueue a provisioning task execution.
 
     Returns the RQ job id on success or ``None`` if the queue is unavailable
     (caller must then execute the task inline).
-
-    ``force=True`` purges the deterministic job key BEFORE the dedup check, so
-    a **zombie** ``started`` job (worker SIGKILLed mid-run — RQ leaves the job
-    id locked in ``started`` and ``StartedJobRegistry.cleanup`` doesn't always
-    reclaim it) can't silently swallow the re-enqueue. Only pending-rescue's
-    escalation tier passes this, and only for tasks stuck well past any
-    legitimate in-flight window (a DB row still ``pending`` means no worker has
-    claimed it, so purging its job can't kill a live run). See
-    ``run_pending_rescue_tick``.
     """
     queue = get_queue()
     if queue is None:
-        # Очередь недоступна — вызывающий выполнит задачу inline-потоком внутри
-        # API-процесса. Это осознанная деградация, но её надо видеть в логах и
-        # метриках: если считать растёт при живом Redis, значит разделение
-        # API/worker поехало (см. get_redis + REDIS_RETRY_COOLDOWN).
-        INLINE_FALLBACK_COUNTER.inc()
-        logger.warning(
-            "enqueue_task: RQ queue unavailable — task %s falls back to inline execution",
-            task_id,
-        )
         return None
     try:
         from rq import Retry
@@ -176,61 +103,6 @@ def enqueue_task(task_id: int, node_id: int | None, *, force: bool = False) -> s
         from rq.registry import StartedJobRegistry
 
         job_id = f"provision-{task_id}"
-        if force:
-            # Escalation path: drop any existing job record (zombie `started`,
-            # stale queued, corrupted hash) so the dedup below always falls
-            # through to a fresh enqueue. Safe only because the caller has
-            # established the task is stuck (DB still `pending`, well past any
-            # in-flight window) — see the docstring.
-            #
-            # Сырого `DEL rq:job:<id>` НЕДОСТАТОЧНО: id остаётся лежать в списке
-            # очереди (`rq:queue:<name>`) и в регистрах, а `queue.enqueue(...,
-            # job_id=job_id)` ниже кладёт его туда ВТОРОЙ раз — воркер снимает
-            # обе копии и выполняет одну и ту же provisioning-таску дважды
-            # (возможно параллельно). Штатный путь ниже зовёт `existing.delete()`,
-            # который делает ровно это — вычищает id отовсюду; здесь
-            # воспроизводим тот же эффект вручную (аудит 2026-07-25).
-            try:
-                # count=0 — снять ВСЕ вхождения; Queue.remove() делает lrem(..,1,..)
-                # и убрал бы только первое.
-                queue.connection.lrem(queue.key, 0, job_id)
-            except Exception:  # noqa: BLE001
-                logger.debug(
-                    "enqueue_task(force): FIFO purge failed for %s", job_id,
-                    exc_info=True,
-                )
-            # Регистры достаём защищённо: набор свойств у Queue отличается
-            # между версиями RQ, и отсутствующий атрибут не должен ронять
-            # эскалацию (иначе rescue-тик перестанет расшивать зомби вовсе).
-            for _reg_name in (
-                "failed_job_registry",
-                "scheduled_job_registry",
-                "deferred_job_registry",
-            ):
-                _registry = getattr(queue, _reg_name, None)
-                if _registry is None:
-                    continue
-                try:
-                    _registry.remove(job_id)
-                except Exception:  # noqa: BLE001
-                    logger.debug(
-                        "enqueue_task(force): registry purge failed for %s (%s)",
-                        job_id, _reg_name, exc_info=True,
-                    )
-            try:
-                StartedJobRegistry(queue=queue).remove(job_id)
-            except Exception:  # noqa: BLE001
-                logger.debug(
-                    "enqueue_task(force): started-registry purge failed for %s",
-                    job_id, exc_info=True,
-                )
-            try:
-                queue.connection.delete(f"rq:job:{job_id}")
-            except Exception:  # noqa: BLE001
-                logger.debug(
-                    "enqueue_task(force): raw key purge failed for %s", job_id,
-                    exc_info=True,
-                )
         # Reclaim zombie `started` jobs before the dedupe check below.
         # When a worker is SIGKILLed (OOM, container drop) mid-job, RQ
         # leaves the job in `started` state with the deterministic id
@@ -260,18 +132,6 @@ def enqueue_task(task_id: int, node_id: int | None, *, force: bool = False) -> s
             existing.delete()
         except NoSuchJobError:
             pass
-        except Exception:  # noqa: BLE001
-            # Битый job-hash (см. schedule_tick — KeyError('created_at') и т.п.)
-            # не должен вешать таску: чистим сырой ключ и enqueue'им свежий job
-            # под тем же job_id.
-            logger.warning(
-                "enqueue_task: corrupted job %s — purging + re-enqueuing",
-                job_id, exc_info=True,
-            )
-            try:
-                queue.connection.delete(f"rq:job:{job_id}")
-            except Exception:  # noqa: BLE001
-                logger.debug("enqueue_task: raw key purge failed", exc_info=True)
 
         job = queue.enqueue(
             "app.worker.run_provisioning_task",
@@ -289,108 +149,6 @@ def enqueue_task(task_id: int, node_id: int | None, *, force: bool = False) -> s
         return None
 
 
-def enqueue_spawn_finalize(kind: str, entity_id: int) -> str | None:
-    """Enqueue достройку застрявшего спавна (finding #70, spawn-sweep-тик).
-
-    Финализация спавна (wait_for_ipv4 + host + bootstrap) исторически жила в
-    daemon-потоке backend'а и умирала при рестарте. Sweep-тик воркера находит
-    застрявшие ноды, но НЕ может достраивать их потоком у себя: RQ work-horse
-    завершает процесс сразу после return тика, убивая daemon-потоки. Поэтому
-    достройка едет отдельной RQ-джобой на провижининг-очередь (персистентно:
-    краш воркера → джоба видна в failed, а следующий sweep через
-    NODE_SPAWN_STUCK_MINUTES переоткроет её заново).
-
-    Дедуп по детерминированному job_id — повторный sweep при ещё живой
-    джобе схлопывается в no-op. Возвращает job id или ``None`` при
-    недоступной очереди (вызывающий НЕ должен фолбэчиться в поток — просто
-    подождёт следующего тика).
-    """
-    queue = get_queue()
-    if queue is None:
-        logger.warning(
-            "enqueue_spawn_finalize: RQ queue unavailable — %s %s remains stuck "
-            "until the next sweep tick",
-            kind, entity_id,
-        )
-        return None
-    try:
-        from rq.job import Job
-        from rq.exceptions import NoSuchJobError
-        from rq.registry import StartedJobRegistry
-
-        job_id = f"spawn-finalize-{kind}-{entity_id}"
-        # Зомби-«started» без живого воркера → failed (см. enqueue_task).
-        try:
-            StartedJobRegistry(queue=queue).cleanup()
-        except Exception:  # noqa: BLE001
-            logger.debug("StartedJobRegistry.cleanup() failed (non-fatal)", exc_info=True)
-        try:
-            existing = Job.fetch(job_id, connection=queue.connection)
-            if existing.get_status(refresh=True) in {"queued", "started", "deferred", "scheduled"}:
-                return existing.id
-            existing.delete()
-        except NoSuchJobError:
-            pass
-        except Exception:  # noqa: BLE001
-            logger.warning(
-                "enqueue_spawn_finalize: corrupted job %s — purging + re-enqueuing",
-                job_id, exc_info=True,
-            )
-            try:
-                queue.connection.delete(f"rq:job:{job_id}")
-            except Exception:  # noqa: BLE001
-                logger.debug("enqueue_spawn_finalize: raw key purge failed", exc_info=True)
-
-        # Без Retry: финализация не идемпотентна на ретраях по времени (двойной
-        # wait_for_ipv4 безвреден, но бессмыслен) — восстановление после краша
-        # обеспечивает сам sweep-тик, который переоткроет застрявшую ноду.
-        job = queue.enqueue(
-            "app.worker.run_spawn_finalize",
-            kind,
-            entity_id,
-            job_timeout=DEFAULT_JOB_TIMEOUT,
-            failure_ttl=FAILED_TTL,
-            result_ttl=RESULT_TTL,
-            job_id=job_id,
-        )
-        return job.id
-    except Exception:  # noqa: BLE001
-        logger.exception(
-            "enqueue_spawn_finalize failed for %s %s", kind, entity_id
-        )
-        return None
-
-
-def cancel_task_job(task_id: int) -> bool:
-    """Best-effort снять ещё НЕ стартовавшую provisioning RQ-джобу, чтобы
-    worker её не подхватил. True если джоба найдена в очереди и снята. No-op
-    если RQ не настроен или джоба уже started/finished (там отмена идёт через
-    cancel_requested_at + poll → SIGTERM в раннере)."""
-    queue = get_queue()
-    if queue is None:
-        return False
-    try:
-        from rq.job import Job
-        from rq.exceptions import NoSuchJobError
-
-        job_id = f"provision-{task_id}"
-        try:
-            job = Job.fetch(job_id, connection=queue.connection)
-        except NoSuchJobError:
-            return False
-        if job.get_status(refresh=True) in {"queued", "deferred", "scheduled"}:
-            job.cancel()
-            try:
-                job.delete()
-            except Exception:  # noqa: BLE001
-                pass
-            return True
-        return False
-    except Exception:  # noqa: BLE001
-        logger.exception("cancel_task_job failed for task %s", task_id)
-        return False
-
-
 # Stable job_ids for the self-rescheduling worker ticks. Each tick's
 # bootstrap call (in worker.main) and its self-reschedule call (at the
 # end of the tick body) MUST pass the same tick_id — that's what makes
@@ -405,18 +163,6 @@ TICK_IDS = {
     "app.worker.run_traffic_stats_tick": "tick-traffic-stats",
     "app.worker.run_user_health_ping_tick": "tick-health-ping",
     "app.worker.run_relay_link_health_tick": "tick-relay-link-health",
-    "app.worker.run_node_reachability_tick": "tick-node-reachability",
-    "app.worker.run_broadcast_dispatch_tick": "tick-broadcast-dispatch",
-    "app.worker.run_operator_report_watch_tick": "tick-operator-report-watch",
-    "app.worker.run_reconcile_tick": "tick-reconcile",
-    "app.worker.run_cloud_billing_tick": "tick-cloud-billing",
-    "app.worker.run_spawn_sweep_tick": "tick-spawn-sweep",
-    "app.worker.run_lava_reconcile_tick": "tick-lava-reconcile",
-    "app.worker.run_device_swap_reaper_tick": "tick-device-swap-reaper",
-    "app.worker.run_cert_renewal_tick": "tick-cert-renewal",
-    "app.worker.run_reality_dest_health_tick": "tick-reality-dest-health",
-    "app.worker.run_node_versions_tick": "tick-node-versions",
-    "app.worker.run_xray_upstream_tick": "tick-xray-upstream",
 }
 
 # Per-tick hard timeouts. Без них зависшая SSH (traffic-stats,
@@ -428,39 +174,12 @@ TICK_IDS = {
 TICK_TIMEOUTS = {
     "tick-traffic-stats": 120,
     "tick-relay-link-health": 120,
-    # Probes ping/ssh across ALL active nodes + exits — serial SSH can be
-    # slow when several are down (each waits the ssh timeout), so a roomier
-    # cap than the wg-only relay tick.
-    "tick-node-reachability": 240,
     "tick-pending-rescue": 60,
     "tick-warm-pool": 180,
     "tick-autoscale": 90,
     "tick-renewal": 300,
     "tick-balance-charge": 300,
     "tick-health-ping": 180,
-    "tick-broadcast-dispatch": 60,
-    # DB-only (no SSH) — резолвит pending operator-репорты по NodeTrafficSample.
-    "tick-operator-report-watch": 60,
-    # DB-only — находит due-ноды и диспатчит coalesced bootstrap'ы (сам ansible
-    # не гоняет). Быстрый, но cap на всякий.
-    "tick-reconcile": 60,
-    # HTTP к API провайдеров (balance) — несколько провайдеров последовательно.
-    "tick-cloud-billing": 120,
-    # DB-only + enqueue RQ-джоб (сама достройка едет на провижининг-очереди).
-    "tick-spawn-sweep": 60,
-    # HTTP GET к lava /api/v2/invoices + DB-зачисление pending-счетов.
-    "tick-lava-reconcile": 60,
-    "tick-device-swap-reaper": 120,
-    # Внешние TLS-хендшейки ко ВСЕМ xhttp/ws-cdn доменам (проба cert-expiry) +
-    # enqueue renew near-expiry нодам. Network-bound, как node-reachability.
-    "tick-cert-renewal": 240,
-    # TLS1.3+h2-пробы ко всем reality-dest'ам + авто-ротация битых. Network-bound.
-    "tick-reality-dest-health": 240,
-    # SSH ко всем активным нодам за версиями софта (пул потоков, две короткие
-    # команды на ноду). Бюджет как у traffic-stats: сеть, а не CPU.
-    "tick-node-versions": 120,
-    # Один HTTP-запрос к GitHub + сравнение версий в БД.
-    "tick-xray-upstream": 60,
 }
 
 
@@ -537,22 +256,6 @@ def schedule_tick(
             existing.delete()
         except NoSuchJobError:
             pass
-        except Exception:  # noqa: BLE001
-            # Битый/частичный job-hash (наблюдали KeyError('created_at'): хэш
-            # потерял поля, но registry на него ещё ссылается) роняет
-            # Job.fetch/get_status/delete. Раньше это всплывало в внешний
-            # handler и тик оставался НЕ запланированным НАВСЕГДА (dead-tick:
-            # node-reachability висел 12ч, recovery нод не детектился, инциденты
-            # на ожившие ноды замерзали). Чистим сырой ключ и проваливаемся в
-            # свежий enqueue — один битый job не должен вечно вешать тик.
-            logger.warning(
-                "schedule_tick: corrupted job %s — purging + re-enqueuing",
-                tick_id, exc_info=True,
-            )
-            try:
-                queue.connection.delete(f"rq:job:{tick_id}")
-            except Exception:  # noqa: BLE001
-                logger.debug("schedule_tick: raw key purge failed", exc_info=True)
 
         # job_timeout нужен чтобы зависшая SSH-сессия в traffic-stats /
         # relay-link-health не держала воркер вечно — RQ kill horse через

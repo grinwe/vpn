@@ -14,23 +14,19 @@ from __future__ import annotations
 from alembic import op
 from sqlalchemy import Boolean, Column
 
-from app.alembic._idempotent import has_column
-
 revision = "0023_user_notification_prefs"
 down_revision = "0022_device_sub_token"
 
 
 def upgrade() -> None:
-    if not has_column("users", "notify_renewals"):
-        op.add_column(
-            "users",
-            Column("notify_renewals", Boolean, nullable=False, server_default="true"),
-        )
-    if not has_column("users", "notify_migrations"):
-        op.add_column(
-            "users",
-            Column("notify_migrations", Boolean, nullable=False, server_default="true"),
-        )
+    op.add_column(
+        "users",
+        Column("notify_renewals", Boolean, nullable=False, server_default="true"),
+    )
+    op.add_column(
+        "users",
+        Column("notify_migrations", Boolean, nullable=False, server_default="true"),
+    )
 
 
 def downgrade() -> None:

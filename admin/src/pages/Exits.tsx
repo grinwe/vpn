@@ -1,13 +1,6 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { Fragment, useEffect, useState, type FormEvent } from "react";
-import {
-  api,
-  ApiError,
-  getProviderOfferings,
-  spawnExit,
-  type OfferingImage,
-  type ProviderOfferings,
-} from "../api";
+import { Fragment, useState } from "react";
+import { api, ApiError } from "../api";
 import { HealthDots, linkHealth } from "../linkHealth";
 import { WorkerHealthBadge } from "../workerHealth";
 
@@ -43,7 +36,6 @@ interface CloudProviderOut {
   id: number;
   name: string;
   kind: string;
-  is_active: boolean;
 }
 
 interface VPNNodeMini {
@@ -71,26 +63,6 @@ interface RelayExitLinkOut {
   last_tx_bytes: number | null;
   last_observed_at: string | null;
   active_subs: number;
-}
-
-interface BatchDetachLinkOut {
-  relay_node_id: number;
-  relay_node_name: string;
-  link_id: number;
-  task_id: number | null;
-  credentials: {
-    migrated?: number;
-    cleared?: number;
-    distribution?: Record<string, number>;
-  };
-}
-
-interface BatchDetachRelayResponse {
-  batch_id: string;
-  exit_id: number;
-  exit_name: string;
-  links: BatchDetachLinkOut[];
-  not_found: number[];
 }
 
 interface ExitEvacuateOut {
@@ -124,17 +96,9 @@ const STATUSES = ["registering", "active", "error", "disabled"] as const;
 export default function Exits() {
   const qc = useQueryClient();
   const [showForm, setShowForm] = useState(false);
-  const [orderCloudOpen, setOrderCloudOpen] = useState(false);
   const [editId, setEditId] = useState<number | null>(null);
   const [expanded, setExpanded] = useState<Set<number>>(new Set());
   const [evacuateFromId, setEvacuateFromId] = useState<number | null>(null);
-  const [batchAttachOpen, setBatchAttachOpen] = useState(false);
-  // batchProgressId != null — открыт drawer-sidebar с прогрессом batch'а.
-  // Установлен либо сразу после успешного POST /exits/batch-attach
-  // (из модалки), либо вручную из таблицы /tasks через клик на batch_id
-  // badge — но второй путь не реализован, нынешний flow только из
-  // модалки выше.
-  const [batchProgressId, setBatchProgressId] = useState<string | null>(null);
 
   const { data, isLoading, error } = useQuery<WGExitNodeOut[]>({
     queryKey: ["wg-exits"],
@@ -166,21 +130,6 @@ export default function Exits() {
       ),
     onSuccess: () => qc.invalidateQueries({ queryKey: ["wg-exits"] }),
     onError: (e: Error) => alert(`Ошибка: ${e.message}`),
-  });
-
-  // Перезагрузка exit'а без панели хостера: cloud → hard-reboot через API
-  // (даже если завис), иначе/при сбое — graceful по SSH.
-  const rebootMut = useMutation({
-    mutationFn: (id: number) =>
-      api.post<{ exit_id: number; method: string }>(`/exits/${id}/reboot`, {}),
-    onSuccess: (res) => {
-      alert(
-        `Exit #${res.exit_id}: команда reboot отправлена ` +
-          `(${res.method === "api" ? "API хостера" : "SSH"}). Поднимется через ~1 мин.`,
-      );
-      qc.invalidateQueries({ queryKey: ["wg-exits"] });
-    },
-    onError: (e: Error) => alert(`Не удалось перезагрузить: ${e.message}`),
   });
 
   const diagnoseMut = useMutation({
@@ -255,19 +204,6 @@ export default function Exits() {
             {refreshAllHealthMut.isPending ? "Обновляем…" : "↻ health всех"}
           </button>
           <button
-            onClick={() => setBatchAttachOpen(true)}
-            title="Прицепить один relay сразу к нескольким exit'ам — одной транзакцией"
-            className="text-sm px-3 py-1 rounded bg-blue-700 hover:bg-blue-600"
-          >
-            ⇆ Batch attach relay
-          </button>
-          <button
-            onClick={() => { setOrderCloudOpen((v) => !v); setShowForm(false); }}
-            className="text-sm px-3 py-1 rounded bg-sky-700 hover:bg-sky-600"
-          >
-            {orderCloudOpen ? "Отмена" : "☁ Заказать в облаке"}
-          </button>
-          <button
             onClick={() => { setShowForm(true); setEditId(null); }}
             className="text-sm px-3 py-1 rounded bg-green-700 hover:bg-green-600"
           >
@@ -284,10 +220,6 @@ export default function Exits() {
       {isLoading && <div className="text-slate-400">Загрузка…</div>}
       {error && <div className="text-red-400">{(error as Error).message}</div>}
 
-      {orderCloudOpen && (
-        <OrderCloudExitForm onDone={() => setOrderCloudOpen(false)} />
-      )}
-
       {showForm && (
         <ExitForm
           editExit={editId != null ? data?.find((e) => e.id === editId) : undefined}
@@ -301,27 +233,6 @@ export default function Exits() {
           fromExit={data.find((e) => e.id === evacuateFromId)!}
           allExits={data}
           onDone={() => setEvacuateFromId(null)}
-        />
-      )}
-
-      {batchAttachOpen && data && (
-        <BatchAttachToExitsModal
-          exits={data}
-          onDone={(batchId) => {
-            setBatchAttachOpen(false);
-            if (batchId) {
-              setBatchProgressId(batchId);
-              qc.invalidateQueries({ queryKey: ["wg-exits"] });
-              qc.invalidateQueries({ queryKey: ["wg-exit-links"] });
-            }
-          }}
-        />
-      )}
-
-      {batchProgressId && (
-        <BatchProgressDrawer
-          batchId={batchProgressId}
-          onClose={() => setBatchProgressId(null)}
         />
       )}
 
@@ -395,9 +306,8 @@ export default function Exits() {
                         <button
                           onClick={() => { setEditId(e.id); setShowForm(true); }}
                           className="text-xs px-2 py-1 rounded bg-blue-700 hover:bg-blue-600"
-                          title="Править имя / регион / host / WG-параметры exit-ноды"
                         >
-                          ✎ правка
+                          edit
                         </button>
                         <button
                           disabled={keygenMut.isPending}
@@ -431,23 +341,6 @@ export default function Exits() {
                           className="text-xs px-2 py-1 rounded bg-purple-700 hover:bg-purple-600 disabled:opacity-50"
                         >
                           bootstrap
-                        </button>
-                        <button
-                          disabled={rebootMut.isPending}
-                          title="Перезагрузить exit: API хостера (hard) или SSH (graceful) — без захода в панель"
-                          onClick={() => {
-                            if (
-                              confirm(
-                                `Перезагрузить exit #${e.id} (${e.name})?\n\n` +
-                                  "Cloud → hard-reboot через API хостера (даже если завис), " +
-                                  "иначе/при сбое — graceful по SSH. Тоннели поднимутся за ~1 мин.",
-                              )
-                            )
-                              rebootMut.mutate(e.id);
-                          }}
-                          className="text-xs px-2 py-1 rounded bg-amber-700 hover:bg-amber-600 disabled:opacity-50"
-                        >
-                          ↻ reboot
                         </button>
                         <button
                           disabled={diagnoseMut.isPending}
@@ -486,10 +379,7 @@ export default function Exits() {
                   {isOpen && (
                     <tr className="bg-slate-900/50">
                       <td colSpan={15} className="p-4">
-                        <ExitLinksPanel
-                          exitNode={e}
-                          onBatchStarted={setBatchProgressId}
-                        />
+                        <ExitLinksPanel exitNode={e} />
                       </td>
                     </tr>
                   )}
@@ -651,19 +541,9 @@ function EvacuateExitModal({
   );
 }
 
-function ExitLinksPanel({
-  exitNode,
-  onBatchStarted,
-}: {
-  exitNode: WGExitNodeOut;
-  onBatchStarted?: (batchId: string) => void;
-}) {
+function ExitLinksPanel({ exitNode }: { exitNode: WGExitNodeOut }) {
   const qc = useQueryClient();
   const [showAttach, setShowAttach] = useState(false);
-  // Выбор relay'ев для массовой отвязки (обратное к batch-attach).
-  const [selectedForDetach, setSelectedForDetach] = useState<Set<number>>(
-    new Set(),
-  );
 
   const links = useQuery<RelayExitLinkOut[]>({
     queryKey: ["wg-exit-links", exitNode.id],
@@ -717,34 +597,6 @@ function ExitLinksPanel({
             credMsg,
         );
       }
-    },
-    onError: (e: Error) => alert(`Ошибка: ${e.message}`),
-  });
-
-  // Массовая отвязка: отцепить выбранные relay'и от этого exit'а одним
-  // POST'ом. Все ansible-задачи идут под общим batch_id — прогресс
-  // показывает тот же BatchProgressDrawer, что и batch-attach (через
-  // onBatchStarted в родительском Exits).
-  const batchDetachMut = useMutation({
-    mutationFn: (relayIds: number[]) =>
-      api.post<BatchDetachRelayResponse>(
-        `/exits/${exitNode.id}/batch-detach`,
-        { relay_node_ids: relayIds },
-      ),
-    onSuccess: (res) => {
-      qc.invalidateQueries({ queryKey: ["wg-exit-links", exitNode.id] });
-      qc.invalidateQueries({ queryKey: ["wg-exits"] });
-      qc.invalidateQueries({ queryKey: ["provisioning-tasks"] });
-      qc.invalidateQueries({ queryKey: ["user-subs"] });
-      setSelectedForDetach(new Set());
-      if (res.batch_id) onBatchStarted?.(res.batch_id);
-      const nf = res.not_found.length
-        ? `\nПропущено (не было линка к этому exit): ${res.not_found.length}.`
-        : "";
-      alert(
-        `Отцеплено relay: ${res.links.length}. Ansible крутится в фоне ` +
-          `под общим batch — следи в drawer'е справа / вкладке Tasks.${nf}`,
-      );
     },
     onError: (e: Error) => alert(`Ошибка: ${e.message}`),
   });
@@ -803,48 +655,11 @@ function ExitLinksPanel({
     (n) => n.is_active && !alreadyAttached.has(n.id),
   );
 
-  const allRelayIds = (links.data ?? []).map((l) => l.relay_node_id);
-  const allSelected =
-    allRelayIds.length > 0 &&
-    allRelayIds.every((id) => selectedForDetach.has(id));
-  const toggleSelectAll = () =>
-    setSelectedForDetach(allSelected ? new Set() : new Set(allRelayIds));
-  const toggleSelectOne = (id: number) =>
-    setSelectedForDetach((prev) => {
-      const next = new Set(prev);
-      if (next.has(id)) next.delete(id);
-      else next.add(id);
-      return next;
-    });
-  const runBatchDetach = () => {
-    if (selectedForDetach.size === 0) return;
-    if (
-      confirm(
-        `Отсоединить ${selectedForDetach.size} relay-нод от ${exitNode.name}?\n\n` +
-          "Для каждой запустится ansible (как в одиночном detach): peer уйдёт " +
-          "из wg0.conf exit'а, wgN на relay'е снимется, Xray rule/outbound " +
-          "удалятся. Осиротевшие creds перепинятся на оставшиеся линки релея " +
-          "либо обнулятся (если это был последний линк).",
-      )
-    )
-      batchDetachMut.mutate(Array.from(selectedForDetach));
-  };
-
   return (
     <div className="space-y-3">
       <div className="flex items-center justify-between">
         <h3 className="text-sm font-semibold text-slate-300">Attached relays</h3>
         <div className="flex gap-2">
-          <button
-            disabled={selectedForDetach.size === 0 || batchDetachMut.isPending}
-            onClick={runBatchDetach}
-            title="Массово отцепить выбранные relay-ноды от этого exit'а — одной транзакцией, прогресс в drawer'е справа"
-            className="text-xs px-3 py-1 rounded bg-red-700 hover:bg-red-600 disabled:opacity-50"
-          >
-            {batchDetachMut.isPending
-              ? "Отцепляю…"
-              : `⇆ Отцепить выбранные (${selectedForDetach.size})`}
-          </button>
           <button
             disabled={refreshHealthMut.isPending}
             onClick={() => refreshHealthMut.mutate()}
@@ -894,15 +709,6 @@ function ExitLinksPanel({
         <table className="w-full text-xs">
           <thead className="text-slate-400">
             <tr>
-              <th className="py-1 px-2 w-6">
-                <input
-                  type="checkbox"
-                  checked={allSelected}
-                  onChange={toggleSelectAll}
-                  title="Выбрать все"
-                  aria-label="Выбрать все relay"
-                />
-              </th>
               <th className="text-left py-1 px-2">Relay</th>
               <th className="text-left py-1 px-2">Iface</th>
               <th className="text-left py-1 px-2">WG client addr</th>
@@ -918,14 +724,6 @@ function ExitLinksPanel({
               const h = linkHealth(l);
               return (
               <tr key={l.id} className="border-t border-slate-800">
-                <td className="py-1 px-2">
-                  <input
-                    type="checkbox"
-                    checked={selectedForDetach.has(l.relay_node_id)}
-                    onChange={() => toggleSelectOne(l.relay_node_id)}
-                    aria-label={`Выбрать ${l.relay_node_name}`}
-                  />
-                </td>
                 <td className="py-1 px-2 font-mono">
                   #{l.relay_node_id} {l.relay_node_name}
                 </td>
@@ -1424,724 +1222,6 @@ function ExitForm({
         >
           {isEdit ? "Сохранить" : "Создать"}
         </button>
-      </div>
-    </form>
-  );
-}
-
-
-// ─── Batch attach: один relay → много exits ────────────────────────────
-// Симметричный flow к AttachRelayForm (тот цепляет N relay'ев к одному
-// exit'у). Open'ится из bar'а наверху страницы /exits. POST'ит в новый
-// /exits/batch-attach, получает batch_id, передаёт его в BatchProgress
-// Drawer. См. docs/RELAY_ROADMAP.md G.5+ + commit "batch-attach API".
-
-interface BatchAttachLinkOut {
-  exit_id: number;
-  exit_name: string;
-  link_id: number;
-  task_id: number;
-  wg_interface_name: string;
-  wg_client_address_v4: string;
-  mode: string; // "attached" | "reapplied"
-}
-
-interface BatchAttachRelayResponse {
-  batch_id: string;
-  relay_node_id: number;
-  relay_node_name: string;
-  links: BatchAttachLinkOut[];
-}
-
-function BatchAttachToExitsModal({
-  exits,
-  onDone,
-}: {
-  exits: WGExitNodeOut[];
-  onDone: (batchId: string | null) => void;
-}) {
-  const [relayId, setRelayId] = useState<number | null>(null);
-  const [selected, setSelected] = useState<Set<number>>(new Set());
-  const [err, setErr] = useState<string | null>(null);
-  const [submitting, setSubmitting] = useState(false);
-
-  const nodes = useQuery<VPNNodeMini[]>({
-    queryKey: ["nodes-mini"],
-    queryFn: () => api.get("/nodes"),
-  });
-
-  // Active-only exits — inactive не пройдут серверную валидацию,
-  // показывать их в чекбоксах = напрашиваться на красную ошибку.
-  const activeExits = exits.filter((e) => e.is_active);
-
-  // Ensure-режим: бэк сам решает attach vs re-apply по факту наличия
-  // link'а. UI показывает ВСЕ active exit'ы; для уже-прицепленных к
-  // выбранному relay'ю рисуем бейдж «re-apply» в строке, чтобы юзер
-  // понимал что INSERT'а не будет.
-  function isAttachedToSelectedRelay(e: WGExitNodeOut): boolean {
-    if (relayId == null) return false;
-    return e.links.some((l) => l.relay_node_id === relayId);
-  }
-
-  function toggle(id: number) {
-    setSelected((prev) => {
-      const next = new Set(prev);
-      if (next.has(id)) next.delete(id);
-      else next.add(id);
-      return next;
-    });
-  }
-
-  function selectAll() {
-    setSelected(new Set(activeExits.map((e) => e.id)));
-  }
-  function clearAll() {
-    setSelected(new Set());
-  }
-
-  // Подсчёт привязки выбранного к attach/reapply — для footer'а submit-кнопки.
-  const selectedAttach = relayId == null
-    ? 0
-    : Array.from(selected).filter(
-        (id) => !activeExits.find((e) => e.id === id)?.links.some(
-          (l) => l.relay_node_id === relayId,
-        ),
-      ).length;
-  const selectedReapply = selected.size - selectedAttach;
-
-  async function submit(e: React.FormEvent) {
-    e.preventDefault();
-    setErr(null);
-    if (relayId == null) {
-      setErr("Выберите relay");
-      return;
-    }
-    if (selected.size === 0) {
-      setErr("Выберите хотя бы один exit");
-      return;
-    }
-    setSubmitting(true);
-    try {
-      const res = await api.post<BatchAttachRelayResponse>(
-        "/exits/batch-attach",
-        { relay_node_id: relayId, exit_ids: Array.from(selected) },
-      );
-      onDone(res.batch_id);
-    } catch (apiErr) {
-      const msg =
-        apiErr instanceof ApiError
-          ? `${apiErr.status}: ${apiErr.message}`
-          : apiErr instanceof Error
-            ? apiErr.message
-            : String(apiErr);
-      setErr(msg);
-      setSubmitting(false);
-    }
-  }
-
-  return (
-    <div className="fixed inset-0 z-40 flex items-center justify-center bg-black/60">
-      <div className="bg-slate-900 border border-slate-700 rounded-lg p-5 w-[640px] max-h-[80vh] flex flex-col">
-        <div className="flex items-center justify-between mb-3">
-          <h2 className="text-lg font-bold">Batch-attach relay → exits</h2>
-          <button
-            onClick={() => onDone(null)}
-            className="text-slate-400 hover:text-white text-xl leading-none"
-            disabled={submitting}
-            title="Закрыть"
-          >
-            ×
-          </button>
-        </div>
-        <p className="text-xs text-slate-400 mb-3">
-          Выбираете один relay и галочками — exit'ы. Бэк делает «ensure»:
-          для новых exit'ов alloc'ает /32 + keypair и INSERT'ит link, для
-          уже-прицепленных просто re-apply ansible'а на существующий
-          link. Все task'и под общим batch_id — drawer покажет прогресс,
-          retry отдельных upal'нувших обычной кнопкой.
-        </p>
-
-        <form onSubmit={submit} className="flex flex-col gap-3 overflow-hidden">
-          <label className="flex flex-col text-xs">
-            <span className="text-slate-400 mb-1">Relay node</span>
-            <select
-              value={relayId ?? ""}
-              onChange={(e) => {
-                setRelayId(e.target.value ? Number(e.target.value) : null);
-                setSelected(new Set());
-              }}
-              className="bg-slate-800 border border-slate-700 rounded px-2 py-1"
-              disabled={submitting || nodes.isLoading}
-              required
-            >
-              <option value="">— выбрать relay —</option>
-              {(nodes.data ?? [])
-                .filter((n) => n.is_active)
-                .map((n) => (
-                  <option key={n.id} value={n.id}>
-                    {n.name} — {n.host}
-                    {n.has_relay_config ? " (уже relay)" : ""}
-                  </option>
-                ))}
-            </select>
-          </label>
-
-          <div className="flex items-center justify-between text-xs">
-            <span className="text-slate-400">
-              Exit'ы ({activeExits.length} active)
-            </span>
-            <div className="flex gap-2">
-              <button
-                type="button"
-                onClick={selectAll}
-                className="px-2 py-0.5 rounded bg-slate-700 hover:bg-slate-600"
-                disabled={submitting || activeExits.length === 0}
-              >
-                все
-              </button>
-              <button
-                type="button"
-                onClick={clearAll}
-                className="px-2 py-0.5 rounded bg-slate-700 hover:bg-slate-600"
-                disabled={submitting}
-              >
-                очистить
-              </button>
-            </div>
-          </div>
-
-          <div className="overflow-y-auto border border-slate-800 rounded p-2 flex-1 min-h-[150px] max-h-[40vh]">
-            {activeExits.length === 0 && (
-              <div className="text-xs text-yellow-400">
-                Нет активных exit'ов.
-              </div>
-            )}
-            {activeExits.map((e) => {
-              const attached = isAttachedToSelectedRelay(e);
-              return (
-                <label
-                  key={e.id}
-                  className="flex items-center gap-2 py-1 text-xs hover:bg-slate-800/50 rounded px-1 cursor-pointer"
-                >
-                  <input
-                    type="checkbox"
-                    checked={selected.has(e.id)}
-                    onChange={() => toggle(e.id)}
-                    disabled={submitting}
-                  />
-                  <span className="font-mono w-32 truncate" title={e.name}>
-                    {e.name}
-                  </span>
-                  <span className="text-slate-400 w-16 truncate">{e.region}</span>
-                  <span className="text-slate-500 font-mono truncate flex-1" title={e.host}>
-                    {e.host}
-                  </span>
-                  {attached && (
-                    <span
-                      className="text-[10px] px-1.5 py-0.5 rounded bg-yellow-700/40 text-yellow-200"
-                      title="Уже прицеплен — submit пере-применит ansible на существующем link'е"
-                    >
-                      re-apply
-                    </span>
-                  )}
-                </label>
-              );
-            })}
-          </div>
-
-          {err && <div className="text-red-400 text-xs">{err}</div>}
-
-          <div className="flex justify-end gap-2">
-            <button
-              type="button"
-              onClick={() => onDone(null)}
-              disabled={submitting}
-              className="text-xs px-3 py-1 rounded bg-slate-700 hover:bg-slate-600"
-            >
-              Отмена
-            </button>
-            <button
-              type="submit"
-              disabled={submitting || relayId == null || selected.size === 0}
-              className="text-xs px-3 py-1 rounded bg-blue-700 hover:bg-blue-600 disabled:opacity-50"
-            >
-              {submitting
-                ? "Создаём…"
-                : selected.size === 0
-                  ? "Выберите exit'ы"
-                  : selectedReapply === 0
-                    ? `Attach к ${selectedAttach} exit'ам`
-                    : selectedAttach === 0
-                      ? `Re-apply на ${selectedReapply} exit'ах`
-                      : `Прогнать на ${selected.size} (${selectedAttach} attach + ${selectedReapply} re-apply)`}
-            </button>
-          </div>
-        </form>
-      </div>
-    </div>
-  );
-}
-
-
-// ─── Batch progress drawer ─────────────────────────────────────────────
-// Polling-сводка по batch_id: GET /provisioning/batches/{id} раз в 2.5s,
-// останавливается когда нет pending/running. Per-task retry — обычный
-// /provisioning/tasks/{id}/rerun. error_message задачи (если failed)
-// разворачивается inline под строкой.
-
-interface BatchTaskOut {
-  id: number;
-  target_type: string;
-  target_id: number;
-  action: string;
-  status: string;
-  payload: { exit_id?: number; link_id?: number } | null;
-  error_message: string | null;
-  created_at: string;
-  finished_at: string | null;
-  batch_id: string | null;
-}
-
-interface BatchSummaryOut {
-  batch_id: string;
-  total: number;
-  status_counts: Record<string, number>;
-  tasks: BatchTaskOut[];
-}
-
-function BatchProgressDrawer({
-  batchId,
-  onClose,
-}: {
-  batchId: string;
-  onClose: () => void;
-}) {
-  const qc = useQueryClient();
-  const [expandedTaskId, setExpandedTaskId] = useState<number | null>(null);
-
-  const summary = useQuery<BatchSummaryOut>({
-    queryKey: ["batch-summary", batchId],
-    queryFn: () => api.get(`/provisioning/batches/${batchId}`),
-    // Polling: пока хоть один task в pending/running — раз в 2.5s.
-    // Когда все терминалы — refetchInterval=false (стопит polling).
-    refetchInterval: (q) => {
-      // Если данных ещё нет (первый fetch упал на сетевом блипе), НЕ
-      // выключаем polling: иначе после retry:1 запрос замирает навсегда
-      // и дровер виснет в «Загрузка…». Продолжаем опрашивать — так
-      // поллинг сам восстановится, когда сеть вернётся (ср. Broadcasts.tsx).
-      if (!q.state.data) return 2500;
-      const sc = q.state.data.status_counts ?? {};
-      const live = (sc["pending"] ?? 0) + (sc["running"] ?? 0);
-      return live > 0 ? 2500 : false;
-    },
-  });
-
-  const rerunMut = useMutation({
-    mutationFn: (taskId: number) =>
-      api.post(`/provisioning/tasks/${taskId}/rerun`),
-    onSuccess: () => {
-      qc.invalidateQueries({ queryKey: ["batch-summary", batchId] });
-    },
-    onError: (e: Error) => alert(`Не удалось retry: ${e.message}`),
-  });
-
-  const sc = summary.data?.status_counts ?? {};
-  const done = (sc["success"] ?? 0) + (sc["failed"] ?? 0);
-  const total = summary.data?.total ?? 0;
-  const allDone = total > 0 && done === total;
-  const anyFailed = (sc["failed"] ?? 0) > 0;
-
-  function statusBadge(s: string) {
-    const map: Record<string, string> = {
-      pending: "bg-slate-700 text-slate-300",
-      running: "bg-blue-700/60 text-blue-200",
-      success: "bg-green-700/60 text-green-200",
-      failed: "bg-red-700/60 text-red-200",
-    };
-    return (
-      <span className={`px-2 py-0.5 rounded text-[10px] ${map[s] ?? "bg-slate-700"}`}>
-        {s}
-      </span>
-    );
-  }
-
-  return (
-    <>
-      <div
-        className="fixed inset-0 z-30 bg-black/50"
-        onClick={onClose}
-      />
-      <div className="fixed right-0 top-0 bottom-0 z-40 w-[480px] bg-slate-900 border-l border-slate-700 flex flex-col">
-        <div className="flex items-center justify-between p-4 border-b border-slate-800">
-          <div>
-            <div className="text-sm font-bold">Batch attach</div>
-            <div className="text-[11px] text-slate-500 font-mono truncate" title={batchId}>
-              {batchId.slice(0, 8)}…
-            </div>
-          </div>
-          <button
-            onClick={onClose}
-            className="text-slate-400 hover:text-white text-xl leading-none"
-          >
-            ×
-          </button>
-        </div>
-
-        <div className="p-4 border-b border-slate-800">
-          {summary.isLoading && <div className="text-slate-400 text-xs">Загрузка…</div>}
-          {summary.error && (
-            <div className="text-red-400 text-xs">
-              {(summary.error as Error).message}
-            </div>
-          )}
-          {summary.data && (
-            <>
-              <div className="flex items-center justify-between text-xs mb-2">
-                <span className="text-slate-400">
-                  Прогресс: <span className="text-white font-bold">{done}/{total}</span>
-                </span>
-                <div className="flex gap-2 text-[10px]">
-                  {Object.entries(sc).map(([k, v]) => (
-                    <span key={k}>
-                      {statusBadge(k)} {v}
-                    </span>
-                  ))}
-                </div>
-              </div>
-              <div className="h-2 rounded bg-slate-800 overflow-hidden flex">
-                <div
-                  className="bg-green-600 h-full"
-                  style={{ width: `${total ? ((sc["success"] ?? 0) / total) * 100 : 0}%` }}
-                />
-                <div
-                  className="bg-red-600 h-full"
-                  style={{ width: `${total ? ((sc["failed"] ?? 0) / total) * 100 : 0}%` }}
-                />
-                <div
-                  className="bg-blue-600 h-full"
-                  style={{ width: `${total ? ((sc["running"] ?? 0) / total) * 100 : 0}%` }}
-                />
-              </div>
-              <div className="mt-2 text-[11px] text-slate-500">
-                {allDone
-                  ? anyFailed
-                    ? "Готово, есть упавшие — попробуйте retry."
-                    : "Все attach'и прошли."
-                  : "Polling каждые 2.5с — драйвер обновляется автоматически."}
-              </div>
-            </>
-          )}
-        </div>
-
-        <div className="overflow-y-auto flex-1 p-2">
-          {summary.data?.tasks.map((t) => {
-            const isExpanded = expandedTaskId === t.id;
-            const exit_id = t.payload?.exit_id;
-            return (
-              <div
-                key={t.id}
-                className="border border-slate-800 rounded mb-2 text-xs"
-              >
-                <div
-                  className="flex items-center justify-between p-2 cursor-pointer hover:bg-slate-800/50"
-                  onClick={() =>
-                    setExpandedTaskId(isExpanded ? null : t.id)
-                  }
-                >
-                  <div className="flex items-center gap-2 min-w-0">
-                    {statusBadge(t.status)}
-                    <span className="font-mono text-slate-300">
-                      task #{t.id}
-                    </span>
-                    {exit_id != null && (
-                      <span className="text-slate-500">→ exit {exit_id}</span>
-                    )}
-                  </div>
-                  <div className="flex items-center gap-1">
-                    {t.status === "failed" && (
-                      <button
-                        onClick={(e) => {
-                          e.stopPropagation();
-                          rerunMut.mutate(t.id);
-                        }}
-                        disabled={rerunMut.isPending}
-                        className="px-2 py-0.5 rounded bg-blue-700 hover:bg-blue-600 text-[10px]"
-                      >
-                        ↻ retry
-                      </button>
-                    )}
-                    <a
-                      href={`/tasks?id=${t.id}`}
-                      onClick={(e) => e.stopPropagation()}
-                      className="px-2 py-0.5 rounded bg-slate-700 hover:bg-slate-600 text-[10px]"
-                      title="Открыть в Tasks"
-                    >
-                      ↗
-                    </a>
-                  </div>
-                </div>
-                {isExpanded && (
-                  <div className="px-3 pb-2 text-[11px] text-slate-400 border-t border-slate-800 pt-2">
-                    <div>
-                      <span className="text-slate-500">created:</span>{" "}
-                      {new Date(t.created_at).toLocaleString()}
-                    </div>
-                    {t.finished_at && (
-                      <div>
-                        <span className="text-slate-500">finished:</span>{" "}
-                        {new Date(t.finished_at).toLocaleString()}
-                      </div>
-                    )}
-                    {t.error_message && (
-                      <pre className="mt-2 bg-slate-950 border border-slate-800 rounded p-2 whitespace-pre-wrap text-red-300 text-[10px] max-h-40 overflow-y-auto">
-                        {t.error_message}
-                      </pre>
-                    )}
-                  </div>
-                )}
-              </div>
-            );
-          })}
-        </div>
-      </div>
-    </>
-  );
-}
-
-// ☁ Заказать exit-ноду у облачного провайдера — зеркало OrderCloudNodeForm
-// (Nodes.tsx) без pool_id. Зарубежный сервер заводится как WG-exit за РУ-relay
-// (см. диагноз: прямой зарубежный endpoint душит DPI). По умолчанию провайдер —
-// «зарубежный» (4vps, не -ru); тариф/ОС тянутся из live offerings, ОС авто-
-// выбирается Ubuntu 22.04. Нода появляется registering → active, relay цепляешь
-// отдельно.
-function OrderCloudExitForm({ onDone }: { onDone: () => void }) {
-  const qc = useQueryClient();
-  const providersQ = useQuery<CloudProviderOut[]>({
-    queryKey: ["cloud-providers"],
-    queryFn: () => api.get("/cloud/providers"),
-  });
-  const [providerId, setProviderId] = useState<number | null>(null);
-  const [name, setName] = useState("");
-  const [dc, setDc] = useState("");
-  const [plan, setPlan] = useState("");
-  const [image, setImage] = useState("");
-  const [err, setErr] = useState<string | null>(null);
-
-  useEffect(() => {
-    if (providerId == null && providersQ.data?.length) {
-      const actives = providersQ.data.filter((p) => p.is_active);
-      // exit'ы — на «зарубежном» провайдере (4vps, НЕ -ru): exit за РУ-relay,
-      // его IP клиент не видит.
-      const pick =
-        actives.find((p) => !p.name.toLowerCase().includes("ru")) ??
-        actives[0] ??
-        providersQ.data[0];
-      setProviderId(pick.id);
-    }
-  }, [providersQ.data, providerId]);
-
-  const offeringsQ = useQuery<ProviderOfferings>({
-    queryKey: ["provider-offerings", providerId],
-    queryFn: () => getProviderOfferings(providerId as number),
-    enabled: providerId != null,
-  });
-
-  const datacenters = offeringsQ.data?.datacenters ?? [];
-  const plans = offeringsQ.data?.plans ?? [];
-  const selectedPlan = plans.find((p) => String(p.id) === plan);
-  const images: OfferingImage[] =
-    selectedPlan?.images?.length ? selectedPlan.images : offeringsQ.data?.images ?? [];
-
-  useEffect(() => {
-    if (!image && images.length) {
-      const pick =
-        images.find((im) => /ubuntu\s*22\.04/i.test(im.name)) ??
-        images.find((im) => /ubuntu/i.test(im.name)) ??
-        images[0];
-      if (pick?.id != null) setImage(String(pick.id));
-    }
-  }, [images.length, image]);
-
-  const mutation = useMutation({
-    mutationFn: () =>
-      spawnExit({
-        provider_id: providerId as number,
-        name: name.trim() || null,
-        region: dc.trim(),
-        plan: plan.trim(),
-        image: image.trim() || null,
-      }),
-    onSuccess: () => {
-      qc.invalidateQueries({ queryKey: ["wg-exits"] });
-      qc.invalidateQueries({ queryKey: ["provisioning-tasks"] });
-      onDone();
-    },
-    onError: (e: Error) =>
-      setErr(e instanceof ApiError ? `${e.status}: ${e.message}` : e.message),
-  });
-
-  function submit(e: FormEvent) {
-    e.preventDefault();
-    setErr(null);
-    if (providerId == null) return setErr("выбери провайдера");
-    // имя необязательно: пусто → бэкенд сгенерит «<хостер>-<cc>-<NN>»
-    if (!dc.trim()) return setErr("укажи дата-центр");
-    if (!plan.trim()) return setErr("укажи тариф");
-    mutation.mutate();
-  }
-
-  const inputCls = "bg-slate-800 border border-slate-700 rounded px-2 py-1";
-
-  return (
-    <form
-      onSubmit={submit}
-      className="mb-4 p-4 rounded border border-sky-800 bg-slate-900/60 flex flex-col gap-4 text-sm"
-    >
-      <div className="text-sky-300 text-xs font-semibold">
-        ☁ Заказать exit-ноду у облачного провайдера
-      </div>
-      <div className="grid grid-cols-2 gap-3">
-        <label className="flex flex-col">
-          <span className="text-slate-400 text-xs mb-1">Провайдер</span>
-          <select
-            className={inputCls}
-            value={providerId ?? ""}
-            onChange={(e) => {
-              setProviderId(e.target.value ? Number(e.target.value) : null);
-              setDc("");
-              setPlan("");
-              setImage("");
-            }}
-          >
-            <option value="">— выбери —</option>
-            {(providersQ.data ?? []).map((p) => (
-              <option key={p.id} value={p.id} disabled={!p.is_active}>
-                {p.name} ({p.kind}){p.is_active ? "" : " — выкл"}
-              </option>
-            ))}
-          </select>
-        </label>
-        <label className="flex flex-col">
-          <span className="text-slate-400 text-xs mb-1">
-            Имя (пусто → авто «хостер-cc-NN»)
-          </span>
-          <input
-            className={`${inputCls} font-mono`}
-            placeholder="авто, или вручную: aeza-nl-01"
-            value={name}
-            onChange={(e) => setName(e.target.value)}
-          />
-        </label>
-
-        <label className="flex flex-col">
-          <span className="text-slate-400 text-xs mb-1">
-            Дата-центр {offeringsQ.isFetching ? "(загрузка…)" : ""}
-          </span>
-          {datacenters.length ? (
-            <select
-              className={inputCls}
-              value={dc}
-              onChange={(e) => setDc(e.target.value)}
-            >
-              <option value="">— выбери —</option>
-              {datacenters.map((d) => (
-                <option key={String(d.id)} value={String(d.id)}>
-                  {d.name} {d.flag ? `[${d.flag}]` : ""} (id {d.id})
-                </option>
-              ))}
-            </select>
-          ) : (
-            <input
-              className={`${inputCls} font-mono`}
-              placeholder="id датацентра"
-              value={dc}
-              onChange={(e) => setDc(e.target.value)}
-            />
-          )}
-        </label>
-
-        <label className="flex flex-col">
-          <span className="text-slate-400 text-xs mb-1">Тариф</span>
-          {plans.length ? (
-            <select
-              className={inputCls}
-              value={plan}
-              onChange={(e) => {
-                setPlan(e.target.value);
-                setImage("");
-              }}
-            >
-              <option value="">— выбери —</option>
-              {plans.map((p) => (
-                <option key={String(p.id)} value={String(p.id)}>
-                  {p.name}
-                  {p.price != null ? ` — ${p.price}₽` : ""}
-                  {p.cpu ? ` · ${p.cpu}vCPU` : ""}
-                  {p.ram_mib ? ` · ${Math.round(p.ram_mib / 1024)}G` : ""}
-                </option>
-              ))}
-            </select>
-          ) : (
-            <input
-              className={`${inputCls} font-mono`}
-              placeholder="id тарифа"
-              value={plan}
-              onChange={(e) => setPlan(e.target.value)}
-            />
-          )}
-        </label>
-
-        <label className="flex flex-col">
-          <span className="text-slate-400 text-xs mb-1">
-            ОС {selectedPlan && !images.length ? "(нет образов у тарифа)" : ""}
-          </span>
-          {images.length ? (
-            <select
-              className={inputCls}
-              value={image}
-              onChange={(e) => setImage(e.target.value)}
-            >
-              <option value="">— дефолт провайдера —</option>
-              {images.map((im) => (
-                <option key={String(im.id)} value={String(im.id)}>
-                  {im.name} (id {im.id})
-                </option>
-              ))}
-            </select>
-          ) : (
-            <input
-              className={`${inputCls} font-mono`}
-              placeholder="ostempl id (необязательно)"
-              value={image}
-              onChange={(e) => setImage(e.target.value)}
-            />
-          )}
-        </label>
-      </div>
-
-      {offeringsQ.error && (
-        <div className="text-amber-400 text-xs">
-          Не удалось загрузить offerings провайдера (
-          {offeringsQ.error instanceof ApiError
-            ? offeringsQ.error.message
-            : String(offeringsQ.error)}
-          ). Можно ввести id вручную.
-        </div>
-      )}
-      {err && <div className="text-red-400 text-xs">{err}</div>}
-
-      <div className="flex items-center gap-3">
-        <button
-          type="submit"
-          disabled={mutation.isPending}
-          className="px-4 py-1.5 rounded bg-sky-600 hover:bg-sky-500 text-sm font-semibold disabled:opacity-50"
-        >
-          {mutation.isPending ? "Заказываем…" : "Заказать и развернуть"}
-        </button>
-        <span className="text-slate-500 text-xs">
-          заказ спишет средства; exit появится как registering → active, relay
-          привяжешь отдельно
-        </span>
       </div>
     </form>
   );

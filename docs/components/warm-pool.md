@@ -61,25 +61,17 @@ Username генерится как `warm-<node_id>-<8 hex>` (`warm_pool.py:100-1
 3. Запускает `playbooks/provision_device.yml` с `extra_vars={state: present, username, uuid, password, protocols: [...]}` под семафором `_warmer_semaphore`.
 4. **Только после** успешного `returncode == 0` добавляет `Credential`-объекты в сессию и коммитит.
 
-Порядок принципиальный: если писать в БД до ansible'а, падение роли оставит в warm-пуле «мертвецов», которых assignment потом отдаст платящему пользователю.
-
-**Компенсация partial-failure (аудит #76).** Обратная сторона «сначала ansible, потом БД»: если плейбук залил часть протоколов и упал (rc≠0) или бросил исключение, на ноде остаётся identity, о которой БД не знает, а `username` на каждую попытку новый — на флапающей ноде мусорные клиенты xray копились бы с каждым тиком. Поэтому при любом неуспехе `warm_one_bundle` вызывает `_best_effort_remove_identity` — тот же плейбук со `state=absent` по этому `username` (best-effort, ошибки только логируются, БД не трогается). Строк в БД ещё нет, поэтому снять огрызок можно только по имени.
+Порядок принципиальный (см. комментарий `warm_pool.py:228-230`): если писать в БД до ansible'а, падение роли оставит в warm-пуле «мертвецов», которых assignment потом отдаст платящему пользователю. Симметрия нарушена в двух других местах (см. ⚠️ Неясные места).
 
 ## Atomic assignment — hot path
 
 `try_assign_bundle(db, node_id, subscription_id)` (`warm_pool.py:304-366`) — функция, которую вызывает orchestrator в момент активации подписки.
 
 ```python
-# сокращённо: анкер — минимальный id КАЖДОГО bundle'а, не просто
-# минимальный warm-id ноды
-anchor_ids = (
-    db.query(func.min(models.Credential.id))
-    .filter(node_id == node_id, pool_state == warm)
-    .group_by(models.Credential.access_username)
-)
+# warm_pool.py:323-330 (сокращённо)
 anchor = (
     db.query(models.Credential)
-    .filter(models.Credential.id.in_(anchor_ids))
+    .filter(node_id == node_id, pool_state == warm)
     .order_by(Credential.id.asc())
     .with_for_update(skip_locked=True)
     .first()
@@ -88,11 +80,12 @@ anchor = (
 
 **Почему SKIP LOCKED, а не advisory lock или отдельная таблица:**
 
-- Кандидаты в анкеры — только «первые» (минимальный `id`) строки каждого bundle'а: `MIN(id) GROUP BY access_username`. Это load-bearing.
-- Два параллельных воркера, взявших разные анкеры, гарантированно смотрят на разные bundle'ы.
+- `access_username` уникален per-node на один bundle.
+- Анкер — строка с минимальным `id` среди warm'ов ноды.
+- Два параллельных воркера, взявших разные анкеры, гарантированно смотрят на разные bundle'ы (потому что у анкеров разные `access_username`).
 - Третий воркер, попытавшийся взять тот же анкер, что и первый, провалится в `SKIP LOCKED` и увидит следующий по порядку (или `None`, если пул пустой).
 
-**Почему именно `MIN(id) per bundle`, а не «минимальный warm-id ноды»:** строки одного bundle'а (N протоколов одного username) имеют соседние `id`. Если бы кандидатом был любой warm-row, воркер B мог бы через `SKIP LOCKED` перескочить залоченный воркером A анкер `id=10` и взять `id=11` — соседа того же bundle'а — своим анкером. Дальше A ждёт row'у B, B ждёт row'у A → дедлок, Postgres убьёт одну транзакцию. Анкер по per-bundle-минимуму гарантирует, что два воркера всегда попадают на два разных bundle'а. (Это была находка аудита #73; прежний комментарий про «unique access_username per row» был неверен — уникален username bundle'а, а не каждой строки-кандидата.)
+Результат: «two workers can ever pick the same bundle even if they hit the table at the exact same instant» (комментарий `warm_pool.py:25-30`), **без** отдельного app-level мьютекса, **без** advisory lock, **без** двухфазного claim.
 
 После анкера — второй `SELECT ... FOR UPDATE` (уже **без** SKIP LOCKED) на всех credential'ах bundle'а по `access_username`:
 
@@ -149,29 +142,21 @@ return [f"{n}:{u}" for (n, u) in pending.keys()]
 
 ### Stage 2: `physical_revoke_credential_bundle` (в воркере)
 
-`physical_revoke_credential_bundle(db, node_id, access_username)`. Шаги:
+`warm_pool.py:398-478`. Запускается как RQ-job. Шаги:
 
 1. Ищет строки по `(node_id, access_username, pool_state=revoked)`.
-2. Если их **нет** — возвращает `True` (идемпотентно: retry не должен фэйлить).
+2. Если их **нет** — возвращает `True` (идемпотентно: retry не должен фэйлить job).
 3. Если нода удалена (`node is None`) — удаляет записи и возвращает `True`. Нельзя запустить ansible на несуществующей ноде.
 4. Собирает `protocols_payload` через dedup по `proto` (bundle может иметь несколько credential'ов с одним и тем же `proto`, если была multi-config ситуация).
 5. Запускает `playbooks/provision_device.yml` с `state=absent` под тем же `_warmer_semaphore`.
 6. После успешного exit'а — `db.delete()` на все credential'ы bundle'а и `commit`.
-7. При non-zero exit возвращает `False` — бандл остаётся revoked и будет повторён на следующем тике.
+7. При non-zero exit возвращает `False` — RQ retry policy перезапустит job.
 
 Это — единственная функция warm_pool, которая реально удаляет строки из таблицы `credentials`.
 
-### Драйвер stage 2: `run_warm_pool_revoke_sweep` (аудит #71)
-
-`physical_revoke_credential_bundle` сама себя не вызывает — её гоняет периодический тик `run_warm_pool_revoke_sweep(db, batch_limit)`. Он выбирает все уникальные `(node_id, access_username)` в `pool_state=revoked` (и после `unassign_bundle`, и после `invalidate_node_warm_pool`) и для каждого запускает физическое удаление, не более `WARM_POOL_REVOKE_BATCH_PER_TICK` (default 5) за тик. Без этого свипа revoked-identity никогда не покидали ноду (лишние клиенты в конфиге xray), а revoked-строки копились в БД вечно.
-
-Back-off: неуспешный бандл остаётся `revoked` и повторяется на следующем тике (`physical_revoke_credential_bundle` идемпотентна). После `WARM_POOL_REVOKE_MAX_ATTEMPTS` (default 5) подряд неудач бандл пропускается и логируется для ручного разбора, чтобы мёртвая нода (dead SSH, decommissioned box) не молотилась каждый тик. Счётчик попыток — process-local (`_revoke_attempts`), сбрасывается при перезапуске воркера; durable-счётчик потребовал бы колонку в `Credential` и намеренно не заведён.
-
-> Оркестрация: тик подключается в `app.worker` рядом с `run_warm_pool_check` (см. `components/worker.md`).
-
 ### `invalidate_node_warm_pool`
 
-`invalidate_node_warm_pool`. Вызывается, когда у ноды меняется набор `VPNConfig` (добавили/убрали протокол). Старые warm-bundle'ы собраны под прежнюю конфигурацию xray и уже не соответствуют реальности на ноде, поэтому все warm'ы ноды помечаются revoked. Потом их догоняет `run_warm_pool_revoke_sweep` (см. драйвер stage 2) и снимает с ноды через ansible `state=absent`.
+`warm_pool.py:481-502`. Вызывается, когда у ноды меняется набор `VPNConfig` (добавили/убрали протокол). Старые warm-bundle'ы собраны под прежнюю конфигурацию xray и уже не соответствуют реальности на ноде, поэтому все warm'ы ноды помечаются revoked. Потом обычный воркер (`physical_revoke_credential_bundle`) их догонит и снимет через ansible.
 
 ## Concurrency и семафор
 
@@ -188,8 +173,6 @@ Back-off: неуспешный бандл остаётся `revoked` и повт
 | `WARM_POOL_ENABLED` | `1` | `0`/`false`/`no` — `ensure_pool` возвращает `{}`, `try_assign_bundle` возвращает `None`. Cold path работает всегда. |
 | `WARM_POOL_TARGET` | `10` | глубина пула на одну ноду |
 | `WARM_POOL_BATCH_PER_TICK` | `3` | максимум новых warm'ов за одну тику на одну ноду |
-| `WARM_POOL_REVOKE_BATCH_PER_TICK` | `5` | максимум физических revoke'ов за тик `run_warm_pool_revoke_sweep` |
-| `WARM_POOL_REVOKE_MAX_ATTEMPTS` | `5` | после скольких подряд неудач свип бросает бандл в ручной разбор |
 | `WARM_POOL_MAX_CONCURRENT` | `2` | размер `_warmer_semaphore` |
 
 Интервал тика warmer'а задаётся через `WARM_POOL_INTERVAL_SECONDS` в воркере (см. `components/worker.md`).
@@ -215,7 +198,7 @@ Hits/misses — прямой индикатор того, справляется
 
 ## ⚠️ Неясные места
 
-- **Идемпотентность `warm_one_bundle` при partial failure.** Случай «ansible rc≠0 / исключение» закрыт компенсацией `_best_effort_remove_identity` (аудит #76, см. раздел Warming). Остаётся более узкий хвост: ansible прошёл (нода имеет user'а), а `db.commit()` упал (конфликт на уникальном индексе, OOM в PG) — тогда компенсация не срабатывает (мы уже за пределами ansible-блока), и на ноде остаётся orphan, которого никто не снимет. Редко, но не покрыто.
+- **Идемпотентность `warm_one_bundle` при partial failure.** Если ansible прошёл (нода уже имеет user'а), а `db.commit()` упал (например, конфликт на уникальном индексе, OOM в PG), то запись на ноде останется, а в БД — нет. При следующем тике сгенерится **другой** `access_username` и на ноду pushнётся ещё один user. Ни очистки, ни проверки на orphan'ов не видно.
 - **`physical_revoke_credential_bundle` ↔ `threading.Semaphore` ↔ RQ concurrency.** RQ по умолчанию гоняет job'ы в одном worker-процессе последовательно. Но если кто-то поднимет `RQ_WORKER_COUNT>1` (через `supervisor`/compose replicas), физический revoke сможет войти в семафор одновременно с warming'ом на разных процессах — см. комментарий к process-local ограничению.
 - **Inconsistency в ordering «DB first vs ansible first».** `warm_one_bundle` делает `ansible → db.commit()`. `physical_revoke_credential_bundle` тоже: `ansible → db.delete()`. А `unassign_bundle` — напротив, `db.flush()` без ansible. Это намеренно (revoke делится на два стадии), но читатель видит один модуль с двумя несимметричными порядками операций — явно это нигде не объяснено.
 - **`try_assign_bundle` при частично warm bundle'е.** Если по какой-то причине в bundle'е осталась только одна warm-строка (скажем, ручной DELETE в админке), anchor-lock найдёт её, а `bundle = [...]` вернёт только её — функция назначит подписке credential с неполным набором протоколов. Нет валидации «bundle должен содержать N credential'ов, где N = количество активных конфигов ноды».

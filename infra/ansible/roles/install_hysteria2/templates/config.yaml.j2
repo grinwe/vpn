@@ -1,4 +1,3 @@
-{% set _bind = hysteria2_bind_device | default(xray_primary_interface | default('')) %}
 listen: :{{ hysteria2_port | int }}
 
 {% if hysteria2_cert_path | default('') | length > 0 %}
@@ -24,109 +23,7 @@ bandwidth:
   up: {{ hysteria2_up_mbps | default(100) }} mbps
   down: {{ hysteria2_down_mbps | default(100) }} mbps
 
-# ── Traffic Stats API ─────────────────────────────────────────────────────
-# hy2 — отдельный демон, и в сборе телеметрии его не было вовсе: xray отдаёт
-# статистику через gRPC StatsService, а hysteria до этой секции не отдавал
-# ничего. Практический результат — carrying_fraction и watcher репортов не
-# видели hy2-трафик, то есть человек, у которого работает ТОЛЬКО hy2 (регионы
-# с жёстким DPI — там вывозит именно он), выглядел для нас как «не подключился
-# вовсе».
-#
-# Без secret и строго на loopback — ровно как xray-gRPC на 127.0.0.1:10085-87
-# рядом: наружу порт не выставлен, а клиенту loopback ноды закрыт правилом
-# `reject(geoip:private)` ниже. Ходим за статистикой по SSH как root.
-trafficStats:
-  listen: 127.0.0.1:{{ hysteria2_traffic_api_port | default(10088) }}
-
-{% if _bind %}
-# ── Split-tunnel (relay-нода) ─────────────────────────────────────────────
-# До 2026-07-28 этой секции не было вовсе, и hy2 на relay-ноде выпускал ВЕСЬ
-# трафик с российского IP: клиент показывал «подключено», РУ-сайты работали, а
-# заблокированное оставалось заблокированным. Причина не в отсутствии acl, а в
-# маршрутизации: WG-дефолт на relay'е намеренно хуже основного
-# (relay_jump_node: `Table = off` + PostUp с `metric 200`), поэтому в туннель
-# попадает только то, что процесс ЯВНО забиндил на интерфейс. xray это делает
-# через sockopt.interface, а hysteria — отдельный демон, и до этой секции не
-# биндил ничего.
-#
-# `tunnel` стоит ПЕРВЫМ намеренно: при отсутствии ACL hysteria шлёт всё в
-# первый outbound (док: «If you do not use ACL, all connections will always be
-# routed through the first ('default') outbound»). Если ACL когда-нибудь не
-# применится, деградация будет в сторону «РУ-сайты видят зарубежный IP», а не
-# «VPN не работает вовсе».
-outbounds:
-  - name: tunnel
-    type: direct
-    direct:
-      bindDevice: {{ _bind }}
-  - name: local
-    type: direct
-    # БЕЗ bindDevice — это и есть «мимо туннеля, с IP самой ноды», цель
-    # РУ-правил ниже. mode указан явно, чтобы поведение не зависело от того,
-    # как hysteria трактует пустую секцию.
-    direct:
-      mode: auto
-
-# Правила матчатся сверху вниз, первое совпадение выигрывает. Списки зон и
-# доменов — из роли ru_direct_list, той же, что кормит три xray-шаблона;
-# `suffix:` в hysteria = домен + все поддомены (аналог `domain:` в xray).
-acl:
-  inline:
-    # Приватные сети и loopback самой ноды клиенту недоступны — симметрично
-    # правилу geoip:private → block в xray-конфигах.
-    - reject(geoip:private)
-{% for _z in ru_direct_list_zones %}
-    - local(suffix:{{ _z }})
-{% endfor %}
-{% for _d in ru_direct_list_domains %}
-    - local(suffix:{{ _d }})
-{% endfor %}
-    # Резолвится в РУ-IP → тоже напрямую (домен мог не попасть в список выше).
-    - local(geoip:ru)
-    # Всё остальное — в туннель к зарубежному exit'у.
-    - tunnel(all)
-  # Переиспользуем файл, который качает и обновляет роль xray_geoip: формат
-  # общий (v2ray geoip.dat), второй копии и второго таймера не нужно.
-  geoip: /usr/local/share/xray/geoip.dat
-{% else %}
-# ── Direct-нода (туннеля нет) ─────────────────────────────────────────────
-# Split-tunnel тут не нужен: весь трафик и так выходит с IP самой ноды. Но
-# приватные сети закрыть надо — симметрично правилу geoip:private → block,
-# которое у xray-шаблонов стоит БЕЗУСЛОВНО. Без этого клиент дотягивается до
-# loopback ноды (gRPC StatsService xray на 127.0.0.1:10085-10087 перечисляет
-# все email'ы ноды и их трафик), до приватной сети ДЦ и до 169.254.169.254.
-outbounds:
-  - name: local
-    type: direct
-    direct:
-      mode: auto
-
-acl:
-  inline:
-    - reject(geoip:private)
-    - local(all)
-  geoip: /usr/local/share/xray/geoip.dat
-{% endif %}
-
 # Auth via password file — managed by manage_hy2_user.sh
 auth:
   type: userpass
-  userpass:
-{% for _u, _p in (hysteria2_existing_userpass | default({}) | dictsort) %}
-    {{ _u }}: "{{ _p }}"
-{% endfor %}
-{% if '__sentinel__' not in (hysteria2_existing_userpass | default({})) %}
-    # Sentinel-заглушка: hysteria2 FATAL'ит (exit 1 → краш-луп) на пустом
-    # userpass. Нода с включённым hy2, но без назначенных юзеров (свежий
-    # hy2-конфиг до того как diverse-sub раздаст девайсы) иначе уходит в вечный
-    # краш-луп. Держим один заглушечный юзер со случайным 32-символьным
-    # паролем: клиенту НЕ выдаётся, угадать нельзя (=реальный секрет), реальных
-    # юзеров manage_hy2_user.sh дописывает рядом (setdefault по userpass;
-    # заглушку del не трогает).
-    #
-    # Генерится ТОЛЬКО при первом рендере: существующие записи (включая сам
-    # sentinel) приезжают из slurp'а выше — иначе роль стирала всех юзеров
-    # ноды на каждом прогоне, а новый случайный sentinel делал файл вечно
-    # changed и дёргал рестарт hysteria-server (аудит 2026-07-25).
-    __sentinel__: "{{ lookup('password', '/dev/null chars=ascii_letters,digits length=32') }}"
-{% endif %}
+  userpass: {}

@@ -57,15 +57,9 @@ class AezaDriver:
 
         data = self._post("/services", body)
         # Aeza returns {"data": {"items": [{"id": ..., ...}]}}
-        # data["data"] может прийти как dict, list или отсутствовать —
-        # гардируем каждый .get, чтобы не словить голый AttributeError.
-        inner = data.get("data")
-        items = (inner.get("items") if isinstance(inner, dict) else None) \
-            or data.get("items") or []
-        if isinstance(inner, list):
-            items = inner
-        if isinstance(inner, dict) and "id" in inner:
-            items = [inner]
+        items = data.get("data", {}).get("items") or data.get("items") or []
+        if isinstance(data.get("data"), dict) and "id" in data["data"]:
+            items = [data["data"]]
         if not items:
             raise DriverError(f"Aeza did not return service id: {data}")
 
@@ -121,14 +115,8 @@ class AezaDriver:
         while time.time() < deadline:
             data = self._get(f"/services/{service_id}")
             last = data.get("data") or data
-            # data["data"] может оказаться списком (как у /locations) —
-            # берём первый dict-элемент, иначе .get ниже упал бы с AttributeError.
-            if isinstance(last, list):
-                last = next((x for x in last if isinstance(x, dict)), {})
             if isinstance(last, dict) and last.get("items"):
                 last = last["items"][0] if last["items"] else last
-            if not isinstance(last, dict):
-                last = {}
             status = str(last.get("status") or "").lower()
             if status in ("active", "running"):
                 return last

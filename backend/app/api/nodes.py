@@ -13,8 +13,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query
-from pydantic import BaseModel, StrictBool
-from sqlalchemy import func, or_
+from sqlalchemy import func
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -26,24 +25,9 @@ from ..services.ansible_runner import (
     validate_node_name,
 )
 from ..services.health import recompute_node_health
-from ..services.node_spawner import (
-    NodeSpawnError,
-    destroy_node,
-    maybe_enable_reality_unify,
-    reboot_node,
-    reinstall_node,
-    renew_node,
-    resolve_spawn_name,
-    spawn_node_async,
-)
+from ..services.node_spawner import NodeSpawnError, destroy_node, spawn_node
 from ..services.provisioning import ProvisioningOrchestrator
-from ._common import (
-    ADMIN_ACTOR_HEADER,
-    _audit,
-    _resolve_admin_actor,
-    get_db,
-    logger,
-)
+from ._common import ADMIN_ACTOR_HEADER, _audit, _resolve_admin_actor, get_db
 
 router = APIRouter()
 
@@ -79,333 +63,9 @@ def create_node(
     actor, actor_type = _resolve_admin_actor(admin_actor)
     _audit(db, actor, "node_created", "vpn_node", node.id, actor_type=actor_type)
     orchestrator = ProvisioningOrchestrator(db)
-    # Ручное создание ноды — нужна немедленная bootstrap-таска (оператор ждёт
-    # провижининг + трекаемую таску), НЕ дефёрим в reconciler-debounce.
-    task, _created = orchestrator.create_or_coalesce_node_bootstrap(
-        node, {"pool_id": payload.pool_id}, defer_to_reconciler=False
-    )
+    task = orchestrator.create_task("node", node.id, "bootstrap", {"pool_id": payload.pool_id})
     db.commit()
-    if _created:
-        orchestrator.run_task_async(task, node=node)
-    return node
-
-
-def _ws_cdn_resolve_ip(host: str) -> str:
-    """node.host may be an IP or a hostname; CF A-records need an IPv4."""
-    import ipaddress
-    import socket
-
-    try:
-        ipaddress.ip_address(host)
-        return host
-    except ValueError:
-        return socket.gethostbyname(host)
-
-
-def _provision_cf_subdomain(
-    db: Session, node: models.VPNNode, config: models.VPNConfig
-) -> None:
-    """Mint a **DNS-only** subdomain → node IP and pin it onto the config
-    (``sni`` + ``settings.cf_record_id/cf_subdomain``).
-
-    Applies to: ws-cdn (always — its sni is always the minted subdomain) and
-    xhttp when the operator left ``sni`` empty (auto-front mode; a non-empty
-    sni = classic direct+LE xhttp, left untouched). The record is grey-cloud
-    (proxied=False) → resolves straight to the node, which serves TLS itself
-    (LE per subdomain). CF is DNS only — proxying WS/xhttp is dead (RKN; see
-    project_cf_ws_cdn_dead). Fails loud (HTTPException) if CF isn't configured
-    or the API errors.
-    """
-    from ..services import cloudflare_dns
-
-    proto = config.protocol
-    if proto == models.VPNConfigProtocol.vless_ws_cdn:
-        # ws-cdn sni is always the minted subdomain.
-        domain = cloudflare_dns.front_domain()
-    elif proto == models.VPNConfigProtocol.vless_xhttp and not config.sni:
-        # empty sni → auto-front xhttp. Single zone now (wgse.info): xhttp
-        # shares the ws-cdn front; grwr.ink is retired (DNS-only removed the
-        # cert-clobber that forced the per-protocol zone split).
-        domain = cloudflare_dns.front_domain()
-    else:
-        return  # other protocols, or xhttp with an explicit (direct) domain
-
-    if not cloudflare_dns.is_configured(domain):
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                "DNS front requires CLOUDFLARE_DNS_TOKEN + WSCDN_FRONT_DOMAIN "
-                "on the backend"
-            ),
-        )
-    try:
-        ip = _ws_cdn_resolve_ip(node.host)
-        # proxied=False → DNS-only A → node IP directly; node serves TLS (LE).
-        rec = cloudflare_dns.create_node_record(ip, domain=domain, proxied=False)
-    except cloudflare_dns.CloudflareError as exc:
-        raise HTTPException(
-            status_code=502, detail=f"Cloudflare DNS failed: {exc}"
-        ) from exc
-    except OSError as exc:
-        raise HTTPException(
-            status_code=400, detail=f"Cannot resolve node host {node.host!r}: {exc}"
-        ) from exc
-
-    config.sni = rec["subdomain"]
-    settings = dict(config.settings or {})
-    settings["cf_record_id"] = rec["record_id"]
-    settings["cf_subdomain"] = rec["subdomain"]
-    settings["cf_front_domain"] = rec["front_domain"]  # zone for teardown
-    config.settings = settings
-    db.add(config)
-    db.commit()
-    db.refresh(config)
-
-
-def _teardown_cf_subdomain(config: models.VPNConfig) -> None:
-    """Best-effort delete the DNS-only CF record bound to a config (ws-cdn or
-    auto xhttp) — idempotent. Keyed on cf_record_id (+ stored cf_front_domain
-    for the zone), so it's protocol-agnostic and still tears down legacy
-    proxied/grwr.ink records: a config without a record is a no-op."""
-    settings = config.settings or {}
-    record_id = settings.get("cf_record_id")
-    if not record_id:
-        return
-    from ..services import cloudflare_dns
-
-    # Delete in the zone the record was minted in (ws→wgse, xhttp→grwr).
-    # Older configs predate cf_front_domain → fall back to the default front.
-    cloudflare_dns.delete_record(
-        record_id, domain=settings.get("cf_front_domain")
-    )
-
-
-def _build_config_from_payload(
-    db: Session, node: models.VPNNode, payload: schemas.VPNConfigCreate
-) -> models.VPNConfig:
-    """Создать VPNConfig из payload с auto-keygen для REALITY/shadowtls.
-
-    Reuse'ит логику ``create_config`` (см. ниже), но без bootstrap-task'и
-    в конце — caller сам решает когда планировать bootstrap (в composite
-    flow — один общий для всех configs).
-    """
-    try:
-        protocol = models.VPNConfigProtocol(payload.protocol)
-    except ValueError as exc:  # noqa: BLE001
-        raise HTTPException(
-            status_code=400, detail=f"Unknown protocol: {payload.protocol}"
-        ) from exc
-
-    existing_same = (
-        db.query(models.VPNConfig)
-        .filter(
-            models.VPNConfig.node_id == node.id,
-            models.VPNConfig.protocol == protocol,
-        )
-        .first()
-    )
-    if existing_same is not None:
-        raise HTTPException(
-            status_code=409,
-            detail=(
-                f"Config for {protocol.value} already exists on this node "
-                f"(id={existing_same.id})"
-            ),
-        )
-
-    if protocol == models.VPNConfigProtocol.vless_reality and not payload.public_key:
-        from ..services.node_spawner import ensure_reality_config
-        return ensure_reality_config(
-            db, node,
-            port=payload.port or None,
-            sni=payload.sni or None,
-            dest=payload.fallback or None,
-        )
-    if protocol == models.VPNConfigProtocol.shadowtls_ss and not (
-        payload.settings or {}
-    ).get("ss_password_enc"):
-        from ..services.node_spawner import ensure_shadowtls_config
-        return ensure_shadowtls_config(
-            db, node,
-            port=payload.port or None,
-            handshake_domain=payload.sni or None,
-            name=payload.name or None,
-        )
-    # hysteria2 без явного obfs_password = «авто»-режим: транспортные дефолты
-    # (obfs+пароль парой, лимиты полосы, port-hopping) и переиспользование
-    # LE-серта xhttp/ws-cdn фронта этой ноды. Ветка зеркалит ``create_config``
-    # (одиночный POST /configs) — без неё composite-путь /nodes/with-configs
-    # создавал бы hy2 голым: без obfs, без cert_path, без sni, то есть
-    # заведомо нерабочим. Разъехалось, когда hy2 вернули в UI 2026-07-28.
-    if protocol == models.VPNConfigProtocol.hysteria2 and not (
-        payload.settings or {}
-    ).get("obfs_password"):
-        from ..services.node_spawner import ensure_hysteria2_config
-        return ensure_hysteria2_config(
-            db, node,
-            port=payload.port or None,
-            sni=payload.sni or None,
-            name=payload.name or None,
-        )
-
-    settings = dict(payload.settings or {})
-    # vless-xhttp: nginx-фронт matchит SNI с settings.domain — без
-    # дублирования у админа задача «sni vs settings.domain» расходилась
-    # после DR (sni был, domain пустой → fix_xhttp_sni.sh). Auto-fill
-    # сохраняет explicit значение, если админ его задал.
-    if (
-        protocol == models.VPNConfigProtocol.vless_xhttp
-        and payload.sni
-        and not settings.get("domain")
-    ):
-        settings["domain"] = payload.sni
-
-    config = models.VPNConfig(
-        node_id=node.id,
-        name=payload.name,
-        protocol=protocol,
-        port=payload.port,
-        sni=payload.sni,
-        public_key=payload.public_key,
-        fallback=payload.fallback,
-        settings=settings or None,
-        is_enabled=payload.is_enabled,
-    )
-    db.add(config)
-    db.commit()
-    db.refresh(config)
-    try:
-        _provision_cf_subdomain(db, node, config)
-    except HTTPException:
-        db.delete(config)
-        db.commit()
-        raise
-    return config
-
-
-@router.post("/nodes/with-configs", response_model=schemas.VPNNodeOut)
-def create_node_with_configs(
-    payload: schemas.VPNNodeWithConfigsCreate,
-    db: Session = Depends(get_db),
-    admin_token: str = Depends(require_admin),
-    admin_actor: str | None = Header(default=None, alias=ADMIN_ACTOR_HEADER),
-):
-    """Создать ноду + N VPN-конфигов + один bootstrap одним запросом.
-
-    Заменяет последовательность «POST /nodes → POST /configs × N», где
-    каждый шаг плодил свой bootstrap-task. Здесь все INSERT'ы делаются
-    в логическом блоке + один bootstrap-task в конце c ``initial=True``
-    в payload — site.yml на ноде сразу видит финальный набор протоколов.
-
-    Best-effort atomicity: при exception в середине rollback'аем ноду
-    + успешно созданные configs ручным cleanup'ом (полностью atomic
-    require'ло бы non-committing варианты ensure_reality/shadowtls'ов).
-    Для админ-UX этого достаточно: при провале юзер видит чистое
-    состояние и пробует заново.
-    """
-    try:
-        validate_node_identity_fields(
-            payload.node.name, payload.node.host, payload.node.ssh_port
-        )
-    except InvalidNodeIdentity as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-
-    protocols_seen: set[str] = set()
-    for cfg in payload.configs:
-        if cfg.protocol in protocols_seen:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Duplicate protocol in configs: {cfg.protocol}",
-            )
-        protocols_seen.add(cfg.protocol)
-        try:
-            models.VPNConfigProtocol(cfg.protocol)
-        except ValueError as exc:  # noqa: BLE001
-            raise HTTPException(
-                status_code=400, detail=f"Unknown protocol: {cfg.protocol}"
-            ) from exc
-
-    node = models.VPNNode(
-        name=payload.node.name,
-        region=payload.node.region,
-        host=payload.node.host,
-        ssh_port=payload.node.ssh_port,
-        pool_id=payload.node.pool_id,
-        notes=payload.node.notes,
-        status=models.VPNNodeStatus.registering,
-    )
-    db.add(node)
-    db.commit()
-    db.refresh(node)
-
-    actor, actor_type = _resolve_admin_actor(admin_actor)
-    _audit(db, actor, "node_created", "vpn_node", node.id, actor_type=actor_type)
-
-    created_configs: list[models.VPNConfig] = []
-    try:
-        # Порядок создания несущий: два протокола смотрят на то, что уже есть
-        # на ноде, и получаются неполноценными, если приедут раньше своих
-        # зависимостей. Порядок клиентского JSON-массива к этому отношения
-        # иметь не должен, поэтому раскладываем сами.
-        #
-        #   1. xhttp / ws-cdn — TCP-фронты: ставят nginx и выпускают LE-серт;
-        #   2. reality — по наличию фронта включает 443-унификацию
-        #      (settings.public_port + loopback-listen);
-        #   3. hysteria2 — переиспользует LE-серт фронта (свой ACME у него на
-        #      combo-ноде дерётся с nginx за :80/:443).
-        _CREATE_ORDER = {
-            models.VPNConfigProtocol.vless_ws_cdn.value: 0,
-            models.VPNConfigProtocol.vless_xhttp.value: 0,
-            models.VPNConfigProtocol.vless_reality.value: 1,
-            models.VPNConfigProtocol.hysteria2.value: 2,
-        }
-        for cfg_payload in sorted(
-            payload.configs,
-            key=lambda c: _CREATE_ORDER.get(c.protocol, 1),
-        ):
-            # ensure_hysteria2_config ищет фронт в ``node.configs`` — а это
-            # lazy-relationship, закэшированный на момент первой загрузки ноды.
-            # Без refresh он не увидит xhttp/ws-cdn, созданные в этом же цикле
-            # секундой раньше, и hy2 останется без домена и сертификата даже
-            # при правильном порядке.
-            db.refresh(node)
-            cfg = _build_config_from_payload(db, node, cfg_payload)
-            created_configs.append(cfg)
-            _audit(
-                db, actor, "config_created", "vpn_config", cfg.id,
-                actor_type=actor_type,
-            )
-        # Догнать унификацию, если reality приехал раньше своего фронта
-        # (сортировка выше это предотвращает, но payload мог прийти и не от
-        # нашей формы — например из скрипта).
-        db.refresh(node)
-        maybe_enable_reality_unify(db, node)
-    except HTTPException:
-        # Rollback: убираем уже созданные configs + ноду. Юзер видит
-        # чистое состояние и понимает что весь composite запрос
-        # провалился (без orphan'ной ноды без configs).
-        for cfg in created_configs:
-            _teardown_cf_subdomain(cfg)  # release CF record before dropping the row
-            db.delete(cfg)
-        db.delete(node)
-        db.commit()
-        raise
-
-    orchestrator = ProvisioningOrchestrator(db)
-    # Первичный bootstrap новой ноды — немедленно (НЕ дефёрим): оператор ждёт,
-    # пока нода поднимется, и трекает таску. initial=True не коалесить.
-    task, _created = orchestrator.create_or_coalesce_node_bootstrap(
-        node,
-        {
-            "pool_id": payload.node.pool_id,
-            "initial": True,
-            "config_change": len(created_configs) > 0,
-        },
-        defer_to_reconciler=False,
-    )
-    db.commit()
-    if _created:
-        orchestrator.run_task_async(task, node=node)
+    orchestrator.run_task_async(task, node=node)
     return node
 
 
@@ -433,11 +93,7 @@ def list_nodes(
     if is_active is not None:
         query = query.filter(models.VPNNode.is_active.is_(is_active))
     nodes = (
-        # id как вторичный ключ — детерминированный тайбрейкер. Без него
-        # ноды с равным (или NULL после DR-restore) created_at возвращались
-        # в физическом heap-порядке, который меняется на UPDATE строки
-        # (bootstrap/любое действие) → нода «перепрыгивала» в списке админки.
-        query.order_by(models.VPNNode.created_at, models.VPNNode.id)
+        query.order_by(models.VPNNode.created_at)
         .offset(offset)
         .limit(limit)
         .all()
@@ -476,82 +132,6 @@ def list_nodes(
         )
         last_ssh_by_node = {node_id: latest for node_id, latest in rows}
 
-    # active_users из ПОСЛЕДНЕГО сэмпла per-node (DISTINCT ON node_id ORDER BY
-    # observed_at DESC). Нужно для idle-aware health-dots: 0 юзеров + протухший
-    # WG-handshake = простой, не обрыв (см. linkHealth.tsx). Колонки
-    # active_users на vpn_nodes НЕТ — она живёт только в node_traffic_samples.
-    active_users_by_node: dict[int, int] = {}
-    if node_ids:
-        au_rows = (
-            db.query(
-                models.NodeTrafficSample.node_id,
-                models.NodeTrafficSample.active_users,
-            )
-            .filter(models.NodeTrafficSample.node_id.in_(node_ids))
-            .order_by(
-                models.NodeTrafficSample.node_id,
-                models.NodeTrafficSample.observed_at.desc(),
-            )
-            .distinct(models.NodeTrafficSample.node_id)
-            .all()
-        )
-        active_users_by_node = {nid: au for nid, au in au_rows}
-
-    # assigned_users — сколько РАЗНЫХ юзеров держат активный cred на ноде.
-    # diverse-sub-корректно (по Credential.node_id → девайс считается на КАЖДОЙ
-    # своей ноде, в отличие от Subscription.node_id=primary в choose_node).
-    # Детерминированный DB-join: всегда доступен, НЕ протухает как active_users
-    # из traffic-сэмпла (тот мёртв если stats-тик стоит). Один GROUP BY.
-    assigned_users_by_node: dict[int, int] = {}
-    if node_ids:
-        assigned_rows = (
-            db.query(
-                models.Credential.node_id,
-                func.count(func.distinct(models.Subscription.user_id)),
-            )
-            .join(models.Device, models.Credential.device_id == models.Device.id)
-            .join(
-                models.Subscription,
-                models.Device.subscription_id == models.Subscription.id,
-            )
-            .filter(
-                models.Credential.node_id.in_(node_ids),
-                models.Credential.is_active.is_(True),
-                models.Credential.device_id.isnot(None),
-                models.Device.status == models.DeviceStatus.active,
-                models.Subscription.status == models.SubscriptionStatus.active,
-            )
-            .group_by(models.Credential.node_id)
-            .all()
-        )
-        assigned_users_by_node = {nid: cnt for nid, cnt in assigned_rows}
-
-    # cert_expires_at — ближайшее (min) истечение LE-серта среди xhttp/ws-cdn
-    # конфигов ноды. Пишет cert-renewal-тик в config.settings.cert_expires_at
-    # (ISO, внешняя TLS-проба). ISO сортируется лексикографически=хронологически
-    # → func.min по тексту = самый ранний. Для cert-бейджа в админке.
-    cert_expires_by_node: dict[int, datetime] = {}
-    if node_ids:
-        ce_rows = (
-            db.query(
-                models.VPNConfig.node_id,
-                func.min(models.VPNConfig.settings["cert_expires_at"].astext),
-            )
-            .filter(
-                models.VPNConfig.node_id.in_(node_ids),
-                models.VPNConfig.settings["cert_expires_at"].astext.isnot(None),
-            )
-            .group_by(models.VPNConfig.node_id)
-            .all()
-        )
-        for nid, ce in ce_rows:
-            if not ce:
-                continue
-            try:
-                cert_expires_by_node[nid] = datetime.fromisoformat(ce)
-            except ValueError:
-                continue
-
     def _to_out(n: models.VPNNode) -> schemas.VPNNodeOut:
         out = schemas.VPNNodeOut.from_orm(n)
         out.exit_links = [
@@ -565,30 +145,9 @@ def list_nodes(
             for link in links_by_relay.get(n.id, [])
         ]
         out.last_ssh_at = last_ssh_by_node.get(n.id)
-        out.active_users = active_users_by_node.get(n.id, 0)
-        out.assigned_users = assigned_users_by_node.get(n.id, 0)
-        out.cert_expires_at = cert_expires_by_node.get(n.id)
-        # Reconciler-видимость: нода помечена dirty (desired бампнут правкой),
-        # но прогон ещё отложен на тик. reconcile_due_at уже подтянут from_orm.
-        out.reconcile_pending = n.desired_generation > n.reconciled_generation
         return out
 
     return [_to_out(n) for n in nodes]
-
-
-@router.get("/nodes/carrying-fractions")
-def list_carrying_fractions(
-    db: Session = Depends(get_db),
-    admin_token: str = Depends(require_admin),
-):
-    """Phase C — per-node ``carrying_fraction`` (детект блокировок по поведению
-    клиентов). Read-only. = (девайсов сейчас на ноде) / (девайсов, у кого нода в
-    наборе). Осмыслен при ``DIVERSE_SUB_NODES``>1; устойчивый тренд вниз = нода
-    широко заблокирована (клиенты ушли на 2nd-best). См.
-    docs/operations/diverse_subscription_epic.md."""
-    from ..services.carrying import compute_carrying_fractions
-
-    return {"nodes": compute_carrying_fractions(db)}
 
 
 @router.post("/nodes/{node_id}/resync")
@@ -715,17 +274,11 @@ def rebootstrap_node(
     if not node:
         raise HTTPException(status_code=404, detail="Node not found")
     orchestrator = ProvisioningOrchestrator(db)
-    # Явная кнопка «перекатить site.yml» — оператор ждёт НЕМЕДЛЕННУЮ таску,
-    # поэтому НЕ дефёрим в reconciler (иначе при RECONCILER_ENABLED=1 кнопка
-    # молча возвращала (None, False) и «висела» — root-фикс под включение).
-    task, _created = orchestrator.create_or_coalesce_node_bootstrap(
-        node, {"pool_id": node.pool_id, "rerun": True}, defer_to_reconciler=False
+    task = orchestrator.create_task(
+        "node", node.id, "bootstrap", {"pool_id": node.pool_id, "rerun": True}
     )
     db.commit()
-    if _created:
-        orchestrator.run_task_async(task, node=node)
-    # defer_to_reconciler=False → таска создаётся всегда; None-safe на всякий.
-    task_id = task.id if task else None
+    orchestrator.run_task_async(task, node=node)
     actor, actor_type = _resolve_admin_actor(admin_actor)
     _audit(
         db,
@@ -734,9 +287,9 @@ def rebootstrap_node(
         "vpn_node",
         node.id,
         actor_type=actor_type,
-        metadata={"task_id": task_id},
+        metadata={"task_id": task.id},
     )
-    return {"node_id": node.id, "task_id": task_id}
+    return {"node_id": node.id, "task_id": task.id}
 
 
 @router.post("/nodes/{node_id}/diagnose")
@@ -767,285 +320,10 @@ def diagnose_node(
     return {"node_id": node.id, "task_id": task.id}
 
 
-@router.post("/nodes/{node_id}/renew-certs")
-def renew_node_certs_route(
-    node_id: int,
-    db: Session = Depends(get_db),
-    admin_token: str = Depends(require_admin),
-    admin_actor: str | None = Header(default=None, alias=ADMIN_ACTOR_HEADER),
-):
-    """Ручной re-issue LE-сертов ноды (certbot webroot force-renewal + reload
-    nginx), без полного site.yml. Дополняет авто-renewal cert-renewal-тика
-    (за CERT_RENEWAL_DAYS до истечения). NB: НЕ путать с ``/nodes/{id}/renew``
-    — тот продлевает облачную аренду VPS. 400, если у ноды нет LE-серт-конфигов
-    (xhttp/ws-cdn с sni без cert_path)."""
-    node = db.get(models.VPNNode, node_id)
-    if not node:
-        raise HTTPException(status_code=404, detail="Node not found")
-    orchestrator = ProvisioningOrchestrator(db)
-    task = orchestrator.renew_node_certs(node)
-    if task is None or not (task.payload or {}).get("domains"):
-        raise HTTPException(
-            status_code=400,
-            detail="Node has no Let's Encrypt cert configs (xhttp/ws-cdn) to renew",
-        )
-    actor, actor_type = _resolve_admin_actor(admin_actor)
-    _audit(
-        db,
-        actor,
-        "node_renew_certs",
-        "vpn_node",
-        node.id,
-        actor_type=actor_type,
-        metadata={"task_id": task.id, "domains": (task.payload or {}).get("domains")},
-    )
-    return {"node_id": node.id, "task_id": task.id}
-
-
-class UpgradeXrayRequest(BaseModel):
-    """Батч-апгрейд: список нод, которые оператор выбрал в админке."""
-
-    node_ids: list[int]
-    reason: str | None = None
-
-
-@router.post("/nodes/{node_id}/upgrade-xray")
-def upgrade_node_xray_route(
-    node_id: int,
-    db: Session = Depends(get_db),
-    admin_token: str = Depends(require_admin),
-    admin_actor: str | None = Header(default=None, alias=ADMIN_ACTOR_HEADER),
-):
-    """Доставить на ноду ядро xray целевой версии (пин из роли xray_core).
-
-    Точечно: гоняется только ``playbooks/upgrade_xray.yml``, а не весь site.yml.
-    config.json не трогается, клиенты ноды на месте; рестарт xray рвёт живые
-    соединения примерно на 100 мс.
-    """
-    node = db.get(models.VPNNode, node_id)
-    if not node:
-        raise HTTPException(status_code=404, detail="Node not found")
-    orchestrator = ProvisioningOrchestrator(db)
-    task = orchestrator.upgrade_node_xray(node, reason="manual")
-    actor, actor_type = _resolve_admin_actor(admin_actor)
-    _audit(
-        db,
-        actor,
-        "node_upgrade_xray",
-        "vpn_node",
-        node.id,
-        actor_type=actor_type,
-        metadata={"task_id": task.id},
-    )
-    db.commit()
-    return {"node_id": node.id, "task_id": task.id}
-
-
-@router.post("/nodes/upgrade-xray")
-def upgrade_nodes_xray_batch(
-    payload: UpgradeXrayRequest,
-    db: Session = Depends(get_db),
-    admin_token: str = Depends(require_admin),
-    admin_actor: str | None = Header(default=None, alias=ADMIN_ACTOR_HEADER),
-):
-    """Тот же апгрейд, но по списку нод — «обновить выбранные» из админки.
-
-    Таски создаются по одной на ноду и уезжают в общую очередь провижининга:
-    её семафор сам растянет фанаут, чтобы 10 одновременных прогонов не выели
-    слоты у горячего пути выдачи конфигов. Неизвестные id молча пропускаем и
-    возвращаем в ``skipped`` — оператор увидит расхождение, а батч не упадёт
-    целиком из-за одной удалённой ноды.
-    """
-    if not payload.node_ids:
-        raise HTTPException(status_code=400, detail="node_ids is empty")
-
-    orchestrator = ProvisioningOrchestrator(db)
-    started: list[dict[str, int]] = []
-    skipped: list[int] = []
-    actor, actor_type = _resolve_admin_actor(admin_actor)
-    for node_id in payload.node_ids:
-        node = db.get(models.VPNNode, node_id)
-        if not node:
-            skipped.append(node_id)
-            continue
-        task = orchestrator.upgrade_node_xray(node, reason=payload.reason or "batch")
-        started.append({"node_id": node.id, "task_id": task.id})
-        _audit(
-            db,
-            actor,
-            "node_upgrade_xray",
-            "vpn_node",
-            node.id,
-            actor_type=actor_type,
-            metadata={"task_id": task.id, "batch": True},
-        )
-    db.commit()
-    return {"started": started, "skipped": skipped}
-
-
-@router.post("/nodes/{node_id}/upgrade-hysteria")
-def upgrade_node_hysteria_route(
-    node_id: int,
-    db: Session = Depends(get_db),
-    admin_token: str = Depends(require_admin),
-    admin_actor: str | None = Header(default=None, alias=ADMIN_ACTOR_HEADER),
-):
-    """Доставить на ноду бинарь hysteria целевой версии (пин из роли).
-
-    Точечно: только бинарная часть роли install_hysteria2, без перерендера
-    config.yaml — пер-юзерные hy2-учётки не задеваются. Рестарт демона рвёт
-    активные QUIC-сессии, клиент переподключается сам.
-    """
-    node = db.get(models.VPNNode, node_id)
-    if not node:
-        raise HTTPException(status_code=404, detail="Node not found")
-    orchestrator = ProvisioningOrchestrator(db)
-    task = orchestrator.upgrade_node_hysteria(node, reason="manual")
-    actor, actor_type = _resolve_admin_actor(admin_actor)
-    _audit(
-        db,
-        actor,
-        "node_upgrade_hysteria",
-        "vpn_node",
-        node.id,
-        actor_type=actor_type,
-        metadata={"task_id": task.id},
-    )
-    db.commit()
-    return {"node_id": node.id, "task_id": task.id}
-
-
-@router.post("/nodes/upgrade-hysteria")
-def upgrade_nodes_hysteria_batch(
-    payload: UpgradeXrayRequest,
-    db: Session = Depends(get_db),
-    admin_token: str = Depends(require_admin),
-    admin_actor: str | None = Header(default=None, alias=ADMIN_ACTOR_HEADER),
-):
-    """Тот же апгрейд hysteria, но по списку нод. Форма запроса общая с xray."""
-    if not payload.node_ids:
-        raise HTTPException(status_code=400, detail="node_ids is empty")
-
-    orchestrator = ProvisioningOrchestrator(db)
-    started: list[dict[str, int]] = []
-    skipped: list[int] = []
-    actor, actor_type = _resolve_admin_actor(admin_actor)
-    for node_id in payload.node_ids:
-        node = db.get(models.VPNNode, node_id)
-        if not node:
-            skipped.append(node_id)
-            continue
-        task = orchestrator.upgrade_node_hysteria(
-            node, reason=payload.reason or "batch"
-        )
-        started.append({"node_id": node.id, "task_id": task.id})
-        _audit(
-            db,
-            actor,
-            "node_upgrade_hysteria",
-            "vpn_node",
-            node.id,
-            actor_type=actor_type,
-            metadata={"task_id": task.id, "batch": True},
-        )
-    db.commit()
-    return {"started": started, "skipped": skipped}
-
-
-@router.get("/versions/overview")
-def versions_overview(
-    db: Session = Depends(get_db),
-    admin_token: str = Depends(require_admin),
-):
-    """Сводка версий: наш код, upstream-релиз xray, пин в роли и дрейф по нодам.
-
-    Кормит страницу «Версии» в админке. Upstream берётся из кэша
-    (``software_releases``, наполняет tick-xray-upstream) — на каждый рендер в
-    GitHub не ходим.
-    """
-    from ..services.xray_releases import version_overview
-
-    return version_overview(db)
-
-
-@router.post("/nodes/{node_id}/auto-diagnose/disable", status_code=200)
-def disable_node_auto_diagnose(
-    node_id: int,
-    db: Session = Depends(get_db),
-    admin_token: str = Depends(require_admin),
-    admin_actor: str | None = Header(default=None, alias=ADMIN_ACTOR_HEADER),
-):
-    """Mute smart-диагностику и Telegram-алерты для этой ноды и ВСЕХ её link'ов.
-
-    Worker `_auto_diagnose_stale_links` skip'ает links у этой ноды.
-    `run_relay_link_health_tick` фильтрует `failed_relay_names` против
-    muted nodes перед `notify_admins(kind=infra_ssh)` — в Telegram алёрт
-    не уходит. Ручная диагностика (`POST /nodes/{id}/diagnose`,
-    `POST /exits/links/{id}/diagnose`) остаётся доступной — это только
-    выключение АВТОматического trigger'а + алёртов.
-
-    Idempotent: повторный disable не перезаписывает timestamp.
-    """
-    from ..time_utils import utcnow
-
-    node = db.get(models.VPNNode, node_id)
-    if not node:
-        raise HTTPException(status_code=404, detail="Node not found")
-    if node.auto_diagnose_disabled_at is not None:
-        return {
-            "node_id": node.id,
-            "auto_diagnose_disabled_at": node.auto_diagnose_disabled_at,
-            "already_disabled": True,
-        }
-    node.auto_diagnose_disabled_at = utcnow()
-    db.commit()
-    db.refresh(node)
-    actor, actor_type = _resolve_admin_actor(admin_actor)
-    _audit(
-        db, actor, "node_auto_diagnose_disabled", "vpn_node",
-        node.id, actor_type=actor_type,
-    )
-    return {
-        "node_id": node.id,
-        "auto_diagnose_disabled_at": node.auto_diagnose_disabled_at,
-    }
-
-
-@router.post("/nodes/{node_id}/auto-diagnose/enable", status_code=200)
-def enable_node_auto_diagnose(
-    node_id: int,
-    db: Session = Depends(get_db),
-    admin_token: str = Depends(require_admin),
-    admin_actor: str | None = Header(default=None, alias=ADMIN_ACTOR_HEADER),
-):
-    """Снять mute с smart-диагностики и Telegram-алертов для ноды."""
-    node = db.get(models.VPNNode, node_id)
-    if not node:
-        raise HTTPException(status_code=404, detail="Node not found")
-    if node.auto_diagnose_disabled_at is None:
-        return {"node_id": node.id, "already_enabled": True}
-    node.auto_diagnose_disabled_at = None
-    db.commit()
-    actor, actor_type = _resolve_admin_actor(admin_actor)
-    _audit(
-        db, actor, "node_auto_diagnose_enabled", "vpn_node",
-        node.id, actor_type=actor_type,
-    )
-    return {"node_id": node.id, "auto_diagnose_disabled_at": None}
-
-
-class NodeActiveIn(BaseModel):
-    # StrictBool (не bool): без него FastAPI-парс dict давал bool("false")==True,
-    # т.е. curl-скрипт с {"is_active": "false"} НЕВЕРНО включал ноду и заодно
-    # сбрасывал cooldown_until/suspect_since/blocked_regions. StrictBool
-    # принимает только JSON true/false, строку/число отвергает 422-ой.
-    is_active: StrictBool
-
-
 @router.post("/nodes/{node_id}/active", response_model=schemas.VPNNodeOut)
 def set_node_active(
     node_id: int,
-    payload: NodeActiveIn,
+    body: dict,
     db: Session = Depends(get_db),
     admin_token: str = Depends(require_admin),
     admin_actor: str | None = Header(default=None, alias=ADMIN_ACTOR_HEADER),
@@ -1069,7 +347,9 @@ def set_node_active(
     node = db.get(models.VPNNode, node_id)
     if not node:
         raise HTTPException(404, "Node not found")
-    next_active = payload.is_active
+    if "is_active" not in body:
+        raise HTTPException(400, "is_active required")
+    next_active = bool(body["is_active"])
     cleared: list[str] = []
     if next_active:
         if node.cooldown_until is not None:
@@ -1099,16 +379,10 @@ def set_node_active(
 _ALLOWED_STATUS_OVERRIDES = {"active", "error", "disabled"}
 
 
-class NodeStatusIn(BaseModel):
-    # str-схема вместо сырого dict: гарантирует, что status пришёл строкой
-    # (bool/число/список → 422), дальше явный whitelist по значению.
-    status: str
-
-
 @router.patch("/nodes/{node_id}/status", response_model=schemas.VPNNodeOut)
 def set_node_status(
     node_id: int,
-    payload: NodeStatusIn,
+    body: dict,
     db: Session = Depends(get_db),
     admin_token: str = Depends(require_admin),
     admin_actor: str | None = Header(default=None, alias=ADMIN_ACTOR_HEADER),
@@ -1126,7 +400,7 @@ def set_node_status(
     node = db.get(models.VPNNode, node_id)
     if not node:
         raise HTTPException(404, "Node not found")
-    raw = payload.status
+    raw = body.get("status")
     if not raw or raw not in _ALLOWED_STATUS_OVERRIDES:
         raise HTTPException(
             400,
@@ -1165,13 +439,6 @@ def set_node_status(
 def create_config(
     node_id: int,
     payload: schemas.VPNConfigCreate,
-    defer_bootstrap: bool = Query(
-        default=False,
-        description=(
-            "If true, не создаём bootstrap-task в конце — caller сам "
-            "вызовет POST /nodes/{id}/bootstrap после batch'а правок"
-        ),
-    ),
     db: Session = Depends(get_db),
     admin_token: str = Depends(require_admin),
     admin_actor: str | None = Header(default=None, alias=ADMIN_ACTOR_HEADER),
@@ -1232,20 +499,6 @@ def create_config(
             handshake_domain=payload.sni or None,
             name=payload.name or None,
         )
-    # Hysteria2: если админ не передал готовый obfs_password (= "авто"-режим),
-    # генерим транспортные дефолты (obfs+пароль, mbps, port-hopping) и
-    # переиспользуем LE-серт xhttp/ws-cdn домена ноды. Полный settings с
-    # obfs_password → ручной режим (else-ветка, как передал оператор).
-    elif protocol == models.VPNConfigProtocol.hysteria2 and not (
-        payload.settings or {}
-    ).get("obfs_password"):
-        from ..services.node_spawner import ensure_hysteria2_config
-        config = ensure_hysteria2_config(
-            db, node,
-            port=payload.port or None,
-            sni=payload.sni or None,
-            name=payload.name or None,
-        )
     else:
         config = models.VPNConfig(
             node_id=node.id,
@@ -1261,17 +514,6 @@ def create_config(
         db.add(config)
         db.commit()
         db.refresh(config)
-    # WS+CDN: provision the CF-proxied subdomain (sets config.sni) BEFORE
-    # backfill so credentials are built against the CDN domain. On CF
-    # failure drop the just-created row, else the 409 "already exists"
-    # guard blocks the retry and the operator is stuck with a dangling
-    # sni-less config.
-    try:
-        _provision_cf_subdomain(db, node, config)
-    except HTTPException:
-        db.delete(config)
-        db.commit()
-        raise
     actor, actor_type = _resolve_admin_actor(admin_actor)
     _audit(db, actor, "config_created", "vpn_config", config.id, actor_type=actor_type)
     # Existing warm bundles were built against the previous protocol set;
@@ -1279,30 +521,20 @@ def create_config(
     from ..services import warm_pool
     warm_pool.invalidate_node_warm_pool(db, node.id, reason="config added")
     orchestrator = ProvisioningOrchestrator(db)
-    # Backfill credentials for existing devices on this node — без этого
-    # юзеры провижененные до новой протоколы получат обновлённый xray
-    # config, но stale-credential без нового протокола. Backfill дёргаем
-    # ВСЕГДА (даже при defer_bootstrap), т.к. он только пишет в БД и не
-    # запускает ansible — реально дотолкает протокол на ноду только
-    # bootstrap (через _handle_task_outcome → resync_node_clients).
+    # Backfill credentials for existing devices on this node — without
+    # this, users provisioned before the new protocol existed get an
+    # updated node xray config but a stale per-user credential set, and
+    # the new protocol never appears in /sub/{token}. The node-level
+    # bootstrap's auto-resync (_handle_task_outcome → resync_node_clients)
+    # then pushes the newly-created vless-family rows onto the node.
     orchestrator.backfill_credentials_for_new_config(node, config)
-    # Backfill внутри делает только flush — коммитим сразу и безусловно,
-    # иначе при defer_bootstrap=true сессия закрывается в get_db без
-    # commit и backfill-креды молча откатываются (батч-сценарий «несколько
-    # конфигов + один bootstrap в конце» терял их).
+    # Run site.yml so Ansible installs the new protocol on the node.
+    task = orchestrator.create_task(
+        "node", node.id, "bootstrap",
+        {"pool_id": node.pool_id, "config_change": True},
+    )
     db.commit()
-    # Добавили TCP-фронт к ноде, где reality уже стоял (типичный путь
-    # автоспавна: он заводит только reality, протоколы дозаливают потом) —
-    # включаем 443-унификацию задним числом, пока креды не розданы.
-    db.refresh(node)
-    maybe_enable_reality_unify(db, node)
-    if not defer_bootstrap:
-        task, _created = orchestrator.create_or_coalesce_node_bootstrap(
-            node, {"pool_id": node.pool_id, "config_change": True}
-        )
-        db.commit()
-        if _created:
-            orchestrator.run_task_async(task, node=node)
+    orchestrator.run_task_async(task, node=node)
     return config
 
 
@@ -1314,13 +546,6 @@ def update_config(
     node_id: int,
     config_id: int,
     payload: schemas.VPNConfigUpdate,
-    defer_bootstrap: bool = Query(
-        default=False,
-        description=(
-            "If true, не создаём bootstrap-task в конце — caller сам "
-            "вызовет POST /nodes/{id}/bootstrap после batch'а правок"
-        ),
-    ),
     db: Session = Depends(get_db),
     admin_token: str = Depends(require_admin),
     admin_actor: str | None = Header(default=None, alias=ADMIN_ACTOR_HEADER),
@@ -1347,41 +572,7 @@ def update_config(
             ),
         )
 
-    # Auto-front configs (ws-cdn, and xhttp in auto mode): sni is the minted
-    # DNS-only *.wgse subdomain (= settings.cf_subdomain) and port is pinned
-    # to 443. A manual edit would desync from the live A-record / nginx
-    # server_name / LE cert and break the chain silently — neutralize those
-    # two fields. Direct xhttp (no cf_subdomain) stays editable.
-    _cf_fronted = config.protocol == models.VPNConfigProtocol.vless_ws_cdn or (
-        config.protocol == models.VPNConfigProtocol.vless_xhttp
-        and (config.settings or {}).get("cf_subdomain")
-    )
-    if _cf_fronted:
-        payload.sni = None
-        payload.port = None
-
     changed: list[str] = []
-
-    # xhttp: явный пустой sni ("") = «переведи в auto-front (DNS-only)» —
-    # чистим stale direct-домен/серт и минтим wgse.info-сабдомен (как при create с пустым
-    # sni). null = поле не трогали (PATCH-семантика); ТОЛЬКО "" — явный сброс
-    # из формы. Для прочих протоколов "" трактуем как «не трогать», чтобы
-    # случайно не обнулить, например, reality-SNI.
-    if payload.sni == "":
-        if (
-            config.protocol == models.VPNConfigProtocol.vless_xhttp
-            and not (config.settings or {}).get("cf_subdomain")
-        ):
-            _s = dict(config.settings or {})
-            for _k in ("domain", "cert_path", "key_path"):
-                _s.pop(_k, None)
-            config.sni = None
-            config.settings = _s
-            db.flush()
-            _provision_cf_subdomain(db, config.node, config)  # sni ← DNS-only *.wgse subdomain (node serves LE)
-            changed.append("sni")
-        payload.sni = None  # обработали (или игнор для non-xhttp) — не применять ниже
-
     if payload.name is not None and payload.name != config.name:
         config.name = payload.name
         changed.append("name")
@@ -1433,16 +624,16 @@ def update_config(
     # rebuilds with the updated config.
     from ..services import warm_pool
     warm_pool.invalidate_node_warm_pool(db, node_id, reason="config updated")
-    if not defer_bootstrap:
-        node = db.get(models.VPNNode, node_id)
-        if node:
-            orchestrator = ProvisioningOrchestrator(db)
-            task, _created = orchestrator.create_or_coalesce_node_bootstrap(
-                node, {"pool_id": node.pool_id, "config_change": True}
-            )
-            db.commit()
-            if _created:
-                orchestrator.run_task_async(task, node=node)
+    # Re-run site.yml so Ansible re-renders xray config with new values.
+    node = db.get(models.VPNNode, node_id)
+    if node:
+        orchestrator = ProvisioningOrchestrator(db)
+        task = orchestrator.create_task(
+            "node", node.id, "bootstrap",
+            {"pool_id": node.pool_id, "config_change": True},
+        )
+        db.commit()
+        orchestrator.run_task_async(task, node=node)
     return config
 
 
@@ -1450,13 +641,6 @@ def update_config(
 def delete_config(
     node_id: int,
     config_id: int,
-    defer_bootstrap: bool = Query(
-        default=False,
-        description=(
-            "If true, не создаём bootstrap-task в конце — caller сам "
-            "вызовет POST /nodes/{id}/bootstrap после batch'а правок"
-        ),
-    ),
     db: Session = Depends(get_db),
     admin_token: str = Depends(require_admin),
     admin_actor: str | None = Header(default=None, alias=ADMIN_ACTOR_HEADER),
@@ -1510,24 +694,22 @@ def delete_config(
     ).update({models.Credential.config_id: None}, synchronize_session=False)
     db.flush()
 
-    # Tear down the CF DNS record for ws-cdn configs before dropping the row.
-    _teardown_cf_subdomain(config)
     db.delete(config)
     db.commit()
     actor, actor_type = _resolve_admin_actor(admin_actor)
     _audit(db, actor, "config_deleted", "vpn_config", config_id, actor_type=actor_type)
     from ..services import warm_pool
     warm_pool.invalidate_node_warm_pool(db, node_id, reason="config removed")
-    if not defer_bootstrap:
-        node = db.get(models.VPNNode, node_id)
-        if node:
-            orchestrator = ProvisioningOrchestrator(db)
-            task, _created = orchestrator.create_or_coalesce_node_bootstrap(
-                node, {"pool_id": node.pool_id, "config_change": True}
-            )
-            db.commit()
-            if _created:
-                orchestrator.run_task_async(task, node=node)
+    # Re-run site.yml so Ansible stops/removes the deleted protocol's service.
+    node = db.get(models.VPNNode, node_id)
+    if node:
+        orchestrator = ProvisioningOrchestrator(db)
+        task = orchestrator.create_task(
+            "node", node.id, "bootstrap",
+            {"pool_id": node.pool_id, "config_change": True},
+        )
+        db.commit()
+        orchestrator.run_task_async(task, node=node)
     return None
 
 
@@ -1583,63 +765,19 @@ def list_node_relay_links(
         .all()
     )
 
-    # ── Auto-diagnose badge data ────────────────────────────────────
-    # Latest symptom_detected audit entry per link_id. Subquery: ROW_NUMBER()
-    # would be cleaner на PG, но per-link массив маленький (макс ~5-10
-    # линков на одну ноду), поэтому one query + python-group дешевле и
-    # переноcимее. extra→symptom + extra→action_taken вытаскиваем JSON-ом.
-    link_ids = [link.id for link in links]
-    latest_audit_by_link: dict[int, models.AuditLog] = {}
-    if link_ids:
-        audit_rows = (
-            db.query(models.AuditLog)
-            .filter(models.AuditLog.target_type == "relay_exit_link")
-            .filter(models.AuditLog.target_id.in_(link_ids))
-            .filter(models.AuditLog.action == "symptom_detected")
-            .order_by(models.AuditLog.created_at.desc())
-            .all()
+    return [
+        schemas.NodeRelayLinkOut(
+            link_id=link.id,
+            exit_id=link.exit_id,
+            exit_name=link.exit_node.name if link.exit_node else "",
+            wg_interface_name=link.wg_interface_name,
+            wg_client_address_v4=link.wg_client_address_v4,
+            wg_client_public_key=link.wg_client_public_key,
+            credentials_count=counts.get(link.exit_id, 0),
+            created_at=link.created_at,
         )
-        for row in audit_rows:
-            if row.target_id not in latest_audit_by_link:
-                latest_audit_by_link[row.target_id] = row
-
-    def _audit_to_diag(
-        link_id: int,
-    ) -> tuple[datetime | None, int | None, str | None]:
-        row = latest_audit_by_link.get(link_id)
-        if row is None:
-            return (None, None, None)
-        extra = row.extra or {}
-        action_taken = str(extra.get("action_taken") or "")
-        # action_taken формата "enqueued_task:<id>" — извлекаем числовой id.
-        task_id: int | None = None
-        if action_taken.startswith("enqueued_task:"):
-            try:
-                task_id = int(action_taken.split(":", 1)[1])
-            except ValueError:
-                task_id = None
-        symptom = extra.get("symptom")
-        return (row.created_at, task_id, str(symptom) if symptom else None)
-
-    out: list[schemas.NodeRelayLinkOut] = []
-    for link in links:
-        diag_at, diag_task_id, diag_symptom = _audit_to_diag(link.id)
-        out.append(
-            schemas.NodeRelayLinkOut(
-                link_id=link.id,
-                exit_id=link.exit_id,
-                exit_name=link.exit_node.name if link.exit_node else "",
-                wg_interface_name=link.wg_interface_name,
-                wg_client_address_v4=link.wg_client_address_v4,
-                wg_client_public_key=link.wg_client_public_key,
-                credentials_count=counts.get(link.exit_id, 0),
-                created_at=link.created_at,
-                last_auto_diagnose_at=diag_at,
-                last_auto_diagnose_task_id=diag_task_id,
-                last_auto_diagnose_symptom=diag_symptom,
-            )
-        )
-    return out
+        for link in links
+    ]
 
 
 # Freshness window for "who's on the node right now" — matches the
@@ -1711,19 +849,13 @@ def list_node_users(
             users=[],
         )
 
-    # Резолвим юзера через CREDENTIAL.access_username (а НЕ Device) — xray на ноде
-    # видит access_username КРЕДОВ, а у диверс/warm-кредов он "warm-<node>-<hash>"
-    # и НЕ совпадает с Device.access_username → раньше такие показывались как
-    # «orphan» с голым warm-именем без телеги. Cred несёт device_id → дотягиваем
-    # Device→Sub→User. Фильтр node_id — креды ЭТОЙ ноды ИЛИ легаси/детачнутые с
-    # node_id=NULL (детач при удалении соседней ноды обнуляет node_id, но
-    # access_username warm-бандла уникален по ноде → ложных совпадений нет).
-    # ORDER BY ниже ставит node-specific строку первой, чтобы при дубле она и
-    # выиграла дедуп.
+    # One JOIN grabs every field the UI needs in a single query. Left
+    # joins so orphan access_usernames (on the node but not in the DB)
+    # still show up with ``device_id=None``.
     rows = (
         db.query(
             models.Device.id.label("device_id"),
-            models.Credential.access_username,
+            models.Device.access_username,
             models.Device.name.label("device_name"),
             models.Subscription.id.label("subscription_id"),
             models.Subscription.expires_at,
@@ -1732,33 +864,22 @@ def list_node_users(
             models.Plan.id.label("plan_id"),
             models.Plan.name.label("plan_name"),
         )
-        .select_from(models.Credential)
-        .outerjoin(models.Device, models.Device.id == models.Credential.device_id)
         .outerjoin(
             models.Subscription,
             models.Subscription.id == models.Device.subscription_id,
         )
         .outerjoin(models.User, models.User.id == models.Device.user_id)
         .outerjoin(models.Plan, models.Plan.id == models.Subscription.plan_id)
-        .filter(models.Credential.access_username.in_(list(username_protos.keys())))
-        .filter(
-            or_(
-                models.Credential.node_id == node_id,
-                models.Credential.node_id.is_(None),
-            )
-        )
-        # node-specific (node_id IS NULL → False/0) сортируется раньше легаси.
-        .order_by(models.Credential.node_id.is_(None))
+        .filter(models.Device.access_username.in_(list(username_protos.keys())))
         .all()
     )
 
     by_username: dict[str, dict] = {}
     for r in rows:
         if r.access_username in by_username:
-            # Один access_username может встретиться дважды (node-specific +
-            # легаси/детачнутый кред с node_id=NULL). ORDER BY выше гарантирует,
-            # что node-specific строка пришла первой и уже в словаре — она и
-            # выигрывает (UI держит один слот на username).
+            # Multiple Devices sharing access_username shouldn't happen
+            # under current provisioning, but if it does, the first row
+            # wins — the UI only has a single slot per username.
             continue
         by_username[r.access_username] = {
             "device_id": r.device_id,
@@ -1797,39 +918,6 @@ def list_node_users(
     )
 
 
-def _downsample_traffic(
-    points: list["schemas.NodeTrafficSamplePoint"], max_points: int
-) -> list["schemas.NodeTrafficSamplePoint"]:
-    """Схлопнуть серию в ``max_points`` равных бакетов по времени.
-
-    Бакеты режем по ИНДЕКСУ, а не по времени: сэмплы уже идут с постоянным
-    шагом (тик коллектора), а пропуски (нода лежала, тик не отработал) при
-    делении по времени дали бы пустые бакеты и разрывы в линии.
-
-    Метка бакета — время ПОСЛЕДНЕГО сэмпла в нём: так правый край графика
-    всегда совпадает с «сейчас», а не уезжает на полбакета назад.
-    """
-    if max_points <= 0 or len(points) <= max_points:
-        return points
-    size = len(points) / max_points
-    out: list[schemas.NodeTrafficSamplePoint] = []
-    for i in range(max_points):
-        chunk = points[int(i * size) : int((i + 1) * size)]
-        if not chunk:
-            continue
-        out.append(
-            schemas.NodeTrafficSamplePoint(
-                observed_at=chunk[-1].observed_at,
-                # мгновенный счётчик → пик по бакету
-                active_users=max(c.active_users or 0 for c in chunk),
-                # дельты за тик → сумма по бакету
-                uplink_bytes=sum(c.uplink_bytes or 0 for c in chunk),
-                downlink_bytes=sum(c.downlink_bytes or 0 for c in chunk),
-            )
-        )
-    return out
-
-
 @router.get(
     "/nodes/{node_id}/traffic-history",
     response_model=schemas.NodeTrafficHistoryOut,
@@ -1838,25 +926,14 @@ def get_node_traffic_history(
     node_id: int,
     db: Session = Depends(get_db),
     admin_token: str = Depends(require_admin),
-    hours: int = Query(default=24, ge=1, le=720),
-    max_points: int = Query(default=300, ge=24, le=2000),
+    hours: int = Query(default=24, ge=1, le=168),
 ):
     """Return NodeTrafficSample series for the last ``hours`` hours.
 
-    Верхняя граница — 720 ч (30 суток): столько же держит
-    ``TRAFFIC_SAMPLE_RETENTION_DAYS``, дальше данных в БД просто нет.
-
-    Сэмплы пишутся раз в ``TRAFFIC_STATS_INTERVAL`` (300 с), т.е. 12 точек в
-    час на ноду: сутки ≈ 288 точек, 30 дней ≈ 8600. Отдавать их сырыми в
-    админку бессмысленно — график шириной 720 px физически не покажет больше
-    ~700 точек, а json на 8600 записей тормозит и сеть, и рендер. Поэтому при
-    превышении ``max_points`` серия схлопывается в равные бакеты.
-
-    Агрегация РАЗНАЯ по смыслу полей, и это важно:
-      * ``uplink_bytes``/``downlink_bytes`` — ДЕЛЬТА за тик (коллектор дёргает
-        ``xray api statsquery --reset``), поэтому по бакету их СУММИРУЕМ;
-      * ``active_users`` — мгновенный счётчик, сумма была бы бессмыслицей;
-        берём максимум по бакету (пик нагрузки виднее среднего).
+    Hard-bounded to [1, 168] so a misclick in the UI can't drag the
+    whole month of samples (~8600 rows per node). Default 24h lines up
+    with the admin sparkline; operators who want a longer window pass
+    ``?hours=72`` etc.
     """
     node = db.get(models.VPNNode, node_id)
     if not node:
@@ -1874,23 +951,19 @@ def get_node_traffic_history(
         .all()
     )
 
-    points = [
-        schemas.NodeTrafficSamplePoint(
-            observed_at=s.observed_at,
-            active_users=s.active_users,
-            uplink_bytes=s.uplink_bytes,
-            downlink_bytes=s.downlink_bytes,
-        )
-        for s in samples
-    ]
-    if len(points) > max_points:
-        points = _downsample_traffic(points, max_points)
-
     return schemas.NodeTrafficHistoryOut(
         node_id=node_id,
         from_ts=from_ts,
         to_ts=to_ts,
-        samples=points,
+        samples=[
+            schemas.NodeTrafficSamplePoint(
+                observed_at=s.observed_at,
+                active_users=s.active_users,
+                uplink_bytes=s.uplink_bytes,
+                downlink_bytes=s.downlink_bytes,
+            )
+            for s in samples
+        ],
     )
 
 
@@ -1907,29 +980,18 @@ def spawn_node_route(
     admin_actor: str | None = Header(default=None, alias=ADMIN_ACTOR_HEADER),
 ):
     # #55 — same DNS-safe whitelist as /nodes POST. Only ``name`` can be
-    # checked at this point; the host is resolved later by the cloud driver
-    # and re-validated inside ``_finalize_spawn`` before the real host is
-    # written onto the row.
-    # Имя: явное от админа или авто «<хостер>-<cc>-<NN>» при пустом поле.
+    # checked at this point; the host is resolved later by the cloud
+    # driver and re-validated inside spawn_node() itself before the
+    # VPNNode row is written.
     try:
-        name = resolve_spawn_name(
-            db, payload.provider_id, payload.region, payload.name
-        )
-    except NodeSpawnError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-    try:
-        validate_node_name(name)
+        validate_node_name(payload.name)
     except InvalidNodeIdentity as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    # Неблокирующий спавн: синхронно делаем только быстрый заказ (order_server)
-    # + фиксируем VPNNode-строку, долгий поллинг IP + bootstrap — в фоне. Иначе
-    # 600s-поллинг create_server упирался в nginx proxy_read_timeout (60s) → CF
-    # 502, а оплаченный VPS оставался осиротевшим. См. spawn_node_async.
     try:
-        node = spawn_node_async(
+        node, _task = spawn_node(
             db,
             provider_id=payload.provider_id,
-            name=name,
+            name=payload.name,
             region=payload.region,
             plan=payload.plan,
             image=payload.image,
@@ -1938,12 +1000,8 @@ def spawn_node_route(
             user_data=payload.user_data,
             notes=payload.notes,
         )
-    # 400, не 502: заказ падает на этапе обращения к провайдеру (неверный
-    # tarif/ostempl, нет баланса, верификация). Cloudflare подменяет 5xx своей
-    # HTML-страницей и прячет detail — на 4xx он проходит, и админ видит
-    # реальную причину от 4vps в форме. Реальные gateway-сбои тут не при чём.
     except NodeSpawnError as exc:
-        raise HTTPException(status_code=400, detail=f"spawn failed: {exc}") from exc
+        raise HTTPException(status_code=502, detail=f"spawn failed: {exc}") from exc
 
     actor, actor_type = _resolve_admin_actor(admin_actor)
     _audit(
@@ -1981,247 +1039,55 @@ def destroy_node_route(
     return {"node_id": node.id, "status": node.status.value}
 
 
-@router.post("/nodes/{node_id}/reboot")
-def reboot_node_route(
-    node_id: int,
-    db: Session = Depends(get_db),
-    admin_token: str = Depends(require_admin),
-    admin_actor: str | None = Header(default=None, alias=ADMIN_ACTOR_HEADER),
-):
-    """Перезагрузить relay-ноду без захода в панель хостера: hard-reboot через
-    API провайдера (даже если нода зависла), иначе/при сбое — graceful по SSH."""
-    node = db.get(models.VPNNode, node_id)
-    if not node:
-        raise HTTPException(status_code=404, detail="Node not found")
-    try:
-        method = reboot_node(db, node)
-    except NodeSpawnError as exc:
-        # 400 (не 502): CF подменяет 5xx HTML-страницей и прячет detail; а текст
-        # «нет API-reboot и SSH недоступен» админу как раз нужен (см. spawn-роуты).
-        raise HTTPException(status_code=400, detail=f"reboot failed: {exc}") from exc
-    actor, actor_type = _resolve_admin_actor(admin_actor)
-    _audit(
-        db, actor, "node_rebooted", "vpn_node", node.id,
-        metadata={"method": method}, actor_type=actor_type,
-    )
-    return {"node_id": node.id, "method": method}
-
-
-@router.post("/nodes/{node_id}/reinstall", response_model=schemas.VPNNodeOut)
-def reinstall_node_route(
-    node_id: int,
-    payload: schemas.NodeReinstallRequest,
-    db: Session = Depends(get_db),
-    admin_token: str = Depends(require_admin),
-    admin_actor: str | None = Header(default=None, alias=ADMIN_ACTOR_HEADER),
-):
-    """Переустановить ОС на cloud-ноде через API провайдера и заново прокатить
-    site.yml. IP сохраняется → reality-ключи и sub-токены остаются валидными."""
-    node = db.get(models.VPNNode, node_id)
-    if not node:
-        raise HTTPException(status_code=404, detail="Node not found")
-    try:
-        node, _task = reinstall_node(db, node, image=payload.image)
-    except NodeSpawnError as exc:
-        raise HTTPException(status_code=502, detail=f"reinstall failed: {exc}") from exc
-    actor, actor_type = _resolve_admin_actor(admin_actor)
-    _audit(
-        db,
-        actor,
-        "node_reinstalled",
-        "vpn_node",
-        node.id,
-        actor_type=actor_type,
-        metadata={"image": payload.image},
-    )
-    return schemas.VPNNodeOut.from_orm(node)
-
-
-@router.post("/nodes/{node_id}/renew")
-def renew_node_route(
-    node_id: int,
-    db: Session = Depends(get_db),
-    admin_token: str = Depends(require_admin),
-    admin_actor: str | None = Header(default=None, alias=ADMIN_ACTOR_HEADER),
-):
-    """Принудительно продлить аренду cloud-ноды у провайдера (списывает с
-    баланса). Обычно продление автоматическое (autoprolong, включается при
-    заказе) — это ручной путь на случай выключенного autoprolong."""
-    node = db.get(models.VPNNode, node_id)
-    if not node:
-        raise HTTPException(status_code=404, detail="Node not found")
-    try:
-        renew_node(db, node)
-    except NodeSpawnError as exc:
-        raise HTTPException(status_code=502, detail=f"renew failed: {exc}") from exc
-    actor, actor_type = _resolve_admin_actor(admin_actor)
-    _audit(db, actor, "node_renewed", "vpn_node", node.id, actor_type=actor_type)
-    return {"node_id": node.id, "renewed": True}
-
-
-@router.get("/pools", response_model=list[schemas.ServerPoolMini])
-def list_server_pools(
-    db: Session = Depends(get_db),
-    admin_token: str = Depends(require_admin),
-):
-    """Список пулов (id+name) — для дропдауна правки ноды."""
-    return [
-        schemas.ServerPoolMini(id=p.id, name=p.name)
-        for p in db.query(models.ServerPool).order_by(models.ServerPool.name).all()
-    ]
-
-
-@router.patch("/nodes/{node_id}", response_model=schemas.VPNNodeOut)
-def update_node(
-    node_id: int,
-    payload: schemas.VPNNodeUpdate,
-    db: Session = Depends(get_db),
-    admin_token: str = Depends(require_admin),
-    admin_actor: str | None = Header(default=None, alias=ADMIN_ACTOR_HEADER),
-):
-    """Править дисплейные/маршрутные поля ноды: name / region / pool_id / notes.
-
-    ``name`` валидируется как inventory-хост (``[a-z0-9][a-z0-9-]{0,62}``) и
-    проверяется на уникальность. Переименование БЕЗОПАСНО без re-bootstrap:
-    ``build_inventory_for_node`` рендерит name как alias, а ansible коннектится
-    по ``ansible_host=host`` — IP не меняется, развёрнутые клиенты не рвутся.
-    ``region``/``pool_id`` влияют только на будущий ``choose_node``; ``notes`` —
-    текст. ``host``/``ssh_port`` тут нельзя (identity у провайдера →
-    reinstall/renew). ``model_fields_set`` различает «не передано» и «=null».
-    """
-    from ..time_utils import utcnow
-
-    node = db.get(models.VPNNode, node_id)
-    if not node:
-        raise HTTPException(status_code=404, detail="Node not found")
-
-    fields = payload.model_fields_set
-    changed: list[str] = []
-
-    if "name" in fields and payload.name != node.name:
-        new_name = (payload.name or "").strip()
-        try:
-            validate_node_name(new_name)
-        except InvalidNodeIdentity as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
-        clash = (
-            db.query(models.VPNNode)
-            .filter(models.VPNNode.name == new_name, models.VPNNode.id != node.id)
-            .first()
-        )
-        if clash:
-            raise HTTPException(
-                status_code=409,
-                detail=f"Нода с именем '{new_name}' уже есть (#{clash.id})",
-            )
-        node.name = new_name
-        changed.append("name")
-
-    if "region" in fields and payload.region != node.region:
-        new_region = (payload.region or "").strip()
-        if not new_region:
-            raise HTTPException(status_code=400, detail="region не может быть пустым")
-        node.region = new_region
-        changed.append("region")
-
-    if "pool_id" in fields and payload.pool_id != node.pool_id:
-        if payload.pool_id is not None and not db.get(
-            models.ServerPool, payload.pool_id
-        ):
-            raise HTTPException(
-                status_code=400, detail=f"Пул #{payload.pool_id} не найден"
-            )
-        node.pool_id = payload.pool_id
-        changed.append("pool_id")
-
-    if "notes" in fields and payload.notes != node.notes:
-        node.notes = payload.notes
-        changed.append("notes")
-
-    if changed:
-        node.updated_at = utcnow()
-        db.add(node)
-        actor, actor_type = _resolve_admin_actor(admin_actor)
-        # _audit коммитит сам → флашит и правки ноды в той же транзакции.
-        _audit(
-            db, actor, "node_updated", "vpn_node", node.id,
-            actor_type=actor_type, metadata={"changed_fields": changed},
-        )
-        db.refresh(node)
-    return schemas.VPNNodeOut.from_orm(node)
-
-
 @router.delete("/nodes/{node_id}", status_code=200)
 def delete_node(
     node_id: int,
-    force: bool = False,
     db: Session = Depends(get_db),
     admin_token: str = Depends(require_admin),
     admin_actor: str | None = Header(default=None, alias=ADMIN_ACTOR_HEADER),
 ):
-    """Удалить ЗАПИСЬ ноды из админ-панели (БД). НЕ трогает хостер —
-    уничтожение VPS у провайдера это отдельное действие
-    (``POST /nodes/{id}/destroy``: запускает teardown-плейбук и снимает VPS).
+    """Remove a node from the database.
 
-    Гейты (оба обходятся ``?force=true``, фронт это знает):
+    Refuses with 409 if the node still has active/frozen subscriptions —
+    the admin UI uses that signal to offer a migrate-then-delete flow.
+    The response body includes ``active_subs`` so the UI can render a
+    specific confirm rather than a generic error.
 
-    * ``active_subs`` (409) — на ноде ещё есть АКТИВНЫЕ подписки (node_id ==
-      этой ноды). Фронт предлагает «переселить и удалить»: ``/migrate`` →
-      retry. Замороженные подписки НЕ блокируют: их node_id обнуляется через
-      SET NULL, а при разморозке подписка заново выбирает ноду (``choose_node``);
-      живых кредов на этой ноде у них нет, стрэнда не будет. (Раньше frozen тоже
-      считались — но ``migrate_subscriptions_off`` их не двигает, и нода
-      становилась неудаляемой: dead-end.)
-    * ``live_vm`` (409) — у ноды живой VPS у хостера (provider_external_id +
-      статус не disabled/error). Удалять запись = осиротить платный сервер;
-      сначала «уничтожить у хостера» (/destroy) или force.
+    Warm-pool credentials bound to this node are deleted before the node
+    row goes — they can't be reassigned once the node is gone. Credentials
+    attached to terminated subs are detached (node_id → NULL) so the
+    historical sub/cred link survives.
 
-    Warm-кред'ы, привязанные к ноде, удаляются (без ноды они неназначаемы).
-    Кред'ы привязанных подписок ДЕТАЧАТСЯ (node_id → NULL, is_active → False):
-    исторический sub/cred-линк выживает, но мёртвая нода уходит из sub-link'а
-    (per-device alias пересаживается на живого соседа — diverse-саба продолжает
-    отдавать оставшиеся ноды).
+    For cloud-provisioned nodes use ``POST /destroy`` instead — that runs
+    the teardown playbook and deprovisions the VPS.
     """
     node = db.get(models.VPNNode, node_id)
     if not node:
         raise HTTPException(status_code=404, detail="Node not found")
 
-    if not force:
-        active_subs = (
-            db.query(models.Subscription)
-            .filter(
-                models.Subscription.node_id == node.id,
-                models.Subscription.status == models.SubscriptionStatus.active,
-            )
-            .count()
+    active_subs = (
+        db.query(models.Subscription)
+        .filter(
+            models.Subscription.node_id == node.id,
+            models.Subscription.status.in_([
+                models.SubscriptionStatus.active,
+                models.SubscriptionStatus.frozen,
+            ]),
         )
-        if active_subs > 0:
-            raise HTTPException(
-                status_code=409,
-                detail={
-                    "error": "active_subs",
-                    "active_subs": active_subs,
-                    "message": (
-                        f"На ноде ещё {active_subs} активных подписок — "
-                        "сперва перенеси их на другую ноду."
-                    ),
-                },
-            )
-        if node.provider_external_id and node.status not in (
-            models.VPNNodeStatus.disabled,
-            models.VPNNodeStatus.error,
-        ):
-            # Живой VPS у хостера → удаление записи осиротит платный сервер.
-            raise HTTPException(
-                status_code=409,
-                detail={
-                    "error": "live_vm",
-                    "message": (
-                        "У ноды живой VPS у хостера — сначала «уничтожить у "
-                        "хостера» (/destroy), либо force."
-                    ),
-                },
-            )
+        .count()
+    )
+    if active_subs > 0:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error": "active_subs",
+                "active_subs": active_subs,
+                "message": (
+                    f"На ноде ещё {active_subs} активных/замороженных подписок — "
+                    "сперва перенеси их на другую ноду."
+                ),
+            },
+        )
 
     # Warm-pool credentials (no subscription) can't survive a missing
     # node — they'd never be assignable. Delete them.
@@ -2234,22 +1100,15 @@ def delete_node(
         .delete(synchronize_session=False)
     )
 
-    # Bound credentials (any sub: terminated/expired *or* a live diverse sub
-    # losing one of its N nodes): detach (NULL node_id) so the FK stops
-    # pinning the node, AND deactivate (is_active → False) so the dead node
-    # drops out of the served sub-link. The sub-link's per-device alias then
-    # re-points the now-credless device at a live sibling (api_extensions.py
-    # source_device branch) — a diverse sub keeps serving its other nodes.
+    # Bound credentials on terminated/expired subs: detach (NULL node_id)
+    # so the audit trail survives but the FK stops pinning the node.
     bound_detached = (
         db.query(models.Credential)
         .filter(
             models.Credential.node_id == node.id,
             models.Credential.subscription_id.isnot(None),
         )
-        .update(
-            {models.Credential.node_id: None, models.Credential.is_active: False},
-            synchronize_session=False,
-        )
+        .update({models.Credential.node_id: None}, synchronize_session=False)
     )
 
     # Devices point at configs on this node via config_id. The DB-level
@@ -2273,31 +1132,19 @@ def delete_node(
     )
 
     actor, actor_type = _resolve_admin_actor(admin_actor)
-    # Audit-строку собираем ВРУЧНУЮ (не через _audit): _audit коммитит сам,
-    # а ранний commit делает detach/удаление кредов необратимыми — при
-    # последующем IntegrityError на db.delete(node) админ получал 409
-    # «fk_blocked», но креды подписок уже были деактивированы/отвязаны.
-    # Всё удаление должно быть одной транзакцией: единственный commit — ниже,
-    # после db.delete(node); rollback в except откатывает и detach, и audit.
-    db.add(
-        models.AuditLog(
-            actor=actor,
-            action="node_deleted",
-            target_type="vpn_node",
-            target_id=node.id,
-            extra={
-                "warm_credentials_deleted": warm_deleted,
-                "bound_credentials_detached": bound_detached,
-                "devices_detached": devices_detached,
-            },
-            actor_type=actor_type,
-        )
+    _audit(
+        db,
+        actor,
+        "node_deleted",
+        "vpn_node",
+        node.id,
+        actor_type=actor_type,
+        metadata={
+            "warm_credentials_deleted": warm_deleted,
+            "bound_credentials_detached": bound_detached,
+            "devices_detached": devices_detached,
+        },
     )
-    # WS+CDN: release each ws-cdn config's CF DNS record before the ORM
-    # cascade drops the rows — else the proxied A-record (origin IP in the
-    # public CF zone) leaks forever (resource leak + deanon of a burned IP).
-    for _cfg in list(node.configs):
-        _teardown_cf_subdomain(_cfg)
     db.delete(node)
     try:
         db.commit()
@@ -2530,194 +1377,6 @@ def migrate_node_to_target_route(
         revoke_task_ids=[],
         device_task_ids=device_task_ids,
         resync_task_ids=resync_task_ids,
-    )
-
-
-@router.post(
-    "/nodes/{node_id}/refresh-reality-dest",
-    response_model=schemas.NodeRefreshDestOut,
-)
-def refresh_reality_dest(
-    node_id: int,
-    payload: schemas.NodeRefreshDestIn,
-    db: Session = Depends(get_db),
-    admin_token: str = Depends(require_admin),
-    admin_actor: str | None = Header(default=None, alias=ADMIN_ACTOR_HEADER),
-):
-    """Сменить Reality SNI/dest для ноды и пере-провижинить её активных
-    Device'ов под новый SNI.
-
-    ``payload.sni`` — явный домен (должен быть реальный TLS 1.3 host, НЕ
-    заблокированный в target market). ``None`` → ``pick_reality_sni``
-    выберет наименее используемый домен из ``REALITY_DEST_POOL``.
-
-    Flow:
-        1. Обновляем ``VPNConfig.sni`` + ``fallback`` + ``settings.dest``
-           в БД (source of truth для ansible extra_vars и для URI
-           в ``_build_vless_reality_credential``).
-        2. Для каждой активной Subscription на ноде: revoke_device
-           по каждому Device + reprovision_subscription → свежий Device
-           с новым UUID и cred_text, отражающим новый SNI. Sub-status
-           остаётся active (revoke_device не трогает sub.status).
-        3. Ansible apply внутри reprovision перерендерит xray config
-           с новым ``vless_reality_sni``/``vless_reality_dest``.
-
-    Клиентский flow: Hiddify/v2rayN пуллят /sub/{token} → получают
-    новые URI с новым SNI → handshake идёт с новым fallback cert'ом.
-    Старый URI → handshake reject на xray → клиент пуллит sub-link
-    раньше (force refresh), и восстанавливается.
-    """
-    from sqlalchemy.orm.attributes import flag_modified
-
-    from ..services.node_spawner import REALITY_DEST_POOL, pick_reality_sni
-
-    node = db.get(models.VPNNode, node_id)
-    if not node:
-        raise HTTPException(status_code=404, detail="Node not found")
-
-    cfg = (
-        db.query(models.VPNConfig)
-        .filter(
-            models.VPNConfig.node_id == node_id,
-            models.VPNConfig.protocol == models.VPNConfigProtocol.vless_reality,
-        )
-        .one_or_none()
-    )
-    if cfg is None:
-        raise HTTPException(
-            status_code=400,
-            detail="Node has no vless_reality config to refresh",
-        )
-
-    old_sni = cfg.sni or ""
-    # region-aware: dest из пула страны ДЦ ноды (немецкая нода — немецкий dest).
-    new_sni = payload.sni or pick_reality_sni(db, node.region)
-    # Допускаем и sni вне пула — callsite может захотеть форсить
-    # конкретный fallback для ноды (edge-case, whitelist RKN). Но
-    # warn'им если domen явно подозрительный — в MVP только проверяем
-    # что не пустой.
-    if not new_sni:
-        raise HTTPException(status_code=400, detail="Resolved SNI is empty")
-    if new_sni == old_sni:
-        raise HTTPException(
-            status_code=400,
-            detail=f"SNI already equals {new_sni}; noop",
-        )
-
-    new_dest = f"{new_sni}:443"
-    cfg.sni = new_sni
-    cfg.fallback = new_dest
-    cfg.settings = {**(cfg.settings or {}), "dest": new_dest}
-    flag_modified(cfg, "settings")
-    db.commit()
-    db.refresh(cfg)
-
-    # Warm-pool bundles уже содержат ``cred.config_text`` с ОЛД sni
-    # (они построены через ``_build_vless_reality_credential`` в
-    # момент warm_pool refill'а). Если не выбросить — первый юзер на
-    # ноде получит bundle с старым URI и клиент будет handshake'ить
-    # с прежним fallback cert'ом. Invalidate чистит flag'и в БД +
-    # next apply tick с state=absent уберёт их c ноды.
-    from ..services.warm_pool import invalidate_node_warm_pool
-
-    invalidate_node_warm_pool(db, node_id, reason="reality-dest refresh")
-
-    orchestrator = ProvisioningOrchestrator(db)
-
-    # Xray на ноде всё ещё держит старый sni в realitySettings.serverNames
-    # и старый dest в fallback cert'е — без re-render'а config.json клиент
-    # с новым URI получит handshake reject. Триггерим bootstrap ПЕРЕД
-    # reprovision'ом девайсов, install_vless_reality рендерит новый
-    # config.json с обновлённым sni/dest (extra_vars подтянет их из
-    # cfg.sni/cfg.settings.dest). Device-apply таски встанут в очередь
-    # ПОСЛЕ bootstrap'а ноды — xray к тому моменту уже рестартнёт с
-    # новым конфигом, новые UUID'ы добавятся штатно через API.
-    # Ordering-critical: bootstrap ОБЯЗАН пройти ПЕРЕД device-apply тасками
-    # (xray должен рестартнуть с новым sni/dest до добавления UUID'ов). Дефёр
-    # в reconciler сломал бы порядок (device-apply ушли бы раньше реконсайл-
-    # тика) → defer_to_reconciler=False, таска немедленно.
-    bootstrap_task, _created = orchestrator.create_or_coalesce_node_bootstrap(
-        node,
-        {"pool_id": node.pool_id, "rerun": True, "reason": "reality-dest refresh"},
-        defer_to_reconciler=False,
-    )
-    db.commit()
-    if _created:
-        orchestrator.run_task_async(bootstrap_task, node=node)
-    bootstrap_task_id = bootstrap_task.id if bootstrap_task else None
-
-    subs = (
-        db.query(models.Subscription)
-        .filter(
-            models.Subscription.node_id == node_id,
-            models.Subscription.status == models.SubscriptionStatus.active,
-        )
-        .all()
-    )
-    failed: list[int] = []
-    task_ids: list[int] = []
-    if bootstrap_task_id is not None:
-        task_ids.append(bootstrap_task_id)
-    for sub in subs:
-        try:
-            # Снимок имён активных девайсов ДО revoke — чтобы не
-            # схлопнуть N девайсов в один "primary" (см. комментарий
-            # в migrate_subscription_to_new_node).
-            live_names = [
-                d.name or "primary"
-                for d in list(sub.devices)
-                if d.status
-                not in (models.DeviceStatus.disabled, models.DeviceStatus.revoked)
-            ]
-            for device in list(sub.devices):
-                if device.status in (
-                    models.DeviceStatus.disabled,
-                    models.DeviceStatus.revoked,
-                ):
-                    continue
-                orchestrator.revoke_device(
-                    device, reason="reality-dest refresh", background=True
-                )
-            if not live_names:
-                live_names = ["primary"]
-            for name in live_names:
-                _device, task = orchestrator.reprovision_subscription(
-                    sub, device_name=name
-                )
-                if task is not None:
-                    task_ids.append(task.id)
-        except Exception:  # noqa: BLE001
-            logger.exception(
-                "refresh-reality-dest: reprovision failed sub=%s", sub.id
-            )
-            failed.append(sub.id)
-
-    actor, actor_type = _resolve_admin_actor(admin_actor)
-    _audit(
-        db,
-        actor,
-        "node_reality_dest_refreshed",
-        "vpn_node",
-        node.id,
-        actor_type=actor_type,
-        metadata={
-            "old_sni": old_sni,
-            "new_sni": new_sni,
-            "from_pool": new_sni in REALITY_DEST_POOL,
-            "sub_count": len(subs),
-            "failed_subs": failed,
-            "bootstrap_task_id": bootstrap_task_id,
-            "task_ids": task_ids,
-        },
-    )
-
-    return schemas.NodeRefreshDestOut(
-        node_id=node.id,
-        old_sni=old_sni,
-        new_sni=new_sni,
-        sub_count=len(subs),
-        failed_subs=failed,
-        task_ids=task_ids,
     )
 
 

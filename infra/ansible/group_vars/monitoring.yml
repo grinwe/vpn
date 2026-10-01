@@ -2,16 +2,12 @@
 # Non-secret monitoring group vars. Secrets (admin password) live in
 # the sibling ``monitoring/vault.yml`` encrypted with ansible-vault.
 
-# Where the backend's /metrics lives as seen from *inside* prometheus
-# container. Default ``backend:8000`` работает потому что prometheus
-# джойнится к внешней сети app-stack'а (``vpn_default``) и резолвит
-# backend по container-DNS. Линукс-специфика: ``host.docker.internal``
-# на Linux резолвится в bridge-gateway IP, а backend биндится на
-# host-loopback — разные интерфейсы, connection refused. Перешли на
-# joined-network подход. Если когда-нибудь backend/monitoring уедут
-# на разные хосты — поменять на ``<ip>:<port>`` + удалить backend_net
-# из compose + открыть firewall.
-monitoring_stack_backend_metrics_url: "backend:8000"
+# Where the backend's /metrics lives as seen from *inside* the grafana
+# host's docker network. If the backend runs on the same physical box,
+# ``host.docker.internal`` + the backend port works out of the box (the
+# compose template adds the host-gateway alias). If the backend is on a
+# different host, set this to ``<ip>:<port>`` and open the firewall.
+monitoring_stack_backend_metrics_url: "host.docker.internal:8000"
 
 # Override default bind if you want LAN access from a specific bastion.
 # Leave on 127.0.0.1 for SSH-tunnel-only access (recommended).

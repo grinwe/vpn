@@ -17,8 +17,6 @@ from __future__ import annotations
 from alembic import op
 from sqlalchemy import text
 
-from app.alembic._idempotent import has_unique_constraint
-
 revision = "0021_payment_unique_provider_external_id"
 down_revision = "0020_user_health_ping"
 
@@ -42,14 +40,11 @@ def upgrade() -> None:
             """
         )
     )
-    # has_unique_constraint-guard: 0001 create_all() уже создаёт constraint
-    # из __table_args__ модели Payment.
-    if not has_unique_constraint("payments", "uq_payments_provider_external_id"):
-        op.create_unique_constraint(
-            "uq_payments_provider_external_id",
-            "payments",
-            ["provider", "external_id"],
-        )
+    op.create_unique_constraint(
+        "uq_payments_provider_external_id",
+        "payments",
+        ["provider", "external_id"],
+    )
 
 
 def downgrade() -> None:

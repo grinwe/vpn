@@ -37,17 +37,15 @@ import os
 from datetime import datetime
 from typing import Any
 
+logger = logging.getLogger(__name__)
+
 # Reuse constants/policy из traffic_stats, чтобы не дублировать.
-# (traffic_stats нас не импортирует — цикла нет, поэтому импорт на месте,
-# а не в теле функции.)
 from .traffic_stats import (
     SSH_PORT_DEFAULT,
     SSH_USER,
     SSH_CONNECT_TIMEOUT,
     _ssh_run,
 )
-
-logger = logging.getLogger(__name__)
 
 WG_DUMP_CMD = "wg show all dump"
 
@@ -159,35 +157,15 @@ def collect_all_relay_links(session) -> dict[str, Any]:
     for link in links:
         links_by_relay.setdefault(link.relay_node_id, []).append(link)
 
-    stats: dict[str, Any] = {
+    stats = {
         "relays_total": len(links_by_relay),
         "relays_ssh_failed": 0,
         "links_updated": 0,
         "links_no_match": 0,
-        # Список имён relay, у которых SSH упал — нужен для текста
-        # admin-alert-а («SSH упал на нодах: node-5, node-8»). Счётчик
-        # relays_ssh_failed остаётся для обратной совместимости
-        # (старые callers могут на него смотреть), а имена — для
-        # человекочитаемого рендеринга.
-        "failed_relay_names": [],
     }
     now = utcnow()
 
-    # Обходим relay в порядке «самый протухший last_observed_at первым»,
-    # чтобы при повторных kill-по-таймауту не голодали одни и те же relay
-    # в хвосте. Ключ сортировки — минимальный last_observed_at среди links
-    # relay; None (ни разу не наблюдали) считаем максимально старым.
-    _oldest_first = datetime.min
-
-    def _relay_staleness(item):
-        _relay_id, _relay_links = item
-        return min(
-            (lk.last_observed_at or _oldest_first) for lk in _relay_links
-        )
-
-    for relay_id, relay_links in sorted(
-        links_by_relay.items(), key=_relay_staleness
-    ):
+    for relay_id, relay_links in links_by_relay.items():
         relay = session.get(models.VPNNode, relay_id)
         if relay is None:
             continue
@@ -199,7 +177,6 @@ def collect_all_relay_links(session) -> dict[str, Any]:
                 relay.id, relay.name, exc,
             )
             stats["relays_ssh_failed"] += 1
-            stats["failed_relay_names"].append(relay.name)
             continue
         logger.info(
             "relay_link_health: relay=%s links=%d dump_peers=%d "
@@ -251,13 +228,6 @@ def collect_all_relay_links(session) -> dict[str, Any]:
             link.last_observed_at = now
             stats["links_updated"] += 1
 
-        # Коммитим по мере обхода: RQ kill-по-таймауту тика (120с) при
-        # нескольких лежащих relay (до ~10с SSH-таймаута на каждый) может
-        # убить джоб до конца прохода. Один общий commit в конце терял бы
-        # обновления ВСЕХ relay, включая уже успешно опрошенных, и
-        # last_observed_at всего флота протухал бы разом. Per-relay commit
-        # сохраняет частичный прогресс.
-        session.commit()
-
+    session.commit()
     logger.info("relay_link_health: summary=%s", stats)
     return stats

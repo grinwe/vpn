@@ -10,14 +10,12 @@ from __future__ import annotations
 
 from datetime import timedelta
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request
-from sqlalchemy import and_, or_
-from sqlalchemy.orm import Session, joinedload
+from fastapi import APIRouter, Depends, Header, HTTPException, Request
+from sqlalchemy.orm import Session
 
 from .. import models, schemas
 from ..auth import optional_admin as optional_admin_token
 from ..auth import require_admin
-from ..services.balance import total_renewal_cost_kopecks
 from ..time_utils import utcnow
 from ._common import (
     ADMIN_ACTOR_HEADER,
@@ -30,10 +28,6 @@ from ._common import (
 )
 
 router = APIRouter()
-
-# detail 409 «другой тариф» при живой подписке на неоплаченных бесплатных днях.
-# Бот сверяет его строкой (bot/handlers.py), не менять без правки бота.
-ON_TRIAL_DETAIL = "on trial"
 
 
 def _invoice_with_credentials(
@@ -79,18 +73,10 @@ def _mark_invoice_paid_core(
     (which does its own auth via HMAC signature, not admin token) can reuse
     the exact same "flip invoice to paid → provision subscription" logic.
     """
-    # populate_existing ОБЯЗАТЕЛЕН: вызывающие (lava-reconcile-тик, вебхук,
-    # telegram_webhook) уже подгрузили этот же Invoice в ту же сессию, и без
-    # него SQLAlchemy вернёт объект из identity-map — с атрибутами, прочитанными
-    # ДО взятия row-lock. Тогда проверки `status == paid` / `subscription_id`
-    # внутри критической секции смотрят на устаревшее состояние, и два
-    # параллельных зачисления (вебхук + сверка) могут оба увидеть pending
-    # (аудит 2026-07-25). Тот же приём уже применён в api/traffic.py.
     invoice = (
         db.query(models.Invoice)
         .filter(models.Invoice.id == invoice_id)
         .with_for_update()
-        .execution_options(populate_existing=True)
         .first()
     )
     if not invoice:
@@ -110,12 +96,6 @@ def _mark_invoice_paid_core(
 
     latest_subscription = invoice.subscription
     if invoice.status == models.InvoiceStatus.paid:
-        # Инвойс уже оплачен (ретрай вебхука после ручного mark_paid или
-        # повторная доставка вебхука провайдера). Payment мог быть только
-        # что помечён paid выше — зафиксируем его, иначе get_db закроет
-        # сессию с неявным откатом и Payment навсегда останется pending.
-        if payment_id:
-            db.commit()
         if not latest_subscription:
             latest_subscription = (
                 db.query(models.Subscription)
@@ -157,28 +137,45 @@ def _mark_invoice_paid_core(
         if amount_kopecks <= 0:
             raise HTTPException(status_code=400, detail="Topup invoice has non-positive amount")
 
-        # Идемпотентность топапа: инвариант «оплаченный topup-инвойс = ровно
-        # одна topup-транзакция». Если строка reference=invoice:<id> уже есть
-        # (ретрай вебхука CryptoBot при не-2xx, либо mark_paid после ошибочного
-        # mark_unpaid), баланс уже зачислен — не кредитуем повторно, только
-        # возвращаем инвойс в статус paid. balance.py дедупа по reference не
-        # делает, поэтому защита живёт здесь.
-        existing_tx = (
-            db.query(models.BalanceTransaction)
-            .filter_by(reference=f"invoice:{invoice.id}")
-            .first()
-        )
-        if existing_tx is not None:
-            invoice.status = models.InvoiceStatus.paid
-            db.add(invoice)
-            db.commit()
-            db.refresh(invoice)
-            return _invoice_with_credentials(invoice, [])
-
-        # Награда рефереру за ПЕРВУЮ оплату приглашённого. Строго ДО записи
-        # его собственной topup-строки: иначе хелпер увидел бы её и счёл
-        # оплату не первой.
-        _maybe_pay_referrer(db, invoice)
+        # Referrer payout: runs strictly BEFORE we write the user's own
+        # topup row so "first kind=topup" detection is unambiguous. If
+        # the user was attributed to a referrer (via /users/register)
+        # and has never completed a real topup before, credit
+        # REFERRAL_BONUS_KOPECKS to the referrer. Idempotent by
+        # reference — a retried webhook can't double-pay.
+        topup_user = db.get(models.User, invoice.user_id)
+        if topup_user and topup_user.referred_by_id is not None:
+            prior = (
+                db.query(models.BalanceTransaction)
+                .filter_by(
+                    user_id=topup_user.id,
+                    kind=models.BalanceTxKind.topup,
+                )
+                .first()
+            )
+            if prior is None:
+                ref_key = f"referral_payout:{topup_user.id}"
+                already = (
+                    db.query(models.BalanceTransaction)
+                    .filter_by(reference=ref_key)
+                    .first()
+                )
+                if already is None:
+                    try:
+                        balance_svc.referral_bonus(
+                            db,
+                            topup_user.referred_by_id,
+                            reference=ref_key,
+                        )
+                    except Exception:
+                        # Don't fail the whole topup over a referral
+                        # bonus write — log and move on. Payout will
+                        # be retried by a nightly reconciliation if we
+                        # ever add one; for now it's fire-and-forget.
+                        logger.exception(
+                            "referral payout failed for user=%s",
+                            topup_user.id,
+                        )
 
         try:
             balance_svc.topup(
@@ -216,26 +213,6 @@ def _mark_invoice_paid_core(
     subscription: models.Subscription | None = None
     task: models.ProvisioningTask | None = None
     try:
-        # Страховка от гонки «оплатил new_subscription, пока активировался
-        # триал»: к моменту зачисления у юзера уже есть живая подписка этого
-        # плана, и провижининг второй гарантированно упадёт в «Device limit
-        # reached» — так завис счёт #65 (инцидент 2026-08-21): 500 ловили и
-        # вебхук, и reconcile-тик, и ручной mark paid. Проводим как продление
-        # существующей — деньги получены ровно за период этого плана.
-        if (
-            invoice.action == models.InvoiceAction.new_subscription
-            and not invoice.subscription_id
-        ):
-            existing = _active_subscription_for(db, invoice.user_id, invoice.plan_id)
-            if existing is not None:
-                logger.warning(
-                    "invoice %s: new_subscription при живой подписке %s "
-                    "(user %s, plan %s) — проводим как renewal",
-                    invoice.id, existing.id, invoice.user_id, invoice.plan_id,
-                )
-                invoice.action = models.InvoiceAction.renewal
-                invoice.subscription_id = existing.id
-
         if invoice.action == models.InvoiceAction.renewal:
             if not invoice.subscription_id:
                 raise HTTPException(status_code=400, detail="Invoice missing subscription for renewal")
@@ -247,57 +224,8 @@ def _mark_invoice_paid_core(
             now = utcnow()
             base_time = subscription.expires_at if subscription.expires_at > now else now
             subscription.expires_at = base_time + timedelta(days=plan.duration_days)
-            # Новый оплаченный период — шкала трафика в клиенте начинает с нуля
-            # (счётчик информационный, семантика «за период»).
-            subscription.traffic_used_bytes = 0
             subscription.status = models.SubscriptionStatus.active
-            # Ревью 2026-08-21: между выставлением счёта и оплатой подписка
-            # могла замёрзнуть/заблокироваться/истечь — прежний код молча
-            # ставил active, оставляя frozen_* поля (auto-unfreeze тик слеп
-            # к active, ручной unfreeze падает на «not frozen») и ноль живых
-            # девайсов (freeze/блокировка/grace-истечение их ревокают).
-            # Деньги приняты — чистим freeze-поля (годовой лимит
-            # has_frozen_this_year не возвращаем) и, если живых девайсов не
-            # осталось, реповижним — зеркально unfreeze_subscription.
-            subscription.frozen_at = None
-            subscription.frozen_until = None
             db.add(subscription)
-            db.flush()
-            has_live_device = any(
-                d.status
-                not in (models.DeviceStatus.revoked, models.DeviceStatus.disabled)
-                for d in subscription.devices
-            )
-            if not has_live_device:
-                from ..services.provisioning import ProvisioningOrchestrator
-
-                try:
-                    ProvisioningOrchestrator(db).reprovision_subscription(subscription)
-                except Exception:  # noqa: BLE001 — оплата важнее провижна
-                    logger.exception(
-                        "renewal invoice %s: reprovision после оплаты не удался — "
-                        "подписка %s активна без девайсов",
-                        invoice.id,
-                        subscription.id,
-                    )
-                    from ..services.admin_notify import notify_admins
-
-                    notify_admins(
-                        db,
-                        kind="renewal_reprovision_failed",
-                        text=(
-                            f"⚠️ Счёт #{invoice.id} оплачен и продлил подписку "
-                            f"{subscription.id}, но выдать девайс не удалось — "
-                            f"подписка активна без единого устройства. Нужен "
-                            f"ручной репровижн."
-                        ),
-                        dedup_key={"subscription_id": subscription.id},
-                        extra={
-                            "invoice_id": invoice.id,
-                            "subscription_id": subscription.id,
-                        },
-                        autocommit=False,
-                    )
             invoice.subscription_id = subscription.id
             credentials = subscription.credentials
         else:
@@ -311,12 +239,6 @@ def _mark_invoice_paid_core(
     except Exception as exc:  # noqa: BLE001
         logger.exception("Failed to process invoice %s", invoice_id)
         raise HTTPException(status_code=500, detail="Failed to create or update subscription") from exc
-
-    # Первая оплата приглашённого бывает и не пополнением: счёт за тариф или
-    # продление картой/СБП (/plans, /renew, ?fix=1). При трёх бесплатных днях
-    # это самый частый первый платёж, и награду он тоже приносит. Проверки
-    # «первая оплата» и дедуп те же, что в topup-ветке.
-    _maybe_pay_referrer(db, invoice)
 
     invoice.status = models.InvoiceStatus.paid
     db.add(invoice)
@@ -333,182 +255,6 @@ def _mark_invoice_paid_core(
         metadata={"subscription_id": invoice.subscription_id},
     )
     return _invoice_with_credentials(invoice, credentials, subscription=subscription, task=task)
-
-
-def _maybe_pay_referrer(db: Session, invoice: models.Invoice) -> None:
-    """Награда рефереру, если этот оплаченный счёт — первая оплата приглашённого.
-
-    Зовут обе ветки ``_mark_invoice_paid_core`` (пополнение и счёт за тариф
-    или продление) до того, как счёт помечен paid и до собственной
-    topup-строки юзера. Первая оплата = у приглашённого нет ни других
-    оплаченных счетов с суммой > 0, ни строк ``topup``, ни ручных зачислений
-    ``adjust admin_topup:%`` > 0 (так проводили оплаты, пока lava лежал).
-
-    Одного дедупа ``referral_payout:{uid}`` мало: ``/users/register``
-    привязывает реферера любому юзеру с пустым ``referred_by_id``, даже давно
-    платящему. Без условия «первая оплата» его следующая оплата принесла бы
-    награду владельцу чужой ссылки, а исторические приглашённые дали бы её
-    задним числом.
-
-    Строка приглашённого блокируется (SELECT ... FOR UPDATE) ДО проверок: два
-    одновременных вебхука по разным счетам одного юзера лочат разные
-    Invoice-строки и без этого оба прошли бы дедуп до коммита друг друга.
-    Второй дождётся коммита первого и увидит его оплату.
-
-    Ошибка начисления не валит оплату: запись идёт в SAVEPOINT, при сбое
-    откатывается только она.
-    """
-    from ..services import balance as balance_svc
-
-    amount_kopecks = int(round(float(invoice.amount or 0) * 100))
-    if amount_kopecks <= 0:
-        return
-
-    payer = (
-        db.query(models.User)
-        .filter(models.User.id == invoice.user_id)
-        .with_for_update()
-        .first()
-    )
-    if payer is None or payer.referred_by_id is None:
-        return
-
-    earlier_invoice = (
-        db.query(models.Invoice.id)
-        .filter(
-            models.Invoice.user_id == payer.id,
-            models.Invoice.id != invoice.id,
-            models.Invoice.status == models.InvoiceStatus.paid,
-            models.Invoice.amount > 0,
-        )
-        .first()
-    )
-    if earlier_invoice is not None:
-        return
-    tx = models.BalanceTransaction
-    earlier_payment = (
-        db.query(tx.id)
-        .filter(
-            tx.user_id == payer.id,
-            or_(
-                tx.kind == models.BalanceTxKind.topup,
-                and_(
-                    tx.kind == models.BalanceTxKind.adjust,
-                    tx.reference.like("admin_topup:%"),
-                    tx.amount_kopecks > 0,
-                ),
-            ),
-        )
-        .first()
-    )
-    if earlier_payment is not None:
-        return
-
-    ref_key = f"referral_payout:{payer.id}"
-    if db.query(tx.id).filter(tx.reference == ref_key).first() is not None:
-        return
-
-    # Награда в ДНЯХ: сколько именно — из кода реферера, с падением на общий
-    # дефолт REFERRAL_REWARD_DAYS.
-    ref_code = (
-        db.query(models.ReferralCode)
-        .filter_by(owner_id=payer.referred_by_id)
-        .order_by(models.ReferralCode.id.desc())
-        .first()
-    )
-    reward_days = (
-        ref_code.reward_days
-        if ref_code and ref_code.reward_days
-        else balance_svc.REFERRAL_REWARD_DAYS
-    )
-    try:
-        with db.begin_nested():
-            balance_svc.referral_bonus(
-                db,
-                payer.referred_by_id,
-                reference=ref_key,
-                days=reward_days,
-                note=f"referral reward: {reward_days}d",
-            )
-    except Exception:  # noqa: BLE001 — оплата важнее награды
-        logger.exception(
-            "referral payout failed for user=%s invoice=%s", payer.id, invoice.id
-        )
-
-
-@router.post("/invoices/topup", response_model=schemas.InvoiceOut)
-def create_topup_invoice(
-    body: schemas.TopupInvoiceCreate,
-    db: Session = Depends(get_db),
-    admin_token: str = Depends(require_admin),
-    admin_actor: str | None = Header(default=None, alias=ADMIN_ACTOR_HEADER),
-):
-    """Счёт на пополнение баланса для бота (аудит 2026-08-21, паритет A).
-
-    Зеркало webapp_topup без initData-аутентификации: бот ходит с
-    admin-токеном и передаёт telegram_id юзера. Сумма всегда в рублях —
-    конвертацию в валюту провайдера делает checkout, как у план-счетов
-    бота. Проведение — штатная topup-ветка ``_mark_invoice_paid_core``
-    (зачисление на баланс + реферальный бонус за первый топап).
-    """
-    from ..services import balance as balance_svc
-
-    user = (
-        db.query(models.User)
-        .filter_by(telegram_id=str(body.telegram_id))
-        .first()
-    )
-    if not user:
-        raise HTTPException(status_code=404, detail="User not found")
-    if body.amount_kopecks < balance_svc.MIN_TOPUP_KOPECKS:
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                f"Minimum topup is {balance_svc.MIN_TOPUP_KOPECKS // 100} ₽"
-            ),
-        )
-
-    invoice = models.Invoice(
-        user_id=user.id,
-        plan_id=None,
-        amount=body.amount_kopecks / 100,
-        currency="RUB",
-        action=models.InvoiceAction.new_subscription,
-        kind="topup",
-    )
-    db.add(invoice)
-    db.commit()
-    db.refresh(invoice)
-
-    actor, actor_type = _resolve_admin_actor(admin_actor)
-    _audit(
-        db, actor, "invoice_created", "invoice", invoice.id,
-        actor_type=actor_type,
-        metadata={"kind": "topup", "amount_kopecks": body.amount_kopecks},
-    )
-    return invoice
-
-
-def _active_subscription_for(
-    db: Session, user_id: int, plan_id: int | None
-) -> models.Subscription | None:
-    """Живая подписка юзера на этот план — цель авто-renewal.
-
-    Только ``active``: продление frozen размораживало бы её силой, а
-    blocked — оживляло бы то, что заблокировали намеренно.
-    """
-    if plan_id is None:
-        return None
-    return (
-        db.query(models.Subscription)
-        .filter(
-            models.Subscription.user_id == user_id,
-            models.Subscription.plan_id == plan_id,
-            models.Subscription.status == models.SubscriptionStatus.active,
-        )
-        .order_by(models.Subscription.id.desc())
-        .first()
-    )
 
 
 @router.post("/invoices", response_model=schemas.InvoiceOut)
@@ -529,80 +275,17 @@ def create_invoice(
         raise HTTPException(status_code=400, detail="Invalid invoice action") from exc
 
     user = _get_user_from_payload(db, body.user_id, body.telegram_id)
-    subscription = None
     if body.subscription_id:
         subscription = db.get(models.Subscription, body.subscription_id)
         if not subscription:
             raise HTTPException(status_code=404, detail="Subscription not found")
         if subscription.user_id != user.id or subscription.plan_id != plan.id:
             raise HTTPException(status_code=400, detail="Subscription does not match invoice data")
-
-    # Бот шлёт new_subscription всегда (дефолт схемы), но «купить» при уже
-    # живой подписке этого плана — всегда продление: вторая подписка упрётся
-    # в per-user лимит девайсов плана при провижининге (инцидент 2026-08-21,
-    # счёт #65). Переключаем прямо на создании, чтобы админка и вебхук видели
-    # правду, а сумма ниже посчиталась ценой продления (со слотами).
-    if action == models.InvoiceAction.new_subscription and subscription is None:
-        existing = _active_subscription_for(db, user.id, plan.id)
-        if existing is not None:
-            logger.info(
-                "create_invoice: new_subscription при живой подписке %s "
-                "(user %s, plan %s) — счёт создаётся как renewal",
-                existing.id, user.id, plan.id,
-            )
-            action = models.InvoiceAction.renewal
-            subscription = existing
-        elif not admin_token:
-            # Покупка ДРУГОГО плана при живой подписке из бота создавала
-            # вторую параллельную подписку с двойным списанием (аудит
-            # 2026-08-21, C1). Смена тарифа с перерасчётом живёт в ЛК;
-            # клиентский путь режем, админский (с токеном) — оставляем.
-            other = (
-                db.query(models.Subscription)
-                .filter(
-                    models.Subscription.user_id == user.id,
-                    models.Subscription.status
-                    == models.SubscriptionStatus.active,
-                    models.Subscription.plan_id != plan.id,
-                )
-                .order_by(models.Subscription.id.desc())
-                .first()
-            )
-            if other is not None:
-                from ..services import balance as balance_svc
-
-                # Живая подписка — неоплаченные бесплатные дни: бот отвечает на
-                # этот detail своим текстом (другой тариф через кабинет или
-                # /help), а не «продли через /renew».
-                if balance_svc.is_unpaid_trial(db, other):
-                    raise HTTPException(status_code=409, detail=ON_TRIAL_DETAIL)
-                raise HTTPException(
-                    status_code=409,
-                    detail="user already has an active subscription on another plan",
-                )
-    # Сумму диктует СЕРВЕР. body.amount — только с админ-токеном: эндпоинт
-    # доступен без него, а _mark_invoice_paid_core сумму с планом не сверяет —
-    # клиентский renewal-инвойс на 1 ₽ продлевал бы подписку целиком (дыра из
-    # ревью 2026-07-29). Вебхук провайдера сверяет платёж с Invoice.amount,
-    # то есть с той же подконтрольной клиенту цифрой — защита обязана стоять
-    # на создании счёта.
-    if body.amount is not None and not admin_token:
-        raise HTTPException(status_code=403, detail="amount override requires admin token")
-    if body.amount is not None:
-        amount = body.amount
-    elif action == models.InvoiceAction.renewal and subscription is not None:
-        # Цена продления со слотами: баланс-путь берёт доплату за
-        # extra_device_slots, а invoice-путь её терял — два пути продления
-        # брали разные деньги за один и тот же период.
-        amount = total_renewal_cost_kopecks(subscription) / 100
-    else:
-        amount = float(plan.price)
+    amount = body.amount if body.amount is not None else float(plan.price)
     invoice = models.Invoice(
         user_id=user.id,
         plan_id=plan.id,
-        # Не body.subscription_id: авто-renewal выше мог подставить живую
-        # подписку, которой в body не было.
-        subscription_id=subscription.id if subscription else None,
+        subscription_id=body.subscription_id,
         amount=amount,
         currency=body.currency,
         action=action,
@@ -621,18 +304,11 @@ def create_invoice(
 @router.get("/invoices", response_model=list[schemas.InvoiceListItem])
 def list_invoices(
     status: str | None = None,
-    limit: int = Query(default=10, ge=1, le=200),
-    offset: int = Query(default=0, ge=0),
+    limit: int = 10,
     db: Session = Depends(get_db),
     admin_token: str = Depends(require_admin),
 ):
-    # eager-load user/plan: карточка списка читает user.telegram_id и
-    # plan.name на каждую строку — без joinedload это N+1 lazy-load.
-    query = (
-        db.query(models.Invoice)
-        .options(joinedload(models.Invoice.user), joinedload(models.Invoice.plan))
-        .order_by(models.Invoice.created_at.desc())
-    )
+    query = db.query(models.Invoice).order_by(models.Invoice.created_at.desc())
     if status:
         try:
             invoice_status = models.InvoiceStatus(status)
@@ -640,26 +316,9 @@ def list_invoices(
             raise HTTPException(status_code=400, detail="Invalid status") from exc
         query = query.filter(models.Invoice.status == invoice_status)
 
-    invoices = query.offset(offset).limit(limit).all()
-    # Платёж по счёту одним запросом на страницу: paid — приоритетнее, среди
-    # равных — самый свежий. Провайдер + external_id (contractId у lava)
-    # нужны админу для сверки с кабинетом партнёра.
-    ids = [inv.id for inv in invoices]
-    best_payment: dict[int, models.Payment] = {}
-    if ids:
-        for pay in (
-            db.query(models.Payment)
-            .filter(models.Payment.invoice_id.in_(ids))
-            .order_by(models.Payment.id.asc())
-            .all()
-        ):
-            cur = best_payment.get(pay.invoice_id)
-            paid = pay.status == models.PaymentStatus.paid
-            if cur is None or paid or cur.status != models.PaymentStatus.paid:
-                best_payment[pay.invoice_id] = pay
+    invoices = query.limit(limit).all()
     result: list[schemas.InvoiceListItem] = []
     for inv in invoices:
-        pay = best_payment.get(inv.id)
         result.append(
             schemas.InvoiceListItem(
                 id=inv.id,
@@ -674,12 +333,6 @@ def list_invoices(
                 action=inv.action.value,
                 kind=inv.kind or "subscription",
                 created_at=inv.created_at,
-                payment_provider=pay.provider if pay else None,
-                payment_external_id=pay.external_id if pay else None,
-                payment_status=(
-                    pay.status.value if pay and hasattr(pay.status, "value") else (pay.status if pay else None)
-                ),
-                paid_at=(pay.updated_at or pay.created_at) if pay and pay.status == models.PaymentStatus.paid else None,
             )
         )
     return result
@@ -777,11 +430,6 @@ def batch_invoices(
             if invoice.status == models.InvoiceStatus.pending:
                 results["skipped"].append(inv_id)
                 continue
-            # topup-инвойсы не откатываем (см. mark_invoice_unpaid): баланс
-            # уже зачислен, откат ведёт к двойному зачислению.
-            if invoice.kind == "topup":
-                results["skipped"].append(inv_id)
-                continue
             invoice.status = models.InvoiceStatus.pending
             _audit(db, actor, "invoice_marked_unpaid", "invoice", inv_id, actor_type=actor_type)
 
@@ -808,14 +456,6 @@ def mark_invoice_unpaid(
         raise HTTPException(status_code=404, detail="Invoice not found")
     if invoice.status == models.InvoiceStatus.pending:
         return schemas.InvoiceOut.from_orm(invoice)
-    # topup-инвойс откатывать нельзя: баланс уже зачислен, а возврат в
-    # pending открыл бы путь к повторному зачислению (mark_paid снова или
-    # запоздалый ретрай вебхука). Для коррекции — balance adjustment.
-    if invoice.kind == "topup":
-        raise HTTPException(
-            status_code=400,
-            detail="Cannot revert a topup invoice — balance was already credited; use a balance adjustment instead",
-        )
     invoice.status = models.InvoiceStatus.pending
     db.commit()
     db.refresh(invoice)

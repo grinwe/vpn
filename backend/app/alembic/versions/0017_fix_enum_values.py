@@ -23,25 +23,14 @@ def upgrade() -> None:
     # *and* updates all rows that reference it — no separate UPDATE needed.
     # The UPDATE-first approach from the previous version failed because
     # you can't SET a column to a value that doesn't exist in the enum yet.
-    #
-    # На fresh DB через Base.metadata.create_all() (миграция 0001) enum
-    # сразу создаётся с underscore-формой (= имена python-членов), и
-    # старых hyphen-лейблов просто нет. Чтобы миграция не падала с
-    # `InvalidParameterValue`, оборачиваем переименование в pg-блок,
-    # пропускающий ошибку invalid_parameter_value (SQLSTATE 22023) —
-    # происходит, когда исходного лейбла нет.
     op.execute(
-        "DO $$ BEGIN "
-        "  ALTER TYPE vpnconfigprotocol RENAME VALUE 'vless-xhttp' TO 'vless_xhttp'; "
-        "EXCEPTION WHEN invalid_parameter_value THEN NULL; END $$"
+        "ALTER TYPE vpnconfigprotocol RENAME VALUE 'vless-xhttp' TO 'vless_xhttp'"
     )
 
     # Same issue for vless-ws-cdn duplicate (original correct value is
     # vless_ws_cdn which already exists). Rename to inert label.
     op.execute(
-        "DO $$ BEGIN "
-        "  ALTER TYPE vpnconfigprotocol RENAME VALUE 'vless-ws-cdn' TO '_deprecated_vless_ws_cdn'; "
-        "EXCEPTION WHEN invalid_parameter_value THEN NULL; END $$"
+        "ALTER TYPE vpnconfigprotocol RENAME VALUE 'vless-ws-cdn' TO '_deprecated_vless_ws_cdn'"
     )
 
 

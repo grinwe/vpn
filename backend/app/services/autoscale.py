@@ -125,15 +125,22 @@ def _active_subs_on_nodes(db: Session, nodes: Iterable[models.VPNNode]) -> int:
     math, otherwise the autoscaler under-provisions once users start
     adding extra devices to their plans. The function name is
     historical; the return value is now ``COUNT(devices)``.
-
-    Метрика общая с ``choose_node`` (см. ``node_device_load``): считает и
-    diverse-креды на нодах пула — девайс, сидящий кредами на двух нодах,
-    занимает слот на каждой, и утилизация пула должна это видеть так же,
-    как её видит балансировщик.
     """
-    from .provisioning import node_device_load
-
-    return node_device_load(db, [n.id for n in nodes])
+    ids = [n.id for n in nodes]
+    if not ids:
+        return 0
+    return (
+        db.query(models.Device)
+        .join(models.Subscription, models.Subscription.id == models.Device.subscription_id)
+        .filter(
+            models.Subscription.node_id.in_(ids),
+            models.Subscription.status == models.SubscriptionStatus.active,
+            models.Device.status.notin_(
+                [models.DeviceStatus.revoked, models.DeviceStatus.disabled]
+            ),
+        )
+        .count()
+    )
 
 
 # #61 — advisory lock namespace. Two-int form of pg_advisory_xact_lock

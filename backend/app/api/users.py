@@ -6,17 +6,12 @@ response shape for the user-facing webapp history view).
 """
 from __future__ import annotations
 
-from datetime import datetime
-
 from fastapi import APIRouter, Depends, Header, HTTPException, Query
 from pydantic import BaseModel, Field
-from sqlalchemy import func
-from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from .. import models, schemas
 from ..auth import require_admin
-from ..services import sub_links
 from ..services.provisioning import ProvisioningOrchestrator
 from ..time_utils import utcnow
 from ._common import ADMIN_ACTOR_HEADER, _audit, _resolve_admin_actor, get_db
@@ -51,14 +46,8 @@ def _sub_sharing_blocked(db: Session, sub: models.Subscription) -> bool:
     latest block is more recent than the latest unblock mentioning that email;
     if yes for any one email — the sub is blocked.
 
-    Хелпер сидит не только в админке, но и на горячем пути вебаппа
-    (``_subscriptions_for_user`` ← ``api_webapp``), а audit_logs —
-    append-only и без индексов под эти фильтры, так что каждый запрос —
-    seq scan всей таблицы. Поэтому вместо 2 запросов на каждый email
-    делаем ОДИН агрегирующий запрос на все email подписки сразу; в
-    типичном случае (блоков не было) на этом и заканчиваем. Запрос по
-    unblock-событиям выполняется только для тех email, у которых
-    реально есть block — это редкий случай.
+    Runs per-sub per-request and does 2N queries (N = live device emails,
+    usually ≤3). Admin pages aren't hot path — simpler beats batched here.
     """
     emails = [
         d.access_username for d in sub.devices
@@ -68,20 +57,21 @@ def _sub_sharing_blocked(db: Session, sub: models.Subscription) -> bool:
     ]
     if not emails:
         return False
-    # Последний sharing_block по каждому email одним запросом. Блок-аудит
-    # хранит email в extra->>'email' (одна строка = один email, пишет
-    # traffic_stats при срабатывании энфорсера).
-    block_email = models.AuditLog.extra["email"].astext
-    block_rows = (
-        db.query(block_email, func.max(models.AuditLog.created_at))
-        .filter(
-            models.AuditLog.action == "sharing_block",
-            block_email.in_(emails),
+    for email in emails:
+        # Latest sharing_block event for this specific email. The block
+        # audit stores the email in extra->>'email' (single email per row,
+        # written by traffic_stats when the enforcer fires).
+        last_block = (
+            db.query(models.AuditLog.created_at)
+            .filter(
+                models.AuditLog.action == "sharing_block",
+                models.AuditLog.extra["email"].astext == email,
+            )
+            .order_by(models.AuditLog.created_at.desc())
+            .first()
         )
-        .group_by(block_email)
-        .all()
-    )
-    for email, last_block_at in block_rows:
+        if not last_block:
+            continue
         # Latest sharing_unblock event that included this email. Unblocks
         # are batched per-subscription and store the emails list under
         # extra->'emails' (JSONB array). The `?` JSONB op asks
@@ -95,7 +85,7 @@ def _sub_sharing_blocked(db: Session, sub: models.Subscription) -> bool:
             .order_by(models.AuditLog.created_at.desc())
             .first()
         )
-        if last_unblock is None or last_unblock[0] < last_block_at:
+        if last_unblock is None or last_unblock[0] < last_block[0]:
             return True
     return False
 
@@ -109,59 +99,20 @@ def _subscriptions_for_user(user_id: int, db: Session) -> list[schemas.Subscript
     if not subs:
         raise HTTPException(status_code=404, detail="Subscriptions not found")
     result = []
-    # Cache exit rows across subs/devices to avoid N+1 on the admin
-    # "show user" page when a user has many devices across several subs.
-    exit_name_cache: dict[int, str | None] = {}
-
-    def _exit_name(exit_id: int | None) -> str | None:
-        if exit_id is None:
-            return None
-        if exit_id in exit_name_cache:
-            return exit_name_cache[exit_id]
-        exit_row = db.get(models.WGExitNode, exit_id)
-        exit_name_cache[exit_id] = exit_row.name if exit_row is not None else None
-        return exit_name_cache[exit_id]
-
     for sub in subs:
-        # Sub-level representative cred → used for SubscriptionOut
-        # aggregate fields (current_exit_*). Per-device routing is
-        # resolved below inside the device loop — after per-device
-        # migrate a sub can be split across nodes/exits.
-        sub_exit_id: int | None = None
+        # First live cred's exit_id: every active cred of a sub is
+        # pinned to the same exit (switch_subscription_exit rewrites
+        # them en masse), so any live cred is representative.
+        current_exit_id: int | None = None
         for cred in sub.credentials:
             if cred.is_active and cred.exit_id is not None:
-                sub_exit_id = cred.exit_id
+                current_exit_id = cred.exit_id
                 break
-        sub_exit_name = _exit_name(sub_exit_id)
-
-        device_outs: list[schemas.DeviceOut] = []
-        for d in sub.devices:
-            # Resolve the device's actual home: device.config.node is
-            # authoritative post-migrate; fall back to sub.node for
-            # terminal devices whose config_id was nulled out by
-            # config-delete cleanup.
-            d_node = d.config.node if d.config else sub.node
-            d_node_id = d_node.id if d_node else None
-            d_node_name = d_node.name if d_node else None
-            d_node_region = d_node.region if d_node else None
-            d_is_relay = bool(d_node.has_relay_config) if d_node else False
-            d_exit_id: int | None = None
-            for cred in d.credentials:
-                if cred.is_active and cred.exit_id is not None:
-                    d_exit_id = cred.exit_id
-                    break
-            device_outs.append(
-                schemas.DeviceOut.from_orm(
-                    d,
-                    node_id=d_node_id,
-                    node_name=d_node_name,
-                    node_region=d_node_region,
-                    is_relay=d_is_relay,
-                    exit_id=d_exit_id,
-                    exit_name=_exit_name(d_exit_id),
-                )
-            )
-
+        current_exit_name: str | None = None
+        if current_exit_id is not None:
+            exit_row = db.get(models.WGExitNode, current_exit_id)
+            if exit_row is not None:
+                current_exit_name = exit_row.name
         item = schemas.SubscriptionOut(
             id=sub.id,
             plan_name=sub.plan.name,
@@ -174,17 +125,11 @@ def _subscriptions_for_user(user_id: int, db: Session) -> list[schemas.Subscript
             status=sub.status.value,
             auto_renew=sub.auto_renew or False,
             sub_token=sub.sub_token,
-            link_token=sub_links.link_token_for(sub),
-            link_url=(
-                sub_links.sub_url_for(sub_links.link_token_for(sub))
-                if sub.link_token
-                else None
-            ),
             credentials=[schemas.CredentialOut.from_orm(c) for c in sub.credentials],
-            devices=device_outs,
+            devices=[schemas.DeviceOut.from_orm(d) for d in sub.devices],
             sharing_blocked=_sub_sharing_blocked(db, sub),
-            current_exit_id=sub_exit_id,
-            current_exit_name=sub_exit_name,
+            current_exit_id=current_exit_id,
+            current_exit_name=current_exit_name,
         )
         result.append(item)
     return result
@@ -270,21 +215,6 @@ def list_users(
     counts: dict[int, int] = {}
     for uid, _sid in counts_rows:
         counts[uid] = counts.get(uid, 0) + 1
-    # Последняя видимая активность юзера = max по его девайсам; last_seen_at
-    # штампует тик traffic_stats. UI красит индикатор «активен за 24ч» сам —
-    # отдаём момент, а не bool, чтобы тултип мог показать точное время.
-    last_active: dict[int, datetime] = dict(
-        db.query(
-            models.Device.user_id,
-            func.max(models.Device.last_seen_at),
-        )
-        .filter(
-            models.Device.user_id.in_(user_ids),
-            models.Device.last_seen_at.isnot(None),
-        )
-        .group_by(models.Device.user_id)
-        .all()
-    )
     return [
         schemas.UserOut(
             id=u.id,
@@ -294,7 +224,6 @@ def list_users(
             subscription_count=counts.get(u.id, 0),
             balance_kopecks=u.balance_kopecks or 0,
             banned_at=u.banned_at,
-            last_active_at=last_active.get(u.id),
         )
         for u in users
     ]
@@ -423,164 +352,6 @@ def unban_user(
         "user_unbanned",
         "user",
         user_id,
-        actor_type=actor_type,
-    )
-    return {"status": "unbanned"}
-
-
-# ── Per-node user bans ───────────────────────────────────────────────
-# Список нод, на которые авто-выбор (choose_node через exclude_node_ids)
-# НЕ должен селить данного юзера. Ортогонально глобальному banned_at.
-# Заполняется авто-миграцией («обновить подписку» авто-банит старую
-# ноду) и этими ручными эндпоинтами.
-
-
-@router.get(
-    "/users/{user_id}/node-bans",
-    response_model=list[schemas.NodeUserBanOut],
-)
-def list_user_node_bans(
-    user_id: int,
-    db: Session = Depends(get_db),
-    admin_token: str = Depends(require_admin),
-):
-    """Per-node баны юзера (с именами нод для админки)."""
-    user = db.get(models.User, user_id)
-    if not user:
-        raise HTTPException(status_code=404, detail="User not found")
-    rows = (
-        db.query(models.NodeUserBan, models.VPNNode.name)
-        .outerjoin(
-            models.VPNNode, models.VPNNode.id == models.NodeUserBan.node_id
-        )
-        .filter(models.NodeUserBan.user_id == user_id)
-        .order_by(models.NodeUserBan.created_at.desc())
-        .all()
-    )
-    return [
-        schemas.NodeUserBanOut(
-            id=ban.id,
-            user_id=ban.user_id,
-            node_id=ban.node_id,
-            node_name=node_name,
-            reason=ban.reason,
-            created_by=ban.created_by,
-            created_at=ban.created_at,
-        )
-        for ban, node_name in rows
-    ]
-
-
-@router.post(
-    "/users/{user_id}/node-bans",
-    response_model=schemas.NodeUserBanOut,
-)
-def add_user_node_ban(
-    user_id: int,
-    body: schemas.NodeUserBanCreate,
-    db: Session = Depends(get_db),
-    admin_token: str = Depends(require_admin),
-    admin_actor: str | None = Header(default=None, alias=ADMIN_ACTOR_HEADER),
-):
-    """Вручную забанить юзера на ноде — авто-выбор её пропустит.
-
-    Идемпотентно по (user_id, node_id): повторный бан возвращает
-    существующую запись. Не мигрирует юзера — только помечает ноду как
-    нежелательную для будущих авто-выборов.
-    """
-    user = db.get(models.User, user_id)
-    if not user:
-        raise HTTPException(status_code=404, detail="User not found")
-    node = db.get(models.VPNNode, body.node_id)
-    if not node:
-        raise HTTPException(status_code=404, detail="Node not found")
-    actor, actor_type = _resolve_admin_actor(admin_actor)
-    ban = (
-        db.query(models.NodeUserBan)
-        .filter(
-            models.NodeUserBan.user_id == user_id,
-            models.NodeUserBan.node_id == body.node_id,
-        )
-        .first()
-    )
-    if ban is None:
-        try:
-            ban = models.NodeUserBan(
-                user_id=user_id,
-                node_id=body.node_id,
-                reason=body.reason,
-                created_by=actor,
-            )
-            db.add(ban)
-            db.commit()
-            db.refresh(ban)
-            _audit(
-                db,
-                actor,
-                "node_user_banned",
-                "user",
-                user_id,
-                metadata={"node_id": body.node_id, "reason": body.reason},
-                actor_type=actor_type,
-            )
-        except IntegrityError:
-            # Гонка: параллельный запрос уже создал бан (user_id, node_id).
-            # uq_node_user_ban → idempotent: откатываемся и перечитываем.
-            db.rollback()
-            ban = (
-                db.query(models.NodeUserBan)
-                .filter(
-                    models.NodeUserBan.user_id == user_id,
-                    models.NodeUserBan.node_id == body.node_id,
-                )
-                .first()
-            )
-            if ban is None:
-                raise HTTPException(
-                    status_code=409,
-                    detail="Конфликт при создании бана — повторите запрос",
-                )
-    return schemas.NodeUserBanOut(
-        id=ban.id,
-        user_id=ban.user_id,
-        node_id=ban.node_id,
-        node_name=node.name,
-        reason=ban.reason,
-        created_by=ban.created_by,
-        created_at=ban.created_at,
-    )
-
-
-@router.delete("/users/{user_id}/node-bans/{node_id}")
-def remove_user_node_ban(
-    user_id: int,
-    node_id: int,
-    db: Session = Depends(get_db),
-    admin_token: str = Depends(require_admin),
-    admin_actor: str | None = Header(default=None, alias=ADMIN_ACTOR_HEADER),
-):
-    """Снять per-node бан (разбан) — авто-выбор снова сможет селить юзера
-    на эту ноду. Идемпотентно."""
-    ban = (
-        db.query(models.NodeUserBan)
-        .filter(
-            models.NodeUserBan.user_id == user_id,
-            models.NodeUserBan.node_id == node_id,
-        )
-        .first()
-    )
-    if ban is None:
-        return {"status": "not_banned"}
-    db.delete(ban)
-    db.commit()
-    actor, actor_type = _resolve_admin_actor(admin_actor)
-    _audit(
-        db,
-        actor,
-        "node_user_unbanned",
-        "user",
-        user_id,
-        metadata={"node_id": node_id},
         actor_type=actor_type,
     )
     return {"status": "unbanned"}
@@ -715,7 +486,6 @@ def get_balance_by_telegram(
     for sub in subs:
         plan = sub.plan
         price = balance_svc.plan_price_kopecks(plan) if plan else 0
-        duration = plan.duration_days if plan else 30
         days_left = None
         if sub.expires_at:
             delta = (sub.expires_at - now).total_seconds()
@@ -726,23 +496,13 @@ def get_balance_by_telegram(
             "plan_name": plan.name if plan else "",
             "status": sub.status.value,
             "plan_price_kopecks": price,
-            "plan_duration_days": duration,
+            "plan_duration_days": plan.duration_days if plan else 30,
             "expires_at": sub.expires_at.isoformat() if sub.expires_at else None,
             "auto_renew": bool(sub.auto_renew),
             "frozen_until": sub.frozen_until.isoformat() if sub.frozen_until else None,
         })
         if days_left is not None and sub.status == models.SubscriptionStatus.active:
-            # Mirror the webapp runway: days_left + future renewals the
-            # wallet can cover. Must use total_renewal_cost_kopecks so
-            # device-slot surcharge is counted (bare plan_price would
-            # overstate runway for users with paid slots).
-            runway = days_left
-            if sub.auto_renew and plan:
-                renewal_cost = balance_svc.total_renewal_cost_kopecks(sub)
-                if renewal_cost > 0:
-                    balance_k = user.balance_kopecks or 0
-                    runway += (balance_k // renewal_cost) * duration
-            min_days = runway if min_days is None else min(min_days, runway)
+            min_days = days_left if min_days is None else min(min_days, days_left)
 
     return {
         "user_id": user.id,

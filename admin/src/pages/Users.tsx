@@ -1,4 +1,3 @@
-import { useSearchParams } from "react-router-dom";
 import { useEffect, useState } from "react";
 import {
   useInfiniteQuery,
@@ -7,25 +6,10 @@ import {
   useQueryClient,
 } from "@tanstack/react-query";
 import {
-  adminReportFailureForSubscription,
   api,
   batchBanUsers,
-  bulkMigrateAuto,
-  bulkRebuildConfig,
-  bulkRegenerateSublink,
-  claimOrphanSubscription,
-  DeviceMigrateOut,
-  DeviceNodeOut,
-  DeviceNodeSetOut,
   DeviceOut,
-  DeviceSwitchExitOut,
-  getDeviceNodes,
-  listUserNodeBans,
-  swapDeviceNode,
-  migrateSubscriptionAuto,
   NodeRelayLinkOut,
-  NodeUserBanOut,
-  removeUserNodeBan,
   SubscriptionMigrateOut,
   SubscriptionOut,
   SubscriptionSwitchExitOut,
@@ -42,56 +26,9 @@ const PAGE_SIZE = 50;
 // (backend/app/api/users.py) — "all" means "no filter", not "empty".
 type BannedFilter = "all" | "active" | "banned";
 
-// Человекочитаемый текст сетевой ошибки для показа в существующем слоте UI.
-/** Светофор «активен за 24ч»: зелёный — трафик юзера видели за последние
- *  сутки (Device.last_seen_at, штампует тик traffic_stats), красный — нет,
- *  в том числе «не подключался ни разу». Точное время — в тултипе. */
-/** «22.09 09:41» / «3 ч назад» — точное время последней активности текстом,
- *  а не только тултипом: на телефоне тултипа нет, а именно «когда именно был
- *  онлайн» и нужно оператору (поддержка, проверки платёжек). */
-export function lastSeenLabel(iso: string | null | undefined): string {
-  if (!iso) return "не подключался";
-  const t = new Date(iso).getTime();
-  const diffMin = Math.max(0, Math.round((Date.now() - t) / 60000));
-  if (diffMin < 60) return `${diffMin} мин назад`;
-  if (diffMin < 24 * 60) return `${Math.round(diffMin / 60)} ч назад`;
-  return new Date(iso).toLocaleString("ru-RU", { dateStyle: "short", timeStyle: "short" });
-}
-
-function ActivityDot({ lastActiveAt }: { lastActiveAt: string | null }) {
-  const active =
-    lastActiveAt !== null &&
-    Date.now() - new Date(lastActiveAt).getTime() < 24 * 60 * 60 * 1000;
-  return (
-    <span
-      className={`inline-block w-2.5 h-2.5 rounded-full ${
-        active ? "bg-green-500" : "bg-red-500"
-      }`}
-      title={
-        lastActiveAt
-          ? `Последняя активность: ${new Date(lastActiveAt).toLocaleString(
-              "ru-RU",
-              { dateStyle: "short", timeStyle: "short" },
-            )}`
-          : "Активности не было"
-      }
-    />
-  );
-}
-
-function errText(e: unknown): string {
-  return e instanceof Error ? e.message : String(e);
-}
-
 export default function Users() {
   const qc = useQueryClient();
-  // Переход из других разделов: /users?telegram_id=123 (ссылки из списка нод,
-  // из активных юзеров ноды). До 2026-07-26 параметр не читался вовсе, и такая
-  // ссылка открывала просто общий список — то есть переход «кред → юзер»
-  // формально существовал, но никуда не вёл.
-  const [searchParams, setSearchParams] = useSearchParams();
-  const urlTelegramId = searchParams.get("telegram_id") ?? "";
-  const [search, setSearch] = useState(urlTelegramId);
+  const [search, setSearch] = useState("");
   // Debounce the search input so we don't hammer the backend on every
   // keystroke — 300ms is the sweet spot between "feels instant" and
   // "one request per full word".
@@ -103,25 +40,10 @@ export default function Users() {
   // Tab filter.  Default "active" — banned accounts are usually ban-waves
   // of hundreds of rows that the operator only wants to see intentionally
   // (either to review the wave or to batch-unban a false positive).
-  // Приходя по ссылке на конкретного юзера, показываем ВСЕХ: дефолтный
-  // фильтр «активные» скрыл бы забаненного, и переход выглядел бы как
-  // «юзер не найден».
-  const [banned, setBanned] = useState<BannedFilter>(
-    urlTelegramId ? "all" : "active",
-  );
-  // Выбранный юзер храним как id, а сам объект деривим из загруженного
-  // списка (см. `selected` ниже). Так любой refetch списка (после ban,
-  // batch-операций, пополнения) автоматически перерисовывает сайдбар —
-  // не нужно вручную патчить снапшот в каждом onSuccess (иначе сайдбар
-  // показывает устаревшее состояние: незабаненного юзера с кнопкой ban).
-  const [selectedId, setSelectedId] = useState<number | null>(null);
+  const [banned, setBanned] = useState<BannedFilter>("active");
+  const [selected, setSelected] = useState<UserOut | null>(null);
   const [topupRub, setTopupRub] = useState("");
   const [topupNote, setTopupNote] = useState("");
-  // claim-orphan form state — operator pastes either a bare UUID or
-  // the full vless:// URL the user sent from Hiddify. Device name is
-  // optional (existing device's name is kept if blank).
-  const [claimInput, setClaimInput] = useState("");
-  const [claimDeviceName, setClaimDeviceName] = useState("");
   // Bulk selection lives next to single-row selection. Single-row
   // selection (`selected`) drives the detail sidebar; `selectedIds` is
   // the set used by bulk ban/unban. They are intentionally independent —
@@ -144,13 +66,7 @@ export default function Users() {
     fetchNextPage,
     hasNextPage,
     isFetchingNextPage,
-    isFetchNextPageError,
     isLoading,
-    // error/isError раньше не читались: при падении /users список молча
-    // рендерил пустую таблицу — оператор принимал упавший backend за
-    // «юзеров нет». Теперь показываем текст ошибки вместо пустого списка.
-    isError,
-    error,
   } = useInfiniteQuery({
     queryKey: ["users", { search: debouncedSearch, banned }],
     initialPageParam: 0,
@@ -172,39 +88,11 @@ export default function Users() {
     },
   });
   const users = usersData?.pages.flat() ?? [];
-  // Деривим выбранного юзера из актуальных данных списка — единственный
-  // источник правды. Если юзер выпал из текущего фильтра (напр. забанен
-  // на вкладке «Активные»), selected → null и сайдбар закрывается: это
-  // корректно отражает реальность, а не показывает застывший снапшот.
-  const selected = users.find((u) => u.id === selectedId) ?? null;
 
-  // Пришли по ссылке — открываем карточку сами, как только юзер нашёлся.
-  // Ждать, пока оператор ткнёт в единственную строку, незачем: он уже сказал,
-  // кого хочет увидеть.
-  useEffect(() => {
-    if (!urlTelegramId || selectedId !== null) return;
-    const hit = users.find((u) => String(u.telegram_id) === urlTelegramId);
-    if (hit) {
-      setSelectedId(hit.id);
-      // Параметр отработал — убираем из URL, чтобы «назад» и последующая
-      // ручная фильтрация не тянули его обратно.
-      searchParams.delete("telegram_id");
-      setSearchParams(searchParams, { replace: true });
-    }
-  }, [urlTelegramId, users, selectedId, searchParams, setSearchParams]);
-
-  const {
-    data: subs,
-    // Раньше состояние сайдбара определялось только по `subs === undefined`:
-    // при ошибке запроса data остаётся undefined и панель висела в вечном
-    // «Загрузка…». Теперь различаем loading / error / empty.
-    isLoading: subsLoading,
-    isError: subsError,
-    error: subsErrObj,
-  } = useQuery<SubscriptionOut[]>({
-    queryKey: ["user-subs", selectedId],
-    queryFn: () => api.get(`/users/${selectedId}`),
-    enabled: selectedId !== null,
+  const { data: subs } = useQuery<SubscriptionOut[]>({
+    queryKey: ["user-subs", selected?.id],
+    queryFn: () => api.get(`/users/${selected!.id}`),
+    enabled: selected !== null,
   });
 
   // Only loaded when a user is selected — the list is used to populate
@@ -214,7 +102,7 @@ export default function Users() {
   const { data: allNodes } = useQuery<VPNNodeOut[]>({
     queryKey: ["nodes-for-migrate"],
     queryFn: () => api.get(`/nodes`),
-    enabled: selectedId !== null,
+    enabled: selected !== null,
   });
 
   const topup = useMutation({
@@ -227,47 +115,17 @@ export default function Users() {
       amountKopecks: number;
       note: string;
     }) => adminTopupByTelegram(telegramId, amountKopecks, note),
-    onSuccess: () => {
-      // Баланс в сайдбаре обновится сам через invalidateQueries(["users"])
-      // → refetch списка → derive selected. Ручной патч снапшота больше
-      // не нужен.
+    onSuccess: (res) => {
+      // Optimistically patch the selected user's balance so the UI
+      // updates instantly without waiting for the users-list refetch.
+      if (selected && selected.id === res.user_id) {
+        setSelected({ ...selected, balance_kopecks: res.balance_kopecks });
+      }
       setTopupRub("");
       setTopupNote("");
       qc.invalidateQueries({ queryKey: ["users"] });
     },
     onError: (e: Error) => alert(`Не удалось пополнить: ${e.message}`),
-  });
-
-  const claimOrphan = useMutation({
-    mutationFn: ({
-      userId,
-      uuidOrUrl,
-      deviceName,
-    }: {
-      userId: number;
-      uuidOrUrl: string;
-      deviceName: string;
-    }) =>
-      claimOrphanSubscription({
-        user_id: userId,
-        uuid: uuidOrUrl,
-        device_name: deviceName || null,
-      }),
-    onSuccess: (res) => {
-      setClaimInput("");
-      setClaimDeviceName("");
-      const expires = new Date(res.new_expires_at).toLocaleString();
-      const protos = res.claimed_credentials.map((c) => c.proto).join(", ");
-      alert(
-        `Подписка #${res.subscription_id} передана user_id=${res.new_user_id}.\n` +
-          `Девайс #${res.device_id}. Протоколы: ${protos}.\n` +
-          `expires_at: ${expires}.\n` +
-          `Existing connection в Hiddify не прерывается — UUID остался прежним.`,
-      );
-      qc.invalidateQueries({ queryKey: ["user-subs"] });
-      qc.invalidateQueries({ queryKey: ["users"] });
-    },
-    onError: (e: Error) => alert(`Не удалось восстановить: ${e.message}`),
   });
 
   const revokeNow = useMutation({
@@ -337,27 +195,6 @@ export default function Users() {
     onError: (e: Error) => alert(`Не удалось перевести: ${e.message}`),
   });
 
-  // «Обновить подписку»: авто-выбор свободного сервера из пула (исключая
-  // ноды из бан-листа юзера) + миграция + авто-бан старой ноды. В отличие
-  // от ручного MigrateSubControl админ НЕ выбирает target — backend сам
-  // берёт наименее загруженный healthy сервер.
-  const migrateAuto = useMutation({
-    mutationFn: (subId: number) => migrateSubscriptionAuto(subId),
-    onSuccess: (res) => {
-      const banMsg = res.banned_old_node
-        ? " Старая нода добавлена в бан-лист юзера (авто-выбор туда больше не вернёт)."
-        : "";
-      alert(
-        `Подписка #${res.subscription_id} переведена на свободный сервер: ` +
-          `${res.old_node_name} → ${res.new_node_name}. Таск #${res.provisioning_task_id ?? "—"} — следи в Tasks.${banMsg}`,
-      );
-      qc.invalidateQueries({ queryKey: ["user-subs"] });
-      qc.invalidateQueries({ queryKey: ["provisioning-tasks"] });
-      qc.invalidateQueries({ queryKey: ["user-node-bans"] });
-    },
-    onError: (e: Error) => alert(`Не удалось обновить подписку: ${e.message}`),
-  });
-
   const switchExit = useMutation({
     mutationFn: ({ subId, exitId }: { subId: number; exitId: number }) =>
       api.post<SubscriptionSwitchExitOut>(
@@ -373,73 +210,6 @@ export default function Users() {
       qc.invalidateQueries({ queryKey: ["relay-links"] });
     },
     onError: (e: Error) => alert(`Не удалось сменить exit: ${e.message}`),
-  });
-
-  // Control-channel admin trigger — оператор имитирует сигнал клиента,
-  // backend select_target_node + migrate_subscription_to_new_node.
-  // Используется когда юзер написал в саппорт через 2й канал (e-mail,
-  // друг с работающим VPN), и его нужно срочно переселить на healthy
-  // ноду без custom-клиента (Phase B).
-  const reportFailure = useMutation({
-    mutationFn: (subId: number) =>
-      adminReportFailureForSubscription({
-        subscription_id: subId,
-        kind: "user_reported",
-      }),
-    onSuccess: (res) => {
-      const detail =
-        res.action === "migrated"
-          ? `Подписка #${res.subscription_id} переведена на ноду #${res.target_node_id} (${res.target_node_name}). Таск #${res.task_id ?? "—"} — следи в /tasks.`
-          : res.action === "throttled"
-            ? `Уже мигрировали #${res.subscription_id} в последние 5 мин — подожди ${res.retry_after_sec}s.`
-            : res.action === "no_target_available"
-              ? `❌ Нет healthy target ноды для #${res.subscription_id}. Проверь /admin/nodes — все active/unmuted?`
-              : res.action === "subscription_inactive"
-                ? `Подписка #${res.subscription_id} не active — нечего мигрировать.`
-                : `action=${res.action} (retry через ${res.retry_after_sec}s)`;
-      alert(detail);
-      qc.invalidateQueries({ queryKey: ["user-subs"] });
-      qc.invalidateQueries({ queryKey: ["provisioning-tasks"] });
-    },
-    onError: (e: Error) =>
-      alert(`Не удалось имитировать сигнал: ${e.message}`),
-  });
-
-  const migrateDevice = useMutation({
-    mutationFn: ({
-      deviceId,
-      targetNodeId,
-    }: {
-      deviceId: number;
-      targetNodeId: number;
-    }) =>
-      api.post<DeviceMigrateOut>(`/devices/${deviceId}/migrate`, {
-        target_node_id: targetNodeId,
-      }),
-    onSuccess: (res) => {
-      alert(
-        `Device #${res.old_device_id} → #${res.device_id}: ${res.old_node_name} → ${res.new_node_name}. Таск провиженинга #${res.provisioning_task_id ?? "—"} в фоне.`,
-      );
-      qc.invalidateQueries({ queryKey: ["user-subs"] });
-      qc.invalidateQueries({ queryKey: ["provisioning-tasks"] });
-    },
-    onError: (e: Error) => alert(`Не удалось переселить устройство: ${e.message}`),
-  });
-
-  const switchDeviceExit = useMutation({
-    mutationFn: ({ deviceId, exitId }: { deviceId: number; exitId: number }) =>
-      api.post<DeviceSwitchExitOut>(`/devices/${deviceId}/switch-exit`, {
-        exit_id: exitId,
-      }),
-    onSuccess: (res) => {
-      alert(
-        `Device #${res.device_id} переключён на exit #${res.new_exit_id} (${res.new_interface}). Запущено таск: ${res.task_ids.length}.`,
-      );
-      qc.invalidateQueries({ queryKey: ["user-subs"] });
-      qc.invalidateQueries({ queryKey: ["provisioning-tasks"] });
-      qc.invalidateQueries({ queryKey: ["relay-links"] });
-    },
-    onError: (e: Error) => alert(`Не удалось сменить exit устройства: ${e.message}`),
   });
 
   const batchBan = useMutation({
@@ -471,10 +241,14 @@ export default function Users() {
   const singleBan = useMutation({
     mutationFn: ({ id, action }: { id: number; action: "ban" | "unban" }) =>
       batchBanUsers([id], action),
-    onSuccess: () => {
-      // banned_at в сайдбаре подтянется из refetch списка (derive selected).
-      // На вкладке «Активные» забаненный юзер выпадет из списка и сайдбар
-      // закроется — это ожидаемо и отражает реальное состояние.
+    onSuccess: (res) => {
+      const id = res.done[0];
+      if (id !== undefined && selected && selected.id === id) {
+        setSelected({
+          ...selected,
+          banned_at: res.action === "ban" ? new Date().toISOString() : null,
+        });
+      }
       qc.invalidateQueries({ queryKey: ["users"] });
     },
     onError: (e: Error) => alert(`Не удалось изменить статус бана: ${e.message}`),
@@ -576,152 +350,6 @@ export default function Users() {
     qc.invalidateQueries({ queryKey: ["users"] });
   };
 
-  // Both bulk-subscription ops fire ansible per device and the backend
-  // caps user_ids at 25/request (ansible backlog safety — see the 2026
-  // incidents). Chunk the selection the same way runBatchBan does. One
-  // shared `bulkBusy` flag disables both buttons while either runs so the
-  // operator can't double-fire a heavy provisioning wave.
-  const BULK_SUBS_CHUNK = 25;
-  const [bulkBusy, setBulkBusy] = useState(false);
-  // Слать ли Telegram-нудж «возьми новую ссылку» при bulk-регенерации.
-  // Дефолт OFF — массовая регенерация почти всегда операционная (старая
-  // ссылка живёт), спамить юзеров не надо. Галкой включаешь для честного
-  // «выдать новый линк».
-  const [notifyOnRegen, setNotifyOnRegen] = useState(false);
-
-  const runBulkRegenerate = async (ids: number[], notify: boolean) => {
-    setBulkBusy(true);
-    let done = 0,
-      skipped = 0,
-      notFound = 0,
-      failed = 0,
-      notified = 0,
-      subs = 0,
-      devices = 0;
-    try {
-      for (let i = 0; i < ids.length; i += BULK_SUBS_CHUNK) {
-        const res = await bulkRegenerateSublink(
-          ids.slice(i, i + BULK_SUBS_CHUNK),
-          notify,
-        );
-        done += res.done.length;
-        skipped += res.skipped.length;
-        notFound += res.not_found.length;
-        failed += res.failed.length;
-        notified += res.notified.length;
-        subs += res.subscriptions_regenerated;
-        devices += res.devices_created;
-      }
-    } catch (e) {
-      alert(
-        `Перегенерация упала на чанке: ${e instanceof Error ? e.message : String(e)}.\n\n` +
-          `Успешно до падения: юзеров ${done}, подписок ${subs}.`,
-      );
-      setBulkBusy(false);
-      qc.invalidateQueries({ queryKey: ["user-subs"] });
-      qc.invalidateQueries({ queryKey: ["provisioning-tasks"] });
-      return;
-    }
-    alert(
-      `Перегенерация sub-link готова.\n` +
-        `Юзеров обновлено: ${done}` +
-        (skipped ? `, без активных подписок: ${skipped}` : "") +
-        (notFound ? `, не найдено: ${notFound}` : "") +
-        (failed ? `, ошибок по подпискам: ${failed}` : "") +
-        `.\nПодписок: ${subs}, новых устройств: ${devices}, уведомлено в Telegram: ${notified}.\n\n` +
-        `Провижининг идёт в фоне — следи в Tasks. Старые ссылки остаются живыми до перехода.`,
-    );
-    setSelectedIds(new Set());
-    setBulkBusy(false);
-    qc.invalidateQueries({ queryKey: ["users"] });
-    qc.invalidateQueries({ queryKey: ["user-subs"] });
-    qc.invalidateQueries({ queryKey: ["provisioning-tasks"] });
-  };
-
-  const runBulkMigrate = async (ids: number[]) => {
-    setBulkBusy(true);
-    let done = 0,
-      skipped = 0,
-      notFound = 0,
-      failed = 0,
-      subs = 0;
-    try {
-      for (let i = 0; i < ids.length; i += BULK_SUBS_CHUNK) {
-        const res = await bulkMigrateAuto(ids.slice(i, i + BULK_SUBS_CHUNK));
-        done += res.done.length;
-        skipped += res.skipped.length;
-        notFound += res.not_found.length;
-        failed += res.failed.length;
-        subs += res.subscriptions_migrated;
-      }
-    } catch (e) {
-      alert(
-        `Переезд упал на чанке: ${e instanceof Error ? e.message : String(e)}.\n\n` +
-          `Успешно до падения: юзеров ${done}, подписок ${subs}.`,
-      );
-      setBulkBusy(false);
-      qc.invalidateQueries({ queryKey: ["provisioning-tasks"] });
-      return;
-    }
-    alert(
-      `Массовый переезд запущен.\n` +
-        `Юзеров: ${done}` +
-        (skipped ? `, без активных подписок: ${skipped}` : "") +
-        (notFound ? `, не найдено: ${notFound}` : "") +
-        (failed ? `, ошибок (нет свободной ноды и т.п.): ${failed}` : "") +
-        `.\nПодписок переезжает: ${subs}. Старые ноды забанены для этих юзеров.\n\n` +
-        `Провижининг в фоне — следи в Tasks.`,
-    );
-    setSelectedIds(new Set());
-    setBulkBusy(false);
-    qc.invalidateQueries({ queryKey: ["users"] });
-    qc.invalidateQueries({ queryKey: ["user-subs"] });
-    qc.invalidateQueries({ queryKey: ["provisioning-tasks"] });
-    qc.invalidateQueries({ queryKey: ["user-node-bans"] });
-  };
-
-  // Тихая пересборка config_text из текущего VPNConfig: без ротации
-  // токена, нового устройства, ansible и пуша. Под починку вшитых URI
-  // после правки конфигов (xhttp sni/port и т.п.).
-  const runBulkRebuild = async (ids: number[]) => {
-    setBulkBusy(true);
-    let done = 0,
-      skipped = 0,
-      notFound = 0,
-      failed = 0,
-      creds = 0;
-    try {
-      for (let i = 0; i < ids.length; i += BULK_SUBS_CHUNK) {
-        const res = await bulkRebuildConfig(ids.slice(i, i + BULK_SUBS_CHUNK));
-        done += res.done.length;
-        skipped += res.skipped.length;
-        notFound += res.not_found.length;
-        failed += res.failed.length;
-        creds += res.credentials_rebuilt;
-      }
-    } catch (e) {
-      alert(
-        `Пересборка упала на чанке: ${e instanceof Error ? e.message : String(e)}.\n\n` +
-          `Успешно до падения: юзеров ${done}.`,
-      );
-      setBulkBusy(false);
-      qc.invalidateQueries({ queryKey: ["user-subs"] });
-      return;
-    }
-    alert(
-      `Пересборка config_text готова (тихо, без пуша).\n` +
-        `Юзеров: ${done}` +
-        (skipped ? `, без активных подписок: ${skipped}` : "") +
-        (notFound ? `, не найдено: ${notFound}` : "") +
-        (failed ? `, ошибок по подпискам: ${failed}` : "") +
-        `.\nПересобрано кредов: ${creds}. Клиенты подтянут исправленный URI на следующем рефреше сабки (sub_token не менялся).`,
-    );
-    setSelectedIds(new Set());
-    setBulkBusy(false);
-    qc.invalidateQueries({ queryKey: ["users"] });
-    qc.invalidateQueries({ queryKey: ["user-subs"] });
-  };
-
   return (
     <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
       <div className="lg:col-span-2">
@@ -762,79 +390,6 @@ export default function Users() {
                 className="text-xs px-2 py-1 rounded bg-emerald-700 hover:bg-emerald-600 disabled:opacity-50"
               >
                 unban all
-              </button>
-              <span className="w-px h-4 bg-slate-600" />
-              <label
-                className="flex items-center gap-1 text-[11px] text-slate-400 select-none"
-                title="Слать ли юзерам Telegram «возьми новую ссылку» при регенерации"
-              >
-                <input
-                  type="checkbox"
-                  checked={notifyOnRegen}
-                  onChange={(e) => setNotifyOnRegen(e.target.checked)}
-                  disabled={bulkBusy}
-                />
-                уведомить
-              </label>
-              <button
-                disabled={bulkBusy}
-                onClick={() => {
-                  if (
-                    confirm(
-                      `Перегенерировать sub-link для ${selArr.length} юзер(ов)?\n\n` +
-                        `Каждому активному устройству выдаётся НОВАЯ ссылка (появится в ЛК), ` +
-                        `старая остаётся рабочей до перехода.\n` +
-                        (notifyOnRegen
-                          ? `Юзерам УЙДЁТ Telegram: «возьми новую ссылку в ЛК».\n`
-                          : `Telegram-уведомление НЕ шлётся (галка «уведомить» снята).\n`) +
-                        `\nЭто НЕ переезд на другой сервер. sub_token сменится, стоимость НЕ изменится.\n` +
-                        `Идёт ansible-провижининг — для больших пачек подними воркеры (scripts/workers.sh).`,
-                    )
-                  )
-                    runBulkRegenerate(selArr, notifyOnRegen);
-                }}
-                title="Новая ссылка в ЛК (+ Telegram по галке «уведомить»), старая ссылка остаётся живой. sub_token меняется, сервер тот же, цена та же."
-                className="text-xs px-2 py-1 rounded bg-indigo-700 hover:bg-indigo-600 disabled:opacity-50"
-              >
-                {bulkBusy ? "…" : "🔁 регенерация sub-link"}
-              </button>
-              <button
-                disabled={bulkBusy}
-                onClick={() => {
-                  if (
-                    confirm(
-                      `Переселить ${selArr.length} юзер(ов) на свободные серверы?\n\n` +
-                        `Каждая активная подписка авто-переезжает на свободную здоровую ноду, ` +
-                        `старая нода банится для юзера. sub_token СОХРАНЯЕТСЯ — ссылка та же, меняется только сервер.\n\n` +
-                        `Это НЕ регенерация ссылки. Тяжёлый ansible (revoke+apply на каждое устройство) — ` +
-                        `подними воркеры (scripts/workers.sh) перед большой пачкой.`,
-                    )
-                  )
-                    runBulkMigrate(selArr);
-                }}
-                title="bulk-версия карточной «обновить подписку»: авто-выбор свободной ноды + бан старой. sub_token сохраняется, уведомления нет."
-                className="text-xs px-2 py-1 rounded bg-sky-700 hover:bg-sky-600 disabled:opacity-50"
-              >
-                {bulkBusy ? "…" : "🚚 переезд на сервер"}
-              </button>
-              <button
-                disabled={bulkBusy}
-                onClick={() => {
-                  if (
-                    confirm(
-                      `Пересобрать config_text для ${selArr.length} юзер(ов)?\n\n` +
-                        `ТИХО пересобирает вшитые ссылки из ТЕКУЩЕГО VPNConfig — ` +
-                        `без смены sub_token, нового устройства, ansible и пуша. ` +
-                        `Клиент сам подтянет исправленный URI на рефреше сабки.\n\n` +
-                        `Под починку конфигов (напр. xhttp sni/port после правок в БД). Безопасно.`,
-                    )
-                  )
-                    runBulkRebuild(selArr);
-                }}
-                title="Тихо пересобрать config_text из текущего VPNConfig: без токена/ansible/пуша. Под починку вшитых URI."
-                className="text-xs px-2 py-1 rounded bg-teal-700 hover:bg-teal-600 disabled:opacity-50"
-              >
-                {bulkBusy ? "…" : "🧩 пересобрать конфиг"}
               </button>
             </div>
           )}
@@ -892,14 +447,6 @@ export default function Users() {
         </div>
         {isLoading ? (
           <div>Загрузка…</div>
-        ) : isError ? (
-          // Сетевой сбой /users показываем в том же слоте, где рендерился
-          // «Загрузка…», а не пустой таблицей — иначе «Загружено: 0» неотличимо
-          // от реального отсутствия юзеров. Кнопку повтора не добавляем:
-          // react-query сам перезапросит при фокусе окна / восстановлении сети.
-          <div className="text-red-400 text-sm">
-            Не удалось загрузить список пользователей: {errText(error)}
-          </div>
         ) : (
           <>
             <table className="w-full text-sm">
@@ -934,7 +481,6 @@ export default function Users() {
                   <th>Telegram</th>
                   <th>Email</th>
                   <th>Subs</th>
-                  <th title="Был ли трафик юзера за последние 24 часа">24ч</th>
                   <th>Баланс</th>
                   <th>Создан</th>
                 </tr>
@@ -943,7 +489,7 @@ export default function Users() {
                 {users.map((u, idx) => (
                   <tr
                     key={u.id}
-                    onClick={() => setSelectedId(u.id)}
+                    onClick={() => setSelected(u)}
                     className={`cursor-pointer border-b border-slate-800 hover:bg-slate-800 ${
                       selected?.id === u.id ? "bg-slate-800" : ""
                     } ${selectedIds.has(u.id) ? "bg-blue-950/30" : ""} ${
@@ -977,12 +523,6 @@ export default function Users() {
                     </td>
                     <td>{u.email ?? "—"}</td>
                     <td>{u.subscription_count}</td>
-                    <td className="whitespace-nowrap">
-                      <ActivityDot lastActiveAt={u.last_active_at} />
-                      <span className="ml-1.5 text-[11px] text-slate-400 align-middle">
-                        {lastSeenLabel(u.last_active_at)}
-                      </span>
-                    </td>
                     <td>{(u.balance_kopecks / 100).toFixed(2)} ₽</td>
                     <td>
                       {new Date(u.created_at).toLocaleString("ru-RU", {
@@ -1004,13 +544,6 @@ export default function Users() {
                 >
                   {isFetchingNextPage ? "Загружаем…" : "Загрузить ещё"}
                 </button>
-              )}
-              {/* Ошибку подгрузки следующей страницы раньше проглатывали молча —
-                  показываем её рядом с кнопкой (повторный клик перезапросит). */}
-              {isFetchNextPageError && (
-                <span className="text-red-400">
-                  не удалось подгрузить — нажми «Загрузить ещё» ещё раз
-                </span>
               )}
             </div>
           </>
@@ -1125,74 +658,10 @@ export default function Users() {
             </div>
 
             <div className="pt-2 border-t border-slate-700">
-              <div className="font-semibold mb-1">
-                Восстановить orphan-подписку
-              </div>
-              <div className="text-xs text-slate-400 mb-2">
-                Передаёт подписку, висящую на placeholder-юзере{" "}
-                <span className="font-mono">999999</span>, текущему
-                выбранному юзеру. Подключение в Hiddify не прерывается —
-                UUID на ноде не меняется. Подробнее: docs/operations/
-                admin_claim_orphans.md.
-              </div>
-              <div className="space-y-2">
-                <textarea
-                  placeholder="UUID или vless://… ссылка от юзера"
-                  rows={2}
-                  value={claimInput}
-                  onChange={(e) => setClaimInput(e.target.value)}
-                  className="w-full px-2 py-1 rounded bg-slate-900 border border-slate-700 font-mono text-xs"
-                />
-                <input
-                  type="text"
-                  placeholder="Имя устройства (необязательно)"
-                  value={claimDeviceName}
-                  onChange={(e) => setClaimDeviceName(e.target.value)}
-                  maxLength={64}
-                  className="w-full px-2 py-1 rounded bg-slate-900 border border-slate-700"
-                />
-                <button
-                  disabled={claimOrphan.isPending || !claimInput.trim()}
-                  onClick={() => {
-                    const value = claimInput.trim();
-                    if (!value) return;
-                    if (
-                      !confirm(
-                        `Восстановить orphan-подписку юзеру #${selected.id}` +
-                          (selected.telegram_id
-                            ? ` (tg ${selected.telegram_id})`
-                            : "") +
-                          `?\n\nПодписка будет передана от placeholder-юзера 999999. Existing connection в Hiddify не прервётся — UUID на ноде тот же.`,
-                      )
-                    )
-                      return;
-                    claimOrphan.mutate({
-                      userId: selected.id,
-                      uuidOrUrl: value,
-                      deviceName: claimDeviceName.trim(),
-                    });
-                  }}
-                  className="w-full text-xs px-2 py-1 rounded bg-indigo-700 hover:bg-indigo-600 disabled:opacity-50"
-                >
-                  {claimOrphan.isPending
-                    ? "Восстанавливаем…"
-                    : "Восстановить"}
-                </button>
-              </div>
-            </div>
-
-            <div className="pt-2 border-t border-slate-700">
               <div className="font-semibold mb-1">Подписки</div>
-              {subsLoading ? (
+              {subs === undefined ? (
                 <div className="text-slate-400">Загрузка…</div>
-              ) : subsError ? (
-                // Ошибка загрузки деталей юзера — показываем текст в том же
-                // слоте, где висел «Загрузка…», размыкая вечный спиннер.
-                // react-query перезапросит при фокусе окна / reconnect.
-                <div className="text-red-400">
-                  Не удалось загрузить подписки: {errText(subsErrObj)}
-                </div>
-              ) : !subs || subs.length === 0 ? (
+              ) : subs.length === 0 ? (
                 <div className="text-slate-400">Нет активных</div>
               ) : (
                 <ul className="space-y-2">
@@ -1224,9 +693,6 @@ export default function Users() {
                         <DeviceList
                           devices={s.devices}
                           revokeDevice={revokeDevice}
-                          nodes={allNodes}
-                          migrateDevice={migrateDevice}
-                          switchDeviceExit={switchDeviceExit}
                         />
                       )}
                       <div className="mt-2 flex gap-2">
@@ -1243,7 +709,7 @@ export default function Users() {
                             }}
                             className="text-xs px-2 py-1 rounded bg-red-700 hover:bg-red-600 disabled:opacity-50"
                           >
-                            ⏸ Отключить
+                            revoke now
                           </button>
                         )}
                         {s.status === "active" && (
@@ -1262,53 +728,20 @@ export default function Users() {
                             + add device
                           </button>
                         )}
-                        {s.status === "active" && (
-                          <button
-                            disabled={reportFailure.isPending}
-                            onClick={() => reportFailure.mutate(s.id)}
-                            title="Имитирует client report failure: backend выберет healthy target ноду и перенесёт подписку. Используй когда юзер написал через 2й канал что VPN сломан и нет custom-клиента чтобы сигнал прислать."
-                            className="text-xs px-2 py-1 rounded bg-orange-700 hover:bg-orange-600 disabled:opacity-50"
-                          >
-                            {reportFailure.isPending
-                              ? "…"
-                              : "🚨 report failure"}
-                          </button>
-                        )}
-                        {s.status === "active" && (
-                          <button
-                            disabled={migrateAuto.isPending}
-                            onClick={() => {
-                              if (
-                                confirm(
-                                  `Обновить подписку #${s.id}?\n\nBackend выберет свободный сервер из пула (исключая текущий и ноды из бан-листа юзера), мигрирует подписку (sub_token сохранится) и забанит старую ноду для этого юзера.`
-                                )
-                              )
-                                migrateAuto.mutate(s.id);
-                            }}
-                            title="Авто-выбор свободного сервера из пула + миграция + авто-бан старой ноды. В будущем — кнопка в ЛК юзера."
-                            className="text-xs px-2 py-1 rounded bg-sky-700 hover:bg-sky-600 disabled:opacity-50"
-                          >
-                            {migrateAuto.isPending ? "…" : "🔄 обновить подписку"}
-                          </button>
-                        )}
                         {s.status !== "active" && (
                           <button
                             disabled={enableSub.isPending}
                             onClick={() => {
                               if (
                                 confirm(
-                                  `Реактивировать подписку #${s.id} (сейчас ${s.status})?\n\n` +
-                                    `Статус → active, перепровижн одного девайса через Ansible. ` +
-                                    `frozen разморозится с сохранением токена и годового бюджета. ` +
-                                    `Если срок истёк (expired) — продлится на срок плана.`
+                                  `Включить подписку #${s.id}?\n\nБудет перепровижнен один девайс через Ansible.`
                                 )
                               )
                                 enableSub.mutate(s.id);
                             }}
-                            title="Вернуть подписку в active: expired/blocked → active+reprovision (expired продлевается на срок плана), frozen → unfreeze."
                             className="text-xs px-2 py-1 rounded bg-emerald-700 hover:bg-emerald-600 disabled:opacity-50"
                           >
-                            {enableSub.isPending ? "…" : "✅ Реактивировать"}
+                            enable
                           </button>
                         )}
                         {s.sharing_blocked && (
@@ -1346,8 +779,6 @@ export default function Users() {
                 </ul>
               )}
             </div>
-
-            <UserNodeBans userId={selected.id} />
           </div>
         )}
       </aside>
@@ -1355,373 +786,12 @@ export default function Users() {
   );
 }
 
-function DeviceCard({
-  d,
-  revokeDevice,
-  nodes,
-  migrateDevice,
-  switchDeviceExit,
-}: {
-  d: DeviceOut;
-  revokeDevice: { mutate: (id: number) => void; isPending: boolean };
-  nodes: VPNNodeOut[] | undefined;
-  migrateDevice: {
-    mutate: (args: { deviceId: number; targetNodeId: number }) => void;
-    isPending: boolean;
-  };
-  switchDeviceExit: {
-    mutate: (args: { deviceId: number; exitId: number }) => void;
-    isPending: boolean;
-  };
-}) {
-  const [copied, setCopied] = useState(false);
-  const uri = d.connection_uri ?? "";
-  const exitLabel = d.exit_name
-    ? `${d.exit_name}${d.exit_id ? ` (#${d.exit_id})` : ""}`
-    : d.exit_id
-      ? `#${d.exit_id}`
-      : null;
-  const isLive = d.status !== "revoked" && d.status !== "disabled";
-
-  async function copyUri() {
-    if (!uri) return;
-    try {
-      await navigator.clipboard.writeText(uri);
-    } catch {
-      const ta = document.createElement("textarea");
-      ta.value = uri;
-      document.body.appendChild(ta);
-      ta.select();
-      try {
-        document.execCommand("copy");
-      } catch {
-        /* empty */
-      }
-      document.body.removeChild(ta);
-    }
-    setCopied(true);
-    setTimeout(() => setCopied(false), 1500);
-  }
-
-  return (
-    <div className="bg-slate-800 rounded px-2 py-1.5 text-xs space-y-1">
-      <div className="flex items-center justify-between gap-2">
-        <span className="truncate">
-          #{d.id}
-          {d.name ? ` · ${d.name}` : ""} · {d.status}{d.status !== "revoked" && d.status !== "disabled" && (
-            <span className="text-slate-400"> · онлайн: {lastSeenLabel(d.last_seen_at)}</span>
-          )}
-          {d.is_relay && (
-            <span className="ml-1 px-1 rounded bg-red-900/60 text-red-300">
-              relay
-            </span>
-          )}
-        </span>
-        <button
-          disabled={revokeDevice.isPending}
-          onClick={() => {
-            if (
-              confirm(
-                `Отвязать девайс #${d.id}?\n\nЮзер будет отключён от ноды через Ansible.`,
-              )
-            )
-              revokeDevice.mutate(d.id);
-          }}
-          className="text-xs px-2 py-0.5 rounded bg-red-800 hover:bg-red-700 disabled:opacity-50"
-        >
-          unbind
-        </button>
-      </div>
-      {(d.node_name || d.node_region || exitLabel) && (
-        <div className="text-slate-400 text-[11px]">
-          {d.node_name ?? "—"}
-          {d.node_region && ` · ${d.node_region}`}
-          {exitLabel && (
-            <>
-              {" → exit: "}
-              <span className="text-slate-300">{exitLabel}</span>
-            </>
-          )}
-        </div>
-      )}
-      {uri && (
-        <div className="flex items-center gap-1">
-          <code
-            className="flex-1 truncate font-mono text-[11px] text-slate-300 bg-slate-900/60 rounded px-1 py-0.5"
-            title={uri}
-          >
-            {uri}
-          </code>
-          <button
-            onClick={copyUri}
-            className="text-[11px] px-2 py-0.5 rounded bg-slate-700 hover:bg-slate-600"
-          >
-            {copied ? "✓" : "copy"}
-          </button>
-        </div>
-      )}
-      {isLive && (
-        <DeviceNodeSet
-          device={d}
-          nodes={nodes}
-          migrateDevice={migrateDevice}
-        />
-      )}
-      {isLive && d.is_relay && d.node_id != null && (
-        <SwitchDeviceExitControl
-          device={d}
-          mutation={switchDeviceExit}
-        />
-      )}
-    </div>
-  );
-}
-
-// Диверсная подписка (DIVERSE_SUB_NODES>1): набор RU-нод, на которых сидит
-// device, + per-node «↻ заменить». Однонодовый device (набор ≤1 или ещё
-// грузится) → показываем legacy-миграцию как было; для диверс-набора legacy
-// migrate запрещён на бэке (схлопнул бы набор в одну ноду), поэтому вместо
-// него — точечная замена одной ноды через swap_node_out.
-function DeviceNodeSet({
-  device,
-  nodes,
-  migrateDevice,
-}: {
-  device: DeviceOut;
-  nodes: VPNNodeOut[] | undefined;
-  migrateDevice: {
-    mutate: (args: { deviceId: number; targetNodeId: number }) => void;
-    isPending: boolean;
-  };
-}) {
-  const qc = useQueryClient();
-  const { data, isLoading } = useQuery<DeviceNodeSetOut>({
-    queryKey: ["device-nodes", device.id],
-    queryFn: () => getDeviceNodes(device.id),
-  });
-  const swap = useMutation({
-    mutationFn: (nodeId: number) => swapDeviceNode(device.id, nodeId),
-    onSuccess: (res) => {
-      alert(
-        `Нода #${res.removed_node_id} убрана из набора device #${res.device_id}. ` +
-          `Добрано свежих диверсных: ${res.added_nodes}. sub_token не менялся — ` +
-          `клиент подхватит на обновлении подписки.`,
-      );
-      qc.invalidateQueries({ queryKey: ["device-nodes", device.id] });
-      qc.invalidateQueries({ queryKey: ["user-subs"] });
-      qc.invalidateQueries({ queryKey: ["provisioning-tasks"] });
-    },
-    onError: (e: Error) => alert(`Не удалось заменить ноду: ${e.message}`),
-  });
-
-  const set = data?.nodes ?? [];
-  // Однонодовый девайс (или набор ещё грузится) → legacy «перевести на ноду».
-  if (isLoading || set.length <= 1) {
-    return (
-      <MigrateDeviceControl
-        device={device}
-        nodes={nodes}
-        mutation={migrateDevice}
-      />
-    );
-  }
-
-  // Диверс-набор (>1 ноды): список нод + точечная замена + прицельный переезд.
-  // С 2026-09-21 бэк переносит и диверс-девайс: primary-нода → выбранная
-  // (тёплый бандл), остальные ноды набора добираются заново случайно,
-  // sub_token сохраняется, основной лег в списке — на выбранной ноде.
-  return (
-    <div className="pt-1 border-t border-slate-700/60 space-y-1">
-      <MigrateDeviceControl
-        device={device}
-        nodes={nodes}
-        mutation={migrateDevice}
-        diverse
-      />
-      <div className="text-[11px] text-slate-400">
-        Ноды подписки ({set.length}):
-      </div>
-      {set.map((n: DeviceNodeOut) => (
-        <div
-          key={n.node_id}
-          className="flex items-center justify-between gap-2 bg-slate-900/50 rounded px-1.5 py-1"
-        >
-          <span className="truncate text-[11px]">
-            <span className="text-slate-300">{n.name ?? `#${n.node_id}`}</span>
-            {n.region && <span className="text-slate-500"> · {n.region}</span>}
-            {n.status && n.status !== "active" && (
-              <span className="ml-1 px-1 rounded bg-amber-900/60 text-amber-300">
-                {n.status}
-              </span>
-            )}
-            {n.protocols.length > 0 && (
-              <span className="text-slate-500"> · {n.protocols.join(", ")}</span>
-            )}
-          </span>
-          <button
-            disabled={swap.isPending}
-            onClick={() => {
-              if (
-                confirm(
-                  `Заменить ноду «${n.name ?? `#${n.node_id}`}» (#${n.node_id}) в наборе device #${device.id}?\n\n` +
-                    `Нода убирается из подписки, взамен добирается свежая диверсная ` +
-                    `(если есть тёплый запас на другом регионе). sub_token не меняется.`,
-                )
-              )
-                swap.mutate(n.node_id);
-            }}
-            className="shrink-0 text-[11px] px-2 py-0.5 rounded bg-slate-700 hover:bg-slate-600 disabled:opacity-50"
-            title="Убрать эту ноду и добрать свежую взамен"
-          >
-            ↻ заменить
-          </button>
-        </div>
-      ))}
-    </div>
-  );
-}
-
-// Per-device "move to specific node" control. Unlike MigrateSubControl,
-// this keeps sub.node_id in place — the sub becomes split across nodes.
-// Confirmation copy warns the admin that pool/health/cooldown bypass
-// the same way as the sub-level override.
-function MigrateDeviceControl({
-  device,
-  nodes,
-  mutation,
-  diverse = false,
-}: {
-  device: DeviceOut;
-  nodes: VPNNodeOut[] | undefined;
-  mutation: {
-    mutate: (args: { deviceId: number; targetNodeId: number }) => void;
-    isPending: boolean;
-  };
-  // Диверс-девайс (>1 ноды): бэк едет тёплым путём — primary на выбранную
-  // ноду, остальные ноды набора добираются заново случайно, sub_token
-  // сохраняется, основной лег в списке — на выбранной ноде.
-  diverse?: boolean;
-}) {
-  const [targetId, setTargetId] = useState<string>("");
-  const candidates = (nodes ?? []).filter(
-    (n) => n.is_active && n.id !== device.node_id,
-  );
-  if (candidates.length === 0) return null;
-  const target = candidates.find((n) => String(n.id) === targetId);
-  return (
-    <div className="flex gap-1 items-center">
-      <select
-        value={targetId}
-        onChange={(e) => setTargetId(e.target.value)}
-        className="text-[11px] px-1 py-0.5 rounded bg-slate-800 border border-slate-700 flex-1"
-      >
-        <option value="">— переселить на ноду —</option>
-        {candidates.map((n) => (
-          <option key={n.id} value={String(n.id)}>
-            #{n.id} {n.name} ({n.region})
-          </option>
-        ))}
-      </select>
-      <button
-        disabled={mutation.isPending || !target}
-        onClick={() => {
-          if (!target) return;
-          if (
-            confirm(
-              `Перевести устройство #${device.id} с ноды «${device.node_name ?? "—"}» на «${target.name}» (#${target.id}, ${target.region})?\n\n` +
-                (diverse
-                  ? `Основной сервер станет «${target.name}», остальные ноды набора доберутся заново случайно. sub_token сохраняется, клиенту достаточно обновить подписку. Нужен тёплый бандл на целевой ноде — если его нет, бэк откажет, повтори через пару минут.`
-                  : `Остальные устройства подписки остаются на текущей ноде. Пул/health/cooldown НЕ проверяются — ручной override. Если на целевой ноде есть тёплый бандл — переезд мгновенный; иначе старое устройство revoke'нется в фоне, новое поднимется через ansible.`),
-            )
-          )
-            mutation.mutate({
-              deviceId: device.id,
-              targetNodeId: target.id,
-            });
-        }}
-        className="text-[11px] px-2 py-0.5 rounded bg-blue-700 hover:bg-blue-600 disabled:opacity-50"
-      >
-        migrate
-      </button>
-    </div>
-  );
-}
-
-// Per-device exit switch for devices on multi-link relays. Обновляет
-// Credential.exit_id только у кредов этого device'а — соседи по
-// подписке остаются на своём exit'е. Видно только когда links≥2.
-function SwitchDeviceExitControl({
-  device,
-  mutation,
-}: {
-  device: DeviceOut;
-  mutation: {
-    mutate: (args: { deviceId: number; exitId: number }) => void;
-    isPending: boolean;
-  };
-}) {
-  const [targetId, setTargetId] = useState<string>("");
-  const { data: links } = useQuery<NodeRelayLinkOut[]>({
-    queryKey: ["relay-links", device.node_id],
-    queryFn: () => api.get(`/nodes/${device.node_id}/links`),
-    enabled: device.node_id != null,
-  });
-  if (!links || links.length < 2) return null;
-  const candidates = links.filter((l) => l.exit_id !== device.exit_id);
-  if (candidates.length === 0) return null;
-  const target = candidates.find((l) => String(l.exit_id) === targetId);
-  return (
-    <div className="flex gap-1 items-center">
-      <select
-        value={targetId}
-        onChange={(e) => setTargetId(e.target.value)}
-        className="text-[11px] px-1 py-0.5 rounded bg-slate-800 border border-slate-700 flex-1"
-      >
-        <option value="">— сменить exit —</option>
-        {candidates.map((l) => (
-          <option key={l.exit_id} value={String(l.exit_id)}>
-            #{l.exit_id} {l.exit_name ?? ""} ({l.wg_interface_name})
-          </option>
-        ))}
-      </select>
-      <button
-        disabled={mutation.isPending || !target}
-        onClick={() => {
-          if (!target) return;
-          if (
-            confirm(
-              `Переключить устройство #${device.id} с exit #${device.exit_id ?? "—"} на exit #${target.exit_id} (${target.wg_interface_name})?\n\n` +
-                `Остальные устройства подписки не трогаются. reconcile_xray на relay'е сам переместит email в новый direct-wgN. sub_token не меняется.`,
-            )
-          )
-            mutation.mutate({ deviceId: device.id, exitId: target.exit_id });
-        }}
-        className="text-[11px] px-2 py-0.5 rounded bg-purple-700 hover:bg-purple-600 disabled:opacity-50"
-      >
-        switch exit
-      </button>
-    </div>
-  );
-}
-
 function DeviceList({
   devices,
   revokeDevice,
-  nodes,
-  migrateDevice,
-  switchDeviceExit,
 }: {
   devices: DeviceOut[];
   revokeDevice: { mutate: (id: number) => void; isPending: boolean };
-  nodes: VPNNodeOut[] | undefined;
-  migrateDevice: {
-    mutate: (args: { deviceId: number; targetNodeId: number }) => void;
-    isPending: boolean;
-  };
-  switchDeviceExit: {
-    mutate: (args: { deviceId: number; exitId: number }) => void;
-    isPending: boolean;
-  };
 }) {
   const [showDead, setShowDead] = useState(false);
   const live = devices.filter(
@@ -1734,14 +804,28 @@ function DeviceList({
   return (
     <div className="mt-2 space-y-1">
       {live.map((d) => (
-        <DeviceCard
+        <div
           key={d.id}
-          d={d}
-          revokeDevice={revokeDevice}
-          nodes={nodes}
-          migrateDevice={migrateDevice}
-          switchDeviceExit={switchDeviceExit}
-        />
+          className="flex items-center justify-between gap-2 bg-slate-800 rounded px-2 py-1 text-xs"
+        >
+          <span className="truncate">
+            #{d.id} · {d.status}
+          </span>
+          <button
+            disabled={revokeDevice.isPending}
+            onClick={() => {
+              if (
+                confirm(
+                  `Отвязать девайс #${d.id}?\n\nЮзер будет отключён от ноды через Ansible.`,
+                )
+              )
+                revokeDevice.mutate(d.id);
+            }}
+            className="text-xs px-2 py-0.5 rounded bg-red-800 hover:bg-red-700 disabled:opacity-50"
+          >
+            unbind
+          </button>
+        </div>
       ))}
       {dead.length > 0 && (
         <>
@@ -1758,10 +842,7 @@ function DeviceList({
                 className="flex items-center gap-2 bg-slate-900/60 rounded px-2 py-1 text-xs text-slate-500"
               >
                 <span className="truncate">
-                  #{d.id}
-                  {d.name ? ` · ${d.name}` : ""} · {d.status}{d.status !== "revoked" && d.status !== "disabled" && (
-            <span className="text-slate-400"> · онлайн: {lastSeenLabel(d.last_seen_at)}</span>
-          )}
+                  #{d.id} · {d.status}
                 </span>
               </div>
             ))}
@@ -1777,71 +858,6 @@ function DeviceList({
 // migrate_subscription_to_new_node) — админ осознанно берёт
 // ответственность. Мы всё равно прячем ноды с is_active=false из
 // дропдауна, чтобы не собирать 400 на пустом месте.
-// Бан-лист нод юзера: ноды, на которые авто-выбор («обновить подписку»)
-// его не селит. Заполняется авто-баном при миграции + ручным баном.
-// Здесь — просмотр + разбан (снять, чтобы авто-выбор снова мог вернуть).
-function UserNodeBans({ userId }: { userId: number }) {
-  const qc = useQueryClient();
-  const bans = useQuery<NodeUserBanOut[]>({
-    queryKey: ["user-node-bans", userId],
-    queryFn: () => listUserNodeBans(userId),
-  });
-  const unban = useMutation({
-    mutationFn: (nodeId: number) => removeUserNodeBan(userId, nodeId),
-    onSuccess: () => {
-      qc.invalidateQueries({ queryKey: ["user-node-bans", userId] });
-    },
-    onError: (e: Error) => alert(`Не удалось снять бан: ${e.message}`),
-  });
-  return (
-    <div className="pt-2 border-t border-slate-700">
-      <div className="font-semibold mb-1">
-        Бан-лист нод{" "}
-        <span className="text-slate-500 text-xs font-normal">
-          (авто-выбор сюда не селит)
-        </span>
-      </div>
-      {bans.isLoading && (
-        <div className="text-slate-400 text-xs">Загрузка…</div>
-      )}
-      {bans.data && bans.data.length === 0 && (
-        <div className="text-slate-500 text-xs">Пусто.</div>
-      )}
-      {bans.data && bans.data.length > 0 && (
-        <ul className="space-y-1">
-          {bans.data.map((b) => (
-            <li
-              key={b.id}
-              className="flex items-center justify-between gap-2 text-xs bg-slate-900 rounded px-2 py-1"
-            >
-              <div className="min-w-0">
-                <span className="font-mono">
-                  #{b.node_id} {b.node_name ?? ""}
-                </span>
-                {b.reason && (
-                  <span
-                    className="text-slate-500 block truncate"
-                    title={b.reason}
-                  >
-                    {b.reason}
-                  </span>
-                )}
-              </div>
-              <button
-                disabled={unban.isPending}
-                onClick={() => unban.mutate(b.node_id)}
-                className="text-xs px-2 py-0.5 rounded bg-slate-700 hover:bg-slate-600 disabled:opacity-50 shrink-0"
-              >
-                разбан
-              </button>
-            </li>
-          ))}
-        </ul>
-      )}
-    </div>
-  );
-}
-
 function MigrateSubControl({
   sub,
   nodes,

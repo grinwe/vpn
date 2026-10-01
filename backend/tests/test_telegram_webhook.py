@@ -101,36 +101,14 @@ def test_valid_secret_passes_auth(client, _settings):
 # ── pre_checkout_query ──
 
 
-def test_pre_checkout_xtr_answers_ok(client, _settings, db_session):
-    # Аудит #2: pre_checkout подтверждается только для существующего
-    # pending-инвойса с совпадающей суммой. Валидный XTR-инвойс (amount
-    # уже в звёздах) → ok=True. Отклонения (нет инвойса / failed / не та
-    # сумма) покрыты в test_auditfix_telegram_webhook_py.py.
-    from app import models
-
-    from .factories import make_plan, make_user
-
-    user = make_user(db_session, telegram_id="tg-precheck-ok")
-    plan = make_plan(db_session, name="plan-precheck-ok")
-    invoice = models.Invoice(
-        user_id=user.id,
-        plan_id=plan.id,
-        amount=10,
-        currency="XTR",
-        status=models.InvoiceStatus.pending,
-        kind="subscription",
-    )
-    db_session.add(invoice)
-    db_session.commit()
-    db_session.refresh(invoice)
-
+def test_pre_checkout_xtr_answers_ok(client, _settings):
     update = {
         "update_id": 2,
         "pre_checkout_query": {
             "id": "pcq-123",
             "currency": "XTR",
             "total_amount": 10,
-            "invoice_payload": str(invoice.id),
+            "invoice_payload": "42",
         },
     }
     with patch("app.telegram_webhook._answer_pre_checkout_query") as ans:
@@ -140,7 +118,7 @@ def test_pre_checkout_xtr_answers_ok(client, _settings, db_session):
             headers={"X-Telegram-Bot-Api-Secret-Token": SECRET},
         )
     assert resp.status_code == 200
-    ans.assert_called_once_with(BOT_TOKEN, "pcq-123", ok=True, error_message=None)
+    ans.assert_called_once_with(BOT_TOKEN, "pcq-123", ok=True)
 
 
 def test_pre_checkout_non_xtr_rejects(client, _settings):

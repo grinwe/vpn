@@ -35,6 +35,7 @@ _LEGACY_TO_ALEMBIC = {
     "0001_initial": "0001_initial",
     "0002_health_and_cloud": "0002_health_and_cloud",
 }
+_ALEMBIC_HEAD = "0009_balance_billing"
 
 
 def _backfill_from_legacy(engine: Engine) -> None:
@@ -75,25 +76,19 @@ def _backfill_from_legacy(engine: Engine) -> None:
         conn.execute(text("INSERT INTO alembic_version (version_num) VALUES (:v)"), {"v": stamp})
 
 
-def _run_alembic_upgrade() -> str | None:
-    """Try to run ``alembic upgrade head``.
-
-    Returns the actual head revision that was applied (as reported by
-    Alembic itself) on success, or ``None`` if Alembic is unavailable and
-    the caller should fall back to the legacy runner.
-    """
+def _run_alembic_upgrade() -> bool:
+    """Try to run ``alembic upgrade head``. Returns True on success."""
     try:
         from alembic import command
         from alembic.config import Config
-        from alembic.script import ScriptDirectory
     except ImportError:
         logger.warning("Alembic not installed — falling back to legacy migration runner")
-        return None
+        return False
 
     ini_path = Path(__file__).resolve().parents[1] / "alembic.ini"
     if not ini_path.exists():
         logger.warning("alembic.ini not found at %s — using legacy runner", ini_path)
-        return None
+        return False
 
     cfg = Config(str(ini_path))
     # env.py reads DATABASE_URL directly; we set it here too for completeness.
@@ -104,10 +99,7 @@ def _run_alembic_upgrade() -> str | None:
         "script_location", str(ini_path.parent / "app" / "alembic")
     )
     command.upgrade(cfg, "head")
-    # Читаем фактическую голову из самого Alembic, чтобы лог не врал о версии
-    # (раньше здесь была захардкоженная константа, вечно отстающая от миграций).
-    head = ScriptDirectory.from_config(cfg).get_current_head()
-    return head or "unknown"
+    return True
 
 
 def _legacy_run() -> None:
@@ -129,9 +121,8 @@ def run_migrations() -> None:
     except Exception:  # noqa: BLE001
         logger.exception("Failed to backfill Alembic from legacy runner; continuing anyway")
 
-    head = _run_alembic_upgrade()
-    if head is not None:
-        logger.info("Alembic migrations applied up to %s", head)
+    if _run_alembic_upgrade():
+        logger.info("Alembic migrations applied up to %s", _ALEMBIC_HEAD)
         return
 
     logger.warning("Using legacy migration runner (no Alembic available)")

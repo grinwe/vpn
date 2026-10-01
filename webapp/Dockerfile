@@ -2,9 +2,6 @@
 
 # ---- build ----
 FROM node:20-alpine AS build
-# Версия выката (файл VERSION в корне репозитория) — запекается в бандл.
-ARG VITE_APP_VERSION=0.0.0-dev
-ENV VITE_APP_VERSION=${VITE_APP_VERSION}
 WORKDIR /app
 COPY package.json package-lock.json ./
 RUN npm ci --no-audit --no-fund

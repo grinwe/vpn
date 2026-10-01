@@ -16,8 +16,6 @@ purely the wiring on top.
 from alembic import op
 import sqlalchemy as sa
 
-from app.alembic._idempotent import has_column
-
 
 revision = "0009_balance_billing"
 down_revision = "0008_warmpool_and_balance"
@@ -43,38 +41,31 @@ def upgrade() -> None:
     # next_charge_at is nullable: legacy invoice-based subs leave it
     # NULL and the cron skips them. New balance subs get it set on
     # activate.
-    # has_column-guards: 0001 делает create_all() с текущей моделью где
-    # эти колонки уже есть. См. _idempotent.py.
-    if not has_column("subscriptions", "next_charge_at"):
-        op.add_column(
-            "subscriptions",
-            sa.Column("next_charge_at", sa.DateTime(), nullable=True),
-        )
-    if not has_column("subscriptions", "frozen_at"):
-        op.add_column(
-            "subscriptions",
-            sa.Column("frozen_at", sa.DateTime(), nullable=True),
-        )
-    if not has_column("subscriptions", "frozen_until"):
-        op.add_column(
-            "subscriptions",
-            sa.Column("frozen_until", sa.DateTime(), nullable=True),
-        )
-    if not has_column("subscriptions", "frozen_days_used"):
-        op.add_column(
-            "subscriptions",
-            sa.Column(
-                "frozen_days_used",
-                sa.Integer(),
-                nullable=False,
-                server_default="0",
-            ),
-        )
-    if not has_column("subscriptions", "frozen_year"):
-        op.add_column(
-            "subscriptions",
-            sa.Column("frozen_year", sa.Integer(), nullable=True),
-        )
+    op.add_column(
+        "subscriptions",
+        sa.Column("next_charge_at", sa.DateTime(), nullable=True),
+    )
+    op.add_column(
+        "subscriptions",
+        sa.Column("frozen_at", sa.DateTime(), nullable=True),
+    )
+    op.add_column(
+        "subscriptions",
+        sa.Column("frozen_until", sa.DateTime(), nullable=True),
+    )
+    op.add_column(
+        "subscriptions",
+        sa.Column(
+            "frozen_days_used",
+            sa.Integer(),
+            nullable=False,
+            server_default="0",
+        ),
+    )
+    op.add_column(
+        "subscriptions",
+        sa.Column("frozen_year", sa.Integer(), nullable=True),
+    )
 
     # Hot path index for the charge tick:
     #   SELECT ... WHERE status='active' AND next_charge_at <= now
@@ -98,16 +89,15 @@ def upgrade() -> None:
     # 'subscription' = legacy plan-purchase invoice (provisions a sub on
     # paid). 'topup' = balance topup (credits user wallet on paid).
     # Default keeps every existing row addressable as a legacy invoice.
-    if not has_column("invoices", "kind"):
-        op.add_column(
-            "invoices",
-            sa.Column(
-                "kind",
-                sa.String(),
-                nullable=False,
-                server_default="subscription",
-            ),
-        )
+    op.add_column(
+        "invoices",
+        sa.Column(
+            "kind",
+            sa.String(),
+            nullable=False,
+            server_default="subscription",
+        ),
+    )
 
     # Topup invoices have no plan_id by definition — relax the FK
     # NOT NULL so the same Invoice table can carry both kinds. The FK

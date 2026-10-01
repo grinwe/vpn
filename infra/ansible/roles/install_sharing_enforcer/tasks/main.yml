@@ -16,59 +16,56 @@
     path: /usr/local/bin/xray
   register: _xray_bin
 
+- name: Skip enforcer when xray is not installed
+  meta: end_role
+  when: not _xray_bin.stat.exists
+
 - name: Verify python3 is available
   command: python3 --version
   changed_when: false
   failed_when: false
   register: _py3_check
 
-# Раньше тут стоял `meta: end_role`, но он требует ansible-core >= 2.16
-# (введён в 2023-09). На control-машинах с 2.15-/2.14- падает с
-# `invalid meta action requested: end_role` до того, как доходит до
-# нужного нам отключающего systemd-таска. Заменили на block-with-when,
-# который понимают все версии и который даёт тот же эффект: на хостах
-# без xray/python3 деплой и systemd-управление просто пропускаются.
-- name: Deploy enforcer and manage service state
-  when:
-    - _xray_bin.stat.exists
-    - _py3_check.rc == 0
-  block:
-    - name: Deploy xray_enforcer.py
-      copy:
-        src: xray_enforcer.py
-        dest: /usr/local/bin/xray_enforcer.py
-        owner: root
-        group: root
-        mode: '0755'
-      notify: restart xray-enforcer
+- name: Skip enforcer when python3 is not available
+  meta: end_role
+  when: _py3_check.rc != 0
 
-    - name: Deploy xray-enforcer systemd unit
-      template:
-        src: xray-enforcer.service.j2
-        dest: /etc/systemd/system/xray-enforcer.service
-        owner: root
-        group: root
-        mode: '0644'
-      notify: restart xray-enforcer
+- name: Deploy xray_enforcer.py
+  copy:
+    src: xray_enforcer.py
+    dest: /usr/local/bin/xray_enforcer.py
+    owner: root
+    group: root
+    mode: '0755'
+  notify: restart xray-enforcer
 
-    # Soft-off switch. Set `sharing_enforcer_enabled: true` in group_vars
-    # (or per-host) when ready to re-enable. Default is off because the
-    # v2 enforcer was kicking legitimate users on small-fleet prod — see
-    # backend/app/services/traffic_stats.py for matching backend gate.
-    # Leaving the role wired (unit file + binary stay deployed) makes it
-    # a one-variable flip to re-enable without a full role re-run.
-    - name: Ensure xray-enforcer runs (enabled)
-      systemd:
-        name: xray-enforcer
-        enabled: true
-        state: started
-        daemon_reload: true
-      when: sharing_enforcer_enabled | default(false) | bool
+- name: Deploy xray-enforcer systemd unit
+  template:
+    src: xray-enforcer.service.j2
+    dest: /etc/systemd/system/xray-enforcer.service
+    owner: root
+    group: root
+    mode: '0644'
+  notify: restart xray-enforcer
 
-    - name: Ensure xray-enforcer is stopped (disabled)
-      systemd:
-        name: xray-enforcer
-        enabled: false
-        state: stopped
-        daemon_reload: true
-      when: not (sharing_enforcer_enabled | default(false) | bool)
+# Soft-off switch. Set `sharing_enforcer_enabled: true` in group_vars
+# (or per-host) when ready to re-enable. Default is off because the
+# v2 enforcer was kicking legitimate users on small-fleet prod — see
+# backend/app/services/traffic_stats.py for matching backend gate.
+# Leaving the role wired (unit file + binary stay deployed) makes it
+# a one-variable flip to re-enable without a full role re-run.
+- name: Ensure xray-enforcer runs (enabled)
+  systemd:
+    name: xray-enforcer
+    enabled: yes
+    state: started
+    daemon_reload: yes
+  when: sharing_enforcer_enabled | default(false) | bool
+
+- name: Ensure xray-enforcer is stopped (disabled)
+  systemd:
+    name: xray-enforcer
+    enabled: no
+    state: stopped
+    daemon_reload: yes
+  when: not (sharing_enforcer_enabled | default(false) | bool)

@@ -91,46 +91,6 @@ def list_cloud_providers(
     ]
 
 
-@router.get(
-    "/cloud/providers/{provider_id}/offerings",
-    response_model=schemas.ProviderOfferingsOut,
-)
-def provider_offerings(
-    provider_id: int,
-    db: Session = Depends(get_db),
-    admin_token: str = Depends(require_admin),
-):
-    """Datacenters / tariffs / OS-images провайдера для admin-формы заказа.
-    Делает live-запросы к API провайдера. Драйверы, не умеющие конкретный
-    список (capability-проверка через hasattr), отдают пустой список."""
-    from ..services.cloud.base import DriverError, get_driver
-
-    provider = db.get(models.CloudProvider, provider_id)
-    if not provider:
-        raise HTTPException(status_code=404, detail="Provider not found")
-    try:
-        driver = get_driver(provider)
-    except DriverError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-
-    def _safe(method: str) -> list[dict]:
-        fn = getattr(driver, method, None)
-        if not callable(fn):
-            return []
-        try:
-            return fn() or []
-        except DriverError as exc:
-            raise HTTPException(
-                status_code=502, detail=f"{provider.kind.value} {method}: {exc}"
-            ) from exc
-
-    return schemas.ProviderOfferingsOut(
-        datacenters=_safe("list_datacenters"),
-        plans=_safe("list_plans"),
-        images=_safe("list_images"),
-    )
-
-
 @router.patch("/cloud/providers/{provider_id}", response_model=schemas.CloudProviderOut)
 def update_cloud_provider(
     provider_id: int,

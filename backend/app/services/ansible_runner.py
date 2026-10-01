@@ -4,37 +4,12 @@ from __future__ import annotations
 import json
 import os
 import re
-import signal
 import subprocess
 import tempfile
-import threading
-import time
-from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
 from .. import models
-
-# Per-thread активный cancel_check: run_task ставит его вокруг _execute_task,
-# а run_playbook (которых в одном task'е до 9 штук) подхватывает как fallback,
-# если cancel_check не передан явно. Thread-local изолирует параллельные таски
-# (in-process-thread fallback) и forked RQ-джобы (отдельный процесс) — никакой
-# глобальный флаг не утечёт между задачами.
-_cancel_tls = threading.local()
-
-
-def set_active_cancel_check(fn: "Callable[[], bool] | None") -> None:
-    _cancel_tls.fn = fn
-
-
-class AnsibleCancelled(RuntimeError):
-    """Raised when run_playbook is SIGTERM'd mid-run via cancel_check.
-    Carries partial stdout/stderr so the Tasks UI shows the last progress."""
-
-    def __init__(self, msg: str, *, stdout: str = "", stderr: str = "") -> None:
-        super().__init__(msg)
-        self.stdout = stdout
-        self.stderr = stderr
 
 # Strict whitelists for values that get interpolated into the dynamically
 # rendered inventory YAML (see ``build_inventory_for_node``). Because that
@@ -152,57 +127,6 @@ def _ensure_ssh_control_path_dir() -> None:
     control_dir.mkdir(parents=True, exist_ok=True)
 
 
-def _apply_ansible_env_compat() -> None:
-    """Force connection-layer settings via env vars (ansible-core 2.19 compat).
-
-    Симптом: после rebuild mgmt (Dockerfile.worker подтянул ansible-core
-    2.19), per-task время на ансибл выросло x3-5. Диагностика показала
-    что cfg-файл сам **подхватывается** (config file = /app/infra/ansible/
-    ansible.cfg, видны DEFAULT_FORKS/DEFAULT_TIMEOUT/CACHE_PLUGIN_* из
-    cfg), но настройки из секции ``[ssh_connection]`` — pipelining,
-    ssh_args, retries — на дефолтах. То есть **именно эта секция** в
-    2.19 либо переименована, либо парсится строже и теряет ключи.
-
-    Env vars wins over cfg на всех версиях ansible (см. precedence в
-    ansible-core docs), поэтому форсим их здесь. ``setdefault`` — чтобы
-    оператор мог override'нуть через env.j2 без правки кода.
-
-    Без этого fix'а:
-      * pipelining=False → каждая task copy'ит python-модуль через scp →
-        +1-2s per task per host. На relay_tunnel_apply (~30 task'ов) =
-        +30-60s оверхеда **только на копирование модулей**.
-      * ssh_args отсутствуют → ControlMaster/ControlPersist не активны
-        → каждая task = свежий ssh-handshake (+1-2s) и
-        ServerAliveInterval/ConnectionAttempts не применяются → flaky-
-        канал дольше отваливается без retries.
-      * SSH_RETRIES=0 → одиночный network glitch = task fails вместо
-        retry.
-    """
-    defaults = {
-        "ANSIBLE_PIPELINING": "True",
-        "ANSIBLE_SSH_ARGS": (
-            "-o ControlMaster=auto"
-            " -o ControlPersist=10m"
-            " -o ControlPath=~/.ansible/cp/%h-%p-%r"
-            " -o ConnectTimeout=30"
-            " -o ConnectionAttempts=3"
-            " -o ServerAliveInterval=15"
-            " -o ServerAliveCountMax=3"
-            # Cloud-ноды переустанавливаются / переиспользуют IP → host-key
-            # меняется. host_key_checking=False (ansible.cfg) даёт
-            # StrictHostKeyChecking=no, но OpenSSH ВСЁ РАВНО отказывает при
-            # СМЕНЕ ключа ("REMOTE HOST IDENTIFICATION HAS CHANGED"). С
-            # UserKnownHostsFile=/dev/null хранилища нет → конфликта нет, и
-            # свежая/переехавшая нода не вешает bootstrap.
-            " -o UserKnownHostsFile=/dev/null"
-            " -o StrictHostKeyChecking=accept-new"
-        ),
-        "ANSIBLE_SSH_RETRIES": "3",
-    }
-    for key, val in defaults.items():
-        os.environ.setdefault(key, val)
-
-
 def build_inventory_for_node(node: models.VPNNode, ansible_user: str = "root") -> Path:
     """Generate a temporary inventory file for a single node.
 
@@ -218,9 +142,7 @@ def build_inventory_for_node(node: models.VPNNode, ansible_user: str = "root") -
     inventory keys. The validation runs *before* any filesystem work,
     so a rejected call leaves ``/tmp`` untouched.
     """
-    # Сборка inventory-строки во временный файл не требует каталога
-    # infra/ansible — гард _ensure_ansible_root() остаётся только в
-    # run_playbook перед реальным прогоном.
+    _ensure_ansible_root()
     _validate_node_for_inventory(node)
     inventory_content = """
 all:
@@ -256,8 +178,7 @@ def build_inventory_for_exit_node(
 
     Caller must unlink the returned temp file in a ``finally`` block.
     """
-    # Сборка inventory-строки во временный файл не требует каталога
-    # infra/ansible — гард остаётся только в run_playbook.
+    _ensure_ansible_root()
     validate_node_identity_fields(exit_node.name, exit_node.host, exit_node.ssh_port)
     inventory_content = """
 all:
@@ -282,60 +203,6 @@ all:
     return Path(handle.name)
 
 
-def build_inventory_for_relay_link_diagnose(
-    relay: models.VPNNode,
-    exit_node: models.WGExitNode,
-    ansible_user: str = "root",
-) -> Path:
-    """Combined inventory: relay in ``vpn_nodes`` + exit in ``wg_exit_nodes``.
-
-    diagnose_relay_link.yml is a two-play playbook (jump-side then
-    exit-side), so both hosts must be reachable from the same inventory
-    file. Mirrors the two single-host builders above, just doubled up.
-    Identity validation runs for both nodes before any filesystem work —
-    a rejected pair leaves /tmp untouched.
-
-    Caller must unlink the returned temp file in a ``finally`` block.
-    """
-    # Сборка inventory-строки во временный файл не требует каталога
-    # infra/ansible — гард остаётся только в run_playbook.
-    _validate_node_for_inventory(relay)
-    validate_node_identity_fields(exit_node.name, exit_node.host, exit_node.ssh_port)
-    inventory_content = """
-all:
-  hosts:
-    {relay_name}:
-      ansible_host: {relay_host}
-      ansible_port: {relay_port}
-      ansible_user: {user}
-    {exit_name}:
-      ansible_host: {exit_host}
-      ansible_port: {exit_port}
-      ansible_user: {user}
-  children:
-    vpn_nodes:
-      hosts:
-        {relay_name}:
-    wg_exit_nodes:
-      hosts:
-        {exit_name}:
-    db_host:
-      hosts: {{}}
-""".format(
-        relay_name=relay.name,
-        relay_host=relay.host,
-        relay_port=relay.ssh_port,
-        exit_name=exit_node.name,
-        exit_host=exit_node.host,
-        exit_port=exit_node.ssh_port,
-        user=ansible_user,
-    )
-    handle = tempfile.NamedTemporaryFile("w", delete=False, suffix="-inventory.yml")
-    handle.write(inventory_content)
-    handle.flush()
-    return Path(handle.name)
-
-
 def run_playbook(
     playbook: str,
     inventory: Path,
@@ -343,7 +210,6 @@ def run_playbook(
     limit: str | None = None,
     extra_vars: dict[str, Any] | None = None,
     timeout: int | None = None,
-    cancel_check: Callable[[], bool] | None = None,
 ) -> subprocess.CompletedProcess:
     """Execute an Ansible playbook and return the completed process.
 
@@ -354,8 +220,6 @@ def run_playbook(
     """
     if timeout is None:
         timeout = int(os.getenv("ANSIBLE_PLAYBOOK_TIMEOUT", "300"))
-    if cancel_check is None:
-        cancel_check = getattr(_cancel_tls, "fn", None)
     _ensure_ansible_root()
     playbook_path = ANSIBLE_ROOT / playbook
     if not playbook_path.exists():
@@ -395,90 +259,14 @@ def run_playbook(
     # to exist before it can create sockets. Fresh backend containers
     # don't have it → mkdir -p it here.
     _ensure_ssh_control_path_dir()
-    # Third catch (ansible-core 2.19 regression): pipelining + ssh_args
-    # from [ssh_connection] section в cfg перестали подхватываться. Без
-    # этих env vars каждая task делает свежий ssh + scp модуля — x3-5
-    # slowdown по сравнению с тем, что было на старом mgmt с 2.17.
-    # Подробности — в _apply_ansible_env_compat docstring.
-    _apply_ansible_env_compat()
-
-    def _tail(buf: str | None, n: int = 40) -> str:
-        if not buf:
-            return ""
-        lines = [ln for ln in buf.splitlines() if ln.strip()]
-        return "\n".join(lines[-n:])
-
-    # Popen + poll-цикл вместо блокирующего subprocess.run: даёт (а) отмену
-    # на запрос оператора (cancel_check → SIGTERM процессу ansible-playbook),
-    # (б) сохраняет timeout-поведение. communicate(timeout=N) в цикле НЕ
-    # теряет вывод (см. python docs: "retrying communication will not lose
-    # any output"). poll каждые ANSIBLE_CANCEL_POLL_S сек.
-    poll_s = float(os.getenv("ANSIBLE_CANCEL_POLL_S", "3"))
-    # start_new_session=True → ansible-playbook становится лидером своей
-    # process group (setsid). Тогда timeout/cancel убивает ВСЮ группу через
-    # os.killpg (см. _kill_process_group ниже), а не только родителя: иначе
-    # форк-воркеры ansible и порождённые ими ssh продолжают крутить таски на
-    # ноде уже после того, как backend посчитал прогон убитым (гонка на
-    # config.json xray/wg + утечка осиротевших ssh в контейнере воркера).
-    proc = subprocess.Popen(  # noqa: S603
-        cmd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        cwd=str(ANSIBLE_ROOT),
-        start_new_session=True,
-    )
-
-    def _kill_process_group(sig: int) -> None:
-        """Послать сигнал всей process group ansible-playbook.
-
-        pid лидера группы == pgid (start_new_session). ProcessLookupError —
-        группа уже мертва (нормальный финал эскалации TERM→KILL или гонка с
-        самозавершением), глушим. Fallback на proc-сигнал на случай, если
-        по какой-то причине setsid не сработал.
-        """
-        try:
-            os.killpg(proc.pid, sig)
-        except ProcessLookupError:
-            pass
-        except OSError:
-            # На всякий случай — если killpg недоступен, бьём хотя бы родителя.
-            try:
-                proc.send_signal(sig)
-            except ProcessLookupError:
-                pass
-    start = time.monotonic()
-    while True:
-        try:
-            stdout, stderr = proc.communicate(timeout=poll_s)
-            return subprocess.CompletedProcess(
-                cmd, proc.returncode, stdout, stderr
-            )
-        except subprocess.TimeoutExpired:
-            # Запрошена отмена → SIGTERM, добиваем kill'ом если не реагирует.
-            if cancel_check is not None and cancel_check():
-                _kill_process_group(signal.SIGTERM)
-                try:
-                    stdout, stderr = proc.communicate(timeout=15)
-                except subprocess.TimeoutExpired:
-                    _kill_process_group(signal.SIGKILL)
-                    stdout, stderr = proc.communicate()
-                raise AnsibleCancelled(
-                    "Ansible playbook cancelled by operator",
-                    stdout=stdout or "",
-                    stderr=stderr or "",
-                )
-            # Общий timeout — kill + tail в сообщение (как раньше).
-            if time.monotonic() - start > timeout:
-                _kill_process_group(signal.SIGKILL)
-                try:
-                    stdout, stderr = proc.communicate(timeout=15)
-                except subprocess.TimeoutExpired:
-                    stdout, stderr = "", ""
-                parts = [f"Ansible playbook timed out after {timeout}s"]
-                if _tail(stderr):
-                    parts.append(f"--- stderr tail ---\n{_tail(stderr)}")
-                if _tail(stdout):
-                    parts.append(f"--- stdout tail ---\n{_tail(stdout)}")
-                raise RuntimeError("\n".join(parts))
-            # иначе — продолжаем поллить
+    try:
+        return subprocess.run(
+            cmd,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            cwd=str(ANSIBLE_ROOT),
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError("Ansible playbook timed out") from exc
