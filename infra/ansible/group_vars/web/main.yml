@@ -234,3 +234,8 @@ deploy_app_stack_sub_fix_entrypoints: "all"  # ВКЛ 2026-07-29: большая
 deploy_app_stack_sub_fix_throttle_sec: 120
 deploy_app_stack_sub_fix_daily_max: 5
 deploy_app_stack_sub_fix_provider: "lava_top"
+
+# Бэкапы БД (roles/db_backup): парольная фраза, которой шифруются дампы
+# перед раскладкой на exit-ноды. Живёт в vault; без неё роль останавливается.
+# Расшифровка/восстановление — docs/operations/runbook.md.
+db_backup_passphrase: "{{ vault_db_backup_passphrase | default('') }}"

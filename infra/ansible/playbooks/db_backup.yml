@@ -1,94 +1,77 @@
 ---
-# DB-бэкап перед деплоем. pg_dump (custom-format, сжатый) из db-контейнера
-# app-стека на web-хосте. Кладём ВНЕ /opt/vpn — иначе rsync деплоя
-# (deploy_app_stack, delete: true) снесёт каталог — плюс тянем копию на
-# контроллер (~/vpn-backups, вне репозитория).
+# Ручной DB-бэкап (перед деплоем, перед рискованной миграцией, «на всякий»).
+#
+# Ставит/обновляет роль db_backup (идемпотентно), снимает дамп ТЕМ ЖЕ
+# скриптом, что и плановый таймер (pg_dump -Fc → шифр → push копий на
+# exit-ноды → ротация), и тянет свежий дамп на контроллер в ~/vpn-backups
+# (вне репозитория). Копии на exit'ах лежат зашифрованными
+# (roles/db_backup_receiver), локально и на контроллере — plain.
 #
 # Запуск (cwd = infra/ansible):
 #   ansible-playbook playbooks/db_backup.yml --vault-password-file ~/.vpn_vault_pass
+#   ... -e db_backup_no_push=true   # только локальный дамп, без exit'ов
 #
-# Восстановление:
-#   docker compose -f /opt/vpn/docker-compose.yml exec -T db \
-#     pg_restore -U vpn -d vpn --clean --if-exists < vpn-<stamp>.dump
-- hosts: web
+# Восстановление — docs/operations/runbook.md «Бэкапы и восстановление БД».
+- name: Manual DB backup (dump, push to exits, fetch to controller)
+  hosts: web
+  become: true
   gather_facts: false
+  # Плейбуки из playbooks/ не видят group_vars/web/ (ansible ищет group_vars
+  # рядом с плейбуком и с инвентарём, а не рядом с site.yml), а роли нужна
+  # парольная фраза из vault. Подключаем явно; симлинк playbooks/group_vars
+  # НЕЛЬЗЯ — он заставил бы provision_device.yml из worker'а расшифровывать
+  # vault, которого у него нет.
+  vars_files:
+    - "{{ playbook_dir }}/../group_vars/web/main.yml"
+    - "{{ playbook_dir }}/../group_vars/web/vault.yml"
   vars:
-    db_backup_dir: /opt/vpn-backups
-    # Ротация: дампы старше N дней удаляются после успешного нового бэкапа.
-    db_backup_retention_days: 14
+    db_backup_no_push: false
+  roles:
+    - db_backup
   tasks:
-    - name: Freeze backup filename once (lookup in vars re-evaluates per use)
-      set_fact:
-        db_backup_file: "{{ db_backup_dir }}/vpn-{{ lookup('pipe', 'date +%Y%m%d-%H%M%S') }}.dump"
-
-    - name: Ensure backup dir exists (outside /opt/vpn, survives deploy rsync)
-      file:
-        path: "{{ db_backup_dir }}"
-        state: directory
-        mode: "0700"
-
-    - name: pg_dump (custom format) from the app-stack db container
-      # rc редиректа = rc pg_dump'а → упавший дамп валит таск; assert ниже —
-      # вторая страховка от пустого/обрезанного файла.
-      shell: >
-        docker compose exec -T db pg_dump -U vpn -Fc -d vpn > "{{ db_backup_file }}"
-      args:
-        chdir: /opt/vpn
+    - name: Run the backup now (same script as the timer)
+      ansible.builtin.command:
+        cmd: "/usr/local/sbin/vpn-db-backup{{ ' --no-push' if db_backup_no_push | bool else '' }}"
+      register: db_backup_run
       changed_when: true
+      # rc=2 — дамп снят, но какой-то exit копию не принял: прогон не валим,
+      # дамп всё равно забираем, а про exit'ы предупреждаем ниже.
+      failed_when: db_backup_run.rc not in [0, 2]
 
-    - name: Stat the dump
-      stat:
-        path: "{{ db_backup_file }}"
-      register: db_backup_stat
+    - name: Show the backup log
+      ansible.builtin.debug:
+        msg: "{{ db_backup_run.stdout_lines }}"
 
-    - name: Fail if dump is missing or suspiciously small (pg_dump likely errored)
-      assert:
-        that:
-          - db_backup_stat.stat.exists
-          - db_backup_stat.stat.size > 4096
-        fail_msg: >-
-          Backup {{ db_backup_file }} missing or too small
-          ({{ db_backup_stat.stat.size | default(0) }} B) — pg_dump probably failed.
-        success_msg: >-
-          Backup OK: {{ db_backup_file }}
-          ({{ (db_backup_stat.stat.size / 1024 / 1024) | round(2) }} MB)
+    - name: Locate the dump path in the script output
+      ansible.builtin.set_fact:
+        db_backup_file: "{{ (db_backup_run.stdout_lines | select('match', '^DUMP=') | first)[5:] }}"
 
-    - name: Fetch dump to controller (~/vpn-backups, outside the repo)
-      fetch:
+    - name: Fetch the dump to the controller (~/vpn-backups, outside the repo)
+      ansible.builtin.fetch:
         src: "{{ db_backup_file }}"
         dest: "{{ lookup('env', 'HOME') }}/vpn-backups/"
         flat: true
 
-    # --- Ротация: чистим старые дампы ТОЛЬКО после успешного нового бэкапа ---
-    # (assert выше уже гарантировал целостность свежего дампа).
-    - name: Find old dumps on the web host
-      find:
-        paths: "{{ db_backup_dir }}"
-        patterns: "vpn-*.dump"
-        age: "{{ db_backup_retention_days }}d"
-      register: db_backup_old_host
-
-    - name: Prune old dumps on the web host
-      file:
-        path: "{{ item.path }}"
-        state: absent
-      loop: "{{ db_backup_old_host.files }}"
-      loop_control:
-        label: "{{ item.path }}"
+    - name: Warn when some exits did not receive the copy
+      ansible.builtin.debug:
+        msg: "ВНИМАНИЕ: rc=2 — часть exit-нод копию не приняла, см. лог выше."
+      when: db_backup_run.rc == 2
 
     - name: Find old dumps on the controller
-      find:
+      ansible.builtin.find:
         paths: "{{ lookup('env', 'HOME') }}/vpn-backups"
         patterns: "vpn-*.dump"
-        age: "{{ db_backup_retention_days }}d"
+        age: "{{ db_backup_controller_retention_days }}d"
       register: db_backup_old_ctrl
       delegate_to: localhost
+      become: false
 
     - name: Prune old dumps on the controller
-      file:
+      ansible.builtin.file:
         path: "{{ item.path }}"
         state: absent
       loop: "{{ db_backup_old_ctrl.files }}"
       loop_control:
         label: "{{ item.path }}"
       delegate_to: localhost
+      become: false

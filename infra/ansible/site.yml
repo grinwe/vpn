@@ -110,3 +110,22 @@
   tags: [web, mirror]
   roles:
     - mgmt_mirror
+
+# ── Бэкапы БД ────────────────────────────────────────────────────────
+# web-хост снимает дамп по таймеру, шифрует и раскладывает копии по
+# exit-нодам; exit'ы принимают их forced-command ключом (ни шелла, ни
+# форвардинга). Тег `backup` катает обе половины; `--tags web` обновляет
+# только web-часть (таймер/скрипт/конфиг). Backend site.yml на exit'ы не
+# гоняет (у него playbooks/bootstrap_exit.yml), так что play ниже — только
+# для ручных прогонов из статик-инвентаря.
+- hosts: web
+  become: true
+  tags: [web, backup]
+  roles:
+    - db_backup
+
+- hosts: wg_exit_nodes
+  become: true
+  tags: [backup]
+  roles:
+    - db_backup_receiver

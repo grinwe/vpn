@@ -1,0 +1,19 @@
+---
+# db_backup_receiver — exit-нода принимает зашифрованные дампы БД от
+# web-хоста (roles/db_backup). Ключ web-хоста прописывается root'у с forced
+# command: им можно только положить файл в каталог бэкапов, подчистить
+# старые и посмотреть список — ни шелла, ни форвардинга.
+
+# Куда складывать копии на exit'е.
+db_backup_receiver_dir: /opt/vpn-db-backups
+# Потолок размера одного файла (защита от заполнения диска чужим ключом).
+db_backup_receiver_max_bytes: 2147483648
+# Пол для `prune <days>`: push-ключ не может снести копии моложе N дней,
+# даже если web-хост скомпрометирован и просит `prune 0`.
+db_backup_receiver_min_prune_days: 7
+
+# Публичный ключ web-хоста. Пусто = взять с web-хоста из inventory-группы
+# `web` (slurp db_backup_receiver_web_key_path + .pub). Если web в инвентаре нет и
+# ключ не задан явно — роль ничего не делает и пишет об этом.
+db_backup_receiver_public_key: ""
+db_backup_receiver_web_key_path: /root/.ssh/vpn-db-backup_ed25519

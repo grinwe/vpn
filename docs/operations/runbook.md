@@ -495,9 +495,62 @@ netfilter-persistent save
 
 ---
 
+## Бэкапы и восстановление БД
+
+Схема описана в `infrastructure/deployment.md` «Бэкапы БД». Коротко: раз в сутки web-хост снимает `pg_dump -Fc` в `/opt/vpn-backups`, шифрует и раскладывает копии по всем exit-нодам в `/opt/vpn-db-backups`; ручной бэкап перед деплоем — `playbooks/db_backup.yml`, он же тянет дамп на контроллер в `~/vpn-backups/`.
+
+**Снять дамп руками** (cwd = `infra/ansible`):
+
+```bash
+ansible-playbook playbooks/db_backup.yml --vault-password-file ~/.vpn_vault_pass
+# только локальный дамп, без push на exit'ы:
+ansible-playbook playbooks/db_backup.yml --vault-password-file ~/.vpn_vault_pass -e db_backup_no_push=true
+```
+
+**Проверить, что плановый бэкап живой:**
+
+```bash
+ansible nl-web -m shell -a "systemctl list-timers vpn-db-backup.timer --no-pager; cat /var/lib/vpn-db-backup/last-run.json; ls -l /opt/vpn-backups | tail -3"
+ansible wg_exit_nodes -m shell -a "ls -l --time-style=long-iso /opt/vpn-db-backups | tail -3"
+```
+
+Упал юнит — `journalctl -u vpn-db-backup -n 50` на web-хосте. rc=2 означает «дамп есть, но exit копию не принял»: чаще всего exit лежит или у него сменился host-ключ (пересоздан на том же IP) — прогнать `site.yml --tags backup -l web:wg_exit_nodes`, роль перечитает ключи через `ssh-keyscan`. Приёмник фиксирует копию только при совпадении размера и sha256, так что обрыв посреди передачи оставляет на exit'е не обрезок, а ничего — и rc=2.
+
+**Восстановить из локального дампа на web-хосте.** Восстанавливаем в ЧИСТУЮ базу, а не поверх живой: `pg_restore --clean` роняет только объекты, которые есть в дампе, а всё, что добавили миграции после дампа, осталось бы и уронило бы `alembic upgrade head` при старте backend'а. Дамп должен быть не старше кода, который стартует backend (миграции идут при старте); если код ушёл вперёд — сначала откатить код на версию времени дампа.
+
+```bash
+cd /opt/vpn
+docker compose stop backend bot worker worker-scheduler
+docker compose exec -T db psql -U vpn -d postgres -c 'DROP DATABASE vpn' -c 'CREATE DATABASE vpn OWNER vpn'
+docker compose exec -T db pg_restore -U vpn -d vpn -1 --exit-on-error < /opt/vpn-backups/vpn-<stamp>.dump
+docker compose up -d
+```
+
+Дамп с контроллера (`~/vpn-backups/`) сначала докинуть на хост: `ansible nl-web -m copy -a "src=~/vpn-backups/vpn-<stamp>.dump dest=/opt/vpn-backups/ mode=0600"`.
+
+**Восстановить из копии на exit-ноде** (web-хост потерян):
+
+```bash
+# 1. забрать зашифрованную копию с любого exit'а на контроллер
+ansible dc-nl-01 -m fetch -a "src=/opt/vpn-db-backups/vpn-<stamp>.dump.enc dest=~/vpn-backups/ flat=true"
+# 2. парольная фраза — из vault в файл, не на экран и не в командную строку
+umask 077
+ansible-vault view group_vars/web/vault.yml --vault-password-file ~/.vpn_vault_pass \
+    | sed -n 's/^vault_db_backup_passphrase: *"\{0,1\}\([^"]*\)"\{0,1\}$/\1/p' > ~/vpn-backups/.pass
+# 3. расшифровать (те же параметры, что у скрипта); проверка — первые 5 байт = PGDMP
+openssl enc -d -aes-256-cbc -md sha256 -pbkdf2 -iter 600000 \
+    -in ~/vpn-backups/vpn-<stamp>.dump.enc -out ~/vpn-backups/vpn-<stamp>.dump -pass file:$HOME/vpn-backups/.pass
+shred -u ~/vpn-backups/.pass
+head -c 5 ~/vpn-backups/vpn-<stamp>.dump
+```
+
+Дальше: поднять новый web-хост (`site.yml --tags web`), докинуть дамп и восстановить в чистую базу теми же командами, что выше. `APP_SECRET_KEY` в `.env` нового хоста должен быть тем же, иначе зашифрованные Fernet'ом поля (credentials, токены провайдеров) не прочитаются — он тоже в vault. Последний шаг обязателен: `site.yml --tags backup -l web:wg_exit_nodes` — на новом web-хосте родился новый push-ключ, exit'ы должны его получить; проверить `systemctl start vpn-db-backup.service` и `failed: 0` в `/var/lib/vpn-db-backup/last-run.json`.
+
+**Ограничения:** гранулярность — сутки (между дампами данные не защищены), алерта на упавший таймер нет, Redis (очередь RQ, кэш) не бэкапится и после потери поднимается пустым.
+
 ## Что делать, если ничего не помогает
 
-1. **Снять снапшот:** `docker compose logs > /tmp/vpn-logs-$(date +%s).txt`, `pg_dump`, `redis-cli -a $REDIS_PASSWORD save`.
+1. **Снять снапшот:** `docker compose logs > /tmp/vpn-logs-$(date +%s).txt`, дамп БД (`playbooks/db_backup.yml` с контроллера или `/usr/local/sbin/vpn-db-backup` на хосте), `redis-cli -a $REDIS_PASSWORD save`.
 2. **Остановить**: `docker compose down` (не `-v` — данные сохранятся в named volumes).
 3. **Сделать бэкап volume'ов** на всякий случай: `tar -czf /tmp/vpn_db_$(date +%s).tgz /var/lib/docker/volumes/vpn_db_data/`.
 4. **Читать** логи и БД в спокойной обстановке, не под нагрузкой.
@@ -507,7 +560,7 @@ netfilter-persistent save
 
 ## ⚠️ Неясные места
 
-- **Backup-стратегии нет** в репо. Никакого `pg_dump` cron'а, никакого WAL-shipping'а. Любой incident recovery сценарий предполагает, что БД цела — если нет, восстанавливать неоткуда, кроме ручного последнего снапшота.
+- **Бэкапы — только суточные дампы** (см. «Бэкапы и восстановление БД»). WAL-shipping'а нет, между дампами данные не защищены; алерта на упавший `vpn-db-backup.timer` нет — только `last-run.json`/journal.
 - **`audit_logs` и `health_probes` растут без retention.** Очистка — ручная операция, не зафиксирована в cron/timer.
 - **RQ failed-jobs очередь не мониторится.** Упавший physical_revoke job останется в failed registry навсегда, если его не чистить вручную. Нет алерта, что `failed_job_registry.count > N`.
 - **Sub_token invalidation при компрометации.** Нет документированного пути «я знаю, что у пользователя утёк sub_token, как его отозвать, не трогая подписку». Формально — `UPDATE subscriptions SET sub_token=NULL WHERE id=...`, но последствия (старый клиент перестанет получать конфиг) не документированы.

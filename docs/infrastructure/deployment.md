@@ -324,7 +324,27 @@ volumes:
 
 Оба — named volumes, живут под `/var/lib/docker/volumes/` на хосте. **Не** bind-mount'ы в `/opt/vpn`, т.е. `rsync --delete` в `deploy_app_stack` их не тронет. `docker compose down -v` — единственный способ случайно снести БД; обычный `down` их оставит.
 
-Резервных копий postgres на уровне compose-стека **нет**. Backup-стратегия не зафиксирована в документации — любые pg_dump'ы запускаются руками или отдельным systemd-timer'ом за пределами репо.
+Резервные копии postgres — вне compose-стека, см. следующий раздел. Redis (`redis_data`, AOF) не бэкапится: там только очередь RQ и кэш, после потери он пересоздаётся пустым.
+
+## Бэкапы БД
+
+Схема (с 2026-09-07, роли `db_backup` + `db_backup_receiver`, см. `infrastructure/ansible.md`):
+
+| Что | Где | Формат | Хранение |
+|-----|-----|--------|----------|
+| Плановый дамп раз в сутки (`vpn-db-backup.timer`, 03:17–03:37 UTC: 03:17 плюс случайная задержка до 20 мин) | `nl-web:/opt/vpn-backups/vpn-<UTC-stamp>.dump` | `pg_dump -Fc` (plain) | 14 дней |
+| Зашифрованная копия того же дампа | все exit-ноды группы `wg_exit_nodes`: `/opt/vpn-db-backups/vpn-<stamp>.dump.enc` | AES-256-CBC, ключ из парольной фразы (PBKDF2, 600k итераций) | 30 дней |
+| Ручной дамп перед деплоем (`playbooks/db_backup.yml`) | то же + копия на контроллере `~/vpn-backups/` | plain | контроллер 60 дней |
+
+Как это устроено:
+
+- Скрипт `/usr/local/sbin/vpn-db-backup` на web-хосте (роль `db_backup`): `docker compose exec -T db pg_dump -U vpn -Fc` → проверка размера и сигнатуры `PGDMP` → `openssl enc` → push на каждый exit → ротация. Один и тот же скрипт дёргают таймер и ручной playbook, поэтому плановый и ручной бэкап не расходятся. Итог последнего прогона — `/var/lib/vpn-db-backup/last-run.json`, лог — `journalctl -u vpn-db-backup`.
+- Push идёт по SSH выделенным ключом `/root/.ssh/vpn-db-backup_ed25519`, который роль генерирует на web-хосте. На exit'ах (роль `db_backup_receiver`) он прописан root'у с `command="/usr/local/sbin/vpn-db-backup-receive",restrict`: этим ключом можно только положить файл `vpn-*.dump.enc` в каталог бэкапов, подчистить старые и посмотреть список. Ни шелла, ни форвардинга, ни файла вне каталога; размер одного файла ограничен 2 ГБ, чтобы чужой ключ не забил диск.
+- Парольная фраза — `vault_db_backup_passphrase` в `group_vars/web/vault.yml`, на web-хосте лежит в `/etc/vpn-db-backup/passphrase` (0600). Копии на exit'ах без неё — мусор, так что vault и есть второй экземпляр фразы.
+- Host-ключи exit'ов роль заранее кладёт в `/var/lib/vpn-db-backup/known_hosts` (`ssh-keyscan`). Пересозданный exit с тем же IP push не примет, пока роль не прогонят заново (`--tags backup`).
+- Коды выхода скрипта: 0 — ок; 1 — дамп не снят или не зашифрован (при ошибке шифрования локальный дамп остаётся, см. journal); 2 — дамп снят, но какой-то exit копию не принял (юнит `failed`, локальный дамп цел). Приёмник на exit'е фиксирует файл только при совпадении заявленных размера и sha256, поэтому оборванная передача копии не оставляет; `prune` не опускается ниже 7 дней даже по просьбе push-ключа.
+
+Чего здесь **нет**: алерта на упавший таймер (проверять `systemctl status vpn-db-backup.service` или `last-run.json`), WAL-shipping'а и point-in-time recovery — гранулярность сутки. Восстановление — `operations/runbook.md` «Бэкапы и восстановление БД».
 
 ## Кто дёргает `deploy_app_stack`
 
@@ -354,4 +374,4 @@ ansible-playbook -i inventories/prod/hosts.yml site.yml -l nl-web --ask-vault-pa
 - **Single-host для всех трёх логических ролей.** `db_host`, `monitoring`, `web` ссылаются на `45.14.244.140`. Компрометация / отказ этого хоста = полный outage control-plane. HA-стратегия в коде никак не зафиксирована, inventory явно комментирует «splitting is a trivial inventory change later».
 - **Cloudflare edge → origin зависимость.** Без CF зоны `grinwer.online` домен не резолвится (origin IP — `45.14.244.140`, но публичного DNS A-record на него без CF нет по дизайну). Отзыв CF API-токена или zone миграция = ломается renewal сертификата через DNS-01, и рендер vhost'а начнёт падать при следующем прогоне роли.
 - **Monitoring и web — один и тот же docker daemon.** Два compose-проекта под `/opt/vpn` и `/opt/vpn-monitoring` делят сеть, volume namespace, CPU, диск. Явная изоляция между ними — только через префиксы проектов compose. Для проверки «что ест диск» нужно залезать в оба.
-- **Нет backup'ов Postgres/Redis в публичных ролях репо.** `db_data` и `redis_data` — named volumes, любая операция `docker volume rm` необратимо уничтожит БД. Отдельного `pg_dump` cron'а в compose нет.
+- **Redis не бэкапится, Postgres — только суточными дампами.** `db_data` и `redis_data` — named volumes, `docker volume rm` уничтожит их необратимо; между суточными дампами (см. «Бэкапы БД») данные ничем не защищены, WAL-shipping'а нет.

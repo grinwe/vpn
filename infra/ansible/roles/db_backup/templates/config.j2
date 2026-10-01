@@ -1,0 +1,12 @@
+# Managed by ansible (roles/db_backup). Читается /usr/local/sbin/vpn-db-backup.
+BACKUP_DIR="{{ db_backup_dir }}"
+STACK_DIR="{{ db_backup_stack_dir }}"
+RETENTION_DAYS="{{ db_backup_retention_days }}"
+REMOTE_RETENTION_DAYS="{{ db_backup_remote_retention_days }}"
+PASSPHRASE_FILE="{{ db_backup_passphrase_file }}"
+SSH_KEY="{{ db_backup_ssh_key }}"
+SSH_CONNECT_TIMEOUT="{{ db_backup_ssh_connect_timeout }}"
+STATE_DIR="{{ db_backup_state_dir }}"
+PBKDF2_ITER="{{ db_backup_pbkdf2_iter }}"
+# name=host:port — exit-ноды, куда раскладываются зашифрованные копии.
+TARGETS="{% for t in db_backup_targets %}{{ t.name }}={{ t.host }}:{{ t.port }}{% if not loop.last %} {% endif %}{% endfor %}"

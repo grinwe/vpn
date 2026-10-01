@@ -1,0 +1,14 @@
+[Unit]
+Description=VPN DB backup: pg_dump + encrypt + push copies to exit nodes
+# Managed by ansible (roles/db_backup)
+After=docker.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/vpn-db-backup
+Nice=10
+IOSchedulingClass=idle
+# Дамп 6-10 МБ, пуш на 4 exit'а — минуты, не часы. Зависший ssh не должен
+# держать юнит вечно.
+TimeoutStartSec=30min

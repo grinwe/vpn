@@ -27,6 +27,7 @@ infra/ansible/
 │   ├── deploy_app_stack.yml      ← deploy на web-host (docker-compose + nginx)
 │   ├── deploy_web_frontend.yml   ← SPA build + nginx site conf
 │   ├── deploy_monitoring.yml     ← Grafana/Prometheus на monitoring-host
+│   ├── db_backup.yml             ← ручной DB-бэкап: дамп + push на exit'ы + fetch на контроллер (см. ниже)
 │   └── mgmt_mirror.yml           ← standalone-раскат mgmt-зеркала upstream (см. ниже)
 └── roles/
     ├── base_node                 ← общие системные настройки (не vpn-спец.)
@@ -38,6 +39,8 @@ infra/ansible/
     ├── install_hysteria2         ← hysteria2 (UDP)
     ├── install_probe_agent       ← опциональный node-to-node health probe
     ├── install_traffic_collector ← опциональный traffic accounting
+    ├── db_backup                 ← web-хост: pg_dump по таймеру, шифрование, push копий на exit'ы
+    ├── db_backup_receiver        ← exit-ноды: приём копий forced-command ключом (put/prune/list)
     ├── relay_jump_node           ← WG tunnel client → чужая exit-нода
     ├── wg_exit_node              ← non-RU exit нода для relay'ев
     ├── check_node_health         ← post-install assertion: порты LISTEN
@@ -111,6 +114,35 @@ ansible-playbook -i inventories/prod/hosts.yml playbooks/mgmt_mirror.yml \
 
 Cron на mgmt'е сам обновляет geoip раз в неделю (понедельник 04:00,
 лог `/var/log/mgmt-mirror-refresh.log`).
+
+### Бэкапы БД (`db_backup` + `db_backup_receiver`)
+
+Два play в конце `site.yml` под тегом `backup`: web-хост получает скрипт
+`/usr/local/sbin/vpn-db-backup`, конфиг, парольную фразу из vault
+(`vault_db_backup_passphrase`), выделенный SSH-ключ и таймер
+`vpn-db-backup.timer`; exit-ноды из `wg_exit_nodes` — каталог
+`/opt/vpn-db-backups` и запись в `authorized_keys` root'а с forced command.
+Порядок важен: сначала web (ключ рождается там), потом exit'ы (роль читает
+`.pub` с web-хоста через `delegate_to`). Оба play в одном прогоне:
+
+```bash
+ansible-playbook -i inventories/prod/hosts.yml site.yml --tags backup \
+    -l web:wg_exit_nodes --vault-password-file ~/.vpn_vault_pass
+```
+
+`-l web:wg_exit_nodes` нужен: без него нетегированные play (vpn_nodes,
+db_host) всё равно собирают факты со всех RU-нод, и один лежащий узел из
+статик-снапшота уронит прогон, хотя оба backup-play прошли.
+
+`--tags web` обновляет только web-половину (скрипт/конфиг/таймер) — новый
+exit в инвентаре и пересозданный web-хост (на нём рождается новый ключ)
+требуют `--tags backup`, чтобы exit'ы получили ключ. Backend
+`site.yml` на exit'ы не гоняет (`playbooks/bootstrap_exit.yml`), так что
+play-приёмник — только для ручных прогонов из статик-инвентаря.
+
+Ручной дамп (перед деплоем) — `playbooks/db_backup.yml`: тот же скрипт,
+плюс `fetch` дампа в `~/vpn-backups/` на контроллере. Схема хранения и
+восстановление — `deployment.md` «Бэкапы БД», `operations/runbook.md`.
 
 ## `ansible.cfg` — важные дефолты
 

@@ -28,3 +28,4 @@ backups/
 # Diag-выводы scratch — для одноразовых сессий.
 diag.out
 runtime.out
+infra/ansible/inventories/prod/hosts.yml
