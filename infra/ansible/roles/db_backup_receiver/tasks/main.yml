@@ -1,0 +1,55 @@
+---
+# db_backup_receiver — приём зашифрованных дампов БД на exit-ноде.
+# См. docs/operations/runbook.md «Бэкапы и восстановление БД».
+
+- name: Resolve the web host's backup public key from inventory
+  when:
+    - db_backup_receiver_public_key | length == 0
+    - groups['web'] is defined
+    - groups['web'] | length > 0
+  block:
+    - name: Read the public key from the web host
+      ansible.builtin.slurp:
+        src: "{{ db_backup_receiver_web_key_path }}.pub"
+      delegate_to: "{{ groups['web'][0] }}"
+      register: db_backup_receiver_pub_raw
+      failed_when: false
+
+    - name: Use the key read from the web host
+      ansible.builtin.set_fact:
+        db_backup_receiver_public_key: "{{ (db_backup_receiver_pub_raw.content | b64decode) | trim }}"
+      when: db_backup_receiver_pub_raw.content is defined
+
+- name: Explain why the receiver is skipped
+  ansible.builtin.debug:
+    msg: >-
+      db_backup_receiver: публичного ключа нет (web-хост не в инвентаре и
+      db_backup_receiver_public_key не задан) — пропускаю. Сначала прогоните
+      роль db_backup на web-хосте.
+  when: db_backup_receiver_public_key | length == 0
+
+- name: Configure the receiver
+  when: db_backup_receiver_public_key | length > 0
+  block:
+    - name: Create the backup directory (root-only)
+      ansible.builtin.file:
+        path: "{{ db_backup_receiver_dir }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0700"
+
+    - name: Install the forced-command receiver script
+      ansible.builtin.template:
+        src: vpn-db-backup-receive.sh.j2
+        dest: /usr/local/sbin/vpn-db-backup-receive
+        owner: root
+        group: root
+        mode: "0755"
+
+    - name: Authorize the web host's backup key (forced command, restricted)
+      ansible.posix.authorized_key:
+        user: root
+        key: "{{ db_backup_receiver_public_key }}"
+        key_options: 'command="/usr/local/sbin/vpn-db-backup-receive",restrict'
+        state: present

@@ -3,6 +3,7 @@ __pycache__/
 *.pyc
 *.pyo
 .pytest_cache/
+scripts/.cache/
 *.egg-info/
 dist/
 build/
@@ -14,3 +15,17 @@ infra/ansible/group_vars/web/vault*
 .codegraph/
 AGENTS.md
 CLAUDE.md
+# Build artifacts
+admin/tsconfig.tsbuildinfo
+# Disaster-recovery local dumps. Содержат приватные ключи, telegram_id,
+# балансы — никогда не коммитим. Воссоздаётся прогонкой recover_*-playbook'а.
+infra/ansible/recovered/
+infra/ansible/recovered-runtime/
+infra/ansible/recovered-wg/
+# Локальные pg_dump'ы БД (scripts/db_dump.sh) — содержат telegram_id,
+# балансы, шифрованные креды. Никогда не коммитим.
+backups/
+# Diag-выводы scratch — для одноразовых сессий.
+diag.out
+runtime.out
+infra/ansible/inventories/prod/hosts.yml

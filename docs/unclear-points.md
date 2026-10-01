@@ -109,7 +109,7 @@
 - **Single-host для всех трёх логических ролей.** `db_host`, `monitoring`, `web` ссылаются на `45.14.244.140`. Компрометация / отказ этого хоста = полный outage control-plane. HA-стратегия в коде никак не зафиксирована, inventory явно комментирует «splitting is a trivial inventory change later».
 - **Cloudflare edge → origin зависимость.** Без CF зоны `grinwer.online` домен не резолвится (origin IP — `45.14.244.140`, но публичного DNS A-record на него без CF нет по дизайну). Отзыв CF API-токена или zone миграция = ломается renewal сертификата через DNS-01, и рендер vhost'а начнёт падать при следующем прогоне роли.
 - **Monitoring и web — один и тот же docker daemon.** Два compose-проекта под `/opt/vpn` и `/opt/vpn-monitoring` делят сеть, volume namespace, CPU, диск. Явная изоляция между ними — только через префиксы проектов compose. Для проверки «что ест диск» нужно залезать в оба.
-- **Нет backup'ов Postgres/Redis в публичных ролях репо.** `db_data` и `redis_data` — named volumes, любая операция `docker volume rm` необратимо уничтожит БД. Отдельного `pg_dump` cron'а в compose нет.
+- ✅ **Бэкапы Postgres есть с 2026-09-07** — роли `db_backup`/`db_backup_receiver`: суточный `pg_dump -Fc` на web-хосте + зашифрованные копии на всех exit-нодах (`infrastructure/deployment.md` «Бэкапы БД»). Осталось: Redis не бэкапится (очередь/кэш), нет алерта на упавший таймер, нет WAL-shipping'а.
 
 ---
 
@@ -127,7 +127,7 @@
 
 ## operations/runbook.md
 
-- **Backup-стратегии нет** в репо. Никакого `pg_dump` cron'а, никакого WAL-shipping'а. Любой incident recovery сценарий предполагает, что БД цела — если нет, восстанавливать неоткуда, кроме ручного последнего снапшота.
+- ✅ **Бэкапы есть с 2026-09-07** — суточные дампы + копии на exit'ах, восстановление описано в `operations/runbook.md` «Бэкапы и восстановление БД». Остаток: гранулярность сутки, нет алерта на упавший таймер.
 - **`audit_logs` и `health_probes` растут без retention.** Очистка — ручная операция, не зафиксирована в cron/timer.
 - **RQ failed-jobs очередь не мониторится.** Упавший physical_revoke job останется в failed registry навсегда, если его не чистить вручную. Нет алерта, что `failed_job_registry.count > N`.
 - **Sub_token invalidation при компрометации.** Нет документированного пути «я знаю, что у пользователя утёк sub_token, как его отозвать, не трогая подписку». Формально — `UPDATE subscriptions SET sub_token=NULL WHERE id=...`, но последствия (старый клиент перестанет получать конфиг) не документированы.

@@ -1,0 +1,50 @@
+---
+# db_backup — pg_dump БД vpn по таймеру на web-хосте, шифрование дампа и
+# раскладка копий по exit-нодам (их принимает roles/db_backup_receiver).
+# Документация: docs/operations/runbook.md «Бэкапы и восстановление БД»,
+# docs/infrastructure/deployment.md «Бэкапы БД».
+
+# Куда складывать нешифрованные дампы на web-хосте. ВНЕ /opt/vpn — rsync
+# деплоя (deploy_app_stack, delete: true) снёс бы каталог.
+db_backup_dir: /opt/vpn-backups
+# Каталог compose-стека, из чьего db-контейнера снимаем дамп.
+db_backup_stack_dir: "{{ deploy_app_stack_dir | default('/opt/vpn') }}"
+# Конфиг скрипта, парольная фраза, состояние (known_hosts, last-run.json).
+db_backup_conf_dir: /etc/vpn-db-backup
+db_backup_passphrase_file: "{{ db_backup_conf_dir }}/passphrase"
+db_backup_state_dir: /var/lib/vpn-db-backup
+
+# Парольная фраза шифрования (AES-256-CBC, ключ через PBKDF2). Приходит из
+# vault (group_vars/web/main.yml → vault_db_backup_passphrase). Без неё роль
+# останавливается: копии на exit'ах без фразы — мусор.
+db_backup_passphrase: ""
+db_backup_pbkdf2_iter: 600000
+
+# Ротация: локальные дампы (дни) и зашифрованные копии на exit'ах (дни).
+db_backup_retention_days: 14
+db_backup_remote_retention_days: 30
+# Копии, которые ручной playbooks/db_backup.yml тянет на контроллер.
+db_backup_controller_retention_days: 60
+
+# Выделенный ключ для push'а на exit'ы. Генерируется ролью на web-хосте;
+# публичная половина уезжает в authorized_keys exit'ов с forced command
+# (см. db_backup_receiver) — этим ключом можно только положить/подчистить
+# файлы в каталоге бэкапов, шелл им не открыть.
+db_backup_ssh_key: /root/.ssh/vpn-db-backup_ed25519
+db_backup_ssh_connect_timeout: 25
+
+# Расписание таймера (systemd OnCalendar) + размазывание старта.
+db_backup_timer_on_calendar: "*-*-* 03:17:00 UTC"
+db_backup_timer_randomized_delay: "20m"
+
+# Куда раскладывать копии. По умолчанию — все хосты inventory-группы
+# wg_exit_nodes (адрес/порт из hostvars). Переопределить можно списком
+# словарей {name, host, port}.
+db_backup_target_group: wg_exit_nodes
+db_backup_targets: "{{ _db_backup_targets_from_inventory }}"
+_db_backup_targets_from_inventory: >-
+  [{% for h in groups[db_backup_target_group] | default([]) %}
+  {"name": "{{ h }}",
+   "host": "{{ hostvars[h].ansible_host | default(h) }}",
+   "port": {{ hostvars[h].ansible_port | default(22) }}}{{ "," if not loop.last else "" }}
+  {% endfor %}]

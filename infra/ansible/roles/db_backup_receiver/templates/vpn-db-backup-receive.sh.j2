@@ -1,0 +1,67 @@
+#!/usr/bin/env bash
+# vpn-db-backup-receive — forced command для ключа vpn-db-backup web-хоста.
+# Managed by ansible (roles/db_backup_receiver).
+#
+# Через SSH_ORIGINAL_COMMAND принимает ровно три команды и ничего больше:
+#   put <vpn-YYYYMMDD-HHMMSS.dump.enc> <size> <sha256>
+#        тело файла в stdin → каталог бэкапов; фиксируется ТОЛЬКО если
+#        принятый размер и sha256 совпали с заявленными (обрыв связи
+#        посреди передачи даёт EOF, а не ошибку — без этой проверки обрезок
+#        лёг бы как «валидная» копия)
+#   prune <days>   удалить копии старше N дней (N не ниже пола — см. ниже)
+#   list           показать, что лежит
+# Ключ в authorized_keys стоит с `restrict`, так что ни pty, ни форвардинга,
+# ни другого исполняемого файла этим ключом не получить.
+set -euo pipefail
+
+DIR="{{ db_backup_receiver_dir }}"
+MAX_BYTES="{{ db_backup_receiver_max_bytes }}"
+# Пол ретеншена: даже владелец push-ключа (скомпрометированный web-хост) не
+# может одной командой снести все копии моложе этого срока.
+MIN_PRUNE_DAYS="{{ db_backup_receiver_min_prune_days }}"
+NAME_RE='^vpn-[0-9]{8}-[0-9]{6}\.dump\.enc$'
+
+umask 077
+mkdir -p "$DIR"
+
+die() { echo "ERR: $*" >&2; exit 1; }
+
+read -r cmd arg expect sum _ <<< "${SSH_ORIGINAL_COMMAND:-}" || true
+
+case "${cmd:-}" in
+    put)
+        [[ "${arg:-}" =~ $NAME_RE ]] || die "bad name"
+        [[ "${expect:-}" =~ ^[0-9]{1,12}$ ]] || die "bad size"
+        [[ "${sum:-}" =~ ^[0-9a-f]{64}$ ]] || die "bad sha256"
+        (( expect <= MAX_BYTES )) || die "too big"
+        (( expect >= 1024 )) || die "too small ($expect B)"
+        dst="$DIR/$arg"
+        tmp="$DIR/.$arg.part"
+        [[ -e "$dst" ]] && die "already exists"
+        trap 'rm -f "$tmp"' EXIT
+        # +1 байт сверх заявленного: так отличаем «ровно столько» от «прислали больше».
+        head -c "$((expect + 1))" > "$tmp"
+        size=$(stat -c %s "$tmp")
+        (( size == expect )) || die "size mismatch: got $size, expected $expect"
+        [[ "$(head -c 8 "$tmp")" == "Salted__" ]] || die "not an openssl enc file"
+        got=$(sha256sum < "$tmp" | cut -c1-64)
+        [[ "$got" == "$sum" ]] || die "sha256 mismatch"
+        mv "$tmp" "$dst"
+        trap - EXIT
+        echo "OK $size"
+        ;;
+    prune)
+        [[ "${arg:-}" =~ ^[0-9]{1,3}$ ]] || die "bad days"
+        (( arg >= MIN_PRUNE_DAYS )) || die "days below floor ($MIN_PRUNE_DAYS)"
+        find "$DIR" -maxdepth 1 -type f -name 'vpn-*.dump.enc' -mtime +"$arg" -delete
+        # Огрызки от оборванных put'ов (процесс убит до trap) — подчищаем тоже.
+        find "$DIR" -maxdepth 1 -type f -name '.vpn-*.part' -mmin +120 -delete
+        echo "OK"
+        ;;
+    list)
+        ls -l --time-style=long-iso "$DIR"/vpn-*.dump.enc 2> /dev/null || true
+        ;;
+    *)
+        die "unsupported command"
+        ;;
+esac

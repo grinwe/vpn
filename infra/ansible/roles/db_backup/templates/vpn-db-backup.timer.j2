@@ -1,0 +1,12 @@
+[Unit]
+Description=Daily VPN DB backup
+# Managed by ansible (roles/db_backup)
+
+[Timer]
+OnCalendar={{ db_backup_timer_on_calendar }}
+RandomizedDelaySec={{ db_backup_timer_randomized_delay }}
+# Хост был выключен в момент срабатывания — догнать сразу после старта.
+Persistent=true
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,77 @@
+---
+# Ручной DB-бэкап (перед деплоем, перед рискованной миграцией, «на всякий»).
+#
+# Ставит/обновляет роль db_backup (идемпотентно), снимает дамп ТЕМ ЖЕ
+# скриптом, что и плановый таймер (pg_dump -Fc → шифр → push копий на
+# exit-ноды → ротация), и тянет свежий дамп на контроллер в ~/vpn-backups
+# (вне репозитория). Копии на exit'ах лежат зашифрованными
+# (roles/db_backup_receiver), локально и на контроллере — plain.
+#
+# Запуск (cwd = infra/ansible):
+#   ansible-playbook playbooks/db_backup.yml --vault-password-file ~/.vpn_vault_pass
+#   ... -e db_backup_no_push=true   # только локальный дамп, без exit'ов
+#
+# Восстановление — docs/operations/runbook.md «Бэкапы и восстановление БД».
+- name: Manual DB backup (dump, push to exits, fetch to controller)
+  hosts: web
+  become: true
+  gather_facts: false
+  # Плейбуки из playbooks/ не видят group_vars/web/ (ansible ищет group_vars
+  # рядом с плейбуком и с инвентарём, а не рядом с site.yml), а роли нужна
+  # парольная фраза из vault. Подключаем явно; симлинк playbooks/group_vars
+  # НЕЛЬЗЯ — он заставил бы provision_device.yml из worker'а расшифровывать
+  # vault, которого у него нет.
+  vars_files:
+    - "{{ playbook_dir }}/../group_vars/web/main.yml"
+    - "{{ playbook_dir }}/../group_vars/web/vault.yml"
+  vars:
+    db_backup_no_push: false
+  roles:
+    - db_backup
+  tasks:
+    - name: Run the backup now (same script as the timer)
+      ansible.builtin.command:
+        cmd: "/usr/local/sbin/vpn-db-backup{{ ' --no-push' if db_backup_no_push | bool else '' }}"
+      register: db_backup_run
+      changed_when: true
+      # rc=2 — дамп снят, но какой-то exit копию не принял: прогон не валим,
+      # дамп всё равно забираем, а про exit'ы предупреждаем ниже.
+      failed_when: db_backup_run.rc not in [0, 2]
+
+    - name: Show the backup log
+      ansible.builtin.debug:
+        msg: "{{ db_backup_run.stdout_lines }}"
+
+    - name: Locate the dump path in the script output
+      ansible.builtin.set_fact:
+        db_backup_file: "{{ (db_backup_run.stdout_lines | select('match', '^DUMP=') | first)[5:] }}"
+
+    - name: Fetch the dump to the controller (~/vpn-backups, outside the repo)
+      ansible.builtin.fetch:
+        src: "{{ db_backup_file }}"
+        dest: "{{ lookup('env', 'HOME') }}/vpn-backups/"
+        flat: true
+
+    - name: Warn when some exits did not receive the copy
+      ansible.builtin.debug:
+        msg: "ВНИМАНИЕ: rc=2 — часть exit-нод копию не приняла, см. лог выше."
+      when: db_backup_run.rc == 2
+
+    - name: Find old dumps on the controller
+      ansible.builtin.find:
+        paths: "{{ lookup('env', 'HOME') }}/vpn-backups"
+        patterns: "vpn-*.dump"
+        age: "{{ db_backup_controller_retention_days }}d"
+      register: db_backup_old_ctrl
+      delegate_to: localhost
+      become: false
+
+    - name: Prune old dumps on the controller
+      ansible.builtin.file:
+        path: "{{ item.path }}"
+        state: absent
+      loop: "{{ db_backup_old_ctrl.files }}"
+      loop_control:
+        label: "{{ item.path }}"
+      delegate_to: localhost
+      become: false

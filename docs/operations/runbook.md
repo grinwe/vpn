@@ -219,6 +219,32 @@ docker compose exec db psql -U vpn -d vpn -c \
   - `docker compose logs backend | grep setWebhook` — webhook зарегистрировался на startup?
 - **Telegram Stars (polling legacy):** Если `BOT_WEBHOOK_PORT=0` — старый поток, webhook форвардится ботом. Смотреть `bot` логи на `successful_payment` event. Проверить `TELEGRAM_STARS_WEBHOOK_SECRET` одинаково в обоих env.
 - **SBP (generic):** webhook может не прийти, если провайдер кладёт его на URL, закрытый nginx'ом или CF WAF'ом. Смотреть `/var/log/nginx/access.log` на хосте — есть ли вообще POST на `/api/payments/webhook/<slug>`.
+- **lava.top (карта `lava_top` / СБП `lava_top_sbp`):** вебхук здесь и так best-effort — основной денежный путь это тик сверки `run_lava_reconcile_tick`, он ищет платёж по ОБОИМ именам. Прежде чем копать вебхук, проверь, что счета вообще СОЗДАЮТСЯ: человек видит «Не удалось создать счёт: 502», в логах бэка — 400 от lava.
+
+**Счёт не создаётся: 400 «Restricted payment method type».** Это не ключ и не
+сумма — у эквайрера закрыт тот способ оплаты, который ушёл в create (так
+2026-09-19 умерла карта у агрегатора PAY2ME и вместе с ней ВСЕ платежи lava,
+включая СБП: без явного `paymentMethod` PAY2ME берёт карту по умолчанию).
+Диагностика — прощупать пары «эквайрер × способ» прод-ключом с ЯВНЫМ
+`paymentMethod`:
+
+```bash
+# amount 50 — минимум платформы; счёт можно не оплачивать
+curl -sS -o /dev/null -w '%{http_code}\n' -X POST https://gate.lava.top/api/v3/invoice \
+  -H "X-Api-Key: ${LAVA_TOP_API_KEY}" -H 'Content-Type: application/json' \
+  -d '{"email":"probe@example.org","offerId":"'"${LAVA_TOP_OFFER_ID}"'","currency":"RUB",
+       "amount":50,"paymentProvider":"PAY2ME","paymentMethod":"SBP"}'
+# 201 — пара живая; 400 «Restricted payment method type» — способ закрыт
+```
+
+Живая пара задаётся переменными `LAVA_TOP_CARD_PROVIDER` /
+`LAVA_TOP_SBP_PROVIDER`. Сейчас в `group_vars/web/main.yml` они не заданы —
+работают дефолты шаблона (`SMART_GLOCAL` / `PAY2ME`, `env.j2`); чтобы сменить
+эквайрера, добавить `deploy_app_stack_lava_top_card_provider` /
+`…_sbp_provider` в `main.yml` и выкатить `--tags app`. Если закрыт весь
+способ — убрать его имя из `deploy_app_stack_payment_provider_choices`, иначе
+кнопка в боте/кабинете ведёт в 502. Контекст — `docs/PLAN_LAVA_TOP.md`,
+«Инцидент 2026-09-19».
 
 **Manual mark paid:** админский путь — через бота `/invoices` → inline-кнопка, или через SPA. Это триггерит `_mark_invoice_paid_core`, который сделает branch-specific логику (topup vs renewal vs new_subscription). См. `components/payments.md`.
 
@@ -238,6 +264,7 @@ FROM vpn_nodes WHERE id = <X>;
 - `is_active=false` — кто-то нажал в SPA.
 - `status='error'` — был fail при bootstrap или `destroy_node`. **Из `error` автомата нет**, см. `infrastructure/nodes.md`.
 - `health_score < MIN_HEALTHY_SCORE` — probe'ы упали. Смотреть `health_probes` таблицу по `node_id`.
+- `blocked_regions` непустой ИЛИ probe-смерть (общий success-rate ниже порога при достаточной выборке) — probe-риги детектят DPI-блок, который SSH-тик не видит. Авто-миграция отключена (2026-04-15), но теперь на такой сигнал уходит **админ-пуш** (`node_region_blocked` / `node_probe_death`), дедуп-окно `ADMIN_ALERT_BLOCKED_WINDOW_SEC` (default 1800с), подавляется mute по ноде. Решение о переселении — ручное (мигрировать через admin SPA). Пуш идёт только с автоматического (probe-driven) пути; ручной пересчёт из админки не алертит.
 - `cooldown_until > now` — временный lock. Обычно проходит сам через 5–15 минут.
 - `status='draining'` — нода помечена для вывода из пула (автоматика выпилена 2026-04-17; статус меняется руками). Новые subs сюда не едут, старые надо мигрировать через admin SPA. Вернуть в пул: `UPDATE vpn_nodes SET status='active' WHERE id=<X>;`.
 
@@ -373,9 +400,157 @@ docker compose exec backend alembic -c /app/alembic.ini history | head -20
 
 ---
 
+## 13. Ротация `vault_admin_secret_path` (secret admin URL)
+
+Admin-панель публикуется по secret-пути `/mgmt-<hex>/` вместо `/admin/` (см. anti-probing camo). Ротировать нужно редко — при подозрении на утечку пути (засветился в чужих логах / referer'ах, кто-то прислал скрин и т.п.).
+
+**Как поменять:**
+
+```bash
+# 1. На контроллере — выбрать новое значение.
+NEW_PATH="mgmt-$(openssl rand -hex 4)"
+echo "$NEW_PATH"   # например mgmt-9f21a0c4
+
+# 2. Вписать в vault.
+cd infra/ansible
+ansible-vault edit group_vars/web/vault.yml
+#   vault_admin_secret_path: "mgmt-9f21a0c4"
+
+# 3. Прогнать плей для web-группы. deploy_app_stack увидит changed .env
+#    → triggers recreate admin-контейнера (build-arg VITE_ADMIN_BASE_PATH
+#    поменялся, образ пересобирается); deploy_web_frontend перерендерит
+#    nginx vhost с новым location.
+ansible-playbook -i inventories/prod/hosts.yml site.yml -l nl-web --ask-vault-pass
+
+# 4. На web-хосте — убедиться, что старый путь отдаёт camo, а новый живой.
+ssh root@45.14.244.140
+curl -sI https://grinwer.online/admin/              # → 200 от camo-landing'а (не 302!)
+curl -sI https://grinwer.online/${NEW_PATH}/        # → 200 от admin SPA
+```
+
+**Что сломается, если путь в compose не совпадёт с path'ом в nginx'е:** admin-контейнер внутри собран с `VITE_ADMIN_BASE_PATH=<старый>`, а nginx проксирует в `<новый>` — upstream отдаст 404 по неправильной base. Поэтому ВАЖНО: `deploy_app_stack_admin_base_path` и `deploy_web_frontend_admin_path` оба читают одну переменную (`vault_admin_secret_path`); менять нельзя что-то одно руками.
+
+**Инвариант:** после ротации старый путь должен стать camo (404 → 200 landing), а не 302 на новый (такой 302 был бы leak'ом). Проверка — `curl -sI https://grinwer.online/admin/` должен возвращать 200 с `content-type: text/html`, а не `location: /mgmt-xxx/`.
+
+**Откат:** если после ротации не можешь зайти — снова `ansible-vault edit`, вернуть старое значение, прогнать play. Без доступа к админке откатить можно и вручную на хосте: `docker compose exec admin ls /usr/share/nginx/html` покажет, какой именно base baked в образ.
+
+---
+
+## 14. Порт-хоппинг Hysteria2 не работает (правила iptables не пережили ребут)
+
+**Симптом.** hy2-лег подключается на основном порту, но перестаёт работать, стоит клиенту задействовать порт-хоппинг. В логе Xray — `proxy/hysteria: failed to find an available destination > timeout: no recent network activity`.
+
+**Причина.** Роль `install_hysteria2` ставит DNAT-правило `hy2-port-hopping` (UDP `20000:40000` → порт hy2) и сохраняет его в `/etc/iptables/rules.v4`. Но восстанавливать правила после ребута должен `netfilter-persistent`, а на части нод он **не установлен** — таск `netfilter-persistent save` стоит с `changed_when: false` и не падает, если команды нет. Итог: правило есть в файле, но не в ядре.
+
+**Диагностика по флоту:**
+
+```bash
+cd infra/ansible
+ansible vpn_nodes -i inventories/prod/hosts.yml -m shell \
+  -a "iptables -t nat -S PREROUTING | grep -c hy2-port-hopping" \
+  --vault-password-file ~/.vpn_vault_pass
+# 1 — правило живо; 0 — отвалилось
+```
+
+Отличить «не применялось никогда» от «не пережило ребут» — сравнить файл и ядро:
+
+```bash
+ansible <нода> -i inventories/prod/hosts.yml -m shell \
+  -a "sed -n '/\*nat/,/COMMIT/p' /etc/iptables/rules.v4; iptables -t nat -S; which netfilter-persistent || echo NO-PERSISTENT" \
+  --vault-password-file ~/.vpn_vault_pass
+```
+
+**Починка — плейбуком** (идемпотентен, идёт по одной ноде, отказывается работать там, где это опасно):
+
+```bash
+cd infra/ansible
+ansible-playbook playbooks/fix_hy2_dnat.yml --vault-password-file ~/.vpn_vault_pass
+# только на конкретные:  -l aeza-ru-01,ufo-ru-01
+# посмотреть вхолостую:  --check
+```
+
+🔴 **Почему плейбук, а не `apt install` руками.** `apt install iptables-persistent` в postinst стартует юнит, а тот делает `iptables-restore` **без `--noflush`** — то есть ЗАМЕНЯЕТ живое ядро содержимым файла. Всё, что живёт только в ядре и в файл не попало, умирает молча: цепочки fail2ban, счётчики трафика, правила, добавленные ролями после последнего `save`. Воспроизведено в контейнере с systemd. Preseed `autosave_v4/v6`, который выглядит защитой, управляет только веткой `save` и к restore отношения не имеет. Плейбук перед установкой сверяет ядро с файлом и отказывается работать при расхождении.
+
+**Починка руками** (если плейбук почему-то недоступен — сверьте ядро с файлом ДО установки):
+
+```bash
+DEBIAN_FRONTEND=noninteractive apt-get install -y iptables-persistent
+iptables -t nat -C PREROUTING -p udp --dport 20000:40000 \
+  -m comment --comment hy2-port-hopping -j DNAT --to-destination :443 2>/dev/null \
+  || iptables -t nat -A PREROUTING -p udp --dport 20000:40000 \
+       -m comment --comment hy2-port-hopping -j DNAT --to-destination :443
+netfilter-persistent save
+```
+
+Проверка — `iptables -t nat -S PREROUTING` должен показать правило, и оно обязано пережить `reboot`.
+
+**Два побочных эффекта, о которых стоит знать заранее** (наблюдались на ufo-ru-03, 2026-08-25):
+
+1. **`iptables-persistent` конфликтует с `ufw` и сносит его.** На наших нодах ufw стоит, но `Status: inactive` (правила пишет bootstrap напрямую через iptables), поэтому фактической потери защиты нет. Перед установкой всё же проверьте: `ufw status`. Если где-то окажется `active` — сначала выясните, что именно он держит, иначе нода останется без этих правил.
+2. **`netfilter-persistent` при старте восстанавливает из `rules.v4` ВСЮ таблицу, а не только DNAT.** На ufo-ru-03 это вернуло задуманный bootstrap'ом набор filter-правил: 443/80/22 открыты, порт метрик 9100 закрыт для всех, кроме mgmt-хоста. До починки правил не было вовсе (политика `ACCEPT`), то есть 9100 висел открытым наружу — побочно закрылась и эта дыра. Но если в `rules.v4` лежит что-то устаревшее, оно тоже вернётся: перед установкой стоит прочитать файл (`sed -n '/\*filter/,/COMMIT/p' /etc/iptables/rules.v4`) и сверить с тем, что сейчас в ядре.
+
+**Почему это шире, чем порт-хоппинг.** `mport=20000-40000` уезжает в hy2-URI **всем** пользователям (`_build_hysteria2_credential`). Клиент, который этот параметр читает и начинает прыгать по портам, на такой ноде получит молчащий сервер — при полностью исправном на вид конфиге. То есть это кандидат в объяснение части жалоб «hy2 не работает у меня», а не только блокер для `SUB_XRAY_HY2_HOP`.
+
+**Гейт в подписке.** Пока ноды не починены, `SUB_XRAY_HY2_HOP` держим в `off` (`group_vars/web/main.yml`): включение вслепую меняет рабочий hy2-лег на молчащий.
+
+---
+
+## Бэкапы и восстановление БД
+
+Схема описана в `infrastructure/deployment.md` «Бэкапы БД». Коротко: раз в сутки web-хост снимает `pg_dump -Fc` в `/opt/vpn-backups`, шифрует и раскладывает копии по всем exit-нодам в `/opt/vpn-db-backups`; ручной бэкап перед деплоем — `playbooks/db_backup.yml`, он же тянет дамп на контроллер в `~/vpn-backups/`.
+
+**Снять дамп руками** (cwd = `infra/ansible`):
+
+```bash
+ansible-playbook playbooks/db_backup.yml --vault-password-file ~/.vpn_vault_pass
+# только локальный дамп, без push на exit'ы:
+ansible-playbook playbooks/db_backup.yml --vault-password-file ~/.vpn_vault_pass -e db_backup_no_push=true
+```
+
+**Проверить, что плановый бэкап живой:**
+
+```bash
+ansible nl-web -m shell -a "systemctl list-timers vpn-db-backup.timer --no-pager; cat /var/lib/vpn-db-backup/last-run.json; ls -l /opt/vpn-backups | tail -3"
+ansible wg_exit_nodes -m shell -a "ls -l --time-style=long-iso /opt/vpn-db-backups | tail -3"
+```
+
+Упал юнит — `journalctl -u vpn-db-backup -n 50` на web-хосте. rc=2 означает «дамп есть, но exit копию не принял»: чаще всего exit лежит или у него сменился host-ключ (пересоздан на том же IP) — прогнать `site.yml --tags backup -l web:wg_exit_nodes`, роль перечитает ключи через `ssh-keyscan`. Приёмник фиксирует копию только при совпадении размера и sha256, так что обрыв посреди передачи оставляет на exit'е не обрезок, а ничего — и rc=2.
+
+**Восстановить из локального дампа на web-хосте.** Восстанавливаем в ЧИСТУЮ базу, а не поверх живой: `pg_restore --clean` роняет только объекты, которые есть в дампе, а всё, что добавили миграции после дампа, осталось бы и уронило бы `alembic upgrade head` при старте backend'а. Дамп должен быть не старше кода, который стартует backend (миграции идут при старте); если код ушёл вперёд — сначала откатить код на версию времени дампа.
+
+```bash
+cd /opt/vpn
+docker compose stop backend bot worker worker-scheduler
+docker compose exec -T db psql -U vpn -d postgres -c 'DROP DATABASE vpn' -c 'CREATE DATABASE vpn OWNER vpn'
+docker compose exec -T db pg_restore -U vpn -d vpn -1 --exit-on-error < /opt/vpn-backups/vpn-<stamp>.dump
+docker compose up -d
+```
+
+Дамп с контроллера (`~/vpn-backups/`) сначала докинуть на хост: `ansible nl-web -m copy -a "src=~/vpn-backups/vpn-<stamp>.dump dest=/opt/vpn-backups/ mode=0600"`.
+
+**Восстановить из копии на exit-ноде** (web-хост потерян):
+
+```bash
+# 1. забрать зашифрованную копию с любого exit'а на контроллер
+ansible dc-nl-01 -m fetch -a "src=/opt/vpn-db-backups/vpn-<stamp>.dump.enc dest=~/vpn-backups/ flat=true"
+# 2. парольная фраза — из vault в файл, не на экран и не в командную строку
+umask 077
+ansible-vault view group_vars/web/vault.yml --vault-password-file ~/.vpn_vault_pass \
+    | sed -n 's/^vault_db_backup_passphrase: *"\{0,1\}\([^"]*\)"\{0,1\}$/\1/p' > ~/vpn-backups/.pass
+# 3. расшифровать (те же параметры, что у скрипта); проверка — первые 5 байт = PGDMP
+openssl enc -d -aes-256-cbc -md sha256 -pbkdf2 -iter 600000 \
+    -in ~/vpn-backups/vpn-<stamp>.dump.enc -out ~/vpn-backups/vpn-<stamp>.dump -pass file:$HOME/vpn-backups/.pass
+shred -u ~/vpn-backups/.pass
+head -c 5 ~/vpn-backups/vpn-<stamp>.dump
+```
+
+Дальше: поднять новый web-хост (`site.yml --tags web`), докинуть дамп и восстановить в чистую базу теми же командами, что выше. `APP_SECRET_KEY` в `.env` нового хоста должен быть тем же, иначе зашифрованные Fernet'ом поля (credentials, токены провайдеров) не прочитаются — он тоже в vault. Последний шаг обязателен: `site.yml --tags backup -l web:wg_exit_nodes` — на новом web-хосте родился новый push-ключ, exit'ы должны его получить; проверить `systemctl start vpn-db-backup.service` и `failed: 0` в `/var/lib/vpn-db-backup/last-run.json`.
+
+**Ограничения:** гранулярность — сутки (между дампами данные не защищены), алерта на упавший таймер нет, Redis (очередь RQ, кэш) не бэкапится и после потери поднимается пустым.
+
 ## Что делать, если ничего не помогает
 
-1. **Снять снапшот:** `docker compose logs > /tmp/vpn-logs-$(date +%s).txt`, `pg_dump`, `redis-cli -a $REDIS_PASSWORD save`.
+1. **Снять снапшот:** `docker compose logs > /tmp/vpn-logs-$(date +%s).txt`, дамп БД (`playbooks/db_backup.yml` с контроллера или `/usr/local/sbin/vpn-db-backup` на хосте), `redis-cli -a $REDIS_PASSWORD save`.
 2. **Остановить**: `docker compose down` (не `-v` — данные сохранятся в named volumes).
 3. **Сделать бэкап volume'ов** на всякий случай: `tar -czf /tmp/vpn_db_$(date +%s).tgz /var/lib/docker/volumes/vpn_db_data/`.
 4. **Читать** логи и БД в спокойной обстановке, не под нагрузкой.
@@ -385,7 +560,7 @@ docker compose exec backend alembic -c /app/alembic.ini history | head -20
 
 ## ⚠️ Неясные места
 
-- **Backup-стратегии нет** в репо. Никакого `pg_dump` cron'а, никакого WAL-shipping'а. Любой incident recovery сценарий предполагает, что БД цела — если нет, восстанавливать неоткуда, кроме ручного последнего снапшота.
+- **Бэкапы — только суточные дампы** (см. «Бэкапы и восстановление БД»). WAL-shipping'а нет, между дампами данные не защищены; алерта на упавший `vpn-db-backup.timer` нет — только `last-run.json`/journal.
 - **`audit_logs` и `health_probes` растут без retention.** Очистка — ручная операция, не зафиксирована в cron/timer.
 - **RQ failed-jobs очередь не мониторится.** Упавший physical_revoke job останется в failed registry навсегда, если его не чистить вручную. Нет алерта, что `failed_job_registry.count > N`.
 - **Sub_token invalidation при компрометации.** Нет документированного пути «я знаю, что у пользователя утёк sub_token, как его отозвать, не трогая подписку». Формально — `UPDATE subscriptions SET sub_token=NULL WHERE id=...`, но последствия (старый клиент перестанет получать конфиг) не документированы.

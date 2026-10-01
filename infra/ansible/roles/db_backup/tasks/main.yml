@@ -1,0 +1,128 @@
+---
+# db_backup — ставит на web-хост скрипт vpn-db-backup, его конфиг, парольную
+# фразу, выделенный SSH-ключ для exit'ов и systemd-таймер. Сам дамп снимает
+# скрипт (тот же, что дёргает ручной playbooks/db_backup.yml), поэтому
+# ручной и плановый бэкап не расходятся.
+
+- name: Require the backup passphrase (vault_db_backup_passphrase)
+  ansible.builtin.assert:
+    that:
+      - db_backup_passphrase | length >= 16
+    fail_msg: >-
+      db_backup_passphrase пуст или короче 16 символов. Задайте
+      vault_db_backup_passphrase в group_vars/web/vault.yml
+      (сгенерировать: openssl rand -base64 48). Без фразы копии на
+      exit-нодах невозможно расшифровать, поэтому роль останавливается.
+    quiet: true
+
+- name: Ensure openssl and the ssh client are present
+  ansible.builtin.apt:
+    name:
+      - openssl
+      - openssh-client
+    state: present
+    update_cache: true
+    cache_valid_time: 3600
+
+- name: Create backup directories (root-only)
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0700"
+  loop:
+    - "{{ db_backup_conf_dir }}"
+    - "{{ db_backup_dir }}"
+    - "{{ db_backup_state_dir }}"
+
+- name: Write the encryption passphrase
+  ansible.builtin.copy:
+    content: "{{ db_backup_passphrase }}\n"
+    dest: "{{ db_backup_passphrase_file }}"
+    owner: root
+    group: root
+    mode: "0600"
+  no_log: true
+
+- name: Generate the dedicated SSH key for pushing copies to exits
+  ansible.builtin.command:
+    cmd: >-
+      ssh-keygen -q -t ed25519 -N "" -C "vpn-db-backup@{{ inventory_hostname }}"
+      -f {{ db_backup_ssh_key }}
+    creates: "{{ db_backup_ssh_key }}"
+
+- name: Read the public half of the key
+  ansible.builtin.slurp:
+    src: "{{ db_backup_ssh_key }}.pub"
+  register: db_backup_pubkey_raw
+
+- name: Expose the public key as a fact (db_backup_receiver reads it)
+  ansible.builtin.set_fact:
+    db_backup_ssh_public_key: "{{ (db_backup_pubkey_raw.content | b64decode) | trim }}"
+    cacheable: true
+
+# Host-ключи exit'ов заранее кладём в отдельный known_hosts скрипта: пуш
+# идёт с BatchMode и StrictHostKeyChecking=accept-new, так что сменившийся
+# ключ (пересозданная VM на том же IP) не пройдёт молча — его обновит
+# следующий прогон роли. Недоступный сейчас exit просто пропускаем.
+- name: Scan exit host keys
+  ansible.builtin.command:
+    cmd: ssh-keyscan -T 10 -t ed25519 -p {{ item.port }} {{ item.host }}
+  loop: "{{ db_backup_targets }}"
+  loop_control:
+    label: "{{ item.name }}"
+  register: db_backup_keyscan
+  changed_when: false
+  failed_when: false
+
+- name: Record exit host keys in the script's known_hosts
+  ansible.builtin.known_hosts:
+    path: "{{ db_backup_state_dir }}/known_hosts"
+    name: "{{ item.item.host if (item.item.port | int) == 22 else '[' ~ item.item.host ~ ']:' ~ item.item.port }}"
+    key: "{{ item.stdout_lines | select('search', 'ssh-ed25519') | first }}"
+    state: present
+  loop: "{{ db_backup_keyscan.results }}"
+  loop_control:
+    label: "{{ item.item.name }}"
+  when:
+    - item.rc == 0
+    - item.stdout_lines | select('search', 'ssh-ed25519') | list | length > 0
+
+- name: Install the backup script
+  ansible.builtin.copy:
+    src: vpn-db-backup.sh
+    dest: /usr/local/sbin/vpn-db-backup
+    owner: root
+    group: root
+    mode: "0750"
+
+- name: Render the backup config
+  ansible.builtin.template:
+    src: config.j2
+    dest: "{{ db_backup_conf_dir }}/config"
+    owner: root
+    group: root
+    mode: "0600"
+
+- name: Install the systemd service and timer
+  ansible.builtin.template:
+    src: "{{ item }}.j2"
+    dest: "/etc/systemd/system/{{ item }}"
+    owner: root
+    group: root
+    mode: "0644"
+  loop:
+    - vpn-db-backup.service
+    - vpn-db-backup.timer
+  notify: Reload systemd units
+
+- name: Apply pending unit reloads before touching the timer
+  ansible.builtin.meta: flush_handlers
+
+- name: Enable and start the backup timer
+  ansible.builtin.systemd:
+    name: vpn-db-backup.timer
+    enabled: true
+    state: started
+    daemon_reload: true

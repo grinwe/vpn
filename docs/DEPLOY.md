@@ -168,6 +168,21 @@ Worker автоматически:
 - **Grafana dashboard**: `docs/dashboards/business-metrics.json` — импортируй в Grafana, тянет MRR, churn, LTV, warm-pool depth.
 - **Audit log**: `audit_log` таблица в БД. Каждое админ-действие, trial activation, referral attribution, provisioning-таска, revoke.
 
+## 11. Бэкапы БД
+
+Суточный `pg_dump` на web-хосте + зашифрованные копии на всех exit-нодах
+ставятся ролями `db_backup`/`db_backup_receiver` (`site.yml --tags backup -l web:wg_exit_nodes`).
+Нужна `vault_db_backup_passphrase` в `group_vars/web/vault.yml`
+(`openssl rand -base64 48`). Ручной дамп перед деплоем:
+
+```bash
+cd infra/ansible
+ansible-playbook playbooks/db_backup.yml --vault-password-file ~/.vpn_vault_pass
+```
+
+Где что лежит и как восстанавливать — `infrastructure/deployment.md`
+«Бэкапы БД» и `operations/runbook.md` «Бэкапы и восстановление БД».
+
 ## Troubleshooting
 
 | Симптом | Где смотреть |
