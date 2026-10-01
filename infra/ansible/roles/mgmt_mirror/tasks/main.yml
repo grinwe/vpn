@@ -1,0 +1,117 @@
+---
+# mgmt_mirror — поднять nginx-зеркало upstream-ресурсов (geoip.dat,
+# Xray-linux-64-*.zip) на mgmt-host'е. К нему ходят wrapper'ы
+# xray-{geoip,core}-fetch.sh с vpn-нод как к первому источнику до
+# fallback'а на ghproxy/jsdelivr/github.
+#
+# Зачем нужно: ряд RU-провайдеров троттлит/блокирует outbound к
+# github настолько что даже ghproxy не спасает (ru-cloud-web-02:
+# 5-минутный SSL timeout на любой URL включая jsdelivr CF-edge).
+# Mgmt-host же сидит на нормальном connectivity и работает как relay.
+#
+# Цель — db_host (там mgmt-1). Сам Docker должен быть установлен
+# заранее (он у нас уже стоит под основной /opt/vpn стек).
+
+- name: Ensure mgmt-mirror directory
+  ansible.builtin.file:
+    path: "{{ mgmt_mirror_dir }}"
+    state: directory
+    owner: root
+    group: root
+    mode: '0755'
+
+- name: Ensure assets subdir
+  ansible.builtin.file:
+    path: "{{ mgmt_mirror_dir }}/assets/xray"
+    state: directory
+    owner: root
+    group: root
+    mode: '0755'
+
+- name: Stage docker-compose.yml
+  ansible.builtin.copy:
+    src: docker-compose.yml
+    dest: "{{ mgmt_mirror_dir }}/docker-compose.yml"
+    owner: root
+    group: root
+    mode: '0644'
+  register: mgmt_mirror_compose
+
+- name: Stage nginx.conf
+  ansible.builtin.copy:
+    src: nginx.conf
+    dest: "{{ mgmt_mirror_dir }}/nginx.conf"
+    owner: root
+    group: root
+    mode: '0644'
+  register: mgmt_mirror_nginx
+
+- name: Stage refresh-assets.sh
+  ansible.builtin.copy:
+    src: refresh-assets.sh
+    dest: "{{ mgmt_mirror_dir }}/refresh-assets.sh"
+    owner: root
+    group: root
+    mode: '0755'
+
+# Initial fetch: качаем upstream при первом раскате (geoip.dat
+# отсутствует → нода-wrapper'ы получат 404 → fallback'нутся на github).
+# `creates:` guard защищает от повторных fetch'ей на каждом ansible-run'е;
+# weekly cron ниже обновляет geoip независимо. Принудительный refresh —
+# `--extra-vars mgmt_mirror_force_refresh=true` или ручным запуском
+# /opt/mgmt-mirror/refresh-assets.sh на mgmt'е.
+- name: Initial assets refresh (first run only unless forced)
+  ansible.builtin.command: "{{ mgmt_mirror_dir }}/refresh-assets.sh"
+  args:
+    creates: "{{ mgmt_mirror_dir }}/assets/geoip.dat"
+  when: not mgmt_mirror_force_refresh
+  changed_when: true
+
+- name: Force assets refresh
+  ansible.builtin.command: "{{ mgmt_mirror_dir }}/refresh-assets.sh"
+  when: mgmt_mirror_force_refresh
+  changed_when: true
+
+# `docker compose up -d` — идемпотентно. Если контейнер уже идёт с теми
+# же image+config — no-op. Если compose.yml/nginx.conf поменялись —
+# compose recreate'нёт сервис.
+- name: Bring mgmt-mirror compose stack up
+  ansible.builtin.command: docker compose up -d
+  args:
+    chdir: "{{ mgmt_mirror_dir }}"
+  changed_when: true
+
+# Force-recreate если поменялись compose.yml или nginx.conf — иначе
+# nginx продолжит читать старый bind-mount'нутый конфиг.
+- name: Recreate container on config change
+  ansible.builtin.command: docker compose up -d --force-recreate
+  args:
+    chdir: "{{ mgmt_mirror_dir }}"
+  when: mgmt_mirror_compose.changed or mgmt_mirror_nginx.changed
+  changed_when: true
+
+- name: Schedule weekly refresh via cron
+  ansible.builtin.cron:
+    name: "mgmt-mirror weekly refresh"
+    minute: "{{ mgmt_mirror_refresh_cron_minute }}"
+    hour: "{{ mgmt_mirror_refresh_cron_hour }}"
+    weekday: "{{ mgmt_mirror_refresh_cron_weekday }}"
+    job: "{{ mgmt_mirror_dir }}/refresh-assets.sh >> /var/log/mgmt-mirror-refresh.log 2>&1"
+    user: root
+
+- name: Ensure ufw allows mirror port (no-op on inactive ufw)
+  community.general.ufw:
+    rule: allow
+    port: "{{ mgmt_mirror_port }}"
+    proto: tcp
+    comment: "mgmt-mirror — upstream relay для vpn-нод"
+  failed_when: false
+
+- name: Smoke-check mirror reachable from itself
+  ansible.builtin.uri:
+    url: "http://localhost:{{ mgmt_mirror_port }}/healthz"
+    status_code: 200
+  register: mgmt_mirror_smoke
+  retries: 5
+  delay: 3
+  until: mgmt_mirror_smoke.status == 200

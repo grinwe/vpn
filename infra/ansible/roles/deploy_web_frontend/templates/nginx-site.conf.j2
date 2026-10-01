@@ -1,9 +1,11 @@
 # {{ ansible_managed }}
 #
 # Single-domain nginx vhost: {{ deploy_web_frontend_domain }} terminates
-# TLS on the host and proxies two loopback upstreams:
-#   /admin/  -> admin SPA container (docker, {{ deploy_web_frontend_admin_upstream }})
-#   /api/    -> backend FastAPI      (docker, {{ deploy_web_frontend_api_upstream }})
+# TLS on the host and proxies three loopback upstreams:
+#   /{{ deploy_web_frontend_admin_path }}/   -> admin SPA container (docker, {{ deploy_web_frontend_admin_upstream }})
+#   /app/    -> Telegram WebApp container     (docker, {{ deploy_web_frontend_webapp_upstream }})
+#   /api/    -> backend FastAPI               (docker, {{ deploy_web_frontend_api_upstream }})
+# Всё остальное — camo-landing (см. anti-probing план / stage 3).
 #
 # TLS cert is obtained via certbot DNS-01 challenge against Cloudflare
 # (see tasks/main.yml). Certificate paths below are Let's Encrypt's
@@ -27,8 +29,20 @@ server {
 }
 
 server {
-    listen 443 ssl http2;
-    listen [::]:443 ssl http2;
+    # http2 СНЯТ намеренно, и это не про этот домен, а про соседний vhost.
+    # В nginx 1.24 `http2` — параметр слушающего СОКЕТА, а не server-блока
+    # (per-server `http2 off;` появился только в 1.25.1). Сокет :443 общий
+    # с зеркалом саб-линка (nginx-sub-mirror.conf.j2), которому HTTP/2
+    # противопоказан: RKN DPI на 4G режет H2-stream после handshake. Пока
+    # nginx младше 1.25.1, единственный способ выключить h2 зеркалу —
+    # выключить его на сокете.
+    #
+    # Для самого grinwer.online потеря нулевая: клиентский TLS терминирует
+    # Cloudflare, здесь остаётся только плечо CF→origin, которому HTTP/1.1
+    # достаточно. Вернуть http2 можно после апгрейда nginx до 1.25.1+,
+    # добавив в зеркало `http2 off;`.
+    listen 443 ssl;
+    listen [::]:443 ssl;
     server_name {{ deploy_web_frontend_domain }};
 
     ssl_certificate     /etc/letsencrypt/live/{{ deploy_web_frontend_domain }}/fullchain.pem;
@@ -43,6 +57,13 @@ server {
     ssl_session_cache shared:SSL:10m;
     ssl_session_tickets off;
 
+    # Strip the nginx version from the Server: header so an active
+    # prober can't fingerprint the exact build. `proxy_hide_header` in
+    # each proxy location below drops upstream Server/X-Powered-By for
+    # the same reason (ngx_headers_more is not guaranteed to be built
+    # in, so we use the stock directives).
+    server_tokens off;
+
     # HSTS. CF also sets it, but belt-and-braces — if someone ever
     # points straight at origin bypassing CF, this still applies.
     add_header Strict-Transport-Security "max-age=15768000" always;
@@ -51,11 +72,6 @@ server {
     # eat the box. Backend's largest legit body is the manual-mark
     # invoice JSON, well under 1 MB.
     client_max_body_size 2m;
-
-    # Root -> /admin/ for convenience.
-    location = / {
-        return 302 /admin/;
-    }
 
     # Telegram WebApp (Mini App) SPA. Same proxy pattern as /admin/ —
     # the webapp container serves its bundle under /app/ so asset URLs
@@ -66,16 +82,30 @@ server {
         proxy_set_header X-Real-IP $remote_addr;
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_hide_header X-Powered-By;
+        proxy_hide_header Server;
     }
 
-    # Admin SPA. trailing slash on both sides preserves the /admin/
-    # prefix so the bundled asset URLs (base: "/admin/") resolve.
-    location /admin/ {
-        proxy_pass http://{{ deploy_web_frontend_admin_upstream }}/admin/;
+    # Admin SPA за secret path'ом (см. deploy_web_frontend_admin_path).
+    # По дефолту — /admin/. Если задан vault_admin_secret_path, сюда
+    # приходит /mgmt-<hex>/; admin-контейнер внутри собран с тем же
+    # base'ом и отдаёт статику по этому префиксу, поэтому proxy_pass
+    # проксирует как есть (trailing slash сохраняет префикс).
+    #
+    # Ссылаться на старый /admin/ снаружи после переключения бесполезно —
+    # попадёт в camo-landing ниже (404 от root catch-all).
+    #
+    # Referrer-Policy — external-ссылки из админки (логи, интерком и
+    # т.п.) не должны утекать полный URL с secret-путём в чужие логи.
+    location /{{ deploy_web_frontend_admin_path }}/ {
+        proxy_pass http://{{ deploy_web_frontend_admin_upstream }}/{{ deploy_web_frontend_admin_path }}/;
         proxy_set_header Host $host;
         proxy_set_header X-Real-IP $remote_addr;
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_hide_header X-Powered-By;
+        proxy_hide_header Server;
+        add_header Referrer-Policy "same-origin" always;
     }
 
     # Backend API. proxy_pass without a trailing slash preserves the
@@ -87,6 +117,8 @@ server {
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto $scheme;
         proxy_read_timeout 60s;
+        proxy_hide_header X-Powered-By;
+        proxy_hide_header Server;
     }
 
     # #62 — Telegram Bot API webhook. Telegram sends updates here
@@ -99,6 +131,8 @@ server {
         proxy_set_header X-Real-IP $remote_addr;
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_hide_header X-Powered-By;
+        proxy_hide_header Server;
     }
 
     # Dynamic subscription link endpoint — lives outside /api/ by
@@ -110,11 +144,17 @@ server {
         proxy_set_header X-Real-IP $remote_addr;
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_hide_header X-Powered-By;
+        proxy_hide_header Server;
     }
 
-    # Block anything else — no static site, no root index. Keeps the
-    # surface small.
+    # Camo-landing на всё, что не /app/, /{admin_path}/, /api/, /sub/,
+    # /tg-webhook. До stage-3 здесь был голый 404 — активные проберы
+    # получали пустой корень как VPN-маркер. Теперь скучный «internal
+    # tools portal» с 200, чтобы нас путали с корпоративным фронтом.
     location / {
-        return 404;
+        root {{ deploy_web_frontend_camo_root }};
+        index index.html;
+        try_files $uri $uri/ /index.html =404;
     }
 }

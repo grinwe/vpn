@@ -25,10 +25,18 @@ emits if you run it locally.
 from __future__ import annotations
 
 import base64
+import re
 import secrets
 
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey
+
+# UUID v4 wire format used in xray.clients[] and vless:// URIs.
+_UUID_RE = re.compile(
+    r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
+    re.IGNORECASE,
+)
+_VLESS_URI_USER_RE = re.compile(r"^vless://([^@/?#\s]+)@", re.IGNORECASE)
 
 
 def _b64url_nopad(data: bytes) -> str:
@@ -53,6 +61,30 @@ def generate_reality_keypair() -> tuple[str, str]:
 def generate_short_id() -> str:
     """Return a Reality ``shortId`` — 8 bytes of hex, xray's typical length."""
     return secrets.token_hex(8)
+
+
+def extract_uuid_from_vless_url(value: str | None) -> str | None:
+    """Return the VLESS user UUID embedded in ``value``, or ``None``.
+
+    Accepts either a bare UUID string or a full ``vless://UUID@host:port?...``
+    URI — operators paste whatever the user sends from Hiddify. The
+    returned UUID is always lowercased: claim-orphan матчит его подстрокой по
+    РАСШИФРОВАННОМУ ``Credential.config_text`` (сама колонка с 2026-07-25
+    хранит Fernet-блоб), и обе стороны сравнения приводятся к нижнему
+    регистру — регистро-независимость прежнего SQL ``ILIKE`` сохранена.
+    """
+    if not value:
+        return None
+    s = value.strip()
+    if not s:
+        return None
+    m = _VLESS_URI_USER_RE.match(s)
+    if m:
+        s = m.group(1)
+    m = _UUID_RE.search(s)
+    if m:
+        return m.group(0).lower()
+    return None
 
 
 def generate_wireguard_keypair() -> tuple[str, str]:

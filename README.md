@@ -56,7 +56,7 @@ docker-compose logs -f backend
 | `/status` | Show subscription status |
 | `/renew` | Renew subscription (legacy invoice flow) |
 | `/referral` | Get referral link (see Referral program below for payout mechanics) |
-| `/newconfig` | Self-service: regenerate config on a different node |
+| `/newconfig` | Self-service repair: moves the whole subscription to another node (same path as the «all my devices» button, `POST /api/admin/client-control/report-broken`) |
 
 ## Payment Providers
 
@@ -78,8 +78,8 @@ docker-compose logs -f backend
 - **Health probes** with regional granularity + auto-migration
 - **Autoscale** via Hetzner API when utilization > high watermark, with Prometheus visibility (`vpn_autoscale_pool_utilization`, `vpn_autoscale_events_total{outcome=…}`)
 - **Telegram Mini App** — full личный кабинет with native Stars checkout (`tg.openInvoice`)
-- **Free trial** — any user can one-shot activate a trial via WebApp: credits the price of Basic 1m (read from DB, not hardcoded) as `kind=bonus` onto the balance. Gated by `User.trial_activated_at IS NULL`, row-locked. Worker sends a warning `TRIAL_EXPIRY_WARN_DAYS` before `trial_expires_at`; on expiry, users without any real `kind=topup` get a `kind=adjust` clawback of `min(15000, balance)`. Paid users keep everything. See [docs/TRIAL_SYSTEM.md](docs/TRIAL_SYSTEM.md).
-- **Referral program** — three-stage, anti-farm: (1) **attribution** happens on any `/start ref_XXX` while `user.referred_by_id IS NULL`, no bonus at this point; (2) **referee bonus** `REFERRAL_BONUS_KOPECKS` is credited when the referee activates their trial; (3) **referrer payout** of the same amount is credited only when the referee makes their **first real `kind=topup`** via a payment webhook. Idempotent via `referral_payout:{user_id}` reference. Fake-account farming yields zero payout until real money flows.
+- **Free trial (3 days since 2026-09-30)** — any user can one-shot activate free days from the bot or the WebApp: one server-side service (`services.trial.activate_trial_full`) credits `TRIAL_DURATION_DAYS` (3) days at the cheapest visible 30-day plan's daily price (Solo: 15 ₽, read from DB, not hardcoded) as `kind=bonus` and immediately spends it on a subscription for those days plus `TRIAL_HIDDEN_HOURS` (24) unbilled hidden hours. Gated by `User.trial_activated_at IS NULL`, row-locked; a second trial after expiry returns 409 «Trial already used». Worker sends a warning `TRIAL_EXPIRY_WARN_DAYS` before `trial_expires_at` (skipped when the balance covers renewal or the sub is already paid); on expiry, users who never paid get a `kind=adjust` clawback of the unspent bonus only. Freeze is available only after the first payment. See [docs/TRIAL_SYSTEM.md](docs/TRIAL_SYSTEM.md).
+- **Referral program** — three-stage, anti-farm: (1) **attribution** happens on any `/start ref_XXX` while `user.referred_by_id IS NULL`, no bonus at this point; (2) **referee gift** of `bonus_days` (default 3) is added to the trial, 3 + 3 = 6 free days; (3) **referrer payout** of `reward_days` (default 10) is credited only on the referee's **first payment of any kind** (topup or a plan/renewal invoice). Idempotent via `referral_payout:{user_id}` reference. Fake-account farming yields zero payout until real money flows.
 - **Self-service** — users can regenerate configs via bot
 - **Credential sharing protection** — per-device sub_tokens (each device gets its own sub link) + local enforcer daemon on nodes (xray access log → detect 2+ IPs per UUID → xray gRPC rmuser/adduser cycle, instant disconnect)
 - **4 VPN protocols** with automatic fallback
@@ -132,9 +132,10 @@ See [docs/DEPLOY.md](docs/DEPLOY.md) for full deployment guide.
 | `BALANCE_CHARGE_INTERVAL` | No | Balance tick interval, seconds (default 3600). |
 | `MAX_FREEZE_DAYS_PER_PERIOD` | No | Per-freeze cap (default 14). |
 | `FREEZE_YEAR_BUDGET_DAYS` | No | Yearly freeze budget per sub (default 30). |
-| `REFERRAL_BONUS_KOPECKS` | No | Referral bonus amount (default 5000 = ₽50). Paid to referee on trial activation, to referrer on referee's first real topup. |
-| `TRIAL_DURATION_DAYS` | No | Trial window from activation (default 30). |
-| `TRIAL_EXPIRY_WARN_DAYS` | No | Warning sent this many days before trial expiry (default 3). |
+| `REFERRAL_BONUS_KOPECKS` | No | Legacy referral amount (default 5000 = ₽50), used only when there is no visible 30-day plan to convert days into money. Referral rewards are in days now (`REFERRAL_INVITEE_DAYS`, `REFERRAL_REWARD_DAYS`). |
+| `TRIAL_DURATION_DAYS` | No | Visible free trial days (default 3, was 30 before 2026-09-30). Backend. |
+| `TRIAL_HIDDEN_HOURS` | No | Unbilled hidden hours on top of the free days (default 24, `0` disables). Backend. |
+| `TRIAL_EXPIRY_WARN_DAYS` | No | Warning sent this many days before trial expiry (default 3). Worker. |
 | `MIN_TOPUP_KOPECKS` | No | Minimum topup amount (default 10000 = ₽100). |
 | `LOW_BALANCE_WARN_DAYS` | No | Threshold for low-balance bot warning (default 3). |
 

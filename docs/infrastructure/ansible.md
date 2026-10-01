@@ -13,7 +13,7 @@ infra/ansible/
 ├── requirements.yml              ← галакси-зависимости (если есть)
 ├── group_vars/
 │   ├── vpn_nodes.yml             ← роли: ansible_user, firewall_allowed_ports,
-│   │                                    vpn_system_user, ssh_public_keys, domain_mask
+│   │                                    vpn_system_user, ssh_public_keys
 │   ├── db.yml
 │   ├── monitoring.yml
 │   ├── web.yml
@@ -26,13 +26,14 @@ infra/ansible/
 │   ├── diagnose_node.yml         ← диагностика, read-only
 │   ├── deploy_app_stack.yml      ← deploy на web-host (docker-compose + nginx)
 │   ├── deploy_web_frontend.yml   ← SPA build + nginx site conf
-│   └── deploy_monitoring.yml     ← Grafana/Prometheus на monitoring-host
+│   ├── deploy_monitoring.yml     ← Grafana/Prometheus на monitoring-host
+│   └── mgmt_mirror.yml           ← standalone-раскат mgmt-зеркала upstream (см. ниже)
 └── roles/
     ├── base_node                 ← общие системные настройки (не vpn-спец.)
     ├── bootstrap_node            ← pre-install: user, ufw (+ rate-limit 22/tcp), sshd-hardening, fail2ban, unattended-upgrades, apt
     ├── install_shadowtls_stack   ← ShadowTLS v3 + shadowsocks-rust
     ├── install_vless_reality     ← xray + VLESS Reality (xtls-rprx-vision)
-    ├── install_vless_ws_cdn      ← xray + VLESS/WS за Cloudflare
+    ├── install_vless_ws_cdn      ← xray + VLESS/WS, прямой TLS (LE), DNS-only (без CF-прокси)
     ├── install_vless_xhttp       ← xray + VLESS/xHTTP
     ├── install_hysteria2         ← hysteria2 (UDP)
     ├── install_probe_agent       ← опциональный node-to-node health probe
@@ -40,12 +41,76 @@ infra/ansible/
     ├── relay_jump_node           ← WG tunnel client → чужая exit-нода
     ├── wg_exit_node              ← non-RU exit нода для relay'ев
     ├── check_node_health         ← post-install assertion: порты LISTEN
+    ├── xray_geoip                ← geoip.dat fetcher с CDN-fallback (mirror→jsdelivr→ghproxy→github) + weekly timer
+    ├── xray_core                 ← xray-core install через CDN-fallback (mirror→ghproxy→github), pinned version
+    ├── mgmt_mirror               ← nginx-зеркало upstream-ресурсов на web-host'е (см. ниже)
     ├── db_host                   ← PostgreSQL + volume на mgmt-хосте
     ├── deploy_app_stack          ← backend, bot, redis, db compose-stack на web
     ├── deploy_web_frontend       ← nginx site для SPA и sub-ссылок
     ├── monitoring_stack          ← Grafana/Prometheus compose на nl-monitoring
     └── node_exporter             ← prom node_exporter (запускается поверх vpn_nodes)
 ```
+
+## mgmt-mirror — собственное зеркало upstream
+
+Часть RU-провайдеров троттлит outbound к `github.com` и его зеркалам
+настолько, что `curl` стоит 5+ минут SSL-handshake и фейлится: видели на
+`ru-cloud-web-02` при попытке скачать `Xray-linux-64.zip` (даже через
+`ghproxy.com`). Чтобы ноды не зависели от capricious-доступности
+upstream'а, у нас есть свой mini-mirror на web-host'е (`nl-web` /
+`mgmt-1` — один IP).
+
+### Что лежит в зеркале
+
+`/srv/assets/` на nginx-контейнере отдаёт по `http://<web-host>:8090/`:
+
+| URL | Что |
+|---|---|
+| `/geoip.dat` | v2fly geoip database (latest, qweekly refresh) |
+| `/geosite.dat` | v2fly geosite list |
+| `/xray/Xray-linux-64-<version>.zip` | pinned-версии xray-core |
+| `/healthz` | docker healthcheck endpoint |
+
+Источник правды pinned-версий — `XRAY_VERSIONS` массив в
+[refresh-assets.sh](../../infra/ansible/roles/mgmt_mirror/files/refresh-assets.sh).
+Bump xray — два места: тут + `xray_core_version` в
+[roles/xray_core/defaults/main.yml](../../infra/ansible/roles/xray_core/defaults/main.yml).
+При реальной установке новой версии роль `xray_core` сама рестартует активные
+сервисы (`xray`, `xray-ws-cdn`, `xray-xhttp`) — новый бинарь применяется сразу,
+ручной рестарт после бампа не нужен.
+
+### Как ноды его находят
+
+[group_vars/all.yml](../../infra/ansible/inventories/prod/group_vars/all.yml)
+задаёт `xray_mirror_url: "http://{{ hostvars['mgmt-1']['ansible_host'] }}:8090"`.
+`bootstrap_node` рендерит `/etc/default/xray-mirror` на каждой ноде, оттуда
+wrapper'ы `xray-geoip-fetch.sh` и `xray-core-fetch.sh` подхватывают `MIRROR_URL`
+и пробуют его **первым** в цепочке. При недоступности — fallback на
+ghproxy/jsdelivr/github как раньше.
+
+### Раскатка
+
+В составе общего `site.yml`:
+
+```bash
+ansible-playbook -i inventories/prod/hosts.yml site.yml --tags web,mirror
+```
+
+Точечно, только mirror без перетряхивания backend/admin:
+
+```bash
+ansible-playbook -i inventories/prod/hosts.yml playbooks/mgmt_mirror.yml
+```
+
+Принудительный refresh upstream'а (после bump'а xray-version, например):
+
+```bash
+ansible-playbook -i inventories/prod/hosts.yml playbooks/mgmt_mirror.yml \
+    -e mgmt_mirror_force_refresh=true
+```
+
+Cron на mgmt'е сам обновляет geoip раз в неделю (понедельник 04:00,
+лог `/var/log/mgmt-mirror-refresh.log`).
 
 ## `ansible.cfg` — важные дефолты
 
@@ -70,17 +135,19 @@ pipelining = True
 
 ## Inventory
 
-**Статический inventory** — `inventories/prod/hosts.yml` — содержит **только инфраструктуру**:
+**Статический inventory** — `inventories/prod/hosts.yml` — содержит инфраструктуру **и snapshot fleet'а для static plays**:
 
 ```yaml
-db_host:     { mgmt-1       → 45.14.244.140 }
-monitoring:  { nl-monitoring → 45.14.244.140 }
-web:         { nl-web       → 45.14.244.140 }
+db_host:        { mgmt-1       → 45.14.244.140 }
+monitoring:     { nl-monitoring → 45.14.244.140 }
+web:            { nl-web       → 45.14.244.140 }
+vpn_nodes:      { ru-*         → RU relay-ноды }
+wg_exit_nodes:  { kr-*, fr-*, tq-*, uk-*, ur-*, cz-*, nl-* → non-RU exit-ноды }
 ```
 
-Все три — один и тот же IP. Разделение только логическое: когда появится вторая машина, это тривиальный inventory-edit.
+Первые три — один и тот же IP. Разделение только логическое: когда появится вторая машина, это тривиальный inventory-edit. Группы `vpn_nodes`/`wg_exit_nodes` нужны для **bulk/static operator-plays** (`monitoring`, ручной rollout bootstrap'а, fleet-wide audit). Это **snapshot**, не источник истины.
 
-**VPN-ноды в inventory не записываются.** Секция `vpn_nodes:` закомментирована. Реальные ноды приходят из **базы данных** и материализуются в **temp-inventory на лету** при каждом `run_playbook`-вызове (функция `build_inventory_for_node` в `backend/app/services/ansible_runner.py`, рендерит через `.format()` шаблон вида):
+**Provisioning runtime inventory — всё ещё dynamic из БД.** Реальные ноды для ad-hoc `run_playbook`-вызовов из backend'а материализуются в **temp-inventory на лету** (функция `build_inventory_for_node` в `backend/app/services/ansible_runner.py`, рендерит через `.format()` шаблон вида):
 
 ```yaml
 all:
@@ -109,7 +176,7 @@ all:
 
 **Cleanup контракт.** `build_inventory_for_node` возвращает путь к файлу с `delete=False`, и **каллер обязан** вызвать `inventory.unlink()` в `finally`-блоке — иначе `/tmp` забивается по одному файлу на каждый прогон. Текущие вызовы (`provisioning.py::_run_ansible`, `warm_pool.py::_warm_bundle`/`_physical_revoke`) это делают; перед добавлением нового caller'а проверьте grep'ом.
 
-Для ручных операторских прогонов (`ansible-playbook site.yml`) inventory с реальными VPN-нодами просто не существует в git-репо — это сознательное решение. Заливку с оператор-машины предполагается делать с подменой через `-i`.
+Для ручных операторских прогонов (`ansible-playbook site.yml`) используется snapshot из `hosts.yml`. **Дрейф-риск:** fleet ведётся в БД (`VPNNode`-таблица) как источник истины; `hosts.yml` — ручной snapshot, обновляется оператором при добавлении/выводе нод. Если после спавна новой ноды забыть добавить её в `hosts.yml`, monitoring play её не накроет (node_exporter не встанет, Prometheus target не появится). Pre-flight check отсутствует — жить с этим, пока fleet маленький; при росте — либо dynamic inventory script из БД, либо обязательный step в runbook'е спавна ноды.
 
 ## `site.yml` — главный playbook
 
@@ -196,6 +263,8 @@ username, uuid, password, protocols: [{proto, port[, method]}], state: present|a
 
 Playbook циклит `protocols` и для каждого вызывает правильный скрипт. Идемпотентен: `add` → уже есть → skip, `del` → отсутствует → skip.
 
+Если manage-скрипт запрошенного протокола отсутствует на ноде (нода не bootstrap'нута под протокол), при `state=present` playbook **падает** с сообщением `node is not bootstrapped for <proto>` — раньше задача молча скипалась и backend считал девайс успешно провижнутым (аудит #174). При `state=absent` отсутствие скрипта по-прежнему skip: revoke на пустой ноде — норма.
+
 **Forward-compat тонкость для ShadowTLS+SS.** Сейчас `manage_vpn_user.sh` — no-op логгер (один SS password на ноду, multi-user ещё не заведён на SS2022 EIH). Но скрипт жёстко требует 4 позиционных аргумента, и ansible `command:` silently drops empty-string args. Чтобы на revoke (без password'а) счётчик аргументов не сбивался, в playbook явно передаётся литерал `'x'`:
 
 ```yaml
@@ -270,7 +339,7 @@ Xray биндит исходящий freedom-socket на интерфейс `wg0
 
 `roles/wg_exit_node/tasks/main.yml`. Настраивает WireGuard **сервер** на чужой (не-RU) машине: устанавливает wg-tools, рендерит `wg0.conf` с peers, включает NAT masquerade и IP forwarding. Эта нода — terminus трафика относительно relay'ев.
 
-Отдельная hosts-секция в `site.yml` (`- hosts: wg_exit_nodes`), но в inventory эта группа **не определена** — предполагается, что exit-ноды добавляются динамически через `-i` или через group_vars на стороне оператора. (`inventories/prod/hosts.yml` их не содержит.)
+Отдельная hosts-секция в `site.yml` (`- hosts: wg_exit_nodes`). Группа **описана** в `inventories/prod/hosts.yml` — это статический snapshot для operator-plays (monitoring, rollout node_exporter, fleet audit). Для ad-hoc provisioning из backend'а используется dynamic inventory из БД.
 
 ## Как backend использует ansible
 
@@ -314,8 +383,7 @@ Matching вызовов backend → ansible (из `provisioning.py:692-773` и `
 
 - **`host_key_checking = False` + динамический inventory.** Каждый новый ansible-run backend'а открывает SSH в ноду, взятую из БД, без какой-либо записи в `known_hosts`. MITM между backend'ом и нодой полностью незаметен ansible'у. Защита остаётся только «доверие к IPv4-адресу в `vpn_nodes.host`».
 - **Секреты в CLI-строке `--extra-vars`.** `shadowtls_password`, `shadowtls_ss_password`, `relay_wg_private_key`, `vless_reality_private_key` — все попадают в ansible через `json.dumps(extra_vars)` как аргумент команды. В `ps auxf` на worker-хосте это видно любому пользователю, имеющему читать `/proc/*/cmdline`. В контейнере worker'а root — только process owner'а, но host-level инспектор (если кто-то получит host) увидит секреты в аргументах.
-- **`wg_exit_nodes` группа не описана в `inventories/prod/hosts.yml`.** Роль есть, playbook'ная секция есть, но `ansible-playbook site.yml` на бэкенде ничего не сделает с exit-нодами, потому что группа пустая. Как реально развёрнуты существующие exit-ноды — нигде не видно.
-- **Реальные VPN-ноды НЕ в git'е inventory.** Запрос «посмотреть, какие ноды сейчас в проде» возможен только через backend.db (`vpn_nodes`), не через `git log` ansible-репо. Для disaster recovery оператору нужен доступ к БД, иначе он не знает, куда деплоиться.
+- **`hosts.yml` vs БД — дрейф-риск.** Fleet ведётся в БД (`VPNNode` / `WGExitNode`) как источник истины для provisioning'а; `hosts.yml` — ручной snapshot для operator-plays (monitoring, bulk rollout). Если после спавна ноды забыть добавить её в `hosts.yml`, monitoring play её не накроет: node_exporter не встанет, Prometheus target не появится, нода «пропадёт» из Grafana.
 - **Playbook `diagnose_node.yml` не упомянут в `deployment.md`-роутах.** В `playbooks/` есть, orchestrator его зовёт (`action=diagnose`), но как именно оператор триггерит диагностику — через API-эндпоинт `/api/nodes/{id}/diagnose` или напрямую `ansible-playbook` — не документировано в коде однозначно.
 - **`forks = 20` в defaults** — но backend процесс ограничивает параллельность через `MAX_CONCURRENT_ANSIBLE=3` (и warm_pool — ещё два). Эффективно используется только один fork на запуск (одна нода в temp-inventory). Высокий `forks` — это наследие, когда site.yml мог бить по нескольким нодам сразу вручную; сейчас никогда не стреляет.
 

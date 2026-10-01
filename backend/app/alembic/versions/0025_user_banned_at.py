@@ -13,6 +13,8 @@ from __future__ import annotations
 from alembic import op
 from sqlalchemy import Column, DateTime
 
+from app.alembic._idempotent import has_column
+
 revision = "0025_user_banned_at"
 down_revision = "0024_node_suspect_since"
 branch_labels = None
@@ -20,7 +22,8 @@ depends_on = None
 
 
 def upgrade() -> None:
-    op.add_column("users", Column("banned_at", DateTime, nullable=True))
+    if not has_column("users", "banned_at"):
+        op.add_column("users", Column("banned_at", DateTime, nullable=True))
 
 
 def downgrade() -> None:

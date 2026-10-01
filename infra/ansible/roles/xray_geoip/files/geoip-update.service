@@ -1,0 +1,31 @@
+[Unit]
+Description=Refresh xray geoip.dat via fallback CDN chain
+After=network-online.target
+Wants=network-online.target
+ConditionPathExists=/usr/local/bin/xray-geoip-fetch.sh
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/xray-geoip-fetch.sh
+# Все try-restart с best-effort префиксом `-`. try-restart трогает
+# только АКТИВНЫЕ юниты: на чисто-xhttp ноде xray.service отключён,
+# не воскрешаем его с stale config.json; на чисто-Reality нет
+# xray-xhttp. `-` гасит non-zero от inactive/not-loaded юнита — иначе
+# падение одного флавора пометило бы oneshot failed И оборвало бы
+# следующую строку ExecStart, живой xray так и не получил бы свежий
+# geoip.
+#
+# xray-ws-cdn добавлен 2026-07-28 вместе с RU-обходом на этом протоколе:
+# до того третий инстанс geoip не перечитывал и после weekly-обновления
+# крутил файл, загруженный при старте.
+ExecStart=-/bin/systemctl try-restart xray
+ExecStart=-/bin/systemctl try-restart xray-xhttp
+ExecStart=-/bin/systemctl try-restart xray-ws-cdn
+# hysteria читает geo-базы ТОЛЬКО при старте (hot-reload нет, а geoUpdateInterval
+# не применяется, когда путь к файлу задан явно). Без этой строки hy2 крутила бы
+# geoip.dat, загруженный при старте демона, сколь угодно долго — а у неё, в
+# отличие от xray, правило geoip:ru несущее: доменный список покрывает не всё.
+ExecStart=-/bin/systemctl try-restart hysteria-server
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7

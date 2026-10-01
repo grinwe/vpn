@@ -1,0 +1,94 @@
+---
+# DB-бэкап перед деплоем. pg_dump (custom-format, сжатый) из db-контейнера
+# app-стека на web-хосте. Кладём ВНЕ /opt/vpn — иначе rsync деплоя
+# (deploy_app_stack, delete: true) снесёт каталог — плюс тянем копию на
+# контроллер (~/vpn-backups, вне репозитория).
+#
+# Запуск (cwd = infra/ansible):
+#   ansible-playbook playbooks/db_backup.yml --vault-password-file ~/.vpn_vault_pass
+#
+# Восстановление:
+#   docker compose -f /opt/vpn/docker-compose.yml exec -T db \
+#     pg_restore -U vpn -d vpn --clean --if-exists < vpn-<stamp>.dump
+- hosts: web
+  gather_facts: false
+  vars:
+    db_backup_dir: /opt/vpn-backups
+    # Ротация: дампы старше N дней удаляются после успешного нового бэкапа.
+    db_backup_retention_days: 14
+  tasks:
+    - name: Freeze backup filename once (lookup in vars re-evaluates per use)
+      set_fact:
+        db_backup_file: "{{ db_backup_dir }}/vpn-{{ lookup('pipe', 'date +%Y%m%d-%H%M%S') }}.dump"
+
+    - name: Ensure backup dir exists (outside /opt/vpn, survives deploy rsync)
+      file:
+        path: "{{ db_backup_dir }}"
+        state: directory
+        mode: "0700"
+
+    - name: pg_dump (custom format) from the app-stack db container
+      # rc редиректа = rc pg_dump'а → упавший дамп валит таск; assert ниже —
+      # вторая страховка от пустого/обрезанного файла.
+      shell: >
+        docker compose exec -T db pg_dump -U vpn -Fc -d vpn > "{{ db_backup_file }}"
+      args:
+        chdir: /opt/vpn
+      changed_when: true
+
+    - name: Stat the dump
+      stat:
+        path: "{{ db_backup_file }}"
+      register: db_backup_stat
+
+    - name: Fail if dump is missing or suspiciously small (pg_dump likely errored)
+      assert:
+        that:
+          - db_backup_stat.stat.exists
+          - db_backup_stat.stat.size > 4096
+        fail_msg: >-
+          Backup {{ db_backup_file }} missing or too small
+          ({{ db_backup_stat.stat.size | default(0) }} B) — pg_dump probably failed.
+        success_msg: >-
+          Backup OK: {{ db_backup_file }}
+          ({{ (db_backup_stat.stat.size / 1024 / 1024) | round(2) }} MB)
+
+    - name: Fetch dump to controller (~/vpn-backups, outside the repo)
+      fetch:
+        src: "{{ db_backup_file }}"
+        dest: "{{ lookup('env', 'HOME') }}/vpn-backups/"
+        flat: true
+
+    # --- Ротация: чистим старые дампы ТОЛЬКО после успешного нового бэкапа ---
+    # (assert выше уже гарантировал целостность свежего дампа).
+    - name: Find old dumps on the web host
+      find:
+        paths: "{{ db_backup_dir }}"
+        patterns: "vpn-*.dump"
+        age: "{{ db_backup_retention_days }}d"
+      register: db_backup_old_host
+
+    - name: Prune old dumps on the web host
+      file:
+        path: "{{ item.path }}"
+        state: absent
+      loop: "{{ db_backup_old_host.files }}"
+      loop_control:
+        label: "{{ item.path }}"
+
+    - name: Find old dumps on the controller
+      find:
+        paths: "{{ lookup('env', 'HOME') }}/vpn-backups"
+        patterns: "vpn-*.dump"
+        age: "{{ db_backup_retention_days }}d"
+      register: db_backup_old_ctrl
+      delegate_to: localhost
+
+    - name: Prune old dumps on the controller
+      file:
+        path: "{{ item.path }}"
+        state: absent
+      loop: "{{ db_backup_old_ctrl.files }}"
+      loop_control:
+        label: "{{ item.path }}"
+      delegate_to: localhost

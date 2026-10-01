@@ -2,6 +2,8 @@
 
 Как живут VPN-ноды в системе: из каких состояний, как бэкенд выбирает конфиг, pool'ы, health, drain.
 
+> **Новая нода или exit** — сначала пройти [чек-лист приёмки](operations/node_exit_acceptance_checklist.md): стейджинга в коде нет, успешный bootstrap сразу отдаёт ноду юзерам. Реальный выход и то, какую страну видят Google/OpenAI, проверяется клиентом: [`scripts/egress_probe/`](../scripts/egress_probe/README.md).
+
 ## Lifecycle states
 
 `VPNNode.status` (enum `VPNNodeStatus`):
@@ -22,11 +24,13 @@
 
 | Protocol | Ansible role | Default port | Default SNI | Service |
 |----------|--------------|--------------|-------------|---------|
-| `vless-reality` | [install_vless_reality](../infra/ansible/roles/install_vless_reality) | 9443 | `www.asus.com` | xray |
+| `vless-reality` | [install_vless_reality](../infra/ansible/roles/install_vless_reality) | 9443 (loopback, наружу 443) | авто из пула | xray |
 | `vless-xhttp` | [install_vless_xhttp](../infra/ansible/roles/install_vless_xhttp) | 443 | (TLS fronting domain) | xray |
 | `vless-ws-cdn` | [install_vless_ws_cdn](../infra/ansible/roles/install_vless_ws_cdn) | 443 | (CDN domain) | xray + Cloudflare proxy |
 
-> `shadowtls+shadowsocks` — **deprecated** (0.2, April 2026).  `hysteria2` — **deprecated** (0.3, April 2026). Роли `install_shadowtls_stack` и `install_hysteria2` закомментированы в [site.yml](../infra/ansible/site.yml), UI не даёт создавать новые конфиги.  Enum-значения `shadowtls_ss` / `hysteria2` оставлены в `VPNConfigProtocol` и бэкенд-branch'и — until 0.4 — на случай легаси-нод.
+> `shadowtls+shadowsocks` — **deprecated** (0.2, April 2026), роль `install_shadowtls_stack` закомментирована в [site.yml](../infra/ansible/site.yml).
+>
+> `hysteria2` — **реанимирован 22.07.2026**: роль активна (гейт — `hysteria2_port` из БД), доступен в admin-UI. SNI вводить не нужно: бэкенд берёт домен и LE-серт уже созданного xhttp/ws-cdn фронта той же ноды (свой ACME у hy2 на combo-ноде дерётся с nginx за :80/:443), а obfs-пароль, лимиты полосы и port-hopping генерит сам. С **28.07.2026** умеет split-tunnel наравне с vless-флаворами: на relay-ноде `outbounds[].direct.bindDevice: wgN` + `acl.inline` (РУ → напрямую, остальное → в туннель). До этой даты выпускал весь трафик с российского IP, то есть давал коннект без VPN. Подробности — [infrastructure/nodes.md](infrastructure/nodes.md) «RU-обход» и [operations/ru_split_routing_audit_2026_07_28.md](operations/ru_split_routing_audit_2026_07_28.md).
 
 Источник дефолтов: [admin/src/pages/Nodes.tsx `PROTOCOL_DEFAULTS`](../admin/src/pages/Nodes.tsx). Если меняешь значения в ansible-ролях — синхронизируй оба места, иначе форма в Admin UI будет предлагать не то, что реально поднимется на ноде.
 
@@ -34,7 +38,11 @@
 
 По состоянию на April 2026 (см. таблицу TSPU status в [README.md](../README.md#supported-protocols)):
 
-1. **Primary: VLESS Reality** — основной протокол, per-user isolation + sharing enforcer. Порт 9443 (или high-port 47000+).
+1. **Primary: VLESS Reality** — основной протокол, per-user isolation + sharing enforcer.
+
+   **Порт.** На унифицированной ноде (есть xhttp/ws-cdn, значит есть nginx) reality слушает **loopback:9443**, а клиент подключается на **:443** — nginx stream `ssl_preread` разводит соединения по SNI. Признак режима — `settings.public_port = 443` на reality-конфиге: по нему provisioning выставляет роли `reality_stream_unify` и подставляет 443 в клиентский URI. Ставить 443 во внутренний порт нельзя — nginx уже держит `0.0.0.0:443`, и `127.0.0.1:443` это тот же сокет. На ноде без TCP-фронта reality остаётся публично на своём порту.
+
+   **SNI и dest.** Не задаются руками: при пустом `sni` бэкенд берёт домен из `REALITY_DEST_POOLS` по стране ДЦ и выбирает наименее используемый (`pick_reality_sni`) — per-node рандомизация, чтобы блокировка одного домена не выкосила весь флот. `dest` (он же `fallback` в форме) выводится как `<sni>:443`. Это **не** запасной сервер: `dest` — реальный сайт, к которому xray проксирует чужой трафик и чей TLS-хендшейк Reality выдаёт за свой, поэтому он обязан совпадать с `sni` и держать TLS 1.3 + HTTP/2. Пул ротировали 2026-07-22 после регионального DPI в Яр/Туле.
 2. **VLESS XHTTP** — основной TCP-протокол, обход 16KB curtain ТСПУ.
 3. **Fallback: VLESS+WS+CDN** — через Cloudflare. Работает, пока CF IP'шники в whitelist'е, но это moving target и каждая нода требует отдельного domain-setup'а.
 
@@ -71,6 +79,34 @@ return configs[0]
 
 Env vars — см. [README.md](../README.md#environment-variables).
 
+## Балансировка новых юзеров и её диагностика
+
+Ноду для новой подписки выбирает единственный селектор `choose_node`
+([provisioning.py](../backend/app/services/provisioning.py)): least-loaded по
+числу **занятых слотов** (`active_device_node_pairs` — union двух ног: живые
+девайсы активных подписок по `Subscription.node_id` **плюс** девайсы с активным
+diverse-кредом на ноде по `Credential.node_id`), с гейтами is_active / pool
+плана / cooldown / мьюты диагностики / status=active / health_score ≥ 50 и
+потолком `max_users` (в слотах-девайсах). При равной нагрузке — случайный
+tie-break. Ту же метрику использует автоскейлер (`_active_subs_on_nodes`).
+Ребаланса нет: назначение sticky, миграции только событийные.
+
+История: до 2026-07 нагрузка считалась только по primary-ноде подписки —
+diverse-популярные ноды (единственные в своём регионе foreign) выглядели
+пустыми и стягивали новых юзеров; админ-колонка «Юзеры» при этом считала по
+кредам, и цифры «админка vs балансировщик» расходились в разы.
+
+Диагностика (read-only, три распределения рядом — primary/assigned/carrying,
+ghost-девайсы, причины исключения ноды из выбора, топ подписок по девайсам):
+
+```bash
+cd infra/ansible
+ansible-playbook playbooks/node_balance_report.yml --vault-password-file ~/.vpn_vault_pass
+```
+
+Плейбук: [playbooks/node_balance_report.yml](../infra/ansible/playbooks/node_balance_report.yml),
+скрипт: [playbooks/files/node_balance_report.py](../infra/ansible/playbooks/files/node_balance_report.py).
+
 ## Health monitoring
 
 Probe-agent ([probes/](../probes)) бежит из нескольких регионов каждые 5 минут и пишет в `health_probes`. Backend агрегирует в `VPNNode.health_score` (0-100).
@@ -90,7 +126,7 @@ Probe-agent ([probes/](../probes)) бежит из нескольких реги
 - **Клик по строке** — expand конфигов, добавление/удаление. Удаление конфига каскадно подчищает терминальные девайсы + их креденшелы, чтобы FK-constraint не блокировал.
 - **исключить** / **вернуть в пул** — `POST /api/nodes/{id}/active {is_active: bool}`. Выводит ноду из `_pick_node` не ломая активные подписки. Типичный use-case: свежая нода, которую хочется обкатать на тест-аккаунтах до боевого трафика; либо подготовка к миграции перед баном/миграцией в другой регион.
 - **переселить** — `POST /api/nodes/{id}/migrate` → `services.health.migrate_subscriptions_off`. Все активные подписки получают новую ноду через `_pick_node` (который уже уважает `is_active=False`), девайсы перепровижиниваются через ansible в фоне. Миграция **in-place**: `sub.node_id` флипается на существующей строке, `sub_token` сохраняется, дубликатов в webapp не появляется (раньше рождалась вторая sub в статусе `blocked`). Рекомендуемый flow при бане ноды: **сначала `исключить`, потом `переселить`** — иначе планировщик может случайно вернуть подписки на ту же умирающую ноду.
-- **resync** — `POST /api/nodes/{id}/resync` → `ProvisioningOrchestrator.resync_node_vless_clients`. Force-retry всех активных VLESS+Reality клиентов на ноде: бэк собирает UUID'ы из зашифрованных credentials, парсит их через `_extract_vless_uuid()`, создаёт таску `action=resync_vless` и гонит `playbooks/resync_node.yml`, которая цикличит `manage_vless_user.sh add` по списку. Идемпотентно (`manage_vless_user.sh` дропает запись по email перед re-append), безопасно запускать в любом состоянии. See [§ VLESS client resync](#vless-client-resync).
+- **resync** — `POST /api/nodes/{id}/resync` → `ProvisioningOrchestrator.resync_node_vless_clients`. Force-retry всех активных VLESS+Reality клиентов на ноде: бэк собирает UUID'ы из зашифрованных credentials, парсит их через `_extract_vless_uuid()`, создаёт таску `action=resync_vless` и гонит `playbooks/resync_node.yml`, которая применяет весь список ОДНИМ вызовом `bulk_apply_clients.py` на протокол (см. § Батч-применение ниже). Идемпотентно (`manage_vless_user.sh` дропает запись по email перед re-append), безопасно запускать в любом состоянии. See [§ VLESS client resync](#vless-client-resync).
 - **backfill креды** — `POST /api/nodes/{id}/backfill-missing-creds` → для каждого `enabled` `VPNConfig` ноды вызывает `ProvisioningOrchestrator.backfill_credentials_for_new_config`. Создаёт `Credential` для тех `Device`-ов, у которых её нет под данный протокол (обычно — на ноде после добавления второго/третьего протокола к уже провижённым юзерам). Для VLESS family переиспользует UUID из существующей vless-credential девайса; для прочих протоколов мнятся фреш-ключи. После создания `Credential` следом авто-триггернётся resync, чтобы на ноде материализовался новый пользователь. Идемпотентно (skip если Credential уже есть), возвращает `{node_id, created: {config_id: count, ...}, total_created}`.
 - **удалить** — `DELETE /api/nodes/{id}` (manual-нода) или `POST /api/nodes/{id}/destroy` (cloud-нода, выбирается UI по `provider_id`). Бэкенд сперва проверяет живые подписки (`active`/`frozen`) на ноде: если есть — **409** с `{active_subs: N}` в `detail`, UI автоматически предлагает запустить `/migrate` и после — повторный DELETE. Терминальная история (`expired`/`terminated`) не блокирует удаление: `Subscription.node_id` `nullable` + `ON DELETE SET NULL` (миграция `0028_subscription_node_id_nullable`), так что старые строки остаются в БД с `node_id=NULL` (webapp это уже переживает — `sub_token` продолжает резолвиться через device-alias). Warm-pool `Credential`-ы с `pool_state=warm` на удаляемой ноде подчищаются каскадно (они — inventory, а не user-data). Если на ноде висят `RelayExitLink`-и — они дропаются каскадом (см. `0027_relay_exit_link`).
 
@@ -117,9 +153,27 @@ Probe-agent ([probes/](../probes)) бежит из нескольких реги
    - Создаёт `ProvisioningTask(target_type=node, action=resync_vless, payload={clients: [{username, uuid}]})`, запускает `playbooks/resync_node.yml`.
    - Resync-таски **не флипают** `node.status` в `_handle_task_outcome` — ранний return по `task.action == "resync_vless"`, иначе upscale/bootstrap transition мог бы сломаться.
 
+3. **hysteria2 после reinstall (audit #78).** Auto-resync выше покрывает только vless-семейство. Пер-юзерные `hysteria2`-учётки (auth=userpass) после `reinstall_node` (диск стёрт) на ноду сами не возвращаются. Поэтому на **reinstall-bootstrap'е** (`task.payload.reinstall`) `_handle_task_outcome` дополнительно зовёт `resync_node_hysteria2_clients(node)`: собирает всех активных hy2-клиентов ноды (пароли парсятся из URI, дедуп по username) в **одну батч-таску `node/resync_hy2`** — `playbooks/resync_node_hy2.yml` добавляет их одним прогоном через `manage_hy2_user.sh add` (NO_RESTART=1 + один рестарт `hysteria-server` в конце), не трогая vless. До 2026-07 тут был веер `device/apply`-тасок по одной на учётку (bootstrap ноды с N девайсами = N прогонов `provision_device.yml`, повторные bootstrap-успехи плодили дубли). Флаг `RESTORE_HY2_AFTER_REINSTALL=0` отключает (fallback — восстановить вручную по warning-логу `_warn_lost_hysteria2_users`). ShadowTLS сюда не входит: node-wide пароль восстанавливает сам `site.yml`. Warm-пул hy2-бандлы не покрываются (pool-miss, не user-facing).
+
+   > **Sentinel-userpass (2026-07).** **hysteria2 FATAL'ит на пустом `userpass`** (exit 1 → краш-луп), поэтому шаблон держит один заглушечный юзер `__sentinel__` со случайным 32-символьным паролём (`lookup('password', …)`): клиенту не выдаётся, угадать нельзя, реальных юзеров `manage_hy2_user.sh` дописывает рядом (`del` заглушку не трогает).
+   >
+   > **Роль недеструктивна с 2026-07-25 (аудит).** Раньше `config.yaml.j2` рендерил `auth.userpass` с нуля на КАЖДОМ прогоне, т.е. любой `site.yml` стирал всех hy2-юзеров ноды, а восстановление жило в бэкенде под `if success:` — падение play ПОСЛЕ hy2-роли (а она идёт первой среди протокольных) оставляло ноду без hy2 до следующего успешного прогона. Теперь роль делает slurp существующего `/etc/hysteria/config.yaml` и re-inject `auth.userpass` в новый рендер — ровно как `install_vless_reality` сохраняет `clients` (битый/недописанный конфиг → пустая карта + `ignore_errors`, дальше добирает backend-resync). Sentinel при этом не перегенерируется на каждом прогоне, так что файл перестал быть вечно-`changed` и не дёргает лишний рестарт. `resync_hy2` из `_handle_task_outcome` остаётся вторым поясом (и единственным после `reinstall`, где диск стёрт).
+   >
+   > `manage_hy2_user.sh` передаёт имя/пароль в python через **окружение**, а не подстановкой в текст скрипта: значение с кавычкой иначе исполнялось бы как код от root (аудит 2026-07-25).
+
 Операторский flow при подозрении на drift (ручная правка конфига, restore из бэкапа, половинчатый bootstrap, клиенты ловят `invalid request user id`):
 1. Нажать **resync** в Admin UI `/admin/nodes` (либо `curl -X POST /api/nodes/{id}/resync`).
 2. Смотреть прогресс в `/admin/tasks` (фильтр `target=node, action=resync_vless`). Успех → все UUID из БД снова в `config.json` на ноде.
+
+### Батч-применение клиентов (2026-07-25)
+
+До аудита оба ресинк-плейбука гоняли ansible-`loop`, где **каждый клиент = отдельный SSH-раунд** и отдельная перезапись конфига на ноде. Время росло строго линейно — по 25 реальным прогонам `T ≈ 15с + 0.38с × клиентов` — и при `ANSIBLE_PLAYBOOK_TIMEOUT=300` упиралось в потолок **~740 кредов на ноду** (≈250 юзеров при трёх протоколах). За потолком таска падает по таймауту, а нода остаётся несинхронизированной, т.е. её юзеры без доступа после bootstrap.
+
+Теперь список пишется на ноду одним JSON (`/run/resync-<kind>.json`, mode 0600, удаляется после) и применяется одним вызовом [files/bulk_apply_clients.py](../infra/ansible/playbooks/files/bulk_apply_clients.py). Замер на проде: **108 клиентов — 14.7с** против 50–77с прежде; на 5 клиентах ~14.5с, то есть время теперь определяется базой прогона, а не числом юзеров.
+
+Семантика намеренно совпадает с прежним циклом `manage_*_user.sh add`: upsert по email, G.6-роутинг трогается **только** для клиентов с непустым `exit_interface` (иначе ресинк затирал бы состояние, которое отрендерил шаблон роли), клиенты вне списка не удаляются (снятие доступа — отдельный путь `del`/revoke). Скрипт берёт те же `flock`, что и per-user хелперы, поэтому не гоняется с параллельным `device/apply`, и пишет конфиг атомарно через временный файл в той же директории с сохранением `root:nogroup` + `0640`.
+
+Per-user скрипты (`manage_vless_*_user.sh`, `manage_hy2_user.sh`) остаются — их использует одиночная выдача (`device/apply`).
 
 Плейбук: [playbooks/resync_node.yml](../infra/ansible/playbooks/resync_node.yml). Помощник на ноде: [files/manage_vless_user.sh](../infra/ansible/roles/install_vless_reality/files/manage_vless_user.sh) — после `mv` из `/tmp` делает `chown root:nogroup` + `chmod 0640`, иначе xray (запущенный как `nobody:nogroup`) ловит permission denied и сервис экзитает кодом 23.
 

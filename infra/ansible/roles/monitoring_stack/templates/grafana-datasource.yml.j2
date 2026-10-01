@@ -4,6 +4,7 @@ apiVersion: 1
 datasources:
   - name: Prometheus
     type: prometheus
+    uid: prometheus
     access: proxy
     # Container-to-container DNS: grafana reaches prometheus by service name
     # over the compose default network.

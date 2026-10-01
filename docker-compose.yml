@@ -39,6 +39,10 @@ services:
   backend:
     build: ./backend
     environment:
+      APP_ENV: ${APP_ENV:-dev}
+      # Версия выката из файла VERSION (ansible кладёт её в .env). Отдаётся
+      # в GET /api/version и уезжает на ноды маркером при бутстрапе.
+      APP_VERSION: ${APP_VERSION:-0.0.0-dev}
       DATABASE_URL: ${DATABASE_URL}
       ADMIN_API_TOKEN: ${ADMIN_API_TOKEN}
       APP_SECRET_KEY: ${APP_SECRET_KEY}
@@ -51,6 +55,22 @@ services:
       PAYMENT_PROVIDERS: ${PAYMENT_PROVIDERS:-}
       CRYPTOBOT_TOKEN: ${CRYPTOBOT_TOKEN:-}
       TELEGRAM_STARS_WEBHOOK_SECRET: ${TELEGRAM_STARS_WEBHOOK_SECRET:-}
+      # Stage 9b — карты РФ/СБП: lava.top (offerId продукта с «Ценой по
+      # запросу через API») и Tribute Shop API. docs/PLAN_LAVA_TOP.md.
+      LAVA_TOP_API_KEY: ${LAVA_TOP_API_KEY:-}
+      LAVA_TOP_OFFER_ID: ${LAVA_TOP_OFFER_ID:-}
+      LAVA_TOP_WEBHOOK_SECRET: ${LAVA_TOP_WEBHOOK_SECRET:-}
+      LAVA_TOP_EMAIL_DOMAIN: ${LAVA_TOP_EMAIL_DOMAIN:-}
+      # Пусто → драйвер бьёт в прод-URL по умолчанию; override для теста/стейджа.
+      LAVA_TOP_API_BASE: ${LAVA_TOP_API_BASE:-}
+      # Эквайрер lava: PAY2ME = карта+СБП на одной странице; пусто = дефолт
+      # lava (SMART_GLOCAL, только карта).
+      LAVA_TOP_CARD_PROVIDER: ${LAVA_TOP_CARD_PROVIDER:-SMART_GLOCAL}
+      LAVA_TOP_SBP_PROVIDER: ${LAVA_TOP_SBP_PROVIDER:-PAY2ME}
+      TRIBUTE_API_KEY: ${TRIBUTE_API_KEY:-}
+      TRIBUTE_ORDER_TITLE: ${TRIBUTE_ORDER_TITLE:-}
+      TRIBUTE_ORDER_DESCRIPTION: ${TRIBUTE_ORDER_DESCRIPTION:-}
+      TRIBUTE_API_BASE: ${TRIBUTE_API_BASE:-}
       # #62 — native Telegram webhook mode. When set, the backend
       # registers itself as the Bot API webhook receiver on startup
       # and processes Stars payments directly — no shared secret.
@@ -70,10 +90,88 @@ services:
       # pool entirely when set to "0". Worker has its own copy because
       # it also reads the var to gate the periodic warmer.
       WARM_POOL_ENABLED: ${WARM_POOL_ENABLED:-1}
+      # Diverse N×M subscription (Phase A): N nodes per sub (1 = current single-node).
+      DIVERSE_SUB_NODES: ${DIVERSE_SUB_NODES:-1}
+      # Набор эндпоинтов 4×1: legacy = все протоколы всех нод в сабе (как было),
+      # 4x1 = по одной роли с ноды. Backend читает флаг в _decrypt_configs
+      # (фильтр публикации) и в лестнице ротации по жалобе.
+      # SUB_STATUS_BANNER — рубильник блока статуса в клиенте; он обязан быть
+      # ЗДЕСЬ, а не только в .env: иначе аварийное выключение потребует релиза.
+      SUB_LEG_SCHEME: ${SUB_LEG_SCHEME:-legacy}
+      SUB_LEG_NODES: ${SUB_LEG_NODES:-4}
+      SUB_LEG_DUP_MAX: ${SUB_LEG_DUP_MAX:-1}
+      ROTATION_LADDER_WINDOW_SEC: ${ROTATION_LADDER_WINDOW_SEC:-86400}
+      COMPLAINT_DEDUP_SEC: ${COMPLAINT_DEDUP_SEC:-60}
+      SUB_STATUS_BANNER: ${SUB_STATUS_BANNER:-1}
+      # Provider ID Happ (happ-proxy.com): без него клиент игнорирует весь
+      # Advanced-слой — sub-info, sub-expire, пуши об истечении.
+      HAPP_PROVIDER_ID: ${HAPP_PROVIDER_ID:-}
+      # announce — Standard-блок статуса, работает без providerid.
+      # auto = слать, пока providerid не задан; 1 = всегда; 0 = никогда.
+      SUB_STATUS_ANNOUNCE: ${SUB_STATUS_ANNOUNCE:-auto}
+      # Страница «починить и продлить» на домене саб-ссылки (?fix=1) —
+      # разрывает круг «VPN сломан → чинить только в Telegram → Telegram
+      # без VPN недоступен». Все флаги выключены по умолчанию.
+      SUB_FIX_PAGE: ${SUB_FIX_PAGE:-0}
+      SUB_FIX_PAY: ${SUB_FIX_PAY:-0}
+      # off / support / all — какие кнопки в VPN-клиенте ведут на страницу.
+      SUB_FIX_ENTRYPOINTS: ${SUB_FIX_ENTRYPOINTS:-off}
+      SUB_FIX_THROTTLE_SEC: ${SUB_FIX_THROTTLE_SEC:-120}
+      SUB_FIX_DAILY_MAX: ${SUB_FIX_DAILY_MAX:-5}
+      # Единая политика повторов «VPN не работает» для ВСЕХ каналов (бот,
+      # кабинет, страница по токену, ответ на плановый пинг). Пусто →
+      # fallback на SUB_FIX_THROTTLE_SEC / SUB_FIX_DAILY_MAX, затем 120 / 5.
+      SELF_REPAIR_THROTTLE_SEC: ${SELF_REPAIR_THROTTLE_SEC:-}
+      SELF_REPAIR_DAILY_MAX: ${SELF_REPAIR_DAILY_MAX:-}
+      # Провайдер оплаты СО СТРАНИЦЫ. Пинится явно: общая ротация по
+      # умолчанию даёт cryptobot, а сюда приходит человек без Telegram —
+      # платить он будет картой.
+      SUB_FIX_PROVIDER: ${SUB_FIX_PROVIDER:-lava_top}
+      # Кнопка «Продлить по СБП» на странице (&pay=sbp).
+      SUB_FIX_SBP_PROVIDER: ${SUB_FIX_SBP_PROVIDER:-lava_top_sbp}
+      # Прямая ссылка на мини-апп для кнопок в VPN-клиенте (пусто = deep-link
+      # в бота с кнопкой входа).
+      TELEGRAM_MINIAPP_SHORT_NAME: ${TELEGRAM_MINIAPP_SHORT_NAME:-}
+      # Phase B — HAPP auto-connect (lowestdelay-on-reconnect) sub-headers.
+      # Read ONLY by api_extensions._autoconnect_enabled (backend serves /sub).
+      # Без этих строк .env-значение не доезжало до контейнера → autoconnect
+      # был молча off, хотя group_var=all с 2026-06-13 (891d3ef). fallback-url —
+      # запасной домен источника сабы (дормант, пока env не задан).
+      SUB_HAPP_AUTOCONNECT: ${SUB_HAPP_AUTOCONNECT:-off}
+      SUB_HAPP_AUTOCONNECT_SINCE: ${SUB_HAPP_AUTOCONNECT_SINCE:-}
+      SUB_LINK_FALLBACK_BASE_URL: ${SUB_LINK_FALLBACK_BASE_URL:-}
+      # Аварийные рубильники фильтров саб-выдачи. Тот же класс бага, что у
+      # SUB_HAPP_AUTOCONNECT выше: у сервиса нет env_file, только этот
+      # allowlist, поэтому переменная без строки здесь = правка .env молча
+      # ничего не делает, а рубильник недоступен ровно тогда, когда нужен.
+      SUB_FILTER_TUNNEL_BLIND: ${SUB_FILTER_TUNNEL_BLIND:-0}
+      SUB_FILTER_UNHEALTHY_NODES: ${SUB_FILTER_UNHEALTHY_NODES:-1}
+      # Xray-JSON вместо списка ссылок для Happ/v2rayTun (фейловер внутри
+      # сессии). off/allowlist/on + CSV токенов для обкатки. Тот же класс
+      # бага, что выше: без строк здесь правка .env молча не доедет.
+      SUB_XRAY_JSON: ${SUB_XRAY_JSON:-off}
+      SUB_XRAY_JSON_TOKENS: ${SUB_XRAY_JSON_TOKENS:-}
+      SUB_XRAY_JSON_CLIENTS: ${SUB_XRAY_JSON_CLIENTS:-}
+      SUB_XRAY_HY2_HOP: ${SUB_XRAY_HY2_HOP:-off}
+      # Клиентское правило ru-direct в Xray-JSON: РУ-домены мимо VPN с
+      # реального IP юзера — закрывает direct-ноды без туннеля и hy2, где
+      # серверный split невозможен. off / all / CSV саб-токенов.
+      SUB_XRAY_RU_DIRECT: ${SUB_XRAY_RU_DIRECT:-off}
+      SUB_XRAY_PROBE_INTERVAL_S: ${SUB_XRAY_PROBE_INTERVAL_S:-300}
       # Stage 4 — balance billing. Backend reads these for the
       # WebApp endpoints (freeze caps, min topup, referral bonus).
-      FREEZE_DAYS: ${FREEZE_DAYS:-14}
+      FREEZE_DAYS: ${FREEZE_DAYS:-7}
       REFERRAL_BONUS_KOPECKS: ${REFERRAL_BONUS_KOPECKS:-5000}
+      # Задержка доставки пуша «приведи друга» (часы) после первого
+      # скачивания конфига; 0 = сразу. Только backend: очередь бота
+      # (/api/notifications/pending) отдаёт он, worker её не читает.
+      REFERRAL_INVITE_DELAY_H: ${REFERRAL_INVITE_DELAY_H:-24}
+      # Бесплатные дни триала (бонус = столько дней Solo, сразу тратится на
+      # подписку) и скрытый запас сверх них в часах, за который не списываем
+      # (0 выключает). Читает только backend: триал выдают бот и кабинет
+      # через API. Без строк здесь правка .env молча не доедет.
+      TRIAL_DURATION_DAYS: ${TRIAL_DURATION_DAYS:-3}
+      TRIAL_HIDDEN_HOURS: ${TRIAL_HIDDEN_HOURS:-24}
       MIN_TOPUP_KOPECKS: ${MIN_TOPUP_KOPECKS:-10000}
       EXTRA_DEVICE_KOPECKS_PER_MONTH: ${EXTRA_DEVICE_KOPECKS_PER_MONTH:-10000}
       # Stage 8 — public base URL for the dynamic sub link. When set,
@@ -82,7 +180,47 @@ services:
       # CDN-fronted domain (Cloudflare Worker proxy etc.) so an RKN
       # block on grinwer.online does not kill installed clients.
       SUB_LINK_BASE_URL: ${SUB_LINK_BASE_URL:-}
+      # Запасной фронт саб-ссылки (мимо CF) + доля токенов на нём, 0..100.
+      # Пусто/0 = вся раздача на основном домене, как было.
+      SUB_LINK_BASE_URL_ALT: ${SUB_LINK_BASE_URL_ALT:-}
+      SUB_LINK_ALT_SHARE: ${SUB_LINK_ALT_SHARE:-0}
+      # WS+CDN / xhttp DNS front (Cloudflare DNS-only). Backend mints a
+      # DNS-only A-record on config-create; the node serves TLS via LE.
+      # CF-proxying ws/xhttp is dead. See services/cloudflare_dns.py.
+      CLOUDFLARE_DNS_TOKEN: ${CLOUDFLARE_DNS_TOKEN:-}
+      WSCDN_FRONT_DOMAIN: ${WSCDN_FRONT_DOMAIN:-}
       ANSIBLE_PLAYBOOK_TIMEOUT: ${ANSIBLE_PLAYBOOK_TIMEOUT:-300}
+      # AI-агент (read-only диагностический триаж, AI_AGENT_ROADMAP Phase 1).
+      # Kill switch + LLM-ключ + модель. Выключен по умолчанию.
+      AGENT_ENABLED: ${AGENT_ENABLED:-}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      AGENT_MODEL: ${AGENT_MODEL:-claude-sonnet-4-6}
+      # Admin push-уведомления: backend шлёт в телегу по тем же
+      # telegram_id'шникам, что бот считает админами. Одна переменная
+      # в .env (ADMIN_IDS), два контейнерных алиаса — бот читает
+      # ADMIN_IDS, backend ADMIN_TELEGRAM_IDS (имя говорит куда шлём).
+      ADMIN_TELEGRAM_IDS: ${ADMIN_IDS}
+      # Дедуп окна для разных типов алертов (см. services/admin_notify.py
+      # и worker.dlq_exception_handler).
+      ADMIN_ALERT_DEDUP_WINDOW_SEC: ${ADMIN_ALERT_DEDUP_WINDOW_SEC:-600}
+      ADMIN_ALERT_SSH_FAILED_THRESHOLD: ${ADMIN_ALERT_SSH_FAILED_THRESHOLD:-1}
+      ADMIN_ALERT_DLQ_WINDOW_SEC: ${ADMIN_ALERT_DLQ_WINDOW_SEC:-300}
+      # ── Provisioning reconciler (desired-state convergence) ──────────
+      # Backend-сторона: правка ноды бампает desired_generation + ставит
+      # debounce-таймер (mark_node_dirty) ВМЕСТО немедленного bootstrap'а.
+      # Сам прогон сходит reconcile-тик на worker-scheduler. Пусто/0 →
+      # старое immediate-поведение (Phase-0 coalescing). См.
+      # docs/operations/provisioning_reconciler_epic.md.
+      RECONCILER_ENABLED: ${RECONCILER_ENABLED:-}
+      RECONCILE_DEBOUNCE_S: ${RECONCILE_DEBOUNCE_S:-5}
+      # Provisioning-ключ нужен и БЭКЕНДУ (не только воркеру): спавн
+      # key-инжектящих провайдеров (VDSina) дёргает order_server СИНХРОННО в
+      # HTTP-роуте /nodes/spawn → _ensure_key_id → provisioning_pubkey() деривит
+      # pubkey из этого ключа для авто-регистрации на хостере. Без mount'а ключа
+      # в backend-контейнер VDSina-заказ падал «ssh-ключ не задан».
+      ANSIBLE_PRIVATE_KEY_FILE: /run/secrets/provisioning_key
+    volumes:
+      - ${PROVISIONING_SSH_KEY:?Set PROVISIONING_SSH_KEY to the host path of the SSH private key}:/run/secrets/provisioning_key:ro
     ports:
       - "127.0.0.1:8000:8000"
     depends_on:
@@ -102,11 +240,18 @@ services:
       context: .
       dockerfile: backend/Dockerfile.worker
     deploy:
-      replicas: 1
+      # WORKER_REPLICAS параметризован для bulk-provisioning: дефолт 1 на
+      # обычный prod нагрузке, бамп до 5 на массовый bootstrap/resync
+      # (5×3 concurrent ansible = 15 параллельных playbook-ранов, на 4×8
+      # VPS укладывается с запасом).
+      replicas: ${WORKER_REPLICAS:-1}
     environment: &worker-env
       DATABASE_URL: ${DATABASE_URL}
       ADMIN_API_TOKEN: ${ADMIN_API_TOKEN}
       APP_SECRET_KEY: ${APP_SECRET_KEY}
+      # Воркер прошивает эту версию нодам (extra_vars vpn_release_version →
+      # /etc/vpn-node-release.json), поэтому она нужна и здесь, не только в API.
+      APP_VERSION: ${APP_VERSION:-0.0.0-dev}
       REDIS_URL: "redis://:${REDIS_PASSWORD}@redis:6379/0"
       QUEUE_BACKEND: "rq"
       WORKER_ROLE: "provisioning"
@@ -119,13 +264,57 @@ services:
       SKIP_MIGRATIONS: "1"
       ANSIBLE_ROOT: /app/infra/ansible
       ANSIBLE_PRIVATE_KEY_FILE: /run/secrets/provisioning_key
+      # ansible-core 2.19 compat — секция [ssh_connection] в ansible.cfg
+      # перестала подхватываться. Без env vars per-task время x3-5,
+      # потому что pipelining=False и ControlMaster не активирован.
+      # См. POSTMORTEM_2026-05-19 + scripts/diag_ansible_perf.sh.
+      ANSIBLE_PIPELINING: ${ANSIBLE_PIPELINING:-True}
+      ANSIBLE_SSH_RETRIES: ${ANSIBLE_SSH_RETRIES:-3}
+      ANSIBLE_SSH_ARGS: ${ANSIBLE_SSH_ARGS:--o ControlMaster=auto -o ControlPersist=10m -o ControlPath=~/.ansible/cp/%h-%p-%r -o ConnectTimeout=30 -o ConnectionAttempts=3 -o ServerAliveInterval=15 -o ServerAliveCountMax=3}
       AUTOSCALE_INTERVAL: ${AUTOSCALE_INTERVAL:-300}
       # Self-heal for stuck pending provisioning tasks.
       PENDING_RESCUE_INTERVAL: ${PENDING_RESCUE_INTERVAL:-60}
       PENDING_RESCUE_AGE: ${PENDING_RESCUE_AGE:-60}
+      # Эскалация rescue-тика: force-ре-энкью зомби-джоба и отказ от древних
+      # тасок. Без проброса дефолты кода недостижимы снаружи — «прикрутить
+      # пороги в проде» было нечем (аудит 2026-07-25).
+      PENDING_RESCUE_FORCE_AGE: ${PENDING_RESCUE_FORCE_AGE:-1800}
+      PENDING_RESCUE_ABANDON_AGE: ${PENDING_RESCUE_ABANDON_AGE:-86400}
+      # Cert-renewal тик: внешняя проба TLS-expiry xhttp/ws-cdn + авто-renew LE
+      # (против fleet-wide cert-пожара 2026-07-22). 0 = выключить.
+      CERT_RENEWAL_INTERVAL: ${CERT_RENEWAL_INTERVAL:-86400}
+      CERT_RENEWAL_DAYS: ${CERT_RENEWAL_DAYS:-21}
+      CERT_RENEWAL_MAX_PER_TICK: ${CERT_RENEWAL_MAX_PER_TICK:-6}
+      # Reality-dest health: детект деградировавших dest'ов (TLS1.3+h2).
+      # AUTO_ROTATE по умолчанию ВЫКЛ — воркер пробит из NL, geo-dest'ы
+      # false-positive'ят; это главный kill-switch фичи, и он обязан быть
+      # доступен без правки кода.
+      REALITY_DEST_HEALTH_INTERVAL: ${REALITY_DEST_HEALTH_INTERVAL:-86400}
+      REALITY_DEST_FAIL_THRESHOLD: ${REALITY_DEST_FAIL_THRESHOLD:-2}
+      REALITY_DEST_AUTO_ROTATE: ${REALITY_DEST_AUTO_ROTATE:-0}
+      REALITY_DEST_MAX_ROTATE_PER_TICK: ${REALITY_DEST_MAX_ROTATE_PER_TICK:-3}
+      # Восстановление hy2-учёток после reinstall (роль рендерит userpass
+      # заново). Safe-default = вкл.
+      RESTORE_HY2_AFTER_REINSTALL: ${RESTORE_HY2_AFTER_REINSTALL:-1}
+      # Stage 9b — авто-сверка карточных платежей lava.top (вебхук-независимо).
+      # Тику нужен доступ к API lava (те же LAVA_TOP_* что у backend), т.к. он
+      # зовёт get_provider("lava_top") и опрашивает /api/v2/invoices.
+      LAVA_TOP_RECONCILE_INTERVAL: ${LAVA_TOP_RECONCILE_INTERVAL:-60}
+      LAVA_TOP_API_KEY: ${LAVA_TOP_API_KEY:-}
+      LAVA_TOP_OFFER_ID: ${LAVA_TOP_OFFER_ID:-}
+      LAVA_TOP_WEBHOOK_SECRET: ${LAVA_TOP_WEBHOOK_SECRET:-}
+      LAVA_TOP_EMAIL_DOMAIN: ${LAVA_TOP_EMAIL_DOMAIN:-}
+      LAVA_TOP_API_BASE: ${LAVA_TOP_API_BASE:-}
+      LAVA_TOP_CARD_PROVIDER: ${LAVA_TOP_CARD_PROVIDER:-SMART_GLOCAL}
+      LAVA_TOP_SBP_PROVIDER: ${LAVA_TOP_SBP_PROVIDER:-PAY2ME}
       ANSIBLE_PLAYBOOK_TIMEOUT: ${ANSIBLE_PLAYBOOK_TIMEOUT:-300}
       RENEWAL_CHECK_INTERVAL: ${RENEWAL_CHECK_INTERVAL:-300}
       RENEWAL_GRACE_HOURS: ${RENEWAL_GRACE_HOURS:-24}
+      # Cloud-billing guard: баланс провайдеров + стоимость флота. Порог
+      # алерта 0 = алерты выкл (только gauge). Единицы баланса — как у
+      # провайдера (4vps: копейки). CLOUD_BILLING_INTERVAL=0 → тик выкл.
+      CLOUD_BILLING_INTERVAL: ${CLOUD_BILLING_INTERVAL:-3600}
+      CLOUD_BALANCE_ALERT_THRESHOLD: ${CLOUD_BALANCE_ALERT_THRESHOLD:-0}
       # Stage 2.5 — warm credential pool. Worker tops up each active
       # node to WARM_POOL_TARGET bundles every WARM_POOL_CHECK_INTERVAL
       # seconds, capped to WARM_POOL_BATCH_PER_TICK provisions per node
@@ -136,6 +325,15 @@ services:
       WARM_POOL_BATCH_PER_TICK: ${WARM_POOL_BATCH_PER_TICK:-3}
       WARM_POOL_CHECK_INTERVAL: ${WARM_POOL_CHECK_INTERVAL:-120}
       WARM_POOL_MAX_CONCURRENT: ${WARM_POOL_MAX_CONCURRENT:-2}
+      # Diverse N×M subscription (Phase A): N nodes per sub (1 = current single-node).
+      # Worker copy — reprovision/migration paths also read it.
+      DIVERSE_SUB_NODES: ${DIVERSE_SUB_NODES:-1}
+      # Копия набора 4×1: раскладку легов делает и провижининг, и backfill —
+      # оба живут в воркере. Разъехавшиеся значения тут означали бы, что
+      # покупка собирает набор по одной схеме, а бэкфилл по другой.
+      SUB_LEG_SCHEME: ${SUB_LEG_SCHEME:-legacy}
+      SUB_LEG_NODES: ${SUB_LEG_NODES:-4}
+      SUB_LEG_DUP_MAX: ${SUB_LEG_DUP_MAX:-1}
       # Cold-path throttle — sliding-window cap on warm-pool-miss
       # activations (migrations/reprovision bypass). Prevents a bot
       # burst from chaining ansible runs faster than xray tolerates.
@@ -145,8 +343,12 @@ services:
       # auto-unfreezes paused ones whose frozen_until lapsed. Tunables
       # cover the freeze caps, referral bonus and minimum topup.
       BALANCE_CHARGE_INTERVAL: ${BALANCE_CHARGE_INTERVAL:-3600}
-      FREEZE_DAYS: ${FREEZE_DAYS:-14}
+      FREEZE_DAYS: ${FREEZE_DAYS:-7}
       REFERRAL_BONUS_KOPECKS: ${REFERRAL_BONUS_KOPECKS:-5000}
+      # За сколько дней до конца бесплатных дней воркер шлёт «⏳ Бесплатные
+      # дни скоро закончатся» (проход 3a тика списаний). Тики крутит
+      # worker-scheduler, он наследует это окружение через якорь.
+      TRIAL_EXPIRY_WARN_DAYS: ${TRIAL_EXPIRY_WARN_DAYS:-3}
       MIN_TOPUP_KOPECKS: ${MIN_TOPUP_KOPECKS:-10000}
       EXTRA_DEVICE_KOPECKS_PER_MONTH: ${EXTRA_DEVICE_KOPECKS_PER_MONTH:-10000}
       # Stage 8 — same SUB_LINK_BASE_URL the backend reads, propagated to
@@ -154,19 +356,53 @@ services:
       # provisioning.py also bake the sub URL into Device.connection_uri
       # when running off the queue.
       SUB_LINK_BASE_URL: ${SUB_LINK_BASE_URL:-}
+      # Запасной фронт саб-ссылки (мимо CF) + доля токенов на нём, 0..100.
+      # Пусто/0 = вся раздача на основном домене, как было.
+      SUB_LINK_BASE_URL_ALT: ${SUB_LINK_BASE_URL_ALT:-}
+      SUB_LINK_ALT_SHARE: ${SUB_LINK_ALT_SHARE:-0}
+      # WS+CDN / xhttp DNS front (Cloudflare DNS-only). Token/domain let the
+      # backend mint DNS-only records; node serves TLS via LE (no Origin CA).
+      CLOUDFLARE_DNS_TOKEN: ${CLOUDFLARE_DNS_TOKEN:-}
+      WSCDN_FRONT_DOMAIN: ${WSCDN_FRONT_DOMAIN:-}
       LOW_BALANCE_WARN_DAYS: ${LOW_BALANCE_WARN_DAYS:-3}
       # Phase B — passive xray traffic stats collector. Worker SSHs
       # into each active node every TRAFFIC_STATS_INTERVAL seconds and
       # writes per-node uplink/downlink/active_users into
       # node_traffic_samples. 0 disables the tick.
       TRAFFIC_STATS_INTERVAL: ${TRAFFIC_STATS_INTERVAL:-300}
+      # Per-user учёт: тот же тик копит байты в Subscription.traffic_used_bytes
+      # (шкала в клиенте). 0 — аварийный стоп только учёта, сбор по нодам жив.
+      TRAFFIC_USER_ACCOUNTING: ${TRAFFIC_USER_ACCOUNTING:-1}
       # Phase C — bot health-ping with consent. Worker queues a
       # friendly "помогите нам улучшить сервис" prompt to active users
-      # at most once per USER_HEALTH_PING_DEBOUNCE_HOURS, capped at
-      # USER_HEALTH_PING_BATCH per tick. 0 disables the tick.
+      # раз в [DEBOUNCE_HOURS, DEBOUNCE_HOURS + DEBOUNCE_JITTER_HOURS]
+      # — random per-user. Дефолт 168+168 = 7-14 дней, чтобы юзеры
+      # не привыкали игнорить ежедневный спам и реальные «не работает»
+      # не тонули в шуме. Batch — sanity-cap на тик.
       USER_HEALTH_PING_INTERVAL: ${USER_HEALTH_PING_INTERVAL:-1800}
       USER_HEALTH_PING_BATCH: ${USER_HEALTH_PING_BATCH:-50}
-      USER_HEALTH_PING_DEBOUNCE_HOURS: ${USER_HEALTH_PING_DEBOUNCE_HOURS:-24}
+      USER_HEALTH_PING_DEBOUNCE_HOURS: ${USER_HEALTH_PING_DEBOUNCE_HOURS:-168}
+      USER_HEALTH_PING_DEBOUNCE_JITTER_HOURS: ${USER_HEALTH_PING_DEBOUNCE_JITTER_HOURS:-168}
+      # Admin push-уведомления: тиковый воркер читает те же ADMIN_IDS,
+      # чтобы alert-ы из run_relay_link_health_tick / dlq_exception_handler
+      # пошли нужным людям.
+      ADMIN_TELEGRAM_IDS: ${ADMIN_IDS}
+      ADMIN_ALERT_DEDUP_WINDOW_SEC: ${ADMIN_ALERT_DEDUP_WINDOW_SEC:-600}
+      ADMIN_ALERT_SSH_FAILED_THRESHOLD: ${ADMIN_ALERT_SSH_FAILED_THRESHOLD:-1}
+      ADMIN_ALERT_DLQ_WINDOW_SEC: ${ADMIN_ALERT_DLQ_WINDOW_SEC:-300}
+      # ── Provisioning reconciler (desired-state convergence) ──────────
+      # worker-scheduler (WORKER_ROLE=ticks) гоняет reconcile-тик: берёт
+      # ноды с desired>reconciled и созревшим due_at, диспатчит ОДИН
+      # coalesced bootstrap (cap MAX_PER_TICK, FIFO по due_at). worker
+      # (provisioning) исполняет bootstrap и стэмпит reconciled / backoff
+      # на фейле. Пусто/0 в RECONCILER_ENABLED → фича выключена (Phase-0).
+      # См. docs/operations/provisioning_reconciler_epic.md.
+      RECONCILER_ENABLED: ${RECONCILER_ENABLED:-}
+      RECONCILE_INTERVAL: ${RECONCILE_INTERVAL:-3}
+      RECONCILE_DEBOUNCE_S: ${RECONCILE_DEBOUNCE_S:-5}
+      RECONCILE_MAX_PER_TICK: ${RECONCILE_MAX_PER_TICK:-15}
+      RECONCILE_RETRY_S: ${RECONCILE_RETRY_S:-60}
+      RECONCILE_OVERDUE_WARN_S: ${RECONCILE_OVERDUE_WARN_S:-120}
     volumes:
       - ${PROVISIONING_SSH_KEY:?Set PROVISIONING_SSH_KEY to the host path of the SSH private key}:/run/secrets/provisioning_key:ro
     depends_on:
@@ -200,13 +436,31 @@ services:
     restart: unless-stopped
 
   admin:
-    build: ./admin
+    build:
+      context: ./admin
+      args:
+        # Версия выката — Vite запекает её в бандл, поэтому смена VERSION
+        # требует ребилда (деплой его и делает: дерево изменилось).
+        VITE_APP_VERSION: ${APP_VERSION:-0.0.0-dev}
+        # Rebuild required on change — Vite bakes the base into every
+        # asset URL. Default "admin" сохраняет старое поведение;
+        # прод передаёт secret path из ansible vault.
+        VITE_ADMIN_BASE_PATH: ${ADMIN_BASE_PATH:-admin}
+    environment:
+      # Runtime env для envsubst нашего nginx.conf template'а.
+      ADMIN_BASE_PATH: ${ADMIN_BASE_PATH:-admin}
+      # Ограничиваем envsubst только этой переменной, чтобы не
+      # попортить $uri / $http_upgrade / $remote_addr в конфиге.
+      NGINX_ENVSUBST_FILTER: "^ADMIN_BASE_PATH$$"
     ports:
       - "127.0.0.1:8080:80"
     restart: unless-stopped
 
   webapp:
-    build: ./webapp
+    build:
+      context: ./webapp
+      args:
+        VITE_APP_VERSION: ${APP_VERSION:-0.0.0-dev}
     ports:
       - "127.0.0.1:8082:80"
     restart: unless-stopped
@@ -223,10 +477,25 @@ services:
       # picks one provider per checkout (random). Falls back to
       # PAYMENT_PROVIDER above when unset.
       PAYMENT_PROVIDERS: ${PAYMENT_PROVIDERS:-}
+      # Stage 9b — меню выбора способа оплаты в боте (comma-separated
+      # имена провайдеров). Пусто/одно имя = старое поведение.
+      PAYMENT_PROVIDER_CHOICES: ${PAYMENT_PROVIDER_CHOICES:-}
+      # Ссылки на оферту/возвраты/ПД в «О сервисе» (пусто = кнопок нет).
+      LEGAL_BASE_URL: ${LEGAL_BASE_URL:-}
       TELEGRAM_STARS_WEBHOOK_SECRET: ${TELEGRAM_STARS_WEBHOOK_SECRET:-}
       SUB_LINK_BASE_URL: ${SUB_LINK_BASE_URL:-}
+      # Запасной фронт саб-ссылки (мимо CF) + доля токенов на нём, 0..100.
+      # Пусто/0 = вся раздача на основном домене, как было.
+      SUB_LINK_BASE_URL_ALT: ${SUB_LINK_BASE_URL_ALT:-}
+      SUB_LINK_ALT_SHARE: ${SUB_LINK_ALT_SHARE:-0}
       WEBAPP_BASE_URL: ${WEBAPP_BASE_URL:-}
+      # Версия выката из файла VERSION — кэшбастер ?v= в URL мини-аппа
+      # (кнопки и menu-button), см. bot/keyboards.py:WEBAPP_URL.
+      APP_VERSION: ${APP_VERSION:-0.0.0-dev}
       NOTIFICATION_POLL_INTERVAL: ${NOTIFICATION_POLL_INTERVAL:-10}
+      # Auto-delete ack-сообщения health-ping опроса через N секунд после
+      # ответа юзера. 0 — выключить (оставить «Спасибо!» в чате навсегда).
+      HEALTH_PING_ACK_DELETE_DELAY_S: ${HEALTH_PING_ACK_DELETE_DELAY_S:-60}
       # #62 — webhook mode port. >0 switches from polling to an internal
       # aiohttp server that receives forwarded updates from the backend.
       BOT_WEBHOOK_PORT: ${BOT_WEBHOOK_PORT:-0}

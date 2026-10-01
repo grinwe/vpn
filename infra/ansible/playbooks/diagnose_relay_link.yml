@@ -1,0 +1,58 @@
+---
+# Diagnose one relay→exit WireGuard link.
+#
+# Read-only — `wg show`, `ping`, `curl`, `ss`, `iptables -L`. No config
+# changes, no service restarts. Safe to run on a live relay/exit with
+# active traffic.
+#
+# Two-play layout:
+#   Play 1 (vpn_nodes, target=relay) — jump-side checks: peer_on_jump,
+#     handshake_age, ping_endpoint, ping_internet_through, xray_port,
+#     listening_sockets. Writes /tmp/<task_id>.json.jump.
+#   Play 2 (wg_exit_nodes, target=exit) — exit-side: peer_on_exit,
+#     iptables_forward. Skipped entirely if `diag_check_types` doesn't
+#     request either of them. Writes /tmp/<task_id>.json.exit.
+#
+# Backend orchestrator (provisioning.py:_run_relay_link_diagnose) merges
+# both result files into one structured ProvisioningTask.result.checks
+# array — UI rendering doesn't care which side the check came from.
+#
+# Required extra vars (orchestrator passes via -e):
+#   diag_wg_iface          — wg0 / wg1 on RELAY (RelayExitLink.wg_interface_name)
+#   diag_wg_iface_on_exit  — usually "wg0" on EXIT (its main WG iface)
+#   diag_exit_pubkey       — WGExitNode.wg_public_key (peer match jump-side)
+#   diag_client_pubkey     — RelayExitLink.wg_client_public_key (peer match exit-side)
+#   diag_exit_wg_addr      — exit's inner WG IP (ping target)
+#   diag_client_wg_addr    — relay's inner WG IP
+#   diag_xray_port         — usually 9443
+#   diag_check_types       — list, subset of: peer_on_jump, handshake_age,
+#                             ping_endpoint, ping_internet_through,
+#                             xray_port, listening_sockets,
+#                             peer_on_exit, iptables_forward
+#   diag_result_file       — base path; .jump / .exit suffixes appended
+
+- name: Diagnose relay→exit WG link — jump side
+  hosts: vpn_nodes
+  become: true
+  gather_facts: false
+  vars:
+    # Только производное имя. Переопределять сам diag_result_file бессмысленно:
+    # он приходит от оркестратора через -e и play-переменной не перекрывается
+    # (и раньше эта строка вдобавок ссылалась сама на себя по кругу).
+    diag_result_file_jump: "{{ diag_result_file }}.jump"
+  roles:
+    - diagnose_relay_link
+
+- name: Diagnose relay→exit WG link — exit side
+  hosts: wg_exit_nodes
+  become: true
+  gather_facts: false
+  # Полностью скип, если ни одной exit-side проверки не запрошено —
+  # не дёргаем второй SSH впустую.
+  vars:
+    diag_result_file_exit: "{{ diag_result_file }}.exit"
+  tasks:
+    - name: Run exit-side diagnostics
+      ansible.builtin.include_role:
+        name: diagnose_relay_link_exit_side
+      when: ('peer_on_exit' in diag_check_types) or ('iptables_forward' in diag_check_types)

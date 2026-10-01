@@ -47,8 +47,40 @@ deploy_app_stack_force_recreate: false
 # Optional (leave empty string to disable the corresponding feature):
 #   deploy_app_stack_telegram_stars_webhook_secret
 #   deploy_app_stack_payment_provider        (default: "cryptobot")
+#   deploy_app_stack_payment_provider_choices (Stage 9b: меню способов
+#       оплаты в боте, например "telegram_stars,lava_top,tribute")
+#   deploy_app_stack_lava_top_*              (Stage 9b: lava.top —
+#       api_key/offer_id/webhook_secret из vault, email_domain открытый)
+#   deploy_app_stack_tribute_*               (Stage 9b: Tribute —
+#       api_key из vault; order_title/description опциональны)
 deploy_app_stack_payment_provider: "cryptobot"
 deploy_app_stack_telegram_stars_webhook_secret: ""
+deploy_app_stack_payment_provider_choices: ""
+deploy_app_stack_lava_top_api_key: ""
+deploy_app_stack_lava_top_offer_id: ""
+deploy_app_stack_lava_top_webhook_secret: ""
+deploy_app_stack_lava_top_email_domain: ""
+deploy_app_stack_lava_top_api_base: ""
+# Одна интеграция lava — два имени провайдера (2026-09-19): lava_top = карта
+# (эквайрер SMART_GLOCAL, метод CARD), lava_top_sbp = СБП (PAY2ME, метод SBP).
+deploy_app_stack_lava_top_card_provider: "SMART_GLOCAL"
+deploy_app_stack_lava_top_sbp_provider: "PAY2ME"
+# Провайдер кнопки «Продлить по СБП» на странице ?fix=1 (&pay=sbp).
+deploy_app_stack_sub_fix_sbp_provider: "lava_top_sbp"
+# Авто-сверка карточных платежей lava (вебхук-независимо). Воркер раз в N
+# секунд опрашивает /api/v2/invoices и зачисляет pending-счета. 0 = выкл.
+deploy_app_stack_lava_top_reconcile_interval: 60
+deploy_app_stack_tribute_api_key: ""
+deploy_app_stack_tribute_order_title: ""
+deploy_app_stack_tribute_order_description: ""
+deploy_app_stack_tribute_api_base: ""
+
+# Admin SPA base path. Default "admin" keeps the legacy /admin/ URL;
+# override via vault_admin_secret_path in group_vars/web/vault.yml to
+# bury the panel behind a secret path (anti-probing — see docs). Must
+# match deploy_web_frontend_admin_path so nginx and the admin container
+# agree on the exposed prefix. Change triggers docker image rebuild.
+deploy_app_stack_admin_base_path: "{{ vault_admin_secret_path | default('admin') }}"
 
 # Telegram WebApp / Mini App.
 #
@@ -65,3 +97,36 @@ deploy_app_stack_telegram_stars_webhook_secret: ""
 #                                         WebAppInfo / Direct Link buttons.
 deploy_app_stack_webapp_base_url: "https://{{ deploy_web_frontend_domain | default('grinwer.online') }}/app"
 deploy_app_stack_webapp_jwt_ttl_seconds: 1800
+
+# ── WS+CDN / xhttp DNS front (Cloudflare DNS-only, no proxy) ───────────
+# CF is used ONLY as a DNS host: the backend mints a random DNS-only
+# (grey-cloud) A-record <rand>.wgse.info → node IP; the node serves TLS
+# itself via Let's Encrypt. CF-proxying ws/xhttp is dead (RKN; see
+# project_cf_ws_cdn_dead) — the Origin-CA vars are gone, no CF cert anymore.
+# Leave vault_cloudflare_api_token empty to disable DNS fronting. NB: the
+# token must still cover grwr.ink until the old CF-proxied xhttp records
+# are torn down (teardown resolves the zone from the stored cf_front_domain).
+deploy_app_stack_cloudflare_dns_token: "{{ vault_cloudflare_api_token | default('') }}"
+deploy_app_stack_wscdn_front_domain: "{{ vault_wscdn_front_domain | default('wgse.info') }}"
+
+# ── Provisioning reconciler (desired-state convergence) ────────────────
+# Master-тумблер + тунаблы reconcile-модели. Безопасный role-дефолт OFF;
+# прод включает через group_vars/web/main.yml (deploy_app_stack_reconciler_enabled: "1").
+# См. docs/operations/provisioning_reconciler_epic.md.
+deploy_app_stack_reconciler_enabled: "0"
+deploy_app_stack_reconcile_interval: 3
+deploy_app_stack_reconcile_debounce_s: 5
+deploy_app_stack_reconcile_max_per_tick: 15
+deploy_app_stack_reconcile_retry_s: 60
+# Watchdog: WARNING в логах, если самая старая dirty-нода просрочена дольше
+# (run_reconcile_tick также экспортит pending/overdue гейджи для алертов).
+deploy_app_stack_reconcile_overdue_warn_s: 120
+# Cloud-billing guard: интервал тика (сек) + порог алерта по балансу
+# провайдера (единицы как у провайдера; 0 = алерты выкл, только gauge).
+deploy_app_stack_cloud_billing_interval: 3600
+deploy_app_stack_cloud_balance_alert_threshold: 0
+# AI-агент (read-only триаж). Выключен по умолчанию; ключ — из vault
+# (vault_anthropic_api_key → deploy_app_stack_anthropic_api_key в group_vars).
+deploy_app_stack_agent_enabled: ""
+deploy_app_stack_anthropic_api_key: "{{ vault_anthropic_api_key | default('') }}"
+deploy_app_stack_agent_model: "claude-sonnet-4-6"

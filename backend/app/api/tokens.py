@@ -1,12 +1,12 @@
 """Scoped API tokens admin CRUD: ``/api/api-tokens``."""
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, Header, HTTPException, status
 from sqlalchemy.orm import Session
 
 from .. import models, schemas
 from ..auth import ALL_SCOPES, generate_token, require_admin
-from ._common import _audit, get_db
+from ._common import ADMIN_ACTOR_HEADER, _audit, _resolve_admin_actor, get_db
 
 router = APIRouter()
 
@@ -30,6 +30,7 @@ def create_api_token(
     payload: schemas.ApiTokenCreate,
     db: Session = Depends(get_db),
     admin_token: str = Depends(require_admin),
+    admin_actor: str | None = Header(default=None, alias=ADMIN_ACTOR_HEADER),
 ):
     """Mint a new scoped token.
 
@@ -57,14 +58,15 @@ def create_api_token(
     db.add(row)
     db.commit()
     db.refresh(row)
+    actor, actor_type = _resolve_admin_actor(admin_actor)
     _audit(
         db,
-        actor="admin",
+        actor=actor,
         action="api_token.create",
         target_type="api_token",
         target_id=row.id,
         metadata={"name": row.name, "scopes": row.scopes},
-        actor_type=models.AuditActor.admin,
+        actor_type=actor_type,
     )
     db.commit()
 
@@ -85,6 +87,7 @@ def revoke_api_token(
     token_id: int,
     db: Session = Depends(get_db),
     admin_token: str = Depends(require_admin),
+    admin_actor: str | None = Header(default=None, alias=ADMIN_ACTOR_HEADER),
 ):
     """Disable a token. Row is kept for audit continuity."""
     row = db.get(models.ApiToken, token_id)
@@ -92,13 +95,14 @@ def revoke_api_token(
         raise HTTPException(status_code=404, detail="token not found")
     row.is_active = False
     db.commit()
+    actor, actor_type = _resolve_admin_actor(admin_actor)
     _audit(
         db,
-        actor="admin",
+        actor=actor,
         action="api_token.revoke",
         target_type="api_token",
         target_id=row.id,
         metadata={"name": row.name},
-        actor_type=models.AuditActor.admin,
+        actor_type=actor_type,
     )
     db.commit()

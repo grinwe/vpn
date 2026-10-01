@@ -11,6 +11,9 @@
 #
 - hosts: vpn_nodes
   become: yes
+  # Как в resync_node.yml: фактов play не использует (только stat/command/
+  # debug), а full setup — это +5-10s на каждый прогон при частых вызовах.
+  gather_facts: false
   vars:
     state: present
     protocols: "{{ [ {'proto': config_proto | default('shadowtls+shadowsocks'),
@@ -28,6 +31,20 @@
       stat:
         path: /usr/local/sbin/manage_vpn_user.sh
       register: st_manage_script
+
+    # Аудит #174: отсутствие manage-скрипта при state=present — это ошибка
+    # (нода не bootstrap'нута под протокол), а не повод молча заскипать
+    # задачу и вернуть rc=0 бэкенду. Для state=absent скип остаётся:
+    # revoke на пустой ноде — норма.
+    - name: Fail if ShadowTLS apply requested but manage script is missing
+      ansible.builtin.fail:
+        msg: >-
+          node is not bootstrapped for shadowtls:
+          /usr/local/sbin/manage_vpn_user.sh is missing (state=present)
+      when:
+        - state == 'present'
+        - protocols | selectattr('proto', 'match', 'shadowtls') | list | length > 0
+        - not st_manage_script.stat.exists
 
     - name: Add or remove ShadowTLS user
       # Placeholder 'x' for password: the legacy shadowtls manage
@@ -56,6 +73,17 @@
       stat:
         path: /usr/local/sbin/manage_vless_user.sh
       register: vless_manage_script
+
+    # Аудит #174: при state=present отсутствие скрипта = ошибка, не скип.
+    - name: Fail if VLESS Reality apply requested but manage script is missing
+      ansible.builtin.fail:
+        msg: >-
+          node is not bootstrapped for vless-reality:
+          /usr/local/sbin/manage_vless_user.sh is missing (state=present)
+      when:
+        - state == 'present'
+        - protocols | selectattr('proto', 'equalto', 'vless-reality') | list | length > 0
+        - not vless_manage_script.stat.exists
 
     - name: Fail if VLESS Reality apply is missing UUID
       fail:
@@ -98,6 +126,17 @@
         path: /usr/local/sbin/manage_vless_ws_user.sh
       register: vless_ws_manage_script
 
+    # Аудит #174: при state=present отсутствие скрипта = ошибка, не скип.
+    - name: Fail if VLESS WS apply requested but manage script is missing
+      ansible.builtin.fail:
+        msg: >-
+          node is not bootstrapped for vless-ws-cdn:
+          /usr/local/sbin/manage_vless_ws_user.sh is missing (state=present)
+      when:
+        - state == 'present'
+        - protocols | selectattr('proto', 'equalto', 'vless-ws-cdn') | list | length > 0
+        - not vless_ws_manage_script.stat.exists
+
     - name: Fail if VLESS WS apply is missing UUID
       fail:
         msg: "vless-ws-cdn provisioning requires uuid when state=present"
@@ -134,6 +173,17 @@
         path: /usr/local/sbin/manage_vless_xhttp_user.sh
       register: vless_xhttp_manage_script
 
+    # Аудит #174: при state=present отсутствие скрипта = ошибка, не скип.
+    - name: Fail if VLESS XHTTP apply requested but manage script is missing
+      ansible.builtin.fail:
+        msg: >-
+          node is not bootstrapped for vless-xhttp:
+          /usr/local/sbin/manage_vless_xhttp_user.sh is missing (state=present)
+      when:
+        - state == 'present'
+        - protocols | selectattr('proto', 'equalto', 'vless-xhttp') | list | length > 0
+        - not vless_xhttp_manage_script.stat.exists
+
     - name: Fail if VLESS XHTTP apply is missing UUID
       fail:
         msg: "vless-xhttp provisioning requires uuid when state=present"
@@ -169,6 +219,17 @@
       stat:
         path: /usr/local/sbin/manage_hy2_user.sh
       register: hy2_manage_script
+
+    # Аудит #174: при state=present отсутствие скрипта = ошибка, не скип.
+    - name: Fail if Hysteria2 apply requested but manage script is missing
+      ansible.builtin.fail:
+        msg: >-
+          node is not bootstrapped for hysteria2:
+          /usr/local/sbin/manage_hy2_user.sh is missing (state=present)
+      when:
+        - state == 'present'
+        - protocols | selectattr('proto', 'equalto', 'hysteria2') | list | length > 0
+        - not hy2_manage_script.stat.exists
 
     - name: Fail if Hysteria2 apply is missing password
       fail:

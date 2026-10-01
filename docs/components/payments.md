@@ -47,7 +47,7 @@ Legacy fallback: если `PAYMENT_PROVIDERS` не задан, читается 
 
 Единственный honest-to-god внешний провайдер. API `@CryptoBot` (Crypto Pay API).
 
-- `create_invoice`: POST `/createInvoice` с `asset: "USDT"` (маппится из `USD`), `payload: str(invoice_id)`. Возвращает `pay_url` и `invoice_id` провайдера → в `ProviderInvoice`.
+- `create_invoice`: POST `/createInvoice`, `payload: str(invoice_id)`. Валюта различается по коду (аудит #115): крипто-ассеты (`USDT`/`TON`/`BTC`/…, и исторический `USD`→`USDT`) уходят как `currency_type=crypto` + `asset`; всё остальное (`RUB`/`EUR`/…) — как `currency_type=fiat` + `fiat=<код>` (топап-путь `webapp_topup` шлёт `RUB` напрямую без конвертации). Возвращает `pay_url` и `invoice_id` провайдера → в `ProviderInvoice`.
 - `verify_webhook`: подпись в заголовке `Crypto-Pay-Api-Signature`. Секрет считается как `sha256(token)` (не сам токен!), затем `HMAC-SHA256(raw_body)`. `cryptobot.py:88-92`. Распаковывается `payload.payload` — это наш же `invoice_id`, отправленный на этапе create.
 - Статусы: `invoice_paid → "paid"`, `invoice_expired → "expired"`, всё остальное → `"other"`.
 - Токен передаётся в `Crypto-Pay-API-Token` header, **не в query** (`cryptobot.py:33-34`). Явный комментарий: «never in query strings».
@@ -80,7 +80,9 @@ user pays → TG шлёт successful_payment → bot handler
 user pays → TG шлёт update на /tg-webhook (backend напрямую)
      → backend проверяет secret_token header
      → если successful_payment (XTR): _mark_invoice_paid_core
-     → если pre_checkout_query (XTR): answerPreCheckoutQuery(ok=True) через Bot API
+       (сбой = error-лог + алерт админам stars_payment_failed; 5xx → не-200, Telegram ретраит — аудит #209)
+     → если pre_checkout_query (XTR): валидация инвойса (существует, pending,
+       сумма в Stars совпадает) → answerPreCheckoutQuery(ok|ok=False) — аудит #2
      → иначе: forward в bot через BOT_INTERNAL_WEBHOOK_URL
 ```
 
@@ -117,25 +119,86 @@ SBP_<SLUG>_PAID_STATUSES         ← default "paid,success,succeeded"
 - Дальше ищется `payload.invoice_id` или `payload.order_id`, **один** из них обязан совпадать с тем, что мы клали на create.
 - Маппинг статусов: `paid_statuses → "paid"`, `{failed, canceled, cancelled, declined} → "failed"`, `{expired, timeout} → "expired"`, остальное → `"other"`.
 
-«Mock aggregator» в тестах использует именно этот driver — `tests/test_payment_providers.py` гоняет generic_sbp с поддельными env'ами.
+«Mock aggregator» в тестах использует именно этот driver — `tests/test_payment_providers.py` гоняет generic_sbp с поддельными env'ами. Сквозной конвейер «webhook → `_mark_invoice_paid_core` → подписка/баланс» покрыт интеграционно в `tests/test_auditfix_api_invoices_py.py` (аудит #186): реальные POST на `/api/payments/webhook/sbp:*` с HMAC-подписью тела, идемпотентность повторной доставки, mark_paid, topup + реферальный бонус, ветки ошибок 400/401/404.
+
+### Lava.top (`lava_top.py`, Stage 9b)
+
+Карты РФ (МИР/Visa/MC) + СБП через lava.top (LAVALANE LTD). Полный
+контекст выбора и рисков — `docs/PLAN_LAVA_TOP.md`.
+
+**Одна интеграция — два имени провайдера (2026-09-19).** Драйвер один, но
+`get_provider` поднимает его под двумя именами, и каждое пишется в
+`Payment.provider`:
+
+| имя | эквайрер (`paymentProvider`) | `paymentMethod` | подпись кнопки |
+|---|---|---|---|
+| `lava_top` | `LAVA_TOP_CARD_PROVIDER`, дефолт `SMART_GLOCAL` | `CARD` | 💳 Карта РФ |
+| `lava_top_sbp` | `LAVA_TOP_SBP_PROVIDER`, дефолт `PAY2ME` | `SBP` | 🏦 СБП |
+
+Ключ, `offerId`, секрет вебхука и email-домен общие; вебхук-URL тоже один —
+`/api/payments/webhook/lava_top`. До 2026-09-19 кнопка была одна («Карта РФ /
+СБП»): `paymentProvider=PAY2ME` **без** `paymentMethod`, способ человек
+выбирал на странице агрегатора. lava закрыл у PAY2ME карту, а без метода
+PAY2ME берёт её по умолчанию → create падал с 400 «Restricted payment method
+type» (в кабинете — «Не удалось создать счёт: 502»), и весь сентябрь платежей
+картой/СБП не было. Поэтому способ теперь шлётся ЯВНО, а имена разведены.
+
+- `create_invoice`: POST `{LAVA_TOP_API_BASE}/api/v3/invoice`, auth-заголовок `X-Api-Key`. В теле — `paymentProvider` (эквайрер) и `paymentMethod` (`CARD`/`SBP`) выбранного имени; пустой эквайрер = поле не шлём. Динамическая сумма работает только у продукта с включённым в кабинете режимом «Цена по запросу через API» (`LAVA_TOP_OFFER_ID`); лимиты платформы 50–1 000 000 ₽. Metadata-поля у платформы нет — наш `invoice_id` едет в `clientUtm.utm_content`, а обязательный email покупателя синтезируется как `inv{invoice_id}@{LAVA_TOP_EMAIL_DOMAIN}`. Из ответа: `id` (contractId) → `external_id`, `paymentUrl` → `pay_url`.
+- `verify_webhook`: HMAC у платформы **нет** — она шлёт наш статический секрет `LAVA_TOP_WEBHOOK_SECRET` в заголовке `X-Api-Key` (настраивается в кабинете при добавлении вебхука, тип «API key»). `paid` = `eventType=payment.success` **и** `status ∈ {completed, subscription-active}`; `payment.failed`/`subscription.recurring.payment.failed` → `failed`; остальное → `other`. Событие без `clientUtm.utm_content` (покупка не из нашего backend'а) — warning + `other`/`external_id="0"`, чтобы платформа не ретраила вечно (до 20 попыток).
+- **Матчинг Payment-строки по семейству имён.** Вебхук приходит на `/webhook/lava_top`, но строка СБП-платежа записана как `lava_top_sbp` — поэтому `api/payments.py` ищет pending-платежи не по `provider == provider.name`, а по `provider.family` (`LavaTopProvider.family = ("lava_top", "lava_top_sbp")`). Тик сверки в `worker.py` фильтрует по тому же кортежу (`_LAVA_PROVIDERS`). Провайдеры без атрибута `family` работают по-старому (одно имя). Порядок выбора строки: при известном `contractId` — только точное совпадение `external_id` (среди pending, иначе среди всех статусов: paid-строка = ретрай, без алерта); контракт, которого нет ни в одной строке, на уже оплаченном счёте = двойная оплата (алерт). Фолбэк «последняя pending» — только когда `contractId` из события не извлёкся. То же правило в сверке воркера (`_alert_stale_lava_sale` и матчинг в `run_lava_reconcile_tick`): брошенная pending-строка второго способа на одном счёте — штатная ситуация, а не «двойная оплата» (ревью 2026-09-19).
+- Env-цепочка: `LAVA_TOP_API_KEY`/`_OFFER_ID`/`_WEBHOOK_SECRET` из vault (`vault_lava_top_*`), `LAVA_TOP_EMAIL_DOMAIN` — открытый (default: домен фронта), `LAVA_TOP_CARD_PROVIDER`/`LAVA_TOP_SBP_PROVIDER` — эквайреры двух имён (дефолты `SMART_GLOCAL`/`PAY2ME`). Старая `LAVA_TOP_PAYMENT_PROVIDER` удалена и не читается.
+- **Авто-сверка (вебхук-независимо).** Доставка вебхуков lava — best-effort (до 20 ретраев по докам; в проде наблюдалось, что POST не приходит вовсе — счёт остаётся pending, деньги списаны). Воркер-тик `run_lava_reconcile_tick` (`worker.py`, интервал `LAVA_TOP_RECONCILE_INTERVAL`, default 60с; TICK_IDS/TIMEOUTS в `queue.py`) раз в минуту зовёт `LavaTopProvider.list_recent_invoices()` (`GET /api/v2/invoices`) и зачисляет любой pending-счёт, чья продажа у lava `COMPLETED` (матч по `clientUtm.utm_content` = наш invoice_id), через тот же `_mark_invoice_paid_core`. Идемпотентно: уже-paid счета пропускаются, а если вебхук всё-таки долетит — дедуп по `reference=invoice:{id}`. **Сверка fail-closed (аудит 2026-07-25):** продажа должна покрывать счёт, валюта продажи обязана совпасть с валютой счёта, а `offerId` — с `LAVA_TOP_OFFER_ID`; если сумму распарсить не удалось (пустой ещё фискальный `receipt`, строковое поле, смена формы ответа — `_sale_amount` пробует `receipt.amount`, `amountTotal`, `amount`), счёт **не зачисляется**, а поднимается `notify_admins(kind="payment_amount_unverified")` — раньше `amount=None` означал «сверка пройдена» и кредитовал счёт целиком. Payment-строка матчится по `contract_id` ↔ `Payment.external_id` (фолбэк — последняя pending), а не слепо «последняя по id DESC». Счёт **не** в статусе `pending` больше не пропускается молча: при живой pending-строке lava это `payment_double_paid` (человек заплатил дважды), иначе `payment_for_inactive_invoice` — при неработающем вебхуке сверка единственный канал, который вообще видит карточные платежи. Так карта пополняет баланс даже при полностью нерабочем вебхуке. No-op без `LAVA_TOP_API_KEY`. **Воркеру для этого прокинуты все `LAVA_TOP_*` в `worker-env`** (docker-compose), иначе `get_provider("lava_top")` в тике вернёт not_configured.
+
+- **Устойчивость и наблюдаемость (2026-09-19).** `create_invoice` делает один повтор через 1,5 с при транзиентном сбое (обрыв соединения, 5xx, не-JSON тело вроде «no available server» от балансировщика lava); 4xx не повторяются. Если счёт всё равно не выписан, API отвечает 502 с человеческим текстом (`PROVIDER_UNAVAILABLE_MESSAGE` в `services/payments/checkout.py`), а сырая ошибка провайдера уходит в лог и админам пушем `admin_alert_payment_provider` (`report_provider_failure`, дедуп час на провайдера). Раньше сырой текст показывался пользователю, а админ не узнавал о проблеме вовсе.
+
+### Tribute (`tribute.py`, Stage 9b)
+
+Tribute Shop API (tribute.tg, TRBT Limited): карты (браузерная ссылка), СБП, Stars.
+
+- `create_invoice`: POST `{TRIBUTE_API_BASE}/shop/orders`, заголовок `Api-Key`. Сумма — **int в копейках/центах** (драйвер конвертирует из рублёвого float). `title`/`description` обязательны у платформы — берутся нейтральные строки из `TRIBUTE_ORDER_TITLE`/`_DESCRIPTION` (дефолт «Пополнение баланса», Stage 9d-нейтральность), описание счёта не пересылается. `customerId` = наш `invoice_id` (round-trip), `uuid` заказа → `external_id`. `pay_url` = `paymentUrl` (браузер; приоритетнее `webappPaymentUrl` — карты за цифровые услуги внутри Telegram нарушают Stars-only правило Bot ToS §6.2).
+- `verify_webhook`: заголовок `trbt-signature` = HMAC-SHA256 сырого тела, ключ — сам `TRIBUTE_API_KEY` (отдельного секрета нет). Кодировка в доке не зафиксирована — принимаются hex и base64. `paid` = **только** событие `shop_order` со `status=paid`; промежуточный `shop_order_payment_received` («фиат получен, ждём финала») намеренно → `other`; `shop_order_payment_failed`/`_cancelled`/`_refunded` → `failed`. Событие без `customerId` — warning + `other`/`"0"` (заказ не из нашего backend'а).
+
+Оба драйвера рублёвые: `_convert_for_provider` пропускает их суммы без конвертации, сверка суммы вебхука работает из коробки. `_provider_invoice_id_from_event` понимает их raw (lava: `contractId` на верхнем уровне; tribute: `payload.uuid`). Юнит-тесты — `tests/test_payments_lava_top.py` (оба драйвера: построение запроса, подписи/секреты, маппинг событий, get_provider-диспатч).
+
+### Выбор способа оплаты в боте (Stage 9b)
+
+`PAYMENT_PROVIDER_CHOICES` (env бота, comma-separated имена провайдеров): при 2+ значениях бот после создания счёта показывает меню способов (прод 2026-09-19: «⭐ Telegram Stars / 🏦 СБП / 💳 Карта РФ» — `telegram_stars,lava_top_sbp,lava_top`), checkout происходит в callback'е `payvia:{kind}:{invoice_id}:{provider}` выбранным провайдером. Кнопки способов остаются в клавиатуре после выдачи pay-ссылки — неудавшийся способ (антифрод агрегатора) можно сменить, каждый выбор создаёт свою Payment-строку (#117 матчит оплаченную). Пусто/одно имя — старое поведение (`PAYMENT_PROVIDER` без меню).
+
+## Единый чекаут — `services/payments/checkout.py`
+
+Цепочка «счёт у провайдера → `Payment(pending)` → `pay_url`» жила в трёх
+копиях, причём конвертация валют (#108) и `IntegrityError`-дедуп (#52) были
+только в одной. Теперь все ходят в `checkout_pending_invoice`: бот-чекаут,
+WebApp-чекаут, WebApp-топап и страница починки без Telegram.
+
+* `Payment.pay_url` персистится (миграция 0067) → повторный тап возвращает
+  ТОТ ЖЕ URL без второго похода к провайдеру (не плодим счета-сироты).
+* Ошибки разделены: конфигурация (нет провайдера/курса) → 503,
+  поход к провайдеру → 502 (`ProviderApiError`).
+* Сумма продления считается СЕРВЕРОМ (`total_renewal_cost_kopecks`, со
+  слотами). Клиентский `amount` в `POST /api/invoices` принимается только
+  с админ-токеном — иначе renewal-инвойс на 1 ₽ продлевал бы подписку
+  целиком (`_mark_invoice_paid_core` сумму не сверяет).
 
 ## `/api/invoices/{id}/checkout` — создание инвойса
 
 `backend/app/api.py:2578-2636`. Минимальный путь:
 
+0. **Ownership-guard (обязателен для не-админов).** Эндпоинт анонимный, а `invoice_id` в меню оплаты приезжает из подделываемой `callback_data`, поэтому вызывающий обязан доказать владение: без валидного `X-Admin-Token` тело ДОЛЖНО содержать `telegram_id`, совпадающий с владельцем счёта, иначе `403`. До 2026-07-25 проверка стояла под `if req_tg` и снималась простым отсутствием поля — то есть защищала только честного клиента (аудит, находка #10). Бот всегда шлёт `telegram_id`; WebApp ходит через свой `/api/webapp/checkout` c JWT.
 1. Найти `Invoice`, проверить `status == pending`.
 2. `provider = get_provider(body.provider or None)` — `None` означает «выбери из пула».
-3. `provider.create_invoice(invoice_id, amount, currency, return_url)`.
-4. **Перед** ответом клиенту создать `Payment(status=pending, provider=provider.name, external_id=provider_invoice.external_id)`. Это — то, что webhook потом найдёт по `(invoice_id, provider)`.
-5. `db.commit()`, вернуть `pay_url`.
+3. Конвертация валюты (#108): RUB-счёт приводится к валюте провайдера **до** `create_invoice` — для `telegram_stars` через `_rub_to_stars` (курс `WEBAPP_STARS_PER_RUB`, тот же, что в WebApp), для `cryptobot` через `CRYPTOBOT_RUB_PER_USDT` (не задан → 503, счёт не создаётся). SBP и уже сконвертированные счета (XTR/USDT) проходят как есть. `Payment`-строка при этом хранится в валюте `Invoice` (RUB).
+4. `provider.create_invoice(invoice_id, amount, currency, return_url)`.
+5. **Перед** ответом клиенту создать `Payment(status=pending, provider=provider.name, external_id=provider_invoice.external_id)`. Это — то, что webhook потом найдёт по `(invoice_id, provider)`.
+6. `db.commit()`, вернуть `pay_url`.
 
 `return_url` передаётся только в CryptoBot и только как `paid_btn_url` (кнопка «Return to bot» после оплаты). Stars игнорирует, SBP — тоже, потому что его UX мы не контролируем.
 
-Особенность: **один invoice может получить несколько Payment-строк**. Если пользователь дважды нажал checkout, каждый вызов создаст свой `Payment` с новым `external_id`. Старые — остаются `pending`. Webhook с конкретным `external_id` попадёт в правильную строку, потому что ищется `order_by(Payment.id.desc()).first()` и `provider == event.provider` (см. ниже).
+Особенность: **один invoice может получить несколько Payment-строк**. Если пользователь дважды нажал checkout, каждый вызов создаст свой `Payment` с новым `external_id` (id счёта на стороне провайдера). Webhook помечает `paid` именно ту строку, которую реально оплатили: среди `pending`-строк по `(invoice_id, provider)` ищется та, чей `external_id` совпал с provider invoice id из события (извлекается из `event.raw`, т.к. `event.external_id` — это НАШ внутренний invoice id), с фолбэком на последнюю `pending`, а если pending-строк нет — на последнюю любую (#117, см. ниже).
 
 ## `/api/payments/webhook/{provider_name}` — приём callback'а
 
-`backend/app/api.py:2639-2697`. Единственный unauthenticated route в admin-surface'е (по FastAPI):
+`backend/app/api.py:2639-2697`. Единственный unauthenticated route в admin-surface'е (по FastAPI). Эндпоинт `async`, но вся работа с БД (запрос `Payment` + `_mark_invoice_paid_core` с `with_for_update`) уходит в threadpool через `asyncio.to_thread` (#199) — иначе row-lock на инвойсе замораживал бы event loop всего процесса:
 
 ```
 POST /api/payments/webhook/cryptobot
@@ -165,9 +228,20 @@ POST /api/payments/webhook/sbp:robokassa
                │            log & return  log & return
                ▼
        invoice_id = int(external_id)
-       pending_payment = SELECT p FROM payments
-             WHERE invoice_id=? AND provider=?
-             ORDER BY id DESC LIMIT 1
+               │
+               ▼
+       сверка суммы/валюты (#111):
+         expected = _convert_for_provider(invoice.amount, invoice.currency, provider)
+         if event.amount is not None and (недоплата или валюта≠) →
+             notify_admins + HTTPException 409, счёт остаётся pending
+               │
+               ▼
+       pending_payment = SELECT p FROM payments             (#117)
+             WHERE invoice_id=? AND provider=? AND status='pending'
+             ORDER BY id DESC
+             → предпочесть p.external_id == provider_invoice_id(event.raw)
+             → иначе последнюю pending
+             → иначе (нет pending) последнюю любую
                │
                ▼
        _mark_invoice_paid_core(
@@ -184,6 +258,7 @@ POST /api/payments/webhook/sbp:robokassa
 - **Idempotency защитой инвойса.** `_mark_invoice_paid_core` берёт `SELECT ... FOR UPDATE` на `Invoice`, и если `status == paid` — возвращает уже готовый результат без повторного провижининга. Повтор webhook'а (CryptoBot иногда шлёт два раза при таймауте) не создаёт дубликата credential'ов.
 - **Только `"paid"` обрабатывается.** `expired` / `other` логируются и возвращают 200 — это нужно, иначе провайдер решит, что webhook не доставлен, и будет ретраить до бесконечности.
 - **Actor зашивается как `<provider>:webhook`** — чтобы в `audit_logs` было видно, какой провайдер инициировал переход в paid. Actor type = `system`, не `admin`/`bot`/`user`.
+- **Сверка суммы и валюты (#111).** Перед зачислением webhook сравнивает `event.amount`/`event.currency` с ожидаемой суммой счёта. Счёт хранится в рублях, а провайдер присылает свою валюту (XTR/USDT), поэтому ожидание считается тем же `_convert_for_provider`, что и в `/checkout`, и сравнивается уже в валюте провайдера (синоним `RUR`≡`RUB`). Недоплата (сверх допуска в копейку) или несовпадение валюты → `HTTPException 409` + `notify_admins(kind="payment_amount_mismatch")`, счёт остаётся `pending`. Переплата зачисляется, но пишет `warning`. Если `event.amount` не пришёл (template-режим SBP не фиксирует сумму) — сверять нечего, зачисляем, но с `notify_admins(kind="payment_amount_unverified")`: раньше эта ветка была немой, и любой сбой парсинга суммы (например `int("500.0")` в драйвере Tribute) бесшумно снимал главную проверку денежного пути (аудит 2026-07-25).
 
 ## Взаимодействие с `_mark_invoice_paid_core`
 
@@ -197,7 +272,7 @@ POST /api/payments/webhook/sbp:robokassa
 
 Внутри есть три ветки (по `invoice.kind` и `invoice.action`):
 
-1. **`kind = "topup"`** (`api.py:1845-1917`) — кредитнуть `balance_kopecks`, никакого провижининга. Дополнительно срабатывает **referral payout**: если это первый `kind=topup` у пользователя, и у него есть `referred_by_id`, — начисляем `REFERRAL_BONUS_KOPECKS` реферреру. Защита от double-pay — по `BalanceTransaction.reference = "referral_payout:{user_id}"`. Referral-payout wrapped в `try/except` (`api.py:1882-1890`): если начисление упало, топап пользователя всё равно пройдёт.
+1. **`kind = "topup"`** (`api.py:1845-1917`) — кредитнуть `balance_kopecks`, никакого провижининга. Дополнительно срабатывает **referral payout** (`_maybe_pay_referrer` в `api/invoices.py`, до записи самого топапа): если это первая оплата пользователя (нет других оплаченных счетов с суммой > 0, строк `topup` и `adjust admin_topup:%` > 0) и у него есть `referred_by_id`, — начисляем рефереру `reward_days` кода (по умолчанию 10 дней = 50 ₽). Защита от double-pay — по `BalanceTransaction.reference = "referral_payout:{user_id}"` и лок строки плательщика. Начисление в SAVEPOINT: если оно упало, топап пользователя всё равно пройдёт. С 2026-09-30 тот же хелпер зовут и ветки 2–3 (счёт за продление или тариф): первая оплата приглашённого часто бывает именно renewal-счётом.
 
 2. **`action = "renewal"`** — продлить существующую подписку: `expires_at += plan.duration_days`, статус → `active`. Провижининг не нужен — credential'ы уже есть.
 
@@ -281,7 +356,7 @@ bot/handlers.py                                   │
 ## ⚠️ Неясные места
 
 - **Random rotation без веса.** `pick_provider_name` — чистый `random.choice`. Нельзя настроить «80% CryptoBot, 20% SBP», нельзя выключить провайдер для конкретного плана, нельзя упасть обратно на резерв при сбое. Если CryptoBot лёг — `/checkout` будет рандомно успех/502 пока оператор не поправит `.env`.
-- **`Payment.external_id` не уникален.** Схема позволяет два `Payment` с одним `(provider, external_id)` для одного `Invoice` — если кто-то дважды нажал checkout. Webhook найдёт последний по `ORDER BY id DESC` — старшие `Payment`-ы так и останутся `pending` навсегда. Чистильщика нет.
+- **Дубли `Payment` при двойном checkout.** Один `Invoice` может получить несколько `Payment`-строк (каждый checkout создаёт свою с уникальным provider `external_id`). Webhook помечает `paid` ту строку, чей `external_id` совпал с provider invoice id из события (#117), поэтому сверка с провайдером сходится; но неоплаченные дубли так и остаются `pending` навсегда — отдельного чистильщика нет.
 - **Webhook rate-limit 30/min** (`api.py:2640`) — общий на все провайдеры. Если CryptoBot начнёт агрессивно ретраить, он съест budget SBP'шных уведомлений. Индивидуальных лимитов нет.
 - **Generic SBP template mode.** `PAY_URL_TEMPLATE` — чистый `str.format`, без проверки, что полученный URL вообще валиден для HTTP. Опечатка в env → пользователь получит битую ссылку без ошибки на стороне backend'а.
 - **`verify_webhook` у Stars принимает любой currency только через ручную проверку.** `raise` срабатывает только если `sp.currency != "XTR"` — а если поле отсутствует, используется fallback `"XTR"` (`telegram_stars.py:114`). Это нужно, потому что forward от бота иногда не содержит currency, но делает провайдер чуть слепее, чем хотелось бы.

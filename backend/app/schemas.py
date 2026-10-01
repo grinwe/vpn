@@ -1,3 +1,4 @@
+import uuid
 from datetime import datetime, timezone
 from typing import Annotated, Any, List, Optional
 from pydantic import BaseModel, Field, PlainSerializer, field_validator
@@ -51,12 +52,43 @@ class DeviceOut(BaseModel):
     config_id: int | None = None
     access_username: str | None = None
     connection_uri: str | None = None
+    # Per-device placement context for the admin UI. Populated by the
+    # admin serializer (_subscriptions_for_user in api/users.py) from
+    # the sub's already-loaded ``node`` + the first active cred's
+    # ``exit_id``. Left as None/False for non-admin callers (bot
+    # ``_subscriptions_for_user`` in api.py, webapp flows) so the field
+    # additions don't leak sub-level data onto user-facing endpoints.
+    node_id: int | None = None
+    node_name: str | None = None
+    node_region: str | None = None
+    # True iff the sub's VPNNode has ``relay_config`` set — admin UI
+    # renders a red "relay" badge and shows the exit alongside so ops
+    # can tell at a glance which devices tunnel out via WG.
+    is_relay: bool = False
+    # Exit the sub currently egresses through (same value as
+    # SubscriptionOut.current_exit_id; duplicated onto each device so
+    # per-device cards in the admin UI stay self-contained).
+    exit_id: int | None = None
+    exit_name: str | None = None
+    # Когда трафик устройства видели в последний раз (штампует тик
+    # traffic_stats). Админке нужна точная отметка, а не только «за 24 ч».
+    last_seen_at: UTCDateTime | None = None
 
     class Config:
         from_attributes = True
 
     @classmethod
-    def from_orm(cls, obj):  # type: ignore[override]
+    def from_orm(
+        cls,
+        obj,  # type: ignore[override]
+        *,
+        node_id: int | None = None,
+        node_name: str | None = None,
+        node_region: str | None = None,
+        is_relay: bool = False,
+        exit_id: int | None = None,
+        exit_name: str | None = None,
+    ):
         from .security import decrypt
 
         return cls(
@@ -66,6 +98,13 @@ class DeviceOut(BaseModel):
             config_id=obj.config_id,
             access_username=obj.access_username,
             connection_uri=decrypt(obj.connection_uri),
+            node_id=node_id,
+            node_name=node_name,
+            node_region=node_region,
+            is_relay=is_relay,
+            exit_id=exit_id,
+            exit_name=exit_name,
+            last_seen_at=getattr(obj, "last_seen_at", None),
         )
 
 
@@ -88,20 +127,23 @@ class VPNConfigCreate(BaseModel):
 class VPNConfigOut(VPNConfigCreate):
     id: int
     node_id: int
-    created_at: datetime
-    updated_at: datetime
+    created_at: UTCDateTime
+    updated_at: UTCDateTime
 
     class Config:
         from_attributes = True
 
 
 class VPNConfigUpdate(BaseModel):
-    # In-place edit of an existing VPNConfig. Protocol is intentionally
-    # absent — changing protocol turns the row into a different config
-    # entirely. All other fields are optional; omitted ones are left
-    # untouched. ``settings`` is merged into the existing JSONB so the UI
-    # can update one sub-key without having to re-send the encrypted
-    # secrets it never received in VPNConfigOut.
+    # In-place edit of an existing VPNConfig. ``protocol`` сюда приходит
+    # read-only echo'ом из UI — менять протокол нельзя (это другой конфиг),
+    # эндпоинт лишь отвергает запрос, если присланный protocol != текущего.
+    # Поле ОБЯЗАНО быть объявлено: update_config читает ``payload.protocol``,
+    # а в Pydantic v2 доступ к необъявленному (extra-ignored) полю кидает
+    # AttributeError → весь PUT падал в 500 ДО применения sni/прочих полей,
+    # т.е. редактирование конфига вообще не сохранялось. Все поля optional;
+    # пропущенные — не трогаются. ``settings`` мёржится в существующий JSONB,
+    # чтобы UI мог обновить один под-ключ, не пересылая зашифрованные секреты.
     name: str | None = None
     port: int | None = None
     sni: str | None = None
@@ -124,7 +166,7 @@ class NodeActiveUserOut(BaseModel):
     plan_id: int | None = None
     plan_name: str | None = None
     protocols: list[str] = Field(default_factory=list)
-    subscription_expires_at: datetime | None = None
+    subscription_expires_at: UTCDateTime | None = None
 
 
 class NodeActiveUsersOut(BaseModel):
@@ -157,6 +199,47 @@ class VPNNodeCreate(BaseModel):
     ssh_port: int = 22
     pool_id: int | None = None
     notes: str | None = None
+
+
+class VPNNodeUpdate(BaseModel):
+    """PATCH /nodes/{id} — правка дисплейных/маршрутных полей ноды.
+
+    Только безопасные поля: ``name`` (валидируется как inventory-хост;
+    переименование НЕ требует bootstrap — инвентарь рендерит name как alias,
+    ansible коннектится по ansible_host=host, IP не меняется), ``region``
+    (дисплей + фильтр choose_node), ``pool_id`` (членство в пуле), ``notes``.
+    ``host``/``ssh_port`` сюда НЕ входят — это identity у провайдера
+    (меняется через reinstall/renew). model_fields_set различает «не
+    передано» и «выставлено в null» (нужно для очистки pool_id).
+    """
+    name: str | None = None
+    region: str | None = None
+    pool_id: int | None = None
+    notes: str | None = None
+
+
+class ServerPoolMini(BaseModel):
+    """id+name пула для дропдауна правки ноды (GET /pools)."""
+    id: int
+    name: str
+
+
+class VPNNodeWithConfigsCreate(BaseModel):
+    """Composite create-node-and-configs: за один запрос делаем INSERT
+    ноды + N INSERT'ов VPN-конфигов + один общий bootstrap.
+
+    Заменяет старый flow «создать ноду → bootstrap → добавить config →
+    bootstrap → …», который плодил N+1 таску на каждое добавление
+    протокола.
+
+    Best-effort атомарность: при exception во время создания configs
+    бэк rollback'ает уже-созданную ноду + успешные configs (см.
+    create_node_with_configs). Полностью atomic'ный flow требовал бы
+    рефакторинга ensure_reality_config/ensure_shadowtls_config'ов
+    (они сейчас сами commit'ят) — оставлено на потом.
+    """
+    node: VPNNodeCreate
+    configs: list[VPNConfigCreate] = []
 
 
 class NodeExitLinkHealthMini(BaseModel):
@@ -200,8 +283,55 @@ class VPNNodeOut(VPNNodeCreate):
     # stats. Без клика по diagnose. Дефолт None (``list_nodes`` bulk-load,
     # остальные call-сайты VPNNodeOut его не проставляют — им неактуально).
     last_ssh_at: UTCDateTime | None = None
-    created_at: datetime
-    updated_at: datetime
+    # Текущее число активных юзеров — active_users из ПОСЛЕДНЕГО
+    # NodeTrafficSample (тем же per-node lookup, что и last_ssh_at). Нужно
+    # админке, чтобы отличать idle-туннель (0 юзеров → WG без трафика не делает
+    # handshake → серый) от реального обрыва (юзеры есть, а handshake протух →
+    # красный). Дефолт 0; кроме list_nodes другие call-сайты не проставляют.
+    active_users: int = 0
+    # assigned_users — сколько РАЗНЫХ юзеров держат активный cred на ноде
+    # (diverse-sub-корректно, по Credential.node_id). В отличие от active_users
+    # (живой счёт из traffic-сэмпла, протухает без stats-тика) это
+    # детерминированный DB-join — «сколько людей на ноде сидит». Ставится в
+    # list_nodes; прочие call-сайты не проставляют (дефолт 0).
+    assigned_users: int = 0
+    # cert_expires_at — ближайшее истечение LE-серта (xhttp/ws-cdn) ноды,
+    # min из config.settings.cert_expires_at (пишет cert-renewal-тик внешней
+    # TLS-пробой). None = сертов нет / ещё не пробовано. Для cert-бейджа.
+    cert_expires_at: UTCDateTime | None = None
+    # Версии софта на ноде — снимает tick-node-versions по SSH (маппятся из ORM
+    # автоматически). xray_version — что реально стоит; release_version — какой
+    # версией нашего кода нода прошита (маркер /etc/vpn-node-release.json);
+    # versions_checked_at=None значит «ни разу не опрашивали», и это не то же
+    # самое, что «опросили и не нашли».
+    xray_version: str | None = None
+    release_version: str | None = None
+    # hysteria2 — отдельный демон со своим бинарём, xray его не обслуживает.
+    hysteria_version: str | None = None
+    versions_checked_at: UTCDateTime | None = None
+    # Reconciler-видимость: desired_generation > reconciled_generation, т.е.
+    # ноде нужен прогон, но он отложен на reconcile-тик (defer-модель). Без
+    # этого флага операторское действие при включённом RECONCILER_ENABLED
+    # выглядит как «ничего не произошло» — таска материализуется только когда
+    # тик сойдёт ноду. reconcile_pending derived (ставится в list_nodes, как
+    # active_users); reconcile_due_at маппится из ORM-колонки автоматически.
+    reconcile_pending: bool = False
+    reconcile_due_at: UTCDateTime | None = None
+    # NULL = auto-trigger и Telegram-алерты на эту ноду работают.
+    # Timestamp = оператор замьютил (legacy combined-флаг, до migration 0039).
+    auto_diagnose_disabled_at: UTCDateTime | None = None
+    # Diagnostics overhaul (migration 0039) — два независимых тумблера +
+    # per-incident state для admin UI (две разные кнопки в строке ноды).
+    diagnostics_disabled_at: UTCDateTime | None = None
+    alerts_muted_until: UTCDateTime | None = None
+    diagnose_incident_open_at: UTCDateTime | None = None
+    diagnose_follow_mode: str | None = None
+    diagnose_acked_at: UTCDateTime | None = None
+    last_diagnosed_at: UTCDateTime | None = None
+    last_probe_at: UTCDateTime | None = None
+    last_probe_status: str | None = None
+    created_at: UTCDateTime
+    updated_at: UTCDateTime
 
     @field_validator("blocked_regions", mode="before")
     @classmethod
@@ -277,10 +407,17 @@ class SubscriptionOut(BaseModel):
     # data paths may still hit this code before node_id is set.
     node_id: int | None = None
     region: str
-    expires_at: datetime
+    expires_at: UTCDateTime
     status: str
     auto_renew: bool = False
     sub_token: str | None = None
+    # Что показывать юзеру в боте: токен устройства (Subscription.link_token)
+    # или legacy-токен подписки у подписок до 0070 (sub_links.link_token_for).
+    link_token: str | None = None
+    # Готовый URL этой ссылки — домен выбран как у бота (sub_links.sub_url_for,
+    # 50/50 по токену). Только у подписок с Subscription.link_token (с 0070):
+    # у старых кабинет строит URL по-старому, чтобы он не поменялся.
+    link_url: str | None = None
     credentials: List[CredentialOut]
     devices: List[DeviceOut] = []
     # True iff at least one of this subscription's live device emails
@@ -313,6 +450,27 @@ class SubscriptionMigrateOut(BaseModel):
     new_node_id: int
     new_node_name: str
     provisioning_task_id: int | None
+    # Заполняется только авто-миграцией (/migrate-auto): добавили ли
+    # старую ноду в бан-лист юзера. None для ручной /migrate.
+    banned_old_node: bool | None = None
+
+
+class NodeUserBanCreate(BaseModel):
+    node_id: int
+    reason: str | None = None
+
+
+class NodeUserBanOut(BaseModel):
+    id: int
+    user_id: int
+    node_id: int
+    node_name: str | None = None
+    reason: str | None = None
+    created_by: str | None = None
+    created_at: UTCDateTime
+
+    class Config:
+        from_attributes = True
 
 
 class SubscriptionSwitchExitIn(BaseModel):
@@ -321,6 +479,35 @@ class SubscriptionSwitchExitIn(BaseModel):
 
 class SubscriptionSwitchExitOut(BaseModel):
     subscription_id: int
+    old_exit_id: int | None
+    new_exit_id: int
+    new_interface: str
+    task_ids: list[int]
+
+
+class DeviceMigrateIn(BaseModel):
+    target_node_id: int
+
+
+class DeviceMigrateOut(BaseModel):
+    # old_device_id is the row revoked by the migrate (now status=disabled
+    # but kept in DB for sub_token aliasing); device_id is the freshly
+    # provisioned row on the target node.
+    old_device_id: int
+    device_id: int
+    old_node_id: int
+    old_node_name: str
+    new_node_id: int
+    new_node_name: str
+    provisioning_task_id: int | None
+
+
+class DeviceSwitchExitIn(BaseModel):
+    exit_id: int
+
+
+class DeviceSwitchExitOut(BaseModel):
+    device_id: int
     old_exit_id: int | None
     new_exit_id: int
     new_interface: str
@@ -342,6 +529,19 @@ class NodeBulkMigrateOut(BaseModel):
     revoke_task_ids: list[int] = Field(default_factory=list)
     device_task_ids: list[int] = Field(default_factory=list)
     resync_task_ids: list[int] = Field(default_factory=list)
+
+
+class NodeRefreshDestIn(BaseModel):
+    sni: str | None = None
+
+
+class NodeRefreshDestOut(BaseModel):
+    node_id: int
+    old_sni: str
+    new_sni: str
+    sub_count: int
+    failed_subs: list[int] = Field(default_factory=list)
+    task_ids: list[int] = Field(default_factory=list)
 
 
 class TickStatusItem(BaseModel):
@@ -388,6 +588,24 @@ class WorkerRestartOut(BaseModel):
     failed: list[str] = Field(default_factory=list)
 
 
+class WorkerScaleRequest(BaseModel):
+    """Желаемое число worker-реплик (1..20, как в scripts/workers.sh)."""
+    replicas: int = Field(ge=1, le=20)
+
+
+class WorkerScaleOut(BaseModel):
+    """Результат скейла. ``status``: applied | failed | enqueued.
+
+    Скейл реально делает worker по SSH на mgmt (у API-образа нет ssh/ключа),
+    поэтому API энкьюит job и коротко ждёт результат. ``enqueued`` — job
+    взяли, но за окно ожидания он не успел; счётчик воркеров подтянется
+    в виджете сам.
+    """
+    replicas: int
+    status: str
+    detail: str | None = None
+
+
 class ExitEvacuateOut(BaseModel):
     """Результат массового переезда подписок с exit A на exit B.
 
@@ -415,7 +633,7 @@ class DisableRequest(BaseModel):
 class SubscriptionStatusOut(BaseModel):
     plan_name: str
     server_name: str
-    expires_at: datetime
+    expires_at: UTCDateTime
     is_active: bool
     proto_configs: List[CredentialOut]
 
@@ -423,7 +641,7 @@ class SubscriptionStatusOut(BaseModel):
 class SubscriptionProvisionResponse(BaseModel):
     subscription_id: int
     status: str
-    expires_at: datetime
+    expires_at: UTCDateTime
     node_id: int
     plan_id: int
     device: DeviceStatusOut
@@ -462,6 +680,13 @@ class InvoiceCreate(BaseModel):
     action: str = "new_subscription"
 
 
+class TopupInvoiceCreate(BaseModel):
+    """Счёт на пополнение баланса из бота (admin-token путь)."""
+
+    telegram_id: str
+    amount_kopecks: int
+
+
 class InvoiceMarkPaidRequest(BaseModel):
     payment_id: int | None = None
 
@@ -469,14 +694,18 @@ class InvoiceMarkPaidRequest(BaseModel):
 class InvoiceOut(BaseModel):
     id: int
     user_id: int
-    plan_id: int
+    # Nullable: топап-инвойсы (kind="topup") создаются с plan_id=None
+    # (см. models.Invoice.plan_id nullable). Без Optional cancel/mark_unpaid
+    # такого инвойса роняли from_orm в ValidationError уже ПОСЛЕ commit'а —
+    # 500 на UI при уже применённом статусе (по аналогии с InvoiceListItem).
+    plan_id: int | None = None
     subscription_id: int | None = None
     amount: float
     currency: str
     status: str
     action: str
-    created_at: datetime
-    updated_at: datetime
+    created_at: UTCDateTime
+    updated_at: UTCDateTime
 
     class Config:
         from_attributes = True
@@ -510,7 +739,15 @@ class InvoiceListItem(BaseModel):
     status: str
     action: str
     kind: str = "subscription"
-    created_at: datetime
+    created_at: UTCDateTime
+    # Последний платёж по счёту (paid приоритетнее pending): провайдер и его
+    # идентификатор (для lava.top — contractId). Нужно админу для сверки с
+    # кабинетом платёжного партнёра и для доказательств оказания услуги
+    # (проверка СБ lava.top, 2026-09-22).
+    payment_provider: str | None = None
+    payment_external_id: str | None = None
+    payment_status: str | None = None
+    paid_at: UTCDateTime | None = None
 
 
 class InvoicePaidOut(InvoiceListItem):
@@ -522,6 +759,14 @@ class InvoicePaidOut(InvoiceListItem):
 class InvoiceCheckoutRequest(BaseModel):
     provider: str | None = Field(default=None, description="Payment provider name; defaults to server default")
     return_url: str | None = None
+    telegram_id: str | None = Field(
+        default=None,
+        description=(
+            "If set, the backend verifies the invoice belongs to this Telegram "
+            "user before checkout — the bot passes the caller's id so a forged "
+            "callback_data can't check out another user's invoice."
+        ),
+    )
 
 
 class InvoiceCheckoutOut(BaseModel):
@@ -541,7 +786,9 @@ class HealthProbeIn(BaseModel):
     details: dict[str, Any] | None = None
 
 
-class NodeTrafficSample(BaseModel):
+# Переименовано из NodeTrafficSample: имя коллизировало с ORM-моделью
+# models.NodeTrafficSample (снапшот xray-статистики ноды) при разной семантике.
+class NodeTrafficReportSample(BaseModel):
     access_username: str = Field(..., description="Device.access_username the counter belongs to")
     uplink_bytes: int = Field(..., ge=0)
     downlink_bytes: int = Field(..., ge=0)
@@ -554,7 +801,7 @@ class NodeTrafficReport(BaseModel):
         ge=1,
         description="Length of the accounting window the samples cover, for diagnostics only",
     )
-    samples: List[NodeTrafficSample]
+    samples: List[NodeTrafficReportSample]
 
 
 class NodeTrafficSubscriptionResult(BaseModel):
@@ -598,9 +845,12 @@ class ProbeTargetList(BaseModel):
 
 class NodeHealthOut(BaseModel):
     node_id: int
-    health_score: int
+    # Nullable: нода без probe-сэмплов в lookback-окне даёт overall=None →
+    # health_score=None. Раньше поля были non-nullable → Pydantic
+    # ValidationError → 500 на GET /nodes/{id}/health (и /probes).
+    health_score: int | None = None
     blocked_regions: list[str] = []
-    overall_success_rate: float
+    overall_success_rate: float | None = None
     per_region: dict[str, float]
     migrated_subscriptions: list[int] = Field(default_factory=list)
 
@@ -630,7 +880,7 @@ class CloudProviderOut(BaseModel):
     default_plan: str | None
     ssh_key_ids: list[str] | None
     is_active: bool
-    created_at: datetime
+    created_at: UTCDateTime
 
     class Config:
         from_attributes = True
@@ -672,7 +922,8 @@ class PoolDecisionOut(BaseModel):
 
 class NodeSpawnRequest(BaseModel):
     provider_id: int
-    name: str
+    # Пусто → авто-имя «<хостер>-<cc>-<NN>» по конвенции (resolve_spawn_name).
+    name: str | None = None
     region: str
     plan: str
     image: str | None = None
@@ -680,6 +931,33 @@ class NodeSpawnRequest(BaseModel):
     pool_id: int | None = None
     user_data: str | None = None
     notes: str | None = None
+
+
+class NodeReinstallRequest(BaseModel):
+    # OS template/image id для провайдера (4vps: ostempl). None → default_image.
+    image: str | None = None
+
+
+class ExitSpawnRequest(BaseModel):
+    # Заказ облачной WG-exit-ноды (зеркало NodeSpawnRequest без pool_id —
+    # exit'ы не входят в choose_node-пул).
+    provider_id: int
+    # Пусто → авто-имя «<хостер>-<cc>-<NN>» (resolve_spawn_name).
+    name: str | None = None
+    region: str
+    plan: str
+    image: str | None = None
+    ssh_key_ids: list[str] | None = None
+    user_data: str | None = None
+    notes: str | None = None
+
+
+class ProviderOfferingsOut(BaseModel):
+    # Наполнение admin-формы заказа. Списки сырые-нормализованные (id+name+…)
+    # из driver.list_datacenters/list_plans/list_images.
+    datacenters: list[dict] = []
+    plans: list[dict] = []
+    images: list[dict] = []
 
 
 class ProvisioningTaskOut(BaseModel):
@@ -694,14 +972,35 @@ class ProvisioningTaskOut(BaseModel):
     created_at: UTCDateTime
     started_at: UTCDateTime | None
     finished_at: UTCDateTime | None
+    # Phase 1: выставлен → оператор запросил отмену. Если status ещё running —
+    # UI показывает «отменяется…» (раннер SIGTERM'нет на ближайшем poll'е).
+    cancel_requested_at: UTCDateTime | None = None
     # Best-effort lookup: for device/subscription tasks we resolve the
     # owning user's telegram_id so the admin Tasks table can show who
     # the job belongs to without a second round-trip. None for node
     # tasks and for orphan rows whose FK chain got nulled.
     telegram_id: str | None = None
+    # Группировка задач из одного batch-attach (POST /exits/batch-attach).
+    # NULL для одиночных task'ов. UI рендерит badge «batch N/M» когда есть.
+    batch_id: uuid.UUID | None = None
 
     class Config:
         from_attributes = True
+
+
+class BatchSummary(BaseModel):
+    """Сводка по batch_id для drawer-sidebar в UI.
+
+    ``total`` — всего task'ов в батче, ``status_counts`` — гистограмма
+    по ProvisioningTaskStatus. ``tasks`` — полный список child task'ов
+    (обычно 5-15 шт., возвращаем целиком без пагинации). Drawer на
+    polling'е считает прогресс по ``status_counts``, индивидуальные
+    retry/logs пользуется ``tasks``.
+    """
+    batch_id: uuid.UUID
+    total: int
+    status_counts: dict[str, int]
+    tasks: list[ProvisioningTaskOut]
 
 
 class ApiTokenCreate(BaseModel):
@@ -714,8 +1013,8 @@ class ApiTokenOut(BaseModel):
     name: str
     scopes: list[str]
     is_active: bool
-    created_at: datetime
-    last_used_at: datetime | None = None
+    created_at: UTCDateTime
+    last_used_at: UTCDateTime | None = None
 
     class Config:
         from_attributes = True
@@ -734,6 +1033,12 @@ class StatsOut(BaseModel):
     nodes_total: int
     nodes_active: int
     devices_active: int
+    # «Активны за 24ч» по реальному трафику (NodeTrafficSample) — distinct
+    # юзеры / устройства / активные сироты (recovery-плейсхолдер 999999).
+    # Дефолты 0 для обратной совместимости.
+    users_active_24h: int = 0
+    devices_active_24h: int = 0
+    orphans_active_24h: int = 0
     provisioning_tasks_pending: int
     provisioning_tasks_failed: int
 
@@ -742,10 +1047,14 @@ class UserOut(BaseModel):
     id: int
     telegram_id: str | None = None
     email: str | None = None
-    created_at: datetime
+    created_at: UTCDateTime
     subscription_count: int = 0
     balance_kopecks: int = 0
-    banned_at: datetime | None = None
+    banned_at: UTCDateTime | None = None
+    # max(Device.last_seen_at) по девайсам юзера — момент, когда его трафик
+    # видели в последний раз. Заполняется только админским /users (кабинет
+    # юзера это поле не получает); None = активности не видели ни разу.
+    last_active_at: UTCDateTime | None = None
 
     class Config:
         from_attributes = True
@@ -765,7 +1074,7 @@ class AuditLogOut(BaseModel):
     action: str
     target_type: str
     target_id: int | None
-    created_at: datetime
+    created_at: UTCDateTime
     extra: dict | None = None
 
     class Config:
@@ -812,7 +1121,7 @@ class HealthPingSummaryOut(BaseModel):
 
 
 class HealthPingRecentBadItem(BaseModel):
-    created_at: datetime
+    created_at: UTCDateTime
     telegram_id: str | None
     user_id: int | None
     node_id: int | None
@@ -833,7 +1142,7 @@ class NodeHealthPingStatsOut(BaseModel):
     ok: int
     bad: int
     bad_ratio: float  # 0..1
-    last_bad_at: datetime | None
+    last_bad_at: UTCDateTime | None
 
 
 class WGExitNodeCreate(BaseModel):
@@ -908,8 +1217,18 @@ class WGExitNodeOut(BaseModel):
     # этому exit'у. «Сколько юзеров реально ходит через этот exit».
     # Дефолт 0 — одно-нодовые ответы (create/patch) не считают.
     active_subs_total: int = 0
-    created_at: datetime
-    updated_at: datetime
+    # Diagnostics overhaul (migration 0039) — exits get their own probe +
+    # the same toggles/incident state as nodes.
+    last_probe_at: UTCDateTime | None = None
+    last_probe_status: str | None = None
+    diagnostics_disabled_at: UTCDateTime | None = None
+    alerts_muted_until: UTCDateTime | None = None
+    diagnose_incident_open_at: UTCDateTime | None = None
+    diagnose_follow_mode: str | None = None
+    diagnose_acked_at: UTCDateTime | None = None
+    last_diagnosed_at: UTCDateTime | None = None
+    created_at: UTCDateTime
+    updated_at: UTCDateTime
 
     class Config:
         from_attributes = True
@@ -927,6 +1246,89 @@ class RelayExitLinkCreate(BaseModel):
     wg_client_address_v4: str | None = None
 
 
+class BatchAttachRelayRequest(BaseModel):
+    """Прицепить один relay сразу к N exit'ам одним POST'ом.
+
+    Каждой паре (relay, exit) выделяется свой keypair, свой /32 в
+    подсети exit'а и свой ``wgN`` interface на relay'е. WG-клиент-адрес
+    нельзя задать руками — на batch'е это бессмыслено, пусть выделяет
+    автоматом.
+    """
+    relay_node_id: int
+    exit_ids: list[int]
+
+
+class BatchAttachLinkOut(BaseModel):
+    """Один link + порождённая task внутри batch-ответа.
+
+    ``mode='attached'`` — link создан с нуля (INSERT + new keypair + /32).
+    ``mode='reapplied'`` — link уже существовал, бэк не INSERT'ил, просто
+    запустил relay_tunnel apply task на нём (привести wgN.conf к
+    желаемому состоянию).
+    """
+    exit_id: int
+    exit_name: str
+    link_id: int
+    task_id: int
+    wg_interface_name: str
+    wg_client_address_v4: str
+    mode: str  # "attached" | "reapplied"
+
+
+class BatchAttachRelayResponse(BaseModel):
+    """Ответ batch-attach: общий batch_id + список созданных пар.
+
+    Все валидируется ДО транзакции — частичных attach'ей не бывает.
+    Если хоть один exit_id невалид/duplicate/inactive — endpoint
+    возвращает 400/404/409 c деталями и ничего не пишет в БД. Сами
+    же task'и независимы и retry'ятся per-task в UI через batch_id.
+    """
+    batch_id: uuid.UUID
+    relay_node_id: int
+    relay_node_name: str
+    links: list[BatchAttachLinkOut]
+
+
+class BatchDetachRelayRequest(BaseModel):
+    """Отцепить несколько relay-нод от ОДНОГО exit'а одним POST'ом.
+
+    Обратная операция к batch-attach (там один relay → N exit'ов, тут
+    один exit → N relay'ев). relay_node_id, у которого нет линка к этому
+    exit'у, попадает в ``not_found`` ответа — батч best-effort и не падает
+    целиком из-за одной устаревшей строки в выборке UI.
+    """
+    relay_node_ids: list[int]
+
+
+class BatchDetachLinkOut(BaseModel):
+    """Один отцепленный relay + порождённая teardown-task внутри batch.
+
+    ``task_id`` = ``None`` только если relay-строка уже исчезла (редко —
+    FK cascade удалил link первым). ``credentials`` — summary миграции
+    осиротевших creds: ``{"migrated": N, "distribution": {...}}`` либо
+    ``{"cleared": N}`` (последний линк relay'я ушёл → exit_id обнулён).
+    """
+    relay_node_id: int
+    relay_node_name: str
+    link_id: int
+    task_id: int | None
+    credentials: dict[str, Any]
+
+
+class BatchDetachRelayResponse(BaseModel):
+    """Ответ batch-detach: общий batch_id + отцепленные + ненайденные.
+
+    Все task'и идут под одним ``batch_id`` — UI рендерит прогресс тем же
+    drawer'ом, что и batch-attach, retry отдельных через /tasks.
+    ``not_found`` — relay_node_id'ы без линка к этому exit'у (не ошибка).
+    """
+    batch_id: uuid.UUID
+    exit_id: int
+    exit_name: str
+    links: list[BatchDetachLinkOut]
+    not_found: list[int] = []
+
+
 class RelayExitLinkOut(BaseModel):
     id: int
     relay_node_id: int
@@ -940,7 +1342,7 @@ class RelayExitLinkOut(BaseModel):
     wg_interface_name: str
     wg_client_public_key: str
     wg_client_address_v4: str
-    created_at: datetime
+    created_at: UTCDateTime
     # Health telemetry — заполняется worker-тиком
     # run_relay_link_health_tick (см. services/relay_link_health.py).
     # NULL = тик ещё не прошёл / SSH не дошёл / peer не найден в wg.
@@ -968,6 +1370,11 @@ class NodeRelayLinkOut(BaseModel):
     screen (where the relay is the anchor) plus a live credentials
     counter so the operator can see how many active users are pinned
     to each exit via this link.
+
+    ``last_auto_diagnose_*`` triplet exposes the most recent auto-trigger
+    by `_auto_diagnose_stale_links` (worker_relay_link_health_tick).
+    Frontend renders a small badge "автодиагностика N мин назад" with
+    a click-through to the task's structured `checks` block.
     """
     link_id: int
     exit_id: int
@@ -976,4 +1383,7 @@ class NodeRelayLinkOut(BaseModel):
     wg_client_address_v4: str
     wg_client_public_key: str
     credentials_count: int
-    created_at: datetime
+    created_at: UTCDateTime
+    last_auto_diagnose_at: UTCDateTime | None = None
+    last_auto_diagnose_task_id: int | None = None
+    last_auto_diagnose_symptom: str | None = None

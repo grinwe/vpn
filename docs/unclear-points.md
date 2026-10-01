@@ -20,7 +20,7 @@
 
 - `HealthProbe`: есть ли периодический cleanup старых строк (retention)? В коде воркера не сразу видно такой тики, но таблица по смыслу должна расти быстро. Если cleanup'а нет — это отдельная тема.
 - Связь `Payment.subscription_id` и `Payment.invoice_id`: оба nullable. Какой из них авторитетен для stage-4 балансного flow — из модели не видно, нужен переход в `services/balance.py` и `_mark_invoice_paid_core`.
-- Поле `Subscription.traffic_used_mb` и `traffic_limit_mb` — кто его обновляет? Ноды пишут через `/api/nodes/{id}/traffic` (есть схема `NodeTrafficReport`), но не ясно, как агрегируются device-уровень в subscription-уровень — код агрегации смотрим в `api.py`, при необходимости отдельный проход.
+- ~~Поле `Subscription.traffic_used_mb` и `traffic_limit_mb` — кто его обновляет?~~ Закрыто 2026-07-29: блокирующий ингест (`api/traffic.py`) удалён, оба поля мертвы. Действующий учёт — `Subscription.traffic_used_bytes`: тик `traffic_stats` копит per-user байты (резолв через `Credential.access_username`), продление обнуляет.
 - `has_frozen_this_year` vs `frozen_days_used` / `frozen_year`: три поля одновременно описывают freeze-историю, одно из них — V2 упрощение. Какое правило сейчас в силе — «один раз в год» или «до N дней в год» — из модели нельзя однозначно сказать.
 
 ---
@@ -36,7 +36,7 @@
 ## components/bot.md
 
 - `ADMIN_IDS` хранится в env и в `bot/config.py`; изменить список = перезапустить контейнер бота. Backend про эти id ничего не знает — только бот фильтрует `/invoices` и support-FSM по ним. Возможны расхождения «админ в боте ≠ тот, кто в SPA», без одного источника истины.
-- `NOTIFICATION_POLL_INTERVAL=10` по дефолту означает доставку уведомлений с задержкой до 10с. Для warning'ов это не критично, для `config_ready` — воспринимается как лаг провижининга. Компромисс нагрузки vs latency не зафиксирован.
+- `NOTIFICATION_POLL_INTERVAL=10` по дефолту означает доставку уведомлений с задержкой до 10с. Для warning'ов это не критично, для `config_ready` — воспринимается как лаг провижининга. Компромисс нагрузки vs latency не зафиксирован. (С 2026-08-25 `config_ready` реально пишется бэкендом — см. `services/config_ready.py`; до этого канал был мёртв, и вопрос лага был чисто теоретическим.)
 - `_stars_successful_payment` возвращается юзеру «оплата получена» только после успешного forward'а в backend (`handlers.py:409-413`). Если backend вдруг подтвердил 200 по verified-seen, но операция на уровне БД упала — юзеру скажут «всё ок», а реального provisioning'а не будет. Гарантии «happy path fall-through» стоит проверять на уровне backend'а, не бота.
 
 ---
@@ -81,7 +81,7 @@
 - **`_execute_task` timeout = 300s жёсткий.** Если ansible `site.yml` на новой ноде с нестабильным сетевым линком физически не успевает за 5 минут, task становится failed без возможности продлить окно через env. Worker re-enqueue сработает с такой же 5-минуткой.
 - **Cold path credential'ы записываются с `is_active = False`.** `_handle_task_outcome` ставит их в `True` только после success. Но между commit'ом credential-row и проходом success/failure есть окно, в течение которого активная подписка имеет *неактивные* credentials. Для warm fast path этого окна нет (creds сразу активные), так что UI/sub-link отдают credentials по-разному в зависимости от пути провижининга — см. фильтрацию `is_active` в `api_extensions.dynamic_sub_link`.
 - **`revoke_device` устанавливает `device.status=disabled`, а не `revoked`.** Терминальный статус «revoked» достигается только после удаления строки из БД. Каждый другой код (admin UI, фильтры capacity) вынужден считать `disabled` и `revoked` эквивалентными — дублирование логики.
-- **`_notify_bot_config_ready` не изолирует ошибки на уровне БД.** Она ловит `Exception` широко (`provisioning.py:689-690`), но **после** `success`-commit'а; то есть если не получилось записать уведомление — task всё равно success, пользователь будет ждать без уведомления до следующего notification-poll'а... которого может и не быть, если bot в этот момент был down.
+- ~~**`_notify_bot_config_ready` не изолирует ошибки на уровне БД.**~~ Снято 2026-08-25. Реальная проблема была глубже: хук писал `_notify` в `ProvisioningTask.result`, который никто не читал, — пуш `config_ready` не доходил никому и никогда (инцидент: юзер 1000054, «сейчас пришлю ссылку» без ссылки). Теперь хук — `services/config_ready.py::notify_config_ready`: обычная строка `AuditLog(action='config_ready')`, гейт «первый рабочий девайс свежей подписки, один раз», два источника (warm — в транзакции вызывающего, cold — отдельной транзакцией после `success`-commit'а). Отдельная транзакция после success — осознанно: сбой уведомления логируется и не роняет провижн, а ссылка всегда доступна в личном кабинете и по `/config`. Down-бот не важен — строка ждёт в очереди.
 - **`access_username` с timestamp suffix только в `reprovision_subscription`.** Cold path reprovision добавляет `-<epoch_second>` к username, чтобы избежать TTL collision на ноде (старый username может ещё жить в кэше ansible/xray после state=absent). Обычный `provision_subscription` такого suffix'а не делает — предполагается, что первый username на ноде всегда свежий.
 
 > ⚠️ См. audit/... — subprocess ansible-playbook с расшифрованными секретами в CLI `--extra-vars`.

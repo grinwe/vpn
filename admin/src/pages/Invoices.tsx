@@ -10,6 +10,9 @@ export default function Invoices() {
   const qc = useQueryClient();
   const [status, setStatus] = useState<(typeof STATUSES)[number] | "">("pending");
   const [limit, setLimit] = useState(50);
+  // Поиск по id/Telegram юзера или контракту провайдера — чтобы найти счёт
+  // конкретного клиента (скриншоты для платёжного партнёра).
+  const [search, setSearch] = useState("");
   const [selected, setSelected] = useState<Set<number>>(new Set());
 
   const { data, isLoading } = useQuery<InvoiceListItem[]>({
@@ -104,6 +107,17 @@ export default function Invoices() {
             </option>
           ))}
         </select>
+        <input
+
+          value={search}
+
+          onChange={(e) => setSearch(e.target.value)}
+
+          placeholder="Поиск: id / tg / контракт"
+
+          className="text-sm px-2 py-1 rounded bg-slate-800 border border-slate-700 w-56"
+
+        />
         <select
           value={limit}
           onChange={(e) => setLimit(Number(e.target.value))}
@@ -174,13 +188,14 @@ export default function Invoices() {
               <th>План</th>
               <th>Сумма</th>
               <th>Статус</th>
+              <th title="Провайдер · его идентификатор счёта (у lava.top — contractId)">Платёж</th>
               <th>Действие</th>
               <th>Создан</th>
               <th></th>
             </tr>
           </thead>
           <tbody>
-            {data?.map((inv) => (
+            {data?.filter((inv) => { const q = search.trim().toLowerCase(); if (!q) return true; return [String(inv.id), String(inv.user_id), inv.user_telegram_id ?? "", inv.payment_external_id ?? "", inv.payment_provider ?? ""].some((v) => v.toLowerCase().includes(q)); }).map((inv) => (
               <tr
                 key={inv.id}
                 className={`border-b border-slate-800 ${
@@ -216,6 +231,24 @@ export default function Invoices() {
                   >
                     {inv.status}
                   </span>
+                </td>
+                <td className="font-mono text-[11px] whitespace-nowrap">
+                  {inv.payment_provider ? (
+                    <>
+                      <span className="text-slate-300">{inv.payment_provider}</span>
+                      {inv.payment_external_id && (
+                        <span className="text-slate-400 select-all"> · {inv.payment_external_id}</span>
+                      )}
+                      {inv.payment_status && inv.payment_status !== "paid" && (
+                        <span className="text-yellow-400"> ({inv.payment_status})</span>
+                      )}
+                      {inv.paid_at && (
+                        <span className="text-slate-500"> · {new Date(inv.paid_at).toLocaleString("ru-RU", { dateStyle: "short", timeStyle: "short" })}</span>
+                      )}
+                    </>
+                  ) : (
+                    "—"
+                  )}
                 </td>
                 <td>{inv.action}</td>
                 <td>{new Date(inv.created_at).toLocaleString()}</td>

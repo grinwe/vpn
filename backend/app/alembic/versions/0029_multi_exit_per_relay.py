@@ -58,6 +58,28 @@ def _rel_unique_index_name(bind) -> str | None:
     return None
 
 
+def _cred_exit_fk_name(bind) -> str | None:
+    """Найти реальное имя FK на credentials.exit_id.
+
+    На БД из create_all FK носит авто-имя ``credentials_exit_id_fkey``;
+    явное ``fk_credentials_exit_id`` создаётся в upgrade только когда
+    колонки exit_id ещё не было. Резолвим по факту (как 0028/0030).
+    """
+    inspector = sa.inspect(bind)
+    for fk in inspector.get_foreign_keys("credentials"):
+        if fk.get("constrained_columns") == ["exit_id"]:
+            return fk.get("name")
+    return None
+
+
+def _cred_exit_index_name(bind) -> str | None:
+    inspector = sa.inspect(bind)
+    for ix in inspector.get_indexes("credentials"):
+        if ix.get("column_names") == ["exit_id"]:
+            return ix.get("name")
+    return None
+
+
 def upgrade() -> None:
     bind = op.get_bind()
     inspector = sa.inspect(bind)
@@ -111,10 +133,17 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
-    op.drop_index("ix_credentials_exit_id", table_name="credentials")
-    op.drop_constraint(
-        "fk_credentials_exit_id", "credentials", type_="foreignkey"
-    )
+    bind = op.get_bind()
+
+    # Индекс на exit_id мог носить авто-имя (create_all) — снимаем по факту.
+    ix_name = _cred_exit_index_name(bind)
+    if ix_name:
+        op.drop_index(ix_name, table_name="credentials")
+    # FK на credentials.exit_id носит авто-имя credentials_exit_id_fkey на
+    # БД из create_all — резолвим реальное имя и снимаем по факту.
+    fk_name = _cred_exit_fk_name(bind)
+    if fk_name:
+        op.drop_constraint(fk_name, "credentials", type_="foreignkey")
     op.drop_column("credentials", "exit_id")
 
     op.drop_constraint(

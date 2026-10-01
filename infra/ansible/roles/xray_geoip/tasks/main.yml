@@ -1,0 +1,87 @@
+---
+# Роль подключается из нескольких протокольных ролей (reality/xhttp/ws-cdn/hysteria2), то есть за
+# один прогон site.yml вызывается 4 раза подряд. Работу она делает ровно один
+# раз — все таски идемпотентны, — но каждый повтор всё равно стоит своих
+# SSH-round-trip'ов по ~1с на таску. На bootstrap'е ноды это ~22с чистых
+# накладных расходов из ~316с (замер profile_tasks, 2026-07-28).
+#
+# Гард — block+when, а НЕ `meta: end_role`: последний появился только в
+# ansible-core 2.18 и на более старом контроллере роль просто падает
+# («invalid meta action»). requirements-worker допускает >=2.16.
+#
+# Флаг живёт в пределах одного play: set_fact без cacheable в fact_caching не
+# попадает, поэтому следующий прогон отработает роль заново, а точечный вызов
+# из отдельного плейбука не ломается.
+- name: Geoip — provision once per run
+  when: not (_xray_geoip_provisioned | default(false) | bool)
+  block:
+    # Установка fetcher'а geoip.dat + еженедельного таймера. Используется
+    # install_vless_reality и install_vless_xhttp через include_role. Файлы
+    # статичные (не зависят от node-specific vars), поэтому files/ а не
+    # templates/. Имена unit'ов сохранены прежние (`geoip-update.service`,
+    # `geoip-update.timer`) — на нодах, забутстрапленных до этой роли,
+    # старые unit'ы перезапишутся новой версией.
+
+    - name: Ensure xray data directory
+      file:
+        path: /usr/local/share/xray
+        state: directory
+        owner: root
+        group: root
+        mode: '0755'
+
+    - name: Stage geoip fetcher with CDN fallback chain
+      copy:
+        src: xray-geoip-fetch.sh
+        dest: /usr/local/bin/xray-geoip-fetch.sh
+        owner: root
+        group: root
+        mode: '0755'
+
+    - name: Install geoip-update systemd units
+      copy:
+        src: "{{ item.src }}"
+        dest: "{{ item.dest }}"
+        owner: root
+        group: root
+        mode: '0644'
+      loop:
+        - { src: geoip-update.service, dest: /etc/systemd/system/geoip-update.service }
+        - { src: geoip-update.timer, dest: /etc/systemd/system/geoip-update.timer }
+      notify: reload systemd
+
+    # Force-flush handlers — daemon-reload должен пройти ДО первого
+    # `systemctl try-restart`/`start`, иначе systemd выкатит unit из старой
+    # inline-curl-версии (если эта роль гонится на уже-забутстрапленной ноде).
+    - name: Force handlers (apply daemon-reload before first run)
+      meta: flush_handlers
+
+    # Initial fetch — блокируем play до получения файла. На fresh-нодах
+    # geoip.dat ещё нет, xray упадёт со "failed to load geoip" если поднять
+    # его до этой задачи. `creates:` делает таску идемпотентной — повторные
+    # прогоны роли (resync, добавление протокола) не качают повторно.
+    # Для принудительного refresh — `rm /usr/local/share/xray/geoip.dat`
+    # перед прогоном ИЛИ `systemctl start geoip-update.service`.
+    # changed_when раньше стоял безусловным `true`, и таска рапортовала changed
+    # ДАЖЕ когда creates её пропускал — в логе bootstrap'а это выглядело как
+    # четыре скачивания geoip.dat подряд (роль подключается из четырёх
+    # протокольных ролей). Файл при этом не трогался: mtime оставался прежним.
+    # Ложные changed мешают читать лог и искать реальные тормоза, поэтому
+    # отмечаем changed только когда скрипт действительно отработал.
+    - name: Initial geoip.dat fetch (blocks play until file present)
+      command: /usr/local/bin/xray-geoip-fetch.sh
+      args:
+        creates: /usr/local/share/xray/geoip.dat
+      register: _geoip_initial_fetch
+      changed_when: _geoip_initial_fetch is not skipped
+
+    - name: Enable weekly geoip refresh timer
+      systemd:
+        name: geoip-update.timer
+        enabled: yes
+        state: started
+        daemon_reload: yes
+
+    - name: Mark geoip as provisioned for this run
+      ansible.builtin.set_fact:
+        _xray_geoip_provisioned: true

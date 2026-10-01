@@ -1,6 +1,28 @@
 ---
+- name: reload systemd
+  systemd:
+    daemon_reload: yes
+
 - name: restart xray xhttp
   systemd:
     name: xray-xhttp
     state: restarted
     daemon_reload: yes
+
+- name: reload nginx xhttp
+  # Guarded reload. На КОМБО-ноде (reality-unify + уже стоящий ws-cdn) во время
+  # ПЕРВОГО unify-бутстрапа ws-cdn-vhost ещё слушает :443 (его роль идёт ПОЗЖЕ по
+  # site.yml), а reality уже положил stream :443 → `nginx -t`: duplicate listen →
+  # reload падает. Раньше НЕгарденный handler ронял play ДО install_vless_ws_cdn и
+  # оставлял reality на loopback (снаружи down) до второго прогона. Теперь на
+  # combo-unify ноде фейл reload толерируется: ws-cdn-роль ниже подвинет свой vhost
+  # на 8443, сделает `nginx -t` (loud) и релоаднёт консистентно — сходится за ОДИН
+  # прогон. Во всех прочих случаях (обычная нода; unify без ws-cdn — dc/ufo-01)
+  # фейл reload остаётся ГРОМКИМ, чтобы не спрятать реальную поломку конфига.
+  ansible.builtin.shell: nginx -t && systemctl reload nginx
+  register: _xhttp_nginx_reload
+  changed_when: false
+  failed_when: >-
+    _xhttp_nginx_reload.rc != 0
+    and not (reality_stream_unify | default(false)
+             and (vless_ws_cdn_domain | default('')) | length > 0)

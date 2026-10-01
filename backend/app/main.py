@@ -1,7 +1,8 @@
+import logging
 import os
 import uuid
 
-from fastapi import Depends, FastAPI, Request
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, PlainTextResponse
 from prometheus_client import Counter, generate_latest
@@ -14,13 +15,15 @@ from .logging_config import configure_logging, request_id_var
 from .migrations import run_migrations
 from .rate_limit import limiter
 from .services.provisioning_throttle import ColdPathThrottled
-from .api import router as api_router, require_admin
+from .api import router as api_router
 from .api_extensions import ext_router
 from .api_webapp import webapp_router
 from .telegram_webhook import router as tg_webhook_router, register_webhook
 
 configure_logging()
 run_migrations()
+
+logger = logging.getLogger(__name__)
 
 
 def _check_required_settings() -> None:
@@ -85,10 +88,34 @@ def reset_stuck_tasks() -> dict[str, int | bool]:
 _check_required_settings()
 reset_stuck_tasks()
 
-app = FastAPI(title="VPN backend")
+_is_prod = os.getenv("APP_ENV", "dev").lower() == "production"
+app = FastAPI(
+    title="VPN backend",
+    docs_url=None if _is_prod else "/api/docs",
+    redoc_url=None if _is_prod else "/api/redoc",
+    openapi_url=None if _is_prod else "/api/openapi.json",
+)
 
 app.state.limiter = limiter
-app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+
+
+def _rate_limited(request, exc: RateLimitExceeded):
+    """429 браузеру — человеческой страницей, всем остальным — как было.
+
+    Страница починки на саб-домене открывается в браузере (часто в вебвью
+    VPN-клиента), и голый JSON slowapi там означает две беды сразу: человек
+    видит белый экран с непонятной ошибкой вместо «попробуйте через минуту»,
+    а «скучный внутренний портал» внезапно отвечает JSON-ошибкой API — то
+    есть выдаёт себя проберу.
+    """
+    if "text/html" in (request.headers.get("accept") or "").lower():
+        from .api.sub_fix import render_rate_limited
+
+        return render_rate_limited()
+    return _rate_limit_exceeded_handler(request, exc)
+
+
+app.add_exception_handler(RateLimitExceeded, _rate_limited)
 app.add_middleware(SlowAPIMiddleware)
 
 
@@ -104,6 +131,22 @@ async def _cold_path_throttled_handler(request: Request, exc: ColdPathThrottled)
             "retry_after_seconds": exc.retry_after_seconds,
         },
         headers={"Retry-After": str(exc.retry_after_seconds)},
+    )
+
+
+@app.exception_handler(Exception)
+async def _unhandled_exception_handler(request: Request, exc: Exception):
+    # Ловим необработанные исключения (реальные 500-краши): логируем трейс и
+    # возвращаем клиенту request_id, по которому его можно найти в логах.
+    # ServerErrorMiddleware — самый внешний слой, поэтому этот ответ НЕ проходит
+    # обратно через add_request_id, и заголовок надо проставить здесь вручную.
+    # Метрику 500 при этом инкрементит add_metrics на пути исключения.
+    rid = request_id_var.get() or ""
+    logger.exception("unhandled_exception", extra={"path": request.url.path})
+    return JSONResponse(
+        status_code=500,
+        content={"detail": "Внутренняя ошибка сервера.", "request_id": rid},
+        headers={"X-Request-ID": rid} if rid else None,
     )
 
 # CORS — restrict to explicit origins. WEBAPP_ORIGIN env controls which
@@ -131,15 +174,30 @@ async def add_request_id(request: Request, call_next):
     return response
 
 
-@app.middleware("http")
-async def add_metrics(request: Request, call_next):
-    response = await call_next(request)
-    status_code = response.status_code
+def _metrics_path_label(request: Request) -> str:
     # Use the matched route template (e.g. "/api/users/{user_id}") instead of
     # the raw request path — otherwise every unique id becomes its own label
-    # value and Prometheus cardinality explodes.
+    # value and Prometheus cardinality explodes. request.scope["route"] is set
+    # by the router even when the endpoint later raises, so this stays valid on
+    # the exception path too.
     route = request.scope.get("route")
-    path_label = getattr(route, "path", None) or "unmatched"
+    return getattr(route, "path", None) or "unmatched"
+
+
+@app.middleware("http")
+async def add_metrics(request: Request, call_next):
+    try:
+        response = await call_next(request)
+    except Exception:
+        # Необработанное исключение = настоящий 500-краш. Считаем его в обоих
+        # счётчиках, иначе всплеск багов после деплоя не виден на дашбордах, и
+        # пере-бросываем — финальный ответ строит exception-handler ниже.
+        path_label = _metrics_path_label(request)
+        REQUEST_COUNTER.labels(path=path_label, status="500").inc()
+        ERROR_COUNTER.labels(path=path_label, status="500").inc()
+        raise
+    status_code = response.status_code
+    path_label = _metrics_path_label(request)
     REQUEST_COUNTER.labels(path=path_label, status=str(status_code)).inc()
     if status_code >= 400:
         ERROR_COUNTER.labels(path=path_label, status=str(status_code)).inc()
@@ -153,13 +211,26 @@ app.include_router(tg_webhook_router)
 
 
 @app.on_event("startup")
+def _startup_assert_secrets_configured():
+    """Падаем на старте, если нет APP_SECRET_KEY (аудит 2026-07-25).
+
+    Раньше отсутствие ключа означало тихую запись секретов в БД открытым
+    текстом — контейнер поднимался, эндпоинты отвечали, и заметить мисконфиг
+    было нечем, кроме одной warning-строки в логе.
+    """
+    from .security import assert_secrets_configured
+
+    assert_secrets_configured()
+
+
+@app.on_event("startup")
 def _startup_register_telegram_webhook():
     register_webhook()
 
 
-@app.get("/")
+@app.get("/", include_in_schema=False)
 def root():
-    return {"status": "ok", "service": "vpn-backend"}
+    raise HTTPException(status_code=404)
 
 
 @app.get("/healthz")
@@ -168,5 +239,9 @@ def healthz():
 
 
 @app.get("/metrics")
-def metrics(_: str = Depends(require_admin)):
+def metrics():
+    # No auth — backend binds to 127.0.0.1:8000, Prometheus scrapes via
+    # host.docker.internal from the same host. Labels are route templates
+    # (no PII), counters are aggregates. If binding ever opens to 0.0.0.0,
+    # re-add require_admin or restrict /metrics at nginx.
     return PlainTextResponse(generate_latest(), media_type="text/plain")

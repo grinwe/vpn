@@ -31,6 +31,38 @@ def _add_request_id(
     return event_dict
 
 
+# Пути, для которых per-request access-лог не пишем: healthcheck и метрики
+# опрашиваются мониторингом раз в секунду и только зашумляют журнал.
+_ACCESS_LOG_SKIP_PATHS: frozenset[str] = frozenset({"/healthz", "/metrics", "/"})
+
+def log_request(
+    method: str,
+    path_template: str,
+    status: int,
+    duration_ms: float,
+) -> None:
+    """Записать одно структурное событие на HTTP-запрос.
+
+    Вызывается из middleware add_request_id (main.py) после call_next:
+    method/путь-шаблон/статус/латентность на уровне INFO. request_id
+    подмешивается автоматически через contextvar-процессор — так по нему
+    можно восстановить, какой запрос породил ошибку, и увидеть латентность
+    перед падением. Шумные пути (healthcheck/метрики) отфильтровываются.
+    Полностью выключить журнал можно через ACCESS_LOG=0 (по умолчанию вкл).
+    """
+    if os.getenv("ACCESS_LOG", "1").strip().lower() in ("0", "false", "no", "off"):
+        return
+    if path_template in _ACCESS_LOG_SKIP_PATHS:
+        return
+    structlog.get_logger("app.access").info(
+        "http_request",
+        method=method,
+        path=path_template,
+        status=status,
+        duration_ms=round(duration_ms, 1),
+    )
+
+
 def configure_logging() -> None:
     log_level = os.getenv("LOG_LEVEL", "INFO").upper()
     json_logs = os.getenv("LOG_FORMAT", "json").lower() == "json"

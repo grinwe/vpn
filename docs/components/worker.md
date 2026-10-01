@@ -53,11 +53,25 @@ Backend прогоняет `alembic upgrade head` на старте (`main.py:18
 | Функция                    | Default interval             | Что делает                                       |
 |----------------------------|------------------------------|---------------------------------------------------|
 | `run_autoscale_tick`       | `AUTOSCALE_INTERVAL=300`     | Проходит по server_pools, решает по utilization, спавнит новые ноды |
-| `run_renewal_check`        | `RENEWAL_CHECK_INTERVAL=300` | Expire-ит подписки, инициирует renewal reminders, hard-revoke после grace |
+| `run_renewal_check`        | `RENEWAL_CHECK_INTERVAL=300` | Expire-ит подписки, инициирует renewal reminders, hard-revoke после grace. Для `auto_renew=ON` сначала пробует `balance.renew_subscription`; expire — ТОЛЬКО на явное «недостаточно средств» (renew вернул False). Исключение в renew (обрыв БД, deadlock) — skip до следующего тика, подписка без плана — admin-алерт `renewal_broken_sub` с суточным дедупом (аудит-фикс #59) |
 | `run_warm_pool_check`      | `WARM_POOL_CHECK_INTERVAL=120` | Топит warm pool на каждой активной ноде до `WARM_POOL_TARGET` |
-| `run_balance_charge_tick`  | `BALANCE_CHARGE_INTERVAL=3600` | Renew balance-подписок, expire auto_renew=False, auto-unfreeze, clawback trial |
-| `run_traffic_stats_tick`   | `TRAFFIC_STATS_INTERVAL=300` | SSH на каждую active/draining ноду, читает xray stats + sharing violations → `node_traffic_samples` + `AuditLog`. Per-protocol breakdown в `details` содержит список `access_username` (а не просто count) — админка читает последний sample через `GET /api/nodes/{id}/users`. После persist вызывается Phase D `detect_traffic_drops()` — пассивный детектор ТСПУ-блокировок (gated через `TRAFFIC_DROP_ENABLED=1`) |
-| `run_pending_rescue_tick`  | `PENDING_RESCUE_INTERVAL=60` | Сканирует `ProvisioningTask.status=pending` старше `PENDING_RESCUE_AGE` секунд и re-enqueue'ит через `enqueue_task`. Дедуп по `job_id=provision-<task_id>` — если задача уже в RQ, это no-op. Закрывает дыру, когда `run_task_async` закоммитил row, но `enqueue_task` упал (транзиентный Redis hiccup, serialization issue) — до этого фикса такие задачи висели в pending до следующего рестарта бэкенда (`reset_stuck_tasks` в main.py срабатывает только на boot). Метрика: `vpn_provisioning_pending_rescue_total` инкрементится на каждый rescue |
+| `run_warm_pool_revoke_tick` | `WARM_POOL_REVOKE_INTERVAL=300` | Стадия 2 отзыва warm-пула (аудит-фикс #71): драйвер `warm_pool.run_warm_pool_revoke_sweep` — физически снимает `pool_state=revoked` бандлы с нод (`state=absent`) батчем `WARM_POOL_REVOKE_BATCH_PER_TICK=5` и удаляет строки. Без него revoked-identity (юзер-отвязанные + брошенные `invalidate_node_warm_pool`) копятся в конфиге xray и revoked-строками в БД вечно. Back-off после `WARM_POOL_REVOKE_MAX_ATTEMPTS=5` провалов. Gated на `WARM_POOL_ENABLED` |
+| `run_retention_tick`       | `RETENTION_INTERVAL=86400` | Очистка безлимитно растущих таблиц (аудит-фикс #247): удаляет из `audit_logs` строки `action='subscription_fetch'` и `*:delivered` старше `AUDIT_LOG_RETENTION_DAYS=90`, из `node_traffic_samples` — старше `TRAFFIC_SAMPLE_RETENTION_DAYS=30`. Батчами `RETENTION_DELETE_BATCH=10000` (id IN (SELECT … LIMIT), коммит после каждого) до потолка `RETENTION_MAX_BATCHES=200`/таблицу/тик, чтобы не держать долгий лок. Прочие audit-события (провижининг, действия админов, DLQ) не трогаются. `*_DAYS=0` выключает конкретную таблицу |
+| `run_spawn_sweep_tick`     | `NODE_SPAWN_SWEEP_INTERVAL=600` | Подбор спавнов, застрявших в `registering` + placeholder-host дольше `NODE_SPAWN_STUCK_MINUTES=30` (аудит-фикс #70): достройка спавна жила в daemon-потоке backend'а и умирала при рестарте — оплаченный сервер оставался невидимым, продолжая списывать деньги. Тик зовёт `node_spawner.sweep_stuck_spawns(enqueue=queue.enqueue_spawn_finalize)`: возобновляемые заказы (есть `provider_external_id` + драйвер умеет `wait_for_ipv4`) уходят персистентной RQ-джобой `run_spawn_finalize` на провижининг-очередь (`job_id=spawn-finalize-<kind>-<id>`, дедуп; поток из тика не годится — work-horse убил бы его сразу после return), невозобновляемые помечаются `error` с пометкой оператору. `0` — отключить |
+| `run_balance_charge_tick`  | `BALANCE_CHARGE_INTERVAL=3600` | Renew balance-подписок, expire auto_renew=False, auto-unfreeze, предупреждение о конце бесплатных дней (за `TRIAL_EXPIRY_WARN_DAYS=3` до `trial_expires_at`, с гейтом «баланс покрывает продление или подписка уже не неоплаченный триал») и clawback trial (только непотраченная часть бонуса, платящих пропускает) |
+| `run_traffic_stats_tick`   | `TRAFFIC_STATS_INTERVAL=300` | SSH на каждую active/draining ноду (параллельно, `TRAFFIC_STATS_SSH_WORKERS=8`; per-node commit; wall-clock-бюджет `TRAFFIC_STATS_BUDGET_SEC=100` — недособранный хвост уходит в следующий тик), читает xray stats + sharing violations → `node_traffic_samples` + `AuditLog`. Per-protocol breakdown в `details` содержит список `access_username` (а не просто count) — админка читает последний sample через `GET /api/nodes/{id}/users`. Положительные per-user дельты дополнительно (в отдельных SAVEPOINT'ах) копятся в `Subscription.traffic_used_bytes` (гейт `TRAFFIC_USER_ACCOUNTING`) и штампуют `Device.last_seen_at` — признак «активен за 24ч» в админ-списке юзеров и воронке онбординга (штамп НЕ под гейтом). После persist вызывается Phase D `detect_traffic_drops()` — пассивный детектор ТСПУ-блокировок (gated через `TRAFFIC_DROP_ENABLED=1`) |
+| `run_pending_rescue_tick`  | `PENDING_RESCUE_INTERVAL=60` | Сканирует `ProvisioningTask.status=pending` старше `PENDING_RESCUE_AGE` секунд и re-enqueue'ит через `enqueue_task`. Дедуп по `job_id=provision-<task_id>` — если задача уже в RQ, это no-op. Закрывает дыру, когда `run_task_async` закоммитил row, но `enqueue_task` упал (транзиентный Redis hiccup, serialization issue) — до этого фикса такие задачи висели в pending до следующего рестарта бэкенда (`reset_stuck_tasks` в main.py срабатывает только на boot). Эскалация по возрасту: старше `PENDING_RESCUE_FORCE_AGE` (1800s) → `enqueue_task(force=True)` пуржит job-ключ перед дедупом (лечит зомби-`started` джоб от SIGKILL-мид-ран, который иначе вечно проглатывает ре-энкью и вешает реконсилер ноды через `uq_active_node_bootstrap`); старше `PENDING_RESCUE_ABANDON_AGE` (86400s) → mark `failed` (нерасшиваемо, ре-ран древнего опасен). Метрика: `vpn_provisioning_pending_rescue_total` инкрементится на каждый rescue |
+| `run_lava_reconcile_tick`  | `LAVA_TOP_RECONCILE_INTERVAL=60` | Stage 9b: опрашивает `GET /api/v2/invoices` lava.top и закрывает счета, по которым вебхук не долетел (в проде он доказанно не долетает, так что это ОСНОВНОЙ денежный путь для карт). Матч продажи с нашим счётом — по `clientUtm.utm_content` + `contract_id ↔ Payment.external_id`; Payment-строка ищется по ОБОИМ именам lava (`_LAVA_PROVIDERS = ("lava_top", "lava_top_sbp")`, см. две кнопки «карта»/«СБП» от 2026-09-19). Сверка суммы **fail-closed**: непарсимая/отсутствующая сумма не зачисляет, а поднимает `payment_amount_unverified` (аудит 2026-07-25). `0` — отключить |
+| `run_cert_renewal_tick`    | `CERT_RENEWAL_INTERVAL=86400` | Внешняя проба TLS-expiry (`_probe_cert_notafter` — ground truth, а не файл на диске) для xhttp/ws-cdn конфигов; near-expiry (< `CERT_RENEWAL_DAYS=21`) ноды уходят в `renew_node_certs` (cap `CERT_RENEWAL_MAX_PER_TICK=6`). Предотвращает fleet-wide cert-пожар (инцидент 2026-07-22). Expiry пишется в `VPNConfig.settings.cert_expires_at` для админки. `0` — отключить |
+| `run_reality_dest_health_tick` | `REALITY_DEST_HEALTH_INTERVAL=86400` | Пробит Reality-dest'ы на TLS1.3+h2: деградировавший dest = молча мёртвый Reality (инцидент 2026-07-23). Пишет `dest_healthy`/`dest_fail_count`. Авто-ротация за `REALITY_DEST_AUTO_ROTATE` (дефолт **off** — воркер пробит из NL, geo-dest'ы false-positive'ят). `0` — отключить |
+| `run_reconcile_tick`       | `RECONCILE_INTERVAL=3`       | Phase 3 reconcile: сходит dirty-ноды (`desired_generation > reconciled_generation` и `reconcile_due_at <= now`) одним coalesced bootstrap'ом, до `RECONCILE_MAX_PER_TICK=15` нод/тик (FIFO по due_at). No-op пока `RECONCILER_ENABLED` выкл. Self-reschedules. Watchdog-гейджи `vpn_reconcile_pending_nodes` / `vpn_reconcile_oldest_overdue_seconds` (+ WARNING при `oldest_overdue > RECONCILE_OVERDUE_WARN_S=120`) — ловят cap-starvation, повторно падающий bootstrap и (через staleness гейджа) зависший scheduler. См. `docs/operations/provisioning_reconciler_epic.md` |
+
+> ⚠️ **Период self-reschedule = `interval`, без `min(...)`.** Clamp `min(interval, 300)` живёт ТОЛЬКО в bootstrap-ветке `main()`, где означает «первый прогон вскоре после рестарта». Скопированный в тело тика, он превращает суточную периодику в пятиминутную: `run_cert_renewal_tick` так гонял бы `certbot` до 6 нод каждые 5 минут (лимит LE — 5 дубликатов серта в неделю), а `run_reality_dest_health_tick` схлопнул бы порог «2 фейла подряд» с двух суток до 10 минут. Обе ошибки приехали в `020af99`/`615ec54` и починены 2026-07-25 — вместе с тем, что `schedule_tick` в этих двух функциях **не был импортирован** (локальный `from .queue import schedule_tick` есть в каждом тике; здесь его забыли, `NameError` глотался `except`'ом, и тики не перепланировались вовсе — работали один раз на рестарт контейнера). Регресс закрыт `backend/tests/test_audit_fixes_2026_07_25.py`.
+
+**Изоляция ошибок и видимость падений (аудит-фиксы #64/#215/#249):**
+
+- Все тики делают self-reschedule **в начале тела** (до реальной работы), поэтому неожиданное исключение в теле тика теперь **ре-бросается** после `logger.exception` (`raise`), а не глотается: джоба честно уходит в `failed` и подсвечивается в `/ops` (снапшот RQ-registries) — раньше проглоченное падение оставляло статус `finished`, и падающий каждый прогон тик месяцами «светился зелёным». Периодичность при этом не страдает — следующий тик уже запланирован.
+- В `run_renewal_check` каждый пасс напоминаний обрабатывает подписки под per-item `SAVEPOINT` (`session.begin_nested`): битая строка (IntegrityError на инвойсе, обрыв соединения) откатывается только сама и не глушит напоминания остальным + последующим пассам. Выборки окон ограничены `RENEWAL_WINDOW_LIMIT` (default 2000) с `ORDER BY expires_at ASC` — самые срочные первыми, хвост доносится следующим тиком; тик больше не рискует упереться в `job_timeout` на тысячах истекающих.
 
 ### Bootstrap при старте воркера
 
@@ -75,6 +89,29 @@ schedule_tick(
 `schedule_tick` — обёртка над `queue.enqueue_in(..., job_id=tick_id)` с zombie-reclaim и дедупом поверх. Без детерминированного `job_id` каждый рестарт воркера плодил бы новую цепочку тика: после 3-4 рестартов `rq info` показывал 50+ `scheduled` jobs вместо 8 (репро 2026-04-17). Детали — § Дедупликация тиков ниже.
 
 Затем `worker.work(with_scheduler=True)` — блокирующий вызов, запускает worker main loop + scheduler loop для отложенных задач.
+
+#### Stale scheduler-lock после деплоя (фикс 2026-06-09)
+
+`with_scheduler=True` форкает `RQScheduler`, который захватывает лок
+`SET rq:scheduler-lock:<queue> <pid> NX EX (interval+60)` и стартует
+**только если лок захвачен**. Граница: `acquire_locks` зовётся на старте
+**один раз**; reacquire-петля живёт *внутри* форкнутого scheduler-процесса,
+так что при незахвате ретрая нет.
+
+Деплой (`docker compose up -d` recreate) убивает старый worker-scheduler
+SIGKILL'ом после `stop_grace` → graceful `stop()→release_locks()` не
+вызывается → лок мёртвого инстанса висит ~`interval+60`с. Свежий контейнер
+на старте упирается в `NX` → scheduler не форкается → **все тики стоят**,
+пока следующий рестарт случайно не попадёт в окно после истечения TTL
+(наблюдали ~9 мин полного простоя периодики; симптом — `rq` показывает
+N jobs в `scheduled`, очередь пустая, `Job OK` в логах нет).
+
+Фикс (`worker.py`, перед `work()`): т.к. `worker-scheduler` это
+`replicas: 1` и recreate последовательный (стоп старого → старт нового),
+легитимного держателя лока в момент старта нет — поэтому чистим
+`RQScheduler.get_locking_key(q.name)` в Redis до `work()`, гарантируя
+чистый `acquire`. Это убирает костыль «передёрнуть worker-scheduler руками
+после деплоя».
 
 ### Паттерн «самопланирования» — как это работает и где ломается
 
@@ -131,6 +168,18 @@ return summary
 | `run_balance_charge_tick`    | `tick-balance-charge`  |
 | `run_traffic_stats_tick`     | `tick-traffic-stats`   |
 | `run_user_health_ping_tick`  | `tick-health-ping`     |
+| `run_relay_link_health_tick` | `tick-relay-link-health` |
+| `run_node_reachability_tick` | `tick-node-reachability` |
+| `run_ops_plan_reaper_tick`   | `tick-ops-plan-reaper`   |
+| `run_warm_pool_revoke_tick`  | `tick-warm-pool-revoke`  |
+| `run_retention_tick`         | `tick-retention`         |
+| `run_spawn_sweep_tick`       | `tick-spawn-sweep`       |
+
+`run_node_reachability_tick` (diagnostics overhaul, env `NODE_REACHABILITY_INTERVAL=300`) — единственный владелец node/exit down-детекта: пробит ВСЕ active ноды + exit'ы staged-пробой (ping/ssh), на падении открывает инцидент (`services/diagnostics_state.should_diagnose` = одна диагностика на инцидент), шлёт говорящий пуш и enqueue'ит on-host диагноз; на recovery закрывает инцидент. Анти-голодание (аудит-фикс #95): цели обходятся в порядке `last_probe_at` ASC NULLS FIRST (самые давно не пробованные первыми), поэтому хвост, обрезанный wall-clock бюджетом `NODE_REACHABILITY_BUDGET_SEC`, идёт первым в следующем тике; гейдж `vpn_reachability_stale_targets` (+`summary.stale_targets`) показывает число целей без проба дольше `NODE_REACHABILITY_STALE_MIN` (30 мин) — стабильно >0 значит бюджета не хватает на флот. Подробнее — `docs/operations/diagnostics.md` § Overhaul.
+
+Сетевой аудит (2026-07) — фиксы того же тика: **#1** SSH-liveness ≠ VPN-liveness: при живом SSH тик дополнительно пробит TCP VPN-порт(ы) ноды (из enabled `VPNConfig`, hysteria2/UDP исключён; override `NODE_VPN_PROBE_PORTS`). ЗАКРЫТЫ ВСЕ порты при живом SSH → статус `degraded` + пуш + on-host diagnose (`symptom=vpn_port_down`), а не «зелёная». **#3** self-check связности контроллера (`NODE_CONTROLLER_ANCHORS`, default cloudflare+google:443) ПЕРЕД пробами: если воркер потерял сеть (все якоря молчат) — тик пропускает пер-нодовые пробы и шлёт один агрегированный алерт вместо лавины ложных DOWN по всему флоту; опциональный mass-down гейт (`NODE_MASS_DOWN_FRACTION`, default off). **#7** gap-guard: если между прошлым и текущим пробом цели дыра > `NODE_REACHABILITY_INTERVAL * NODE_PROBE_GAP_FACTOR` (цель выпала в обрезанный бюджетом хвост), серия DOWN перезапускается — эскалация только по непрерывному наблюдению, не по дырявому wall-clock.
+
+`run_ops_plan_reaper_tick` (аудит-фикс #120, env `OPS_PLAN_REAPER_INTERVAL=300`, 0=off) — бэкстоп ops-агента: переводит в `failed` (`execution.phase='crash'`) планы, залипшие в `executing` дольше `OPS_EXECUTE_JOB_TIMEOUT`(1800) + `OPS_PLAN_REAPER_GRACE`(120) секунд с момента арма (момент — из AuditLog `agent_ops_execute_armed`, fallback `expires_at`/`created_at`). Ловит смерть воркера (OOM/рестарт) и kill джобы по `job_timeout` — in-job страховка в `run_ops_plan_execute` (generic-except → `failed`) в этих случаях не срабатывает, а эндпоинт `/agent/ops/execute` принимает только `proposed`. Аудит — `agent_ops_execute_reaped`.
 
 Все `tick-*` места (self-reschedule + bootstrap в `main()`) используют `schedule_tick`. После фикса параллельных цепочек быть не может: даже 10 рестартов подряд оставят ровно по одному scheduled job на тик.
 
@@ -194,7 +243,7 @@ return summary
 1. **Renew.** Active subs с `expires_at <= now` и `auto_renew=True`. Берётся `SELECT FOR UPDATE SKIP LOCKED LIMIT 500`. На каждый вызывается `balance.renew_subscription(session, sub)`. Ok → продлили, emit `_maybe_emit_low_balance_warning`. Not ok (денег нет) → status=expired.
 2. **Expire non-renewing.** Active + `auto_renew=False` + expires < now → expired. Без продления.
 3. **Auto-unfreeze.** Frozen + `frozen_until <= now` → `balance.unfreeze_subscription(session, sub, auto=True)`.
-4. **Trial expiry.** T-3 warning + clawback при истечении триала.
+4. **Trial expiry.** Warning за `TRIAL_EXPIRY_WARN_DAYS` (3) до `trial_expires_at` + clawback при истечении триала. При 3-дневном триале (с 2026-09-30) warning приходит в T+1, `trial_expires_at` = конец подписки со скрытыми сутками (T+4), у бонус-онли платящих он NULL, и прохода для них нет. Warning не шлётся, если баланса хватает на продление живой подписки или она уже не неоплаченный триал (`balance.is_unpaid_trial`). Clawback пропускает платящих (`balance.user_has_paid`) и снимает только непотраченную часть бонуса по журналу (подробно в [TRIAL_SYSTEM.md](../TRIAL_SYSTEM.md)).
 
 `_maybe_emit_low_balance_warning` (`worker.py:450-520`) — идемпотентен на календарный день: проверяет, нет ли уже `low_balance_warning` audit-лога на сегодня у этого пользователя, только тогда пишет новый. Это и есть единственный механизм дедупликации нотификаций — бот не отслеживает ack'и сверх `:delivered` маркера.
 
@@ -220,11 +269,16 @@ return summary
 - воркер вообще не поднят (`depends_on` / redis недоступен), или
 - `Retry(max=3)` исчерпан и job ушёл в DLQ до того, как автосамохил успел его пере-enqueue'нуть (по задумке — дальше `dlq_exception_handler` + audit-лог).
 
-Если все 3 retry исчерпаны, RQ вызывает `dlq_exception_handler` (зарегистрирован на Worker через `exception_handlers`). Хендлер:
+`dlq_exception_handler` зарегистрирован на Worker через `exception_handlers`. **ВАЖНО:** RQ зовёт exception handlers на КАЖДОМ падении джобы, ДО retry-логики (`handle_exception` → `handle_job_failure`), а не только на финальном провале. Поэтому хендлер сначала фильтрует (аудит-фикс #60):
+
+- если у джобы остались ретраи (`job.retries_left` > 0) — падение транзиентное: только `logger.warning`, БЕЗ инкремента счётчика / аудита / админ-пуша (раньше первая же транзиентная ошибка ansible-джобы слала админу «Провижининг упал», хотя через 10с был успешный ретрай);
+- аудит/пуш с `target_type='provisioning_task'` пишутся ТОЛЬКО для `run_provisioning_task` (у неё `args[0]` — task_id); у `run_ops_plan_execute` `args[0]` — plan_id, у `run_scale_workers` — число реплик, поэтому для них только лог, без ложного provisioning-аудита.
+
+Когда ретраи исчерпаны (`retries_left == 0`) или у джобы нет `Retry` (`retries_left is None`) и это `run_provisioning_task`, хендлер:
 
 1. Инкрементирует `vpn_provisioning_dlq_total` Prometheus counter
 2. Пишет `AuditLog(action="provisioning_dlq")` с `job_id`, `exc_type`, `error` (первые 500 символов)
-3. Логирует через `logger.error`
+3. Логирует через `logger.error` + шлёт админ-пуш `infra_dlq`
 
 Отдельной DLQ-очереди нет — RQ's FailedJobRegistry и есть DLQ. Audit-лог обеспечивает видимость в admin UI без ковыряния Redis.
 
@@ -244,6 +298,8 @@ return summary
 
 То есть backend'у для провижининга **обязательно** нужен работающий воркер. Без воркера у backend'а есть legacy in-process thread fallback (упоминается в комментарии `api.py:189-190`), но это безопасная крайность, не штатный путь.
 
+Fallback на Redis **не залипает**: `queue.get_redis` кеширует только живой клиент, а после неудачного `ping` повторяет попытку не чаще раза в `REDIS_RETRY_COOLDOWN` (default 30 с). Раньше `@lru_cache` кешировал `None` до конца жизни процесса — один транзиентный blip при одновременном рестарте контейнеров (Redis поднимается на пару секунд позже backend'а) навсегда переводил весь API на inline-исполнение ansible. Каждый уход в inline виден в логах (WARNING `enqueue_task: RQ queue unavailable`) и в метрике `vpn_queue_inline_fallback_total` — ненулевой рост при живом Redis сигналит о поломке разделения API/worker.
+
 ## Восстановление после падения
 
 При каждом старте процесса backend'а (`main.py:27-64`):
@@ -261,6 +317,34 @@ return summary
 - Не прогоняет миграции в проде (`SKIP_MIGRATIONS=1`).
 - Не читает env на горячую — все тики читают `os.getenv(...)` в своём теле при каждом запуске, поэтому смена env требует рестарта процесса (чтобы перевыбрать запланированный интервал в bootstrap-блоке).
 - Не имеет отдельной auth-поверхности. Всё внутри воркера — trusted, потому что контейнер с тем же admin-токеном и тем же провижининг-ключом, что и бэкенд.
+
+## Скейл воркеров из админки
+
+Виджет **Workers** (`admin/src/workerHealth.tsx`, открывается в Nodes) умеет
+менять число реплик: степпер `реплик [−][N][+] OK` → `POST /ops/worker/scale {replicas}`.
+
+Механика (зеркало `scripts/workers.sh`, но из UI):
+- API-образ (`backend/Dockerfile`) **без ssh/ключа** → сам скейлить не может.
+  Поэтому эндпоинт **энкьюит RQ-job** `app.worker.run_scale_workers(N)`, и его
+  подхватывает **worker** (`Dockerfile.worker` несёт `openssh-client` +
+  `/run/secrets/provisioning_key`).
+- Worker SSH-ит на mgmt-хост и гонит `docker compose up -d --scale worker=N worker`
+  + пишет `WORKER_REPLICAS=N` в `.env` (чтобы пережило plain `docker compose up`).
+  Docker-команда исполняется **на хосте**, так что даже scale-DOWN, убивающий
+  этот же worker, доходит до конца.
+- API коротко (окно `OPS_SCALE_WAIT_SECONDS`, дефолт 5с) ждёт результат job'а →
+  отдаёт `applied/failed/enqueued`. Окно узкое намеренно: sleep-поллинг держит
+  поток threadpool'а и DB-сессию запроса, а виджет и так дотягивает счётчик
+  собственным поллингом → не дождались = `enqueued`.
+
+Параметры (env воркера; дефолты под текущий prod): `MGMT_HOST` (иначе резолв
+из inventory `db_host→mgmt-1`), `MGMT_USER` (root), `MGMT_STACK_DIR`
+(`/opt/vpn`), ключ — `ANSIBLE_PRIVATE_KEY_FILE`.
+
+**Предусловия:** (1) нужен ≥1 живой worker, который подхватит job (для бампа
+вверх — всегда; при 0 воркеров сперва «↻ Рестарт»); (2) provisioning-ключ
+должен пускать `MGMT_USER` на mgmt с правом `docker compose`. Если нет — job
+вернёт SSH-ошибку, она прилетит в UI как `failed` + stderr. Аудит — `worker_scale`.
 
 ## ⚠️ Неясные места
 

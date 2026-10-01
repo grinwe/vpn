@@ -1,5 +1,6 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { fetchTransactions, TransactionRow } from "../api";
+import { friendlyError } from "../errors";
 import { navigate } from "../router";
 
 const PAGE = 50;
@@ -10,21 +11,64 @@ export default function History() {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
+  // Рефы для обработчиков online/visibility: замыкание живёт весь сеанс и
+  // должно видеть актуальные loading/error без переподписки.
+  const loadingRef = useRef(false);
+  const errorRef = useRef<string | null>(null);
+  const loadMoreRef = useRef<() => void>(() => {});
+  loadingRef.current = loading;
+  errorRef.current = error;
+
   async function loadMore() {
+    // Не запускаем параллельную загрузку (авто-ретрай + ручной тап).
+    if (loadingRef.current) return;
+    loadingRef.current = true;
     setLoading(true);
+    // Сбрасываем прошлый баннер, иначе он висит навсегда даже после успеха.
+    setError(null);
     try {
       const res = await fetchTransactions(PAGE, items.length);
       setItems((prev) => [...prev, ...res.items]);
       setHasMore(res.has_more);
     } catch (e) {
-      setError((e as Error).message);
+      // Человекочитаемый текст вместо сырого «timeout»/«401: {...}».
+      setError(
+        friendlyError((e as Error).message, { fallback: "загрузить историю" }),
+      );
     } finally {
       setLoading(false);
     }
   }
 
+  // Держим актуальную ссылку на loadMore, чтобы обработчики online/visibility
+  // видели свежий items.length (иначе авто-ретрай дублировал бы страницу 0).
+  loadMoreRef.current = loadMore;
+
   useEffect(() => {
     loadMore();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // Авто-повтор зависшей загрузки при восстановлении сети/возврате в приложение,
+  // чтобы пустой экран с ошибкой не оставался тупиком без способа обновиться.
+  useEffect(() => {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const trigger = () => {
+      if (timer) clearTimeout(timer);
+      timer = setTimeout(() => {
+        if (errorRef.current && !loadingRef.current) loadMoreRef.current();
+      }, 500);
+    };
+    const onVisibility = () => {
+      if (document.visibilityState === "visible") trigger();
+    };
+    window.addEventListener("online", trigger);
+    document.addEventListener("visibilitychange", onVisibility);
+    return () => {
+      if (timer) clearTimeout(timer);
+      window.removeEventListener("online", trigger);
+      document.removeEventListener("visibilitychange", onVisibility);
+    };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 

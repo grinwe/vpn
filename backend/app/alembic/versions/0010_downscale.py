@@ -11,6 +11,8 @@ both columns and inherit the env-level defaults at evaluation time.
 from alembic import op
 import sqlalchemy as sa
 
+from app.alembic._idempotent import has_column
+
 
 revision = "0010_downscale"
 down_revision = "0009_balance_billing"
@@ -25,14 +27,16 @@ def upgrade() -> None:
         "ALTER TYPE vpnnodestatus ADD VALUE IF NOT EXISTS 'draining'"
     )
 
-    op.add_column(
-        "server_pools",
-        sa.Column("autoscale_low_watermark", sa.Numeric(4, 3), nullable=True),
-    )
-    op.add_column(
-        "server_pools",
-        sa.Column("autoscale_min_nodes", sa.Integer(), nullable=True),
-    )
+    if not has_column("server_pools", "autoscale_low_watermark"):
+        op.add_column(
+            "server_pools",
+            sa.Column("autoscale_low_watermark", sa.Numeric(4, 3), nullable=True),
+        )
+    if not has_column("server_pools", "autoscale_min_nodes"):
+        op.add_column(
+            "server_pools",
+            sa.Column("autoscale_min_nodes", sa.Integer(), nullable=True),
+        )
 
 
 def downgrade() -> None:

@@ -1,8 +1,14 @@
 import { Fragment, useEffect, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { api, ProvisioningTaskOut } from "../api";
+import {
+  api,
+  DiagnoseCheckEntry,
+  DiagnoseMeta,
+  ProvisioningTaskOut,
+} from "../api";
+import { DiagnoseResult } from "../diagnoseResult";
 
-const STATUSES = ["", "pending", "running", "success", "failed"] as const;
+const STATUSES = ["", "pending", "running", "success", "failed", "cancelled"] as const;
 const TARGETS = ["", "node", "device", "subscription"] as const;
 const EXPECTED_TICKS = 8;
 
@@ -207,6 +213,8 @@ function statusColor(s: string): string {
       return "text-blue-400";
     case "pending":
       return "text-yellow-400";
+    case "cancelled":
+      return "text-orange-400";
     default:
       return "text-slate-400";
   }
@@ -222,6 +230,17 @@ function fmtDuration(start: string | null, end: string | null): string {
 }
 
 function TaskDetails({ task }: { task: ProvisioningTaskOut }) {
+  // Structured diagnose-результат лежит в task.result.checks (массив
+  // DiagnoseCheckEntry, дописанный ansible-ролью + orchestrator'ом). Для
+  // обычных (non-diagnose) тасок поля нет — рендерим только raw result.
+  const diagnoseChecks = task.result?.checks;
+  const checks: DiagnoseCheckEntry[] | null = Array.isArray(diagnoseChecks)
+    ? (diagnoseChecks as DiagnoseCheckEntry[])
+    : null;
+  const diagnoseMeta = (task.result?.diagnose_meta ?? undefined) as
+    | DiagnoseMeta
+    | undefined;
+
   return (
     <div className="bg-slate-950 border border-slate-800 rounded p-3 space-y-3 text-xs">
       <div className="grid grid-cols-2 gap-4">
@@ -257,8 +276,19 @@ function TaskDetails({ task }: { task: ProvisioningTaskOut }) {
         </details>
       )}
 
+      {checks && (
+        <div>
+          <div className="text-slate-500 uppercase text-[10px] mb-1">
+            диагностика
+          </div>
+          <DiagnoseResult checks={checks} meta={diagnoseMeta} />
+        </div>
+      )}
+
       {task.result && (
-        <details open>
+        // Когда есть structured checks — raw result схлопнут (детали выше),
+        // иначе открыт по умолчанию, как раньше.
+        <details open={!checks}>
           <summary className="cursor-pointer text-slate-400 uppercase text-[10px]">
             result (stdout/stderr/ansible exit)
           </summary>
@@ -315,6 +345,14 @@ export default function Tasks() {
     onSuccess: () =>
       qc.invalidateQueries({ queryKey: ["provisioning-tasks"] }),
     onError: (e: Error) => alert(`Не удалось удалить: ${e.message}`),
+  });
+
+  const cancel = useMutation({
+    mutationFn: (id: number) =>
+      api.post<ProvisioningTaskOut>(`/provisioning/tasks/${id}/cancel`, {}),
+    onSuccess: () =>
+      qc.invalidateQueries({ queryKey: ["provisioning-tasks"] }),
+    onError: (e: Error) => alert(`Не удалось отменить: ${e.message}`),
   });
 
   const batch = useMutation({
@@ -570,6 +608,25 @@ export default function Tasks() {
                     </td>
                     <td onClick={(e) => e.stopPropagation()}>
                       <div className="flex gap-1">
+                        {(t.status === "pending" || t.status === "running") && (
+                          <button
+                            disabled={cancel.isPending || !!t.cancel_requested_at}
+                            onClick={() => {
+                              if (
+                                confirm(
+                                  `Отменить задачу #${t.id} (${t.action} на ${t.target_type}:${t.target_id})?` +
+                                    (t.status === "running"
+                                      ? " Идущий ansible получит SIGTERM."
+                                      : "")
+                                )
+                              )
+                                cancel.mutate(t.id);
+                            }}
+                            className="text-xs px-2 py-1 rounded bg-orange-700 hover:bg-orange-600 disabled:opacity-50"
+                          >
+                            {t.cancel_requested_at ? "отменяется…" : "cancel"}
+                          </button>
+                        )}
                         {t.status !== "running" && (
                           <button
                             disabled={rerun.isPending}

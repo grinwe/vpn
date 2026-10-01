@@ -14,7 +14,7 @@ interface CloudProviderOut {
   created_at: string;
 }
 
-const KINDS = ["hetzner", "vultr", "digitalocean", "aeza", "manual"] as const;
+const KINDS = ["hetzner", "vultr", "digitalocean", "aeza", "4vps", "vdsina", "vdsina_ru", "billmgr", "manual"] as const;
 
 export default function CloudProviders() {
   const qc = useQueryClient();
@@ -186,9 +186,43 @@ function ProviderForm({
           type="password"
           value={apiToken}
           onChange={(e) => setApiToken(e.target.value)}
-          placeholder={isEdit ? "••••••••" : ""}
+          placeholder={
+            kind === "4vps"
+              ? "panel_id:apikey"
+              : kind === "billmgr"
+                ? '{"base_url":"https://bill.ufo.hosting/billmgr","username":"…","password":"…"}'
+                : isEdit
+                  ? "••••••••"
+                  : ""
+          }
           className="bg-slate-800 border border-slate-700 rounded px-2 py-1"
         />
+        {kind === "4vps" && (
+          <span className="text-[10px] text-amber-400 mt-1">
+            4vps: формат <code>panel_id:apikey</code> (panel_id из
+            /api/public/getPanelIds, apikey — из ЛК). Регион/тариф/ОС задаются
+            при заказе ноды, тут можно не заполнять.
+          </span>
+        )}
+        {kind === "billmgr" && (
+          <span className="text-[10px] text-amber-400 mt-1">
+            BILLmanager (DataCheap/UFO/AdminVPS): токен — JSON{" "}
+            <code>{'{"base_url","username","password"}'}</code>, напр.{" "}
+            <code>https://bill.ufo.hosting/billmgr</code> + логин/пароль от ЛК.
+            datacenter/pricelist/ostempl — числовые id из формы заказа. Стартовый
+            хостер — UFO (его API доступен скриптам; DataCheap/AdminVPS режут DC-IP).
+          </span>
+        )}
+        {(kind === "vdsina" || kind === "vdsina_ru") && (
+          <span className="text-[10px] text-amber-400 mt-1">
+            VDSina: токен — <b>постоянный</b> из панели (Пользователь → «Токен для
+            доступа через публичный API»), НЕ через email/пароль (deprecated).{" "}
+            <b>Домен критичен:</b> <code>vdsina</code> = аккаунт на{" "}
+            <code>vdsina.com</code>, <code>vdsina_ru</code> = на{" "}
+            <code>vdsina.ru</code> — это РАЗНЫЕ аккаунты/токены/балансы; токен с
+            чужого домена даёт 401. Заводи отдельный провайдер на каждый домен.
+          </span>
+        )}
       </label>
       <label className="flex flex-col">
         <span className="text-slate-400 mb-1">Default Region</span>

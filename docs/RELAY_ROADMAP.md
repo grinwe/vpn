@@ -172,6 +172,7 @@
 - `services/relay.py`: `allocate_client_address` (итератор по /24 за вычетом server‑IP и занятых), `validate_requested_address`, `build_relay_config` (кладёт приватник шифрованным в JSONB).
 - `provisioning._collect_site_extra_vars` читает `wg_private_key_enc` и расшифровывает перед отправкой в ansible (fallback на legacy `wg_private_key` plain).
 - `api/exits.py`: `GET /exits/{id}/links`, `POST /exits/{id}/links` (автогенерация WG client keypair + /32 + запись link + обновление `relay_config` в одной транзакции), `DELETE /exits/{id}/links/{relay_node_id}`. Удаление exit'а блокируется при наличии link'ов.
+- **Batch-операции с link'ами:** `POST /exits/batch-attach` (`{relay_node_id, exit_ids[]}` — один relay → N exit'ов) и `POST /exits/{exit_id}/batch-detach` (`{relay_node_ids[]}` — N relay'ев → один exit, обратная операция). Detach реплицирует логику одиночного через общий хелпер `_detach_link_core` (перепин осиротевших creds least-loaded по оставшимся линкам / обнуление `exit_id`, удаление link'а, пересборка `relay_config`-флага). Best-effort: relay без линка к этому exit'у → `not_found` в ответе. Все task'и идут под общим `batch_id`; ответ `{batch_id, exit_id, exit_name, links[], not_found[]}`. В `Exits.tsx` — чекбоксы в таблице привязанных relay'ев + кнопка «⇆ Отцепить выбранные (N)», прогресс через тот же `BatchProgressDrawer`, что и batch-attach.
 - `VPNNodeOut.has_relay_config: bool` — чтобы UI фильтровал доступные для прикрепления ноды без раскрытия tunnel-метаданных.
 - `admin/src/pages/Exits.tsx`: expandable row с таблицей прикреплённых relay'ев + inline-формой "+ Прикрепить relay" (dropdown свободных нод + опциональный адрес).
 - Peers count в списке exit'ов.
@@ -326,3 +327,17 @@
 6. C (relay↔exit link + bootstrap flow).
 7. D.1 + D.2 (код). D.3 — оперативно, по одной ноде.
 8. 0.4 (окончательное удаление) — после недели стабильности.
+
+---
+
+## Stage E — Smart Tunnel Diagnostics (roadmap, после ws/xhttp-правок)
+
+**Проблема:** индикатор линка (`admin/src/linkHealth.tsx`) красится из СЫРОГО возраста WG-handshake → не отличает «устанавливается» (новый линк, первый handshake не случился) / «idle-живой» / «реально порван». Новые ноды ложно краснеют. `PersistentKeepalive=25` уже есть → у установленного тоннеля сигнал надёжен; ложняк только на новых/недохэндшейканных.
+
+**Уже есть (~70%):** `diagnose_relay_link.yml`+роль (структурные чеки peer_on_jump / handshake_age / ping_endpoint / ping_internet_through / xray_port — тот же формат `{name,status,latency_ms,message,details}`, что у ноды), `run_relay_link_health_tick` + `_auto_diagnose_stale_links`. Данные в `relay_exit_links`.
+
+**Сделать (по аналогии с node smart-diagnose):**
+1. **Warm-up grace** (дешёвый, первым): линк с `last_handshake_at=NULL` И молодой (`created_at` < ~15 мин) → серый «устанавливается», не красный. Протащить `created_at`/`ever_handshaked` в `exit_links` payload.
+2. **Verdict-driven индикатор**: красный — только когда активный диагноз (ping/curl сквозь тоннель) подтвердил обрыв, а не по голому возрасту. Хранить per-link вердикт+время.
+3. **Speaking-push + ack/mute/follow для тоннелей** (зеркало `notify_node_diagnosis`/`node_diagnosis_keyboard`): `🔴 Туннель relay→exit (wgN) порвался. peer ✅ · handshake ❌ 18м · ping-through ❌ · xray :9443 ✅` + `[👀 Вижу][🔕 1/4/24ч][📈 Следить]`. Переиспользовать `diagnostics_state`-машину (incident/ack/mute/follow/backoff 30м→2ч→6ч), колонки на `RelayExitLink` (или мьютить целый `WGExitNode`).
+4. **Per-check breakdown** в раскрытом линке (бейджи ✅/⚠️/❌/⏭/ℹ️, как у ноды).

@@ -1,13 +1,15 @@
 ---
 # install_vless_ws_cdn
 #
-# Installs xray-core configured for VLESS+WebSocket inbound, designed
-# to sit behind Cloudflare CDN. TLS termination is handled either by
-# Cloudflare (Full Strict mode with origin cert) or locally with
-# certbot. The WebSocket transport allows Cloudflare to proxy traffic,
-# making the origin IP invisible to TSPU.
-#
-# The role is a no-op unless ``vless_ws_cdn_domain`` is defined.
+# Installs the DIRECT (no-CF) VLESS+WebSocket stack:
+#   client (WSS → <rand>.wgse.info, DNS-only A → THIS node)
+#   → nginx :443 (Let's Encrypt cert, routed by SNI) → xray-ws (loopback, WS).
+# Coexists with reality (:9443) + xhttp (nginx :443, different SNI). The node
+# obtains its OWN Let's Encrypt cert per random subdomain (HTTP-01 webroot,
+# same proven path as install_vless_xhttp); CF is DNS-only — proxying WS is
+# dead (RKN kills the CF leg; see project_cf_ws_cdn_dead). No-op unless
+# ``vless_ws_cdn_domain`` is set (the backend's DNS hook sets it to the
+# minted subdomain).
 
 - name: Stop xray-ws-cdn when VLESS WS+CDN is removed
   systemd:
@@ -16,6 +18,29 @@
     enabled: no
   when: vless_ws_cdn_domain is not defined or vless_ws_cdn_domain | length == 0
   failed_when: false
+
+# Teardown: убираем ВСЕ wscdn-*.conf (иначе :443 server-block с мёртвым
+# server_name снесённого CF-субдомена остаётся висеть рядом с xhttp).
+- name: Find ws-cdn nginx vhosts (teardown)
+  find:
+    paths:
+      - /etc/nginx/sites-enabled
+      - /etc/nginx/sites-available
+    patterns: 'wscdn-*.conf'
+    # file_type=any — без него find пропускает симлинки в sites-enabled,
+    # remove сносит лишь файл из sites-available, а битый симлинк остаётся
+    # → nginx -t → reload падает с open() ... No such file or directory.
+    file_type: any
+  register: _wscdn_teardown_vhosts
+  when: vless_ws_cdn_domain is not defined or vless_ws_cdn_domain | length == 0
+
+- name: Drop ws-cdn vhost files (teardown)
+  file:
+    path: "{{ item.path }}"
+    state: absent
+  loop: "{{ _wscdn_teardown_vhosts.files | default([]) }}"
+  when: vless_ws_cdn_domain is not defined or vless_ws_cdn_domain | length == 0
+  notify: reload nginx ws cdn
 
 - name: Skip role when VLESS WS+CDN is not configured
   meta: end_role
@@ -28,27 +53,52 @@
       - vless_ws_cdn_port is defined
       - vless_ws_cdn_path is defined and vless_ws_cdn_path | length > 0
     fail_msg: >-
-      install_vless_ws_cdn requires vless_ws_cdn_domain, vless_ws_cdn_port,
-      and vless_ws_cdn_path.
+      install_vless_ws_cdn requires vless_ws_cdn_domain/port/path. The node
+      serves TLS directly via Let's Encrypt (HTTP-01) for the minted
+      subdomain — no Origin CA needed (CF is DNS-only).
 
-- name: Ensure dependencies
+- name: Ensure dependencies (incl. nginx WS front)
   apt:
-    name: [curl, unzip, jq, ca-certificates]
+    name:
+      - curl
+      - unzip
+      - jq
+      - ca-certificates
+      - nginx
     state: present
     update_cache: yes
+    cache_valid_time: 3600
 
-- name: Install xray-core (idempotent)
-  shell: |
-    set -euo pipefail
-    if command -v xray >/dev/null 2>&1; then
-      echo "xray already installed"
-      exit 0
-    fi
-    bash -c "$(curl -fsSL https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install
-  args:
-    executable: /bin/bash
-  register: xray_ws_install
-  changed_when: "'already installed' not in xray_ws_install.stdout"
+# xray-core: self-install через mirror-backed роль xray_core (идемпотентно;
+# на combo-нодах xray_core скипнется при той же версии). Раньше был
+# github-install (SSL-timeout на заблокированных RU-DC); на ws-cdn-ONLY
+# ноде НИКТО иначе xray не ставит — reality/xhttp end_role'ятся без своего
+# конфига, а xhttp в site.yml идёт ПОСЛЕ нас. Поэтому ставим сами.
+- name: Install xray-core (CDN-fallback via mirror)
+  include_role:
+    name: xray_core
+
+# Единый список РУ-зон/доменов для split-tunnel — общий на все 4 протокола
+# (reality, xhttp, ws-cdn, hysteria2). Роль задач не выполняет, только
+# отдаёт переменные ru_direct_zones / ru_direct_domains, которые шаблон
+# рендерит в свой синтаксис. Без неё рендер упадёт на undefined.
+- name: Load shared RU-direct domain list
+  include_role:
+    name: ru_direct_list
+    # public: true — БЕЗ него defaults подключаемой роли не попадают в скоуп
+    # вызывающей (ansible.builtin.include_role: public=false по умолчанию), и
+    # рендер шаблона падает с AnsibleUndefinedVariable на КАЖДОЙ ноде.
+    public: true
+
+# geoip.dat нужен до первого рендера config_ws_cdn.json — с 2026-07-28 в нём
+# есть routing rule `ip: ["geoip:ru"]`, а без файла данных xray падает со
+# "failed to load geoip" и валит `xray -test` ниже. Роль идемпотентна
+# (creates:-гард на initial fetch), так что на combo-нодах, где её уже
+# подтянул reality/xhttp, это no-op. На ws-cdn-only ноде — единственный
+# путь доставки файла.
+- name: Provision geoip.dat fetcher + weekly refresh timer
+  include_role:
+    name: xray_geoip
 
 # Also in bootstrap_node (the authoritative one). Kept here as a
 # safety net in case bootstrap order changes.
@@ -122,6 +172,14 @@
     backup: yes
   notify: restart xray ws cdn
 
+# Ловим битый рендер ДО старта — иначе xray-ws молча падает в systemd, а на
+# volatile-journald RU-нодах причину потом не восстановить (как в reality/xhttp).
+- name: Validate xray WS+CDN config before starting
+  command: /usr/local/bin/xray -test -config /usr/local/etc/xray/config_ws_cdn.json
+  register: xray_ws_cdn_config_test
+  changed_when: false
+  failed_when: xray_ws_cdn_config_test.rc != 0
+
 - name: Install VLESS WS user management helper
   copy:
     src: manage_vless_ws_user.sh
@@ -167,3 +225,150 @@
     state: restarted
     daemon_reload: yes
   when: _xray_ws_cdn_active.stdout != 'active'
+
+# ── Direct TLS via Let's Encrypt (HTTP-01 webroot) → xray-ws loopback ───
+# No CF Origin CA anymore: the DNS-only subdomain points straight at this
+# node, so nginx terminates TLS with its OWN LE cert. Mirrors the proven
+# install_vless_xhttp certbot path. :80 is opened by bootstrap_node.
+- name: Install certbot (ws-cdn LE)
+  apt:
+    name: [certbot]
+    state: present
+
+- name: Ensure ACME webroot (shared with xhttp on combo nodes)
+  file:
+    path: /var/www/acme-challenge
+    state: directory
+    owner: root
+    group: root
+    mode: '0755'
+
+- name: Check for existing Let's Encrypt certificate (ws-cdn)
+  stat:
+    path: /etc/letsencrypt/live/{{ vless_ws_cdn_domain }}/fullchain.pem
+  register: _ws_cdn_le_cert
+
+# Первичная выдача: рендерим минимальный :80 acme-vhost, через который
+# certbot --webroot кладёт токен. Полноценный TLS-vhost ниже требует уже
+# существующий серт → двухфазный bootstrap неизбежен. На повторных
+# (идемпотентных) прогонах блок скипается (_ws_cdn_le_cert.stat.exists).
+- name: Render pre-cert ws-cdn vhost (HTTP-only acme-challenge)
+  template:
+    src: wscdn-nginx-precert.conf.j2
+    dest: /etc/nginx/sites-available/wscdn-{{ vless_ws_cdn_domain }}.conf
+    owner: root
+    group: root
+    mode: '0644'
+  when: not _ws_cdn_le_cert.stat.exists
+
+- name: Enable pre-cert ws-cdn vhost
+  file:
+    src: /etc/nginx/sites-available/wscdn-{{ vless_ws_cdn_domain }}.conf
+    dest: /etc/nginx/sites-enabled/wscdn-{{ vless_ws_cdn_domain }}.conf
+    state: link
+  when: not _ws_cdn_le_cert.stat.exists
+
+- name: Ensure nginx is up for pre-cert issuance (ws-cdn)
+  systemd:
+    name: nginx
+    state: started
+    enabled: yes
+  when: not _ws_cdn_le_cert.stat.exists
+
+- name: Reload nginx to pick up pre-cert ws-cdn vhost
+  systemd:
+    name: nginx
+    state: reloaded
+  when: not _ws_cdn_le_cert.stat.exists
+
+- name: Issue ws-cdn certificate via webroot challenge
+  command: >-
+    certbot certonly --webroot
+    -w /var/www/acme-challenge
+    --non-interactive --agree-tos
+    --email {{ vless_ws_cdn_acme_email | default('admin@' + vless_ws_cdn_domain) }}
+    -d {{ vless_ws_cdn_domain }}
+  args:
+    creates: /etc/letsencrypt/live/{{ vless_ws_cdn_domain }}/fullchain.pem
+
+- name: Set ws-cdn cert paths from certbot
+  set_fact:
+    _ws_cdn_cert_path: /etc/letsencrypt/live/{{ vless_ws_cdn_domain }}/fullchain.pem
+    _ws_cdn_key_path: /etc/letsencrypt/live/{{ vless_ws_cdn_domain }}/privkey.pem
+
+# Renewal: certbot.timer дёргает deploy-hook → reload nginx (+ restart
+# xray-ws-cdn на случай ручного отката на direct-TLS). Без hook'а свежий
+# fullchain.pem окажется на диске, но nginx продолжит отдавать старый
+# (in-memory) → через 90 дней клиенты ловят CERT_DATE_INVALID.
+- name: Install certbot deploy-hook for ws-cdn (nginx + xray reload)
+  copy:
+    src: wscdn-cert-reload.sh
+    dest: /etc/letsencrypt/renewal-hooks/deploy/wscdn-reload.sh
+    owner: root
+    group: root
+    mode: '0755'
+
+- name: Enable certbot renewal timer (ws-cdn)
+  systemd:
+    name: certbot.timer
+    state: started
+    enabled: yes
+  failed_when: false
+
+- name: Remove default nginx site
+  file:
+    path: /etc/nginx/sites-enabled/default
+    state: absent
+  notify: reload nginx ws cdn
+
+# Субдомен рандомизируется per-config (token_hex), так что delete+recreate
+# оставляет старый wscdn-*.conf с мёртвым server_name на :443. Сносим все,
+# кроме текущего, на каждом прогоне.
+- name: Find existing ws-cdn vhosts
+  find:
+    paths:
+      - /etc/nginx/sites-enabled
+      - /etc/nginx/sites-available
+    patterns: 'wscdn-*.conf'
+    # file_type=any — без него find пропускает симлинки в sites-enabled,
+    # remove сносит лишь файл из sites-available, а битый симлинк остаётся
+    # → nginx -t → reload падает с open() ... No such file or directory.
+    file_type: any
+  register: _wscdn_existing_vhosts
+
+- name: Remove stale ws-cdn vhosts (keep only current subdomain)
+  file:
+    path: "{{ item.path }}"
+    state: absent
+  loop: "{{ _wscdn_existing_vhosts.files }}"
+  when: item.path | basename != ('wscdn-' ~ vless_ws_cdn_domain ~ '.conf')
+  notify: reload nginx ws cdn
+
+- name: Render ws-cdn nginx vhost
+  template:
+    src: wscdn-nginx.conf.j2
+    dest: "/etc/nginx/sites-available/wscdn-{{ vless_ws_cdn_domain }}.conf"
+    owner: root
+    group: root
+    mode: '0644'
+  notify: reload nginx ws cdn
+
+- name: Enable ws-cdn nginx vhost
+  file:
+    src: "/etc/nginx/sites-available/wscdn-{{ vless_ws_cdn_domain }}.conf"
+    dest: "/etc/nginx/sites-enabled/wscdn-{{ vless_ws_cdn_domain }}.conf"
+    state: link
+  notify: reload nginx ws cdn
+
+- name: Validate nginx config (ws-cdn front)
+  command: nginx -t
+  changed_when: false
+
+- name: Ensure nginx is enabled and running
+  systemd:
+    name: nginx
+    enabled: yes
+    state: started
+
+- name: Flush ws-cdn nginx handlers
+  meta: flush_handlers

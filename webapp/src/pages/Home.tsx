@@ -3,7 +3,9 @@ import { createPortal } from "react-dom";
 import QRCode from "qrcode";
 import {
   activateTrial,
+  authWithInitData,
   fetchReferral,
+  setToken,
   MeResponse,
   ReferralInfo,
   Subscription,
@@ -13,13 +15,81 @@ import {
   renameDevice,
   removeDevice,
   createTopup,
+  fetchMe,
+  pollBalanceIncrease,
   cancelSubscription,
   freezeSubscription,
   unfreezeSubscription,
   toggleAutoRenew,
+  humanError,
+  subLinkUrl,
 } from "../api";
 import { navigate } from "../router";
-import { getTg } from "../telegram";
+import { getTg, openExternalUrl } from "../telegram";
+
+// ── Устойчивая загрузка реф-блока ────────────────────────────────────
+// Раньше реферал тянулся одним fetchReferral().catch(() => undefined) на
+// маунте: один сетевой промах на плохой сети (метро/лифт — основная среда
+// Mini App) — и весь реферальный блок (промокод, ссылка, заработок) не
+// рендерился до полной перезагрузки приложения. Тянем его тем же устойчивым
+// способом, что и /me в App.tsx: ретраи на транзиентных сбоях + разовая
+// прозрачная переавторизация по initData на 401/403.
+const REFERRAL_RETRIES = 2;
+const REFERRAL_RETRY_DELAY_MS = 2000;
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+// Ошибки из api.ts прилетают как Error("401: ...") / Error("Failed to fetch").
+function isReferralAuthError(e: unknown): boolean {
+  return /^(401|403)/.test((e as Error)?.message ?? "");
+}
+
+// Разовая переавторизация через Telegram initData (живёт весь сеанс Mini App).
+async function reauthReferral(): Promise<boolean> {
+  const tg = getTg();
+  if (!tg || !tg.initData) return false;
+  try {
+    const auth = await authWithInitData(tg.initData);
+    setToken(auth.token);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function fetchReferralResilient(): Promise<ReferralInfo> {
+  let lastErr: unknown;
+  for (let attempt = 0; attempt <= REFERRAL_RETRIES; attempt++) {
+    try {
+      return await fetchReferral();
+    } catch (e) {
+      lastErr = e;
+      // Токен протух — переавторизуемся один раз и сразу повторяем без паузы.
+      if (isReferralAuthError(e) && (await reauthReferral())) {
+        try {
+          return await fetchReferral();
+        } catch (e2) {
+          lastErr = e2;
+        }
+      }
+      if (attempt < REFERRAL_RETRIES) await sleep(REFERRAL_RETRY_DELAY_MS);
+    }
+  }
+  throw lastErr;
+}
+
+// HTTP-код из ошибки request(): она бросает Error("409: {...}"), поля status
+// у неё нет. Раньше кабинет читал err.status, и 409 никогда не распознавался.
+function httpStatus(e: unknown): number | null {
+  const m = /^(\d{3}):/.exec((e as Error)?.message ?? "");
+  return m ? Number(m[1]) : null;
+}
+
+// 409 «подарок уже забран / уже использован / подписка уже есть» (другая
+// вкладка, второе устройство, гонка): это не ошибка, просто обновляем экран.
+// Другой 409 с этого эндпоинта — сборка подписки не удалась, бонус откатился,
+// и молчать там нельзя: юзер увидел бы «нажал, ничего не произошло».
+const TRIAL_TAKEN_409 =
+  /Trial already activated|Trial already used|already has a live subscription/;
 
 export default function Home({
   me,
@@ -32,26 +102,79 @@ export default function Home({
   const [referral, setReferral] = useState<ReferralInfo | null>(null);
   const [showSetup, setShowSetup] = useState(false);
   const [trialActivating, setTrialActivating] = useState(false);
+  // E2.2/E2.3: результат активации подарка должен быть ВИДЕН. Раньше баннер
+  // просто исчезал, баланс снова показывал 0 ₽, и юзер не понимал, выдали ему
+  // VPN или нет; а провал уходил в console.warn — «тапнул, ничего не
+  // произошло, ушёл».
+  const [trialDone, setTrialDone] = useState<{
+    subToken: string | null;
+    subUrl: string | null;
+    // Сколько дней бесплатно (3 или 3 + 3). null на историческом пути,
+    // когда старый бонус 150 ₽ ушёл на обычный месяц.
+    freeDays: number | null;
+  } | null>(null);
+  const [trialError, setTrialError] = useState<string | null>(null);
 
   // Trial is retroactive: any user whose trial_activated_at is still
   // NULL sees the banner, including "old" users who registered before
   // the trial system existed. Activation is one-shot on the backend
   // (409 on repeat), so we just trust the flag from /me.
   const trialAvailable = me.balance.trial_available;
-  const trialAmountRub = me.balance.trial_amount_kopecks / 100;
+  const trialAmountKopecks = me.balance.trial_amount_kopecks;
+  // Бесплатные дни: всем и сверху по приглашению. Старый бэк полей не
+  // отдаёт: тогда 3 и 0, как в нынешнем оффере.
+  const trialDays = me.balance.trial_days || 3;
+  const trialRefDays = me.balance.trial_referral_days ?? 0;
+  const trialTotalDays = trialDays + trialRefDays;
+  // Живая подписка уже есть: тап даст только деньги на баланс (В3).
+  const trialBonusOnly = me.balance.trial_bonus_only ?? false;
+  // Подарок бонус-онли в рублях: бонус за 3 дня плюс подарок по приглашению
+  // по той же цене дня (15 ₽ или 30 ₽ при Solo 150 ₽).
+  const trialGiftRub = Math.round(
+    (trialAmountKopecks * trialTotalDays) / trialDays / 100,
+  );
 
   const handleActivateTrial = async () => {
     if (trialActivating) return;
     setTrialActivating(true);
+    setTrialError(null);
     try {
-      await activateTrial();
-      // Refresh /me so the banner disappears and the new balance
-      // (including the +50₽ referral bonus if any) shows up.
+      // Один вызов: сервер сам тратит подарок на подписку на бесплатные дни
+      // (тот же сервис, что у бота) и отдаёт ссылку прямо в ответе. Раньше
+      // кабинет делал второй шаг «купить самый дешёвый тариф» из браузера.
+      // Живая подписка уже есть — сервер только кладёт подарок на баланс,
+      // ссылки в ответе нет, просто обновляем /me.
+      const res = await activateTrial();
+      getTg()?.HapticFeedback?.notificationOccurred("success");
+      if (res.sub_token || res.sub_url) {
+        setTrialDone({
+          subToken: res.sub_token ?? null,
+          subUrl: res.sub_url ?? null,
+          freeDays:
+            res.trial_days != null
+              ? res.trial_days + (res.referral_days ?? 0)
+              : null,
+        });
+      }
+      // Refresh /me: баннер исчезнет, появятся подписка и баланс.
       onRefresh();
     } catch (err) {
-      // 409 = already activated by another tab/device in the
-      // meantime. Either way, just refresh — /me will tell the
-      // truth and the banner will hide itself.
+      const status = httpStatus(err);
+      const raw = (err as Error)?.message ?? "";
+      if (status === 409 && TRIAL_TAKEN_409.test(raw)) {
+        // Подарок уже забран: не ошибка, обновление /me уберёт баннер.
+      } else if (status === 503) {
+        // Нет плана для триала или наплыв на сборку подписок.
+        setTrialError("Сейчас много желающих, попробуй через пару минут.");
+      } else if (status === 402) {
+        setTrialError(
+          "Не получилось включить бесплатные дни. Напиши в поддержку из раздела «Помощь».",
+        );
+      } else {
+        setTrialError(
+          "Не получилось забрать подарок. Проверь связь и попробуй ещё раз.",
+        );
+      }
       console.warn("trial activate failed", err);
       onRefresh();
     } finally {
@@ -60,7 +183,36 @@ export default function Home({
   };
 
   useEffect(() => {
-    fetchReferral().then(setReferral).catch(() => undefined);
+    let cancelled = false;
+    const load = () => {
+      fetchReferralResilient()
+        .then((r) => {
+          if (!cancelled) setReferral(r);
+        })
+        .catch(() => undefined);
+    };
+    load();
+    // Пере-запрашиваем реф-блок при возврате в приложение / восстановлении
+    // связи — тем же событием, что и /me в App.tsx. Если первый заход
+    // пришёлся на секундный обрыв, блок подтянется, когда юзер вернётся в
+    // кабинет, а не исчезнет на весь сеанс. Дебаунс: при частой смене сети
+    // (toggling VPN, Wi-Fi↔LTE) события сыплются пачками — схлопываем.
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const trigger = () => {
+      if (timer) clearTimeout(timer);
+      timer = setTimeout(load, 500);
+    };
+    const onVisibility = () => {
+      if (document.visibilityState === "visible") trigger();
+    };
+    window.addEventListener("online", trigger);
+    document.addEventListener("visibilitychange", onVisibility);
+    return () => {
+      cancelled = true;
+      if (timer) clearTimeout(timer);
+      window.removeEventListener("online", trigger);
+      document.removeEventListener("visibilitychange", onVisibility);
+    };
   }, []);
 
   const balanceRub = me.balance.balance_rub;
@@ -98,28 +250,87 @@ export default function Home({
         </div>
       )}
 
-      {/* ── Free trial banner ── */}
-      {trialAvailable && trialAmountRub > 0 && (
-        <section className="card mb-4 border border-[var(--accent-from)]/40">
+      {/* ── Free trial banner (E2.1: главный элемент первого экрана) ──
+          Раньше самым крупным блоком была карточка баланса «0 ₽» с кнопкой
+          «Пополнить» — просьба занести денег до того, как показана польза. */}
+      {trialAvailable && trialAmountKopecks > 0 && (
+        <section className="card-hero mb-4">
           <div className="text-tg-hint text-xs uppercase tracking-wide">Подарок</div>
-          <div className="text-lg font-semibold mt-1">🎁 Забери пробный месяц</div>
-          <div className="text-sm text-tg-hint mt-1">
-            Кладём <b>{trialAmountRub.toFixed(0)} ₽</b> тебе на баланс — хватит на
-            месяц подписки Solo. Без карты, без автосписаний.
-          </div>
+          {trialBonusOnly ? (
+            // Подписка уже есть: тап даст только деньги на баланс. Обещать
+            // «N дней бесплатно» здесь нельзя, человек получит не подписку.
+            <>
+              <div className="text-2xl font-bold mt-1">
+                🎁 Подарок: {trialGiftRub} ₽ на баланс, это {trialTotalDays}{" "}
+                {pluralDays(trialTotalDays)} подписки
+              </div>
+              <div className="text-sm text-tg-hint mt-2">
+                Зачтётся при следующем продлении.
+              </div>
+            </>
+          ) : (
+            <>
+              <div className="text-2xl font-bold mt-1">
+                🎁 Забери {trialTotalDays} {pluralDays(trialTotalDays)} бесплатно
+              </div>
+              <div className="text-sm text-tg-hint mt-2">
+                {trialRefDays > 0 &&
+                  `Тебя пригласил друг, поэтому дней не ${trialDays}, а ${trialTotalDays}. `}
+                Карта не нужна. Один тап, и получишь ссылку с инструкцией,
+                как подключиться.
+              </div>
+            </>
+          )}
           <button
-            className="btn-primary w-full mt-3"
+            className="btn-primary w-full mt-4 py-3 text-base"
             disabled={trialActivating}
             onClick={handleActivateTrial}
           >
-            {trialActivating ? "Активируем…" : "Активировать месяц"}
+            {trialBonusOnly
+              ? trialActivating
+                ? "Зачисляем…"
+                : "Забрать подарок"
+              : trialActivating
+                ? "Включаем VPN…"
+                : "Активировать бесплатно"}
           </button>
+          {trialError && (
+            <div className="mt-3 text-sm bg-red-900/40 ring-1 ring-red-500 rounded-lg p-2 text-red-100">
+              {trialError}
+              <button
+                className="underline ml-1"
+                onClick={handleActivateTrial}
+                disabled={trialActivating}
+              >
+                Попробовать снова
+              </button>
+            </div>
+          )}
         </section>
       )}
 
+      {trialDone && (
+        <TrialSuccess
+          subToken={trialDone.subToken}
+          readyUrl={trialDone.subUrl}
+          freeDays={trialDone.freeDays}
+          subLinkBase={me.sub_link_base_url}
+          onClose={() => {
+            setTrialDone(null);
+            onRefresh();
+          }}
+        />
+      )}
+
       {/* ── Balance card ── */}
+      {/* Пока подписок нет, баланс — не главное: показываем его обычной
+          карточкой, чтобы не спорить за внимание с подарком (E2.1). */}
       <section className="mb-4">
-        <div className={`card-hero ${lowBalance ? "card-danger" : ""}`}>
+        <div
+          className={`${me.subscriptions.length === 0 ? "card" : "card-hero"} ${
+            lowBalance ? "card-danger" : ""
+          }`}
+        >
           <div className="text-tg-hint text-xs uppercase tracking-wide">Баланс</div>
           <div className="text-4xl font-bold mt-1 tracking-tight">
             {balanceRub.toFixed(0)} <span className="text-2xl text-tg-hint">₽</span>
@@ -145,8 +356,20 @@ export default function Home({
       <section className="space-y-3 mb-6">
         <h2 className="text-sm uppercase tracking-wide text-tg-hint">Мои подписки</h2>
         {me.subscriptions.length === 0 ? (
-          <div className="card text-tg-hint text-sm">
-            У вас пока нет подписок. Активируйте тариф ниже.
+          <div className="card text-sm">
+            <div className="text-tg-hint">
+              {trialAvailable
+                ? "Подписки пока нет. Забери бесплатные дни выше."
+                : "Подписки пока нет."}
+            </div>
+            {!trialAvailable && (
+              <button
+                className="btn-primary w-full mt-3"
+                onClick={() => navigate({ name: "plans" })}
+              >
+                Выбрать тариф
+              </button>
+            )}
           </div>
         ) : (
           me.subscriptions.map((s) => (
@@ -181,14 +404,23 @@ export default function Home({
 
 
       {/* ── Referral block ── */}
-      {referral && referral.code && (
+      {/* E2.7: не просим приводить друзей у того, кто сам ещё не пользовался
+          сервисом — на первом экране это расфокусирует и выглядит как шум. */}
+      {referral && referral.code && me.subscriptions.length > 0 && (
         <section className="card mt-6">
           <div className="text-tg-hint text-xs uppercase tracking-wide">
             Пригласи друга
           </div>
           <div className="text-sm mt-1">
+            {/* Сколько дней получит друг: с бэка (3 + подарок кода). «Вместо N»
+                пишем, только если подарок реально есть, иначе без сравнения. */}
+            {referral.invitee_total_days
+              ? `Друг получит ${referral.invitee_total_days} ${pluralDays(referral.invitee_total_days)} бесплатно${
+                  referral.invitee_total_days > trialDays ? ` вместо ${trialDays}` : ""
+                }. `
+              : ""}
             Получи <b>{(referral.bonus_kopecks / 100).toFixed(0)} ₽</b> на баланс,
-            когда друг пополнит счёт впервые. Бонус капает автоматически.
+            когда друг впервые оплатит. Бонус капает автоматически.
           </div>
           {referral.share_url ? (
             <>
@@ -235,7 +467,7 @@ export default function Home({
       )}
 
       {showSetup && createPortal(<SetupSheet onClose={() => setShowSetup(false)} />, document.body)}
-      {topupOpen && createPortal(<TopupModal onClose={() => setTopupOpen(false)} />, document.body)}
+      {topupOpen && createPortal(<TopupModal onClose={() => setTopupOpen(false)} onRefresh={onRefresh} baselineKopecks={me.balance.balance_kopecks} />, document.body)}
     </div>
   );
 }
@@ -263,16 +495,23 @@ function SubscriptionCard({
   const [busy, setBusy] = useState(false);
   const [showQR, setShowQR] = useState(false);
   const qrCanvasRef = useRef<HTMLCanvasElement | null>(null);
-  // Per-device sub link — use the first active device's token so the QR
-  // exposes only that device's credentials.  Falls back to the legacy
-  // subscription-level token for old subscriptions without device tokens.
+  // Per-device sub link — та же ссылка, что показывает бот (link_token):
+  // «первое живое устройство по id» после failover primary становилось
+  // device-2 (токен переезжает на новую строку с большим id), и кабинет с
+  // ботом показывали разные ссылки. link_token == sub_token бывает только у
+  // подписок до 2026-09-28 — это legacy-ссылка на ВСЕ устройства, её не
+  // показываем и остаёмся на первом устройстве, как раньше.
+  const deviceLinkToken =
+    sub.link_token && sub.link_token !== sub.sub_token ? sub.link_token : null;
   const primaryDevice = extra?.devices?.find((d) => d.sub_token);
-  const linkToken = primaryDevice?.sub_token ?? sub.sub_token;
-  const subUrl = linkToken
-    ? subLinkBase
-      ? `${subLinkBase}/${linkToken}`
-      : `${window.location.origin}/api/sub/${linkToken}`
-    : null;
+  const linkToken = deviceLinkToken ?? primaryDevice?.sub_token ?? sub.sub_token;
+  // Готовый URL (домен как у бота) — только у подписок с link_token; у
+  // старых primaryDevice.sub_url пуст, и URL строится как раньше.
+  const subUrl = subLinkUrl(
+    deviceLinkToken ? sub.link_url : primaryDevice?.sub_url,
+    linkToken,
+    subLinkBase,
+  );
 
   const isFrozen = sub.status === "frozen";
 
@@ -286,14 +525,16 @@ function SubscriptionCard({
   }, [showQR, subUrl]);
 
   async function handleFreeze() {
-    if (!confirm(`Заморозить подписку на 7 дней? Деньги списываться не будут, доступ восстановится автоматически.`))
+    if (!confirm(`Заморозить подписку на 7 дней? VPN отключится сразу и включится после разморозки. Оплаченные дни не сгорят: срок подписки сдвинется на 7 дней. Заморозка даётся один раз в год, разморозить можно в любой момент.`))
       return;
     setBusy(true);
     try {
       await freezeSubscription(sub.id);
       onAction();
     } catch (e) {
-      alert(`Не удалось заморозить: ${(e as Error).message}`);
+      // Текст бэкенда без кода и JSON: например, 400 «Заморозка станет
+      // доступна после первой оплаты» у старого /me с can_freeze=true.
+      alert(`Не удалось заморозить: ${humanError(e)}`);
     } finally {
       setBusy(false);
     }
@@ -312,6 +553,10 @@ function SubscriptionCard({
   }
 
   async function handleToggleAutoRenew() {
+    // Игнорируем клики, пока запрос в полёте: автопродление — денежная
+    // настройка, а быстрый двойной тап отправил бы два POST с одинаковым
+    // newValue (пропсы обновятся только после onRefresh) и тумблер бы скакал.
+    if (busy) return;
     const newValue = !extra?.auto_renew;
     if (!newValue && !confirm("Отключить автопродление? Подписка будет активна до конца оплаченного периода."))
       return;
@@ -326,7 +571,11 @@ function SubscriptionCard({
     }
   }
 
-  const priceRub = extra ? (extra.total_monthly_kopecks / 100).toFixed(0) : null;
+  const priceKopecks = extra
+    ? extra.total_per_period_kopecks ?? extra.total_monthly_kopecks
+    : null;
+  const priceRub = priceKopecks !== null ? (priceKopecks / 100).toFixed(0) : null;
+  const periodLabel = extra?.period === "year" ? "год" : "мес";
   const expiresDate = extra?.expires_at
     ? new Date(extra.expires_at).toLocaleDateString("ru-RU", { day: "numeric", month: "long" })
     : null;
@@ -340,7 +589,7 @@ function SubscriptionCard({
       <div className="text-tg-hint text-sm">{sub.region}</div>
       {extra && priceRub && (
         <div className="text-tg-hint text-xs mt-1">
-          {priceRub} ₽/мес
+          {priceRub} ₽/{periodLabel}
           {expiresDate && !isFrozen && (
             <> · {extra.auto_renew ? "до" : "истекает"} {expiresDate}</>
           )}
@@ -451,7 +700,9 @@ function SubscriptionCard({
       {/* Auto-renew toggle */}
       {extra && !isFrozen && (
         <div
-          className="mt-3 flex items-center justify-between cursor-pointer"
+          className={`mt-3 flex items-center justify-between cursor-pointer ${
+            busy ? "opacity-50 pointer-events-none" : ""
+          }`}
           onClick={handleToggleAutoRenew}
         >
           <span className="text-sm">Автопродление</span>
@@ -588,6 +839,120 @@ const SETUP_PLATFORMS = [
   },
 ];
 
+
+/** Ссылки на клиенты под платформу юзера (E2.4).
+ *
+ * Раньше инструкция говорила «установите v2rayNG из Google Play» без единой
+ * ссылки: человек должен был выйти из Telegram, найти приложение по названию и
+ * вернуться — самый длинный разрыв между «получил ссылку» и «работает VPN».
+ */
+const CLIENT_LINKS: { label: string; url: string }[] = [
+  { label: "App Store", url: "https://apps.apple.com/app/happ-proxy-utility/id6504287215" },
+  { label: "Google Play", url: "https://play.google.com/store/apps/details?id=com.happproxy" },
+];
+
+/** Экран «Готово» после активации подарка (E2.2 + E2.4 + E3.1).
+ *
+ * У платного пути такой экран есть (Plans.ActivatedScreen), у бесплатного не
+ * было: баннер исчезал, баланс снова показывал 0 ₽, и юзер не понимал, что VPN
+ * уже выдан и что ссылку нужно вставить в отдельное приложение.
+ */
+function TrialSuccess({
+  subToken,
+  readyUrl,
+  freeDays,
+  subLinkBase,
+  onClose,
+}: {
+  subToken: string | null;
+  readyUrl: string | null;
+  // Бесплатные дни из ответа активации (3 или 6). null: исторический путь,
+  // старый бонус ушёл на обычный месяц, строку про дни не показываем.
+  freeDays: number | null;
+  subLinkBase: string;
+  onClose: () => void;
+}) {
+  const [copied, setCopied] = useState(false);
+  const subUrl = subLinkUrl(readyUrl, subToken, subLinkBase);
+
+  return createPortal(
+    <div className="fixed inset-0 z-50 bg-black/70 flex items-end sm:items-center justify-center p-4">
+      <div className="card w-full max-w-md">
+        <div className="text-center">
+          <div className="text-4xl mb-2">✅</div>
+          <h2 className="text-xl font-semibold">Готово, VPN активен</h2>
+          {freeDays != null && freeDays > 0 && (
+            <div className="text-sm text-tg-hint mt-1">
+              Бесплатно на {freeDays} {pluralDays(freeDays)}
+            </div>
+          )}
+        </div>
+
+        {subUrl && (
+          <div className="mt-4">
+            <div className="text-xs uppercase tracking-wide text-tg-hint mb-1">
+              Твоя ссылка
+            </div>
+            <div className="text-xs break-all bg-tg-secondaryBg rounded-lg p-2 ring-1 ring-tg-hint/30">
+              {subUrl}
+            </div>
+            <button
+              className="btn-primary w-full mt-2"
+              onClick={async () => {
+                try {
+                  await navigator.clipboard.writeText(subUrl);
+                  setCopied(true);
+                  getTg()?.HapticFeedback?.impactOccurred("light");
+                  setTimeout(() => setCopied(false), 2000);
+                } catch (err) {
+                  console.warn("clipboard copy failed", err);
+                }
+              }}
+            >
+              {copied ? "Скопировано ✓" : "📋 Скопировать ссылку"}
+            </button>
+          </div>
+        )}
+
+        <div className="mt-4 text-sm">
+          <div className="font-semibold mb-2">Как подключиться</div>
+          <ol className="space-y-2 text-tg-hint">
+            <li>
+              1. Установи HAPP:{" "}
+              {CLIENT_LINKS.map((c, i) => (
+                <span key={c.url}>
+                  {i > 0 && " · "}
+                  <button
+                    className="underline text-tg-text"
+                    onClick={() => openExternalUrl(getTg(), c.url)}
+                  >
+                    {c.label}
+                  </button>
+                </span>
+              ))}
+            </li>
+            <li>2. Вставь ссылку в приложение</li>
+            <li>3. Нажми «Подключиться»</li>
+          </ol>
+        </div>
+
+        {/* E3.1 — продаём «Помощь» ровно там, где она нужна: в момент первого
+            подключения. В приветствии это читалось бы как «у нас часто не
+            работает», здесь — как забота. Кнопка реально переносит устройство
+            на другой сервер. */}
+        <div className="mt-4 text-xs text-tg-hint">
+          Не подключается? Нажми <b>«Помощь»</b> — перенесём тебя на другой сервер.
+        </div>
+
+        <button className="btn-ghost w-full mt-4" onClick={onClose}>
+          Понятно
+        </button>
+      </div>
+    </div>,
+    document.body,
+  );
+}
+
 function SetupSheet({ onClose }: { onClose: () => void }) {
   const [open, setOpen] = useState<number | null>(null);
 
@@ -624,13 +989,46 @@ function SetupSheet({ onClose }: { onClose: () => void }) {
   );
 }
 
-const TOPUP_PRESETS = [10000, 30000, 60000, 150000]; // kopecks: 100/300/600/1500 ₽
+// kopecks: 150/300/600/1500 ₽. Первый пресет не меньше цены продления Solo
+// (150 ₽): после 3 бесплатных дней пополнение на 100 ₽ молча не хватило бы
+// на автопродление.
+const TOPUP_PRESETS = [15000, 30000, 60000, 150000];
 
-function TopupModal({ onClose }: { onClose: () => void }) {
+function TopupModal({
+  onClose,
+  onRefresh,
+  baselineKopecks,
+}: {
+  onClose: () => void;
+  onRefresh: () => void;
+  // Баланс на момент открытия модалки — точка отсчёта для поллинга карты
+  // (передаётся из Home, чтобы не зависеть от отдельного fetchMe).
+  baselineKopecks: number;
+}) {
   const [busy, setBusy] = useState(false);
   const [customRub, setCustomRub] = useState<string>("");
+  // Выбранная сумма в копейках: null → шаг ввода суммы; число → шаг «чем
+  // платить». Сначала сумма, затем способ оплаты.
+  const [amount, setAmount] = useState<number | null>(null);
+  // Карта отдаёт внешнюю страницу без callback → после её открытия ждём
+  // зачисление поллингом баланса.
+  const [waiting, setWaiting] = useState(false);
+  const [waitTimedOut, setWaitTimedOut] = useState(false);
+  // Успех карточной оплаты: lava не редиректит обратно в Mini App, поэтому
+  // показываем явное «баланс пополнен», а не молча закрываем модалку.
+  const [success, setSuccess] = useState(false);
+  // Модалку можно закрыть во время ожидания — гвардим setState после unmount
+  // (poll живёт ~90с, юзер мог уже закрыть).
+  const mountedRef = useRef(true);
+  useEffect(() => () => { mountedRef.current = false; }, []);
+  // Токен поколения поллинга: закрытие/повторная проверка инкрементят его,
+  // отменяя отвязанный поллинг, чтобы он не дёргал UI постфактум.
+  const pollGenRef = useRef(0);
+  // Baseline, реально использованный для текущего платежа (чтобы «Проверить
+  // ещё раз» сравнивал с той же точкой отсчёта, а не с уже зачисленным).
+  const baselineUsedRef = useRef(0);
 
-  async function pay(amountKopecks: number) {
+  async function payStars(amountKopecks: number) {
     const tg = getTg();
     if (!tg) {
       alert("Открой эту страницу в Telegram");
@@ -640,69 +1038,222 @@ function TopupModal({ onClose }: { onClose: () => void }) {
     try {
       const res = await createTopup(amountKopecks, "telegram_stars");
       tg.openInvoice(res.pay_url, (status) => {
-        setBusy(false);
+        if (mountedRef.current) setBusy(false);
         if (status === "paid") {
           tg.HapticFeedback?.notificationOccurred("success");
-          // Give the backend a tick to mark the invoice paid, then
-          // close so /me reloads via Home's refresh.
-          setTimeout(onClose, 500);
+          // Даём бэкенду тик, чтобы пометить инвойс оплаченным, затем
+          // явно перезапрашиваем /me (App сам не перезагрузит: route
+          // не меняется) и закрываем модалку — баланс на экране обновится.
+          // onClose гвардим mountedRef: callback старого (закрытого) инстанса
+          // не должен закрыть заново открытую модалку.
+          setTimeout(() => {
+            onRefresh();
+            if (mountedRef.current) onClose();
+          }, 500);
         } else if (status === "failed") {
           tg.HapticFeedback?.notificationOccurred("error");
-          alert("Оплата не прошла. Попробуй ещё раз.");
+          if (mountedRef.current) alert("Оплата не прошла. Попробуй ещё раз.");
         }
       });
     } catch (e) {
+      if (mountedRef.current) setBusy(false);
+      // Сырой "502: {json}" человеку бесполезен — показываем detail бэкенда
+      // («Платёжный сервис временно недоступен…»), сырую ошибку админ
+      // получает пушем.
+      alert(`Не удалось создать счёт: ${humanError(e)}`);
+    }
+  }
+
+  // Поллинг зачисления после открытия внешней карточной страницы.
+  async function pollCredit() {
+    const myGen = ++pollGenRef.current;
+    setWaitTimedOut(false);
+    setWaiting(true);
+    // ~90 c: карта дольше Stars (редирект, ввод карты, 3DS).
+    const credited = await pollBalanceIncrease(baselineUsedRef.current, {
+      attempts: 30,
+      delayMs: 3000,
+      shouldStop: () => pollGenRef.current !== myGen || !mountedRef.current,
+    });
+    // Поллинг мог быть отменён (закрытие/новый платёж) — не трогаем UI.
+    if (pollGenRef.current !== myGen) return;
+    if (credited) {
+      getTg()?.HapticFeedback?.notificationOccurred("success");
+      onRefresh(); // App-level: баланс на экране обновится под модалкой
+      // Не закрываем молча — lava не вернёт юзера в приложение, поэтому
+      // показываем явный экран успеха (он же обновит фон балансом).
+      if (mountedRef.current) {
+        setWaiting(false);
+        setSuccess(true);
+      }
+      return;
+    }
+    if (mountedRef.current) {
+      setWaiting(false);
+      setWaitTimedOut(true);
+    }
+  }
+
+  // Внешняя оплата через lava.top: СБП (`lava_top_sbp`) и карта РФ
+  // (`lava_top`). Оба — страница без callback → открываем и поллим баланс.
+  async function payExternal(amountKopecks: number, provider: string) {
+    const tg = getTg();
+    setBusy(true);
+    try {
+      // Свежий baseline с фолбэком на проп при сбое /me — без недостижимого
+      // сентинела (иначе поллинг никогда не подтвердил бы) и без устаревшего
+      // значения (иначе быстрый повторный топап дал бы ложное «зачислено»).
+      let baseline = baselineKopecks;
+      try {
+        baseline = (await fetchMe()).balance.balance_kopecks;
+      } catch {
+        /* /me не ответил — используем проп-baseline (реальное число) */
+      }
+      baselineUsedRef.current = baseline;
+      const res = await createTopup(amountKopecks, provider);
+      // Модалку могли закрыть во время await — не открываем внешнюю страницу
+      // и не стартуем поллинг постфактум.
+      if (!mountedRef.current) return;
+      openExternalUrl(tg, res.pay_url);
       setBusy(false);
-      alert(`Не удалось создать счёт: ${(e as Error).message}`);
+      await pollCredit();
+    } catch (e) {
+      if (mountedRef.current) {
+        setBusy(false);
+        setWaiting(false);
+      }
+      // Сырой "502: {json}" человеку бесполезен — показываем detail бэкенда
+      // («Платёжный сервис временно недоступен…»), сырую ошибку админ
+      // получает пушем.
+      alert(`Не удалось создать счёт: ${humanError(e)}`);
     }
   }
 
   return (
-    <div className="fixed inset-0 bg-black/60 flex items-end justify-center z-50 animate-fadeIn" onClick={onClose}>
+    <div
+      className="fixed inset-0 bg-black/60 flex items-end justify-center z-50 animate-fadeIn"
+      onClick={onClose}
+    >
       <div
         className="bg-tg-bg rounded-t-3xl border-t border-white/10 p-6 max-w-xl w-full max-h-[80vh] overflow-y-auto animate-slideUp"
         onClick={(e) => e.stopPropagation()}
       >
-        <h2 className="text-lg font-semibold mb-3">Пополнение баланса</h2>
-        <div className="grid grid-cols-2 gap-2 mb-4">
-          {TOPUP_PRESETS.map((kop) => (
-            <button
-              key={kop}
-              disabled={busy}
-              onClick={() => pay(kop)}
-              className="btn-ghost"
-            >
-              {(kop / 100).toFixed(0)} ₽
+        {success ? (
+          <div className="text-center py-4">
+            <h2 className="text-lg font-semibold mb-2">✅ Баланс пополнен</h2>
+            <p className="text-tg-hint text-sm mb-4">
+              {amount != null ? `Зачислено ${(amount / 100).toFixed(0)} ₽. ` : ""}
+              Спасибо!
+            </p>
+            <button onClick={onClose} className="btn-primary w-full">
+              Готово
             </button>
-          ))}
-        </div>
-        <div className="flex gap-2">
-          <input
-            type="number"
-            min={100}
-            placeholder="Своя сумма, ₽"
-            value={customRub}
-            onChange={(e) => setCustomRub(e.target.value)}
-            className="flex-1 rounded-xl border border-white/10 bg-white/[0.04] px-4 py-3 text-tg-text placeholder:text-tg-hint outline-none focus:border-[var(--accent-from)] transition-colors"
-          />
-          <button
-            disabled={busy || !customRub || Number(customRub) < 100}
-            onClick={() => pay(Number(customRub) * 100)}
-            className="btn-primary"
-          >
-            Оплатить
-          </button>
-        </div>
-        {customRub && Number(customRub) > 0 && Number(customRub) < 100 && (
-          <div className="text-red-400 text-xs mt-1">Минимальная сумма пополнения — 100 ₽</div>
+          </div>
+        ) : waiting ? (
+          <div className="text-center py-4">
+            <h2 className="text-lg font-semibold mb-2">Ждём подтверждение оплаты…</h2>
+            <p className="text-tg-hint text-sm mb-4">
+              Оплатите на открывшейся странице. Баланс обновится автоматически
+              после подтверждения.
+            </p>
+            <button onClick={onClose} className="w-full py-2 text-tg-hint text-sm">
+              Закрыть
+            </button>
+          </div>
+        ) : waitTimedOut ? (
+          <div className="py-2">
+            <h2 className="text-lg font-semibold mb-2">Оплата пока не подтвердилась</h2>
+            <p className="text-tg-hint text-sm mb-4">
+              Если вы оплатили — баланс появится в течение минуты. Можно
+              проверить ещё раз.
+            </p>
+            <button onClick={pollCredit} className="btn-primary w-full">
+              Проверить ещё раз
+            </button>
+            <button onClick={onClose} className="w-full mt-2 py-2 text-tg-hint text-sm">
+              Закрыть
+            </button>
+          </div>
+        ) : amount === null ? (
+          <>
+            <h2 className="text-lg font-semibold mb-3">Пополнение баланса</h2>
+            <div className="grid grid-cols-2 gap-2 mb-4">
+              {TOPUP_PRESETS.map((kop) => (
+                <button
+                  key={kop}
+                  disabled={busy}
+                  onClick={() => setAmount(kop)}
+                  className="btn-ghost"
+                >
+                  {(kop / 100).toFixed(0)} ₽
+                </button>
+              ))}
+            </div>
+            <div className="flex gap-2">
+              <input
+                type="number"
+                min={100}
+                placeholder="Своя сумма, ₽"
+                value={customRub}
+                onChange={(e) => setCustomRub(e.target.value)}
+                className="flex-1 rounded-xl border border-white/10 bg-white/[0.04] px-4 py-3 text-tg-text placeholder:text-tg-hint outline-none focus:border-[var(--accent-from)] transition-colors"
+              />
+              <button
+                disabled={!customRub || Number(customRub) < 100}
+                // Округляем до целых копеек: ввод «100.1»/«100.505» иначе
+                // ушёл бы на бэкенд как float и упал бы на int-валидации (422).
+                onClick={() => setAmount(Math.round(Number(customRub) * 100))}
+                className="btn-primary"
+              >
+                Далее
+              </button>
+            </div>
+            {customRub && Number(customRub) > 0 && Number(customRub) < 100 && (
+              <div className="text-red-400 text-xs mt-1">Минимальная сумма пополнения — 100 ₽</div>
+            )}
+            <button
+              onClick={onClose}
+              className="w-full mt-4 py-2 text-tg-hint text-sm"
+            >
+              Отмена
+            </button>
+          </>
+        ) : (
+          <>
+            <h2 className="text-lg font-semibold mb-1">Выберите способ оплаты</h2>
+            <p className="text-tg-hint text-sm mb-4">
+              Пополнение на {(amount / 100).toFixed(0)} ₽
+            </p>
+            <button
+              disabled={busy}
+              onClick={() => payStars(amount)}
+              className="btn-ghost w-full mb-2"
+            >
+              ⭐ Telegram Stars
+            </button>
+            <button
+              disabled={busy}
+              onClick={() => payExternal(amount, "lava_top_sbp")}
+              className="btn-primary w-full mb-2"
+            >
+              🏦 СБП
+            </button>
+            <button
+              disabled={busy}
+              onClick={() => payExternal(amount, "lava_top")}
+              className="btn-ghost w-full"
+            >
+              💳 Карта РФ
+            </button>
+            <button
+              onClick={() => setAmount(null)}
+              disabled={busy}
+              className="w-full mt-4 py-2 text-tg-hint text-sm"
+            >
+              ← Назад
+            </button>
+          </>
         )}
-        <button
-          onClick={onClose}
-          disabled={busy}
-          className="w-full mt-4 py-2 text-tg-hint text-sm"
-        >
-          Отмена
-        </button>
       </div>
     </div>
   );
@@ -729,11 +1280,7 @@ function DeviceRow({
   const [copied, setCopied] = useState(false);
   const inputRef = useRef<HTMLInputElement>(null);
 
-  const deviceUrl = device.sub_token
-    ? subLinkBase
-      ? `${subLinkBase}/${device.sub_token}`
-      : `${window.location.origin}/api/sub/${device.sub_token}`
-    : null;
+  const deviceUrl = subLinkUrl(device.sub_url, device.sub_token, subLinkBase);
 
   useEffect(() => {
     if (editing) inputRef.current?.focus();

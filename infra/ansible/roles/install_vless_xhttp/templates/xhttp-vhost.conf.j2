@@ -1,0 +1,121 @@
+# {{ ansible_managed }}
+#
+# Stage-4 anti-probing front для VLESS-XHTTP ноды.
+#
+#   Clients → :443 (nginx, TLS termination) ──┬─→ {{ vless_xhttp_path }}/*       → xray @ 127.0.0.1:{{ vless_xhttp_internal_port }} (xhttp)
+#                                              └─→ everything else               → camo landing (200)
+#
+# До Stage-4 xray сам висел на :443 с TLS. Активные пробры получали
+# голый 404 от Go-stack + фингерпринт в Server-заголовке = явный VPN-
+# маркер. Теперь TLS терминирует nginx, xray сидит на loopback,
+# неизвестные пути уходят на "internal tools portal".
+#
+# Certbot renewal: cert обновляется через /etc/letsencrypt/renewal-hooks/
+# deploy/xhttp-reload.sh — перезагружает nginx и рестартит xray-xhttp,
+# чтобы оба подхватили свежий fullchain.pem без ручной возни.
+
+server {
+    listen 80;
+    listen [::]:80;
+    server_name {{ vless_xhttp_domain }};
+
+    # Webroot для ACME — certbot renewal пользуется тем же каталогом,
+    # что и первичный issuance. Без этого location автоматический
+    # renew ломается после того, как мы переключились с standalone.
+    location /.well-known/acme-challenge/ {
+        root /var/www/acme-challenge;
+    }
+
+    location / {
+        return 301 https://$host$request_uri;
+    }
+}
+
+server {
+{% if reality_stream_unify | default(false) %}
+    # 443-унификация: за nginx-stream ssl_preread на :443, TLS-терминация на loopback:8443.
+    listen 127.0.0.1:8443 ssl http2;
+    listen [::1]:8443 ssl http2;
+{% else %}
+    listen 443 ssl http2;
+    listen [::]:443 ssl http2;
+{% endif %}
+    server_name {{ vless_xhttp_domain }};
+
+    ssl_certificate     {{ _xhttp_cert_path }};
+    ssl_certificate_key {{ _xhttp_key_path }};
+
+    # Mozilla intermediate 2024 profile — TLS 1.2+1.3 + ECDHE/CHACHA.
+    # Тот же набор, что и на web-фронте (deploy_web_frontend),
+    # чтобы JA3/JA4 двух наших доменов не расходились и не давали
+    # сравнительного фингерпринта по циферкам.
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_prefer_server_ciphers off;
+    ssl_ciphers ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305:DHE-RSA-AES128-GCM-SHA256:DHE-RSA-AES256-GCM-SHA384;
+    ssl_session_timeout 1d;
+    ssl_session_cache shared:SSL:10m;
+    ssl_session_tickets off;
+
+    # Убираем версию nginx из Server-header — активный пробер не должен
+    # отличить наш xhttp-фронт от web-фронта по build-строке. НЕ ставим
+    # more_clear_headers: headers-more 0.37 + nginx 1.24 сегфолтят воркер на
+    # каждом :443-запросе (подтверждено на ноде). Server: nginx (без версии)
+    # — ванильный, не маркер; upstream-заголовки чистит proxy_hide_header.
+    server_tokens off;
+
+    add_header Strict-Transport-Security "max-age=31536000" always;
+
+    # xhttp stream-up заливает аплинк ОДНИМ длинным POST-телом — любой cap
+    # его обрежет (413 / обрыв up-канала). Референс XTLS xhttp+nginx ставит
+    # 0 (без лимита). См. cdn_front_nodata_investigation.md.
+    client_max_body_size 0;
+
+    # XHTTP location — проксируем на loopback-xray.
+    # ВНИМАНИЕ: xhttp mode=auto комбинирует GET long-poll + POST stream-up.
+    # В HTTP/1.1 режиме оно работает, но если клиент явно выбирает
+    # "stream-up" — может потребоваться HTTP/2 end-to-end. Если canary
+    # на ru-dc-01 покажет, что handshake ломается, первый шаг отката —
+    # переключить vless_xhttp_mode на "packet-up" (чистый long-poll).
+    location {{ vless_xhttp_path }} {
+        proxy_pass http://127.0.0.1:{{ vless_xhttp_internal_port }};
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        # xhttp stream-up поднимает длительные соединения — буферизация
+        # бэкенда убила бы low-latency flow.
+        proxy_buffering off;
+        proxy_request_buffering off;
+        # Длинные таймауты под долгоживущий xhttp stream/long-poll —
+        # 300s рвало download-канал раньше CF idle-таймаута.
+        proxy_read_timeout 3600s;
+        proxy_send_timeout 3600s;
+        # xhttp — ПЛЕЙН HTTP (GET long-poll + POST stream-up), НЕ websocket.
+        # websocket-style Upgrade/Connection здесь ЯД: без Upgrade-заголовка
+        # map отдаёт Connection: close → nginx рвёт длинный GET-download
+        # стрим к xray = "upstream prematurely closed connection" (тот самый
+        # "коннект есть — данных нет"). Пустой Connection + proxy_http_version
+        # 1.1 = keep-alive к upstream, стрим живёт. Официальный XTLS
+        # xhttp+nginx пример Upgrade/Connection НЕ ставит вовсе.
+        # См. cdn_front_nodata_investigation.md.
+        proxy_set_header Connection "";
+        # Скрываем upstream-заголовки, чтобы xray-specific маркеры не
+        # протекали наружу (на всякий случай — xray обычно не шлёт
+        # Server, но защищаемся от будущих правок).
+        proxy_hide_header Server;
+        proxy_hide_header X-Powered-By;
+    }
+
+    # Всё остальное — camo landing. 404-по-дефолту = VPN-маркер.
+    location / {
+        root {{ vless_xhttp_camo_root }};
+        index index.html;
+        try_files $uri $uri/ /index.html =404;
+    }
+}
+
+# NB: map $http_upgrade $connection_upgrade УДАЛЁН намеренно — xhttp не
+# websocket, Connection задаётся статически "" в location выше. Это также
+# снимает риск конфликта одноимённого $connection_upgrade map с ws-cdn
+# vhost'ом на combo-ноде (ws-cdn использует свой $ws_cdn_connection_upgrade).

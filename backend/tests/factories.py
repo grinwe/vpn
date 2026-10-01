@@ -48,6 +48,15 @@ def make_config(
     port: int = 443,
     sni: str | None = "www.microsoft.com",
 ) -> models.VPNConfig:
+    settings = {"short_id": "deadbeefdeadbeef", "dest": "www.microsoft.com:443"}
+    # ShadowTLS+SS билдер (_build_shadowtls_credential) читает node-level
+    # секреты из settings и падает RuntimeError'ом без них — засеваем
+    # зашифрованные заглушки теми же ключами, что ждёт билдер.
+    if protocol == models.VPNConfigProtocol.shadowtls_ss:
+        from app.security import encrypt
+
+        settings["ss_password_enc"] = encrypt("dummy-ss")
+        settings["shadowtls_password_enc"] = encrypt("dummy-stls")
     cfg = models.VPNConfig(
         node_id=node.id,
         name=name,
@@ -55,13 +64,36 @@ def make_config(
         port=port,
         sni=sni,
         public_key="dummy-pubkey",
-        settings={"short_id": "deadbeefdeadbeef", "dest": "www.microsoft.com:443"},
+        settings=settings,
         is_enabled=True,
     )
     db.add(cfg)
     db.commit()
     db.refresh(cfg)
     return cfg
+
+
+def make_provider(
+    db: Session,
+    *,
+    name: str = "prov-1",
+    kind: models.CloudProviderKind = models.CloudProviderKind.hetzner,
+    is_active: bool = True,
+) -> models.CloudProvider:
+    """Создаёт и коммитит CloudProvider для тестов autoscale.
+
+    ServerPool.autoscale_provider_id — enforced FK на cloud_providers.id;
+    после TRUNCATE ... RESTART IDENTITY первый insert получит id=1.
+    """
+    provider = models.CloudProvider(
+        name=name,
+        kind=kind,
+        is_active=is_active,
+    )
+    db.add(provider)
+    db.commit()
+    db.refresh(provider)
+    return provider
 
 
 def make_plan(

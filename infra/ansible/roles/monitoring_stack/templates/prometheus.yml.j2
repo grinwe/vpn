@@ -24,7 +24,7 @@ scrape_configs:
         labels:
           service: backend
 
-  # node_exporter on every VPN node. Targets are rendered from the
+  # node_exporter on every VPN relay node. Targets are rendered from the
   # inventory at template time — re-run the role (or bump prometheus.yml)
   # whenever you add or remove a node.
   - job_name: vpn-nodes
@@ -38,5 +38,18 @@ scrape_configs:
 {% if not groups.get('vpn_nodes', []) %}
       # No vpn_nodes in inventory — block left empty on purpose so
       # prometheus still loads the job.
+      []
+{% endif %}
+
+  # node_exporter on WireGuard exit nodes (non-RU).
+  - job_name: wg-exit-nodes
+    static_configs:
+{% for host in groups.get('wg_exit_nodes', []) %}
+      - targets: ["{{ hostvars[host].ansible_host }}:{{ monitoring_stack_node_exporter_port }}"]
+        labels:
+          instance: "{{ host }}"
+          location: "{{ hostvars[host].location | default('unknown') }}"
+{% endfor %}
+{% if not groups.get('wg_exit_nodes', []) %}
       []
 {% endif %}

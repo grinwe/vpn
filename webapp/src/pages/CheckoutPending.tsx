@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { fetchInvoiceStatus, InvoiceStatusResponse } from "../api";
+import { friendlyError } from "../errors";
 import { navigate } from "../router";
 
 // 2-second poll. The slow leg is Ansible (multi-protocol provision on
@@ -8,6 +9,15 @@ import { navigate } from "../router";
 // to /status in the bot. Faster polling buys nothing, slower frustrates.
 const POLL_INTERVAL_MS = 2000;
 const MAX_POLL_MS = 180_000;
+// Транзиентные сетевые ошибки (смена Wi-Fi→LTE, короткий 502) не должны
+// быть терминальными: показываем «Ошибка» только после N фейлов подряд.
+// Порог поднят (было 5): пользователь мог только что включить свежий VPN,
+// что рвёт webview на десятки секунд — 5×2с=10с этого не переживали.
+const MAX_CONSECUTIVE_ERRORS = 8;
+// Бэкофф между ретраями при ошибках: задержка растёт линейно и упирается
+// в потолок, чтобы платёжный поллинг переживал типичную смену сети (30-60с),
+// не выжигая счётчик за 10 секунд.
+const MAX_ERROR_BACKOFF_MS = 8000;
 
 type Stage = "paid" | "provisioning" | "ready" | "stuck" | "error";
 
@@ -19,6 +29,17 @@ export default function CheckoutPending({ invoiceId }: { invoiceId: number }) {
   useEffect(() => {
     let cancelled = false;
     let timer: number | null = null;
+    let consecutiveErrors = 0;
+    // active=true, пока цикл поллинга жив (ждёт fetch или запланирован таймером).
+    // Гасим его только на терминальной стадии; stopReason помнит, какой именно —
+    // чтобы после 'ready' (успех) поллинг НЕ возобновлялся.
+    let active = true;
+    let stopReason: Stage | null = null;
+
+    function stop(reason: Stage) {
+      active = false;
+      stopReason = reason;
+    }
 
     async function tick() {
       if (cancelled) return;
@@ -26,29 +47,79 @@ export default function CheckoutPending({ invoiceId }: { invoiceId: number }) {
       try {
         data = await fetchInvoiceStatus(invoiceId);
       } catch (e) {
-        setError((e as Error).message);
+        if (cancelled) return;
+        consecutiveErrors += 1;
+        if (
+          consecutiveErrors < MAX_CONSECUTIVE_ERRORS &&
+          Date.now() - startedAt.current <= MAX_POLL_MS
+        ) {
+          // Одиночный сетевой чих — продолжаем поллинг, не меняя stage.
+          // Линейный бэкофф с потолком: даём сети восстановиться.
+          const delay = Math.min(
+            POLL_INTERVAL_MS * consecutiveErrors,
+            MAX_ERROR_BACKOFF_MS,
+          );
+          timer = window.setTimeout(tick, delay);
+          return;
+        }
+        setError(
+          friendlyError((e as Error).message, {
+            fallback: "проверить статус оплаты",
+          }),
+        );
         setStage("error");
+        stop("error");
         return;
       }
       if (cancelled) return;
+      consecutiveErrors = 0;
 
       if (data.has_credentials && data.subscription_active) {
         setStage("ready");
+        stop("ready");
         return;
       }
       if (data.status === "paid") setStage("provisioning");
 
       if (Date.now() - startedAt.current > MAX_POLL_MS) {
         setStage("stuck");
+        stop("stuck");
         return;
       }
       timer = window.setTimeout(tick, POLL_INTERVAL_MS);
     }
+
+    // Возобновление поллинга при возврате сети / фокуса приложения.
+    // Короткий обрыв (пользователь как раз включил свежий VPN, webview
+    // отвалился) не должен навсегда оставлять экран в ⚠️ «Ошибке» на реально
+    // оплаченном инвойсе: как только связь/видимость вернулись — перезапускаем
+    // проверку, размыкая терминальное состояние. После успеха ('ready') и при
+    // ещё живом цикле ничего не делаем.
+    function resume() {
+      if (cancelled || active) return;
+      if (stopReason === "ready") return;
+      active = true;
+      stopReason = null;
+      consecutiveErrors = 0;
+      startedAt.current = Date.now();
+      setError(null);
+      setStage("provisioning");
+      tick();
+    }
+    function onVisibility() {
+      if (document.visibilityState === "visible") resume();
+    }
+
+    window.addEventListener("online", resume);
+    document.addEventListener("visibilitychange", onVisibility);
+
     tick();
 
     return () => {
       cancelled = true;
       if (timer) clearTimeout(timer);
+      window.removeEventListener("online", resume);
+      document.removeEventListener("visibilitychange", onVisibility);
     };
   }, [invoiceId]);
 
@@ -81,7 +152,7 @@ export default function CheckoutPending({ invoiceId }: { invoiceId: number }) {
         <>
           <p className="text-tg-hint text-sm mt-4">
             {stage === "error"
-              ? error
+              ? `${error ?? "Не удалось проверить статус оплаты."} Оплата, скорее всего, уже прошла — напиши /status в боте, чтобы увидеть актуальный статус. Как только связь восстановится, проверка возобновится сама.`
               : "Это нештатно, обычно занимает меньше минуты. Напиши /status в боте — там увидишь актуальный статус."}
           </p>
           <button

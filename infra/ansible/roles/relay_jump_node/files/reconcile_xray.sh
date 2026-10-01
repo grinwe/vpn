@@ -16,6 +16,24 @@
 set -euo pipefail
 
 CONFIG="${1:?config path required}"
+
+# Сериализуемся с per-user manage_vless_*_user.sh по ТОМУ ЖЕ локу, что
+# держит соответствующий manage-скрипт. Иначе read-modify-write mv ниже
+# гоняется с add/del юзера и молча затирает клиента (lost-update).
+# Лок выбирается по имени конфига; для незнакомых имён — собственный лок
+# (хотя бы сериализует reconcile сам с собой).
+case "$(basename "$CONFIG")" in
+  config.json)         LOCK="/var/lock/manage_vless_user.lock" ;;
+  config_xhttp.json)   LOCK="/var/lock/manage_vless_xhttp.lock" ;;
+  config_ws_cdn.json)  LOCK="/var/lock/manage_vless_ws.lock" ;;
+  *)                   LOCK="/var/lock/reconcile_$(basename "$CONFIG").lock" ;;
+esac
+exec 200>"$LOCK"
+if ! flock -w 30 200; then
+  echo "reconcile_xray: could not acquire lock $LOCK within 30s" >&2
+  exit 1
+fi
+
 TMP=$(mktemp)
 
 jq --argjson fan_out "${FAN_OUT:-[]}" --arg primary "${PRIMARY:-}" \

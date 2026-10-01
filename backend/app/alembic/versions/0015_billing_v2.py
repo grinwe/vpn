@@ -21,6 +21,8 @@ Columns that become unused (kept for rollback safety, not dropped):
 import sqlalchemy as sa
 from alembic import op
 
+from app.alembic._idempotent import has_column
+
 
 revision = "0015_billing_v2"
 down_revision = "0014_backfill_prepaid"
@@ -30,15 +32,17 @@ depends_on = None
 
 def upgrade() -> None:
     # 1. Add has_frozen_this_year boolean for simplified freeze tracking.
-    op.add_column(
-        "subscriptions",
-        sa.Column(
-            "has_frozen_this_year",
-            sa.Boolean(),
-            nullable=False,
-            server_default="false",
-        ),
-    )
+    # has_column-guard: 0001 create_all() уже создаёт колонку из модели.
+    if not has_column("subscriptions", "has_frozen_this_year"):
+        op.add_column(
+            "subscriptions",
+            sa.Column(
+                "has_frozen_this_year",
+                sa.Boolean(),
+                nullable=False,
+                server_default="false",
+            ),
+        )
 
     # Backfill: if they already froze this calendar year under V1, mark it.
     op.execute(

@@ -2,7 +2,10 @@ import { useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api, ApiTokenOut, ApiTokenCreatedOut } from "../api";
 
-const AVAILABLE_SCOPES = ["probe:read", "probe:write", "traffic:write"] as const;
+// traffic:write удалён 2026-07-29 вместе с блокирующим ингестом трафика:
+// учёт наливает тик traffic_stats напрямую. Держать в sync с ALL_SCOPES
+// (backend/app/auth.py) — бэкенд отвергает неизвестные скоупы с 400.
+const AVAILABLE_SCOPES = ["probe:read", "probe:write"] as const;
 
 export default function ApiTokens() {
   const qc = useQueryClient();

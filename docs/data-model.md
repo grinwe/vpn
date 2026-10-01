@@ -46,7 +46,7 @@ class User(Base):
     id, telegram_id (unique, indexed), email,
     balance_kopecks: Integer NOT NULL DEFAULT 0,
     trial_activated_at: DateTime NULL,   # NULL = триал ещё доступен
-    trial_expires_at: DateTime NULL,     # момент клоубэка бонуса
+    trial_expires_at: DateTime NULL,     # конец бесплатного доступа (момент клоубэка); NULL у бонус-онли
     referred_by_id: FK → users.id NULL,
     banned_at: DateTime NULL,            # user-level бан, ставится из админки
     created_at
@@ -54,7 +54,8 @@ class User(Base):
 
 Инварианты:
 - `balance_kopecks` должен сходиться с `SUM(balance_transactions.amount_kopecks) WHERE user_id = x`. Это не enforced — BalanceTransaction — append-only ledger, column обновляется в коде. Комментарий в модели явно это фиксирует как «trust the column for reads, reconcile nightly» (`models.py:551-562`).
-- `trial_activated_at IS NULL` ⇔ пользователь ещё может дёрнуть `/api/trial/activate`.
+- `trial_activated_at IS NULL` ⇔ пользователь ещё может взять бесплатные дни. Точки входа: бот `POST /api/trial/activate_full` и кабинет `POST /api/webapp/trial/activate` (оба через `services.trial.activate_trial_full`: бонус и сразу подписка), legacy `POST /api/trial/activate` (только бонус, вызывающих в коде нет). Повторно после истечения — 409 «Trial already used», если подписка у юзера уже была.
+- `trial_expires_at` (с 2026-09-30) = `activated_at + TRIAL_DURATION_DAYS (+ дни по приглашению) + TRIAL_HIDDEN_HOURS`, у триальной подписки совпадает с её `expires_at` (конец доступа, а не видимых дней). У бонус-онли (платящий с живой подпиской забрал в кабинете только деньги) — NULL: возвращать нечего, пуша «бесплатные дни скоро закончатся» не будет. Воркер обнуляет поле после clawback. Отдельного флага «триальная подписка» нет: признак — строка журнала `spend trial-full:{sub.id}` (`balance.is_unpaid_trial`).
 - `banned_at IS NOT NULL` ⇒ бот молча дропает все апдейты от этого Telegram-аккаунта (без ACK, чтобы не кормить DDoS-ботов обратной связью). Ортогонально `Subscription.status=blocked`: бан юзера не трогает его подписки, а `/users/{id}/disable` не ставит `banned_at`. Ставится `POST /api/users/{id}/ban`, снимается `/unban`.
 
 ### `plans`
@@ -124,6 +125,27 @@ class VPNNode(Base):
 
 `suspect_since` — Phase D traffic-drop детектор (`services/traffic_stats.py::detect_traffic_drops`). Ставится моментом, когда `active_users` на ноде упал с ≥`TRAFFIC_DROP_MIN_USERS` до 0 между двумя traffic_stats тиками (пассивный ТСПУ-сигнал). На следующем тике — либо `status=error`/`cooldown_until=+3d`/`suspect_since=NULL` (подтверждение: трафик пошёл на мигрированных подписках на ноде другого региона), либо `suspect_since=NULL` (false-alarm). Не часть `VPNNodeStatus` enum'а — это промежуточное подозрение внутри детектора, не часть жизненного цикла.
 
+### `node_user_bans`
+
+Per-node бан юзера: ноды, на которые авто-выбор НЕ должен селить данного юзера. **Ортогонально** `users.banned_at` (тот — глобальный бан на уровне бота).
+
+```python
+# backend/app/models.py — class NodeUserBan
+class NodeUserBan(Base):
+    id,
+    user_id → users (ON DELETE CASCADE, index),
+    node_id → vpn_nodes (ON DELETE CASCADE, index),
+    reason: Text NULL,
+    created_by: String NULL,   # admin-actor / "auto" / telegram_id
+    created_at
+    # UniqueConstraint(user_id, node_id) = uq_node_user_ban
+```
+
+- Заполняется авто-миграцией: «Обновить подписку» (`POST /api/subscriptions/{id}/migrate-auto` → `ProvisioningOrchestrator.migrate_subscription_to_free_node`) выбирает свободный сервер пула, исключая текущую ноду **и** ноды из бан-листа юзера (через `choose_node(exclude_node_ids=...)`), мигрирует с сохранением `sub_token`, и **банит старую ноду** (`created_by=actor`, `reason="auto: …"`), чтобы повторное «обновление» не вернуло юзера обратно.
+- Ручное управление: `GET /api/users/{id}/node-bans`, `POST /api/users/{id}/node-bans` (`{node_id, reason}`, идемпотентно по паре), `DELETE /api/users/{id}/node-bans/{node_id}` (разбан). В admin SPA (Users.tsx) — панель «Бан-лист нод» с разбаном + кнопка «🔄 обновить подписку» в строке активной подписки. Аудит: `node_user_banned` / `node_user_unbanned` / `subscription_migrated`.
+- Бан per-**USER**, а не per-subscription: у юзера может быть несколько подписок, бан ноды распространяется на все. Миграция 0038.
+- У авто-банов есть **TTL и потолок** (без колонки в схеме — on-access prune в `api/client_control.py`): перед каждым user-driven failover'ом протухшие авто-баны (`created_by` = `client_control` / `admin_panel` / `user:*`) старше `NODE_USER_BAN_TTL_HOURS` (48) удаляются, а при `NODE_USER_BAN_MAX_PER_USER` (3) свежих авто-банах миграция идёт без бана старой ноды — юзер тапами «VPN не работает» не выжигает себе пул нод навсегда. Ручные админ-баны prune не трогает.
+
 ### `vpn_configs`
 
 Конфигурация одного протокола на одной ноде. Одна нода обычно имеет несколько `VPNConfig` — по одной на активный протокол (ShadowTLS, Reality, WS CDN, xHTTP, Hysteria2).
@@ -151,9 +173,11 @@ class Subscription(Base):
     status: Enum(SubscriptionStatus),  # active/blocked/expired/frozen
     expires_at: DateTime NOT NULL,
     notes,
-    traffic_limit_mb, traffic_used_mb,
+    traffic_limit_mb, traffic_used_mb,       # legacy, мертвы: блокирующий ингест удалён 2026-07-29
+    traffic_used_bytes,                      # байты за оплаченный период (тик traffic_stats), обнуляет продление
     auto_renew,
     sub_token: unique indexed String NULL,   # stable dynamic link
+    link_token: String NULL,                 # токен устройства, чью ссылку показывает бот (0070; NULL = legacy)
     # Stage 4 balance billing
     prepaid_kopecks: Integer NOT NULL DEFAULT 0,
     next_charge_at: DateTime NULL,     # NULL = legacy invoice sub
@@ -165,6 +189,7 @@ class Subscription(Base):
 
 Инварианты:
 - `sub_token` **стабильный**: миграция/freeze/unfreeze его не меняет. Все пути в `services/provisioning.py` явно это сохраняют (комментарии `:1106`, `:1239`, `services/health.py:225`).
+- `link_token` — не отдельный секрет, а КОПИЯ `Device.sub_token` первого устройства: ставится в `provision_subscription`; когда устройство-держатель выведено и создаётся одноимённая замена со свежим токеном (разморозка, enable, продление, reality-dest refresh, перевыпуск ссылки), `reprovision_subscription._adopt_link_token` переносит его на замену; failover/миграции его не трогают (токен сам переезжает на новую строку Device). Читать только через `services/sub_links.link_token_for`. NULL у подписок до 0070 — бот показывает им legacy `sub_token`.
 - `prepaid_kopecks >= 0` всегда. Списывается в `charge_subscription`, возвращается в `balance_kopecks` при ручном revoke. Expired subs теряют остаток (по конструкции ≈0).
 - `next_charge_at IS NULL` означает «legacy invoice-модель» — этот sub не попадает в `run_balance_charge_tick`.
 - `status=frozen` ⇔ `frozen_at IS NOT NULL`.
@@ -186,7 +211,10 @@ class Device(Base):
     access_username,                    # 'warm-<node_id>-<hex>' или аналогичный
     connection_uri,                     # Fernet-encrypted
     sub_token (unique, indexed),        # per-device dynamic sub-link token
-    last_seen_at
+    last_seen_at                        # последний интервал с трафиком девайса; штампует
+                                        # тик traffic_stats (2026-09, бэкфилл 0069);
+                                        # NULL = активности не видели. Кормит «активен
+                                        # за 24ч» в админке (max по девайсам юзера)
 ```
 
 `sub_token` — уникальный токен на уровне устройства (не подписки). `/sub/{token}` сначала ищет `Device.sub_token` и возвращает только credentials этого устройства. Если не найден — fallback на `Subscription.sub_token` (backward compat для старых клиентов). Это предотвращает sharing: поделившись ссылкой, пользователь раскрывает только один device, а не всю подписку.
@@ -212,8 +240,19 @@ class Credential(Base):
     access_username (indexed),
     is_active, revoked_at,
     pool_state: Enum(CredentialPoolState),  # warm/assigned/revoked
-    warmed_at, assigned_at
+    warmed_at, assigned_at,
+    leg_published,          # идёт ли этот протокол в саб-линк (схема 4×1)
+    leg_role,               # primary/fast/backup/reserve/dup; NULL = не опубликован
 ```
+
+**`leg_published` ≠ `is_active`.** `is_active` означает «учётка жива на ноде» и
+массово переставляется провижинингом; `leg_published` — «этот протокол отдан
+человеку в подписку». Тёплый бандл назначается ЦЕЛИКОМ (на ноде под одним
+именем лежат все её протоколы), а при схеме 4×1 публикуется ровно один — отсюда
+главное свойство: сменить протокол на той же ноде стоит переставленного флага,
+без ansible. Инвариант: `leg_role IS NOT NULL ⟺ leg_published`. Схема включается
+`SUB_LEG_SCHEME=4x1`; при `legacy` фильтр не применяется вовсе.
+См. `docs/operations/subset_epic_2026_07_29.md`.
 
 Три критичных индекса для warm pool (`0008_warmpool_and_balance.py`):
 - `ix_credentials_access_username` — группировка warm-пучков.
@@ -372,7 +411,7 @@ class ApiToken(Base):
     is_active, created_at, last_used_at
 ```
 
-Plaintext токен показывается один раз при создании и больше нигде не хранится. Скоупы: `probe:read`, `probe:write`, `traffic:write` (`backend/app/auth.py:35-43`).
+Plaintext токен показывается один раз при создании и больше нигде не хранится. Скоупы: `probe:read`, `probe:write` (`backend/app/auth.py`); `traffic:write` удалён 2026-07-29 — учёт трафика наливает тик traffic_stats напрямую, без HTTP-ручки.
 
 ### `audit_logs`
 
@@ -388,7 +427,9 @@ class AuditLog(Base):
 
 **Важно**: column на диске называется `metadata` (чтобы не конфликтовать с SQLAlchemy reserved `Base.metadata`), в Python-модели — `extra`. См. `models.py:526`.
 
-Особенность: тот же audit log используется как «очередь уведомлений боту» — воркер пишет строки с `action in ('renewal_reminder', 'config_ready', 'migration_notice', …)`, бот опрашивает их через `/api/notifications/pending` (`backend/app/api_extensions.py:359`) и помечает delivered добавлением `:delivered` в `action`.
+Особенность: тот же audit log используется как «очередь уведомлений боту» — воркер пишет строки с `action in ('renewal_reminder', 'config_ready', 'migration_notice', …)`, бот опрашивает их через `/api/notifications/pending` (`backend/app/api_extensions.py:359`) и помечает delivered добавлением `:delivered` в `action`. `config_ready` пишет провижининг (`services/config_ready.py`): `actor='provisioning'`, `target_type='subscription'`, `target_id=sub.id`, `extra={telegram_id, subscription_id, device_id, source: 'warm'|'cold', sub_uri?}` — по одной строке на подписку (дедуп по `config_ready`/`config_ready:delivered` на том же target).
+
+Из-за этой hot-path роли на таблице объявлены индексы `ix_audit_logs_action_created_at (action, created_at)` (под поллер уведомлений и worker-тики, фильтрующие по `action`) и `ix_audit_logs_created_at (created_at)` (под дашборды/выборки по времени). DESC-вариант не нужен — btree читается в обе стороны.
 
 **Health-ping actions** (источник данных для админ-дашборда `/health-pings`):
 
@@ -463,5 +504,5 @@ class ReferralCode(Base):
 
 - `HealthProbe`: есть ли периодический cleanup старых строк (retention)? В коде воркера не сразу видно такой тики, но таблица по смыслу должна расти быстро. Если cleanup'а нет — это отдельная тема.
 - Связь `Payment.subscription_id` и `Payment.invoice_id`: оба nullable. Какой из них авторитетен для stage-4 балансного flow — из модели не видно, нужен переход в `services/balance.py` и `_mark_invoice_paid_core`.
-- Поле `Subscription.traffic_used_mb` и `traffic_limit_mb` — кто его обновляет? Ноды пишут через `/api/nodes/{id}/traffic` (есть схема `NodeTrafficReport`), но не ясно, как агрегируются device-уровень в subscription-уровень — код агрегации смотрим в `api.py`, при необходимости отдельный проход.
+- ~~Поле `Subscription.traffic_used_mb` и `traffic_limit_mb` — кто его обновляет?~~ Закрыто 2026-07-29: блокирующий ингест (`api/traffic.py`) удалён, оба поля мертвы. Действующий учёт — `Subscription.traffic_used_bytes`: тик `traffic_stats` копит per-user байты (резолв через `Credential.access_username`), продление обнуляет.
 - `has_frozen_this_year` vs `frozen_days_used` / `frozen_year`: три поля одновременно описывают freeze-историю, одно из них — V2 упрощение. Какое правило сейчас в силе — «один раз в год» или «до N дней в год» — из модели нельзя однозначно сказать.

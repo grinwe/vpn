@@ -14,6 +14,30 @@ from prometheus_client import Counter, Gauge
 
 logger = logging.getLogger(__name__)
 
+
+def _env_int(name: str, default: int) -> int:
+    """``int(os.getenv(name))`` с защитой от мусорного значения.
+
+    Голый ``int(os.getenv(...))`` на невалидной переменной кидает ValueError.
+    На module-level это роняет импорт ``app.worker`` — а его импортит КАЖДАЯ
+    RQ-джоба и ``main()``, поэтому одна опечатка в .env (``FOO=24h``) кладёт
+    весь фоновый контур в crash-loop. В теле тика ValueError до self-reschedule
+    убивает цепочку периодики молча. Здесь мусор/пустая строка → warning +
+    дефолт, чтобы контур пережил кривую переменную.
+    """
+    raw = os.getenv(name)
+    if raw is None or raw.strip() == "":
+        return default
+    try:
+        return int(raw.strip())
+    except (TypeError, ValueError):
+        logger.warning(
+            "env %s=%r не парсится как int — использую дефолт %s",
+            name, raw, default,
+        )
+        return default
+
+
 # NB: this module MUST be imported under its canonical name `app.worker`, not
 # as `__main__`. RQ executes jobs by calling importlib.import_module("app.worker"),
 # and if the module was originally loaded as `__main__` (via `python -m app.worker`),
@@ -39,13 +63,139 @@ RENEWAL_REVOKED = Counter(
 
 # Grace window after expires_at before we actually rip the user off the node.
 # Default: 24h. Set to 0 for instant revoke.
-RENEWAL_GRACE_HOURS = int(os.getenv("RENEWAL_GRACE_HOURS", "24"))
+RENEWAL_GRACE_HOURS = _env_int("RENEWAL_GRACE_HOURS", 24)
+
+# Верхняя граница числа подписок, обрабатываемых за один тик продлений в
+# каждом окне. Без лимита выборки .all() тянут всё окно, а per-sub цикл делает
+# по несколько запросов на подписку — при тысячах истекающих тик упирается в
+# job_timeout и хвост окна не обрабатывается. Обходим окна в порядке
+# expires_at ASC (самые срочные первыми), остаток донесётся следующим тиком.
+RENEWAL_WINDOW_LIMIT = _env_int("RENEWAL_WINDOW_LIMIT", 2000)
 
 
 PENDING_RESCUE = Counter(
     "vpn_provisioning_pending_rescue_total",
     "Pending provisioning tasks re-enqueued by the self-heal tick",
 )
+
+# Reconciler watchdog gauges — set each reconcile tick (no-op while
+# RECONCILER_ENABLED is off). A wedged scheduler stops updating these, so an
+# external staleness alert on the metric catches the "stuck tick strands a
+# fresh node" failure that no in-tick check can see.
+RECONCILE_PENDING_NODES = Gauge(
+    "vpn_reconcile_pending_nodes",
+    "Nodes with desired_generation > reconciled_generation awaiting reconcile",
+)
+RECONCILE_OLDEST_OVERDUE = Gauge(
+    "vpn_reconcile_oldest_overdue_seconds",
+    "Age (s) of the oldest overdue (due_at<=now) pending-reconcile node",
+)
+
+# Reachability-тик: сколько целей (nodes+exits) не пробовано дольше
+# NODE_REACHABILITY_STALE_MIN минут. >0 на стабильном флоте — сигнал, что
+# wall-clock бюджета тика не хватает на всех (голодание хвоста).
+REACHABILITY_STALE_TARGETS = Gauge(
+    "vpn_reachability_stale_targets",
+    "Reachability targets not probed for longer than the staleness window",
+)
+
+# Cloud billing gauges — set each cloud-billing tick.
+PROVIDER_BALANCE = Gauge(
+    "vpn_cloud_provider_balance",
+    "Account balance at a cloud provider (units per provider)",
+    ["provider"],
+)
+FLEET_MONTHLY_COST = Gauge(
+    "vpn_fleet_monthly_cost",
+    "Sum of monthly_cost over active VPN nodes",
+)
+
+
+def run_cloud_billing_tick() -> dict:
+    """Periodic billing guard for cloud-provisioned fleet:
+    * per active CloudProvider — pull balance → gauge + low-balance admin alert;
+    * export fleet monthly-cost gauge.
+
+    Авто-продление само живёт на стороне провайдера (4vps autoprolong,
+    включается при spawn) — этот тик СТРАЖ, чтобы баланс не иссяк молча и ноды
+    не удалились в конце периода. Self-reschedules. No-op без cloud-провайдеров.
+    """
+    from sqlalchemy import func as sa_func
+
+    from . import models
+    from .db import SessionLocal
+    from .queue import schedule_tick
+    from .services.admin_notify import notify_admins
+    from .services.cloud.base import DriverError, get_driver
+
+    interval = _env_int("CLOUD_BILLING_INTERVAL", 3600)
+    if interval > 0:
+        try:
+            schedule_tick(
+                "app.worker.run_cloud_billing_tick",
+                interval,
+                tick_id="tick-cloud-billing",
+                replace=True,
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("cloud-billing: failed to re-enqueue tick")
+
+    threshold = float(os.getenv("CLOUD_BALANCE_ALERT_THRESHOLD", "0"))
+    session = SessionLocal()
+    checked = 0
+    alerts = 0
+    try:
+        providers = (
+            session.query(models.CloudProvider)
+            .filter(models.CloudProvider.is_active.is_(True))
+            .all()
+        )
+        for p in providers:
+            try:
+                driver = get_driver(p)
+            except DriverError:
+                continue
+            if not hasattr(driver, "get_balance"):
+                continue
+            try:
+                bal = driver.get_balance()
+            except DriverError as exc:
+                logger.warning(
+                    "cloud-billing: balance fetch failed for %s: %s", p.name, exc
+                )
+                continue
+            checked += 1
+            if bal is None:
+                continue
+            PROVIDER_BALANCE.labels(provider=p.name).set(bal)
+            if threshold > 0 and bal < threshold:
+                alerts += 1
+                notify_admins(
+                    session,
+                    kind="cloud_balance_low",
+                    text=(
+                        f"⚠️ Низкий баланс у облачного провайдера {p.name}: "
+                        f"{bal}. Ноды могут не продлиться (autoprolong) — "
+                        f"пополни баланс."
+                    ),
+                    dedup_key={"provider_id": p.id},
+                    autocommit=True,
+                )
+        total = (
+            session.query(
+                sa_func.coalesce(sa_func.sum(models.VPNNode.monthly_cost), 0)
+            )
+            .filter(models.VPNNode.is_active.is_(True))
+            .scalar()
+        ) or 0
+        FLEET_MONTHLY_COST.set(float(total))
+        return {
+            "providers_checked": checked,
+            "alerts": alerts,
+            "fleet_monthly_cost": float(total),
+        }
+    finally:
+        session.close()
 
 
 def run_pending_rescue_tick() -> dict:
@@ -71,7 +221,7 @@ def run_pending_rescue_tick() -> dict:
     # Перепланируем ДО начала работы. Если body упадёт / будет убит по
     # job_timeout — следующий запуск уже в ScheduledJobRegistry. replace=True
     # обязателен: текущий job в "started", default-dedup вернул бы early.
-    interval = int(os.getenv("PENDING_RESCUE_INTERVAL", "60"))
+    interval = _env_int("PENDING_RESCUE_INTERVAL", 60)
     if interval > 0:
         try:
             schedule_tick(
@@ -83,13 +233,30 @@ def run_pending_rescue_tick() -> dict:
         except Exception:  # noqa: BLE001
             logger.exception("pending_rescue: failed to re-enqueue tick (at start)")
 
-    age = int(os.getenv("PENDING_RESCUE_AGE", "60"))
+    age = _env_int("PENDING_RESCUE_AGE", 60)
+    # Escalation tiers for tasks the plain re-enqueue can't rescue:
+    #   force_age  — a normal enqueue keeps deduping against a ZOMBIE `started`
+    #     job (worker SIGKILLed mid-run) so it never re-dispatches; past this
+    #     age we purge the job key first (enqueue_task(force=True)). A DB row
+    #     still `pending` means no worker owns it, so the purge can't kill a
+    #     live run. This is what un-wedges a stuck `bootstrap` (its row holds
+    #     uq_active_node_bootstrap, blocking the reconciler until it clears).
+    #   abandon_age — stuck this long is unrecoverable AND re-running ancient
+    #     work (e.g. a 2-month-old relay apply) is riskier than dropping it;
+    #     mark terminal so slots free and the reconciler recreates only what a
+    #     dirty node still needs.
+    force_age = _env_int("PENDING_RESCUE_FORCE_AGE", 1800)
+    abandon_age = _env_int("PENDING_RESCUE_ABANDON_AGE", 86400)
     rescued = 0
     scanned = 0
+    abandoned = 0
 
     session = SessionLocal()
     try:
-        cutoff = utcnow() - timedelta(seconds=age)
+        now = utcnow()
+        cutoff = now - timedelta(seconds=age)
+        force_cutoff = now - timedelta(seconds=force_age)
+        abandon_cutoff = now - timedelta(seconds=abandon_age)
         pending = (
             session.query(models.ProvisioningTask)
             .filter(
@@ -102,7 +269,17 @@ def run_pending_rescue_tick() -> dict:
         scanned = len(pending)
         for task in pending:
             try:
-                job_id = enqueue_task(task.id, None)
+                if task.created_at < abandon_cutoff:
+                    task.status = models.ProvisioningTaskStatus.failed
+                    task.finished_at = now
+                    task.error_message = (
+                        "abandoned by pending-rescue: stuck pending past "
+                        "PENDING_RESCUE_ABANDON_AGE (unrecoverable RQ job)"
+                    )
+                    abandoned += 1
+                    continue
+                _force = task.created_at < force_cutoff
+                job_id = enqueue_task(task.id, None, force=_force)
                 if job_id:
                     rescued += 1
                     PENDING_RESCUE.inc()
@@ -110,16 +287,1102 @@ def run_pending_rescue_tick() -> dict:
                 logger.exception(
                     "pending_rescue: failed to re-enqueue task %s", task.id
                 )
+        if abandoned:
+            session.commit()
     finally:
         session.close()
 
-    if rescued:
+    if rescued or abandoned:
         logger.warning(
-            "pending_rescue: re-enqueued %s/%s stalled pending task(s)",
-            rescued, scanned,
+            "pending_rescue: re-enqueued %s/%s stalled pending task(s), "
+            "abandoned %s",
+            rescued, scanned, abandoned,
         )
 
-    return {"scanned": scanned, "rescued": rescued}
+    return {"scanned": scanned, "rescued": rescued, "abandoned": abandoned}
+
+
+def _notify_admins_safe(
+    session,
+    *,
+    kind: str,
+    text: str,
+    dedup_key: dict,
+    extra: dict,
+    window_sec: int | None = None,
+) -> None:
+    """notify_admins, который не может уронить тик.
+
+    Алерт — диагностика; если админ-нотификация упала (нет чата, обрыв БД),
+    это не повод оборвать сверку остальных счетов.
+    """
+    try:
+        from .services.admin_notify import notify_admins
+
+        kwargs = {}
+        if window_sec is not None:
+            kwargs["window_sec"] = window_sec
+        notify_admins(
+            session,
+            kind=kind,
+            text=text,
+            dedup_key=dedup_key,
+            extra=extra,
+            autocommit=True,
+            **kwargs,
+        )
+    except Exception:  # noqa: BLE001
+        logger.exception("lava_reconcile: не удалось отправить алерт %s", kind)
+
+
+# Имена Payment.provider одной интеграции lava: карта и СБП (2026-09-19).
+from .services.payments.lava_top import LAVA_FAMILY as _LAVA_PROVIDERS  # noqa: E402
+
+
+def _alert_stale_lava_sale(session, invoice, sale: dict) -> None:
+    """COMPLETED-продажа по счёту, который уже НЕ pending.
+
+    Два разных случая, и оба до 2026-07-25 были невидимы:
+    * счёт уже ``paid``, а продажа — по контракту, который мы НЕ зачитывали
+      (его строка ещё pending или его у нас нет вовсе) — значит человек
+      заплатил второй раз (двойная оплата, деньги надо вернуть);
+    * счёт ``cancelled``/``expired``, а платёж прошёл — деньги списаны за
+      неактивный счёт.
+
+    Дискриминатор — контракт продажи, а не «любая живая pending-строка»:
+    с двумя именами lava (карта и СБП) на одном счёте штатно висит
+    брошенная pending-строка второго способа, и по ней прежняя проверка
+    слала ложный «двойная оплата» раз в сутки (ревью 2026-09-19).
+    """
+    from . import models
+
+    contract_id = str(sale.get("contract_id") or "").strip()
+    if invoice.status == models.InvoiceStatus.paid:
+        if contract_id:
+            own = (
+                session.query(models.Payment)
+                .filter(
+                    models.Payment.invoice_id == invoice.id,
+                    models.Payment.provider.in_(_LAVA_PROVIDERS),
+                    models.Payment.external_id == contract_id,
+                )
+                .order_by(models.Payment.id.desc())
+                .first()
+            )
+            if own is not None and own.status != models.PaymentStatus.pending:
+                return  # штатная идемпотентность: наш же платёж уже зачтён
+        else:
+            duplicate = (
+                session.query(models.Payment)
+                .filter(
+                    models.Payment.invoice_id == invoice.id,
+                    models.Payment.provider.in_(_LAVA_PROVIDERS),
+                    models.Payment.status == models.PaymentStatus.pending,
+                )
+                .first()
+            )
+            if duplicate is None:
+                return  # штатная идемпотентность: наш же платёж уже зачтён
+        text = (
+            f"⚠️ lava.top: счёт #{invoice.id} уже оплачен, но пришла ещё одна "
+            f"завершённая продажа {contract_id or '?'} — похоже на ДВОЙНУЮ оплату. "
+            f"Проверить и вернуть лишнее."
+        )
+        kind = "payment_double_paid"
+    else:
+        text = (
+            f"⚠️ lava.top: продажа {contract_id or '?'} завершена, а счёт "
+            f"#{invoice.id} в статусе {invoice.status.value} — деньги списаны за "
+            f"неактивный счёт. Разобрать вручную."
+        )
+        kind = "payment_for_inactive_invoice"
+    logger.warning("lava_reconcile: %s (invoice %s)", kind, invoice.id)
+    # Сутки, не дефолт: продажа висит в last-N выдаче лавы днями, и с
+    # 10-минутным окном один разобранный вручную счёт спамил админку
+    # каждые 10 минут (кейс 3dfdc4c1/счёт 65, 2026-08-24).
+    _notify_admins_safe(
+        session,
+        kind=kind,
+        text=text,
+        dedup_key={"invoice_id": invoice.id, "contract_id": contract_id},
+        extra={
+            "invoice_id": invoice.id,
+            "contract_id": contract_id,
+            "invoice_status": invoice.status.value,
+        },
+        window_sec=86400,
+    )
+
+
+def run_device_swap_reaper_tick() -> dict:
+    """Завершитель прерванных failover-свапов (миграция 0068).
+
+    ``devices.pending_swap_from`` — журнал намерения: failover пишет его
+    при создании замены и снимает атомарно со свапом токена. Ненулевой
+    маркер старше порога и без живой apply-таски = процесс умер посреди
+    failover'а. Жнец не «убийца», а завершитель: старый девайс уже
+    погашен → доделать своп (юзер получает замену); старый жив →
+    ревокнуть недособранную замену (юзер остаётся на старом). Оба
+    исхода — с алертом: событие должно быть редким.
+    """
+    from datetime import timedelta
+
+    from sqlalchemy import text as sql_text
+
+    from . import models
+    from .db import SessionLocal
+    from .queue import schedule_tick
+    from .services.provisioning import ProvisioningOrchestrator
+    from .time_utils import utcnow
+
+    # Перепланируем ДО работы (как остальные тики): schedule_tick — one-shot,
+    # без этого жнец сработал бы ровно один раз за жизнь воркера (ревью
+    # 2026-08-25, critical).
+    interval = _env_int("DEVICE_SWAP_REAPER_INTERVAL", 300)
+    if interval > 0:
+        try:
+            schedule_tick(
+                "app.worker.run_device_swap_reaper_tick",
+                interval,
+                tick_id="tick-device-swap-reaper",
+                replace=True,
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("swap_reaper: failed to re-enqueue tick (at start)")
+
+    min_age = _env_int("DEVICE_SWAP_REAPER_MIN_AGE_MIN", 30)
+    cutoff = utcnow() - timedelta(minutes=min_age)
+    finished = 0
+    reaped = 0
+    skipped = 0
+    session = SessionLocal()
+    try:
+        stale = (
+            session.query(models.Device)
+            .filter(
+                models.Device.pending_swap_from.isnot(None),
+                models.Device.created_at < cutoff,
+            )
+            .limit(20)
+            .all()
+        )
+        for dev in stale:
+            pending_apply = (
+                session.query(models.ProvisioningTask.id)
+                .filter(
+                    models.ProvisioningTask.target_type == "device",
+                    models.ProvisioningTask.target_id == dev.id,
+                    models.ProvisioningTask.action == "apply",
+                    models.ProvisioningTask.status.in_(
+                        [
+                            models.ProvisioningTaskStatus.pending,
+                            models.ProvisioningTaskStatus.running,
+                        ]
+                    ),
+                )
+                .first()
+            )
+            if pending_apply is not None:
+                skipped += 1
+                continue  # ansible ещё в пути — не прерван, просто долгий
+
+            old_id = dev.pending_swap_from
+            orch = ProvisioningOrchestrator(session)
+            # Весь разбор — строго под advisory-локом старого девайса и на
+            # СВЕЖИХ чтениях (ревью 2026-08-25): без лока гонка с
+            # _handle_task_outcome гасила ОБА девайса (жнец ревокал замену,
+            # которая только что получила токен юзера) или воскрешала
+            # зомби. Лок занят → живой процесс сам доделает, пропускаем.
+            got = session.execute(
+                sql_text("SELECT pg_try_advisory_lock(4001, :dev)"),
+                {"dev": old_id},
+            ).scalar()
+            if not got:
+                skipped += 1
+                continue
+            try:
+                session.expire_all()
+                dev = session.get(
+                    models.Device, dev.id, populate_existing=True
+                )
+                if dev is None or dev.pending_swap_from != old_id:
+                    skipped += 1  # своп уже доделан параллельным процессом
+                    continue
+                old = (
+                    session.get(models.Device, old_id, populate_existing=True)
+                    if old_id
+                    else None
+                )
+                old_gone = old is None or old.status in (
+                    models.DeviceStatus.disabled,
+                    models.DeviceStatus.revoked,
+                )
+                replacement_alive = dev.status == models.DeviceStatus.active and any(
+                    c.is_active for c in dev.credentials
+                )
+                if old_gone or replacement_alive:
+                    # Старый погашен ЛИБО замена уже полностью жива (это
+                    # прерванный deferred-swap, а не сирота — ревокать её
+                    # значило бы оставить юзера на битом наборе навсегда):
+                    # доделываем своп в пользу замены.
+                    if old is not None:
+                        orch._complete_device_swap(
+                            old,
+                            dev,
+                            reason="swap reaper: finish interrupted failover",
+                        )
+                    else:
+                        dev.pending_swap_from = None
+                        session.add(dev)
+                        session.commit()
+                    if dev.status == models.DeviceStatus.pending and any(
+                        c.is_active for c in dev.credentials
+                    ):
+                        dev.status = models.DeviceStatus.active
+                        session.add(dev)
+                        session.commit()
+                    outcome = "finished"
+                    finished += 1
+                else:
+                    # Старый жив, замена не дозрела — сирота: ревокаем её,
+                    # юзер остаётся на рабочем старом наборе.
+                    dev.pending_swap_from = None
+                    session.add(dev)
+                    orch.revoke_device(
+                        dev,
+                        reason="swap reaper: orphan replacement",
+                        background=True,
+                    )
+                    outcome = "reaped"
+                    reaped += 1
+            except Exception:  # noqa: BLE001
+                session.rollback()
+                logger.exception(
+                    "swap_reaper: device %s (old %s) — не удалось обработать",
+                    dev.id if dev else "?", old_id,
+                )
+                continue
+            finally:
+                try:
+                    session.rollback()
+                    session.execute(
+                        sql_text("SELECT pg_advisory_unlock(4001, :dev)"),
+                        {"dev": old_id},
+                    )
+                    session.commit()
+                except Exception:  # noqa: BLE001
+                    logger.exception(
+                        "swap_reaper: advisory unlock failed for %s", old_id
+                    )
+                    try:
+                        session.invalidate()
+                    except Exception:  # noqa: BLE001
+                        pass
+            logger.warning(
+                "swap_reaper: device %s (old %s) — %s", dev.id, old_id, outcome
+            )
+            _notify_admins_safe(
+                session,
+                kind="device_swap_reaped",
+                text=(
+                    f"🧹 Жнец свапов: замена {dev.id} (старый {old_id}) — "
+                    f"{'своп доделан' if outcome == 'finished' else 'сирота ревокнута'}. "
+                    f"Это след прерванного failover'а — стоит глянуть логи."
+                ),
+                dedup_key={"device_id": dev.id},
+                extra={"device_id": dev.id, "old_device_id": old_id, "outcome": outcome},
+                window_sec=86400,
+            )
+    finally:
+        session.close()
+    return {"finished": finished, "reaped": reaped, "skipped": skipped}
+
+
+def run_lava_reconcile_tick() -> dict:
+    """Webhook-independent reconcile для карточных платежей lava.top.
+
+    Доставка вебхуков lava — best-effort (до 20 ретраев по докам; в проде
+    наблюдалось, что POST не приходит вовсе — счёт остаётся pending, деньги
+    у клиента списаны). Этот тик раз в ``LAVA_TOP_RECONCILE_INTERVAL`` секунд
+    опрашивает ``GET /api/v2/invoices`` и зачисляет любой pending-счёт, чья
+    продажа у lava уже COMPLETED (матч по ``clientUtm.utm_content`` = наш
+    invoice_id). Идемпотентно: уже-paid счета пропускаются, а если вебхук
+    всё-таки долетит — ``_mark_invoice_paid_core`` дедупит по
+    ``reference=invoice:{id}``. No-op пока lava_top не сконфигурирован.
+    """
+    from .db import SessionLocal
+    from . import models
+    from .queue import schedule_tick
+    from .services.payments import ProviderError, get_provider
+    from .api.invoices import _mark_invoice_paid_core
+
+    # Перепланируем ДО работы (как остальные тики), чтобы падение тела не
+    # оборвало периодику.
+    interval = _env_int("LAVA_TOP_RECONCILE_INTERVAL", 60)
+    if interval > 0:
+        try:
+            schedule_tick(
+                "app.worker.run_lava_reconcile_tick",
+                interval,
+                tick_id="tick-lava-reconcile",
+                replace=True,
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("lava_reconcile: failed to re-enqueue tick (at start)")
+
+    if not os.getenv("LAVA_TOP_API_KEY"):
+        return {"skipped": "not_configured"}
+    try:
+        provider = get_provider("lava_top")
+    except ProviderError:
+        return {"skipped": "not_configured"}
+
+    try:
+        sales = provider.list_recent_invoices()
+    except ProviderError as exc:
+        logger.warning("lava_reconcile: list invoices failed: %s", exc)
+        return {"error": "list_failed"}
+
+    checked = 0
+    credited = 0
+    session = SessionLocal()
+    try:
+        for sale in sales:
+            if not sale.get("completed") or not sale.get("invoice_id"):
+                continue
+            inv_id = sale["invoice_id"]
+            invoice = session.get(models.Invoice, inv_id)
+            if invoice is None:
+                continue
+            if invoice.status != models.InvoiceStatus.pending:
+                # Раньше здесь был немой continue. Но вебхук в проде не долетает,
+                # т.е. сверка — ЕДИНСТВЕННЫЙ канал, который видит карточные
+                # платежи: «оплатил поверх уже оплаченного/отменённого счёта»
+                # не замечал никто, и алерт payment_double_paid был мёртв на
+                # основном денежном пути (аудит 2026-07-25). Дискриминатор тот
+                # же, что в вебхуке: живая pending Payment-строка = НОВЫЙ платёж.
+                _alert_stale_lava_sale(session, invoice, sale)
+                continue
+            checked += 1
+            # Сверка суммы (RUB↔RUB, как в webhook): продажа lava должна
+            # покрывать сумму счёта — иначе не зачисляем (частичная оплата).
+            # FAIL-CLOSED: сумма, которую не удалось распарсить, — это «сверить
+            # нечем», а не «сверка пройдена». Раньше `is not None` в условии
+            # означал, что None (пустой ещё фискальный чек, строковая сумма,
+            # переименованное поле) зачисляет счёт ЦЕЛИКОМ без единой проверки.
+            sale_amount = sale.get("amount")
+            if sale_amount is None:
+                logger.warning(
+                    "lava_reconcile: invoice %s — сумма продажи %s не распарсилась, "
+                    "НЕ зачисляем (ручная сверка)", inv_id, sale.get("contract_id"),
+                )
+                _notify_admins_safe(
+                    session,
+                    kind="payment_amount_unverified",
+                    text=(
+                        f"⚠️ lava.top: продажа {sale.get('contract_id')} по счёту "
+                        f"#{inv_id} завершена, но сумму сверить не удалось — счёт "
+                        f"оставлен pending. Проверить вручную (форма ответа "
+                        f"/api/v2/invoices могла измениться)."
+                    ),
+                    dedup_key={"invoice_id": inv_id},
+                    extra={"invoice_id": inv_id, "contract_id": sale.get("contract_id")},
+                )
+                continue
+            if float(sale_amount) + 0.01 < float(invoice.amount):
+                logger.warning(
+                    "lava_reconcile: invoice %s underpaid (lava=%s, invoice=%s) — skip",
+                    inv_id, sale_amount, invoice.amount,
+                )
+                continue
+            sale_currency = (sale.get("currency") or "").strip().upper()
+            invoice_currency = (invoice.currency or "").strip().upper()
+            if sale_currency and invoice_currency and sale_currency != invoice_currency:
+                logger.warning(
+                    "lava_reconcile: invoice %s currency mismatch (lava=%s, invoice=%s) — skip",
+                    inv_id, sale_currency, invoice_currency,
+                )
+                continue
+            expected_offer = (os.getenv("LAVA_TOP_OFFER_ID") or "").strip()
+            sale_offer = str(sale.get("offer_id") or "").strip()
+            if expected_offer and sale_offer and sale_offer != expected_offer:
+                logger.warning(
+                    "lava_reconcile: invoice %s — продажа по ЧУЖОМУ офферу %s "
+                    "(ожидался %s) — skip", inv_id, sale_offer, expected_offer,
+                )
+                continue
+            # Помечаем ту же pending Payment-строку, что создал webapp_topup
+            # (provider=lava_top). Приоритет — матч по contract_id: он лежит в
+            # Payment.external_id с момента checkout'а, и это единственная
+            # надёжная привязка продажи к НАШЕМУ чекауту. Слепой «последний
+            # pending по id DESC» — тот же дефект, что чинили для вебхука (#117).
+            contract_id = str(sale.get("contract_id") or "").strip()
+            pending_payment = None
+            if contract_id:
+                pending_payment = (
+                    session.query(models.Payment)
+                    .filter(
+                        models.Payment.invoice_id == inv_id,
+                        models.Payment.provider.in_(_LAVA_PROVIDERS),
+                        models.Payment.external_id == contract_id,
+                    )
+                    .order_by(models.Payment.id.desc())
+                    .first()
+                )
+            if pending_payment is None and not contract_id:
+                # Фолбэк «последняя pending» — только когда контракта в
+                # продаже нет вовсе. При известном contract_id без совпадения
+                # чужую строку (другой способ того же счёта) не трогаем.
+                pending_payment = (
+                    session.query(models.Payment)
+                    .filter(
+                        models.Payment.invoice_id == inv_id,
+                        models.Payment.provider.in_(_LAVA_PROVIDERS),
+                        models.Payment.status == models.PaymentStatus.pending,
+                    )
+                    .order_by(models.Payment.id.desc())
+                    .first()
+                )
+            payment_id = pending_payment.id if pending_payment else None
+            try:
+                _mark_invoice_paid_core(
+                    session,
+                    inv_id,
+                    actor="lava_top:reconcile",
+                    actor_type=models.AuditActor.system,
+                    payment_id=payment_id,
+                )
+                credited += 1
+                logger.warning(
+                    "lava_reconcile: credited invoice %s from lava sale %s (webhook missed)",
+                    inv_id, sale.get("contract_id"),
+                )
+            except Exception as exc:  # noqa: BLE001
+                session.rollback()
+                logger.exception("lava_reconcile: failed to credit invoice %s", inv_id)
+                # Тот же алерт (и тот же дедуп-ключ), что у вебхука: деньги
+                # у провайдера есть, зачисление падает каждый тик — без
+                # алерта это невидимо (инцидент 2026-08-21, счёт #65).
+                _notify_admins_safe(
+                    session,
+                    kind="payment_credit_failed",
+                    text=(
+                        f"🔴 Деньги пришли, зачислить НЕ удалось: счёт #{inv_id} "
+                        f"(lava_top reconcile), причина: {repr(exc)[:160]}. "
+                        f"Счёт висит в pending — чинить причину."
+                    ),
+                    dedup_key={"invoice_id": inv_id},
+                    extra={"invoice_id": inv_id, "provider": "lava_top"},
+                )
+    finally:
+        session.close()
+
+    return {"checked": checked, "credited": credited}
+
+
+def _probe_cert_notafter(host: str, port: int, server_name: str, timeout: float = 8.0):
+    """Внешний TLS-хендшейк → notAfter серта (naive-UTC datetime) или None.
+
+    Читаем РОВНО то, что видит клиент: nginx после certbot-renew продолжает
+    отдавать протухший in-memory серт до reload, поэтому node-side чтение
+    /etc/letsencrypt соврало бы «свежо». verify_mode=CERT_NONE + разбор DER
+    через cryptography — нужен notAfter ДАЖЕ у невалидного/mismatch серта
+    (getpeercert() при CERT_NONE отдаёт пусто, поэтому binary_form+DER)."""
+    import socket
+    import ssl
+
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    try:
+        with socket.create_connection((host, port), timeout=timeout) as sock:
+            with ctx.wrap_socket(sock, server_hostname=server_name) as ssock:
+                der = ssock.getpeercert(binary_form=True)
+    except Exception:  # noqa: BLE001
+        return None
+    if not der:
+        return None
+    try:
+        from cryptography import x509
+
+        cert = x509.load_der_x509_certificate(der)
+        exp = getattr(cert, "not_valid_after", None)
+        if exp is None:
+            return None
+        # cryptography отдаёт naive-UTC (или aware в новых версиях) — нормализуем.
+        if exp.tzinfo is not None:
+            from datetime import timezone as _tz
+
+            exp = exp.astimezone(_tz.utc).replace(tzinfo=None)
+        return exp
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def run_cert_renewal_tick() -> dict:
+    """Проба TLS-expiry LE-серт-конфигов (xhttp/ws-cdn) + авто-renewal за
+    ``CERT_RENEWAL_DAYS`` до истечения. Читаем серт ВНЕШНИМ хендшейком (ground
+    truth — см. _probe_cert_notafter), пишем expiry в
+    ``config.settings.cert_expires_at`` (для админки), near-expiry ноды отдаём
+    ``orchestrator.renew_node_certs`` (cap ``CERT_RENEWAL_MAX_PER_TICK``, чтобы
+    fleet-wide истечение не задогпайлило ansible). Предотвращает fleet-wide
+    cert-пожар (инцидент 2026-07-22). ``CERT_RENEWAL_INTERVAL=0`` выключает."""
+    from datetime import timedelta
+
+    from .db import SessionLocal
+    from . import models
+    from .queue import schedule_tick
+    from .services.provisioning import ProvisioningOrchestrator
+    from .time_utils import utcnow
+
+    interval = _env_int("CERT_RENEWAL_INTERVAL", 86400)
+    if interval > 0:
+        try:
+            # Голый interval, БЕЗ min(..., 300): clamp принадлежит только
+            # bootstrap-ветке main() («первый прогон ≤5 мин»). В теле тика он
+            # означал бы certbot --force-renewal каждые 5 минут до 6 нод за
+            # прогон → упор в лимит LE «5 дубликатов серта в неделю» за час
+            # (аудит 2026-07-25). До фикса это не стреляло только потому, что
+            # schedule_tick здесь не был импортирован и вызов молча падал
+            # NameError'ом в except ниже — т.е. тик вообще не перепланировался
+            # и работал один раз за жизнь контейнера.
+            schedule_tick(
+                "app.worker.run_cert_renewal_tick",
+                interval,
+                tick_id="tick-cert-renewal",
+                replace=True,
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("cert-renewal: failed to reschedule tick")
+
+    days = _env_int("CERT_RENEWAL_DAYS", 21)
+    max_renew = max(1, _env_int("CERT_RENEWAL_MAX_PER_TICK", 6))
+    probed = 0
+    near = 0
+    renewed = 0
+    session = SessionLocal()
+    try:
+        now = utcnow()
+        cutoff = now + timedelta(days=days)
+        configs = (
+            session.query(models.VPNConfig)
+            .join(models.VPNNode, models.VPNNode.id == models.VPNConfig.node_id)
+            .filter(
+                models.VPNConfig.protocol.in_(
+                    (
+                        models.VPNConfigProtocol.vless_xhttp,
+                        models.VPNConfigProtocol.vless_ws_cdn,
+                    )
+                ),
+                models.VPNConfig.is_enabled.is_(True),
+                models.VPNConfig.sni.isnot(None),
+                models.VPNNode.status == models.VPNNodeStatus.active,
+            )
+            .all()
+        )
+        near_nodes: dict[int, models.VPNNode] = {}
+        for cfg in configs:
+            # CF Origin-CA (cert_path задан) — не через LE, certbot не при делах.
+            if (cfg.settings or {}).get("cert_path"):
+                continue
+            node = cfg.node
+            exp = _probe_cert_notafter(node.host, cfg.port or 443, cfg.sni)
+            if exp is None:
+                continue
+            probed += 1
+            # JSONB in-place не детектится SQLAlchemy → новый dict.
+            cfg.settings = {**(cfg.settings or {}), "cert_expires_at": exp.isoformat()}
+            if exp <= cutoff:
+                near += 1
+                near_nodes[node.id] = node
+        session.commit()
+
+        orch = ProvisioningOrchestrator(session)
+        for node in list(near_nodes.values())[:max_renew]:
+            try:
+                orch.renew_node_certs(node)
+                renewed += 1
+            except Exception:  # noqa: BLE001
+                logger.exception("cert-renewal: renew failed for node %s", node.id)
+    finally:
+        session.close()
+
+    if near or renewed:
+        logger.warning(
+            "cert-renewal: probed=%s near_expiry(<%sd)=%s renewed_nodes=%s",
+            probed, days, near, renewed,
+        )
+    return {"probed": probed, "near_expiry": near, "renewed_nodes": renewed}
+
+
+def _probe_reality_dest_ok(host: str, port: int, server_name: str, timeout: float = 8.0) -> bool:
+    """True, если dest годен как Reality-цель: TLS 1.3 + ALPN h2.
+
+    Reality зеркалит handshake dest'а; если dest перестал отдавать TLS1.3/h2
+    (легаси-домены деградируют — lenta/mail/rutube 2026-07), зеркалирование
+    падает («target sent incorrect server hello») и Reality МЁРТВ. Проба —
+    свойство самого dest'а (глобальное), поэтому из воркера репрезентативна.
+    Эквивалент ``openssl s_client -tls1_3 -alpn h2``."""
+    import socket
+    import ssl
+
+    ctx = ssl.create_default_context()
+    try:
+        ctx.minimum_version = ssl.TLSVersion.TLSv1_3
+    except (ValueError, AttributeError):
+        pass
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    try:
+        ctx.set_alpn_protocols(["h2"])
+    except NotImplementedError:
+        pass
+    try:
+        with socket.create_connection((host, port), timeout=timeout) as sock:
+            with ctx.wrap_socket(sock, server_hostname=server_name) as ssock:
+                return ssock.version() == "TLSv1.3" and ssock.selected_alpn_protocol() == "h2"
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def run_reality_dest_health_tick() -> dict:
+    """Проба Reality-dest'ов на TLS1.3+h2 + авто-ротация битых на живой из пула.
+
+    Легаси reality-dest'ы (заданы до ротации пула) со временем перестают
+    отдавать h2 → Reality молча МЁРТВ на ноде (инцидент 2026-07-23: lenta/mail/
+    rutube). Тик раз в сутки пробит dest каждого активного reality-конфига,
+    пишет здоровье в ``config.settings`` (dest_healthy/dest_checked_at/
+    dest_fail_count). Битый ``REALITY_DEST_FAIL_THRESHOLD`` (2) раза ПОДРЯД →
+    авто-ротация: pick_reality_sni выбирает кандидата, проба подтверждает его
+    годность, конфиг+xml-render обновляются (bootstrap) + client-URI регенятся
+    (rebuild_subscription_config_text). Cap ``REALITY_DEST_MAX_ROTATE_PER_TICK``.
+    ``REALITY_DEST_HEALTH_INTERVAL=0`` выключает тик целиком.
+
+    ⚠️ ``REALITY_DEST_AUTO_ROTATE`` ДЕФОЛТ **off** (только детект+алерт): воркер
+    пробит из своей локации (nl-web, NL), а geo-чувствительные dest'ы (гос-сайты
+    типа gosuslugi.ru) из-за границы отдают иначе → false-positive, хотя с самой
+    RU-ноды (где Reality реально зеркалит) dest жив. Безопасная авто-ротация
+    требует пробы С НОДЫ (TODO). Пока: тик флагует dest_healthy/dest_fail_count,
+    оператор смотрит и перепойнчивает вручную (POST /nodes/{id}/refresh-reality-
+    dest). ``REALITY_DEST_AUTO_ROTATE=1`` включает авто-ротацию (для не-geo
+    dest'ов / после node-пробы)."""
+    from sqlalchemy.orm.attributes import flag_modified
+
+    from .db import SessionLocal
+    from . import models
+    from .queue import schedule_tick
+    from .services.node_spawner import pick_reality_sni
+    from .services.provisioning import ProvisioningOrchestrator
+    from .services.warm_pool import invalidate_node_warm_pool
+    from .time_utils import utcnow
+
+    interval = _env_int("REALITY_DEST_HEALTH_INTERVAL", 86400)
+    if interval > 0:
+        try:
+            # Голый interval (см. run_cert_renewal_tick): с min(..., 300)
+            # порог REALITY_DEST_FAIL_THRESHOLD=2 «два раза ПОДРЯД» означал бы
+            # 10 минут вместо двух суток, а при REALITY_DEST_AUTO_ROTATE=1 —
+            # ротацию до 3 нод каждые 5 минут. Плюс schedule_tick здесь не был
+            # импортирован — тик не перепланировался вовсе (аудит 2026-07-25).
+            schedule_tick(
+                "app.worker.run_reality_dest_health_tick",
+                interval,
+                tick_id="tick-reality-dest-health",
+                replace=True,
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("reality-dest-health: failed to reschedule tick")
+
+    threshold = max(1, _env_int("REALITY_DEST_FAIL_THRESHOLD", 2))
+    # Дефолт off — воркер пробит из NL, geo-dest'ы (gosuslugi) false-positive'ят
+    # (см. docstring). Безопасно включать только для не-geo dest'ов / node-пробы.
+    auto_rotate = os.getenv("REALITY_DEST_AUTO_ROTATE", "0") in ("1", "on", "true")
+    max_rotate = max(0, _env_int("REALITY_DEST_MAX_ROTATE_PER_TICK", 3))
+    probed = 0
+    broken = 0
+    rotated = 0
+    session = SessionLocal()
+    try:
+        now = utcnow()
+        cfgs = (
+            session.query(models.VPNConfig)
+            .join(models.VPNNode, models.VPNNode.id == models.VPNConfig.node_id)
+            .filter(
+                models.VPNConfig.protocol == models.VPNConfigProtocol.vless_reality,
+                models.VPNConfig.is_enabled.is_(True),
+                models.VPNConfig.sni.isnot(None),
+                models.VPNNode.status == models.VPNNodeStatus.active,
+            )
+            .all()
+        )
+        to_rotate: list[tuple[models.VPNNode, models.VPNConfig]] = []
+        for cfg in cfgs:
+            dest = (cfg.settings or {}).get("dest") or cfg.fallback or f"{cfg.sni}:443"
+            host, _, port_s = dest.partition(":")
+            port = int(port_s) if port_s.isdigit() else 443
+            ok = _probe_reality_dest_ok(host, port, host)
+            probed += 1
+            settings = dict(cfg.settings or {})
+            settings["dest_checked_at"] = now.isoformat()
+            settings["dest_healthy"] = ok
+            fails = 0 if ok else int(settings.get("dest_fail_count") or 0) + 1
+            settings["dest_fail_count"] = fails
+            cfg.settings = settings
+            flag_modified(cfg, "settings")
+            if not ok:
+                broken += 1
+                logger.warning(
+                    "reality-dest-health: node %s dest %s BROKEN (no TLS1.3/h2), "
+                    "fail #%s", cfg.node_id, dest, fails,
+                )
+                if fails >= threshold and auto_rotate:
+                    to_rotate.append((cfg.node, cfg))
+        session.commit()
+
+        orch = ProvisioningOrchestrator(session)
+        for node, cfg in to_rotate[:max_rotate]:
+            try:
+                new_sni = pick_reality_sni(session, node.region)
+                if not new_sni or new_sni == cfg.sni:
+                    continue
+                # НЕ ротируем на непроверенный dest (иначе битый→битый).
+                if not _probe_reality_dest_ok(new_sni, 443, new_sni):
+                    logger.warning(
+                        "reality-dest-health: candidate %s for node %s also "
+                        "not TLS1.3/h2 — skip rotate", new_sni, node.id,
+                    )
+                    continue
+                cfg.sni = new_sni
+                cfg.fallback = f"{new_sni}:443"
+                cfg.settings = {
+                    **(cfg.settings or {}),
+                    "dest": f"{new_sni}:443",
+                    "dest_healthy": True,
+                    "dest_fail_count": 0,
+                }
+                flag_modified(cfg, "settings")
+                invalidate_node_warm_pool(
+                    session, node.id, reason="dest-health auto-rotate")
+                session.commit()
+                task, created = orch.create_or_coalesce_node_bootstrap(
+                    node,
+                    {"pool_id": node.pool_id, "rerun": True, "reason": "dest-health"},
+                    defer_to_reconciler=False,
+                )
+                session.commit()
+                if created:
+                    orch.run_task_async(task, node=node)
+                # Ре-минт нужен ВСЕМ, у кого есть кред на этой ноде, а не
+                # только «домашним» подпискам: у диверсной (N×M) сабы
+                # Subscription.node_id указывает на другую ноду, и её креды
+                # на этой оставались со сталым SNI — тот самый «reality н/д»
+                # у диверсных юзеров (аудит 2026-07-25).
+                sub_ids = {
+                    sid
+                    for (sid,) in session.query(models.Subscription.id)
+                    .filter(
+                        models.Subscription.node_id == node.id,
+                        models.Subscription.status
+                        == models.SubscriptionStatus.active,
+                    )
+                    .all()
+                }
+                sub_ids.update(
+                    sid
+                    for (sid,) in session.query(models.Credential.subscription_id)
+                    .join(
+                        models.Subscription,
+                        models.Subscription.id == models.Credential.subscription_id,
+                    )
+                    .filter(
+                        models.Credential.node_id == node.id,
+                        models.Credential.is_active.is_(True),
+                        models.Subscription.status
+                        == models.SubscriptionStatus.active,
+                    )
+                    .distinct()
+                    .all()
+                    if sid is not None
+                )
+                for sub in (
+                    session.query(models.Subscription)
+                    .filter(models.Subscription.id.in_(sub_ids))
+                    .all()
+                    if sub_ids
+                    else []
+                ):
+                    try:
+                        orch.rebuild_subscription_config_text(sub)
+                    except Exception:  # noqa: BLE001
+                        logger.exception(
+                            "dest-health: rebuild failed sub %s", sub.id)
+                session.commit()
+                rotated += 1
+                logger.warning(
+                    "reality-dest-health: node %s AUTO-ROTATED dest → %s",
+                    node.id, new_sni,
+                )
+            except Exception:  # noqa: BLE001
+                logger.exception(
+                    "reality-dest-health: rotate failed for node %s", node.id)
+                session.rollback()
+    finally:
+        session.close()
+
+    if broken or rotated:
+        logger.warning(
+            "reality-dest-health: probed=%s broken=%s auto_rotated=%s",
+            probed, broken, rotated,
+        )
+    return {"probed": probed, "broken": broken, "rotated": rotated}
+
+
+def run_node_versions_tick() -> dict:
+    """Снять с нод фактические версии софта: xray + маркер нашей прошивки.
+
+    Ходим по SSH (services/node_versions.py), а не ansible: периодический
+    ansible-фанаут выедал бы слоты семафора у горячего пути выдачи конфигов.
+    Пишем в ``vpn_nodes.xray_version`` / ``release_version`` /
+    ``versions_checked_at`` — на них смотрят бейдж в админке и тик сравнения
+    версий. ``NODE_VERSIONS_INTERVAL=0`` выключает.
+    """
+    from .db import SessionLocal
+    from .queue import schedule_tick
+    from .services.node_versions import collect_all_nodes_versions
+
+    interval = _env_int("NODE_VERSIONS_INTERVAL", 3600)
+    if interval > 0:
+        try:
+            # Голый interval, БЕЗ min(..., 300) — clamp принадлежит только
+            # bootstrap-ветке main(). См. комментарий в run_cert_renewal_tick.
+            schedule_tick(
+                "app.worker.run_node_versions_tick",
+                interval,
+                tick_id="tick-node-versions",
+                replace=True,
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("node-versions: failed to reschedule tick")
+
+    session = SessionLocal()
+    try:
+        results = collect_all_nodes_versions(session)
+    except Exception:  # noqa: BLE001
+        logger.exception("node-versions: collection failed")
+        session.rollback()
+        return {"collected": 0, "failed": 0}
+    finally:
+        session.close()
+
+    failed = sum(1 for r in results if r.error)
+    collected = len(results) - failed
+    if failed:
+        logger.warning(
+            "node-versions: collected=%s failed=%s", collected, failed
+        )
+    return {"collected": collected, "failed": failed}
+
+
+def run_xray_upstream_tick() -> dict:
+    """Проверить, не вышла ли новая версия Xray-core, и сказать админу.
+
+    Сравниваем три вещи: последний upstream-релиз, наш пин в роли
+    (``xray_core_version``) и то, что реально стоит на нодах. Апгрейд НЕ
+    автоматический и быть им не может: ``xray_core_sha256`` пинится в паре с
+    версией, и подмена одной версии без пересчёта хэша положила бы установку на
+    всём флоте (fetch-скрипт отвергнет каждый источник по несовпадению sha).
+    Поэтому тик только уведомляет — решение и бамп остаются за человеком.
+    ``XRAY_UPSTREAM_INTERVAL=0`` выключает.
+    """
+    from .db import SessionLocal
+    from .queue import schedule_tick
+    from .services.xray_releases import check_upstream_and_notify
+
+    interval = _env_int("XRAY_UPSTREAM_INTERVAL", 21600)
+    if interval > 0:
+        try:
+            schedule_tick(
+                "app.worker.run_xray_upstream_tick",
+                interval,
+                tick_id="tick-xray-upstream",
+                replace=True,
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("xray-upstream: failed to reschedule tick")
+
+    session = SessionLocal()
+    try:
+        return check_upstream_and_notify(session)
+    except Exception:  # noqa: BLE001
+        logger.exception("xray-upstream: check failed")
+        session.rollback()
+        return {"latest": None, "notified": False}
+    finally:
+        session.close()
+
+
+def run_operator_report_watch_tick() -> dict:
+    """Periodic — resolve operator-routing reports by observed reconnect.
+
+    Phase 1: flips ``OperatorNodeReport`` rows from ``pending`` to
+    ``ok``/``inconclusive`` once ``T_RECONNECT`` (default 15 min) has
+    elapsed, by checking whether the user reconnected on the target node
+    (``NodeTrafficSample``). See services.operator_reports +
+    docs/operations/operator_routing_roadmap.md.
+    """
+    from .db import SessionLocal
+    from .queue import schedule_tick
+    from .services.operator_reports import resolve_pending_reports
+
+    # Reschedule в начале — см. run_pending_rescue_tick.
+    interval = _env_int("OPERATOR_REPORT_WATCH_INTERVAL", 300)
+    if interval > 0:
+        try:
+            schedule_tick(
+                "app.worker.run_operator_report_watch_tick",
+                interval,
+                tick_id="tick-operator-report-watch",
+                replace=True,
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception(
+                "operator_report_watch: failed to re-enqueue tick (at start)"
+            )
+
+    session = SessionLocal()
+    try:
+        result = resolve_pending_reports(session)
+        # Пуш «починка не помогла» по inconclusive — только после отложенной
+        # перепроверки (services/repair_alerts). Сбой не должен ронять watcher.
+        try:
+            from .services.repair_alerts import alert_stale_inconclusive
+
+            result["repair_alerts"] = alert_stale_inconclusive(session)
+        except Exception:  # noqa: BLE001
+            session.rollback()
+            logger.exception("operator_report_watch: repair alerts pass failed")
+        return result
+    finally:
+        session.close()
+
+
+def run_reconcile_tick() -> dict:
+    """Phase 3 reconcile-тик: сходит ноды по desired-state generations (одним
+    coalesced bootstrap'ом на ноду, у которой due наступил и desired >
+    reconciled). No-op если RECONCILER_ENABLED выключен (provision идёт по
+    Phase-0 immediate-модели). Self-reschedules. См. reconciler_epic.md."""
+    from .db import SessionLocal
+    from .queue import schedule_tick
+    from .services.provisioning import ProvisioningOrchestrator
+
+    interval = _env_int("RECONCILE_INTERVAL", 3)
+    if interval > 0:
+        try:
+            schedule_tick(
+                "app.worker.run_reconcile_tick",
+                interval,
+                tick_id="tick-reconcile",
+                replace=True,
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("reconcile: failed to re-enqueue tick (at start)")
+
+    session = SessionLocal()
+    try:
+        result = ProvisioningOrchestrator(session).reconcile_due_nodes()
+        # Watchdog-гейджи: пока reconciler включён, reconcile_due_nodes
+        # возвращает pending_total/oldest_overdue_s. Если scheduler завис и
+        # тик перестал бежать, гейджи протухают → external staleness-alert.
+        if "pending_total" in result:
+            RECONCILE_PENDING_NODES.set(result["pending_total"])
+            RECONCILE_OLDEST_OVERDUE.set(result["oldest_overdue_s"])
+        return result
+    finally:
+        session.close()
+
+
+def _resolve_mgmt_host() -> str:
+    """Pull the mgmt host from the ansible inventory (db_host → mgmt-1).
+
+    Mirrors ``scripts/workers.sh``. ``MGMT_HOST`` env overrides this.
+    """
+    import yaml
+
+    root = os.getenv("ANSIBLE_ROOT", "/app/infra/ansible")
+    path = os.path.join(root, "inventories", "prod", "hosts.yml")
+    with open(path) as fh:
+        inv = yaml.safe_load(fh)
+    return inv["all"]["children"]["db_host"]["hosts"]["mgmt-1"]["ansible_host"]
+
+
+def run_scale_workers(replicas: int) -> dict:
+    """Scale the worker container replicas on the mgmt host via SSH.
+
+    Runs on a worker (the API image carries no ssh/key) — mirrors
+    ``scripts/workers.sh``: ssh to the mgmt host, persist
+    ``WORKER_REPLICAS`` in ``.env`` (so it survives a plain
+    ``docker compose up``), then ``docker compose up -d --scale
+    worker=N worker``. The docker command runs ON the host, so even a
+    scale-DOWN that kills this very worker mid-run still completes.
+
+    Returns ``{replicas, ok, rc, stdout, stderr}`` (output tails). Raises
+    ``ValueError`` on an out-of-range count (the API also validates).
+    """
+    import subprocess
+
+    n = int(replicas)
+    if not (1 <= n <= 20):
+        raise ValueError(f"replicas {n} out of range 1..20")
+
+    mgmt_host = os.getenv("MGMT_HOST") or _resolve_mgmt_host()
+    mgmt_user = os.getenv("MGMT_USER", "root")
+    stack_dir = os.getenv("MGMT_STACK_DIR", "/opt/vpn")
+    key = os.getenv("ANSIBLE_PRIVATE_KEY_FILE", "/run/secrets/provisioning_key")
+
+    remote = (
+        f"set -e; cd {stack_dir}; "
+        f"if grep -q '^WORKER_REPLICAS=' .env 2>/dev/null; then "
+        f"sed -i 's/^WORKER_REPLICAS=.*/WORKER_REPLICAS={n}/' .env; "
+        f"else echo 'WORKER_REPLICAS={n}' >> .env; fi; "
+        f"docker compose up -d --scale worker={n} worker; "
+        f"docker compose ps worker --format '{{{{.Name}}}} {{{{.State}}}}'"
+    )
+    cmd = [
+        "ssh",
+        "-i", key,
+        "-o", "StrictHostKeyChecking=no",
+        "-o", "UserKnownHostsFile=/dev/null",
+        "-o", "ConnectTimeout=20",
+        "-o", "BatchMode=yes",
+        f"{mgmt_user}@{mgmt_host}",
+        remote,
+    ]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=150)
+    except subprocess.TimeoutExpired:
+        logger.error("scale_workers: ssh to %s timed out", mgmt_host)
+        return {
+            "replicas": n,
+            "ok": False,
+            "rc": -1,
+            "stdout": "",
+            "stderr": "ssh timeout (150s)",
+        }
+
+    ok = proc.returncode == 0
+    if not ok:
+        logger.error(
+            "scale_workers rc=%s stderr=%s", proc.returncode, proc.stderr[-500:]
+        )
+    else:
+        logger.info("scale_workers: set worker replicas = %s on %s", n, mgmt_host)
+    return {
+        "replicas": n,
+        "ok": ok,
+        "rc": proc.returncode,
+        "stdout": proc.stdout[-1500:],
+        "stderr": proc.stderr[-1500:],
+    }
 
 
 def run_autoscale_tick() -> list[dict]:
@@ -131,7 +1394,7 @@ def run_autoscale_tick() -> list[dict]:
     from .services.autoscale import evaluate_all_pools
 
     # Reschedule в начале — см. run_pending_rescue_tick.
-    interval = int(os.getenv("AUTOSCALE_INTERVAL", "0"))
+    interval = _env_int("AUTOSCALE_INTERVAL", 0)
     if interval > 0:
         try:
             schedule_tick(
@@ -175,7 +1438,7 @@ def run_renewal_check() -> dict:
     from .time_utils import utcnow
 
     # Reschedule в начале — см. run_pending_rescue_tick.
-    interval = int(os.getenv("RENEWAL_CHECK_INTERVAL", "3600"))
+    interval = _env_int("RENEWAL_CHECK_INTERVAL", 3600)
     if interval > 0:
         try:
             schedule_tick(
@@ -196,6 +1459,13 @@ def run_renewal_check() -> dict:
         revoke_cutoff = now - timedelta(hours=RENEWAL_GRACE_HOURS)
 
         # ── Mark overdue subscriptions as expired (status flip only). ──
+        # Для auto_renew=True сначала пробуем V2 balance.renew_subscription:
+        # `run_renewal_check` живёт на 5-min cadence, `run_balance_charge_tick`
+        # на часовом — без этого race-fix-а час между balance-тиками означает,
+        # что мы успеваем флипнуть в expired раньше, чем balance успеет
+        # списать с кошелька, и подписка с достаточным балансом и тумблером
+        # auto_renew=ON всё равно не продлевается.
+        from .services import balance as balance_svc
         overdue = (
             session.query(models.Subscription)
             .filter(
@@ -205,6 +1475,52 @@ def run_renewal_check() -> dict:
             .all()
         )
         for sub in overdue:
+            if sub.auto_renew:
+                # Битая строка (план удалён): renew_subscription кидал бы
+                # RuntimeError на каждом тике. Не экспайрим платящего юзера —
+                # алертим админа (с суточным дедупом) и ждём ручного разбора.
+                if sub.plan is None:
+                    logger.error(
+                        "renewal_check: sub=%s auto_renew=ON без плана — "
+                        "продление невозможно, нужен ручной разбор", sub.id
+                    )
+                    try:
+                        from .services.admin_notify import notify_admins
+                        notify_admins(
+                            session,
+                            kind="renewal_broken_sub",
+                            text=(
+                                f"⚠️ Подписка #{sub.id} (auto_renew=ON) без "
+                                f"плана — авто-продление невозможно, нужен "
+                                f"ручной разбор."
+                            ),
+                            dedup_key={"subscription_id": sub.id},
+                            window_sec=86400,
+                            autocommit=True,
+                        )
+                    except Exception:  # noqa: BLE001
+                        logger.exception(
+                            "renewal_check: broken-sub alert failed sub=%s",
+                            sub.id,
+                        )
+                    stats["errors"] += 1
+                    continue
+                try:
+                    if balance_svc.renew_subscription(session, sub):
+                        stats["renewed"] = stats.get("renewed", 0) + 1
+                        continue
+                except Exception:  # noqa: BLE001
+                    logger.exception(
+                        "renewal_check: balance.renew failed sub=%s", sub.id
+                    )
+                    if session.is_active:
+                        session.rollback()
+                    stats["errors"] += 1
+                    # Транзиентный сбой (обрыв БД, deadlock) — НЕ повод
+                    # экспайрить оплаченную подписку: пропускаем, следующий
+                    # тик повторит попытку. Экспайр только при явном
+                    # «недостаточно средств» (renew_subscription вернул False).
+                    continue
             sub.status = models.SubscriptionStatus.expired
             session.add(sub)
             stats["expired"] += 1
@@ -249,50 +1565,96 @@ def run_renewal_check() -> dict:
                 models.Subscription.expires_at <= remind_horizon,
                 models.Subscription.expires_at > now,
             )
+            .order_by(models.Subscription.expires_at.asc())
+            .limit(RENEWAL_WINDOW_LIMIT)
             .all()
         )
         for sub in expiring_soon:
-            existing = (
-                session.query(models.Invoice)
-                .filter(
-                    models.Invoice.subscription_id == sub.id,
-                    models.Invoice.action == models.InvoiceAction.renewal,
-                    models.Invoice.status == models.InvoiceStatus.pending,
-                )
-                .first()
-            )
-            if existing:
-                continue
-            plan = session.get(models.Plan, sub.plan_id)
-            if not plan:
-                continue
-            invoice = models.Invoice(
-                user_id=sub.user_id,
-                plan_id=sub.plan_id,
-                subscription_id=sub.id,
-                amount=float(plan.price),
-                currency="USD",
-                action=models.InvoiceAction.renewal,
-            )
-            session.add(invoice)
-            session.flush()
+            # Per-item SAVEPOINT-изоляция: битая строка (IntegrityError на
+            # flush инвойса, обрыв соединения посреди цикла) откатывается
+            # только сама и не рушит ни остальные подписки этого пасса, ни
+            # последующие пассы (1-day/manual напоминания). Без этого одна
+            # запись глушила напоминания всем.
+            try:
+                with session.begin_nested():
+                    existing = (
+                        session.query(models.Invoice)
+                        .filter(
+                            models.Invoice.subscription_id == sub.id,
+                            models.Invoice.action == models.InvoiceAction.renewal,
+                            models.Invoice.status == models.InvoiceStatus.pending,
+                        )
+                        .first()
+                    )
+                    if existing:
+                        continue
+                    plan = session.get(models.Plan, sub.plan_id)
+                    if not plan:
+                        continue
+                    # Рубли и полная стоимость продления со слотами: счёт
+                    # переиспользует страница починки (sub_fix.do_pay) и шлёт
+                    # в lava. Был currency="USD" + plan.price без слотов —
+                    # lava.top принимает USD, «Продлить за 150 ₽» ушло бы как
+                    # 150 долларов (найдено ревью плана триала 30.09.2026).
+                    invoice = models.Invoice(
+                        user_id=sub.user_id,
+                        plan_id=sub.plan_id,
+                        subscription_id=sub.id,
+                        amount=balance_svc.total_renewal_cost_kopecks(sub) / 100,
+                        currency="RUB",
+                        action=models.InvoiceAction.renewal,
+                    )
+                    session.add(invoice)
+                    session.flush()
 
-            user = session.get(models.User, sub.user_id)
-            if user and user.telegram_id and user.notify_renewals:
-                log = models.AuditLog(
-                    actor="system",
-                    actor_type=models.AuditActor.system,
-                    action="renewal_reminder",
-                    target_type="subscription",
-                    target_id=sub.id,
-                    extra={
-                        "telegram_id": user.telegram_id,
-                        "invoice_id": invoice.id,
-                        "expires_at": sub.expires_at.isoformat(),
-                    },
+                    user = session.get(models.User, sub.user_id)
+                    if not user or not user.telegram_id or not user.notify_renewals:
+                        stats["reminded"] += 1
+                        continue
+                    # Skip notification if balance covers next renewal — V2
+                    # balance tick will silently auto-renew, no need to bug user.
+                    wallet = user.balance_kopecks or 0
+                    cost = balance_svc.total_renewal_cost_kopecks(sub)
+                    if cost > 0 and wallet >= cost:
+                        stats["reminded"] += 1
+                        continue
+                    # Idempotency in addition to invoice-check: invoice can be
+                    # marked paid/cancelled by admin, after which the existing
+                    # invoice query returns nothing and we'd otherwise re-spam.
+                    existing_log = (
+                        session.query(models.AuditLog)
+                        .filter(
+                            models.AuditLog.action.in_(
+                                ["renewal_reminder", "renewal_reminder:delivered"]
+                            ),
+                            models.AuditLog.target_type == "subscription",
+                            models.AuditLog.target_id == sub.id,
+                        )
+                        .first()
+                    )
+                    if existing_log:
+                        stats["reminded"] += 1
+                        continue
+                    log = models.AuditLog(
+                        actor="system",
+                        actor_type=models.AuditActor.system,
+                        action="renewal_reminder",
+                        target_type="subscription",
+                        target_id=sub.id,
+                        extra={
+                            "telegram_id": user.telegram_id,
+                            "invoice_id": invoice.id,
+                            "expires_at": sub.expires_at.isoformat(),
+                        },
+                    )
+                    session.add(log)
+                    stats["reminded"] += 1
+            except Exception:  # noqa: BLE001
+                logger.exception(
+                    "renewal_check: 3d reminder pass failed for sub %s", sub.id
                 )
-                session.add(log)
-            stats["reminded"] += 1
+                stats["errors"] += 1
+                continue
         session.commit()
 
         # ── 1-day urgent reminder for auto_renew subs ──
@@ -304,36 +1666,74 @@ def run_renewal_check() -> dict:
                 models.Subscription.expires_at <= remind_horizon_1d,
                 models.Subscription.expires_at > now,
             )
+            .order_by(models.Subscription.expires_at.asc())
+            .limit(RENEWAL_WINDOW_LIMIT)
             .all()
         )
+        logger.info(
+            "renewal_check.expiring_1d: %d sub(s) in window [now, now+1d]",
+            len(expiring_1d),
+        )
         for sub in expiring_1d:
-            user = session.get(models.User, sub.user_id)
-            if not user or not user.telegram_id or not user.notify_renewals:
-                continue
-            existing_log = (
-                session.query(models.AuditLog)
-                .filter(
-                    models.AuditLog.action == "renewal_reminder_1d",
-                    models.AuditLog.target_type == "subscription",
-                    models.AuditLog.target_id == sub.id,
+            try:
+                with session.begin_nested():
+                    user = session.get(models.User, sub.user_id)
+                    if not user or not user.telegram_id or not user.notify_renewals:
+                        logger.info(
+                            "renewal_check.1d: sub=%s skip (no user/tg/notify_renewals)",
+                            sub.id,
+                        )
+                        continue
+                    # Same balance-gate as 3-day: silent auto-renew, no need to bug.
+                    wallet = user.balance_kopecks or 0
+                    cost = balance_svc.total_renewal_cost_kopecks(sub)
+                    if cost > 0 and wallet >= cost:
+                        logger.info(
+                            "renewal_check.1d: sub=%s skip balance-gate wallet=%s cost=%s",
+                            sub.id, wallet, cost,
+                        )
+                        continue
+                    # `.in_(...)` covers post-ACK state: bot's POST /ack appends
+                    # `:delivered` to action, so a plain `== "renewal_reminder_1d"`
+                    # check would miss the prior log and re-spam every 5-min tick.
+                    existing_log = (
+                        session.query(models.AuditLog)
+                        .filter(
+                            models.AuditLog.action.in_(
+                                ["renewal_reminder_1d", "renewal_reminder_1d:delivered"]
+                            ),
+                            models.AuditLog.target_type == "subscription",
+                            models.AuditLog.target_id == sub.id,
+                        )
+                        .first()
+                    )
+                    if existing_log:
+                        logger.info(
+                            "renewal_check.1d: sub=%s SKIP dedup matched log_id=%s "
+                            "action=%r",
+                            sub.id, existing_log.id, existing_log.action,
+                        )
+                        continue
+                    new_log = models.AuditLog(
+                        actor="system",
+                        actor_type=models.AuditActor.system,
+                        action="renewal_reminder_1d",
+                        target_type="subscription",
+                        target_id=sub.id,
+                        extra={
+                            "telegram_id": user.telegram_id,
+                            "subscription_id": sub.id,
+                            "expires_at": sub.expires_at.isoformat(),
+                        },
+                    )
+                    session.add(new_log)
+                    stats["reminded_1d"] += 1
+            except Exception:  # noqa: BLE001
+                logger.exception(
+                    "renewal_check: 1d reminder pass failed for sub %s", sub.id
                 )
-                .first()
-            )
-            if existing_log:
+                stats["errors"] += 1
                 continue
-            session.add(models.AuditLog(
-                actor="system",
-                actor_type=models.AuditActor.system,
-                action="renewal_reminder_1d",
-                target_type="subscription",
-                target_id=sub.id,
-                extra={
-                    "telegram_id": user.telegram_id,
-                    "subscription_id": sub.id,
-                    "expires_at": sub.expires_at.isoformat(),
-                },
-            ))
-            stats["reminded_1d"] += 1
         session.commit()
 
         # ── Remind non-auto-renew users about expiration (3-day) ──
@@ -345,35 +1745,48 @@ def run_renewal_check() -> dict:
                 models.Subscription.expires_at <= remind_horizon,
                 models.Subscription.expires_at > now,
             )
+            .order_by(models.Subscription.expires_at.asc())
+            .limit(RENEWAL_WINDOW_LIMIT)
             .all()
         )
         for sub in expiring_manual:
-            user = session.get(models.User, sub.user_id)
-            if not user or not user.telegram_id or not user.notify_renewals:
-                continue
-            existing_log = (
-                session.query(models.AuditLog)
-                .filter(
-                    models.AuditLog.action == "expiry_reminder",
-                    models.AuditLog.target_type == "subscription",
-                    models.AuditLog.target_id == sub.id,
+            try:
+                with session.begin_nested():
+                    user = session.get(models.User, sub.user_id)
+                    if not user or not user.telegram_id or not user.notify_renewals:
+                        continue
+                    existing_log = (
+                        session.query(models.AuditLog)
+                        .filter(
+                            models.AuditLog.action.in_(
+                                ["expiry_reminder", "expiry_reminder:delivered"]
+                            ),
+                            models.AuditLog.target_type == "subscription",
+                            models.AuditLog.target_id == sub.id,
+                        )
+                        .first()
+                    )
+                    if existing_log:
+                        continue
+                    session.add(models.AuditLog(
+                        actor="system",
+                        actor_type=models.AuditActor.system,
+                        action="expiry_reminder",
+                        target_type="subscription",
+                        target_id=sub.id,
+                        extra={
+                            "telegram_id": user.telegram_id,
+                            "subscription_id": sub.id,
+                            "expires_at": sub.expires_at.isoformat(),
+                        },
+                    ))
+            except Exception:  # noqa: BLE001
+                logger.exception(
+                    "renewal_check: 3d manual reminder pass failed for sub %s",
+                    sub.id,
                 )
-                .first()
-            )
-            if existing_log:
+                stats["errors"] += 1
                 continue
-            session.add(models.AuditLog(
-                actor="system",
-                actor_type=models.AuditActor.system,
-                action="expiry_reminder",
-                target_type="subscription",
-                target_id=sub.id,
-                extra={
-                    "telegram_id": user.telegram_id,
-                    "subscription_id": sub.id,
-                    "expires_at": sub.expires_at.isoformat(),
-                },
-            ))
         session.commit()
 
         # ── 1-day urgent reminder for non-auto-renew subs ──
@@ -385,36 +1798,62 @@ def run_renewal_check() -> dict:
                 models.Subscription.expires_at <= remind_horizon_1d,
                 models.Subscription.expires_at > now,
             )
+            .order_by(models.Subscription.expires_at.asc())
+            .limit(RENEWAL_WINDOW_LIMIT)
             .all()
         )
+        logger.info(
+            "renewal_check.expiring_manual_1d: %d sub(s) in window",
+            len(expiring_manual_1d),
+        )
         for sub in expiring_manual_1d:
-            user = session.get(models.User, sub.user_id)
-            if not user or not user.telegram_id or not user.notify_renewals:
-                continue
-            existing_log = (
-                session.query(models.AuditLog)
-                .filter(
-                    models.AuditLog.action == "expiry_reminder_1d",
-                    models.AuditLog.target_type == "subscription",
-                    models.AuditLog.target_id == sub.id,
+            try:
+                with session.begin_nested():
+                    user = session.get(models.User, sub.user_id)
+                    if not user or not user.telegram_id or not user.notify_renewals:
+                        logger.info(
+                            "renewal_check.manual_1d: sub=%s skip (no user/tg/notify)",
+                            sub.id,
+                        )
+                        continue
+                    existing_log = (
+                        session.query(models.AuditLog)
+                        .filter(
+                            models.AuditLog.action.in_(
+                                ["expiry_reminder_1d", "expiry_reminder_1d:delivered"]
+                            ),
+                            models.AuditLog.target_type == "subscription",
+                            models.AuditLog.target_id == sub.id,
+                        )
+                        .first()
+                    )
+                    if existing_log:
+                        logger.info(
+                            "renewal_check.manual_1d: sub=%s SKIP dedup matched "
+                            "log_id=%s action=%r",
+                            sub.id, existing_log.id, existing_log.action,
+                        )
+                        continue
+                    session.add(models.AuditLog(
+                        actor="system",
+                        actor_type=models.AuditActor.system,
+                        action="expiry_reminder_1d",
+                        target_type="subscription",
+                        target_id=sub.id,
+                        extra={
+                            "telegram_id": user.telegram_id,
+                            "subscription_id": sub.id,
+                            "expires_at": sub.expires_at.isoformat(),
+                        },
+                    ))
+                    stats["reminded_1d"] += 1
+            except Exception:  # noqa: BLE001
+                logger.exception(
+                    "renewal_check: 1d manual reminder pass failed for sub %s",
+                    sub.id,
                 )
-                .first()
-            )
-            if existing_log:
+                stats["errors"] += 1
                 continue
-            session.add(models.AuditLog(
-                actor="system",
-                actor_type=models.AuditActor.system,
-                action="expiry_reminder_1d",
-                target_type="subscription",
-                target_id=sub.id,
-                extra={
-                    "telegram_id": user.telegram_id,
-                    "subscription_id": sub.id,
-                    "expires_at": sub.expires_at.isoformat(),
-                },
-            ))
-            stats["reminded_1d"] += 1
         session.commit()
 
         RENEWAL_RUNS.labels(outcome="ok").inc()
@@ -425,6 +1864,11 @@ def run_renewal_check() -> dict:
         RENEWAL_RUNS.labels(outcome="error").inc()
         if session.is_active:
             session.rollback()
+        # Ре-бросаем: self-reschedule уже сделан в начале тика, поэтому
+        # периодичность не пострадает, а джоба честно уйдёт в failed и
+        # подсветится в /ops (иначе проглоченное падение неотличимо от
+        # успеха — статус RQ остаётся finished).
+        raise
     finally:
         session.close()
 
@@ -448,7 +1892,7 @@ def run_warm_pool_check() -> dict:
     from .services import warm_pool
 
     # Reschedule в начале — см. run_pending_rescue_tick.
-    interval = int(os.getenv("WARM_POOL_CHECK_INTERVAL", "120"))
+    interval = _env_int("WARM_POOL_CHECK_INTERVAL", 120)
     if interval > 0:
         try:
             schedule_tick(
@@ -466,13 +1910,248 @@ def run_warm_pool_check() -> dict:
         summary = warm_pool.ensure_pool(session)
     except Exception:  # noqa: BLE001
         logger.exception("warm_pool: ensure_pool failed")
+        # Ре-бросаем — см. run_renewal_check: падение тика должно уйти в
+        # failed и подсветиться в /ops, а не молча вернуть finished.
+        raise
     finally:
         session.close()
 
     return summary
 
 
-_LOW_BALANCE_THRESHOLD_DAYS = int(os.getenv("LOW_BALANCE_WARN_DAYS", "3"))
+def run_warm_pool_revoke_tick() -> dict:
+    """Стадия 2 отзыва warm-пула — физически снять revoked-бандлы с нод.
+
+    Драйвер для ``warm_pool.run_warm_pool_revoke_sweep``: находит уникальные
+    ``(node_id, access_username)`` в ``pool_state=revoked`` (и юзер-отвязанные,
+    и брошенные ``invalidate_node_warm_pool``) и гоняет ``state=absent`` по
+    каждому, батчем ``WARM_POOL_REVOKE_BATCH_PER_TICK``. Без этого тика
+    revoked-identity копятся вечно и в конфиге xray (лишние клиенты), и
+    revoked-строками в БД (finding #71). Sweep сам делает back-off после
+    ``WARM_POOL_REVOKE_MAX_ATTEMPTS`` провалов, чтобы не молотить мёртвую ноду.
+
+    Self-reschedules через ``WARM_POOL_REVOKE_INTERVAL`` (default 300s).
+    Disabled при 0 или ``WARM_POOL_ENABLED=0``.
+    """
+    from .db import SessionLocal
+    from .queue import schedule_tick
+    from .services import warm_pool
+
+    # Reschedule в начале — см. run_pending_rescue_tick. Sweep ходит по
+    # нодам ansible'ом и может зависнуть на SSH, поэтому reschedule ДО работы.
+    interval = _env_int("WARM_POOL_REVOKE_INTERVAL", 300)
+    if interval > 0:
+        try:
+            schedule_tick(
+                "app.worker.run_warm_pool_revoke_tick",
+                interval,
+                tick_id="tick-warm-pool-revoke",
+                replace=True,
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("warm_pool_revoke: failed to re-enqueue tick (at start)")
+
+    session = SessionLocal()
+    summary: dict = {}
+    try:
+        summary = warm_pool.run_warm_pool_revoke_sweep(session)
+    except Exception:  # noqa: BLE001
+        logger.exception("warm_pool_revoke: sweep failed")
+        # Ре-бросаем — см. run_renewal_check: падение тика уходит в failed → /ops.
+        raise
+    finally:
+        session.close()
+
+    return summary
+
+
+def run_spawn_sweep_tick() -> dict:
+    """Подбор спавнов, застрявших в ``registering`` (finding #70).
+
+    Достройка спавна исторически жила в daemon-потоке backend'а — рестарт
+    контейнера убивал её молча, и оплаченный сервер навсегда оставался
+    невидимым (registering + placeholder-host), продолжая списывать деньги у
+    хостера. Тик зовёт ``node_spawner.sweep_stuck_spawns``, который для каждой
+    застрявшей ноды/exit'а ставит персистентную RQ-джобу
+    ``run_spawn_finalize`` на провижининг-очередь (поток из тика не годится:
+    work-horse завершается сразу после return и убил бы достройку).
+
+    Self-reschedules через ``NODE_SPAWN_SWEEP_INTERVAL`` (default 600s).
+    Disabled при 0. Порог «застрял» — ``NODE_SPAWN_STUCK_MINUTES`` (30).
+    """
+    from .db import SessionLocal
+    from .queue import enqueue_spawn_finalize, schedule_tick
+    from .services import node_spawner
+
+    interval = _env_int("NODE_SPAWN_SWEEP_INTERVAL", 600)
+    if interval > 0:
+        try:
+            schedule_tick(
+                "app.worker.run_spawn_sweep_tick",
+                interval,
+                tick_id="tick-spawn-sweep",
+                replace=True,
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("spawn_sweep: failed to re-enqueue tick (at start)")
+
+    session = SessionLocal()
+    summary: dict = {}
+    try:
+        summary = node_spawner.sweep_stuck_spawns(
+            session, enqueue=enqueue_spawn_finalize
+        )
+    except Exception:  # noqa: BLE001
+        logger.exception("spawn_sweep: sweep failed")
+        # Ре-бросаем — см. run_renewal_check: падение тика уходит в failed → /ops.
+        raise
+    finally:
+        session.close()
+
+    return summary
+
+
+def run_spawn_finalize(kind: str, entity_id: int) -> dict:
+    """RQ-джоба достройки одного застрявшего спавна (finding #70).
+
+    Ставится ``queue.enqueue_spawn_finalize`` из spawn-sweep-тика; сама
+    достройка (wait_for_ipv4 + host + coalesced bootstrap) — в
+    ``node_spawner.resume_stuck_spawn``. Идёт на провижининг-очереди (не
+    тиковой): может ждать IP минуты и не должна голодать короткие тики.
+    """
+    from .services import node_spawner
+
+    return node_spawner.resume_stuck_spawn(kind, entity_id)
+
+
+def run_retention_tick() -> dict:
+    """Периодическая очистка безлимитно растущих таблиц (finding #247).
+
+    Две таблицы пишутся в горячих путях и растут без потолка:
+      * ``audit_logs`` — ``subscription_fetch`` на каждый фетч сабы (клиенты
+        рефрешат ссылку каждые ~6ч) + ``*:delivered`` маркеры доставки
+        уведомлений (дедуп по ним живёт лишь в узком окне продлений/триала);
+      * ``node_traffic_samples`` — по строке на ноду каждые 5 мин с тяжёлым
+        JSONB (детекторам нужны лишь последние тики/часы).
+
+    Чистим строки старше N дней БАТЧАМИ (``id IN (SELECT id … LIMIT batch)``,
+    коммит после каждого батча), чтобы не держать долгий лок на таблице.
+    Прочие audit-события (провижининг, действия админов, DLQ и т.п.) НЕ
+    трогаем — только высокочастотный шум. Индексы на ``created_at`` /
+    ``observed_at`` (миграции 0019/0056) делают выборку батча дешёвой.
+
+    Env:
+      RETENTION_INTERVAL               default 86400 (раз в сутки), 0 = off
+      AUDIT_LOG_RETENTION_DAYS         default 90, 0 = не чистить audit_logs
+      TRAFFIC_SAMPLE_RETENTION_DAYS    default 30, 0 = не чистить сэмплы
+      RETENTION_DELETE_BATCH           default 10000 (строк на батч)
+      RETENTION_MAX_BATCHES            default 200 (потолок батчей/таблицу/тик)
+    Self-reschedules.
+    """
+    from datetime import timedelta
+
+    from sqlalchemy import or_
+
+    from . import models
+    from .db import SessionLocal
+    from .queue import schedule_tick
+    from .time_utils import utcnow
+
+    # Reschedule в начале — см. run_pending_rescue_tick.
+    interval = _env_int("RETENTION_INTERVAL", 86400)
+    if interval > 0:
+        try:
+            schedule_tick(
+                "app.worker.run_retention_tick",
+                interval,
+                tick_id="tick-retention",
+                replace=True,
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("retention: failed to re-enqueue tick (at start)")
+
+    audit_days = _env_int("AUDIT_LOG_RETENTION_DAYS", 90)
+    traffic_days = _env_int("TRAFFIC_SAMPLE_RETENTION_DAYS", 30)
+    batch = max(1, _env_int("RETENTION_DELETE_BATCH", 10000))
+    max_batches = max(1, _env_int("RETENTION_MAX_BATCHES", 200))
+    now = utcnow()
+    summary = {"audit_deleted": 0, "traffic_deleted": 0}
+
+    session = SessionLocal()
+    try:
+        def _bulk_delete_by_ids(model, ids) -> int:
+            return (
+                session.query(model)
+                .filter(model.id.in_(ids))
+                .delete(synchronize_session=False)
+            )
+
+        # ── audit_logs: subscription_fetch + *:delivered старше N дней ──
+        if audit_days > 0:
+            cutoff = now - timedelta(days=audit_days)
+            cond = or_(
+                models.AuditLog.action == "subscription_fetch",
+                models.AuditLog.action.like("%:delivered"),
+                # webapp_open пишется на КАЖДОЕ открытие кабинета (обмен
+                # initData на JWT), т.е. растёт быстрее всего остального —
+                # без чистки таблица распухнет так же, как от
+                # subscription_fetch. Онбординг-воронка считается по свежим
+                # когортам, поэтому 90 дней истории достаточно.
+                models.AuditLog.action == "webapp_open",
+            )
+            for _ in range(max_batches):
+                ids = [
+                    row[0]
+                    for row in session.query(models.AuditLog.id)
+                    .filter(models.AuditLog.created_at < cutoff)
+                    .filter(cond)
+                    .limit(batch)
+                    .all()
+                ]
+                if not ids:
+                    break
+                summary["audit_deleted"] += _bulk_delete_by_ids(models.AuditLog, ids)
+                session.commit()
+                if len(ids) < batch:
+                    break
+
+        # ── node_traffic_samples старше N дней (весь флот) ──
+        if traffic_days > 0:
+            cutoff = now - timedelta(days=traffic_days)
+            for _ in range(max_batches):
+                ids = [
+                    row[0]
+                    for row in session.query(models.NodeTrafficSample.id)
+                    .filter(models.NodeTrafficSample.observed_at < cutoff)
+                    .limit(batch)
+                    .all()
+                ]
+                if not ids:
+                    break
+                summary["traffic_deleted"] += _bulk_delete_by_ids(
+                    models.NodeTrafficSample, ids
+                )
+                session.commit()
+                if len(ids) < batch:
+                    break
+    except Exception:  # noqa: BLE001
+        logger.exception("retention: tick failed")
+        if session.is_active:
+            session.rollback()
+        # Ре-бросаем — см. run_renewal_check: падение тика уходит в failed → /ops.
+        raise
+    finally:
+        session.close()
+
+    if summary["audit_deleted"] or summary["traffic_deleted"]:
+        logger.info(
+            "retention: удалено audit_logs=%s node_traffic_samples=%s",
+            summary["audit_deleted"], summary["traffic_deleted"],
+        )
+    return summary
+
+
+_LOW_BALANCE_THRESHOLD_DAYS = _env_int("LOW_BALANCE_WARN_DAYS", 3)
 
 
 def _maybe_emit_low_balance_warning(session, sub) -> None:
@@ -493,9 +2172,7 @@ def _maybe_emit_low_balance_warning(session, sub) -> None:
     if not user or not user.telegram_id or not user.notify_renewals:
         return
 
-    base_price = balance_svc.plan_price_kopecks(plan)
-    extra_slots = sub.extra_device_slots or 0
-    price = base_price + extra_slots * balance_svc.EXTRA_DEVICE_MONTHLY_KOPECKS
+    price = balance_svc.total_renewal_cost_kopecks(sub)
     if price <= 0:
         return
     wallet = user.balance_kopecks or 0
@@ -548,8 +2225,19 @@ def _run_trial_expiry_pass(session, stats: dict) -> None:
       * Clawbacks dedup on the ``trial_expiry_clawback:<uid>`` reference
         and additionally clear ``trial_expires_at`` so the next tick
         doesn't even enter the loop.
-    Users with at least one ``kind=topup`` are considered "earned" —
-    they keep the bonus and we just clear ``trial_expires_at``.
+
+    Гейт предупреждения (3a): «пополни баланс» не шлём, если баланса
+    хватает на продление живой подписки или живая подписка уже не
+    неоплаченный триал (человек платит). Юзера без живой подписки не
+    пропускаем. ``user_has_paid`` сюда намеренно не берём: пополнение на
+    100 ₽ не покрывает продление за 150 ₽, и предупреждение для такого
+    триальщика правдиво.
+
+    Clawback (3b): платившие (``balance.user_has_paid``) бонус оставляют,
+    таймер просто обнуляется. Остальным списываем только непотраченную
+    часть бонуса по журналу, а не текущий размер триала: иначе у старых
+    30-дневных триалов после смены размера бонуса возврат не совпал бы, а
+    у потративших бонус ушли бы чужие деньги (например, ``referral_payout``).
     """
     from datetime import timedelta
 
@@ -586,6 +2274,11 @@ def _run_trial_expiry_pass(session, stats: dict) -> None:
         )
         if already:
             continue
+        if _trial_warning_not_needed(session, u):
+            # Не помечаем дедупом: баланс может уйти, а подписка остаться
+            # триалом. Следующий тик в окне перепроверит.
+            stats["trial_warn_skipped"] = stats.get("trial_warn_skipped", 0) + 1
+            continue
         session.add(
             models.AuditLog(
                 actor="system",
@@ -614,14 +2307,11 @@ def _run_trial_expiry_pass(session, stats: dict) -> None:
         .all()
     )
     for u in expired:
-        # Paying customer? Keep the bonus, just clear the timer so we
-        # don't revisit this user every tick.
-        has_topup = (
-            session.query(models.BalanceTransaction)
-            .filter_by(user_id=u.id, kind=models.BalanceTxKind.topup)
-            .first()
-        )
-        if has_topup is not None:
+        # Платящий (пополнение, оплаченный счёт, admin_topup, продление с
+        # баланса)? Бонус остаётся, таймер обнуляем, чтобы не возвращаться
+        # к юзеру каждый тик. Прежняя проверка «есть kind=topup» не видела
+        # оплату тарифа картой и ручное зачисление.
+        if balance_svc.user_has_paid(session, u.id):
             u.trial_expires_at = None
             session.add(u)
             stats["trial_kept"] = stats.get("trial_kept", 0) + 1
@@ -638,13 +2328,12 @@ def _run_trial_expiry_pass(session, stats: dict) -> None:
             session.add(u)
             continue
 
-        # Clawback sized to the trial amount that's currently live, but
-        # capped at the user's balance so we can't push them negative.
-        # adjustment() already floors at balance, but we also compute
-        # the trial amount here so the ledger note matches what we
-        # meant to take.
-        trial_amount = balance_svc_trial_amount(session)
-        take = min(trial_amount, u.balance_kopecks or 0)
+        # Возвращаем только непотраченную часть бонуса по журналу, с капом
+        # по балансу (в минус не уводим; adjustment() тоже капает, но сумма
+        # в журнале должна совпадать с тем, что хотели снять).
+        take = min(
+            _unspent_trial_bonus_kopecks(session, u.id), u.balance_kopecks or 0
+        )
         if take > 0:
             balance_svc.adjustment(
                 session,
@@ -659,16 +2348,67 @@ def _run_trial_expiry_pass(session, stats: dict) -> None:
     session.commit()
 
 
-def balance_svc_trial_amount(session) -> int:
-    """Thin wrapper around ``services.trial.trial_amount_kopecks``.
+def _trial_warning_not_needed(session, user) -> bool:
+    """Гейт 3a: предупреждение «пополни баланс» ложно или не нужно.
 
-    Defined at module scope (rather than inlined) so mocking it in
-    tests is trivial. Imports lazily to dodge the circular-import risk
-    between ``worker`` and ``services.trial`` (both pull ``models``).
+    Правда, если у юзера есть живая (active/frozen) подписка, которая уже
+    не неоплаченный триал (человек платит), или баланса хватает на её
+    продление целиком (тариф + слоты). Без живой подписки ложь: такого юзера
+    предупреждаем, как и раньше. Бонус-онли платящим (забрали в кабинете
+    только деньги при живой подписке) тоже сюда: их подписка не триал.
     """
-    from .services import trial as trial_svc
+    from . import models
+    from .services import balance as balance_svc
 
-    return trial_svc.trial_amount_kopecks(session)
+    live = (
+        session.query(models.Subscription)
+        .filter(
+            models.Subscription.user_id == user.id,
+            models.Subscription.status.in_(
+                [models.SubscriptionStatus.active, models.SubscriptionStatus.frozen]
+            ),
+        )
+        .all()
+    )
+    wallet = user.balance_kopecks or 0
+    for sub in live:
+        if not balance_svc.is_unpaid_trial(session, sub):
+            return True
+        if wallet >= balance_svc.total_renewal_cost_kopecks(sub):
+            return True
+    return False
+
+
+def _unspent_trial_bonus_kopecks(session, user_id: int) -> int:
+    """Непотраченная часть триального бонуса по журналу.
+
+    ``trial:{uid}`` + ``referral_signup:{uid}`` минус модуль суммы ВСЕХ
+    ``spend`` юзера, не меньше нуля. Вычитаем все траты, а не только
+    ``trial-full:``: старые кабинетные триалы тратили бонус через
+    ``activate:{sub.id}``, и при вычете одного ``trial-full`` clawback снял
+    бы у них чужие деньги (например, ``referral_payout``). Для новых
+    триалов бонус целиком уходит на подписку, и результат 0.
+    """
+    from sqlalchemy import func
+
+    from . import models
+
+    tx = models.BalanceTransaction
+    bonus = (
+        session.query(func.coalesce(func.sum(tx.amount_kopecks), 0))
+        .filter(
+            tx.user_id == user_id,
+            tx.kind == models.BalanceTxKind.bonus,
+            tx.reference.in_([f"trial:{user_id}", f"referral_signup:{user_id}"]),
+        )
+        .scalar()
+    )
+    spent = (
+        session.query(func.coalesce(func.sum(tx.amount_kopecks), 0))
+        .filter(tx.user_id == user_id, tx.kind == models.BalanceTxKind.spend)
+        .scalar()
+    )
+    return max(0, int(bonus or 0) - abs(int(spent or 0)))
 
 
 def run_balance_charge_tick() -> dict:
@@ -697,7 +2437,7 @@ def run_balance_charge_tick() -> dict:
     from .time_utils import utcnow
 
     # Reschedule в начале — см. run_pending_rescue_tick.
-    interval = int(os.getenv("BALANCE_CHARGE_INTERVAL", "3600"))
+    interval = _env_int("BALANCE_CHARGE_INTERVAL", 3600)
     if interval > 0:
         try:
             schedule_tick(
@@ -716,23 +2456,53 @@ def run_balance_charge_tick() -> dict:
         now = utcnow()
 
         # ── Pass 1: renew due active subs (auto_renew=True) ───────────
-        due_renew = (
-            session.query(models.Subscription)
+        # Берём только id должников БЕЗ удержания локов: commit после каждой
+        # подписки внутри цикла всё равно закрывал бы транзакцию и снимал
+        # FOR UPDATE со ВСЕХ ещё не обработанных строк батча — оставшиеся 499
+        # дальше «продлевались» бы без блокировки, и параллельный продлеватель
+        # (renewal_check, второй тиковый воркер, ручной прогон) мог списать
+        # деньги дважды. Поэтому лочим каждую подписку индивидуально в своей
+        # короткой транзакции и перепроверяем условие уже под локом.
+        due_renew_ids = [
+            row[0]
+            for row in session.query(models.Subscription.id)
             .filter(
                 models.Subscription.status == models.SubscriptionStatus.active,
                 models.Subscription.auto_renew.is_(True),
                 models.Subscription.expires_at.isnot(None),
                 models.Subscription.expires_at <= now,
             )
-            .with_for_update(skip_locked=True)
+            .order_by(models.Subscription.expires_at.asc())
             .limit(500)
             .all()
-        )
-        for sub in due_renew:
+        ]
+        for sub_id in due_renew_ids:
             try:
+                sub = (
+                    session.query(models.Subscription)
+                    .filter(models.Subscription.id == sub_id)
+                    .with_for_update(skip_locked=True)
+                    .first()
+                )
+                if sub is None:
+                    # Строку залочил другой воркер (skip_locked) или её удалили —
+                    # чужой тик её обработает, пропускаем.
+                    session.rollback()
+                    continue
+                # Перепроверка под локом: пока строка ждала лока, параллельный
+                # продлеватель мог уже продлить/экспайрить её (status/expires_at/
+                # тумблер изменились) — тогда повторно списывать нельзя.
+                if (
+                    sub.status != models.SubscriptionStatus.active
+                    or not sub.auto_renew
+                    or sub.expires_at is None
+                    or sub.expires_at > now
+                ):
+                    session.rollback()
+                    continue
                 ok = balance.renew_subscription(session, sub)
             except Exception:
-                logger.exception("balance: renew failed for sub %s", sub.id)
+                logger.exception("balance: renew failed for sub %s", sub_id)
                 stats["errors"] += 1
                 session.rollback()
                 continue
@@ -766,24 +2536,44 @@ def run_balance_charge_tick() -> dict:
             session.commit()
 
         # ── Pass 3: auto-unfreeze expired pauses ─────────────────────
-        expired_freezes = (
-            session.query(models.Subscription)
+        # Тот же паттерн, что и в пассе 1: commit-в-цикле после общего
+        # with_for_update снимал локи со всего батча, поэтому лочим каждую
+        # подписку по отдельности и перепроверяем условие под локом.
+        expired_freeze_ids = [
+            row[0]
+            for row in session.query(models.Subscription.id)
             .filter(
                 models.Subscription.status == models.SubscriptionStatus.frozen,
                 models.Subscription.frozen_until.isnot(None),
                 models.Subscription.frozen_until <= now,
             )
-            .with_for_update(skip_locked=True)
+            .order_by(models.Subscription.frozen_until.asc())
             .limit(100)
             .all()
-        )
-        for sub in expired_freezes:
+        ]
+        for sub_id in expired_freeze_ids:
             try:
+                sub = (
+                    session.query(models.Subscription)
+                    .filter(models.Subscription.id == sub_id)
+                    .with_for_update(skip_locked=True)
+                    .first()
+                )
+                if sub is None:
+                    session.rollback()
+                    continue
+                if (
+                    sub.status != models.SubscriptionStatus.frozen
+                    or sub.frozen_until is None
+                    or sub.frozen_until > now
+                ):
+                    session.rollback()
+                    continue
                 balance.unfreeze_subscription(session, sub, auto=True)
                 stats["unfrozen"] += 1
                 session.commit()
             except Exception:
-                logger.exception("balance: auto-unfreeze failed for sub %s", sub.id)
+                logger.exception("balance: auto-unfreeze failed for sub %s", sub_id)
                 stats["errors"] += 1
                 session.rollback()
 
@@ -800,6 +2590,8 @@ def run_balance_charge_tick() -> dict:
         stats["errors"] += 1
         if session.is_active:
             session.rollback()
+        # Ре-бросаем — см. run_renewal_check: тик уходит в failed → виден в /ops.
+        raise
     finally:
         session.close()
 
@@ -832,7 +2624,7 @@ def run_traffic_stats_tick() -> dict:
     # это особенно критично: SSH-сессии по всем нодам регулярно зависают
     # и job убивается по job_timeout=120s, end-of-body reschedule бы не
     # выполнился.
-    interval = int(os.getenv("TRAFFIC_STATS_INTERVAL", "300"))
+    interval = _env_int("TRAFFIC_STATS_INTERVAL", 300)
     if interval > 0:
         try:
             schedule_tick(
@@ -871,10 +2663,301 @@ def run_traffic_stats_tick() -> dict:
         logger.exception("traffic_stats: tick failed")
         if session.is_active:
             session.rollback()
+        # Ре-бросаем — см. run_renewal_check: тик уходит в failed → виден в /ops.
+        raise
     finally:
         session.close()
 
     return summary
+
+
+def _auto_diagnose_stale_links(session) -> dict:
+    """Auto-trigger diagnostics for relay→exit WG links with stale handshakes.
+
+    Сценарий: WG-туннель прицеплен, last_observed_at свежий (= relay
+    отвечает на SSH тик и `wg show all dump` парсится), но
+    last_handshake_at либо NULL (handshake никогда не проходил), либо
+    отстал больше чем AUTO_DIAGNOSE_HANDSHAKE_STALE_MIN минут. Это
+    тот самый паттерн, который оператор ловил руками на новой ноде
+    после attach к exit'у.
+
+    Каждому подозрительному линку ENQUEUE'ится diagnose-task с урезанным
+    набором check_types (handshake-side только — full набор ~20s, этот
+    ~5s) и audit_log запись `symptom_detected`, по которой потом дебаунс
+    решает «уже бежал недавно, ждём результата».
+
+    Env vars:
+      AUTO_DIAGNOSE_ENABLED                 default true
+      AUTO_DIAGNOSE_HANDSHAKE_STALE_MIN     default 10
+      AUTO_DIAGNOSE_OBSERVED_FRESH_MIN      default 8  (=relay тик прошёл недавно)
+      AUTO_DIAGNOSE_DEBOUNCE_MIN            default 30 (per-link дедуп)
+      AUTO_DIAGNOSE_MAX_PER_TICK            default 3  (rate-limit на tick)
+    """
+    if os.getenv("AUTO_DIAGNOSE_ENABLED", "true").lower() not in {"1", "true", "yes"}:
+        return {"enabled": False, "enqueued": []}
+
+    from datetime import timedelta
+
+    from sqlalchemy import func as sa_func
+
+    from . import models
+    from .services.provisioning import ProvisioningOrchestrator
+    from .time_utils import utcnow
+
+    stale_hs_min = _env_int("AUTO_DIAGNOSE_HANDSHAKE_STALE_MIN", 10)
+    observed_fresh_min = _env_int("AUTO_DIAGNOSE_OBSERVED_FRESH_MIN", 8)
+    debounce_min = _env_int("AUTO_DIAGNOSE_DEBOUNCE_MIN", 30)
+    max_per_tick = _env_int("AUTO_DIAGNOSE_MAX_PER_TICK", 3)
+
+    now = utcnow()
+    observed_cutoff = now - timedelta(minutes=observed_fresh_min)
+    stale_hs_cutoff = now - timedelta(minutes=stale_hs_min)
+    debounce_cutoff = now - timedelta(minutes=debounce_min)
+
+    # Кандидаты: тик отработал по этому relay недавно, handshake либо
+    # пустой, либо старый. last_observed_at IS NULL отсекаем — пока
+    # один SSH ни разу не прошёл, диагностика всё равно не сможет
+    # сделать `wg show` со стороны jump.
+    #
+    # JOIN с VPNNode + filter VPNNode.diagnostics_disabled_at IS NULL —
+    # оператор выключил диагностику ноды (новый hard-тумблер, migration
+    # 0039; старый auto_diagnose_disabled_at в неё забэкфилен). getattr-
+    # guard для backward-compat: если 0039 ещё не накатилась, фильтр
+    # пропускаем (worst case: лишние diagnose тики, но не падение).
+    node_disabled_col = getattr(models.VPNNode, "diagnostics_disabled_at", None)
+
+    # ORDER BY (handshake_at IS NULL DESC, handshake_at ASC) — NULL первыми
+    # (never observed = worst), потом самые stale → за один tick покрываем
+    # худшие случаи раньше всего. LIMIT max_per_tick прямо в запросе —
+    # candidate-list не превышает rate-limit, дебаунс не нужно скипать
+    # лишние раз. Остальные unhealthy подождут следующего tick (через
+    # 5 мин, что safely ниже debounce window 30 мин).
+    candidates_q = (
+        session.query(models.RelayExitLink)
+        .join(models.VPNNode, models.VPNNode.id == models.RelayExitLink.relay_node_id)
+        .filter(models.RelayExitLink.last_observed_at.isnot(None))
+        .filter(models.RelayExitLink.last_observed_at >= observed_cutoff)
+        .filter(
+            (models.RelayExitLink.last_handshake_at.is_(None))
+            | (models.RelayExitLink.last_handshake_at < stale_hs_cutoff)
+        )
+    )
+    if node_disabled_col is not None:
+        candidates_q = candidates_q.filter(node_disabled_col.is_(None))
+    candidates = (
+        candidates_q
+        .order_by(
+            sa_func.coalesce(
+                models.RelayExitLink.last_handshake_at,
+                # epoch для NULL — на 1970-01-01 (=максимальная stale)
+                # чтобы они отсортировались первыми.
+                sa_func.cast("1970-01-01", models.RelayExitLink.last_handshake_at.type),
+            ).asc(),
+            models.RelayExitLink.id.asc(),
+        )
+        .limit(max_per_tick * 4)  # с запасом — дебаунс может выкинуть часть
+        .all()
+    )
+
+    enqueued: list[dict] = []
+    skipped_debounced: list[int] = []
+    skipped_disabled: list[int] = []
+    auto_check_types = ["peer_on_jump", "handshake_age", "ping_endpoint"]
+
+    for link in candidates:
+        if len(enqueued) >= max_per_tick:
+            break
+        # Debounce: пропускаем, если symptom_detected уже логнут
+        # за последние debounce_min минут.
+        recent = (
+            session.query(models.AuditLog)
+            .filter(models.AuditLog.target_type == "relay_exit_link")
+            .filter(models.AuditLog.target_id == link.id)
+            .filter(models.AuditLog.action == "symptom_detected")
+            .filter(models.AuditLog.created_at >= debounce_cutoff)
+            .first()
+        )
+        if recent:
+            skipped_debounced.append(link.id)
+            continue
+
+        last_hs = link.last_handshake_at
+        hs_age_min = (
+            int((now - last_hs).total_seconds() // 60) if last_hs else None
+        )
+        symptom = "no_handshake" if last_hs is None else "stale_handshake"
+
+        orchestrator = ProvisioningOrchestrator(session)
+        task = orchestrator.create_task(
+            "relay_tunnel",
+            link.relay_node_id,
+            "diagnose",
+            {
+                "link_id": link.id,
+                "exit_id": link.exit_id,
+                "check_types": auto_check_types,
+                "auto_triggered": True,
+            },
+        )
+        session.add(
+            models.AuditLog(
+                actor="auto-diagnose",
+                actor_type=models.AuditActor.system,
+                action="symptom_detected",
+                target_type="relay_exit_link",
+                target_id=link.id,
+                extra={
+                    "symptom": symptom,
+                    "last_hs_age_min": hs_age_min,
+                    "link_id": link.id,
+                    "relay_node_id": link.relay_node_id,
+                    "exit_id": link.exit_id,
+                    "action_taken": f"enqueued_task:{task.id}",
+                    "check_types": auto_check_types,
+                    "stale_threshold_min": stale_hs_min,
+                },
+            )
+        )
+        session.commit()
+        # run_task_async читает task.id из DB — коммит перед enqueue обязателен.
+        orchestrator.run_task_async(task)
+        enqueued.append({
+            "link_id": link.id,
+            "task_id": task.id,
+            "symptom": symptom,
+            "hs_age_min": hs_age_min,
+        })
+        logger.info(
+            "auto_diagnose: link=%s relay=%s exit=%s symptom=%s task=%s",
+            link.id, link.relay_node_id, link.exit_id, symptom, task.id,
+        )
+
+    return {
+        "enabled": True,
+        "candidates": len(candidates),
+        "enqueued": enqueued,
+        "skipped_debounced": skipped_debounced,
+        "skipped_disabled": skipped_disabled,
+        "max_per_tick": max_per_tick,
+    }
+
+
+def _auto_diagnose_unreachable_nodes(
+    session, failed_relay_names: list[str]
+) -> dict:
+    """Auto-trigger node-level diagnose для нод, на которые SSH не дошёл.
+
+    Сценарий: relay_link_health tick попытался достучаться до relay по
+    SSH (paramiko в collect_all_relay_links), упал — записал имя в
+    `failed_relay_names`. Это node-level симптом: «нода не отвечает по
+    SSH» — link-level smart-diagnose не поможет (ему тоже нужен SSH).
+
+    Что делаем: per-failed-node enqueue ProvisioningTask с target_type=
+    'node', action='diagnose' (это уже work'ает — `playbooks/diagnose_
+    node.yml` гоняет `check_node_health` через ansible, который сам
+    retry'ит SSH с другими таймаутами + соберёт listening sockets и
+    systemd state если хоть на чуть дотянется). + audit_log symptom_
+    detected с target_type='vpn_node'.
+
+    Mute: skip nodes где VPNNode.auto_diagnose_disabled_at IS NOT NULL.
+    Debounce: 30 мин per-node через audit_log lookup — иначе при stale
+    SSH-проблеме каждые 5 мин будем спамить tasks.
+
+    Env vars:
+      AUTO_DIAGNOSE_NODE_ENABLED         default true
+      AUTO_DIAGNOSE_NODE_DEBOUNCE_MIN    default 30
+      AUTO_DIAGNOSE_NODE_MAX_PER_TICK    default 2
+    """
+    if not failed_relay_names:
+        return {"enabled": True, "enqueued": [], "candidates": 0}
+    if os.getenv("AUTO_DIAGNOSE_NODE_ENABLED", "true").lower() not in {"1", "true", "yes"}:
+        return {"enabled": False, "enqueued": []}
+
+    from datetime import timedelta
+
+    from . import models
+    from .services.provisioning import ProvisioningOrchestrator
+    from .time_utils import utcnow
+
+    debounce_min = _env_int("AUTO_DIAGNOSE_NODE_DEBOUNCE_MIN", 30)
+    max_per_tick = _env_int("AUTO_DIAGNOSE_NODE_MAX_PER_TICK", 2)
+
+    now = utcnow()
+    debounce_cutoff = now - timedelta(minutes=debounce_min)
+
+    # Resolve names → VPNNode rows. Filter muted сразу — saves audit query.
+    disabled_col = getattr(models.VPNNode, "auto_diagnose_disabled_at", None)
+    nodes_q = (
+        session.query(models.VPNNode)
+        .filter(models.VPNNode.name.in_(failed_relay_names))
+    )
+    if disabled_col is not None:
+        nodes_q = nodes_q.filter(disabled_col.is_(None))
+    nodes = nodes_q.all()
+
+    enqueued: list[dict] = []
+    skipped_debounced: list[int] = []
+
+    for node in nodes:
+        if len(enqueued) >= max_per_tick:
+            break
+        # Per-node debounce. Action имя другое чем у link-level
+        # ('node_unreachable_detected'), чтобы две дебаунс-зоны не
+        # пересекались — link-level и node-level могут срабатывать
+        # независимо для одной и той же ноды.
+        recent = (
+            session.query(models.AuditLog)
+            .filter(models.AuditLog.target_type == "vpn_node")
+            .filter(models.AuditLog.target_id == node.id)
+            .filter(models.AuditLog.action == "node_unreachable_detected")
+            .filter(models.AuditLog.created_at >= debounce_cutoff)
+            .first()
+        )
+        if recent:
+            skipped_debounced.append(node.id)
+            continue
+
+        orchestrator = ProvisioningOrchestrator(session)
+        task = orchestrator.create_task(
+            "node",
+            node.id,
+            "diagnose",
+            {"auto_triggered": True, "symptom": "node_unreachable"},
+        )
+        session.add(
+            models.AuditLog(
+                actor="auto-diagnose",
+                actor_type=models.AuditActor.system,
+                action="node_unreachable_detected",
+                target_type="vpn_node",
+                target_id=node.id,
+                extra={
+                    "symptom": "node_unreachable",
+                    "node_name": node.name,
+                    "action_taken": f"enqueued_task:{task.id}",
+                    "trigger": "relay_link_health_ssh_fail",
+                },
+            )
+        )
+        session.commit()
+        orchestrator.run_task_async(task, node=node)
+        enqueued.append({
+            "node_id": node.id,
+            "node_name": node.name,
+            "task_id": task.id,
+        })
+        logger.info(
+            "auto_diagnose_node: node=%s (%s) unreachable → diagnose task=%s",
+            node.id, node.name, task.id,
+        )
+
+    return {
+        "enabled": True,
+        "candidates": len(nodes),
+        "enqueued": enqueued,
+        "skipped_debounced": skipped_debounced,
+        "max_per_tick": max_per_tick,
+    }
 
 
 def run_relay_link_health_tick() -> dict:
@@ -899,7 +2982,7 @@ def run_relay_link_health_tick() -> dict:
     # Reschedule в начале — см. run_pending_rescue_tick. Аналогично
     # traffic-stats, SSH ходит по всем relay нодам и периодически
     # зависает, поэтому reschedule ДО работы обязателен.
-    interval = int(os.getenv("RELAY_LINK_HEALTH_INTERVAL", "300"))
+    interval = _env_int("RELAY_LINK_HEALTH_INTERVAL", 300)
     if interval > 0:
         try:
             schedule_tick(
@@ -915,10 +2998,557 @@ def run_relay_link_health_tick() -> dict:
     session = SessionLocal()
     try:
         summary = relay_link_health.collect_all_relay_links(session)
+
+        # Smart-trigger автодиагностики для stale-handshake линков. Тик уже
+        # обновил last_handshake_at/last_observed_at — на их основе мы
+        # выявляем links где WG явно жив со стороны мониторинга (SSH
+        # прошёл = last_observed_at свежий), но handshake'и не текут.
+        # Это симптом «attach прошёл, но trafficу не идёт» — exactly
+        # тот сценарий, что юзер ловил руками на ru-adminvps-01.
+        try:
+            auto_summary = _auto_diagnose_stale_links(session)
+            if auto_summary.get("enqueued"):
+                summary["auto_diagnose"] = auto_summary
+        except Exception:  # noqa: BLE001
+            logger.exception("relay_link_health: auto_diagnose failed")
+
+        # Node/exit down-detection + the admin push moved to
+        # ``run_node_reachability_tick``: it probes ALL active nodes + exits
+        # (not just relays with exit-links) and emits a SPEAKING diagnosis
+        # push with ack/mute/follow inline buttons instead of the old static
+        # "Проверь /admin/nodes" alert, with the once-per-incident anti-spam
+        # gate in ``diagnostics_state``. The relay tick now only polls WG
+        # handshakes and auto-diagnoses stale LINKS (a signal reachability
+        # can't see — a relay can be ssh-up while its tunnel to an exit is
+        # dead). ``failed_relay_names`` stays in ``summary`` for telemetry.
     except Exception:  # noqa: BLE001
         logger.exception("relay_link_health: tick failed")
         if session.is_active:
             session.rollback()
+        # Ре-бросаем — см. run_renewal_check: тик уходит в failed → виден в /ops.
+        raise
+    finally:
+        session.close()
+
+    return summary
+
+
+def _incident_auto_close_blocked(target, now) -> bool:
+    """True → инцидент НЕЛЬЗЯ автозакрывать по ssh_ok/реконсайлу (finding #98).
+
+    ``close_incident`` обнуляет ``diagnose_acked_at`` и ``diagnose_follow_mode``.
+    Для двух случаев это стирает значимое состояние и делает кнопки крауд-пуша
+    нефункциональными:
+
+      * оператор явно взял инцидент в работу — ``ack`` (``diagnose_acked_at``
+        свежее открытия) или ``follow`` (``diagnose_follow_mode=='exponential'``);
+      * крауд-инцидент: нода выведена из пула по жалобам юзеров
+        (``cooldown_until`` в будущем). SSH к такой ноде здоров КАЖДЫЙ тик —
+        юзеров блокирует DPI/РКН, а не контроллера, — поэтому ssh_ok-ветка без
+        этого гварда закрывала бы крауд-инцидент немедленно, стирая нажатый
+        оператором ack/follow, и порог заново пушил бы после cooldown, как
+        будто оператор ничего не жал.
+
+    Ручной close (кнопка оператора) идёт мимо этого гварда — оператор всегда
+    может закрыть инцидент сам. ``cooldown_until`` есть только у ``VPNNode``;
+    у ``WGExitNode`` его нет — ``getattr`` вернёт None и ветка не сработает.
+    """
+    incident_open = getattr(target, "diagnose_incident_open_at", None)
+    if incident_open is None:
+        return False
+    acked = getattr(target, "diagnose_acked_at", None)
+    if acked is not None and acked >= incident_open:
+        return True
+    if getattr(target, "diagnose_follow_mode", None) == "exponential":
+        return True
+    cooldown_until = getattr(target, "cooldown_until", None)
+    return cooldown_until is not None and cooldown_until > now
+
+
+def _node_vpn_tcp_ports(node) -> list[int]:
+    """TCP VPN-порты ноды для liveness-пробы сервиса (finding #1 сетевого аудита).
+
+    SSH-доступность ≠ работающий VPN: xray мог упасть/не слушать порт при живом
+    sshd. Берём порты из enabled ``VPNConfig`` ноды, ИСКЛЮЧАЯ hysteria2 (UDP —
+    TCP-проба его не проверяет, иначе hysteria-only нода ложно читалась бы как
+    degraded). ``NODE_VPN_PROBE_PORTS`` (csv) переопределяет список вручную;
+    пустой результат = проверку порта пропускаем (прежнее поведение).
+    """
+    override = os.getenv("NODE_VPN_PROBE_PORTS", "").strip()
+    if override:
+        ports: set[int] = set()
+        for tok in override.split(","):
+            tok = tok.strip()
+            if not tok:
+                continue
+            try:
+                ports.add(int(tok))
+            except ValueError:
+                logger.warning("NODE_VPN_PROBE_PORTS: не число %r — пропускаю", tok)
+        return sorted(ports)
+    ports = set()
+    for cfg in getattr(node, "configs", None) or []:
+        if not getattr(cfg, "is_enabled", True):
+            continue
+        proto = getattr(cfg, "protocol", None)
+        proto_val = getattr(proto, "value", proto)
+        if proto_val == "hysteria2":  # UDP — TCP-пробой не проверяется
+            continue
+        p = getattr(cfg, "port", None)
+        if p:
+            ports.add(int(p))
+    return sorted(ports)
+
+
+def _probe_port_open(probe, port: int) -> bool:
+    """True, если проба зафиксировала TCP-порт открытым (или его не проверяли).
+
+    ``extra_tcp_ports`` кладёт в ``probe.checks`` запись с name ``tcp:{port}``
+    и status ok/fail. Если записи нет (порт не пробовали) — НЕ считаем закрытым,
+    чтобы не поднять ложный degraded.
+    """
+    name = f"tcp:{port}"
+    for c in probe.checks:
+        if c.get("name") == name:
+            return c.get("status") == "ok"
+    return True
+
+
+def _controller_has_network() -> bool:
+    """Есть ли у контроллера (worker) выход в сеть (finding #3 сетевого аудита).
+
+    Перед тем как метить цели недоступными, убеждаемся, что упал не сам
+    аплинк/DNS воркера. Пробуем TCP до внешних якорей ``NODE_CONTROLLER_ANCHORS``
+    (csv host:port, default cloudflare+google:443). Хоть один ответил → сеть
+    есть. ВСЕ молчат → считаем контроллер оффлайн. Пустой список отключает
+    проверку (всегда True) — на случай egress-политики без прямого интернета.
+    """
+    import socket as _socket
+
+    raw = os.getenv("NODE_CONTROLLER_ANCHORS", "1.1.1.1:443,8.8.8.8:443").strip()
+    if not raw:
+        return True
+    anchors: list[tuple[str, int]] = []
+    for item in raw.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        h, sep, p = item.rpartition(":")
+        if sep:
+            try:
+                anchors.append((h, int(p)))
+            except ValueError:
+                continue
+        else:
+            anchors.append((item, 443))
+    if not anchors:
+        return True
+    timeout = float(os.getenv("NODE_CONTROLLER_ANCHOR_TIMEOUT", "5"))
+    for host, port in anchors:
+        try:
+            with _socket.create_connection((host, port), timeout=timeout):
+                return True
+        except OSError:
+            continue
+    return False
+
+
+def run_node_reachability_tick() -> dict:
+    """Controller→host reachability for ALL active VPN nodes + WG exits.
+
+    The single owner of node/exit down-detection (the old relay tick only
+    saw relay nodes with exit-links). Per target runs a staged local probe
+    (ping → tcp:ssh → ssh-pong); on DOWN it consults
+    ``diagnostics_state.should_diagnose`` (the once-per-incident anti-spam
+    gate), and when that fires: opens the incident, sends a SPEAKING admin
+    push built from the probe checks (unless alerts muted), and enqueues the
+    full on-host diagnose task for the detailed /tasks checklist. On RECOVERY
+    it closes the incident so the next outage is fresh.
+
+    Self-reschedules every NODE_REACHABILITY_INTERVAL sec (default 300).
+    Disabled at 0. NODE_REACHABILITY_MAX_DIAGNOSE_PER_TICK (default 4) caps
+    how many full diagnoses we kick off per tick so a multi-node outage
+    can't dogpile ansible.
+    """
+    from .db import SessionLocal
+    from .queue import schedule_tick
+    from . import models
+    from .services import diagnostics, diagnostics_state
+    from .services.admin_notify import notify_admins, notify_node_diagnosis
+    from .services.provisioning import ProvisioningOrchestrator
+    from .time_utils import utcnow
+
+    # Reschedule first (SSH can hang) — same pattern as the other ticks.
+    interval = _env_int("NODE_REACHABILITY_INTERVAL", 300)
+    if interval > 0:
+        try:
+            schedule_tick(
+                "app.worker.run_node_reachability_tick",
+                interval,
+                tick_id="tick-node-reachability",
+                replace=True,
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("node_reachability: failed to re-enqueue tick (at start)")
+
+    if os.getenv("NODE_REACHABILITY_ENABLED", "true").lower() not in {"1", "true", "yes"}:
+        return {"enabled": False}
+
+    max_diag = _env_int("NODE_REACHABILITY_MAX_DIAGNOSE_PER_TICK", 4)
+    # Анти-спам: не диагностируем/алертим, пока недоступность не подтвердилась
+    # серией пробов длиной >= confirm_min минут (единичный пропущенный пинг —
+    # не повод будить админа). Дефолт 20 мин ≈ «5 мин + 15 мин» из ТЗ; при
+    # интервале тика 300с это ~4 проба подряд. Тюнится NODE_ALERT_CONFIRM_MIN;
+    # 0 = старое поведение (алерт с первого DOWN).
+    confirm_min = float(os.getenv("NODE_ALERT_CONFIRM_MIN", "20"))
+    summary: dict = {
+        "enabled": True,
+        "checked": 0,
+        "down": [],
+        "recovered": [],
+        "reconciled": [],
+        "suspect": [],
+        "diagnosed": [],
+        "pushed": [],
+    }
+    session = SessionLocal()
+    try:
+        targets: list[tuple[str, object]] = []
+        for n in (
+            session.query(models.VPNNode)
+            .filter(models.VPNNode.is_active.is_(True))
+            .all()
+        ):
+            targets.append(("node", n))
+        for e in (
+            session.query(models.WGExitNode)
+            .filter(models.WGExitNode.is_active.is_(True))
+            .all()
+        ):
+            targets.append(("exit", e))
+
+        # Анти-голодание: обходим цели в порядке «дольше всех не пробовалась»
+        # (last_probe_at ASC, NULLS FIRST). Раньше порядок был фиксированный
+        # (все node, потом все exit): несколько лежащих нод в начале списка
+        # съедали весь wall-clock бюджет (~30с таймаутов каждая), и хвост —
+        # в первую очередь exit-ноды — не пробовался ВООБЩЕ, пока длится
+        # отказ. Сортировка по давности проба сама ротирует порядок между
+        # тиками: обрезанный бюджетом хвост становится самым «голодным» и
+        # идёт первым в следующем тике.
+        from datetime import datetime as _datetime, timedelta as _timedelta
+        targets.sort(key=lambda kt: kt[1].last_probe_at or _datetime.min)
+
+        # Бэкстоп-реконсиляция: закрыть инциденты, оставшиеся открытыми на уже
+        # здоровых целях (last_probe_status=='ok', серии падений нет). Покрывает
+        # пропуски штатного закрытия на ssh_ok — обрезанный бюджетом хвост,
+        # крауд-открытые инциденты на SSH-здоровой ноде, подвисший тик. Дешёвый
+        # проход без SSH, до бюджетного цикла, поэтому не голодает. Штатное
+        # немедленное закрытие на ssh_ok ниже остаётся.
+        recon_now = utcnow()
+        recon_max_age = float(os.getenv("NODE_INCIDENT_RECONCILE_MAX_AGE_MIN", "30"))
+        for kind, target in targets:
+            # Крауд-инцидент / взятый оператором в работу не реконсилим:
+            # close стёр бы ack/follow (finding #98). Оператор закрывает вручную.
+            if _incident_auto_close_blocked(target, recon_now):
+                continue
+            if diagnostics_state.reconcile_healthy_incident(
+                target, now=recon_now, max_age_min=recon_max_age
+            ):
+                summary["reconciled"].append(f"{kind}:{target.id}")
+        if summary["reconciled"]:
+            session.commit()
+
+        # Finding #3: self-check связности контроллера ДО пер-нодовых пробов.
+        # Если у самого воркера нет выхода в сеть (упал аплинк/DNS/NAT),
+        # ping/tcp/ssh упадут для ВСЕХ целей разом и весь флот уйдёт в ложный
+        # DOWN. Прежде чем метить цели, убеждаемся, что контроллер вообще
+        # видит внешнюю сеть; если нет — один агрегированный алерт и выход.
+        if not _controller_has_network():
+            summary["controller_offline"] = True
+            logger.error(
+                "node_reachability: контроллер не видит внешнюю сеть (все якоря "
+                "недоступны) — пропускаю пер-нодовые пробы, чтобы не пометить "
+                "весь флот ложным DOWN"
+            )
+            try:
+                notify_admins(
+                    session,
+                    kind="controller_offline",
+                    text=(
+                        "⚠️ Монитор доступности потерял выход в сеть (внешние "
+                        "якоря недоступны). Пер-нодовые проверки пропущены, "
+                        "чтобы не поднимать ложные алерты по всему флоту. "
+                        "Проверьте сеть/DNS воркера."
+                    ),
+                    dedup_key={"scope": "reachability"},
+                    window_sec=1800,
+                    autocommit=True,
+                )
+            except Exception:  # noqa: BLE001
+                logger.exception("node_reachability: controller-offline alert failed")
+            return summary
+
+        import time as _time
+
+        # Per-tick wall-clock budget. Serial ping/ssh per DOWN target costs
+        # seconds (each blackholed probe waits its timeout) and the RQ job
+        # timeout is tick-node-reachability=240s. Stop probing once we near
+        # it — the tick already self-rescheduled at the top, so the unprobed
+        # tail is picked up next cycle instead of the whole tick getting
+        # killed mid-loop by the RQ kill-horse (which would also rotate which
+        # targets get starved). Default 200s leaves headroom under 240s.
+        budget_s = _env_int("NODE_REACHABILITY_BUDGET_SEC", 200)
+        started = _time.monotonic()
+        diagnosed = 0
+        down_count = 0
+        # Finding #7: дыра между пробами > interval*gap_factor означает, что
+        # непрерывного наблюдения не было — серию перезапускаем, а не
+        # эскалируем по дырявому wall-clock.
+        gap_factor = float(os.getenv("NODE_PROBE_GAP_FACTOR", "2"))
+        # Finding #3 (mass-down): доля одновременно упавших целей выше порога →
+        # подавляем индивидуальные алерты (вероятно, сеть контроллера, а не
+        # весь флот сразу). Default 0 = выключено (анкерный self-check выше —
+        # основной механизм).
+        mass_down_fraction = float(os.getenv("NODE_MASS_DOWN_FRACTION", "0"))
+        mass_down_min = _env_int("NODE_MASS_DOWN_MIN", 5)
+        for kind, target in targets:
+            if _time.monotonic() - started > budget_s:
+                summary["budget_exceeded_after"] = summary["checked"]
+                logger.warning(
+                    "node_reachability: wall-clock budget %ss hit after %s targets — "
+                    "deferring rest to next tick",
+                    budget_s, summary["checked"],
+                )
+                break
+            host = getattr(target, "host", None)
+            if not host:
+                continue
+            summary["checked"] += 1
+            # Finding #7: запоминаем время ПРЕДЫДУЩЕГО проба ДО перезаписи —
+            # нужно, чтобы отличить непрерывную серию DOWN от двух замеров,
+            # разнесённых бюджетной дырой (тогда wall-clock врёт).
+            prev_probe_at = getattr(target, "last_probe_at", None)
+            # Finding #1: при живом SSH дополнительно пробим TCP VPN-порт(ы)
+            # ноды — SSH-liveness ≠ VPN-liveness. Порты берём из enabled
+            # VPNConfig (hysteria2/UDP исключён). У exit-нод (WG/UDP) — пусто.
+            vpn_ports = _node_vpn_tcp_ports(target) if kind == "node" else []
+            try:
+                probe = diagnostics.run_local_path_probe(
+                    host,
+                    ssh_port=getattr(target, "ssh_port", 22) or 22,
+                    extra_tcp_ports=vpn_ports or None,
+                    # No traceroute in the sweep — it adds ~29s per DOWN
+                    # target. The detailed on-host diagnose task enqueued
+                    # below runs the full probe WITH traceroute for /tasks.
+                    traceroute_on_fail=False,
+                )
+            except Exception:  # noqa: BLE001
+                logger.exception(
+                    "node_reachability: probe crashed for %s:%s", kind, target.id
+                )
+                continue
+            now = utcnow()
+            ref = f"{kind}:{target.id}"
+
+            # net-audit #97: ssh-стадия НЕ выполнялась (нет paramiko или
+            # ssh-ключа на контроллере) — проба недиагностична. Не трогаем
+            # last_probe_status/unreachable_since: конфиг-ошибка контроллера
+            # не должна класть весь флот в ложный DOWN со штормом пушей.
+            # last_probe_at тоже не двигаем — stale_targets-метрика честно
+            # покажет, что флот фактически не мониторится.
+            if probe.ssh_skipped and not probe.ssh_ok:
+                summary.setdefault("ssh_skipped", []).append(ref)
+                continue
+
+            if probe.ssh_ok:
+                # Finding #1: SSH жив, но проверяем, слушают ли TCP VPN-порты.
+                # ЗАКРЫТЫ ВСЕ заявленные порты при живом SSH = сервис (xray)
+                # деградировал/упал. Требуем ИМЕННО все закрыты (не любой) —
+                # единичный отключённый листенер не повод для алерта.
+                degraded = bool(vpn_ports) and all(
+                    not _probe_port_open(probe, p) for p in vpn_ports
+                )
+                if not degraded:
+                    target.last_probe_at = now
+                    target.last_probe_status = "ok"
+                    target.unreachable_since = None  # серия прервалась — сброс
+                    # ssh_ok у крауд-заблокированной ноды true КАЖДЫЙ тик (DPI
+                    # блокирует юзеров, не контроллера). Без гварда close_incident
+                    # стирал бы операторский ack/follow немедленно (finding #98).
+                    if not _incident_auto_close_blocked(target, now):
+                        if diagnostics_state.close_incident(target):
+                            summary["recovered"].append(ref)
+                    session.commit()
+                    continue
+                # ── DEGRADED: SSH ok, но VPN-порт(ы) не слушают ──────────
+                target.last_probe_at = now
+                target.last_probe_status = "degraded"
+                symptom = "vpn_port_down"
+                summary.setdefault("degraded", []).append(ref)
+            else:
+                # ── DOWN ────────────────────────────────────────────────
+                target.last_probe_at = now
+                target.last_probe_status = "unreachable"
+                symptom = "unreachable"
+                summary["down"].append(ref)
+
+            down_count += 1
+
+            # Confirm-окно: первый DOWN/degraded только запоминаем (начало
+            # серии), не диагностируем и не алертим. Эскалируем (диагностика +
+            # пуш) лишь когда недоступность держится >= confirm_min — несколько
+            # пробов подряд. Транзиентный 1-2 пропущенных пинга сюда не дотянет
+            # → recovery очистит unreachable_since и серия не накопится.
+            if getattr(target, "unreachable_since", None) is None:
+                target.unreachable_since = now
+            elif (
+                prev_probe_at is not None
+                and interval > 0
+                and (now - prev_probe_at).total_seconds() > interval * gap_factor
+            ):
+                # Finding #7: между прошлым и этим пробом дыра > interval*factor
+                # (цель выпала в обрезанный бюджетом хвост / тик подвисал).
+                # Непрерывного наблюдения не было — не эскалируем по дырявому
+                # wall-clock, серию начинаем заново.
+                target.unreachable_since = now
+                summary.setdefault("series_reset", []).append(ref)
+                session.commit()
+                continue
+            elapsed_min = (now - target.unreachable_since).total_seconds() / 60.0
+            if confirm_min > 0 and elapsed_min < confirm_min:
+                summary["suspect"].append(ref)
+                session.commit()
+                continue
+
+            # Finding #3 (mass-down): доля DOWN/degraded среди уже пробитых
+            # целей выше порога → вероятно, сеть у контроллера, а не весь флот
+            # разом. Подавляем индивидуальные пуши/диагностику, шлём один
+            # агрегированный алерт в конце. Default off (fraction=0).
+            if (
+                mass_down_fraction > 0
+                and summary["checked"] >= mass_down_min
+                and down_count / summary["checked"] >= mass_down_fraction
+            ):
+                summary["mass_down_suppressed"] = (
+                    summary.get("mass_down_suppressed", 0) + 1
+                )
+                session.commit()
+                continue
+
+            do_diag, reason = diagnostics_state.should_diagnose(target, now)
+            if not do_diag or diagnosed >= max_diag:
+                # Either gated (disabled / acked / once-done / backoff) or we
+                # already kicked off enough diagnoses this tick.
+                session.commit()
+                continue
+
+            diagnosed += 1
+            diagnostics_state.mark_diagnosed(target, now)
+            summary["diagnosed"].append(ref)
+
+            # Speaking push from the probe checks (immediate), unless muted.
+            if not diagnostics_state.is_alerts_muted(target, now):
+                try:
+                    notify_node_diagnosis(
+                        session, target_kind=kind, target=target,
+                        checks=probe.checks, autocommit=False,
+                    )
+                    summary["pushed"].append(ref)
+                except Exception:  # noqa: BLE001
+                    logger.exception("node_reachability: push failed for %s", ref)
+
+            # Enqueue the full on-host diagnose for the detailed /tasks
+            # checklist (should_diagnose already cleared the hard toggle).
+            try:
+                orchestrator = ProvisioningOrchestrator(session)
+                task = orchestrator.create_task(
+                    "node" if kind == "node" else "exit",
+                    target.id,
+                    "diagnose",
+                    {"auto_triggered": True, "symptom": symptom},
+                )
+                session.commit()
+                orchestrator.run_task_async(
+                    task, node=target if kind == "node" else None
+                )
+            except Exception:  # noqa: BLE001
+                logger.exception("node_reachability: diagnose enqueue failed for %s", ref)
+                if session.is_active:
+                    session.rollback()
+
+        # Finding #3 (mass-down): если за тик подавили индивидуальные алерты по
+        # массовой недоступности — шлём ОДИН агрегированный сигнал вместо лавины.
+        if summary.get("mass_down_suppressed"):
+            logger.error(
+                "node_reachability: массовая недоступность (%s подавлено из %s "
+                "пробитых) — вероятно, сеть контроллера/аплинка",
+                summary["mass_down_suppressed"], summary["checked"],
+            )
+            try:
+                notify_admins(
+                    session,
+                    kind="reachability_mass_down",
+                    text=(
+                        "⚠️ Монитор: массовая недоступность нод за один тик — "
+                        "индивидуальные алерты подавлены (вероятно, сетевой сбой "
+                        "контроллера/аплинка, а не всех нод сразу). Проверьте "
+                        "сеть воркера."
+                    ),
+                    dedup_key={"scope": "reachability"},
+                    window_sec=1800,
+                    autocommit=True,
+                )
+            except Exception:  # noqa: BLE001
+                logger.exception("node_reachability: mass-down alert failed")
+
+        # net-audit #97: ssh-пробы скипались по конфиг-ошибке контроллера —
+        # доступность флота фактически НЕ проверяется. Один агрегированный
+        # алерт с дедупом вместо тихого «всё ок» (статусы не обновляются, а
+        # значит и down-детект, и recovery заморожены до починки окружения).
+        if summary.get("ssh_skipped"):
+            logger.error(
+                "node_reachability: ssh-проба пропущена для %s целей (нет "
+                "paramiko или ssh-ключа на контроллере) — статусы нод не "
+                "обновляются, мониторинг слеп",
+                len(summary["ssh_skipped"]),
+            )
+            try:
+                notify_admins(
+                    session,
+                    kind="reachability_ssh_skipped",
+                    text=(
+                        "⚠️ Монитор доступности не может выполнить ssh-пробу "
+                        "(paramiko или ssh-ключ недоступны на контроллере). "
+                        "Статусы нод/exit'ов не обновляются — down-детект и "
+                        "recovery заморожены. Проверьте окружение воркера "
+                        "(ANSIBLE_PRIVATE_KEY_FILE / paramiko)."
+                    ),
+                    dedup_key={"scope": "reachability-ssh-skipped"},
+                    window_sec=1800,
+                    autocommit=True,
+                )
+            except Exception:  # noqa: BLE001
+                logger.exception("node_reachability: ssh-skipped alert failed")
+
+        # Метрика самого голодания: сколько целей не пробовано дольше
+        # NODE_REACHABILITY_STALE_MIN минут (default 30). Стабильно >0 —
+        # бюджета тика не хватает на весь флот, пора его поднимать или
+        # ускорять пробы. Цели без host не считаем — их тик не пробует.
+        stale_min = float(os.getenv("NODE_REACHABILITY_STALE_MIN", "30"))
+        stale_cutoff = utcnow() - _timedelta(minutes=stale_min)
+        stale = sum(
+            1 for _k, t in targets
+            if getattr(t, "host", None)
+            and (t.last_probe_at is None or t.last_probe_at < stale_cutoff)
+        )
+        summary["stale_targets"] = stale
+        REACHABILITY_STALE_TARGETS.set(stale)
+    except Exception:  # noqa: BLE001
+        logger.exception("node_reachability: tick failed")
+        if session.is_active:
+            session.rollback()
+        # Ре-бросаем — см. run_renewal_check: тик уходит в failed → виден в /ops.
+        raise
     finally:
         session.close()
 
@@ -951,9 +3581,19 @@ def run_user_health_ping_tick() -> dict:
     from .queue import schedule_tick
     from .time_utils import utcnow
 
-    interval = int(os.getenv("USER_HEALTH_PING_INTERVAL", "1800"))
-    batch = int(os.getenv("USER_HEALTH_PING_BATCH", "50"))
-    debounce_hours = int(os.getenv("USER_HEALTH_PING_DEBOUNCE_HOURS", "24"))
+    import random as _random
+
+    interval = _env_int("USER_HEALTH_PING_INTERVAL", 1800)
+    batch = _env_int("USER_HEALTH_PING_BATCH", 50)
+    # Базовая дебаунс-дельта = минимум между ping'ами. Jitter (random
+    # forward-offset) добавляется к `health_ping_last_at` при записи,
+    # чтобы фактический интервал растянулся в [base, base+jitter] на
+    # юзера. Дефолты: 168ч (7 дн.) base + 168ч (7 дн.) jitter → ping
+    # каждые 7-14 дней случайно. Раньше было 24ч fixed — юзеры жали
+    # «не работает» в игнор из-за фоновой усталости, и реальные
+    # жалобы тонули в шуме.
+    debounce_hours = _env_int("USER_HEALTH_PING_DEBOUNCE_HOURS", 168)
+    jitter_hours = _env_int("USER_HEALTH_PING_DEBOUNCE_JITTER_HOURS", 168)
 
     # Reschedule в начале — см. run_pending_rescue_tick. Важно: ставим
     # reschedule ДО early-return по MSK-окну, иначе вне окна тик умрёт.
@@ -970,8 +3610,8 @@ def run_user_health_ping_tick() -> dict:
 
     # Only send health pings during MSK lunch window (11:00–14:00)
     # to avoid waking users at night. Configurable via env.
-    ping_hour_start = int(os.getenv("HEALTH_PING_HOUR_START", "11"))
-    ping_hour_end = int(os.getenv("HEALTH_PING_HOUR_END", "14"))
+    ping_hour_start = _env_int("HEALTH_PING_HOUR_START", 11)
+    ping_hour_end = _env_int("HEALTH_PING_HOUR_END", 14)
 
     summary = {"queued": 0, "skipped": 0}
     session = SessionLocal()
@@ -1039,7 +3679,15 @@ def run_user_health_ping_tick() -> dict:
                     },
                 )
             )
-            user.health_ping_last_at = now
+            # Future-time stretch: записываем не `now`, а `now + random(0, jitter)`.
+            # Поле `health_ping_last_at` дальше сравнивается только с
+            # `now - debounce_hours` в фильтре отбора, поэтому смещение
+            # вперёд эквивалентно отсрочке «следующего eligible» на ту же
+            # величину. Range: [debounce_hours, debounce_hours + jitter_hours].
+            jitter_offset = timedelta(
+                hours=_random.uniform(0.0, max(0, jitter_hours))
+            ) if jitter_hours > 0 else timedelta(0)
+            user.health_ping_last_at = now + jitter_offset
             session.add(user)
             summary["queued"] += 1
 
@@ -1049,6 +3697,142 @@ def run_user_health_ping_tick() -> dict:
         logger.exception("user_health_ping: tick failed")
         if session.is_active:
             session.rollback()
+        # Ре-бросаем — см. run_renewal_check: тик уходит в failed → виден в /ops.
+        raise
+    finally:
+        session.close()
+
+    return summary
+
+
+def run_broadcast_dispatch_tick() -> dict:
+    """Admin broadcast dispatcher — батч-рассылка юзерам из Broadcast-очереди.
+
+    Раз в BROADCAST_DISPATCH_INTERVAL (default 10s) проверяет, есть ли
+    broadcast в `queued/sending`. Берёт один (старый сначала) и режет
+    юзеров по target_filter'у батчем BROADCAST_BATCH_SIZE (default 50).
+    На каждого пишет AuditLog(admin_broadcast), который поднимет
+    bot-поллер и доставит через `send_message`.
+
+    Почему один broadcast за тик, а не все сразу
+    ---------------------------------------------
+    Тик запускается каждые 10s. Если броадкастов в очереди два, второй
+    подождёт 10s — это OK, bot всё равно через rate-limit не пропустит
+    два залпа одновременно (0.05s sleep между send_message для
+    admin_broadcast).
+
+    Курсор: `last_user_id_cursor` монотонно растёт. Исчерпали batch
+    (len < BROADCAST_BATCH_SIZE) → `status=completed`, `completed_at=now`.
+    Отменённый broadcast (`status=cancelled`) просто пропускается — ни
+    один ещё-не-отправленный батч ему не уйдёт.
+
+    Self-reschedule в начале тела (см. run_pending_rescue_tick).
+    """
+    from . import models
+    from .api.broadcasts import resolve_target_query, TargetFilter
+    from .db import SessionLocal
+    from .queue import schedule_tick
+    from .time_utils import utcnow
+
+    interval = _env_int("BROADCAST_DISPATCH_INTERVAL", 10)
+    batch_size = _env_int("BROADCAST_BATCH_SIZE", 50)
+
+    if interval > 0:
+        try:
+            schedule_tick(
+                "app.worker.run_broadcast_dispatch_tick",
+                interval,
+                tick_id="tick-broadcast-dispatch",
+                replace=True,
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("broadcast_dispatch: failed to re-enqueue tick")
+
+    summary: dict = {
+        "processed": 0,
+        "sent": 0,
+        "completed": 0,
+    }
+    session = SessionLocal()
+    try:
+        bc = (
+            session.query(models.Broadcast)
+            .filter(
+                models.Broadcast.status.in_(
+                    [
+                        models.BroadcastStatus.queued,
+                        models.BroadcastStatus.sending,
+                    ]
+                )
+            )
+            .order_by(models.Broadcast.id.asc())
+            .first()
+        )
+        if bc is None:
+            return summary
+
+        now = utcnow()
+        if bc.status == models.BroadcastStatus.queued:
+            bc.status = models.BroadcastStatus.sending
+            bc.started_at = now
+
+        try:
+            tf = TargetFilter(**bc.target_filter)
+        except Exception:  # noqa: BLE001
+            # Шейп в БД битый — помечаем failed, больше не трогаем.
+            logger.exception(
+                "broadcast_dispatch: bad target_filter on broadcast %s: %r",
+                bc.id, bc.target_filter,
+            )
+            bc.status = models.BroadcastStatus.failed
+            bc.completed_at = now
+            session.commit()
+            return summary
+
+        q = resolve_target_query(session, tf)
+        users = (
+            q.filter(models.User.id > bc.last_user_id_cursor)
+            .order_by(models.User.id.asc())
+            .limit(batch_size)
+            .all()
+        )
+
+        if not users:
+            # Исчерпали фильтр — финализируем.
+            bc.status = models.BroadcastStatus.completed
+            bc.completed_at = now
+            session.commit()
+            summary["completed"] = 1
+            summary["processed"] = 1
+            return summary
+
+        for u in users:
+            session.add(
+                models.AuditLog(
+                    actor="broadcast_dispatch",
+                    actor_type=models.AuditActor.system,
+                    action="admin_broadcast",
+                    target_type="broadcast",
+                    target_id=bc.id,
+                    extra={
+                        "telegram_id": str(u.telegram_id),
+                        "text": bc.text,
+                        "broadcast_id": bc.id,
+                    },
+                )
+            )
+            bc.sent_count += 1
+            bc.last_user_id_cursor = max(bc.last_user_id_cursor, u.id)
+
+        summary["sent"] = len(users)
+        summary["processed"] = 1
+        session.commit()
+    except Exception:  # noqa: BLE001
+        logger.exception("broadcast_dispatch: tick failed")
+        if session.is_active:
+            session.rollback()
+        # Ре-бросаем — см. run_renewal_check: тик уходит в failed → виден в /ops.
+        raise
     finally:
         session.close()
 
@@ -1089,11 +3873,45 @@ def run_provisioning_task(task_id: int, node_id: int | None = None) -> dict:
 
 
 def dlq_exception_handler(job, exc_type, exc_value, tb):  # noqa: ARG001
-    """Called by RQ when a job permanently fails (all retries exhausted).
+    """RQ exception handler — вызывается на КАЖДОМ падении джобы.
 
-    Writes an AuditLog entry so ops can see the failure in the admin UI
-    without digging through Redis.  Also bumps the Prometheus counter.
+    ВАЖНО: RQ зовёт exception handlers ДО retry-логики (handle_exception →
+    handle_job_failure), поэтому обработчик срабатывает на каждой попытке, а
+    не только на финальной. Наивная реализация инкрементила DLQ-счётчик, писала
+    provisioning_dlq в аудит и пушила админу «Провижининг упал» уже на первой
+    транзиентной ошибке ansible-джобы (у неё Retry(max=3)), хотя через 10с она
+    успешно ретраилась.
+
+    Поэтому:
+      * пока у джобы остались ретраи (``job.retries_left`` > 0) — это НЕ
+        финальное падение: только warning, без DLQ/аудита/пуша;
+      * реальный dead-letter — когда ретраи исчерпаны (retries_left == 0) или
+        у джобы вовсе нет Retry (retries_left is None → падение сразу
+        финальное);
+      * аудит/пуш с ``target_type='provisioning_task'`` пишем ТОЛЬКО для
+        provisioning-джоб (``run_provisioning_task``), у которых ``args[0]`` —
+        это task_id. У ``run_ops_plan_execute`` args[0] — plan_id, у
+        ``run_scale_workers`` — число реплик; приписывать их id несуществующей
+        provisioning-таске нельзя.
     """
+    retries_left = getattr(job, "retries_left", None)
+    if retries_left:
+        # retries_left > 0 (truthy) — впереди ещё ретрай, падение транзиентное.
+        logger.warning(
+            "Job %s (%s) упала, но остались ретраи (retries_left=%s): %s",
+            job.id, getattr(job, "func_name", "?"), retries_left, exc_value,
+        )
+        return True  # let RQ continue its normal failure/retry flow
+
+    func_name = getattr(job, "func_name", "") or ""
+    if not func_name.endswith("run_provisioning_task"):
+        # Не provisioning-джоба — args[0] не task_id, DLQ-аудит неприменим.
+        logger.error(
+            "Job %s (%s) dead-lettered после ретраев: %s",
+            job.id, func_name or "?", exc_value,
+        )
+        return True  # let RQ continue its normal failure flow
+
     DLQ_ENTRIES.inc()
     task_id = job.args[0] if job.args else None
     logger.error(
@@ -1124,12 +3942,249 @@ def dlq_exception_handler(job, exc_type, exc_value, tb):  # noqa: ARG001
                 )
             )
             session.commit()
+
+            # Admin push-алерт на DLQ-событие. Дедуп по task_id —
+            # разные таски пушатся независимо, повтор того же task_id
+            # за ADMIN_ALERT_DLQ_WINDOW_SEC (5 мин по умолчанию) —
+            # подавляется. Окно короче общего ADMIN_ALERT_DEDUP_WINDOW_SEC,
+            # потому что повтор DLQ по тому же task_id — патологический
+            # случай, но хоть один такой за 5 минут интересен ровно
+            # один раз.
+            try:
+                from .services.admin_notify import notify_admins
+
+                exc_name = exc_type.__name__ if exc_type else "?"
+                err_preview = str(exc_value)[:300]
+                dlq_text = (
+                    f"❌ Провижининг упал: task={task_id} "
+                    f"job={job.id}\n"
+                    f"{exc_name}: {err_preview}"
+                )
+                notify_admins(
+                    session,
+                    kind="infra_dlq",
+                    text=dlq_text,
+                    dedup_key={"task_id": task_id},
+                    extra={
+                        "job_id": job.id,
+                        "exc_type": exc_name,
+                    },
+                    window_sec=int(
+                        os.getenv("ADMIN_ALERT_DLQ_WINDOW_SEC", "300")
+                    ),
+                    autocommit=True,
+                )
+            except Exception:  # noqa: BLE001
+                logger.exception(
+                    "notify_admins не отработал для DLQ task %s", task_id
+                )
         finally:
             session.close()
     except Exception:  # noqa: BLE001
         logger.exception("Failed to write DLQ audit log for task %s", task_id)
 
     return True  # let RQ continue its normal failure flow
+
+
+def _fail_stuck_ops_plan(plan_id: int, reason: str, *, phase: str = "crash") -> bool:
+    """Страховка: условный UPDATE executing→failed для ops-плана.
+
+    Открывает СВЕЖУЮ сессию (рабочая после исключения может быть в
+    неопределённом состоянии) и переводит план в failed ТОЛЬКО если он всё
+    ещё в executing — терминальные статусы, выставленные ``execute_plan``
+    (expired / failed с деталями фазы), не затираются. Без этого любое
+    исключение вне OpsExecError оставляло план в executing навсегда:
+    эндпоинт армит план ДО постановки джобы и принимает только proposed,
+    так что подтверждённый оператором план было не перезапустить.
+    Возвращает True, если статус реально флипнули.
+    """
+    from sqlalchemy import update as sa_update
+
+    from . import models
+    from .db import SessionLocal
+    from .time_utils import utcnow
+
+    session = SessionLocal()
+    try:
+        flipped = session.execute(
+            sa_update(models.OpsPlan)
+            .where(
+                models.OpsPlan.id == plan_id,
+                models.OpsPlan.status == "executing",
+            )
+            .values(
+                status="failed",
+                execution={
+                    "phase": phase,
+                    "reason": reason[:500],
+                    "failed_at": utcnow().isoformat(),
+                },
+            )
+        ).rowcount
+        session.commit()
+        if flipped:
+            logger.warning(
+                "ops plan %s: помечен failed (phase=%s) — застрял в executing",
+                plan_id, phase,
+            )
+        return bool(flipped)
+    except Exception:  # noqa: BLE001
+        logger.exception("ops plan %s: не смог пометить план failed", plan_id)
+        return False
+    finally:
+        session.close()
+
+
+def run_ops_plan_execute(plan_id: int) -> dict:
+    """RQ-джоба: исполнить сохранённый ops-план (Phase 3, за флагом
+    OPS_EXECUTE_ENABLED). Эндпоинт ``/api/agent/ops/execute`` армит план
+    (status=executing) и энкьюит сюда; вся тяжёлая работа (ре-валидация,
+    pre-flight по живым ценам/балансу, заказ нод через spawn_node_async) — тут,
+    без HTTP-таймаута. Результат пишется в ``ops_plans.execution``."""
+    from . import models
+    from .db import SessionLocal
+    from .services.agent.ops_execution import OpsExecError, execute_plan
+
+    session = SessionLocal()
+    try:
+        plan = session.get(models.OpsPlan, plan_id)
+        if not plan:
+            return {"ok": False, "error": f"ops_plan {plan_id} not found"}
+        result = execute_plan(session, plan)
+        return {"ok": True, **result}
+    except OpsExecError as exc:
+        logger.warning("ops plan %s execution rejected/failed: %s", plan_id, exc)
+        # execute_plan сам выставляет терминальный статус на путях
+        # integrity/validate/preflight/TTL, но ветка «исполнение выключено
+        # (OPS_EXECUTE_ENABLED=0)» оставляла план в executing — добиваем.
+        # Условный UPDATE не тронет уже выставленные failed/expired.
+        _fail_stuck_ops_plan(plan_id, str(exc), phase="rejected")
+        return {"ok": False, "error": str(exc)}
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("ops plan %s execution crashed", plan_id)
+        # Иначе план навсегда завис бы в executing (ретрай через эндпоинт
+        # закрыт: он принимает только status=proposed).
+        _fail_stuck_ops_plan(plan_id, f"{type(exc).__name__}: {exc}")
+        return {"ok": False, "error": str(exc)}
+    finally:
+        session.close()
+
+
+def run_ops_plan_reaper_tick() -> dict:
+    """Бэкстоп по возрасту: добить ops-планы, залипшие в executing.
+
+    In-job страховка (``_fail_stuck_ops_plan``) не спасает, когда процесса
+    уже нет: воркер перезапустился/упал по OOM или RQ убил джобу по
+    job_timeout=1800 — план остаётся в executing навсегда, а эндпоинт
+    повторное исполнение запрещает (принимает только proposed).
+
+    Момент арминга берём из AuditLog(action='agent_ops_execute_armed') —
+    эндпоинт пишет его одной транзакцией с армом; отдельной колонки
+    executing_since нет, и миграцию ради бэкстопа не заводим. Fallback —
+    expires_at (арм всегда РАНЬШЕ протухания, значит оценка консервативна),
+    затем created_at. Планы, армленные раньше чем job_timeout+grace назад,
+    переводятся в failed (phase='crash') условным UPDATE'ом — с ещё живой
+    джобой не гоняемся. Self-reschedules; OPS_PLAN_REAPER_INTERVAL=0 — off.
+    """
+    from datetime import timedelta
+
+    from sqlalchemy import update as sa_update
+
+    from . import models
+    from .db import SessionLocal
+    from .queue import schedule_tick
+    from .time_utils import utcnow
+
+    # Reschedule в начале — см. run_pending_rescue_tick.
+    interval = _env_int("OPS_PLAN_REAPER_INTERVAL", 300)
+    if interval > 0:
+        try:
+            schedule_tick(
+                "app.worker.run_ops_plan_reaper_tick",
+                interval,
+                tick_id="tick-ops-plan-reaper",
+                replace=True,
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("ops_plan_reaper: failed to re-enqueue tick (at start)")
+
+    # job_timeout джобы run_ops_plan_execute (см. api/agent.py, 1800с) +
+    # запас на ожидание в очереди/clock skew.
+    job_timeout = _env_int("OPS_EXECUTE_JOB_TIMEOUT", 1800)
+    grace = _env_int("OPS_PLAN_REAPER_GRACE", 120)
+    summary: dict = {"checked": 0, "reaped": []}
+    session = SessionLocal()
+    try:
+        cutoff = utcnow() - timedelta(seconds=job_timeout + grace)
+        stuck = (
+            session.query(models.OpsPlan)
+            .filter(models.OpsPlan.status == "executing")
+            .all()
+        )
+        summary["checked"] = len(stuck)
+        for plan in stuck:
+            armed_log = (
+                session.query(models.AuditLog)
+                .filter(
+                    models.AuditLog.action == "agent_ops_execute_armed",
+                    models.AuditLog.target_type == "ops_plan",
+                    models.AuditLog.target_id == plan.id,
+                )
+                .order_by(models.AuditLog.created_at.desc())
+                .first()
+            )
+            armed_at = (
+                armed_log.created_at if armed_log is not None
+                else (plan.expires_at or plan.created_at)
+            )
+            if armed_at is None or armed_at > cutoff:
+                continue  # ещё может легитимно исполняться — ждём
+            reason = (
+                f"executing дольше {job_timeout + grace}с с момента арма "
+                f"({armed_at.isoformat()}) — воркер умер или джоба убита "
+                f"по job_timeout; что успело заказаться — проверь по нодам "
+                f"с notes='ops-agent plan #{plan.id}'"
+            )
+            flipped = session.execute(
+                sa_update(models.OpsPlan)
+                .where(
+                    models.OpsPlan.id == plan.id,
+                    models.OpsPlan.status == "executing",
+                )
+                .values(
+                    status="failed",
+                    execution={
+                        "phase": "crash",
+                        "reason": reason,
+                        "failed_at": utcnow().isoformat(),
+                    },
+                )
+            ).rowcount
+            if not flipped:
+                continue
+            session.add(
+                models.AuditLog(
+                    actor="ops-plan-reaper",
+                    actor_type=models.AuditActor.system,
+                    action="agent_ops_execute_reaped",
+                    target_type="ops_plan",
+                    target_id=plan.id,
+                    extra={"armed_at": armed_at.isoformat(), "reason": reason},
+                )
+            )
+            summary["reaped"].append(plan.id)
+            logger.warning("ops_plan_reaper: план %s → failed (%s)", plan.id, reason)
+        session.commit()
+    except Exception:  # noqa: BLE001
+        logger.exception("ops_plan_reaper: tick failed")
+        if session.is_active:
+            session.rollback()
+        # Ре-бросаем — см. run_renewal_check: тик уходит в failed → виден в /ops.
+        raise
+    finally:
+        session.close()
+
+    return summary
 
 
 def main() -> None:
@@ -1144,8 +4199,13 @@ def main() -> None:
     # воркера цепочка рвалась — админ видел "последний SSH 600 мин"
     # и должен был кликать кнопку заново.
     from .queue import schedule_tick
+    from .security import assert_secrets_configured
 
     configure_logging()
+    # Без APP_SECRET_KEY воркер не имеет права стартовать: он и провижинит, и
+    # ре-минтит креды, т.е. писал бы секреты в БД открытым текстом (аудит
+    # 2026-07-25). Локально форточка — ALLOW_PLAINTEXT_SECRETS=1.
+    assert_secrets_configured()
     try:
         from redis import Redis
         from rq import Queue, Worker
@@ -1208,7 +4268,7 @@ def main() -> None:
     # *alongside* the still-scheduled one from the prior incarnation —
     # N restarts → N parallel chains per tick. See ``queue.schedule_tick``
     # and ``docs/components/worker.md`` § Дедупликация тиков.
-    pending_rescue_interval = int(os.getenv("PENDING_RESCUE_INTERVAL", "60"))
+    pending_rescue_interval = _env_int("PENDING_RESCUE_INTERVAL", 60)
     if do_bootstrap and pending_rescue_interval > 0:
         try:
             schedule_tick(
@@ -1224,8 +4284,160 @@ def main() -> None:
         except Exception:  # noqa: BLE001
             logger.exception("Failed to schedule pending-rescue tick")
 
+    # Schedule lava.top reconcile (webhook-independent credit of card
+    # payments). lava's webhook delivery is best-effort and was observed
+    # missing in prod; this tick polls GET /api/v2/invoices and credits any
+    # pending invoice whose lava sale is COMPLETED. No-op без LAVA_TOP_API_KEY.
+    lava_reconcile_interval = _env_int("LAVA_TOP_RECONCILE_INTERVAL", 60)
+    if do_bootstrap and lava_reconcile_interval > 0:
+        try:
+            schedule_tick(
+                "app.worker.run_lava_reconcile_tick",
+                min(lava_reconcile_interval, 30),
+                tick_id="tick-lava-reconcile",
+                replace=True,
+            )
+            logger.info(
+                "Lava reconcile tick bootstrapped: first run in 30s (interval=%ss)",
+                lava_reconcile_interval,
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("Failed to schedule lava reconcile tick")
+
+    # Жнец прерванных failover-свапов (миграция 0068): доделывает или
+    # компенсирует свопы, брошенные умершим процессом. 0 = off.
+    swap_reaper_interval = _env_int("DEVICE_SWAP_REAPER_INTERVAL", 300)
+    if do_bootstrap and swap_reaper_interval > 0:
+        try:
+            schedule_tick(
+                "app.worker.run_device_swap_reaper_tick",
+                min(swap_reaper_interval, 120),
+                tick_id="tick-device-swap-reaper",
+                replace=True,
+            )
+            logger.info(
+                "Device swap reaper tick bootstrapped (interval=%ss)",
+                swap_reaper_interval,
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("Failed to schedule device swap reaper tick")
+
+    # Schedule operator-report watcher (Phase 1 operator-aware routing) —
+    # resolves «VPN не работает» reports by observed reconnect. Default 5 min.
+    operator_watch_interval = _env_int("OPERATOR_REPORT_WATCH_INTERVAL", 300)
+    if do_bootstrap and operator_watch_interval > 0:
+        try:
+            schedule_tick(
+                "app.worker.run_operator_report_watch_tick",
+                min(operator_watch_interval, 60),
+                tick_id="tick-operator-report-watch",
+                replace=True,
+            )
+            logger.info(
+                "Operator-report watcher bootstrapped: first run in 60s "
+                "(interval=%ss)", operator_watch_interval,
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("Failed to schedule operator-report watcher tick")
+
+    # Phase 3 reconcile tick — сходит ноды по desired-state generations.
+    # No-op пока RECONCILER_ENABLED выключен (сам тик short-circuit'ит).
+    # Дефолт 3s; debounce RECONCILE_DEBOUNCE_S коллапсит burst правок.
+    reconcile_interval = _env_int("RECONCILE_INTERVAL", 3)
+    if do_bootstrap and reconcile_interval > 0:
+        try:
+            schedule_tick(
+                "app.worker.run_reconcile_tick",
+                reconcile_interval,
+                tick_id="tick-reconcile",
+                replace=True,
+            )
+            logger.info(
+                "Reconcile tick bootstrapped: interval=%ss (RECONCILER_ENABLED=%r)",
+                reconcile_interval, os.getenv("RECONCILER_ENABLED", ""),
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("Failed to schedule reconcile tick")
+
+    # Cert-renewal tick — внешняя проба TLS-expiry xhttp/ws-cdn + авто-renew LE
+    # за CERT_RENEWAL_DAYS до истечения (предотвращает fleet-wide cert-пожар,
+    # 2026-07-22). Дефолт раз в сутки; первый прогон ≤5 мин после старта.
+    cert_renewal_interval = _env_int("CERT_RENEWAL_INTERVAL", 86400)
+    if do_bootstrap and cert_renewal_interval > 0:
+        try:
+            schedule_tick(
+                "app.worker.run_cert_renewal_tick",
+                min(cert_renewal_interval, 300),
+                tick_id="tick-cert-renewal",
+                replace=True,
+            )
+            logger.info(
+                "Cert-renewal tick bootstrapped: first run in %ss (interval=%ss)",
+                min(cert_renewal_interval, 300), cert_renewal_interval,
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("Failed to schedule cert-renewal tick")
+
+    # Node-versions tick — снимает с нод фактические версии xray и маркер нашей
+    # прошивки (/etc/vpn-node-release.json). Дефолт раз в час; первый прогон
+    # ≤5 мин после старта, чтобы админка не ждала час с пустыми версиями.
+    node_versions_interval = _env_int("NODE_VERSIONS_INTERVAL", 3600)
+    if do_bootstrap and node_versions_interval > 0:
+        try:
+            schedule_tick(
+                "app.worker.run_node_versions_tick",
+                min(node_versions_interval, 300),
+                tick_id="tick-node-versions",
+                replace=True,
+            )
+            logger.info(
+                "Node-versions tick bootstrapped: first run in %ss (interval=%ss)",
+                min(node_versions_interval, 300), node_versions_interval,
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("Failed to schedule node-versions tick")
+
+    # Xray-upstream tick — следит за релизами XTLS/Xray-core и будит админа,
+    # когда наш пин отстал (сам апгрейд не автоматизируем: sha256 пинится парой
+    # к версии). Дефолт раз в 6 часов.
+    xray_upstream_interval = _env_int("XRAY_UPSTREAM_INTERVAL", 21600)
+    if do_bootstrap and xray_upstream_interval > 0:
+        try:
+            schedule_tick(
+                "app.worker.run_xray_upstream_tick",
+                min(xray_upstream_interval, 300),
+                tick_id="tick-xray-upstream",
+                replace=True,
+            )
+            logger.info(
+                "Xray-upstream tick bootstrapped: first run in %ss (interval=%ss)",
+                min(xray_upstream_interval, 300), xray_upstream_interval,
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("Failed to schedule xray-upstream tick")
+
+    # Reality-dest health tick — пробит reality-dest'ы на TLS1.3+h2 и авто-
+    # ротирует битые (легаси-домены деградируют → Reality молча мёртв,
+    # инцидент 2026-07-23). Дефолт раз в сутки; первый прогон ≤5 мин.
+    reality_dest_interval = _env_int("REALITY_DEST_HEALTH_INTERVAL", 86400)
+    if do_bootstrap and reality_dest_interval > 0:
+        try:
+            schedule_tick(
+                "app.worker.run_reality_dest_health_tick",
+                min(reality_dest_interval, 300),
+                tick_id="tick-reality-dest-health",
+                replace=True,
+            )
+            logger.info(
+                "Reality-dest health tick bootstrapped: first run in %ss "
+                "(interval=%ss)", min(reality_dest_interval, 300),
+                reality_dest_interval,
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("Failed to schedule reality-dest health tick")
+
     # Schedule autoscale tick
-    autoscale_interval = int(os.getenv("AUTOSCALE_INTERVAL", "0"))
+    autoscale_interval = _env_int("AUTOSCALE_INTERVAL", 0)
     if do_bootstrap and autoscale_interval > 0:
         try:
             schedule_tick(
@@ -1239,7 +4451,7 @@ def main() -> None:
             logger.exception("Failed to schedule autoscale tick")
 
     # Schedule renewal check (default: every hour)
-    renewal_interval = int(os.getenv("RENEWAL_CHECK_INTERVAL", "3600"))
+    renewal_interval = _env_int("RENEWAL_CHECK_INTERVAL", 3600)
     if do_bootstrap and renewal_interval > 0:
         try:
             schedule_tick(
@@ -1252,10 +4464,29 @@ def main() -> None:
         except Exception:  # noqa: BLE001
             logger.exception("Failed to schedule renewal check")
 
+    # Schedule cloud-billing guard (default: every hour). Pulls provider
+    # balance (gauge + low-balance alert) + fleet monthly-cost gauge. No-op
+    # без cloud-провайдеров. CLOUD_BILLING_INTERVAL=0 → выключить.
+    cloud_billing_interval = _env_int("CLOUD_BILLING_INTERVAL", 3600)
+    if do_bootstrap and cloud_billing_interval > 0:
+        try:
+            schedule_tick(
+                "app.worker.run_cloud_billing_tick",
+                min(cloud_billing_interval, 120),
+                tick_id="tick-cloud-billing",
+                replace=True,
+            )
+            logger.info(
+                "Cloud-billing guard bootstrapped: first run in 120s (interval=%ss)",
+                cloud_billing_interval,
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("Failed to schedule cloud-billing tick")
+
     # Schedule warm-pool check (default: every 2 min). Stage 2.5 of the
     # WebApp roadmap — keeps each active node's pool topped up so user
     # purchases hit a warm bundle instead of paying the Ansible cost.
-    warm_interval = int(os.getenv("WARM_POOL_CHECK_INTERVAL", "120"))
+    warm_interval = _env_int("WARM_POOL_CHECK_INTERVAL", 120)
     warm_enabled = os.getenv("WARM_POOL_ENABLED", "1").lower() not in {"0", "false", "no"}
     if do_bootstrap and warm_interval > 0 and warm_enabled:
         try:
@@ -1272,10 +4503,48 @@ def main() -> None:
         except Exception:  # noqa: BLE001
             logger.exception("Failed to schedule warm pool check")
 
+    # Warm-pool revoke sweep (stage 2) — физически снимает revoked-бандлы с
+    # нод, иначе брошенные identity копятся в xray-конфиге и revoked-строками
+    # в БД (finding #71). Интервал WARM_POOL_REVOKE_INTERVAL (default 300s).
+    warm_revoke_interval = _env_int("WARM_POOL_REVOKE_INTERVAL", 300)
+    if do_bootstrap and warm_revoke_interval > 0 and warm_enabled:
+        try:
+            schedule_tick(
+                "app.worker.run_warm_pool_revoke_tick",
+                min(warm_revoke_interval, 60),
+                tick_id="tick-warm-pool-revoke",
+                replace=True,
+            )
+            logger.info(
+                "Warm pool revoke sweep bootstrapped: first run in 60s (interval=%ss)",
+                warm_revoke_interval,
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("Failed to schedule warm pool revoke sweep")
+
+    # Spawn-sweep — подбор спавнов, застрявших в registering после рестарта
+    # backend'а (daemon-поток финализации умер). Достройку ставит персистентной
+    # RQ-джобой на провижининг-очередь (finding #70). Default 600s, 0=off.
+    spawn_sweep_interval = _env_int("NODE_SPAWN_SWEEP_INTERVAL", 600)
+    if do_bootstrap and spawn_sweep_interval > 0:
+        try:
+            schedule_tick(
+                "app.worker.run_spawn_sweep_tick",
+                min(spawn_sweep_interval, 120),
+                tick_id="tick-spawn-sweep",
+                replace=True,
+            )
+            logger.info(
+                "Spawn sweep bootstrapped: first run in 120s (interval=%ss)",
+                spawn_sweep_interval,
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("Failed to schedule spawn sweep")
+
     # Schedule balance charge tick (default: hourly). Stage 4 — drives
     # daily-billing ticks for balance subscriptions and auto-unfreezes
     # paused ones whose frozen_until has lapsed.
-    balance_interval = int(os.getenv("BALANCE_CHARGE_INTERVAL", "3600"))
+    balance_interval = _env_int("BALANCE_CHARGE_INTERVAL", 3600)
     if do_bootstrap and balance_interval > 0:
         try:
             schedule_tick(
@@ -1294,7 +4563,7 @@ def main() -> None:
     # Phase B — passive xray stats collector. SSHs into each active
     # node every TRAFFIC_STATS_INTERVAL seconds (default 300) and
     # writes a row into node_traffic_samples. Disabled when set to 0.
-    traffic_stats_interval = int(os.getenv("TRAFFIC_STATS_INTERVAL", "300"))
+    traffic_stats_interval = _env_int("TRAFFIC_STATS_INTERVAL", 300)
     if do_bootstrap and traffic_stats_interval > 0:
         try:
             schedule_tick(
@@ -1314,7 +4583,7 @@ def main() -> None:
     # relay, апдейтит last_handshake_at / rx / tx / observed_at в
     # relay_exit_links. Интервал RELAY_LINK_HEALTH_INTERVAL (default
     # 300s), Disabled at 0.
-    relay_link_health_interval = int(os.getenv("RELAY_LINK_HEALTH_INTERVAL", "300"))
+    relay_link_health_interval = _env_int("RELAY_LINK_HEALTH_INTERVAL", 300)
     if do_bootstrap and relay_link_health_interval > 0:
         try:
             schedule_tick(
@@ -1330,11 +4599,32 @@ def main() -> None:
         except Exception:  # noqa: BLE001
             logger.exception("Failed to schedule relay-link health tick")
 
+    # Diagnostics overhaul — controller→host reachability probe across ALL
+    # active VPN nodes + WG exits (ping/tcp/ssh). Owns node/exit down-
+    # detection, the once-per-incident anti-spam gate, the speaking admin
+    # push and the on-host diagnose enqueue. Interval
+    # NODE_REACHABILITY_INTERVAL (default 300s), disabled at 0.
+    node_reach_interval = _env_int("NODE_REACHABILITY_INTERVAL", 300)
+    if do_bootstrap and node_reach_interval > 0:
+        try:
+            schedule_tick(
+                "app.worker.run_node_reachability_tick",
+                min(node_reach_interval, 60),
+                tick_id="tick-node-reachability",
+                replace=True,
+            )
+            logger.info(
+                "Node-reachability tick bootstrapped: first run in 60s (interval=%ss)",
+                node_reach_interval,
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("Failed to schedule node-reachability tick")
+
     # Phase C — bot health-ping with consent. Queues a friendly
     # "помогите нам улучшить сервис" prompt to active users at most
     # once per USER_HEALTH_PING_DEBOUNCE_HOURS, capped at
     # USER_HEALTH_PING_BATCH per tick. Disabled when set to 0.
-    health_ping_interval = int(os.getenv("USER_HEALTH_PING_INTERVAL", "1800"))
+    health_ping_interval = _env_int("USER_HEALTH_PING_INTERVAL", 1800)
     if do_bootstrap and health_ping_interval > 0:
         try:
             schedule_tick(
@@ -1350,6 +4640,63 @@ def main() -> None:
         except Exception:  # noqa: BLE001
             logger.exception("Failed to schedule user health-ping tick")
 
+    # Admin broadcast dispatcher — тянет Broadcast-рассылки батчами из
+    # таблицы broadcasts и пишет AuditLog(admin_broadcast) по одной
+    # строке на юзера. Интервал BROADCAST_DISPATCH_INTERVAL (default 10s),
+    # disabled при 0.
+    broadcast_interval = _env_int("BROADCAST_DISPATCH_INTERVAL", 10)
+    if do_bootstrap and broadcast_interval > 0:
+        try:
+            schedule_tick(
+                "app.worker.run_broadcast_dispatch_tick",
+                min(broadcast_interval, 30),
+                tick_id="tick-broadcast-dispatch",
+                replace=True,
+            )
+            logger.info(
+                "Broadcast dispatch tick bootstrapped: first run in %ss (interval=%ss)",
+                min(broadcast_interval, 30),
+                broadcast_interval,
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("Failed to schedule broadcast dispatch tick")
+
+    # Бэкстоп залипших ops-планов: executing старше job_timeout+grace →
+    # failed (воркер умер / джоба убита по таймауту). См. run_ops_plan_reaper_tick.
+    ops_reaper_interval = _env_int("OPS_PLAN_REAPER_INTERVAL", 300)
+    if do_bootstrap and ops_reaper_interval > 0:
+        try:
+            schedule_tick(
+                "app.worker.run_ops_plan_reaper_tick",
+                min(ops_reaper_interval, 120),
+                tick_id="tick-ops-plan-reaper",
+                replace=True,
+            )
+            logger.info(
+                "Ops-plan reaper tick bootstrapped: first run in %ss (interval=%ss)",
+                min(ops_reaper_interval, 120), ops_reaper_interval,
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("Failed to schedule ops-plan reaper tick")
+
+    # Retention — очистка безлимитно растущих audit_logs / node_traffic_samples
+    # (finding #247). Раз в сутки по умолчанию; RETENTION_INTERVAL=0 → off.
+    retention_interval = _env_int("RETENTION_INTERVAL", 86400)
+    if do_bootstrap and retention_interval > 0:
+        try:
+            schedule_tick(
+                "app.worker.run_retention_tick",
+                min(retention_interval, 300),
+                tick_id="tick-retention",
+                replace=True,
+            )
+            logger.info(
+                "Retention tick bootstrapped: first run in %ss (interval=%ss)",
+                min(retention_interval, 300), retention_interval,
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("Failed to schedule retention tick")
+
     worker = Worker(
         queues_to_listen,
         connection=connection,
@@ -1361,6 +4708,35 @@ def main() -> None:
         [q.name for q in queues_to_listen],
         with_scheduler,
     )
+    if with_scheduler:
+        # ── Fix: "RQ-scheduler залипает после деплоя" ──
+        # RQScheduler.acquire_locks() (rq/scheduler.py) делает
+        #   SET rq:scheduler-lock:<queue> <pid> NX EX (interval+60)
+        # и форкает scheduler ТОЛЬКО если захватил хоть один лок
+        # (auto_start: `if self._acquired_locks and auto_start: self.start()`).
+        # При деплое `docker compose up -d` пересоздаёт контейнер — старый
+        # worker-scheduler получает SIGKILL после stop_grace и НЕ доходит до
+        # graceful stop()→release_locks(), поэтому его лок остаётся висеть
+        # (TTL ~interval+60). Свежий контейнер на старте делает acquire_locks
+        # ОДИН раз → NX фейлится (лок мёртвого инстанса жив) → scheduler не
+        # форкается, а reacquire-петля (`work()`: should_reacquire_locks)
+        # крутится только ВНУТРИ форкнутого процесса, которого нет → ретрая
+        # нет. Итог: ВСЕ тики стоят, пока следующий рестарт случайно не
+        # попадёт в окно после истечения TTL (наблюдали ~9 мин простоя).
+        # Очередь наша эксклюзивно (worker-scheduler replicas=1, recreate
+        # последовательный: стоп старого → старт нового), легитимного
+        # держателя в этот момент нет — чистим stale-лок до work().
+        from rq.scheduler import RQScheduler
+
+        for q in queues_to_listen:
+            lock_key = RQScheduler.get_locking_key(q.name)
+            if connection.delete(lock_key):
+                logger.warning(
+                    "Cleared stale RQ scheduler lock %s (предыдущий "
+                    "worker-scheduler умер без release_locks) — иначе тики "
+                    "залипли бы до истечения TTL",
+                    lock_key,
+                )
     worker.work(with_scheduler=with_scheduler)
 
 

@@ -19,9 +19,14 @@ from fastapi import APIRouter
 
 from ..auth import require_admin
 from . import (
+    admin_claim,
+    agent,
     audit,
     autoscale,
+    broadcasts,
+    client_control,
     cloud,
+    diagnostics,
     exits,
     health,
     health_pings,
@@ -34,7 +39,6 @@ from . import (
     subscriptions,
     tasks,
     tokens,
-    traffic,
     users,
 )
 from .users import _subscriptions_for_user
@@ -52,7 +56,6 @@ router.include_router(nodes.router)
 router.include_router(tasks.router)
 router.include_router(subscriptions.router)
 router.include_router(users.router)
-router.include_router(traffic.router)
 router.include_router(probes.router)
 router.include_router(health_pings.router)
 
@@ -62,7 +65,12 @@ router.include_router(payments.router)
 router.include_router(cloud.router)
 router.include_router(autoscale.router)
 router.include_router(exits.router)
+router.include_router(diagnostics.router)
 router.include_router(ops.router)
+router.include_router(broadcasts.router)
+router.include_router(admin_claim.router)
+router.include_router(client_control.router)
+router.include_router(agent.router)
 
 
 __all__ = [

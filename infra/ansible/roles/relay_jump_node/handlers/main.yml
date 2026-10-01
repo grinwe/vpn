@@ -11,3 +11,16 @@
     done
   args:
     executable: /bin/bash
+
+# Отдельный от xray-хендлера: hysteria — самостоятельный демон со своим
+# юнитом, и рестартовать её надо только когда реально поменялись её секции
+# (иначе каждый attach/detach рвал бы живые QUIC-сессии всех hy2-юзеров ноды).
+# try-restart, а не restart: на ноде без hy2 юнита нет, и `-` от systemctl
+# здесь не спасёт — ansible смотрит на rc.
+- name: restart hysteria2 after relay change
+  shell: |
+    if systemctl is-active --quiet hysteria-server 2>/dev/null; then
+      systemctl restart hysteria-server
+    fi
+  args:
+    executable: /bin/bash

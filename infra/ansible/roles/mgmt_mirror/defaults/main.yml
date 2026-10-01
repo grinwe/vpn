@@ -1,0 +1,22 @@
+---
+# Куда раскатываем mirror-stack. Отдельная директория от /opt/vpn,
+# чтобы прокатка mirror'а не пересекалась с backend'ом.
+mgmt_mirror_dir: /opt/mgmt-mirror
+
+# Внешний порт. Сюда ходят wrapper'ы на vpn-нодах. 8080 занят admin SPA
+# (см. docs/DEPLOY.md § 4 — `/admin/* → 127.0.0.1:8080`), поэтому 8090.
+# Меняешь — поменяй и:
+#   1. ports: в docker-compose.yml (hardcoded, поскольку файл в files/)
+#   2. xray_mirror_url в inventories/prod/group_vars/all.yml
+mgmt_mirror_port: 8090
+
+# Cron расписание для weekly refresh upstream-ресурсов.
+mgmt_mirror_refresh_cron_minute: "0"
+mgmt_mirror_refresh_cron_hour: "4"
+mgmt_mirror_refresh_cron_weekday: "1"  # понедельник
+
+# По дефолту дёргаем initial refresh при первом раскате роли. На
+# повторных прогонах refresh-assets.sh сам идемпотентно скипает уже
+# скачанные xray-zip'ы; geoip/geosite перезаписываются (это OK —
+# upstream обновляет их без bump'а pinned version'а).
+mgmt_mirror_force_refresh: false

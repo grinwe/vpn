@@ -12,6 +12,8 @@ from alembic import op
 import sqlalchemy as sa
 from sqlalchemy.dialects import postgresql
 
+from app.alembic._idempotent import has_column
+
 
 revision = "0011_provider_fallback_chain"
 down_revision = "0010_downscale"
@@ -20,14 +22,15 @@ depends_on = None
 
 
 def upgrade() -> None:
-    op.add_column(
-        "server_pools",
-        sa.Column(
-            "autoscale_fallback_provider_ids",
-            postgresql.JSONB(astext_type=sa.Text()),
-            nullable=True,
-        ),
-    )
+    if not has_column("server_pools", "autoscale_fallback_provider_ids"):
+        op.add_column(
+            "server_pools",
+            sa.Column(
+                "autoscale_fallback_provider_ids",
+                postgresql.JSONB(astext_type=sa.Text()),
+                nullable=True,
+            ),
+        )
 
 
 def downgrade() -> None:

@@ -11,8 +11,13 @@ This module adds endpoints for:
 """
 from __future__ import annotations
 
+import base64
 import logging
+import os
+import re
 import secrets
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 
 
 from fastapi import APIRouter, Depends, HTTPException, Request
@@ -20,27 +25,27 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from .auth import optional_admin, require_admin  # noqa: F401 — re-exported for legacy imports
 from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel
+from sqlalchemy import func, or_
 from sqlalchemy.orm import Session
 
 from . import models
+from .api import sub_fix
+from .api._common import get_db  # единый источник FastAPI-зависимости сессии (без третьей копии)
 from .config import get_settings
-from .db import SessionLocal
 from .rate_limit import limiter
 from .security import decrypt as _decrypt
+from .services import sub_links, xray_client_config
 from .time_utils import utcnow
 
 logger = logging.getLogger(__name__)
 settings = get_settings()
 
+# Порог «здоровья» ноды для фильтрации кредов в саб-линке — зеркалит
+# provisioning.MIN_HEALTHY_SCORE (читаем env напрямую, без импорта тяжёлого
+# модуля в горячий read-путь).
+MIN_HEALTHY_SCORE = int(os.getenv("MIN_HEALTHY_SCORE", "50"))
+
 ext_router = APIRouter(prefix="/api")
-
-
-def get_db():
-    db = SessionLocal()
-    try:
-        yield db
-    finally:
-        db.close()
 
 
 # ── Dynamic subscription link ──
@@ -57,28 +62,454 @@ class SubLinkResponse(BaseModel):
     configs: list[SubLinkConfig]
 
 
-@ext_router.get("/sub/{token}")
-def dynamic_sub_link(token: str, db: Session = Depends(get_db)):
-    """Dynamic subscription link — per-device or legacy per-subscription.
+def _autoconnect_enabled(sub: models.Subscription, device) -> bool:
+    """Включать ли HAPP-autoconnect для этой сабы/девайса (Phase B-гейт).
 
-    Lookup order:
-    1. Device.sub_token → returns only that device's credentials (secure).
-    2. Subscription.sub_token → backward compat for clients installed
-       before per-device tokens. Returns all active credentials.
-
-    Clients (Hiddify, v2rayNG) poll this URL and auto-update when the
-    server changes due to migration. The token is stable across migrations.
+    ``SUB_HAPP_AUTOCONNECT``: ""/"0"/"off" → никому; "all"/"on"/"true"/"yes" → всем;
+    иначе — CSV ``user_id`` (обкатка на одном юзере, как diverse-backfill).
+    NB: ``"1"`` — это ЮЗЕР 1, НЕ булево «вкл» (коллизия: user_id=1 совпал бы со
+    старым булевым "1" → обкатка на user 1 молча включалась бы ВСЕМ). Для «всем»
+    используй "all"/"on".
+    ``SUB_HAPP_AUTOCONNECT_SINCE`` (опц. ISO-метка): доп.фильтр «только НОВЫЕ девайсы»
+    — включаем лишь для девайсов с ``created_at >= метки`` (тест без путаницы со
+    старыми/primary девайсами). Если метка задана, а девайса нет (legacy саб-токен)
+    — не включаем.
     """
-    import base64
+    ac = (os.getenv("SUB_HAPP_AUTOCONNECT") or "").strip().lower()
+    if ac in ("all", "on", "true", "yes"):
+        on = True
+    elif ac and ac not in ("0", "off", "false"):
+        ids = {x.strip() for x in ac.split(",") if x.strip()}
+        on = str(getattr(sub, "user_id", "")) in ids
+    else:
+        on = False
+    if not on:
+        return False
+    since_raw = (os.getenv("SUB_HAPP_AUTOCONNECT_SINCE") or "").strip()
+    if since_raw:
+        return bool(device) and _created_after(device, since_raw)
+    return True
 
-    # ── Per-device lookup (preferred) ──────────────────────────────────
+
+def _created_after(device, since_raw: str) -> bool:
+    """device.created_at >= since_raw (ISO). Нормализуем обе в naive-UTC."""
+    try:
+        since = datetime.fromisoformat(since_raw.replace("Z", "+00:00"))
+    except ValueError:
+        return False
+    created = getattr(device, "created_at", None)
+    if created is None:
+        return False
+    if since.tzinfo is not None:
+        since = since.astimezone(timezone.utc).replace(tzinfo=None)
+    if created.tzinfo is not None:
+        created = created.astimezone(timezone.utc).replace(tzinfo=None)
+    return created >= since
+
+
+def _header_safe(value: str) -> str:
+    """Значение HTTP-заголовка, которое гарантированно уедет клиенту.
+
+    HTTP-заголовки — latin-1, и Starlette падает с UnicodeEncodeError на любой
+    кириллице: не «заголовок потерялся», а ВЕСЬ ответ подписки превращается в
+    500, то есть VPN перестаёт настраиваться у всех разом. Ровно это и
+    случилось с блоком статуса, где текст по определению русский.
+
+    Кодируем как ``base64:<...>`` — форма из документации Happ (announce).
+    Санитайзер общий на все заголовки намеренно: следующий русский текст в
+    заголовке появится обязательно, и он не должен ронять выдачу.
+    """
+    try:
+        value.encode("latin-1")
+    except (UnicodeEncodeError, AttributeError):
+        return "base64:" + base64.b64encode(str(value).encode("utf-8")).decode()
+    return value
+
+
+def _status_banner_enabled() -> bool:
+    """Рубильник блока статуса.
+
+    Нужен, потому что отрисовка ``base64:``-значений — единственное, что мы не
+    можем проверить со своей стороны: это делает чужой клиент. Если Happ
+    покажет вместо текста абракадабру, выключение обязано стоить одну
+    переменную окружения, а не откат релиза.
+    """
+    return (os.getenv("SUB_STATUS_BANNER") or "1").strip().lower() not in (
+        "0", "false", "off", "no",
+    )
+
+
+def _happ_provider_id() -> str:
+    """Provider ID из кабинета happ-proxy.com — ключ ко всему Advanced-слою Happ.
+
+    Ресёрч по докам 2026-07-29: ``sub-info-*``, ``sub-expire`` и
+    ``notification-subs-expire`` — «Advanced parameters», и клиент МОЛЧА
+    игнорирует их, пока в ответе нет providerid. Прежние «проверено на живом
+    устройстве — не работает» (заголовки ``base64:``, тело base64 и plain)
+    прогонялись без providerid и потому ничего не доказали.
+    ``subscription-autoconnect`` сюда НЕ входит (раздел «Managing app
+    settings») — июньская обкатка lowestdelay без providerid валидна.
+
+    ID привязан хешем к домену, который дёргает клиент (наш CDN-прокси, а не
+    бэкенд). Побочка регистрации: клиент раз в сутки отстукивается на
+    check.happ-proxy.com с HWID.
+
+    Значение валидируется жёстко: оно едет и заголовком, и строкой тела.
+    CR/LF в заголовке — это 500 на всей выдаче (инвариант «VPN настраивается
+    у всех» дороже любого блока), а не-ASCII _header_safe завернул бы в
+    ``base64:`` — и клиент получил бы в заголовке и теле ДВА РАЗНЫХ id.
+    Кривой ID из vault безопаснее не слать вовсе.
+    """
+    pid = (os.getenv("HAPP_PROVIDER_ID") or "").strip()
+    # isascii() обязателен: str.isalnum() юникодный и пропустил бы кириллицу.
+    if pid and not (pid.isascii() and all(ch.isalnum() or ch in "-_" for ch in pid)):
+        return ""
+    return pid
+
+
+def _announce_enabled(client: str = "happ") -> bool:
+    """Слать ли ``announce`` этому клиенту.
+
+    ``0`` — никогда (аварийный выключатель непроверенного рендера), ``1`` —
+    всегда. Разница в режиме ``auto`` (дефолт):
+
+    * **Happ** — announce едет, только пока providerid не задан: с ним статус
+      рисует полноценный sub-info-блок, и второй блок с тем же текстом был бы
+      дублем;
+    * **v2rayTun** — едет всегда, потому что sub-info он не понимает вовсе, и
+      announce у него ЕДИНСТВЕННЫЙ способ показать статус и дать вход на
+      страницу. Гасить его из-за чужого providerid значит оставить клиента
+      ни с чем.
+
+    Аварийный ``SUB_STATUS_BANNER=0`` гасит и announce тоже — он выключает
+    блок статуса целиком, поверх любых режимов здесь.
+    """
+    mode = (os.getenv("SUB_STATUS_ANNOUNCE") or "auto").strip().lower()
+    if mode in ("0", "false", "off", "no", "never"):
+        return False
+    if mode in ("1", "true", "on", "yes", "always"):
+        return True
+    if client == "v2raytun":
+        return True
+    return not _happ_provider_id()
+
+
+def _sub_status_banner(sub, token: str = "") -> dict[str, str]:
+    """Блок статуса подписки над списком серверов (Happ: sub-info-*).
+
+    Смысл: человек видит срок и кнопку продления прямо в VPN-клиенте и не идёт
+    за этим в бота. Системный блок Happ (``sub-expire``) не годится — он считает
+    только полные дни и показывается максимум за 3 дня до конца, а нам нужен
+    статус всегда и с часами на финише.
+
+    Цвет несёт смысл: синий — всё в порядке, красный — пора платить. Текст
+    ограничен 200 символами (лимит Happ), кнопка — 25.
+    """
+    expires_at = sub.expires_at
+    if not expires_at:
+        return {}
+
+    # Приводим к naive-UTC перед вычитанием: в БД срок лежит naive, но приезжает
+    # он и из кода, где datetime собирают с tzinfo, а смешивать их нельзя —
+    # TypeError тут означает 500 на всей выдаче подписки, а не кривой баннер.
+    if expires_at.tzinfo is not None:
+        expires_at = expires_at.astimezone(timezone.utc).replace(tzinfo=None)
+    left = expires_at - utcnow()
+    total_hours = int(left.total_seconds() // 3600)
+    if left.total_seconds() <= 0:
+        text = "Подписка закончилась. Продлите, чтобы VPN снова заработал."
+        color = "red"
+    elif total_hours < 24:
+        # Часы, а не «0 дней»: на финише это единственная понятная человеку
+        # единица, и именно тут решение о продлении принимается.
+        hours = max(1, total_hours)
+        text = f"Подписка истекает через {_plural_hours(hours)}"
+        color = "red"
+    elif left.days <= 3:
+        text = f"Подписка истекает через {_plural_days(left.days)}"
+        color = "red"
+    else:
+        # Дата — по МСК, а не по UTC: срок хранится как 23:59:59 UTC, и
+        # UTC-дата ВСЕГДА на день раньше московской. Клиент рядом рисует
+        # «Истекает» в локальной зоне устройства — наши «до 14.08» против
+        # его «15.08» выглядели багом. RU-сервис, фиксированный UTC+3.
+        msk = expires_at.replace(tzinfo=timezone.utc).astimezone(
+            timezone(timedelta(hours=3))
+        )
+        text = f"Подписка активна до {msk.strftime('%d.%m.%Y')}"
+        color = "blue"
+
+    banner = {
+        "sub-info-text": text[:200],
+        "sub-info-color": color,
+    }
+    # Кнопка блока статуса. В режиме ``all`` она ведёт на страницу починки и
+    # называется «Не подключается?»: пока активно родное expire-предупреждение
+    # Happ, блок sub-info не показывается вовсе — значит он виден только когда
+    # до конца больше трёх дней, в «зелёном» состоянии. В этом окне человек
+    # открывает клиент и что-то жмёт ровно по одной причине: сломалось.
+    if _fix_entrypoints() == "all" and token:
+        page = _fix_page_url(token)
+        if page:
+            banner["sub-info-button-text"] = "Не подключается?"
+            banner["sub-info-button-link"] = page
+            return banner
+    renew_url = _renew_link()
+    if renew_url:
+        banner["sub-info-button-text"] = "Продлить"
+        banner["sub-info-button-link"] = renew_url
+    return banner
+
+
+def _sub_body_directives(sub, token: str = "", client: str = "unknown") -> list[str]:
+    """Директивы Happ строками-комментариями в ТЕЛЕ подписки.
+
+    Тело — UTF-8, и документация Happ разрешает каждый параметр комментарием
+    ``#имя: значение`` перед ссылками наравне с заголовками (заголовки в
+    приоритете). Рабочий канал sub-info — ЗАГОЛОВКИ (base64:-обёртку клиент
+    разворачивает, проверено 2026-07-29); из base64-тела директивы клиент не
+    читает, так что здесь они лишь документированный fallback. Остальные
+    клиенты строки с ``#`` игнорируют — это стандартная форма для панелей.
+
+    ``providerid`` — особый формат БЕЗ двоеточия (``#providerid {id}``), так в
+    доках. Без него sub-info-* клиент игнорирует (Advanced-слой): вывод «Happ
+    не читает директивы из тела», записанный 2026-07-29, не доказан — тесты
+    шли без providerid.
+    """
+    # v2rayTun и Hiddify эти директивы не читают (у первого свой синтаксис
+    # announce, у второго нет блоков вовсе) — сыпать их в тело значит мусорить
+    # в файле, который человек может открыть глазами.
+    if client in ("v2raytun", "hiddify"):
+        return []
+    lines: list[str] = []
+    provider_id = _happ_provider_id()
+    if provider_id:
+        # Не под рубильником баннера: providerid активирует ВЕСЬ Advanced-слой
+        # (sub-expire, notification-subs-expire), не только блок статуса.
+        lines.append(f"#providerid {provider_id}")
+    if not _status_banner_enabled():
+        return lines
+    banner = _sub_status_banner(sub, token)
+    if not banner:
+        return lines
+    lines += [f"#{key}: {value}" for key, value in banner.items()]
+    return lines
+
+
+def _sub_body(
+    configs, sub, *, plain: bool = False, token: str = "",
+    client: str = "unknown",
+) -> str:
+    """Тело подписки: директивы блока статуса + ссылки.
+
+    ``plain`` — без base64, диагностика чтения директив из тела. Прежний
+    вывод «Happ не разбирает директивы из закодированного тела» не доказан:
+    проверка шла без providerid, а без него Advanced-директивы игнорируются
+    при любом способе доставки.
+    """
+    lines = _sub_body_directives(sub, token, client) + [c.uri for c in configs]
+    body = "\n".join(lines)
+    return body if plain else base64.b64encode(body.encode()).decode()
+
+
+def _sub_payload(
+    configs, sub, *, plain: bool, token: str, client: str
+) -> tuple[str, str]:
+    """Тело ответа и его media_type: Xray-JSON или прежний плоский список.
+
+    JSON едет только когда сошлись все условия сразу (умеющий клиент, режим,
+    токен в списке обкатки) И из легов удалось собрать автовыбор — иначе
+    ``build_body`` возвращает None и мы отдаём ровно то же, что отдавали
+    всегда. Диагностический ``?fmt=plain`` формат не переключает: он про
+    чтение директив из тела, и подменять им ветку JSON значило бы прятать
+    две разные вещи за одним параметром.
+    """
+    if not plain and xray_client_config.wants_xray_json(client, token):
+        # Fail-open осознанно: этот роут — единственный источник конфигов, и
+        # исключение здесь означало бы 500 вместо подписки, то есть человека
+        # без интернета из-за украшательства. Любая поломка сборки JSON —
+        # повод отдать проверенный временем плоский список, а не упасть.
+        try:
+            body = xray_client_config.build_body(configs, token)
+        except Exception:
+            logger.exception(
+                "xray-json: build failed for token=%s sub=%s — serving plain list",
+                token, sub.id,
+            )
+            body = None
+        if body is not None:
+            return body, "application/json"
+    return _sub_body(configs, sub, plain=plain, token=token, client=client), "text/plain"
+
+
+def _renew_link() -> str | None:
+    """Куда ведут кнопка «Продлить» и иконка Telegram — в личный кабинет.
+
+    Не на голый ``/start``: человек, нажавший «продлить» в VPN-клиенте, уже
+    знает, чего хочет, и приветственный экран бота — лишний шаг между ним и
+    оплатой.
+
+    Прямая ссылка на мини-апп (``t.me/<bot>/<short_name>``) открывает кабинет
+    одним тапом, но короткое имя приложения задаётся в BotFather и его может
+    не быть — тогда падаем на deep-link в бота, где ``account`` отвечает
+    сообщением с кнопкой входа. WebApp-кнопку саму по себе из внешнего
+    браузера открыть нельзя, только через Telegram.
+    """
+    bot = (os.getenv("BOT_USERNAME") or "").strip()
+    if not bot:
+        return None
+    short_name = (os.getenv("TELEGRAM_MINIAPP_SHORT_NAME") or "").strip()
+    if short_name:
+        return f"https://t.me/{bot}/{short_name}"
+    return f"https://t.me/{bot}?start=account"
+
+
+def _fix_page_url(token: str) -> str | None:
+    """Ссылка на страницу починки для кнопок в VPN-клиенте.
+
+    Строится ТОЛЬКО от домена саб-ссылки: именно он доступен без VPN — с него
+    клиент и так тянет конфиги. Вести кнопку на основной домен бессмысленно,
+    его как раз и может резать РКН.
+
+    Домен берём через ``sub_base_for``: он раскладывает токены по двум
+    фронтам, и кнопка обязана вести на ТОТ ЖЕ, что и сама подписка.
+    """
+    base = sub_links.sub_base_for(token)
+    if not base or not token:
+        return None
+    return f"{base}/{token}?fix=1"
+
+
+def _fix_entrypoints() -> str:
+    """Какие слоты в клиенте ведут на страницу: off / support / all."""
+    mode = (os.getenv("SUB_FIX_ENTRYPOINTS") or "off").strip().lower()
+    return mode if mode in ("off", "support", "all") else "off"
+
+
+# ── Кто именно пришёл за подпиской ──────────────────────────────────────
+#
+# Клиенты называют себя в User-Agent на каждом запросе (``Happ/2.4.1``,
+# ``v2rayTun/5.24.76``, ``HiddifyNext/4.1.1 (windows) like ClashMeta``), и
+# набор украшений у них РАЗНЫЙ: у Happ богатый Advanced-слой за Provider ID,
+# у v2rayTun — одна строка announce с раскраской и кликом, у Hiddify нет
+# ничего, кроме шкалы трафика и двух ссылок в меню профиля.
+#
+# Зачем ветвление, а не «слать всем всё»: имя ``announce`` у Happ и v2rayTun
+# ОБЩЕЕ, но синтаксис разный — цветовые коды ``#RRGGBB``, которые v2rayTun
+# красит, Happ покажет буквально («#ff5555Не подключается?»). Плюс каждый
+# клиент получает только осмысленные для него заголовки, а не кашу.
+_CLIENT_PATTERNS = (
+    # HiddifyNext называет себя «like ClashMeta v2ray sing-box», поэтому
+    # проверяется ПЕРВЫМ: иначе подстрока «v2ray» увела бы его в v2rayTun.
+    ("hiddify", re.compile(r"hiddify", re.I)),
+    ("v2raytun", re.compile(r"v2raytun", re.I)),
+    ("happ", re.compile(r"\bhapp\b|happ/", re.I)),
+    ("streisand", re.compile(r"streisand", re.I)),
+    ("v2rayng", re.compile(r"v2rayng", re.I)),
+)
+
+
+def _client_kind(user_agent: str | None) -> str:
+    """Какой клиент пришёл: happ / v2raytun / hiddify / … / unknown.
+
+    ``unknown`` (в том числе пустой UA) получает нынешний общий набор — то
+    есть добавление ветвления не может ничего сломать у клиента, которого мы
+    не опознали.
+    """
+    ua = user_agent or ""
+    for kind, pattern in _CLIENT_PATTERNS:
+        if pattern.search(ua):
+            return kind
+    return "unknown"
+
+
+def _v2raytun_announce(sub, token: str) -> tuple[str, str] | None:
+    """Строка объявления для v2rayTun + ссылка, которую она открывает.
+
+    У v2rayTun нет ни блока с фоном, ни кнопки с подписью: есть ``announce``
+    (строка под шкалой трафика) и ``announce-url`` (делает ВЕСЬ текст
+    тапабельным, справа появляется стрелка). Поэтому «кнопочность» пишется
+    словами внутри самого текста.
+
+    Срок подписки здесь НЕ повторяем: клиент и так рисует «Активна до …»
+    справа от шкалы трафика (из ``subscription-userinfo``), и вторая та же
+    дата рядом — шум. Строка несёт ровно то, чего в интерфейсе нет: вход на
+    страницу починки.
+
+    Регистрация клиенту не нужна, в отличие от Provider ID у Happ.
+    """
+    entrypoints = _fix_entrypoints()
+    page = _fix_page_url(token) if entrypoints != "off" else None
+    if not page:
+        # Вести некуда — строка бессмысленна: срок клиент показывает сам.
+        return None
+    if entrypoints != "all":
+        # Режим ``support`` — переходная ступень: ссылка уже есть, громкого
+        # призыва ещё нет. У Happ крупная кнопка тоже включается только в
+        # ``all``, и ломать лестницу раската ради одного клиента незачем.
+        return "Проблемы с подключением?", page
+    return _paint("Не подключается? Нажмите здесь", "#e05252"), page
+
+
+def _paint(text: str, colour: str) -> str:
+    """Покрасить ВСЮ фразу в v2rayTun-announce.
+
+    Инлайн-код красит ОДНО следующее слово, а не текст до следующего кода:
+    проверено на живом устройстве 2026-07-30 — из «#e05252Не подключается?»
+    красным вышло только «Не». Поэтому код ставится перед каждым словом.
+    """
+    return " ".join(f"{colour}{word}" for word in text.split())
+
+
+def _plural_hours(n: int) -> str:
+    """«1 час / 3 часа / 5 часов» — см. _plural_days."""
+    n = int(n)
+    if 11 <= n % 100 <= 14:
+        return f"{n} часов"
+    tail = n % 10
+    if tail == 1:
+        return f"{n} час"
+    if tail in (2, 3, 4):
+        return f"{n} часа"
+    return f"{n} часов"
+
+
+@dataclass(frozen=True)
+class SubTokenLookup:
+    """Что нашлось по sub_token: подписка и какое устройство обслуживать."""
+
+    sub: models.Subscription
+    # Устройство, которому принадлежит токен (None у legacy-подписочных).
+    token_device: models.Device | None
+    # Чьи креды реально отдаём: сам token_device либо живой сосед-алиас.
+    serve_device: models.Device | None
+    is_legacy: bool
+
+    @property
+    def aliased(self) -> bool:
+        return (
+            self.token_device is not None
+            and self.serve_device is not None
+            and self.serve_device.id != self.token_device.id
+        )
+
+
+def resolve_sub_token(db: Session, token: str) -> SubTokenLookup | None:
+    """Найти подписку и обслуживающее устройство по sub_token.
+
+    Вынесено из ``dynamic_sub_link`` ДОСЛОВНО (эпик «починка без Telegram»):
+    странице на саб-домене нужен тот же lookup, а копия неизбежно разъехалась
+    бы с оригиналом. Никаких побочных эффектов — ни аудита, ни отметки первой
+    выдачи, ни проверки «подписка обслуживаема»: это остаётся на вызывающем,
+    потому что странице продления нужна и ИСТЁКШАЯ подписка.
+
+    ``None`` — токен неизвестен (вызывающий решает: 404 или camo-страница).
+    """
     device = db.query(models.Device).filter_by(sub_token=token).first()
     if device:
         sub = device.subscription
-        if sub.status != models.SubscriptionStatus.active:
-            raise HTTPException(status_code=403, detail="Subscription is not active")
-        if sub.expires_at and sub.expires_at < utcnow():
-            raise HTTPException(status_code=403, detail="Subscription expired")
+        if sub is None:
+            return None
 
         # ╔══════════════════════════════════════════════════════════════╗
         # ║  DO NOT TOUCH without reading docs/components/backend-api.md ║
@@ -130,21 +561,854 @@ def dynamic_sub_link(token: str, db: Session = Depends(get_db)):
             )
             if live is not None:
                 source_device = live
+        return SubTokenLookup(
+            sub=sub, token_device=device, serve_device=source_device, is_legacy=False
+        )
 
-        configs = []
-        for cred in source_device.credentials:
-            if not cred.is_active:
-                continue
-            decrypted = _decrypt(cred.config_text)
-            if decrypted:
-                configs.append(SubLinkConfig(protocol=cred.proto, uri=decrypted))
+    sub = db.query(models.Subscription).filter_by(sub_token=token).first()
+    if sub is None:
+        return None
+    return SubTokenLookup(
+        sub=sub, token_device=None, serve_device=None, is_legacy=True
+    )
+
+
+def _sub_response_headers(
+    sub: models.Subscription, token: str, device=None,
+    *, userinfo_expire_only: bool = False, user_agent: str | None = None,
+) -> dict[str, str]:
+    """Заголовки саб-ответа (читаются клиентом на каждом рефреше — existing юзеры
+    подхватят без переимпорта).
+
+    Phase B (HAPP «авто»): ``subscription-autoconnect`` + ``-type: lowestdelay`` →
+    HAPP при (пере)коннекте сам берёт ноду с ЛУЧШИМ ПИНГОМ (дохлые с плохим/нет
+    пинга — мимо). Бесшовного per-server failover у HAPP через плоскую сабу НЕТ
+    (сверено по их докам) — это максимум, и он чисто server-side. За гейтом
+    ``SUB_HAPP_AUTOCONNECT`` (+ опц. ``_SINCE`` для «только новых девайсов»).
+    Autoconnect — раздел «Managing app settings», НЕ Advanced: работает без
+    providerid (обкатка 2026-06-13 это и показала).
+    ``fallback-url`` (если задан ``SUB_LINK_FALLBACK_BASE_URL``) — фейловер
+    ИСТОЧНИКА сабы на запасной домен, когда основной саб-URL режет РКН.
+    По докам Happ это тоже Advanced-параметр — без providerid не сработает.
+
+    ``profile-update-interval`` (часы) — как часто Hiddify/v2rayNG/HAPP сами
+    перечитывают сабу и через sibling-alias подхватывают новую ноду после
+    failover/миграции. Захардкоженные 6ч означали окно устаревания конфига
+    до полусуток; для анти-РКН профиля (РУ-ноды-расходники, частые баны)
+    дефолт снижен до 2ч и вынесен в ``SUB_PROFILE_UPDATE_INTERVAL_H`` — прод
+    может ужать до 1ч (компромисс свежесть-failover ↔ нагрузка read-пути;
+    write-amplification уже срезается ``SUB_FETCH_AUDIT_SAMPLE``).
+
+    ``cache-control: no-store, private`` (+ ``pragma``) — тело саб-ответа это
+    ПЕРСОНАЛЬНЫЙ динамический конфиг, меняющийся при каждой миграции/ротации
+    токена; запрещаем CF-Worker'у и любым промежуточным прокси его кэшировать,
+    иначе seamless-alias-инвариант обнулится закэшированным старым конфигом.
+    """
+    client = _client_kind(user_agent)
+    title = "V8-VPN"
+    try:
+        interval_h = int(os.getenv("SUB_PROFILE_UPDATE_INTERVAL_H") or "2")
+    except ValueError:
+        interval_h = 2
+    interval_h = max(1, interval_h)
+    headers: dict[str, str] = {
+        "profile-update-interval": str(interval_h),
+        "profile-title": title,
+        "content-disposition": f'attachment; filename="{title}"',
+        "cache-control": "no-store, private",
+        "pragma": "no-cache",
+        # Ответ теперь зависит от клиента — говорим это вслух любому кэшу на
+        # пути. no-store уже запрещает кэширование, но Vary дешёвый и снимает
+        # целый класс «а вдруг промежуточный прокси всё же сложит».
+        "vary": "User-Agent",
+    }
+    if sub.expires_at:
+        # ВСЕ ЧЕТЫРЕ ключа обязательны: Hiddify парсит заголовок только целиком
+        # (upload/download/total/expire) и при неполном наборе игнорирует его —
+        # а заодно теряет support-url и profile-web-page-url, которые цепляет
+        # только к распарсенному userinfo. Мы месяцами отдавали один expire и
+        # в Hiddify не показывали ничего.
+        #
+        # total=0 означает «безлимит» и в Hiddify, и в Happ. Это честно: тарифы
+        # у нас по устройствам, а не по гигабайтам, а per-user трафик мы не
+        # накапливаем — тик traffic_stats сбрасывает счётчики (xray `--reset`,
+        # hysteria `?clear=1`) и хранит лишь сумму по ноде за интервал. Рисовать
+        # шкалу из выдуманных цифр — врать человеку.
+        expires = sub.expires_at
+        if expires.tzinfo is None:
+            # naive в БД — это UTC, но .timestamp() наивного datetime берёт
+            # ЛОКАЛЬНУЮ зону процесса. В контейнере она UTC и всё совпадает —
+            # однако дата, от которой клиент считает «через сколько платить»,
+            # не должна зависеть от TZ окружения.
+            expires = expires.replace(tzinfo=timezone.utc)
+        if userinfo_expire_only:
+            # Диагностика (?userinfo=expire): только срок, без трафик-ключей.
+            # Гипотеза — без upload/download/total Happ не рисует шкалу
+            # «0B/∞» (нулевые данные, шкала-пустышка), а дату «Истекает»
+            # сохраняет. Поведение недокументировано, потому опт-ин: Hiddify
+            # парсит заголовок только ЦЕЛИКОМ и при неполном наборе теряет
+            # его вместе с support-url — дефолт менять нельзя, пока Happ
+            # не подтвердит рендер на живом устройстве.
+            headers["subscription-userinfo"] = f"expire={int(expires.timestamp())}"
+        else:
+            # download = реальные байты за текущий оплаченный период (наливает
+            # тик traffic_stats, обнуляет продление). Счётчик информационный:
+            # тарифы по устройствам, total=0 = безлимит — «12.5 GB/∞» вместо
+            # прежнего вечного «0B». upload не разделяем: клиент показывает
+            # сумму, а делить один счётчик на два поля — рисовать точность,
+            # которой нет.
+            used = int(getattr(sub, "traffic_used_bytes", 0) or 0)
+            headers["subscription-userinfo"] = (
+                f"upload=0; download={used}; total=0; "
+                f"expire={int(expires.timestamp())}"
+            )
+    # Иконка справа в строке подписки (Happ) — «куда идти, если сломалось».
+    # При включённых входах ведёт на страницу починки: она доступна без VPN,
+    # а Telegram в тех же условиях может быть недоступен — то есть кнопка
+    # «поддержка» вела бы ровно туда, куда человек не может попасть.
+    # Побочка: не-t.me ссылка теряет Telegram-иконку, остаётся обычная.
+    tg_link = _renew_link()
+    entrypoints = _fix_entrypoints()
+    page_url = _fix_page_url(token) if entrypoints != "off" else None
+    # ``support`` — переходный режим (страница вместо Telegram в мелкой
+    # иконке). В ``all`` иконка ВОЗВРАЩАЕТСЯ в Telegram намеренно: на
+    # странице человек уже есть через большую кнопку блока статуса, а два
+    # входа в одно место — дубль. К тому же t.me-ссылка рисуется телеграмной
+    # иконкой, и это единственный оставшийся способ попасть в бота из клиента.
+    # Кому иконка ведёт на страницу:
+    #  * режим ``support`` — всем (переходный режим до больших кнопок);
+    #  * Hiddify — ВСЕГДА, когда страница включена: у него нет ни блока
+    #    статуса, ни объявлений, а ``profile-web-page-url`` на актуальных
+    #    версиях не отображается (баги hiddify-app#2063, #1722). То есть
+    #    support-url — его ЕДИНСТВЕННЫЙ достижимый вход, и уводить его в
+    #    Telegram значит оставить второго по массовости клиента вообще без
+    #    входа ровно тогда, когда Telegram недоступен;
+    #  * Happ — в Telegram: у него вход есть большой кнопкой блока статуса, а
+    #    t.me-ссылка рисуется телеграмной иконкой и остаётся единственным
+    #    способом попасть в бота прямо из клиента.
+    support_to_page = page_url and (
+        entrypoints == "support" or (client == "hiddify" and entrypoints == "all")
+    )
+    support = page_url if support_to_page else tg_link
+    if support:
+        headers["support-url"] = support
+    # ── Happ-специфика ──────────────────────────────────────────────────
+    # Остальным эти заголовки бесполезны: v2rayTun и Hiddify их молча
+    # игнорируют. ``unknown`` тоже получает их — так поведение для
+    # неопознанного клиента остаётся ровно нынешним, и ветвление не может
+    # ничего сломать там, где мы не уверены, кто пришёл.
+    # streisand/v2rayng классифицируются (пригодится для статистики), но своих
+    # веток у них нет — значит набор им остаётся ПРЕЖНИМ. Иначе правка была бы
+    # чистой потерей: лишили бы их sub-info/providerid, не дав ничего взамен.
+    happ_slots = client not in ("v2raytun", "hiddify")
+    provider_id = _happ_provider_id() if happ_slots else ""
+    if provider_id:
+        # Ключ к Advanced-слою Happ: без него sub-expire, notification-subs-
+        # expire и sub-info-* клиент молча игнорирует. Дубль едет в теле
+        # (#providerid …) на случай прокси, режущего нестандартные заголовки.
+        headers["providerid"] = provider_id
+    if happ_slots and sub.expires_at:
+        # Пуш-напоминания клиента за 3 дня до конца — бесплатный канал
+        # возврата, работающий даже когда человек отключил уведомления нашего
+        # бота. Advanced: оживает только с providerid. Без срока подписки
+        # напоминать не о чем.
+        headers["notification-subs-expire"] = "1"
+    # Родное предупреждение Happ «подписка заканчивается через N д.» + кнопка
+    # «Продлить» (текст кнопки фиксирован клиентом). Показывает его сам клиент
+    # за ≤3 дня до конца и после истечения; Advanced — требует providerid.
+    # Значения ASCII, поэтому заголовок безопасен.
+    if happ_slots and _status_banner_enabled() and sub.expires_at:
+        headers["sub-expire"] = "1"
+        # В режиме ``all`` — на страницу, а не в Telegram. Именно у истёкшей
+        # подписки родное предупреждение вытесняет блок sub-info, то есть эта
+        # кнопка остаётся ЕДИНСТВЕННОЙ видимой — и вести ей в Telegram, до
+        # которого без VPN не добраться, значит замкнуть тот самый круг,
+        # ради разрыва которого написан эпик. На странице есть и продление,
+        # и ссылка в Telegram для тех, у кого он жив.
+        # …но только когда на странице реально МОЖНО заплатить. Пока
+        # SUB_FIX_PAY выключен, кнопка «Продлить» на странице показала бы
+        # текст «продлите в кабинете» — то есть лишний шаг на пути к оплате
+        # вместо прямой ссылки в кабинет.
+        expire_to_page = (
+            entrypoints == "all" and page_url and sub_fix.pay_enabled()
+        )
+        expire_link = page_url if expire_to_page else tg_link
+        if expire_link:
+            headers["sub-expire-button-link"] = expire_link
+    # ── announce: одно имя, два разных синтаксиса ───────────────────────
+    #
+    # v2rayTun красит текст инлайн-кодами ``#RRGGBB`` и делает его тапабельным
+    # через ``announce-url``; Happ ни того, ни другого не умеет и показал бы
+    # цветовые коды буквально («#e05252Не подключается?»). Поэтому строка
+    # собирается ПОД КЛИЕНТА, а не одна на всех.
+    # _announce_enabled() гейтит обе ветки: v2rayTun-рендер единственный, что
+    # ещё не проверен на живом устройстве, и выключать его должно быть чем-то
+    # точнее общего SUB_STATUS_BANNER (тот гасит блок статуса целиком).
+    if _status_banner_enabled() and client == "v2raytun" and _announce_enabled(client):
+        pair = _v2raytun_announce(sub, token)
+        if pair:
+            text, url = pair
+            headers["announce"] = (
+                "base64:" + base64.b64encode(text.encode("utf-8")).decode()
+            )
+            if url:
+                headers["announce-url"] = url
+    elif _status_banner_enabled() and happ_slots and _announce_enabled(client):
+        # Happ-вариант: без цветовых кодов и без ссылки (их он не понимает).
+        # Роль — запасной видимый статус, пока providerid не задан или не
+        # провалидирован; в auto-режиме гаснет сам, когда живёт sub-info.
+        announce_text = _sub_status_banner(sub, token).get("sub-info-text")
+        if announce_text:
+            headers["announce"] = (
+                "base64:" + base64.b64encode(announce_text.encode("utf-8")).decode()
+            )
+    # Цветной блок статуса: sub-info-* ЗАГОЛОВКАМИ — рабочий канал, проверено
+    # на живом устройстве 2026-07-29 (?subinfo=headers): Happ разворачивает
+    # base64:-обёрнутую кириллицу в заголовках, а вот директивы из base64-ТЕЛА
+    # не читает вовсе (тело остаётся документированным fallback'ом). Требует
+    # providerid; без него клиент молча игнорирует — не вредно.
+    if happ_slots and _status_banner_enabled():
+        headers.update(_sub_status_banner(sub, token))
+    # Бонусом к support-url: на версиях, где этот слот работает, у Hiddify
+    # появляется ещё и пункт в меню профиля. Полагаться на него нельзя (в
+    # 4.1.1 не отображается), поэтому основной вход — support-url выше.
+    if client == "hiddify" and page_url and entrypoints == "all":
+        # Только в ``all``: в режиме ``support`` на страницу уже ведёт
+        # support-url, и второй пункт меню с тем же адресом — дубль.
+        headers["profile-web-page-url"] = page_url
+    if _autoconnect_enabled(sub, device):
+        headers["subscription-autoconnect"] = "true"  # канон (HAPP принимает и "1")
+        headers["subscription-autoconnect-type"] = "lowestdelay"
+    fallback = (os.getenv("SUB_LINK_FALLBACK_BASE_URL") or "").strip().rstrip("/")
+    if fallback and token:
+        headers["fallback-url"] = f"{fallback}/{token}"
+    # Последним рубежом, а не точечно у баннера: заголовок с кириллицей роняет
+    # ВЕСЬ ответ подписки в 500 (latin-1), и цена промаха тут — «VPN не
+    # настраивается ни у кого», а не «пропала одна подпись».
+    return {k: _header_safe(v) for k, v in headers.items()}
+
+
+def ensure_referral_code(db: Session, user) -> "models.ReferralCode":
+    """Вернуть активный реферальный код пользователя, создав при необходимости.
+
+    Один хелпер на всех, потому что кодов исторически было два формата: ручка
+    для бота минтила ``token_urlsafe(8)``, ручка вебаппа — 6 символов в верхнем
+    регистре, и один и тот же человек видел в боте и в мини-аппе РАЗНЫЕ ссылки.
+    """
+    existing = (
+        db.query(models.ReferralCode)
+        .filter_by(owner_id=user.id, is_active=True)
+        .order_by(models.ReferralCode.id.desc())
+        .first()
+    )
+    if existing is not None:
+        return existing
+    ref = models.ReferralCode(owner_id=user.id, code=secrets.token_urlsafe(8))
+    db.add(ref)
+    db.flush()
+    return ref
+
+
+def referral_share_url(code: str) -> str | None:
+    """``t.me/<bot>?start=ref_<code>``. None, если BOT_USERNAME не задан."""
+    bot = os.getenv("BOT_USERNAME")
+    return f"https://t.me/{bot}?start=ref_{code}" if bot else None
+
+
+def _plural_days(n: int) -> str:
+    """«1 день / 3 дня / 30 дней» — русские числительные требуют трёх форм.
+
+    Без этого шаблон печатал «дарим тебе 3 дней», и сообщение сразу читалось
+    как машинное.
+    """
+    n = int(n)
+    if 11 <= n % 100 <= 14:
+        return f"{n} дней"
+    tail = n % 10
+    if tail == 1:
+        return f"{n} день"
+    if tail in (2, 3, 4):
+        return f"{n} дня"
+    return f"{n} дней"
+
+
+def _mark_first_config_fetch(db: Session, sub) -> None:
+    """Отметить первое скачивание конфига и позвать привести друга.
+
+    Момент «вау»: человек только что забрал рабочий конфиг — единственная точка,
+    где мы знаем, что VPN у него поехал. Предлагать реферальную ссылку в
+    приветствии бессмысленно (человеку ещё нечего рекомендовать), а здесь —
+    уместно, и рынок делает так же.
+
+    Пишем в отдельную колонку, а не считаем по audit_logs: те сэмплируются и
+    чистятся ретеншеном. Гейт `first_config_fetch_at IS NULL` заодно делает
+    приглашение одноразовым — саб-ссылку клиент дёргает каждые пару часов.
+
+    Read-путь горячий, поэтому всё внутри try: ни отметка, ни приглашение не
+    стоят того, чтобы уронить выдачу конфига.
+    """
+    try:
+        user = db.get(models.User, sub.user_id) if sub.user_id else None
+        if user is None or user.first_config_fetch_at is not None:
+            return
+        user.first_config_fetch_at = utcnow()
+        if user.telegram_id:
+            from .services import balance as balance_svc
+
+            ref = ensure_referral_code(db, user)
+            db.add(
+                models.AuditLog(
+                    actor="system",
+                    actor_type=models.AuditActor.system,
+                    action="referral_invite",
+                    target_type="user",
+                    target_id=user.id,
+                    extra={
+                        "telegram_id": user.telegram_id,
+                        "share_url": referral_share_url(ref.code),
+                        "reward_days": (
+                            ref.reward_days or balance_svc.REFERRAL_REWARD_DAYS
+                        ),
+                    },
+                )
+            )
+        db.commit()
+    except Exception:  # noqa: BLE001
+        logger.exception("first-config-fetch: не удалось отметить user=%s", sub.user_id)
+        db.rollback()
+
+
+def _should_log_sub_fetch() -> bool:
+    """Сэмплирование записи ``subscription_fetch`` в самом горячем read-пути.
+
+    Клиенты (Hiddify/v2rayNG) опрашивают ссылку каждые 6 ч (``profile-update-
+    interval``) + ручные рефреши, и каждый успешный фетч пишет строку
+    ``AuditLog`` + ``COMMIT`` — таблица ``audit_logs`` растёт неограниченно
+    (ретеншен-джоба живёт в worker.py, вне этого модуля — см. аудит #247).
+    ``SUB_FETCH_AUDIT_SAMPLE`` (int, по умолчанию 1 = писать каждый фетч) —
+    прод-рубильник: при N>1 пишем примерно 1 фетч из N, срезая write-
+    amplification в горячем эндпоинте, сохраняя сам сигнал активности. N<=1 или
+    мусор → писать всегда (текущее поведение, дефолт-noop для тестов)."""
+    try:
+        n = int(os.getenv("SUB_FETCH_AUDIT_SAMPLE") or "1")
+    except ValueError:
+        n = 1
+    if n <= 1:
+        return True
+    return secrets.randbelow(n) == 0
+
+
+def _retry_after_sec() -> str:
+    """Значение заголовка ``Retry-After`` для транзиентных 503 саб-линка (сек).
+
+    Настраивается через ``SUB_RETRY_AFTER_SEC`` (дефолт 60). Без него «retry
+    shortly» на практике вырождается в плановый ``profile-update-interval``
+    (часы); заголовок даёт корректному клиенту машиночитаемый хинт перезапросить
+    конфиг сразу после провижининга/разморозки."""
+    try:
+        n = int(os.getenv("SUB_RETRY_AFTER_SEC") or "60")
+    except ValueError:
+        n = 60
+    return str(max(1, n))
+
+
+def _node_serviceable(node, now) -> bool:
+    """Пригодна ли нода к выдаче в саб-линке (зеркалит фильтр ``choose_node``):
+    активна, не в cooldown, не заглушена диагностикой, ``health_score`` не ниже
+    порога. Нездоровые ноды исключаем из набора, чтобы клиент не держал мёртвый
+    эндпоинт в ротации client-side failover."""
+    if not getattr(node, "is_active", True):
+        return False
+    cd = getattr(node, "cooldown_until", None)
+    if cd is not None and cd > now:
+        return False
+    if getattr(node, "auto_diagnose_disabled_at", None) is not None:
+        return False
+    if getattr(node, "diagnostics_disabled_at", None) is not None:
+        return False
+    hs = getattr(node, "health_score", None)
+    if hs is not None and hs < MIN_HEALTHY_SCORE:
+        return False
+    return True
+
+
+def _healthy_node_ids(db: Session, creds) -> set[int]:
+    """node_id активных кредов, чьи ноды пригодны к выдаче.
+
+    Пустой результат = «фильтр не применять» (kill-switch ``SUB_FILTER_
+    UNHEALTHY_NODES=0``, у кредов нет node_id, ИЛИ все ноды нездоровы — в
+    последнем случае вызывающий деградирует к нефильтрованному набору: живой-
+    но-неоптимальный конфиг лучше 503)."""
+    if (os.getenv("SUB_FILTER_UNHEALTHY_NODES") or "1").strip().lower() in (
+        "0", "off", "false",
+    ):
+        return set()
+    node_ids = {c.node_id for c in creds if c.is_active and c.node_id is not None}
+    if not node_ids:
+        return set()
+    now = utcnow()
+    rows = db.query(models.VPNNode).filter(models.VPNNode.id.in_(node_ids)).all()
+    return {n.id for n in rows if _node_serviceable(n, now)}
+
+
+# Протоколы, умеющие RU split-tunnel на relay-ноде. С 2026-07-28 это ВСЕ
+# четыре: у трёх vless-флаворов это routing-правила + sockopt.interface, у
+# hysteria2 — секции ``outbounds`` (direct с ``bindDevice: wgN``) и
+# ``acl.inline`` (РУ → local, остальное → tunnel). До той даты hy2 не биндил
+# ничего и на relay-ноде выпускал весь трафик с российского IP.
+#
+# ``shadowtls+shadowsocks`` в список НЕ входит намеренно: роль отключена,
+# split-tunnel там никто не делал, и живой кред этого протокола на relay-ноде
+# — та же поломка, что была у hy2.
+_SPLIT_TUNNEL_PROTOS = {
+    "vless-reality",
+    "vless-xhttp",
+    "vless-ws-cdn",
+    "hysteria2",
+}
+
+
+def _tunnel_blind_node_ids(db: Session, creds) -> set[int]:
+    """node_id relay-нод — тех, у кого есть хотя бы один ``RelayExitLink``.
+
+    На такой ноде «наружу» означает «через WG в зарубежный exit», и кред
+    протокола без split-tunnel даёт юзеру рабочий коннект БЕЗ VPN.
+
+    ⚠️ По умолчанию ВЫКЛЮЧЕН. Это аварийный рубильник, а не штатный механизм:
+    штатно каждый протокол туннелируется сам (см. ``_SPLIT_TUNNEL_PROTOS``).
+    Включать (``SUB_FILTER_TUNNEL_BLIND=1``), если ansible-раскатка
+    split-tunnel где-то не прошла и надо срочно убрать слепые эндпоинты из
+    выдачи, не дожидаясь починки ноды.
+
+    Пустой результат = фильтр не применять (выключен рубильником, у кредов
+    нет node_id, либо ни одна их нода не relay).
+    """
+    if (os.getenv("SUB_FILTER_TUNNEL_BLIND") or "0").strip().lower() not in (
+        "1", "on", "true", "yes",
+    ):
+        return set()
+    node_ids = {c.node_id for c in creds if c.is_active and c.node_id is not None}
+    if not node_ids:
+        return set()
+    rows = (
+        db.query(models.RelayExitLink.relay_node_id)
+        .filter(models.RelayExitLink.relay_node_id.in_(node_ids))
+        .distinct()
+        .all()
+    )
+    return {r[0] for r in rows}
+
+
+# Эмодзи по протоколу для display-name эндпоинта в клиенте. Различает протокол
+# РОЛЬ вместо техножаргона: человеку не нужны слова Reality/XHTTP, ему нужно
+# понимать, что пробовать первым, если основное не пошло. Порядок ролей отражает
+# реальную картину на флоте:
+#   reality   — быстрый и незаметный, но в части регионов ТСПУ его режет;
+#   hysteria2 — UDP/QUIC, вытаскивает как раз те регионы, где TCP-Reality лёг;
+#   xhttp     — за nginx с LE-сертом, снаружи выглядит обычным сайтом;
+#   ws-cdn    — ещё один такой же запасной. Он задумывался «через Cloudflare»,
+#               но CF-проксирование для нас мертво (РКН режет CF-leg), и катаем
+#               мы его напрямую — то есть особой стойкости в нём НЕТ.
+# cred.proto — строка с дефисами.
+_PROTO_LABEL = {
+    "vless-reality": ("⚡", "Основной"),
+    "hysteria2": ("🚀", "Быстрый"),
+    "vless-xhttp": ("🛡️", "Запасной"),
+    "vless-ws-cdn": ("☁️", "Резервный"),
+    "shadowtls": ("🔒", "Резервный"),
+}
+_DEFAULT_PROTO_LABEL = ("🌐", "Сервер")
+
+# Порядок в списке = порядок, в котором стоит пробовать руками.
+_PROTO_ORDER = {
+    "vless-reality": 0,
+    "hysteria2": 1,
+    "vless-xhttp": 2,
+    "vless-ws-cdn": 3,
+}
+
+# Роль лега = протокол. Один источник правды для набора, подписи и ротации.
+LEG_ROLE_BY_PROTO = {
+    "vless-reality": "primary",
+    "hysteria2": "fast",
+    "vless-xhttp": "backup",
+    "vless-ws-cdn": "reserve",
+}
+
+
+def sub_leg_scheme() -> str:
+    """`legacy` — отдаём все активные креды (как было); `4x1` — только
+    опубликованные (по одному протоколу с ноды).
+
+    Флагом, а не миграцией: откат схемы должен стоить перезапуск контейнера, а
+    не откат данных.
+    """
+    return (os.getenv("SUB_LEG_SCHEME") or "legacy").strip().lower()
+
+
+def _strip_lonely_indices(configs: list[SubLinkConfig]) -> None:
+    """Убрать номер у ролей, встречающихся в списке ровно один раз.
+
+    При схеме 4×1 каждая роль живёт на своём сервере, поэтому «Основной 4»
+    среди четырёх строк читается как «а где ещё три Основных?». Номер нужен
+    только там, где роль дублируется — например после эскалации, когда человеку
+    выдан второй «Быстрый» на другой ноде: там цифра снова несёт смысл. И в
+    legacy-схеме, где ролей по три-четыре штуки, всё остаётся как было.
+    """
+    counts: dict[str, int] = {}
+    for cfg in configs:
+        role = _PROTO_LABEL.get(cfg.protocol, _DEFAULT_PROTO_LABEL)[1]
+        counts[role] = counts.get(role, 0) + 1
+    for cfg in configs:
+        role = _PROTO_LABEL.get(cfg.protocol, _DEFAULT_PROTO_LABEL)[1]
+        if counts[role] == 1:
+            cfg.uri = _relabel_uri(cfg.uri, cfg.protocol, None)
+
+
+def _relabel_uri(uri: str, proto: str, index: int | None) -> str:
+    """Переписываем #fragment (display-name в клиенте) на «{эмодзи} {роль} N».
+
+    Зачем: имя ноды НЕ должно палить страну (юзеры возмущаются «VPN в РФ» —
+    СОРМ/приватность) и НЕ должно быть техножаргоном (Reality/XHTTP). Раньше все
+    записи звались одинаково «V8 сервер N», и в списке из двенадцати штук
+    человек не мог отличить рабочий вариант от запасного — при ручном выборе
+    это означало тыкать наугад. Роль отвечает ровно на этот вопрос.
+
+    ``index`` — номер сервера (не сквозной номер строки), поэтому «Основной 2» и
+    «Быстрый 2» — это один и тот же сервер разными протоколами. ``None`` —
+    номера нет вовсе: при схеме 4×1 каждая роль живёт на своём сервере, роль в
+    списке одна, и цифра рядом с ней не значит ничего — «Основной 4» при
+    четырёх строках выглядит так, будто три «Основных» куда-то потерялись.
+
+    RAW UTF-8 (как исходный ``#reality-Russia``), НЕ percent-энкодим: часть
+    клиентов кажет %XX буквально. Делается на ОТДАЧЕ сабы (не запекается в
+    cred.config_text) → смена стиля не требует bulk-rebuild, только рефреш
+    сабы у клиента.
+    """
+    emoji, role = _PROTO_LABEL.get(proto, _DEFAULT_PROTO_LABEL)
+    base = uri.split("#", 1)[0]
+    suffix = "" if index is None else f" {index}"
+    return f"{base}#{emoji} {role}{suffix}"
+
+
+def _decrypt_configs(
+    creds, *, sub, device_id=None, node_filter=None, tunnel_blind_nodes=None
+):
+    """Собирает ``SubLinkConfig`` из АКТИВНЫХ кредов, расшифровывая config_text.
+
+    ``node_filter`` — множество допустимых node_id (креды на прочих нодах
+    пропускаем); None = без фильтра по нодам. Пустой результат ``_decrypt``
+    логируется с полным контекстом (cred/proto/node/device/sub) — раньше
+    per-device ветка молча выкидывала недешифруемый кред, и частичная
+    деградация подписки (рассинхрон APP_SECRET_KEY, битый config_text) была
+    невидима для диагностики.
+
+    ``tunnel_blind_nodes`` — node_id relay-нод: на них выкидываем креды
+    протоколов вне ``_SPLIT_TUNNEL_PROTOS``, потому что такой эндпоинт
+    отдаёт юзеру коннект вообще без VPN (см. ``_tunnel_blind_node_ids``)."""
+    out: list[SubLinkConfig] = []
+    # Номер сервера, а не строки: «Основной 2» и «Быстрый 2» должны означать
+    # один и тот же сервер разными протоколами — иначе номера в списке из
+    # двенадцати строк не значат ничего.
+    server_no: dict[int | None, int] = {}
+    publish_only = sub_leg_scheme() == "4x1"
+    for cred in creds:
+        if not cred.is_active:
+            continue
+        # Схема 4×1: на ноде лежат все протоколы, но в подписку идёт один.
+        # getattr — на случай кредов, прочитанных до миграции 0065.
+        if publish_only and not getattr(cred, "leg_published", True):
+            continue
+        if (
+            node_filter is not None
+            and cred.node_id is not None
+            and cred.node_id not in node_filter
+        ):
+            continue
+        if (
+            tunnel_blind_nodes
+            and cred.node_id in tunnel_blind_nodes
+            and cred.proto not in _SPLIT_TUNNEL_PROTOS
+        ):
+            logger.warning(
+                "sub-link: dropping tunnel-blind credential %s (proto=%s) on relay "
+                "node %s — this endpoint egresses with the relay's own IP, no VPN "
+                "(sub=%s, device=%s)",
+                cred.id, cred.proto, cred.node_id, sub.id, device_id,
+            )
+            continue
+        decrypted = _decrypt(cred.config_text)
+        if decrypted:
+            index = server_no.setdefault(cred.node_id, len(server_no) + 1)
+            out.append(SubLinkConfig(
+                protocol=cred.proto,
+                uri=_relabel_uri(decrypted, cred.proto, index),
+                node_id=cred.node_id,
+            ))
+        else:
+            logger.warning(
+                "sub-link: decrypt returned empty for credential %s "
+                "(proto=%s, node=%s, device=%s, sub=%s)",
+                cred.id, cred.proto, cred.node_id, device_id, sub.id,
+            )
+    # Сверху — то, что стоит пробовать первым. Автовыбор (HAPP lowestdelay) на
+    # порядок не смотрит, но при ручном выборе человек тыкает в первую строку, и
+    # это должен быть основной протокол, а не случайный резервный.
+    out.sort(key=lambda c: _PROTO_ORDER.get(c.protocol, len(_PROTO_ORDER)))
+    _strip_lonely_indices(out)
+    return out
+
+
+def _raise_if_sub_not_serviceable(sub: models.Subscription) -> None:
+    """Гейт статуса/срока подписки для саб-линка.
+
+    ``frozen`` — ВРЕМЕННАЯ user-initiated пауза (sub_token сохраняется, при
+    разморозке alias-блок переклеит старый URL на живого сиблинга) → отдаём
+    503+Retry-After, а НЕ 403: многие клиенты на 403 чистят сохранённый
+    профиль и перестают опрашивать ссылку, и после пополнения/разморозки
+    бесшовного авто-восстановления не происходит. ``blocked``/``expired`` —
+    терминальные состояния, 403 корректен (и покрыт тестами)."""
+    if sub.status == models.SubscriptionStatus.frozen:
+        raise HTTPException(
+            status_code=503,
+            detail="Subscription temporarily paused — retry shortly",
+            headers={"Retry-After": _retry_after_sec()},
+        )
+    if sub.status != models.SubscriptionStatus.active:
+        raise HTTPException(status_code=403, detail="Subscription is not active")
+    if sub.expires_at and sub.expires_at < utcnow():
+        raise HTTPException(status_code=403, detail="Subscription expired")
+
+
+def _device_label(found) -> str | None:
+    """Имя устройства для фразы «мы переключим …» — или None.
+
+    Имя показываем ТОЛЬКО когда живых устройств у подписки больше одного:
+    там оно отвечает на вопрос «а какое именно чинится». При единственном
+    устройстве оно не несёт информации, зато вылезает наружу всем, что
+    человек когда-то вписал — на живом проде это дало «Мы переключим
+    Превью баннера на другой способ связи».
+    """
+    device = found.serve_device or found.token_device
+    if device is None:
+        return None
+    live = [
+        d
+        for d in (found.sub.devices or [])
+        if d.status == models.DeviceStatus.active
+    ]
+    if len(live) < 2:
+        return None
+    return device.name or None
+
+
+def _sub_fix_key(request: Request) -> str:
+    """Ключ лимита — сам токен из пути (см. докстринг ``sub_fix_action``)."""
+    return f"subfix:{request.path_params.get('token', '')}"
+
+
+@ext_router.post("/sub/{token}")
+# Бюджет под 3-шаговый сценарий (починка → оператор → «помогло/не помогло»,
+# плюс «попробовать ещё раз»): прежние 2/minute;6/hour резали штатный флоу на
+# третьем тапе. Это защита от флуда по токену, а не политика повторов —
+# частоту починок держит ядро (SELF_REPAIR_THROTTLE_SEC / _DAILY_MAX).
+@limiter.limit("6/minute;30/hour", key_func=_sub_fix_key)
+def sub_fix_action(
+    request: Request,  # noqa: ARG001 — нужен slowapi key_func
+    token: str,
+    db: Session = Depends(get_db),
+    fix: str | None = None,
+    n: str | None = None,
+    pay: str | None = None,
+    # Обратная связь после починки (зеркало бот-кнопок): ``report`` — id
+    # OperatorNodeReport, ``op`` — оператор связи, ``still=1`` — «всё равно не
+    # работает», ``ok=1`` — «всё работает». Строки, не int: типизированный
+    # параметр отвечал бы 422-JSON на горячем роуте.
+    report: str | None = None,
+    op: str | None = None,
+    still: str | None = None,
+    ok: str | None = None,
+):
+    """Действие со страницы починки: шаг лестницы, счёт на продление или
+    обратная связь по уже сделанной починке.
+
+    POST, а не GET, намеренно: GET дёргают префетчеры браузера, антивирусы и
+    превью-фетчеры, и каждый такой вызов сжигал бы конечный шаг лестницы.
+    Тело пустое — CF Worker его не форвардит, поэтому всё в query.
+
+    Лимит ключуется по ТОКЕНУ, а не по IP: у мобильных операторов CGNAT, и
+    per-IP лимит выкосил бы половину абонентов МТС одним нетерпеливым
+    соседом. GET-выдачу конфигов этот лимит не трогает — он на своём роуте.
+    """
+    if not sub_fix.page_enabled() or fix != "1":
+        return sub_fix.camo_response()
+    found = resolve_sub_token(db, token)
+    if found is None:
+        return sub_fix.camo_response()
+    if report is not None:
+        # Обратная связь: человек ушёл в клиент переподключаться и вернулся
+        # позже — nonce принимаем шире (час), а протухший не превращаем в
+        # стартовый экран: перерисовываем тот же экран со свежим nonce.
+        # Пишется только свой репорт, CSRF-риск нулевой.
+        if not sub_fix.nonce_valid(token, n, buckets=4):
+            return sub_fix.render_feedback_again(db, found, token, report)
+    elif not sub_fix.nonce_valid(token, n):
+        # CSRF: без валидного nonce действие не выполняем и в БД не пишем.
+        return sub_fix.render_start(
+            found.sub, token,
+            device_name=_device_label(found),
+            repairable=not found.is_legacy,
+        )
+    owner = db.get(models.User, found.sub.user_id) if found.sub.user_id else None
+    if owner is not None and getattr(owner, "banned_at", None) is not None:
+        # Глобальный бан закрывает ВСЕ действия страницы, включая оплату и
+        # обратную связь — как у бота (мидлвара дропает апдейты).
+        return sub_fix.render_inactive(found.sub, token, banned=True)
+    if pay in ("1", "sbp"):
+        if not sub_fix.pay_enabled():
+            return sub_fix.render_start(
+                found.sub, token,
+                device_name=_device_label(found),
+                repairable=not found.is_legacy,
+            )
+        # pay=1 — карта (lava_top), pay=sbp — СБП (lava_top_sbp).
+        return sub_fix.do_pay(
+            db, found, token, method="sbp" if pay == "sbp" else "card"
+        )
+    if report is not None:
+        return sub_fix.do_feedback(
+            db, found, token,
+            report_id=report, operator=op, still=still == "1", ok=ok == "1",
+        )
+    return sub_fix.do_repair(db, found, token)
+
+
+@ext_router.get("/sub/{token}")
+def dynamic_sub_link(
+    request: Request,
+    token: str,
+    db: Session = Depends(get_db),
+    fmt: str | None = None,
+    userinfo: str | None = None,
+    fix: str | None = None,
+    paid: str | None = None,
+):
+    """Dynamic subscription link — per-device or legacy per-subscription.
+
+    Lookup order:
+    1. Device.sub_token → returns only that device's credentials (secure).
+    2. Subscription.sub_token → backward compat for clients installed
+       before per-device tokens. Returns all active credentials.
+
+    Clients (Hiddify, v2rayNG) poll this URL and auto-update when the
+    server changes due to migration. The token is stable across migrations.
+
+    ``?fmt=plain`` отдаёт тело незакодированным — диагностика чтения директив
+    из тела. Исходная загадка «блок не появился ни заголовками, ни телом»
+    разгадана иначе: ``sub-info-*``/``sub-expire`` — Advanced-параметры Happ и
+    без providerid игнорируются при любом способе доставки. Параметр оставлен:
+    он позволит проверить plain- против base64-тела уже С providerid. Обычные
+    клиенты параметр не шлют — поведение для них не меняется ни на байт.
+
+    ``?userinfo=expire`` — той же природы диагностика: userinfo без
+    трафик-ключей. Гипотеза — Happ перестанет рисовать шкалу-пустышку
+    «0B/∞» (данных о трафике мы не собираем), сохранив дату «Истекает».
+    Подтвердится на устройстве → кандидат на прод-дефолт для UA Happ
+    (Hiddify неполный набор выбрасывает целиком, ему нельзя).
+    """
+    # ── Страница починки (?fix=1) ──────────────────────────────────────
+    # Ветвление ДО _raise_if_sub_not_serviceable, _mark_first_config_fetch и
+    # аудита выдачи: открытие страницы ничего не пишет в БД и не отравляет
+    # онбординг-воронку («первая выдача конфига»), а истёкшей подписке нужен
+    # экран продления, а не 403.
+    if fix == "1" and sub_fix.page_enabled() and sub_fix.wants_html(request):
+        found = resolve_sub_token(db, token)
+        if found is None:
+            return sub_fix.camo_response()
+        sub = found.sub
+        owner = db.get(models.User, sub.user_id) if sub.user_id else None
+        if owner is not None and getattr(owner, "banned_at", None) is not None:
+            # Глобальный бан — как у бота (мидлвара дропает апдейты): ни
+            # чинить, ни платить, ни ждать оплату. Стоит ПЕРЕД экранами
+            # expired/paid — иначе забаненный с истёкшей подпиской получал
+            # бы кнопку продления.
+            return sub_fix.render_inactive(sub, token, banned=True)
+        if paid is not None:
+            # str, а не int: типизированный параметр заставлял бы FastAPI
+            # отвечать 422-JSON на ЛЮБОЙ нечисловой ?paid= — на горячем
+            # роуте выдачи конфигов, независимо от флагов страницы.
+            try:
+                invoice_id = int(paid)
+            except (TypeError, ValueError):
+                return sub_fix.camo_response()
+            return sub_fix.render_paid_state(db, found, token, invoice_id)
+        if sub.status == models.SubscriptionStatus.expired or (
+            sub.expires_at and sub.expires_at < utcnow()
+        ):
+            return sub_fix.render_expired(sub, token)
+        if sub.status != models.SubscriptionStatus.active:
+            return sub_fix.render_inactive(sub, token)
+        return sub_fix.render_start(
+            sub, token,
+            device_name=_device_label(found),
+            repairable=not found.is_legacy,
+        )
+
+    # ── Per-device lookup (preferred) ──────────────────────────────────
+    # Сам lookup (включая seamless-alias на живого соседа) — в
+    # resolve_sub_token: им же пользуется страница починки на саб-домене.
+    found = resolve_sub_token(db, token)
+    if found is not None and not found.is_legacy:
+        device = found.token_device
+        sub = found.sub
+        _raise_if_sub_not_serviceable(sub)
+        source_device = found.serve_device
+
+        # Исключаем креды нод в cooldown/декоммишене/с низким health_score —
+        # иначе клиент держит заведомо мёртвый эндпоинт в ротации client-side
+        # failover (лишние таймауты на каждом реконнекте).
+        healthy = _healthy_node_ids(db, source_device.credentials)
+        blind = _tunnel_blind_node_ids(db, source_device.credentials)
+        configs = _decrypt_configs(
+            source_device.credentials,
+            sub=sub,
+            device_id=source_device.id,
+            node_filter=healthy or None,
+            tunnel_blind_nodes=blind,
+        )
+        # Fallback: фильтр по здоровью выкинул все креды (единственная нода в
+        # cooldown) → лучше отдать живой-но-неоптимальный набор, чем 503.
+        # tunnel-blind фильтр здесь СОХРАНЯЕМ: эндпоинт без VPN — это не
+        # «неоптимально», это не тот продукт, за который платят.
+        if not configs and healthy:
+            configs = _decrypt_configs(
+                source_device.credentials,
+                sub=sub,
+                device_id=source_device.id,
+                tunnel_blind_nodes=blind,
+            )
+        # Последняя ступень: у юзера НЕТ ни одного туннелирующего эндпоинта.
+        # Отдаём как есть — 503 навсегда оставил бы его вообще без связи, —
+        # но кричим в лог: это состояние чинится снятием hy2-конфигов с
+        # relay-нод или доведением hy2 до настоящего split-tunnel.
+        if not configs and blind:
+            logger.error(
+                "sub-link: sub=%s device=%s has ONLY tunnel-blind endpoints on relay "
+                "nodes — serving them anyway, but this user gets no VPN",
+                sub.id, source_device.id,
+            )
+            configs = _decrypt_configs(
+                source_device.credentials, sub=sub, device_id=source_device.id
+            )
 
         # Safety net: if neither the direct device nor its alias
         # yielded a single working config, return 503 instead of an
         # empty 200. Empty-200 = "subscription with zero servers" and
         # most clients will *overwrite* the local cached profile with
         # nothing, stranding the user. 503 tells the client to retry
-        # and keeps the last-known-good profile in place.
+        # and keeps the last-known-good profile in place. Retry-After даёт
+        # клиенту хинт перезапросить через ~минуту (провижининг обычно
+        # укладывается в секунды-минуты), а не ждать planовый refresh.
         if not configs:
             logger.warning(
                 "sub-link: no active configs for token=%s sub=%s device=%s (source=%s)",
@@ -153,63 +1417,79 @@ def dynamic_sub_link(token: str, db: Session = Depends(get_db)):
             raise HTTPException(
                 status_code=503,
                 detail="No active endpoints — provisioning in progress, retry shortly",
+                headers={"Retry-After": _retry_after_sec()},
             )
 
-        db.add(
-            models.AuditLog(
-                actor=str(sub.user_id),
-                actor_type=models.AuditActor.user,
-                action="subscription_fetch",
-                target_type="device",
-                target_id=device.id,
-                extra={
-                    "protocols": [c.protocol for c in configs],
-                    "device_token": True,
-                    "aliased_to_device_id": (
-                        source_device.id if source_device.id != device.id else None
-                    ),
-                },
-            )
+        _mark_first_config_fetch(db, sub)
+
+        # Тело собираем ДО аудита: в JSON-ветке уезжают не все протоколы из
+        # configs (hy2 в Xray-JSON невыразим), и запись «какие протоколы
+        # получил юзер» без пометки формата вводила бы в заблуждение ровно
+        # там, где по ней потом разбирают жалобу.
+        encoded, media_type = _sub_payload(
+            configs, sub, plain=(fmt == "plain"), token=token,
+            client=_client_kind(request.headers.get("user-agent")),
         )
-        db.commit()
 
-        uris = "\n".join(c.uri for c in configs)
-        encoded = base64.b64encode(uris.encode()).decode()
-        title = "V8-VPN"
+        # Read-путь ничего, кроме audit-строки, не пишет — при сэмплировании
+        # (SUB_FETCH_AUDIT_SAMPLE>1) просто пропускаем и INSERT, и COMMIT.
+        if _should_log_sub_fetch():
+            db.add(
+                models.AuditLog(
+                    actor=str(sub.user_id),
+                    actor_type=models.AuditActor.user,
+                    action="subscription_fetch",
+                    target_type="device",
+                    target_id=device.id,
+                    extra={
+                        "protocols": [c.protocol for c in configs],
+                        "body_format": media_type,
+                        "device_token": True,
+                        "aliased_to_device_id": (
+                            source_device.id if source_device.id != device.id else None
+                        ),
+                    },
+                )
+            )
+            db.commit()
+
         return PlainTextResponse(
             content=encoded,
-            media_type="text/plain",
-            headers={
-                "subscription-userinfo": f"expire={int(sub.expires_at.timestamp())}",
-                "profile-update-interval": "6",
-                "profile-title": title,
-                "content-disposition": f'attachment; filename="{title}"',
-            },
+            media_type=media_type,
+            # device = владелец токена (для гейта «только новые девайсы» по created_at)
+            headers=_sub_response_headers(
+                sub, token, device,
+                userinfo_expire_only=(userinfo == "expire"),
+                user_agent=request.headers.get("user-agent"),
+            ),
         )
 
     # ── Legacy per-subscription fallback ───────────────────────────────
-    sub = db.query(models.Subscription).filter_by(sub_token=token).first()
-    if not sub:
+    if found is None:
         raise HTTPException(status_code=404, detail="Subscription not found")
+    sub = found.sub
 
-    if sub.status != models.SubscriptionStatus.active:
-        raise HTTPException(status_code=403, detail="Subscription is not active")
+    _raise_if_sub_not_serviceable(sub)
 
-    if sub.expires_at and sub.expires_at < utcnow():
-        raise HTTPException(status_code=403, detail="Subscription expired")
-
-    configs = []
-    for cred in sub.credentials:
-        if not cred.is_active:
-            continue
-        decrypted = _decrypt(cred.config_text)
-        if decrypted:
-            configs.append(SubLinkConfig(protocol=cred.proto, uri=decrypted))
-        else:
-            logger.warning(
-                "sub-link: decrypt returned empty for credential %s (proto=%s, sub=%s)",
-                cred.id, cred.proto, sub.id,
-            )
+    # Как и в per-device ветке: отсекаем креды нездоровых нод и логируем пустой
+    # decrypt (общий хелпер).
+    healthy = _healthy_node_ids(db, sub.credentials)
+    blind = _tunnel_blind_node_ids(db, sub.credentials)
+    configs = _decrypt_configs(
+        sub.credentials,
+        sub=sub,
+        node_filter=healthy or None,
+        tunnel_blind_nodes=blind,
+    )
+    if not configs and healthy:
+        configs = _decrypt_configs(sub.credentials, sub=sub, tunnel_blind_nodes=blind)
+    if not configs and blind:
+        logger.error(
+            "sub-link: legacy sub=%s has ONLY tunnel-blind endpoints on relay nodes "
+            "— serving them anyway, but this user gets no VPN",
+            sub.id,
+        )
+        configs = _decrypt_configs(sub.credentials, sub=sub)
 
     # Same safety as the per-device branch — see the invariant box
     # above. Empty-200 would wipe the user's cached profile.
@@ -221,33 +1501,41 @@ def dynamic_sub_link(token: str, db: Session = Depends(get_db)):
         raise HTTPException(
             status_code=503,
             detail="No active endpoints — provisioning in progress, retry shortly",
+            headers={"Retry-After": _retry_after_sec()},
         )
 
-    uris = "\n".join(c.uri for c in configs)
-    encoded = base64.b64encode(uris.encode()).decode()
-
-    db.add(
-        models.AuditLog(
-            actor=str(sub.user_id),
-            actor_type=models.AuditActor.user,
-            action="subscription_fetch",
-            target_type="subscription",
-            target_id=sub.id,
-            extra={"protocols": [c.protocol for c in configs], "legacy_token": True},
+    encoded, media_type = _sub_payload(
+            configs, sub, plain=(fmt == "plain"), token=token,
+            client=_client_kind(request.headers.get("user-agent")),
         )
-    )
-    db.commit()
 
-    title = "V8-VPN"
+    _mark_first_config_fetch(db, sub)
+
+    # См. per-device ветку: сэмплируем горячую audit-запись (аудит #247).
+    if _should_log_sub_fetch():
+        db.add(
+            models.AuditLog(
+                actor=str(sub.user_id),
+                actor_type=models.AuditActor.user,
+                action="subscription_fetch",
+                target_type="subscription",
+                target_id=sub.id,
+                extra={
+                    "protocols": [c.protocol for c in configs],
+                    "body_format": media_type,
+                    "legacy_token": True,
+                },
+            )
+        )
+        db.commit()
+
     return PlainTextResponse(
         content=encoded,
-        media_type="text/plain",
-        headers={
-            "subscription-userinfo": f"expire={int(sub.expires_at.timestamp())}",
-            "profile-update-interval": "6",
-            "profile-title": title,
-            "content-disposition": f'attachment; filename="{title}"',
-        },
+        media_type=media_type,
+        headers=_sub_response_headers(
+            sub, token, userinfo_expire_only=(userinfo == "expire"),
+            user_agent=request.headers.get("user-agent"),
+        ),
     )
 
 
@@ -255,6 +1543,12 @@ def dynamic_sub_link(token: str, db: Session = Depends(get_db)):
 
 class AutoRenewRequest(BaseModel):
     auto_renew: bool
+    # Владелец-инициатор (бот передаёт telegram_id тапнувшего). Задан →
+    # подписка обязана принадлежать ему: callback_data в Telegram
+    # подделываема, и «auto_renew:{чужой id}:off» без сверки гасил бы
+    # автопродление любой подписки (ревью 2026-08-21, IDOR). Не задан
+    # (админка) — поведение прежнее.
+    telegram_id: str | None = None
 
 
 @ext_router.post("/subscriptions/{subscription_id}/auto_renew")
@@ -267,10 +1561,113 @@ def toggle_auto_renew(
     sub = db.get(models.Subscription, subscription_id)
     if not sub:
         raise HTTPException(status_code=404, detail="Subscription not found")
+    if body.telegram_id is not None:
+        owner_tg = sub.user.telegram_id if sub.user else None
+        if owner_tg != str(body.telegram_id):
+            # 404, не 403: не подтверждаем существование чужой подписки.
+            raise HTTPException(status_code=404, detail="Subscription not found")
     sub.auto_renew = body.auto_renew
     db.add(sub)
     db.commit()
     return {"ok": True, "auto_renew": sub.auto_renew}
+
+
+# ── Устройства из бота (паритет с ЛК, аудит 2026-08-21) ────────────
+# Тонкие обёртки над webapp-хэндлерами: это обычные функции, зовём их
+# напрямую с юзером, найденным по telegram_id — логика слотов/402/
+# ownership остаётся в одном месте и не разъезжается.
+
+
+class DeviceByOwnerRequest(BaseModel):
+    telegram_id: str
+
+
+class DeviceRenameByOwnerRequest(BaseModel):
+    telegram_id: str
+    name: str
+
+
+def _user_by_tg_or_404(db: Session, telegram_id: str) -> models.User:
+    user = db.query(models.User).filter_by(telegram_id=str(telegram_id)).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    return user
+
+
+@ext_router.post("/bot/subscriptions/{subscription_id}/add_device")
+def bot_add_device(
+    subscription_id: int,
+    body: DeviceByOwnerRequest,
+    db: Session = Depends(get_db),
+    admin_token: str = Depends(require_admin),
+):
+    from .api_webapp import webapp_add_device
+
+    user = _user_by_tg_or_404(db, body.telegram_id)
+    return webapp_add_device(subscription_id=subscription_id, user=user, db=db)
+
+
+@ext_router.post("/bot/devices/{device_id}/rename")
+def bot_rename_device(
+    device_id: int,
+    body: DeviceRenameByOwnerRequest,
+    db: Session = Depends(get_db),
+    admin_token: str = Depends(require_admin),
+):
+    from .api_webapp import RenameDeviceRequest, webapp_rename_device
+
+    user = _user_by_tg_or_404(db, body.telegram_id)
+    return webapp_rename_device(
+        device_id=device_id,
+        body=RenameDeviceRequest(name=body.name),
+        user=user,
+        db=db,
+    )
+
+
+@ext_router.post("/bot/devices/{device_id}/remove")
+def bot_remove_device(
+    device_id: int,
+    body: DeviceByOwnerRequest,
+    db: Session = Depends(get_db),
+    admin_token: str = Depends(require_admin),
+):
+    from .api_webapp import webapp_remove_device
+
+    user = _user_by_tg_or_404(db, body.telegram_id)
+    return webapp_remove_device(device_id=device_id, user=user, db=db)
+
+
+class UnfreezeByOwnerRequest(BaseModel):
+    telegram_id: str
+
+
+@ext_router.post("/subscriptions/{subscription_id}/unfreeze")
+def unfreeze_by_owner(
+    subscription_id: int,
+    body: UnfreezeByOwnerRequest,
+    db: Session = Depends(get_db),
+    admin_token: str = Depends(require_admin),
+):
+    """Разморозка из бота (паритет с ЛК, аудит 2026-08-21).
+
+    Замороженный без работающего ЛК был заперт до авто-разморозки.
+    Ownership по telegram_id обязателен: sub_id приходит из
+    callback_data, а она подделываема (тот же класс, что auto_renew).
+    """
+    from .services import balance as balance_svc
+
+    sub = db.get(models.Subscription, subscription_id)
+    owner_tg = sub.user.telegram_id if sub and sub.user else None
+    if not sub or owner_tg != str(body.telegram_id):
+        raise HTTPException(status_code=404, detail="Subscription not found")
+    try:
+        balance_svc.unfreeze_subscription(db, sub, auto=False)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+    db.commit()
+    db.refresh(sub)
+    return {"ok": True, "status": sub.status.value}
 
 
 # ── Referral system ──
@@ -284,6 +1681,9 @@ class ReferralCodeOut(BaseModel):
     uses: int
     bonus_days: int
     reward_days: int
+    # Сколько бесплатных дней получит друг по этой ссылке: триал + подарок
+    # (3 + 3). Бот пишет в /referral ровно эту цифру.
+    invitee_total_days: int
 
 
 @ext_router.post("/referral/code", response_model=ReferralCodeOut)
@@ -293,39 +1693,51 @@ def get_or_create_referral(
     admin_token: str | None = Depends(optional_admin),
 ):
     """Get existing referral code or create a new one for the user."""
+    from .services import trial as trial_svc
+
     user = db.query(models.User).filter_by(telegram_id=body.telegram_id).first()
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
 
-    existing = (
-        db.query(models.ReferralCode)
-        .filter_by(owner_id=user.id, is_active=True)
-        .first()
-    )
-    if existing:
-        return ReferralCodeOut(
-            code=existing.code,
-            uses=existing.uses,
-            bonus_days=existing.bonus_days,
-            reward_days=existing.reward_days,
-        )
-
-    code = secrets.token_urlsafe(8)
-    ref = models.ReferralCode(owner_id=user.id, code=code)
-    db.add(ref)
+    ref = ensure_referral_code(db, user)
     db.commit()
     db.refresh(ref)
     return ReferralCodeOut(
         code=ref.code, uses=ref.uses,
         bonus_days=ref.bonus_days, reward_days=ref.reward_days,
+        invitee_total_days=trial_svc.invitee_total_days(ref),
     )
 
 
 # ── User registration with referral ──
 
+_SOURCE_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+# Внутренние start-ключи бота/вебаппа — НЕ рекламные метки (иначе, напр.,
+# t.me/bot?start=support из вебаппа попал бы в рекламную воронку). ``ref_*``
+# отсекается отдельно (это реферал). Пополнять при новых служебных deep-link'ах.
+# ``renew`` — кнопка «Продлить» из блока статуса в VPN-клиенте (см.
+# _renew_link). Без него метка утекла бы в рекламную воронку и отравила
+# статистику каналов десятками фальшивых «переходов по рекламе».
+_RESERVED_SOURCES = frozenset({"support", "renew"})
+
+
+def _clean_source(raw: str | None) -> str | None:
+    """Рекламная метка из deep-link: только Telegram-допустимые символы старт-
+    параметра (``[A-Za-z0-9_-]``, ≤64), не служебный ключ. Мусор/пусто/служебное
+    → None (не пишем)."""
+    if not raw:
+        return None
+    raw = raw.strip()
+    low = raw.lower()  # служебные ключи отсекаем регистронезависимо
+    if low in _RESERVED_SOURCES or low.startswith("ref_"):
+        return None
+    return raw if _SOURCE_RE.match(raw) else None
+
+
 class UserRegisterRequest(BaseModel):
     telegram_id: str
     referral_code: str | None = None
+    source: str | None = None  # рекламная метка (first-touch)
 
 
 @ext_router.post("/users/register")
@@ -349,9 +1761,9 @@ def register_user(
     # attaches the referral when the field is still NULL — this means a
     # user who accidentally /start'ed before ever getting a ref link can
     # still be attributed the next time they click one. The actual
-    # referee-side bonus is handed out on /trial/activate, and the
-    # referrer-side bonus lands on the first confirmed kind=topup (see
-    # _mark_invoice_paid_core in api.py).
+    # referee-side bonus is handed out on trial activation, and the
+    # referrer-side reward lands on the invitee's FIRST payment of any
+    # kind (_maybe_pay_referrer in api/invoices.py).
     if body.referral_code and not user.referred_by_id:
         ref = (
             db.query(models.ReferralCode)
@@ -365,6 +1777,26 @@ def register_user(
                 db.add(ref)
                 db.flush()
 
+    # Рекламная метка (first-touch): ставим один раз, если ещё не задана —
+    # как и referral, чтобы органик-старт без метки не блокировал атрибуцию
+    # при последующем заходе по рекламной ссылке.
+    if not user.source:
+        cleaned = _clean_source(body.source)
+        if cleaned:
+            # Управляемая AdLink выключена → ссылку «погасили», новые заходы не
+            # атрибутируем. Неизвестная метка (ad-hoc, без AdLink) — атрибутируем.
+            link = db.query(models.AdLink).filter_by(tag=cleaned).first()
+            if link is None or link.is_active:
+                user.source = cleaned
+                db.flush()
+
+    # Бесплатные дни для текстов бота (приветствие, кнопка, /plans). Считаем
+    # после привязки реферала выше: пришедший по ссылке сразу видит 3 + 3.
+    # Та же функция, что у самой активации, поэтому цифра совпадёт с выданной.
+    from .services import trial as trial_svc
+
+    trial_days, trial_referral_days = trial_svc.trial_days_for(db, user)
+
     db.commit()
     return {
         "id": user.id,
@@ -373,12 +1805,312 @@ def register_user(
         # Always false under the trial-flow model — retained for
         # backward compat with older bot builds that still read it.
         "referral_bonus_credited": False,
-        # Bot reads this to decide whether to include the "first month
-        # on us" line in the welcome copy. True iff the user hasn't
-        # activated their trial yet — works retroactively for users
-        # who registered before this column existed.
+        # Бот по нему решает, показывать ли строку про бесплатные дни в
+        # приветствии. True, пока юзер не активировал триал (ретроактивно и
+        # для тех, кто зарегистрировался до появления колонки).
         "trial_available": user.trial_activated_at is None,
+        # Сколько бесплатных дней обещать: всем и сверху по приглашению.
+        "trial_days": trial_days,
+        "trial_referral_days": trial_referral_days,
+        # Онбординг-роадмап E3.3: бот прячет кнопку «🆘 VPN не работает» у
+        # тех, кому нечего чинить. Раньше она висела у всех с первого экрана
+        # и вела в тупик «У тебя нет активной подписки. Оформить — /buy»
+        # (команды /buy не существует). Считаем по живым девайсам, а не по
+        # подписке: чинить можно только выданное устройство.
+        "has_devices": (
+            db.query(models.Device.id)
+            .filter(
+                models.Device.user_id == user.id,
+                models.Device.status == models.DeviceStatus.active,
+            )
+            .first()
+            is not None
+        ),
+        # Ревью инцидента 2026-08-25: путь к ссылке (кнопка go:config, строка
+        # «у тебя уже есть подписка» в /plans) бот гейтил по has_devices, а
+        # тот считается только по ACTIVE-девайсам. На cold-пути девайс
+        # ~минуту pending (или failed), у замороженного девайсов нет вовсе —
+        # и такие юзеры видели голый прайс без пути к ссылке/статусу. Считаем
+        # по подписке: active или frozen. has_devices остаётся для «🆘 VPN не
+        # работает» — чинить можно только выданное устройство.
+        "has_subscription": (
+            db.query(models.Subscription.id)
+            .filter(
+                models.Subscription.user_id == user.id,
+                models.Subscription.status.in_([
+                    models.SubscriptionStatus.active,
+                    models.SubscriptionStatus.frozen,
+                ]),
+            )
+            .first()
+            is not None
+        ),
     }
+
+
+# ── Ad-source funnel (admin) ──
+
+class AdSourceRow(BaseModel):
+    source: str
+    started: int  # юзеров пришло с метки
+    trial: int  # из них активировали триал (trial_activated_at)
+    paid: int  # из них сделали ≥1 реальную оплату (topup)
+    revenue_kopecks: int  # суммарная выручка с этой метки (topup'ы)
+
+
+class AdSourcesResponse(BaseModel):
+    sources: list[AdSourceRow]
+    total_started: int
+    total_paid: int
+    total_revenue_kopecks: int
+
+
+def _compute_source_funnel(db: Session) -> dict[str, dict[str, int]]:
+    """``{source: {started, trial, paid, revenue_kopecks}}``. ДВА запроса с
+    мержем — join транзакций к users раздул бы ``started`` кратно числу транзакций
+    юзера (join-fanout). Переиспользуется и воронкой, и листингом AdLink."""
+    base = (
+        db.query(
+            models.User.source.label("source"),
+            func.count(models.User.id).label("started"),
+            func.count(models.User.trial_activated_at).label("trial"),
+        )
+        .filter(models.User.source.isnot(None))
+        .group_by(models.User.source)
+        .all()
+    )
+    paid = (
+        db.query(
+            models.User.source.label("source"),
+            func.count(func.distinct(models.BalanceTransaction.user_id)).label("paid"),
+            func.coalesce(func.sum(models.BalanceTransaction.amount_kopecks), 0).label("revenue"),
+        )
+        .join(
+            models.BalanceTransaction,
+            models.BalanceTransaction.user_id == models.User.id,
+        )
+        .filter(
+            models.User.source.isnot(None),
+            models.BalanceTransaction.kind == models.BalanceTxKind.topup,
+        )
+        .group_by(models.User.source)
+        .all()
+    )
+    paid_map = {r.source: (int(r.paid), int(r.revenue or 0)) for r in paid}
+    out: dict[str, dict[str, int]] = {}
+    for r in base:
+        p, rev = paid_map.get(r.source, (0, 0))
+        out[r.source] = {
+            "started": int(r.started), "trial": int(r.trial),
+            "paid": p, "revenue_kopecks": rev,
+        }
+    return out
+
+
+@ext_router.get("/admin/ad-sources", response_model=AdSourcesResponse)
+def ad_sources_funnel(
+    db: Session = Depends(get_db),
+    admin_token: str = Depends(require_admin),
+):
+    """Воронка по ВСЕМ рекламным меткам (включая ad-hoc без управляемой AdLink)."""
+    funnel = _compute_source_funnel(db)
+    rows = [
+        AdSourceRow(
+            source=src, started=f["started"], trial=f["trial"],
+            paid=f["paid"], revenue_kopecks=f["revenue_kopecks"],
+        )
+        for src, f in funnel.items()
+    ]
+    rows.sort(key=lambda x: x.started, reverse=True)
+    return AdSourcesResponse(
+        sources=rows,
+        total_started=sum(x.started for x in rows),
+        total_paid=sum(x.paid for x in rows),
+        total_revenue_kopecks=sum(x.revenue_kopecks for x in rows),
+    )
+
+
+class FunnelStep(BaseModel):
+    key: str
+    label: str
+    # None, когда шаг НЕизмерим (нет данных телеметрии) — это принципиально
+    # иное состояние, чем 0, и UI обязан показать его словами, а не полосой.
+    count: int | None
+    denominator: int
+    pct: float | None
+    measurable: bool
+
+
+class OnboardingFunnelResponse(BaseModel):
+    days: int | None
+    total: int
+    # Сколько юзеров когорты пришли ПОСЛЕ включения телеметрии (2026-07-25).
+    # 0 — про шаг «открыли кабинет» не известно ничего.
+    telemetry_cohort: int
+    steps: list[FunnelStep]
+    losses: list[FunnelStep]
+    trial_failures: int
+
+
+@ext_router.get("/admin/onboarding-funnel", response_model=OnboardingFunnelResponse)
+def onboarding_funnel(
+    days: int = 7,
+    db: Session = Depends(get_db),
+    admin_token: str = Depends(require_admin),
+):
+    """Воронка нового юзера: бот → кабинет → триал → ссылка → оплата.
+
+    Считает тот же сервис, что и CLI (`scripts/onboarding_funnel.py`), чтобы
+    цифры в админке и в консоли не разъезжались. ``days=0`` — за всё время.
+    """
+    from .services import onboarding_funnel as funnel_svc
+
+    return funnel_svc.compute(db, days or None)
+
+
+# ── Ad links (управляемые рекламные deep-link'и, admin) ──
+
+class AdLinkCreate(BaseModel):
+    name: str
+    tag: str | None = None  # пусто → сгенерим ad_<random>
+    notes: str | None = None
+    # Во сколько обошлось размещение (копейки). Без него воронка не отвечает
+    # на «окупилось ли»; NULL = бесплатно (обмен, свой канал).
+    cost_kopecks: int | None = None
+
+
+class AdLinkUpdate(BaseModel):
+    name: str | None = None
+    is_active: bool | None = None
+    notes: str | None = None
+    cost_kopecks: int | None = None
+
+
+class AdLinkOut(BaseModel):
+    id: int
+    name: str
+    tag: str
+    is_active: bool
+    notes: str | None
+    created_at: datetime
+    share_url: str | None
+    # воронка по этой метке
+    started: int
+    trial: int
+    paid: int
+    revenue_kopecks: int
+    cost_kopecks: int | None
+    # Цена платящего клиента по этой метке. None, если затрат нет или ещё никто
+    # не заплатил — делить не на что.
+    cac_kopecks: int | None
+    # Во сколько раз выручка перекрыла затраты. <1 — канал убыточен.
+    roi: float | None
+
+
+def _ad_link_share_url(tag: str) -> str | None:
+    bot = os.getenv("BOT_USERNAME")
+    return f"https://t.me/{bot}?start={tag}" if bot else None
+
+
+def _ad_link_out(link: models.AdLink, funnel: dict[str, dict[str, int]]) -> AdLinkOut:
+    f = funnel.get(link.tag) or {}
+    paid = f.get("paid", 0)
+    revenue = f.get("revenue_kopecks", 0)
+    cost = link.cost_kopecks
+    return AdLinkOut(
+        id=link.id, name=link.name, tag=link.tag, is_active=link.is_active,
+        notes=link.notes, created_at=link.created_at,
+        share_url=_ad_link_share_url(link.tag),
+        started=f.get("started", 0), trial=f.get("trial", 0),
+        paid=paid, revenue_kopecks=revenue,
+        cost_kopecks=cost,
+        cac_kopecks=int(round(cost / paid)) if cost and paid else None,
+        roi=round(revenue / cost, 2) if cost else None,
+    )
+
+
+@ext_router.get("/admin/ad-links", response_model=list[AdLinkOut])
+def list_ad_links(
+    db: Session = Depends(get_db),
+    admin_token: str = Depends(require_admin),
+):
+    """Список управляемых рекламных ссылок + живая воронка по каждой."""
+    funnel = _compute_source_funnel(db)
+    links = db.query(models.AdLink).order_by(models.AdLink.created_at.desc()).all()
+    return [_ad_link_out(link, funnel) for link in links]
+
+
+@ext_router.post("/admin/ad-links", response_model=AdLinkOut)
+def create_ad_link(
+    body: AdLinkCreate,
+    db: Session = Depends(get_db),
+    admin_token: str = Depends(require_admin),
+):
+    """Завести рекламную ссылку. tag валидируется как source-метка; пустой → ad_<random>."""
+    name = (body.name or "").strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="name обязателен")
+    raw_tag = (body.tag or "").strip() or f"ad_{secrets.token_urlsafe(6)}"
+    tag = _clean_source(raw_tag)
+    if not tag:
+        raise HTTPException(
+            status_code=400,
+            detail="tag недопустим: только [A-Za-z0-9_-], ≤64, не служебный (ref_/support)",
+        )
+    if db.query(models.AdLink).filter_by(tag=tag).first():
+        raise HTTPException(status_code=409, detail=f"ссылка с меткой '{tag}' уже существует")
+    link = models.AdLink(
+        name=name, tag=tag, notes=(body.notes or None),
+        cost_kopecks=body.cost_kopecks,
+    )
+    db.add(link)
+    db.commit()
+    db.refresh(link)
+    return _ad_link_out(link, _compute_source_funnel(db))
+
+
+@ext_router.patch("/admin/ad-links/{link_id}", response_model=AdLinkOut)
+def update_ad_link(
+    link_id: int,
+    body: AdLinkUpdate,
+    db: Session = Depends(get_db),
+    admin_token: str = Depends(require_admin),
+):
+    """Правка ярлыка/заметок и вкл/выкл (tag неизменяем — иначе осиротит стату)."""
+    link = db.get(models.AdLink, link_id)
+    if not link:
+        raise HTTPException(status_code=404, detail="ad link not found")
+    if body.name is not None:
+        nm = body.name.strip()
+        if not nm:
+            raise HTTPException(status_code=400, detail="name не может быть пустым")
+        link.name = nm
+    if body.is_active is not None:
+        link.is_active = body.is_active
+    if body.notes is not None:
+        link.notes = body.notes or None
+    if body.cost_kopecks is not None:
+        # 0 трактуем как «бесплатное размещение» и храним NULL: иначе CAC делил
+        # бы на ноль, а ROI показывал бесконечность.
+        link.cost_kopecks = body.cost_kopecks or None
+    db.commit()
+    db.refresh(link)
+    return _ad_link_out(link, _compute_source_funnel(db))
+
+
+@ext_router.delete("/admin/ad-links/{link_id}", status_code=204)
+def delete_ad_link(
+    link_id: int,
+    db: Session = Depends(get_db),
+    admin_token: str = Depends(require_admin),
+):
+    """Удалить управляемую ссылку. Историческая атрибуция в User.source НЕ
+    трогается (метка останется в /ad-sources как ad-hoc, но без ярлыка)."""
+    link = db.get(models.AdLink, link_id)
+    if not link:
+        raise HTTPException(status_code=404, detail="ad link not found")
+    db.delete(link)
+    db.commit()
 
 
 # ── Free trial activation ──
@@ -400,7 +2132,10 @@ def activate_trial(
     request: Request,
     body: TrialActivateRequest,
     db: Session = Depends(get_db),
-    admin_token: str | None = Depends(optional_admin),
+    # require, не optional: без токена эндпоинт позволял снаружи сжечь
+    # ЧУЖОЙ одноразовый триал по telegram_id (ревью 2026-08-21). Зовут его
+    # только бот и админка — оба с admin-заголовками.
+    admin_token: str = Depends(require_admin),
 ):
     """Grant the one-time trial bonus to a user identified by telegram_id.
 
@@ -431,6 +2166,102 @@ def activate_trial(
     )
 
 
+class TrialActivateFullResponse(BaseModel):
+    subscription_id: int
+    plan_name: str
+    expires_at: str
+    # Бесплатные дни и дни по приглашению (3 и 0 или 3). None на историческом
+    # пути (старый бонус 150 ₽ потрачен на месяц): бот пишет «Подписка
+    # активирована» без числа дней.
+    trial_days: int | None = None
+    referral_days: int | None = None
+
+
+@ext_router.post("/trial/activate_full", response_model=TrialActivateFullResponse)
+@limiter.limit("10/minute")
+def activate_trial_full(
+    request: Request,
+    body: TrialActivateRequest,
+    db: Session = Depends(get_db),
+    admin_token: str = Depends(require_admin),
+):
+    """Подарок ЦЕЛИКОМ: бонус и сразу подписка на бесплатные дни (бот-путь).
+
+    Тонкая обёртка над ``services.trial.activate_trial_full``: тот же сервис
+    зовёт кабинет, поэтому пути не разъедутся. Бот шагов не имеет и без
+    этого эндпоинта выдавал бы деньги вместо VPN (ревью 2026-08-21).
+
+    Коды: 409 — живая подписка или бесплатные дни уже использованы, либо
+    провижининг не смог собрать подписку; 503 — нет плана для триала или
+    холодный путь перегружен (``Retry-After``); 402 — не хватило баланса
+    (исторический путь со старым бонусом).
+    """
+    from .api._common import _audit
+    from .services import trial as trial_svc
+    from .services.provisioning_throttle import ColdPathThrottled
+
+    user = db.query(models.User).filter_by(telegram_id=body.telegram_id).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    user_id = user.id
+
+    def _reject(reason: str, status_code: int, detail: str, headers=None):
+        # Сначала rollback, потом аудит: _audit коммитит, а отказы live /
+        # throttled / provision_failed случаются уже после flush бонуса и
+        # trial_activated_at. Без rollback аудит закоммитил бы бонус.
+        db.rollback()
+        _audit(
+            db, f"user:{user_id}", "trial_activate_rejected", "user", user_id,
+            metadata={"reason": reason, "source": "bot"},
+            actor_type=models.AuditActor.user,
+        )
+        return HTTPException(status_code=status_code, detail=detail, headers=headers)
+
+    try:
+        result = trial_svc.activate_trial_full(db, user, source="bot")
+    except trial_svc.TrialLiveSubscription:
+        raise _reject("live", 409, "User already has a live subscription")
+    except trial_svc.TrialAlreadyUsed:
+        raise _reject("already_used", 409, "Trial already used")
+    except trial_svc.NoTrialPlan:
+        raise _reject("no_trial_plan", 503, "No trial plan configured")
+    except ColdPathThrottled as exc:
+        # Наплыв триальщиков мимо warm-пула: честный 503 с Retry-After
+        # вместо 500 — бот скажет «попробуй через минуту».
+        raise _reject(
+            "throttled", 503, "provisioning is busy, retry later",
+            headers={"Retry-After": str(exc.retry_after_seconds)},
+        )
+    except RuntimeError as exc:
+        raise _reject("provision_failed", 409, str(exc))
+    except ValueError as exc:
+        raise _reject("insufficient", 402, str(exc))
+
+    sub = result.sub
+    _audit(
+        db, f"user:{user_id}", "trial_activated_full", "subscription", sub.id,
+        metadata={
+            "plan_id": result.plan.id,
+            "trial_days": result.trial_days,
+            "referral_days": result.referral_days,
+            "hidden_hours": result.hidden_hours,
+            "charged_kopecks": result.charged_kopecks,
+            "source": "bot",
+        },
+        actor_type=models.AuditActor.user,
+        commit=False,
+    )
+    db.commit()
+    db.refresh(sub)
+    return TrialActivateFullResponse(
+        subscription_id=sub.id,
+        plan_name=result.plan.name,
+        expires_at=sub.expires_at.isoformat(),
+        trial_days=result.trial_days,
+        referral_days=result.referral_days,
+    )
+
+
 # ── Self-service: regenerate config ──
 
 @ext_router.post("/users/by_telegram/{telegram_id}/regenerate")
@@ -439,7 +2270,9 @@ def regenerate_user_config(
     db: Session = Depends(get_db),
     admin_token: str = Depends(require_admin),
 ):
-    """Revoke current devices and re-provision on a different node."""
+    """Move the user's active subscription to a freshly chosen node,
+    preserving every device and its sub-link (device-preserving self-service
+    migration)."""
     from .services.provisioning import ProvisioningOrchestrator
 
     user = db.query(models.User).filter_by(telegram_id=telegram_id).first()
@@ -460,28 +2293,29 @@ def regenerate_user_config(
 
     orchestrator = ProvisioningOrchestrator(db)
 
-    # Revoke old devices
-    for device in active_sub.devices:
-        try:
-            orchestrator.revoke_device(device, reason="self-service regeneration")
-        except Exception:
-            logger.exception("Failed to revoke device %s", device.id)
-
-    # Re-provision (potentially on a different node)
-    new_sub, task = orchestrator.provision_subscription(
-        user, active_sub.plan,
-        expires_at_override=active_sub.expires_at,
-    )
-
-    # Mark old subscription
-    active_sub.status = models.SubscriptionStatus.blocked
-    active_sub.notes = "replaced by self-service regeneration"
-    db.add(active_sub)
-    db.commit()
+    # Device-preserving self-service node move. The old body revoked EVERY
+    # device, provisioned a brand-new single-device subscription and blocked
+    # the old one — collapsing an N-device sub to one "primary", rerolling the
+    # sub-link, and dropping device rows. That breaks the sub-link invariant
+    # (revoked rows must survive as aliases) and was the source of the
+    # "all devices deleted, one primary" report. migrate_subscription_to_new_node
+    # relocates the SAME subscription to a freshly chosen node, mirroring every
+    # live device N:N and preserving sub_token + connection_uri — installed
+    # links keep working and no device is lost.
+    try:
+        target, _device, task = orchestrator.migrate_subscription_to_new_node(
+            active_sub
+        )
+    except RuntimeError as exc:
+        # No eligible target node (single-node pool, all excluded, no healthy
+        # node in the plan's pools, …). Surface as 409 so the bot shows
+        # "couldn't regenerate, try later" instead of a 500.
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
 
     return {
         "ok": True,
-        "new_subscription_id": new_sub.id,
+        "subscription_id": active_sub.id,
+        "node_id": target.id,
         "task_id": task.id,
     }
 
@@ -498,9 +2332,70 @@ class NotificationOut(BaseModel):
     # the subscription ID — leave NULL for notification types that don't
     # need it (renewal_reminder, expiry_reminder, ...).
     subscription_id: int | None = None
+    # Diagnose-incident push (admin_alert_node_diagnosis): carries the
+    # target so the bot can build the ack / mute / follow keyboard
+    # (callback ``diag:<action>:<kind>:<id>``).
+    target_kind: str | None = None
+    target_id: int | None = None
+
+
+# Классы уведомлений, которые поллер бота забирает и доставляет. Список закрытый:
+# admin-алерт с kind'ом, которого тут нет, молча осядет в audit_logs и до админа
+# не доедет. Вынесен на уровень модуля, чтобы это можно было проверить тестом.
+ADMIN_NOTIFICATION_ACTIONS = [
+    "renewal_reminder", "expiry_reminder",
+    "renewal_reminder_1d", "expiry_reminder_1d",
+    "config_ready", "migration_notice", "sublink_rotated",
+    "low_balance_warning", "trial_expiry_warning", "health_ping_request",
+    # Приглашение позвать друга — шлём ОДИН раз, сразу после первого скачивания
+    # конфига (см. _mark_first_config_fetch).
+    "referral_invite",
+    # Admin push-уведомления (см. services/admin_notify.py).
+    # Текст полностью рендерится на backend-е и кладётся в
+    # extra["text"] — бот отдаёт as-is, без собственного
+    # форматирования по kind.
+    "admin_alert_user_report",  # легаси: с 30.09.2026 не создаётся, держим ради недоставленных строк
+    "admin_alert_repair_failed",  # починка не помогла / не смогла (services/repair_alerts)
+    "admin_alert_infra_ssh",
+    "admin_alert_infra_dlq",
+    # Speaking node/exit diagnosis push (diagnostics overhaul) — text is
+    # rendered in services/admin_notify.notify_node_diagnosis; the bot
+    # attaches the ack/mute/follow keyboard from target_kind/target_id.
+    "admin_alert_node_diagnosis",
+    # Дрейф версий xray: вышел новый релиз / ноды отстали от пина в роли
+    # (services/xray_releases.py). Без строки в этом списке пуш молча
+    # оседал бы в audit_logs и до админа не доезжал.
+    "admin_alert_xray_version_drift",
+    # Провайдер не смог выписать счёт (services/payments/checkout.py
+    # report_provider_failure): сырая ошибка провайдера, дедуп час на
+    # провайдера. Без этого «Restricted payment method type» три недели
+    # видели только пользователи (2026-09-19).
+    "admin_alert_payment_provider",
+    "admin_alert_leg_gap",
+]
+
+
+def _referral_invite_delay() -> timedelta | None:
+    """Задержка доставки referral_invite (env REFERRAL_INVITE_DELAY_H, часы).
+
+    Дефолт 24: приглашение приходит через сутки после первого скачивания
+    конфига, когда человек уже попользовался VPN и ему есть что рекомендовать.
+    ``0`` (или мусор в env) отключает задержку — строка отдаётся сразу, как
+    было до 28.08. Читается на каждый запрос, чтобы переключение не требовало
+    рестарта и легко глушилось в тестах.
+    """
+    raw = os.getenv("REFERRAL_INVITE_DELAY_H", "24")
+    try:
+        hours = float(raw)
+    except ValueError:
+        hours = 24.0
+    return timedelta(hours=hours) if hours > 0 else None
 
 
 @ext_router.get("/notifications/pending", response_model=list[NotificationOut])
+
+
+
 def get_pending_notifications(
     db: Session = Depends(get_db),
     admin_token: str = Depends(require_admin),
@@ -518,22 +2413,45 @@ def get_pending_notifications(
     # them from the poller list also suppresses delivery of any
     # backlog rows that were written before the gate landed, so
     # nobody gets a stale "we caught you sharing" ping.
-    notif_actions = [
-        "renewal_reminder", "expiry_reminder",
-        "renewal_reminder_1d", "expiry_reminder_1d",
-        "config_ready", "migration_notice",
-        "low_balance_warning", "trial_expiry_warning", "health_ping_request",
-    ]
-    logs = (
-        db.query(models.AuditLog)
-        .filter(
-            models.AuditLog.action.in_(notif_actions),
+    notif_actions = ADMIN_NOTIFICATION_ACTIONS
+    # Admin broadcast — массовая рассылка (см. /admin/broadcasts). Держим её в
+    # ОТДЕЛЬНОМ, низкоприоритетном классе: диспетчер наполняет её батчами по
+    # BROADCAST_BATCH_SIZE=50/тик, а поллер сливает 20/тик — при общей очереди с
+    # DESC-сортировкой массовая рассылка топила срочные транзакционные пуши
+    # (config_ready, «истекает завтра», migration_notice, health_ping) в хвост
+    # на десятки минут. Разделяем на priority + bulk и доставляем FIFO (asc):
+    # сперва все срочные (до limit), остаток добиваем broadcast'ом.
+    bulk_actions = ["admin_broadcast"]
+    invite_delay = _referral_invite_delay()
+
+    def _fetch(actions: list[str], lim: int) -> list[models.AuditLog]:
+        if lim <= 0:
+            return []
+        q = db.query(models.AuditLog).filter(
+            models.AuditLog.action.in_(actions),
             models.AuditLog.actor_type == models.AuditActor.system,
         )
-        .order_by(models.AuditLog.created_at.desc())
-        .limit(limit)
-        .all()
-    )
+        if invite_delay is not None:
+            # Отложенная ДОСТАВКА referral_invite (запись остаётся мгновенной,
+            # см. _mark_first_config_fetch): строка созревает и только потом
+            # попадает в выборку. Отдельный фильтр, а не отдельный класс —
+            # FIFO и приоритеты остальных пушей не меняются.
+            q = q.filter(
+                or_(
+                    models.AuditLog.action != "referral_invite",
+                    models.AuditLog.created_at <= utcnow() - invite_delay,
+                )
+            )
+        return (
+            q.order_by(models.AuditLog.created_at.asc())  # FIFO — честный порядок
+            .limit(lim)
+            .all()
+        )
+
+    priority_logs = _fetch(notif_actions, limit)
+    # Добиваем свободные слоты массовой рассылкой (не даём ей вытеснить срочные).
+    bulk_logs = _fetch(bulk_actions, limit - len(priority_logs))
+    logs = priority_logs + bulk_logs
 
     results = []
     for log in logs:
@@ -567,10 +2485,49 @@ def get_pending_notifications(
                 "Продли сейчас через /renew, иначе VPN отключится."
             )
         elif log.action == "config_ready":
+            # Продюсер — services/config_ready.py (первая выдача подписки,
+            # warm и cold). sub_uri кладётся только абсолютный http(s); без
+            # SUB_LINK_BASE_URL ссылки в пуше нет — текст ведёт в личный
+            # кабинет, где она лежит всегда (инцидент 2026-08-25: бот
+            # пообещал ссылку и не прислал, юзер упёрся в тупик).
+            # Абзаца про ЛК/config при наличии ссылки нет: бот вешает на этот
+            # тип onboarding_keyboard с кнопкой ЛК первой строкой, текстом это
+            # было бы повтором (жалоба владельца 28.08). Без ссылки единственный
+            # путь к ней — ЛК, и тогда одна строка про него уместна.
             sub_uri = extra.get("sub_uri")
             text = (
-                "✅ Конфиг VPN готов!\n"
-                + (f"Ссылка: {sub_uri}\n" if sub_uri else "")
+                "✅ Конфиг VPN готов, можно подключаться!\n"
+                + (
+                    f"Ссылка: {sub_uri}\n"
+                    if sub_uri
+                    else "Ссылка ждёт в личном кабинете (кнопка ниже).\n"
+                )
+                + "Не знаешь, как настроить? Выбери платформу 👇"
+            )
+        elif log.action == "referral_invite":
+            # Шлётся один раз — после того, как человек впервые скачал конфиг,
+            # но с задержкой REFERRAL_INVITE_DELAY_H (см. _referral_invite_delay):
+            # сразу после ссылки это было третьим-четвёртым сообщением подряд и
+            # тонуло в шуме, а через сутки у человека есть что рекомендовать.
+            # Поэтому текст начинается с вопроса «Как VPN?», а не с «Готово».
+            #
+            # Ссылку зовём отправить лично, а не постить публично: публикация
+            # ссылки на VPN-бота — состав по ч.18 ст.14.3 КоАП (в январе 2026
+            # за такое оштрафовали владельца Telegram-канала), и отвечает
+            # разместивший, то есть наш же пользователь. Прямо про закон в
+            # тексте не пишем — не пугаем, просто не предлагаем публичность.
+            ref_url = extra.get("share_url")
+            reward_days = extra.get("reward_days")
+            reward_line = (
+                f"Если приведёшь друга, получишь {_plural_days(reward_days)} "
+                "подписки, когда он оплатит.\n\n"
+                if reward_days
+                else ""
+            )
+            text = (
+                "Как VPN? "
+                + reward_line
+                + (f"Ссылка для друзей:\n{ref_url}" if ref_url else "")
             )
         elif log.action == "migration_notice":
             # Намеренно без URL. Подписочная ссылка, лежащая в профиле
@@ -586,6 +2543,19 @@ def get_pending_notifications(
                 "просто нажми 🔄 рядом с профилем в Hiddify / V2rayNG / Streisand.\n"
                 "Ничего переустанавливать и копировать не нужно."
             )
+        elif log.action == "sublink_rotated":
+            # Перегенерация sub-link (admin bulk-regenerate, обычно хвосты
+            # аварии). В отличие от migration_notice здесь sub_token
+            # СМЕНИЛСЯ — авто-refresh в клиенте подтянет конфиг по старой
+            # ссылке через sibling-alias, но в ЛК уже лежит новая ссылка,
+            # и правильнее переподключиться по ней. Старый конфиг пока
+            # продолжает работать, так что без паники и без обрыва.
+            text = (
+                "🔁 Мы обновили твой VPN-конфиг.\n"
+                "Чтобы всё продолжило работать без перебоев — открой "
+                "личный кабинет и возьми оттуда новую ссылку.\n"
+                "Старый конфиг ещё работает, но лучше обновиться сейчас."
+            )
         elif log.action == "low_balance_warning":
             days = extra.get("days_remaining", "?")
             balance_rub = extra.get("balance_rub", "?")
@@ -594,10 +2564,11 @@ def get_pending_notifications(
                 "Пополни через /balance, иначе подписка отключится."
             )
         elif log.action == "trial_expiry_warning":
+            # Без числа дней и сумм: текст верен и для 3-дневных триалов, и
+            # для старых 30-дневных, и при любом TRIAL_EXPIRY_WARN_DAYS.
             text = (
-                "⏳ Твой пробный месяц кончается через 3 дня.\n"
-                "Пополни баланс, чтобы подписка не отключилась — "
-                "реферальные 50 ₽ (если есть) остаются при тебе."
+                "⏳ Бесплатные дни скоро закончатся.\n"
+                "Чтобы VPN не отключился, пополни баланс: /balance"
             )
         elif log.action == "health_ping_request":
             text = (
@@ -607,6 +2578,14 @@ def get_pending_notifications(
                 "быстрее находить и устранять проблемы.\n\n"
                 "Спасибо, что вы с нами! 💛"
             )
+        elif log.action.startswith("admin_alert_") or log.action == "admin_broadcast":
+            # Текст готов на backend-е в hook-site (submit_health_ping_response,
+            # run_relay_link_health_tick, dlq_exception_handler, а для
+            # broadcast — в POST /api/broadcasts). Если extra.text пуст —
+            # AuditLog-строка битая, тихо пропускаем.
+            text = extra.get("text") or ""
+            if not text:
+                continue
         # elif log.action == "sharing_warning":
         #     text = (
         #         "Привет! 👋 Мы заметили, что к твоему аккаунту "
@@ -648,12 +2627,25 @@ def get_pending_notifications(
             if isinstance(raw, int):
                 sub_id_extra = raw
 
+        # Diagnose-incident push: forward target so the bot can build the
+        # ack / mute / follow inline keyboard.
+        target_kind_extra: str | None = None
+        target_id_extra: int | None = None
+        if log.action == "admin_alert_node_diagnosis":
+            tk = extra.get("target_kind")
+            ti = extra.get("target_id")
+            if isinstance(tk, str) and isinstance(ti, int):
+                target_kind_extra = tk
+                target_id_extra = ti
+
         results.append(NotificationOut(
             id=log.id,
             telegram_id=telegram_id,
             text=text,
             type=log.action,
             subscription_id=sub_id_extra,
+            target_kind=target_kind_extra,
+            target_id=target_id_extra,
         ))
 
     return results
@@ -695,6 +2687,7 @@ def submit_health_ping_response(
         raise HTTPException(status_code=404, detail="User not found")
 
     node_id: int | None = None
+    sub: models.Subscription | None = None
     if body.subscription_id is not None:
         sub = db.get(models.Subscription, body.subscription_id)
         # Cross-check ownership so a leaked sub_id from one user can't
@@ -717,8 +2710,56 @@ def submit_health_ping_response(
             },
         )
     )
+
+    # Пуша админу на саму жалобу больше нет (30.09.2026): лестница self_repair
+    # ниже чинит автоматически, а админ получает ОДИН пуш, только если починка
+    # не помогла или не смогла ничего сделать (services/repair_alerts: watcher
+    # inconclusive, «всё ещё не работает», no_target). Жалоба остаётся в БД —
+    # строка health_ping_response выше + complaint_received/client_reported_failure
+    # в ядре.
+
+    # Ответ фиксируем ДО починки: у ядра свои коммиты/откаты, и строка
+    # опроса не должна пропасть, если перенос упадёт.
     db.commit()
-    return {"ok": True}
+
+    # «Не работает» от юзера → та же починка, что по кнопке «🆘 VPN не
+    # работает» в боте, кабинете и на странице: единое ядро self_repair
+    # (жалоба → единый троттл/потолок → лестница либо whole-sub перенос).
+    # Ровно одно живое устройство → per-device лестница; иначе → перенос всей
+    # подписки. Ответ несёт action, чтобы бот показал человеку, что именно
+    # сделали (раньше: «мы получили сигнал», хотя подписка уже переехала).
+    resp: dict = {"ok": True}
+    if body.answer == "bad" and sub is not None and sub.user_id == user.id:
+        from .api.client_control import COMPLAINT_DEDUP_SEC, outcome_response
+        from .services import self_repair
+
+        try:
+            live = self_repair.live_devices(sub)
+            if len(live) == 1:
+                outcome = self_repair.handle_broken_device(
+                    db, live[0].id, user=user,
+                    dedup_sec=COMPLAINT_DEDUP_SEC, source="bot_health_ping",
+                )
+            else:
+                outcome = self_repair.handle_broken_subscription(
+                    db, sub, user=user,
+                    dedup_sec=COMPLAINT_DEDUP_SEC, source="bot_health_ping",
+                )
+            db.commit()
+            resp.update(outcome_response(outcome).model_dump())
+        except Exception:  # noqa: BLE001
+            # Откат обязателен: полусделанный перенос нельзя дофлашить.
+            db.rollback()
+            logger.exception(
+                "health-ping-response: repair for sub %s failed",
+                body.subscription_id,
+            )
+            resp["action"] = "no_target"
+            # Ядро упало до своего no_target-алерта — иначе жалоба была бы тихой.
+            from .services.repair_alerts import alert_repair_no_target
+
+            alert_repair_no_target(db, user, sub, source="bot_health_ping")
+    return resp
 
 
 class HealthPingOptOutRequest(BaseModel):
@@ -828,9 +2869,23 @@ def update_notification_prefs(
     )
 
 
+class NotificationAck(BaseModel):
+    """Что бот знает об отправленном сообщении.
+
+    ``message_id`` нужен, чтобы доставленное можно было ОТОЗВАТЬ: Bot API умеет
+    удалять свои сообщения 48 часов, но только по id. Пока мы его не сохраняли,
+    ошибочная рассылка была необратима — ровно это и случилось 2026-07-27 с
+    приглашением позвать друга.
+    """
+
+    message_id: int | None = None
+    chat_id: int | None = None
+
+
 @ext_router.post("/notifications/{notif_id}/ack")
 def ack_notification(
     notif_id: int,
+    body: NotificationAck | None = None,
     db: Session = Depends(get_db),
     admin_token: str = Depends(require_admin),
 ):
@@ -842,6 +2897,13 @@ def ack_notification(
     if not log:
         raise HTTPException(status_code=404, detail="Notification not found")
     log.action = f"{log.action}:delivered"
+    if body and body.message_id:
+        # JSONB in-place не детектится SQLAlchemy → новый dict.
+        log.extra = {
+            **(log.extra or {}),
+            "message_id": body.message_id,
+            "chat_id": body.chat_id,
+        }
     db.add(log)
     db.commit()
     return {"ok": True}

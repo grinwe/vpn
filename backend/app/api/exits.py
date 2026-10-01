@@ -11,9 +11,12 @@ whether keygen is needed.
 from __future__ import annotations
 
 import heapq
+import logging
+import uuid
 from typing import Any
 
 from fastapi import APIRouter, Depends, Header, HTTPException
+from pydantic import BaseModel
 from sqlalchemy import func
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
@@ -29,8 +32,17 @@ from ..services.relay import (
     next_wg_interface_name,
     validate_requested_address,
 )
+from ..services.ansible_runner import InvalidNodeIdentity, validate_node_name
+from ..services.node_spawner import (
+    NodeSpawnError,
+    reboot_exit,
+    resolve_spawn_name,
+    spawn_exit_async,
+)
 from ..services.vless import generate_wireguard_keypair
 from ._common import ADMIN_ACTOR_HEADER, _audit, _resolve_admin_actor, get_db
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
@@ -248,6 +260,95 @@ def _peers_count(db: Session, exit_id: int) -> int:
     )
 
 
+def _run_task_best_effort(
+    orchestrator: ProvisioningOrchestrator,
+    task: models.ProvisioningTask,
+) -> bool:
+    """Enqueue таски в RQ, не роняя запрос при недоступной очереди.
+
+    ``run_task_async`` кидает RuntimeError, если Redis недоступен и
+    ``ALLOW_INPROCESS_PROVISIONING`` выключен. В одиночных операциях
+    (attach/detach/create/reconnect/diagnose/…) БД уже закоммичена и
+    task лежит в ``pending`` — его подберёт pending-rescue-tick. Раньше
+    тут летел 500 ПОСЛЕ успешного изменения БД: админ считал операцию
+    проваленной, ретраил и ловил 409 (dup attach) или 404 (detach), что
+    путало ещё сильнее. Теперь логируем и возвращаем ``False`` (task в
+    pending), как это давно делают batch-эндпоинты.
+
+    Returns ``True`` если задача передана воркеру сразу, ``False`` если
+    осталась в pending до rescue-tick'а.
+    """
+    try:
+        orchestrator.run_task_async(task)
+        return True
+    except Exception:  # noqa: BLE001
+        logger.exception(
+            "run_task_async failed for task %s — "
+            "pending-rescue-tick should pick it up",
+            task.id,
+        )
+        return False
+
+
+def _reapply_links_after_endpoint_change(
+    db: Session,
+    exit_node: models.WGExitNode,
+    *,
+    actor: str,
+    actor_type,
+) -> list[int]:
+    """Пере-прошить wgN.conf на всех relay'ях этого exit'а.
+
+    Зовётся, когда изменились ``host``/``wg_port``/``wg_public_key`` — то
+    есть ровно те поля, что зашиты в конфиг WG-клиента на каждом relay'е.
+    Payload идентичен ручному Reconnect: bootstrap_exit.yml на exit'е +
+    relay_tunnel_apply.yml на relay'е.
+
+    Отказ постановки задачи не откатывает уже сохранённую правку exit'а:
+    таска остаётся в ``pending``, её подберёт rescue-tick. Возвращает
+    id созданных задач (для аудита/логов).
+    """
+    links = (
+        db.query(models.RelayExitLink)
+        .filter(models.RelayExitLink.exit_id == exit_node.id)
+        .all()
+    )
+    if not links:
+        return []
+
+    orchestrator = ProvisioningOrchestrator(db)
+    task_ids: list[int] = []
+    for link in links:
+        task = orchestrator.create_task(
+            "relay_tunnel",
+            link.relay_node_id,
+            "apply",
+            {"exit_id": exit_node.id, "link_id": link.id},
+        )
+        task_ids.append(task.id)
+    db.commit()
+
+    _audit(
+        db,
+        actor,
+        "wg_exit_endpoint_reapplied",
+        "wg_exit_node",
+        exit_node.id,
+        actor_type=actor_type,
+        metadata={"link_ids": [link.id for link in links], "task_ids": task_ids},
+    )
+
+    for task in (db.get(models.ProvisioningTask, tid) for tid in task_ids):
+        if task is not None:
+            _run_task_best_effort(orchestrator, task)
+
+    logger.info(
+        "exit %s endpoint changed — re-applying %d relay link(s): tasks %s",
+        exit_node.id, len(links), task_ids,
+    )
+    return task_ids
+
+
 @router.get("/exits", response_model=list[schemas.WGExitNodeOut])
 def list_exits(
     db: Session = Depends(get_db),
@@ -323,8 +424,69 @@ def create_exit(
     orchestrator = ProvisioningOrchestrator(db)
     task = orchestrator.create_task("exit", exit_node.id, "bootstrap", {})
     db.commit()
-    orchestrator.run_task_async(task)
+    # Best-effort enqueue: exit уже создан в БД, task в pending —
+    # rescue-tick подхватит, если Redis лежит. Не роняем 200 в 500.
+    _run_task_best_effort(orchestrator, task)
 
+    return _to_out(exit_node, peers_count=0)
+
+
+@router.post("/exits/spawn", response_model=schemas.WGExitNodeOut)
+def spawn_exit_route(
+    payload: schemas.ExitSpawnRequest,
+    db: Session = Depends(get_db),
+    admin_token: str = Depends(require_admin),
+    admin_actor: str | None = Header(default=None, alias=ADMIN_ACTOR_HEADER),
+):
+    """Заказать облачную WG-exit-ноду у провайдера и развернуть.
+
+    Зеркало ``POST /nodes/spawn``: быстрый заказ синхронно + фиксация
+    ``WGExitNode`` (registering, placeholder host), долгий поллинг IP +
+    ``bootstrap_exit`` — в фоне (см. ``node_spawner.spawn_exit_async``).
+    Зарубежные серверы заводят так — как exit за РУ-relay, а не прямой нодой.
+    """
+    # Имя: явное от админа или авто «<хостер>-<cc>-<NN>» при пустом поле.
+    try:
+        name = resolve_spawn_name(
+            db, payload.provider_id, payload.region, payload.name
+        )
+    except NodeSpawnError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    try:
+        validate_node_name(name)
+    except InvalidNodeIdentity as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    # 400 (не 502): ошибка заказа у провайдера; CF прячет 5xx — на 4xx detail
+    # доходит до админки (как в /nodes/spawn).
+    try:
+        exit_node = spawn_exit_async(
+            db,
+            provider_id=payload.provider_id,
+            name=name,
+            region=payload.region,
+            plan=payload.plan,
+            image=payload.image,
+            ssh_key_ids=payload.ssh_key_ids,
+            user_data=payload.user_data,
+            notes=payload.notes,
+        )
+    except NodeSpawnError as exc:
+        raise HTTPException(status_code=400, detail=f"spawn failed: {exc}") from exc
+
+    actor, actor_type = _resolve_admin_actor(admin_actor)
+    _audit(
+        db,
+        actor,
+        "wg_exit_spawned",
+        "wg_exit_node",
+        exit_node.id,
+        actor_type=actor_type,
+        metadata={
+            "provider_id": payload.provider_id,
+            "region": payload.region,
+            "plan": payload.plan,
+        },
+    )
     return _to_out(exit_node, peers_count=0)
 
 
@@ -351,6 +513,15 @@ def update_exit(
     exit_node = db.get(models.WGExitNode, exit_id)
     if not exit_node:
         raise HTTPException(status_code=404, detail="Exit node not found")
+
+    # Endpoint-поля зашиты в wgN.conf на КАЖДОМ relay'е этого exit'а. WG сам
+    # не переприцеливается: PersistentKeepalive продолжает слать кипэлайвы на
+    # старый адрес, wg-quick@ без Restart= не перезапустится, а exit не может
+    # спасти роумингом — wg0.conf.j2 рендерит peer'ов без Endpoint. Смена
+    # wg_port ломает обе стороны сразу. Раньше правка молча оставляла все
+    # туннели этого exit'а висеть, и лечилось это ручным Reconnect по каждому
+    # линку. Аудит RU split-routing 2026-07-28, находка А2.
+    _endpoint_before = (exit_node.host, exit_node.wg_port, exit_node.wg_public_key)
 
     if payload.name is not None:
         if (
@@ -394,6 +565,12 @@ def update_exit(
     db.refresh(exit_node)
     actor, actor_type = _resolve_admin_actor(admin_actor)
     _audit(db, actor, "wg_exit_updated", "wg_exit_node", exit_node.id, actor_type=actor_type)
+
+    if (exit_node.host, exit_node.wg_port, exit_node.wg_public_key) != _endpoint_before:
+        _reapply_links_after_endpoint_change(
+            db, exit_node, actor=actor, actor_type=actor_type
+        )
+
     return _to_out(exit_node, peers_count=_peers_count(db, exit_node.id))
 
 
@@ -450,6 +627,12 @@ def keygen_exit(
 
     Overwrites any existing keys on the row. Returns only the public key
     — the private half is stored encrypted and never exposed via API.
+
+    Ротация ключа рвёт КАЖДЫЙ существующий туннель к этому exit'у: старый
+    публичный ключ зашит в ``wgN.conf`` на relay'ях, и без пере-прошивки
+    peer больше не проходит handshake. Поэтому после смены ключа сразу
+    ставим relay_tunnel/apply на все линки — как и ``PATCH /exits/{id}``
+    при смене endpoint-полей.
     """
     exit_node = db.get(models.WGExitNode, exit_id)
     if not exit_node:
@@ -460,6 +643,9 @@ def keygen_exit(
     db.commit()
     actor, actor_type = _resolve_admin_actor(admin_actor)
     _audit(db, actor, "wg_exit_keygen", "wg_exit_node", exit_node.id, actor_type=actor_type)
+    _reapply_links_after_endpoint_change(
+        db, exit_node, actor=actor, actor_type=actor_type
+    )
     return schemas.WGExitKeygenOut(id=exit_node.id, wg_public_key=pub)
 
 
@@ -489,7 +675,7 @@ def rebootstrap_exit(
         "exit", exit_node.id, "bootstrap", {"rerun": True}
     )
     db.commit()
-    orchestrator.run_task_async(task)
+    enqueued = _run_task_best_effort(orchestrator, task)
     actor, actor_type = _resolve_admin_actor(admin_actor)
     _audit(
         db,
@@ -500,7 +686,34 @@ def rebootstrap_exit(
         actor_type=actor_type,
         metadata={"task_id": task.id},
     )
-    return {"exit_id": exit_node.id, "task_id": task.id}
+    # task_enqueued=false → задача в pending, её подберёт rescue-tick;
+    # админка не считает операцию проваленной.
+    return {"exit_id": exit_node.id, "task_id": task.id, "task_enqueued": enqueued}
+
+
+@router.post("/exits/{exit_id}/reboot")
+def reboot_exit_route(
+    exit_id: int,
+    db: Session = Depends(get_db),
+    admin_token: str = Depends(require_admin),
+    admin_actor: str | None = Header(default=None, alias=ADMIN_ACTOR_HEADER),
+):
+    """Перезагрузить exit-ноду без захода в панель хостера: hard-reboot через
+    API провайдера (даже если зависла), иначе/при сбое — graceful по SSH."""
+    exit_node = db.get(models.WGExitNode, exit_id)
+    if not exit_node:
+        raise HTTPException(status_code=404, detail="Exit node not found")
+    try:
+        method = reboot_exit(db, exit_node)
+    except NodeSpawnError as exc:
+        # 400 (не 502): CF прячет 5xx HTML'ом; admin'у нужен текст ошибки.
+        raise HTTPException(status_code=400, detail=f"reboot failed: {exc}") from exc
+    actor, actor_type = _resolve_admin_actor(admin_actor)
+    _audit(
+        db, actor, "wg_exit_rebooted", "wg_exit_node", exit_node.id,
+        metadata={"method": method}, actor_type=actor_type,
+    )
+    return {"exit_id": exit_node.id, "method": method}
 
 
 @router.post("/exits/{exit_id}/diagnose")
@@ -527,7 +740,7 @@ def diagnose_exit(
     orchestrator = ProvisioningOrchestrator(db)
     task = orchestrator.create_task("exit", exit_node.id, "diagnose", {})
     db.commit()
-    orchestrator.run_task_async(task)
+    enqueued = _run_task_best_effort(orchestrator, task)
     actor, actor_type = _resolve_admin_actor(admin_actor)
     _audit(
         db,
@@ -538,7 +751,7 @@ def diagnose_exit(
         actor_type=actor_type,
         metadata={"task_id": task.id},
     )
-    return {"exit_id": exit_node.id, "task_id": task.id}
+    return {"exit_id": exit_node.id, "task_id": task.id, "task_enqueued": enqueued}
 
 
 @router.get("/exits/{exit_id}/links", response_model=list[schemas.RelayExitLinkOut])
@@ -683,74 +896,251 @@ def attach_relay(
         {"exit_id": exit_node.id, "link_id": link.id},
     )
     db.commit()
-    orchestrator.run_task_async(task)
+    # Best-effort: link уже создан, task в pending — rescue-tick подхватит
+    # при недоступном Redis. Иначе 500 после успешного attach → админ
+    # ретраит и ловит 409 (dup). См. _run_task_best_effort.
+    _run_task_best_effort(orchestrator, task)
 
     return _link_to_out(link)
 
 
-@router.delete("/exits/{exit_id}/links/{relay_node_id}", status_code=200)
-def detach_relay(
-    exit_id: int,
-    relay_node_id: int,
+@router.post(
+    "/exits/batch-attach",
+    response_model=schemas.BatchAttachRelayResponse,
+)
+def batch_attach_relay(
+    payload: schemas.BatchAttachRelayRequest,
     db: Session = Depends(get_db),
     admin_token: str = Depends(require_admin),
     admin_actor: str | None = Header(default=None, alias=ADMIN_ACTOR_HEADER),
 ):
-    """Detach a relay from this exit (G.5: multi-exit aware).
+    """Ensure: один relay прицеплен ко всем выбранным exit'ам одним запросом.
 
-    Drops the single matching link row. If the relay has other
-    remaining links, ``relay_config`` is re-snapshotted from one of
-    them so the admin schema still flags this node as a relay; if
-    this was the last link, ``relay_config`` is cleared. Either way
-    a ``relay_tunnel`` task is scheduled — ansible re-renders the
-    exit's peer list without this client (``bootstrap_exit.yml`` +
-    ``wg syncconf``) and re-applies the relay's WG tunnel set from
-    ``relay_wg_links``: the removed ``wgN`` gets torn down by the
-    drift-reconciliation step in the ``relay_jump_node`` role, any
-    remaining ``wgN`` stays up.
+    Семантика «ensure», не «strict attach»:
+      - exit_id, к которому relay ещё НЕ прицеплен → INSERT link + new
+        ``relay_tunnel apply`` task. ``mode="attached"`` в ответе.
+      - exit_id, к которому relay уже прицеплен → re-apply: НЕ
+        INSERT'им новый link (keypair и /32 сохраняются), просто
+        создаём свежий ``relay_tunnel apply`` task на существующем
+        link'е. ``mode="reapplied"`` в ответе.
 
-    Перед удалением линка все live creds с ``exit_id == exit_id`` и
-    ``node_id == relay.id`` перепиниваются: если остаются другие
-    линки — распределяются least-loaded по ним; если линков больше
-    нет — ``exit_id`` обнуляется в NULL. Без этого шага
-    ``build_xray_relay_outbounds`` выкидывает emails со stale
-    ``exit_id`` из routing rules и юзер идёт по default outbound
-    (direct), а не через оставшийся туннель.
+    Зачем так: оператор открывает модалку на /exits и хочет «прогнать
+    relay-tunnel для этих exit'ов» — независимо от того, новые они
+    или уже прицеплены. Strict-режим с 409 на дубликаты делал re-apply
+    невозможным через тот же UI (см. issue 2026-05-27).
 
-    Returns ``task_id`` so the admin UI can surface progress in
-    /tasks, plus ``credentials`` summary (migrated count +
-    распределение по exit'ам). ``task_id`` is ``None`` only if the
-    relay row was already gone (rare — FK cascade order drops the
-    link first).
+    Все task'и (attach'и и re-apply'и) идут под общим ``batch_id`` —
+    UI рендерит их одной таблицей с прогрессом N/M, retry отдельных
+    upal'нувших через обычную /tasks-кнопку.
+
+    Защита от race в ``allocate_client_address`` для НОВЫХ link'ов:
+    каждый link добавляем через ``db.add()`` + ``db.flush()`` ДО
+    следующего allocate в той же транзакции — следующий
+    ``_taken_hosts`` уже видит свежий address как pending-INSERT и
+    пропустит его. То же для ``next_wg_interface_name``.
     """
-    link = (
-        db.query(models.RelayExitLink)
-        .filter(
-            models.RelayExitLink.exit_id == exit_id,
-            models.RelayExitLink.relay_node_id == relay_node_id,
+    if not payload.exit_ids:
+        raise HTTPException(
+            status_code=400, detail="exit_ids must be non-empty"
         )
-        .first()
-    )
-    if not link:
-        raise HTTPException(status_code=404, detail="Link not found")
 
+    if len(set(payload.exit_ids)) != len(payload.exit_ids):
+        raise HTTPException(
+            status_code=400,
+            detail="exit_ids содержит дубликаты — почистите список",
+        )
+
+    relay = db.get(models.VPNNode, payload.relay_node_id)
+    if not relay:
+        raise HTTPException(status_code=404, detail="Relay node not found")
+
+    exits_by_id: dict[int, models.WGExitNode] = {}
+    for eid in payload.exit_ids:
+        exit_node = db.get(models.WGExitNode, eid)
+        if not exit_node:
+            raise HTTPException(
+                status_code=404, detail=f"Exit node {eid} not found"
+            )
+        if not exit_node.is_active:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Exit {exit_node.name} is not active",
+            )
+        exits_by_id[eid] = exit_node
+
+    existing_links_by_exit: dict[int, models.RelayExitLink] = {
+        row.exit_id: row
+        for row in (
+            db.query(models.RelayExitLink)
+            .filter(
+                models.RelayExitLink.relay_node_id == relay.id,
+                models.RelayExitLink.exit_id.in_(payload.exit_ids),
+            )
+            .all()
+        )
+    }
+
+    batch_id = uuid.uuid4()
+    orchestrator = ProvisioningOrchestrator(db)
+    # mode → (link, exit_node, task). Сохраняем порядок payload.exit_ids
+    # чтобы в ответе links шли в том же порядке, что выбрал юзер.
+    created_entries: list[
+        tuple[str, models.RelayExitLink, models.WGExitNode, models.ProvisioningTask]
+    ] = []
+    relay_config_snapshot: dict[str, Any] | None = None
+
+    try:
+        for exit_id in payload.exit_ids:
+            exit_node = exits_by_id[exit_id]
+            existing = existing_links_by_exit.get(exit_id)
+            if existing is not None:
+                # Re-apply на существующем link'е: новый task с тем же
+                # link_id, никаких INSERT'ов. keypair и /32 сохранены —
+                # клиент-сторона WG-конфига и так корректна, ansible
+                # должен лишь привести iface/peer-state на нодах.
+                task = orchestrator.create_task(
+                    "relay_tunnel",
+                    relay.id,
+                    "apply",
+                    {"exit_id": exit_node.id, "link_id": existing.id},
+                    batch_id=batch_id,
+                )
+                created_entries.append(("reapplied", existing, exit_node, task))
+                continue
+
+            # Новый attach: alloc + keygen + INSERT + task.
+            client_address = allocate_client_address(db, exit_node)
+            iface_name = next_wg_interface_name(db, relay.id)
+            pub, priv = generate_wireguard_keypair()
+            relay_config_snapshot = build_relay_config(
+                exit_node=exit_node,
+                client_private_key=priv,
+                client_address_v4=client_address,
+            )
+            link = models.RelayExitLink(
+                relay_node_id=relay.id,
+                exit_id=exit_node.id,
+                wg_interface_name=iface_name,
+                wg_client_private_key_enc=_encrypt(priv),
+                wg_client_public_key=pub,
+                wg_client_address_v4=client_address,
+            )
+            db.add(link)
+            db.flush()
+            task = orchestrator.create_task(
+                "relay_tunnel",
+                relay.id,
+                "apply",
+                {"exit_id": exit_node.id, "link_id": link.id},
+                batch_id=batch_id,
+            )
+            created_entries.append(("attached", link, exit_node, task))
+    except RelayAllocationError as exc:
+        db.rollback()
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except IntegrityError as exc:
+        # UNIQUE на (relay_id, exit_id) — race с single attach из другого
+        # запроса между нашим existing-check'ом и flush'ем. uq_relay_exit_pair
+        # migration 0031.
+        db.rollback()
+        raise HTTPException(
+            status_code=409,
+            detail=f"Batch attach race на уникальном индексе: {exc.orig}",
+        ) from exc
+
+    if relay_config_snapshot is not None:
+        # relay_config — флажок «это relay» для admin badge'а; ansible
+        # его не читает (см. attach_relay комментарий). Обновляем
+        # только если был хоть один новый attach — для чистого re-apply
+        # batch'а флаг уже стоит.
+        relay.relay_config = relay_config_snapshot
+
+    db.commit()
+
+    actor, actor_type = _resolve_admin_actor(admin_actor)
+    for mode, link, _exit, _task in created_entries:
+        if mode == "attached":
+            _audit(
+                db, actor, "relay_exit_attached", "relay_exit_link", link.id,
+                actor_type=actor_type,
+            )
+    _audit(
+        db, actor, "relay_batch_attach", "relay_node", relay.id,
+        actor_type=actor_type,
+        metadata={
+            "batch_id": str(batch_id),
+            "exit_ids": payload.exit_ids,
+            "attached": [
+                e.id for m, _l, e, _t in created_entries if m == "attached"
+            ],
+            "reapplied": [
+                e.id for m, _l, e, _t in created_entries if m == "reapplied"
+            ],
+        },
+    )
+
+    # Enqueue после commit'а — worker по job_id подбирает row из БД;
+    # если задача ещё не committed — `_execute_task` не найдёт её и
+    # запишет fail. При недоступности Redis enqueue падает, но task'и
+    # остаются в pending — pending-rescue-tick подберёт через
+    # PENDING_RESCUE_INTERVAL секунд.
+    for _mode, _link, _exit, task in created_entries:
+        try:
+            orchestrator.run_task_async(task)
+        except Exception:  # noqa: BLE001
+            logger.exception(
+                "run_task_async failed for batch %s task %s — "
+                "pending-rescue-tick should pick it up",
+                batch_id, task.id,
+            )
+
+    out_links = [
+        schemas.BatchAttachLinkOut(
+            exit_id=exit_node.id,
+            exit_name=exit_node.name,
+            link_id=link.id,
+            task_id=task.id,
+            wg_interface_name=link.wg_interface_name,
+            wg_client_address_v4=link.wg_client_address_v4,
+            mode=mode,
+        )
+        for mode, link, exit_node, task in created_entries
+    ]
+    return schemas.BatchAttachRelayResponse(
+        batch_id=batch_id,
+        relay_node_id=relay.id,
+        relay_node_name=relay.name,
+        links=out_links,
+    )
+
+
+def _detach_link_core(
+    db: Session,
+    link: models.RelayExitLink,
+) -> tuple[models.VPNNode | None, int, dict[str, Any]]:
+    """Ядро отцепления одного relay↔exit link'а — БЕЗ commit'а и task'а.
+
+    Перепинивает осиротевшие creds (live с ``node_id == relay`` и
+    ``exit_id == этот exit``): если у релея остаются другие линки —
+    раскладывает их least-loaded по оставшимся exit'ам (в памяти, чтобы
+    распределить пачку равномерно, а не свалить всех на наименее
+    загруженный); если линков больше нет — обнуляет ``exit_id`` в NULL
+    (релей становится direct-нодой), иначе ``build_xray_relay_outbounds``
+    видел бы stale exit_id и выкидывал email'ы из routing rules → юзер
+    ушёл бы на default outbound без sockopt (прямой egress из РФ). Затем
+    удаляет link и пересобирает ``relay_config``-флаг (NULL если это был
+    последний линк, иначе snapshot с любого оставшегося).
+
+    Возвращает ``(relay, link_id, migration_summary)``. Вынесено из
+    ``detach_relay``, чтобы ``batch_detach_relay`` повторял ту же логику
+    per-relay без дублирования. Commit, audit и создание ``relay_tunnel``
+    teardown-task'а — на стороне вызывающего.
+    """
+    exit_id = link.exit_id
+    relay_node_id = link.relay_node_id
     link_id = link.id
     relay = db.get(models.VPNNode, relay_node_id)
 
-    # ── Авто-миграция осиротевших creds ──────────────────────────────
-    # До удаления линка фиксируем, кого надо переносить: каждый живой
-    # cred (``pool_state != revoked``) с ``node_id == relay.id`` и
-    # ``exit_id == exit_id`` указывает на уже отрезаемый exit.
-    # Если у релея остаются другие линки — раскладываем эти creds по
-    # оставшимся exit'ам least-loaded (в памяти, чтобы распределить
-    # пачку равномерно, а не свалить всех на один наименее
-    # загруженный). Если линков больше нет — релей де-факто становится
-    # direct-нодой, чистим ``exit_id`` в NULL, иначе
-    # ``build_xray_relay_outbounds`` будет видеть stale exit_id и
-    # исключать email'ы из routing rules → юзер попадёт на default
-    # outbound без sockopt (= прямой egress из РФ). Ранее этот шаг не
-    # делался вообще — creds жили с указателем на удалённый линк до
-    # следующего ручного switch-exit или миграции.
     migration_summary: dict[str, Any] = {"migrated": 0, "cleared": 0}
     orphans = (
         db.query(models.Credential)
@@ -850,6 +1240,56 @@ def detach_relay(
                     ),
                     client_address_v4=remaining.wg_client_address_v4,
                 )
+    return relay, link_id, migration_summary
+
+
+@router.delete("/exits/{exit_id}/links/{relay_node_id}", status_code=200)
+def detach_relay(
+    exit_id: int,
+    relay_node_id: int,
+    db: Session = Depends(get_db),
+    admin_token: str = Depends(require_admin),
+    admin_actor: str | None = Header(default=None, alias=ADMIN_ACTOR_HEADER),
+):
+    """Detach a relay from this exit (G.5: multi-exit aware).
+
+    Drops the single matching link row. If the relay has other
+    remaining links, ``relay_config`` is re-snapshotted from one of
+    them so the admin schema still flags this node as a relay; if
+    this was the last link, ``relay_config`` is cleared. Either way
+    a ``relay_tunnel`` task is scheduled — ansible re-renders the
+    exit's peer list without this client (``bootstrap_exit.yml`` +
+    ``wg syncconf``) and re-applies the relay's WG tunnel set from
+    ``relay_wg_links``: the removed ``wgN`` gets torn down by the
+    drift-reconciliation step in the ``relay_jump_node`` role, any
+    remaining ``wgN`` stays up.
+
+    Перед удалением линка все live creds с ``exit_id == exit_id`` и
+    ``node_id == relay.id`` перепиниваются: если остаются другие
+    линки — распределяются least-loaded по ним; если линков больше
+    нет — ``exit_id`` обнуляется в NULL. Без этого шага
+    ``build_xray_relay_outbounds`` выкидывает emails со stale
+    ``exit_id`` из routing rules и юзер идёт по default outbound
+    (direct), а не через оставшийся туннель.
+
+    Returns ``task_id`` so the admin UI can surface progress in
+    /tasks, plus ``credentials`` summary (migrated count +
+    распределение по exit'ам). ``task_id`` is ``None`` only if the
+    relay row was already gone (rare — FK cascade order drops the
+    link first).
+    """
+    link = (
+        db.query(models.RelayExitLink)
+        .filter(
+            models.RelayExitLink.exit_id == exit_id,
+            models.RelayExitLink.relay_node_id == relay_node_id,
+        )
+        .first()
+    )
+    if not link:
+        raise HTTPException(status_code=404, detail="Link not found")
+
+    relay, link_id, migration_summary = _detach_link_core(db, link)
     db.commit()
     actor, actor_type = _resolve_admin_actor(admin_actor)
     _audit(
@@ -868,6 +1308,7 @@ def detach_relay(
     # down + unpatches Xray. If the relay row is gone (rare — FK cascades
     # drop the link first), skip — there's no target to reconfigure.
     task_id: int | None = None
+    enqueued: bool | None = None
     if relay is not None:
         orchestrator = ProvisioningOrchestrator(db)
         task = orchestrator.create_task(
@@ -878,7 +1319,9 @@ def detach_relay(
         )
         db.commit()
         task_id = task.id
-        orchestrator.run_task_async(task)
+        # Best-effort: link уже удалён — task в pending подхватит
+        # rescue-tick, иначе 500 после detach → админ ретраит и ловит 404.
+        enqueued = _run_task_best_effort(orchestrator, task)
 
     return {
         "exit_id": exit_id,
@@ -887,10 +1330,166 @@ def detach_relay(
         # task_id lets the admin UI link to /tasks?id=N so the admin
         # sees the ansible run instead of wondering if anything happened.
         "task_id": task_id,
+        # task_enqueued=false → task в pending, подхватит rescue-tick.
+        "task_enqueued": enqueued,
         # Сколько осиротевших creds переписали и как распределили —
         # админка показывает это в alert'е после detach'а.
         "credentials": migration_summary,
     }
+
+
+@router.post(
+    "/exits/{exit_id}/batch-detach",
+    response_model=schemas.BatchDetachRelayResponse,
+)
+def batch_detach_relay(
+    exit_id: int,
+    payload: schemas.BatchDetachRelayRequest,
+    db: Session = Depends(get_db),
+    admin_token: str = Depends(require_admin),
+    admin_actor: str | None = Header(default=None, alias=ADMIN_ACTOR_HEADER),
+):
+    """Отцепить несколько relay-нод от одного exit'а одним запросом.
+
+    Обратная операция к batch-attach (там один relay → N exit'ов, тут
+    один exit → N relay'ев). Для каждого relay повторяет логику
+    ``detach_relay`` через общий хелпер ``_detach_link_core`` (перепин
+    осиротевших creds → удаление link'а → пересборка relay_config-флага)
+    и ставит ``relay_tunnel`` teardown-task. Все task'и идут под общим
+    ``batch_id`` — UI рендерит прогресс N/M тем же drawer'ом, что и
+    batch-attach, retry отдельных upal'нувших через /tasks.
+
+    Best-effort по составу: relay_node_id без линка к этому exit'у — не
+    ошибка, попадает в ``not_found`` ответа (UI мог показывать stale
+    строку). Каждый relay независим (его линки/creds scoped по
+    ``node_id``), поэтому порядок обработки на результат не влияет.
+    """
+    exit_node = db.get(models.WGExitNode, exit_id)
+    if not exit_node:
+        raise HTTPException(status_code=404, detail="Exit node not found")
+
+    if not payload.relay_node_ids:
+        raise HTTPException(
+            status_code=400, detail="relay_node_ids must be non-empty"
+        )
+    if len(set(payload.relay_node_ids)) != len(payload.relay_node_ids):
+        raise HTTPException(
+            status_code=400,
+            detail="relay_node_ids содержит дубликаты — почистите список",
+        )
+
+    links_by_relay: dict[int, models.RelayExitLink] = {
+        row.relay_node_id: row
+        for row in (
+            db.query(models.RelayExitLink)
+            .filter(
+                models.RelayExitLink.exit_id == exit_id,
+                models.RelayExitLink.relay_node_id.in_(payload.relay_node_ids),
+            )
+            .all()
+        )
+    }
+    not_found = [
+        rid for rid in payload.relay_node_ids if rid not in links_by_relay
+    ]
+    if not links_by_relay:
+        raise HTTPException(
+            status_code=404,
+            detail="Ни один из выбранных relay не прицеплен к этому exit'у",
+        )
+
+    batch_id = uuid.uuid4()
+    orchestrator = ProvisioningOrchestrator(db)
+    # (relay_id, relay_name, link_id, migration_summary, task|None).
+    # Сохраняем порядок payload.relay_node_ids для стабильного ответа.
+    created_entries: list[
+        tuple[int, str, int, dict[str, Any], models.ProvisioningTask | None]
+    ] = []
+
+    try:
+        for relay_id in payload.relay_node_ids:
+            link = links_by_relay.get(relay_id)
+            if link is None:
+                continue  # уже учтён в not_found
+            relay, link_id, migration_summary = _detach_link_core(db, link)
+            relay_name = relay.name if relay is not None else f"#{relay_id}"
+            task = None
+            if relay is not None:
+                task = orchestrator.create_task(
+                    "relay_tunnel",
+                    relay.id,
+                    "apply",
+                    {"exit_id": exit_id, "link_id": link_id, "detach": True},
+                    batch_id=batch_id,
+                )
+            created_entries.append(
+                (relay_id, relay_name, link_id, migration_summary, task)
+            )
+    except IntegrityError as exc:
+        db.rollback()
+        raise HTTPException(
+            status_code=409,
+            detail=f"Batch detach race на FK/уникальном индексе: {exc.orig}",
+        ) from exc
+
+    db.commit()
+
+    actor, actor_type = _resolve_admin_actor(admin_actor)
+    for relay_id, _name, link_id, summary, _task in created_entries:
+        _audit(
+            db, actor, "relay_exit_detached", "relay_exit_link", link_id,
+            actor_type=actor_type,
+            metadata={
+                "exit_id": exit_id,
+                "relay_node_id": relay_id,
+                # Паритет с одиночным detach: пишем summary перепина creds.
+                "credentials": summary,
+            },
+        )
+    _audit(
+        db, actor, "relay_batch_detach", "wg_exit_node", exit_id,
+        actor_type=actor_type,
+        metadata={
+            "batch_id": str(batch_id),
+            "relay_node_ids": payload.relay_node_ids,
+            "detached": [rid for rid, *_ in created_entries],
+            "not_found": not_found,
+        },
+    )
+
+    # Enqueue после commit'а — worker по job_id подбирает row из БД; см.
+    # развёрнутый комментарий в batch_attach_relay. Redis-fail → task'и
+    # в pending, pending-rescue-tick их подберёт.
+    for _rid, _name, _lid, _summary, task in created_entries:
+        if task is None:
+            continue
+        try:
+            orchestrator.run_task_async(task)
+        except Exception:  # noqa: BLE001
+            logger.exception(
+                "run_task_async failed for batch %s task %s — "
+                "pending-rescue-tick should pick it up",
+                batch_id, task.id,
+            )
+
+    out_links = [
+        schemas.BatchDetachLinkOut(
+            relay_node_id=relay_id,
+            relay_node_name=relay_name,
+            link_id=link_id,
+            task_id=task.id if task is not None else None,
+            credentials=migration_summary,
+        )
+        for relay_id, relay_name, link_id, migration_summary, task
+        in created_entries
+    ]
+    return schemas.BatchDetachRelayResponse(
+        batch_id=batch_id,
+        exit_id=exit_id,
+        exit_name=exit_node.name,
+        links=out_links,
+        not_found=not_found,
+    )
 
 
 @router.post("/exits/{exit_id}/links/{relay_node_id}/reconnect", status_code=200)
@@ -938,11 +1537,87 @@ def reconnect_relay_link(
         actor_type=actor_type,
     )
     db.commit()
-    orchestrator.run_task_async(task)
+    enqueued = _run_task_best_effort(orchestrator, task)
     return {
         "exit_id": exit_id,
         "relay_node_id": relay_node_id,
         "task_id": task.id,
+        # task_enqueued=false → task в pending, подхватит rescue-tick.
+        "task_enqueued": enqueued,
+    }
+
+
+class DiagnoseLinkRequest(BaseModel):
+    """Body для POST /exits/links/{link_id}/diagnose.
+
+    `check_types` опционален — если пуст/отсутствует, оркестратор
+    подставит `DEFAULT_DIAGNOSE_CHECKS` (все 6 jump-side checks).
+    `xray_port` тоже опционален; по умолчанию 9443 (Reality).
+    """
+
+    check_types: list[str] | None = None
+    xray_port: int | None = None
+
+
+@router.post("/exits/links/{link_id}/diagnose", status_code=200)
+def diagnose_relay_link(
+    link_id: int,
+    body: DiagnoseLinkRequest | None = None,
+    db: Session = Depends(get_db),
+    admin_token: str = Depends(require_admin),
+    admin_actor: str | None = Header(default=None, alias=ADMIN_ACTOR_HEADER),
+):
+    """Read-only диагностика конкретного relay→exit WG-линка.
+
+    Создаёт ProvisioningTask с target_type='relay_tunnel', target_id=
+    relay.id, action='diagnose'. На worker'е оркестратор зовёт
+    `playbooks/diagnose_relay_link.yml`, парсит структурированный JSON
+    и кладёт `checks: [{name,status,latency_ms,message,details}, ...]`
+    в `task.result` рядом со stdout/stderr/rc. UI рендерит `checks`
+    карточками — raw stdout уходит в collapsible details.
+
+    Безопасно: `_handle_task_outcome` для relay_tunnel — no-op, поэтому
+    диагностика никогда не флипает статусы и не дёргает credentials.
+    """
+    link = db.get(models.RelayExitLink, link_id)
+    if link is None:
+        raise HTTPException(status_code=404, detail="Link not found")
+    relay = db.get(models.VPNNode, link.relay_node_id)
+    if relay is None:
+        raise HTTPException(status_code=404, detail="Relay node not found")
+
+    task_payload: dict[str, Any] = {
+        "link_id": link.id,
+        "exit_id": link.exit_id,
+    }
+    if body is not None:
+        if body.check_types:
+            task_payload["check_types"] = list(body.check_types)
+        if body.xray_port is not None:
+            task_payload["xray_port"] = int(body.xray_port)
+
+    orchestrator = ProvisioningOrchestrator(db)
+    task = orchestrator.create_task(
+        "relay_tunnel", relay.id, "diagnose", task_payload,
+    )
+    db.commit()
+    enqueued = _run_task_best_effort(orchestrator, task)
+    actor, actor_type = _resolve_admin_actor(admin_actor)
+    _audit(
+        db, actor, "relay_link_diagnose", "relay_exit_link", link.id,
+        actor_type=actor_type,
+        metadata={
+            "task_id": task.id,
+            "check_types": task_payload.get("check_types"),
+        },
+    )
+    return {
+        "link_id": link.id,
+        "relay_node_id": relay.id,
+        "exit_id": link.exit_id,
+        "task_id": task.id,
+        # task_enqueued=false → task в pending, подхватит rescue-tick.
+        "task_enqueued": enqueued,
     }
 
 
@@ -978,36 +1653,47 @@ def refresh_relay_link_health(
       * ``enqueued=false`` — очередь недоступна (Redis down), тогда
         индикаторы не обновятся пока не поднимется очередь.
     """
-    from ..queue import RESULT_TTL, TICK_IDS, get_queue
+    from ..queue import TICK_IDS, get_ticks_queue, schedule_tick
     from rq.exceptions import NoSuchJobError
     from rq.job import Job
     from rq.registry import StartedJobRegistry
 
-    queue = get_queue()
+    # Форсируем тик на ТИКОВОЙ очереди (get_ticks_queue), а не на
+    # provisioning'е (get_queue). Раньше здесь стоял get_queue(): под
+    # нагрузкой (bulk bootstrap) форс кидал SSH-тяжёлый тик в хвост за
+    # ansible-run'ами И удалял его scheduled-джобу из тиковой очереди —
+    # health-индикаторы замирали на весь бэклог, а сам тик исполнялся на
+    # воркере не своей роли и без per-tick timeout (900s вместо 120s).
+    queue = get_ticks_queue()
     if queue is None:
         return {"enqueued": False, "reason": "queue unavailable"}
 
     tick_id = TICK_IDS["app.worker.run_relay_link_health_tick"]
 
+    # Уже идёт сбор — не дёргаем: тик вот-вот сам обновит health-колонки.
     try:
         StartedJobRegistry(queue=queue).cleanup()
     except Exception:  # noqa: BLE001
         pass
-
     try:
         existing = Job.fetch(tick_id, connection=queue.connection)
         if existing.get_status(refresh=True) == "started":
             return {"enqueued": True, "job_id": existing.id, "note": "already running"}
-        existing.delete()
     except NoSuchJobError:
         pass
 
-    job = queue.enqueue(
+    # replace=True снимает stale scheduled/queued job и кладёт свежий без
+    # задержки с per-tick job_timeout (TICK_TIMEOUTS) — та же безопасная
+    # замена scheduled-джобы, что делает периодический self-reschedule.
+    job_id = schedule_tick(
         "app.worker.run_relay_link_health_tick",
-        job_id=tick_id,
-        result_ttl=RESULT_TTL,
+        0,
+        tick_id,
+        replace=True,
     )
-    return {"enqueued": True, "job_id": job.id}
+    if job_id is None:
+        return {"enqueued": False, "reason": "queue unavailable"}
+    return {"enqueued": True, "job_id": job_id}
 
 
 @router.post(
@@ -1142,7 +1828,10 @@ def evacuate_exit_to(
             },
         )
         db.commit()
-        orchestrator.run_task_async(task)
+        # Best-effort: creds уже переписаны и закоммичены; при недоступном
+        # Redis task остаётся в pending (rescue-tick подхватит), не роняем
+        # эвакуацию в 500 на середине цикла с частично переселёнными сабами.
+        _run_task_best_effort(orchestrator, task)
         task_ids.append(task.id)
         migrated.extend(sub_ids)
 

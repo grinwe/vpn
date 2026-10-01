@@ -2,7 +2,7 @@
 
 Документ про **ноды-exit'ы**: кто их регистрирует, какой у них жизненный цикл, какие на них роли выполняются и что значит каждая колонка в `VPNNode`. Детали про оркестратор ansible — в `infrastructure/ansible.md`, про орchestration из backend'а — в `components/provisioning.md`. Здесь — перспектива самих нод.
 
-> **Deprecation notice (0.2/0.3, April 2026):** `shadowtls_ss` и `hysteria2` — legacy-протоколы. Роли `install_shadowtls_stack` и `install_hysteria2` закомментированы в [site.yml](../../infra/ansible/site.yml), UI запрещает создание новых `shadowtls+shadowsocks` / `hysteria2` конфигов.  Описания ниже оставлены для легаси-нод, которые пока их ещё отдают; полное удаление — в 0.4 после rollout.
+> **Статус протоколов (обновлено 2026-07-28):** `shadowtls_ss` — legacy, роль `install_shadowtls_stack` закомментирована в [site.yml](../../infra/ansible/site.yml). `hysteria2` **реанимирован 22.07.2026**: роль активна в `site.yml` (гейт — `hysteria2_port` из БД); с 28.07.2026 протокол снова доступен и в admin-UI (форма создания ноды + добавление конфига к существующей). С **28.07.2026** hysteria2 умеет split-tunnel наравне с vless-флаворами (`outbounds[].direct.bindDevice` + `acl.inline` — см. матрицу «протокол × split-tunnel» ниже). До этой даты он на relay-ноде выпускал весь трафик с российского IP, то есть давал коннект без VPN.
 
 ## Модель: `VPNNode` и её колонки
 
@@ -75,11 +75,12 @@ enum VPNNodeStatus (models.py:50-61):
 Начальное состояние, когда строка только-только создана:
 
 - **ручная регистрация**: `POST /api/nodes` — админ заводит запись в БД. Статус `registering`, `is_active=True`, `health_score=NULL` (нет проб → `choose_node` всё равно берёт, т.к. `IS NULL` проходит фильтр).
-- **автоспавн**: `node_spawner.spawn_node` (`backend/app/services/node_spawner.py:154-221`). Порядок:
-  1. `driver.create_server(...)` — вызов у Hetzner/Vultr/DO/Aeza/manual. Блокирующий (30–90с).
-  2. `VPNNode(status=registering, provider_id=..., provider_external_id=...)` в БД.
-  3. `ensure_reality_config(node)` — сгенерировать Reality ключи и сохранить `VPNConfig`.
-  4. `ProvisioningOrchestrator.create_task("node", node.id, "bootstrap")` + `run_task_async` — в воркер.
+- **автоспавн (autoscale-тик)**: `node_spawner.spawn_node` — вызывается из `autoscale.evaluate_pool` в RQ-воркере (без HTTP-таймаута). Блокирующий: `driver.create_server(...)` (30–600с, ждёт IP) → `VPNNode(registering, is_active=True, provider_external_id=...)` → `ensure_reality_config` → bootstrap-task создаётся сразу, но её запуск дожидается SSH в фоновом daemon-потоке `_deferred_bootstrap_after_ssh` (**`_wait_for_ssh`**, аудит-фикс #77: раньше синхронный путь стартовал `site.yml` без ожидания → на свежем VPS `No route to host` → нода `error`, а автоскейл в следующий тик покупал ещё сервер).
+- **спавн из админ-панели**: `POST /api/nodes/spawn` → `node_spawner.spawn_node_async`. **Неблокирующий** (нельзя держать HTTP-запрос на 600s-поллинге — nginx `proxy_read_timeout` 60s убьёт воркер → CF 502, а оплаченный VPS осиротеет). Порядок:
+  1. `driver.order_server(...)` — синхронно, БЫСТРО (только `buyServer`, ~секунды) → `(external_id, root_password)`. Драйверы без `order_server` (vultr/DO/aeza) — заказ целиком уходит в фон на шаге 4. У hetzner сплит есть (аудит-фикс #83); его блокирующий `create_server` (autoscale-путь) при провале после успешного POST best-effort сносит оплаченный сервер (orphan-guard), а поллинг статуса переживает транзиентные ошибки API (аудит-фикс #82).
+  2. `VPNNode(status=registering, is_active=False, host="0.0.0.0", provider_external_id=...)` сразу в БД — сервер привязан к строке с момента заказа (**сирот нет**). `is_active=False` ⇒ `choose_node` не назначает на неё юзеров, пока нет реального IP.
+  3. `ensure_reality_config(node)` (синхронно — host не нужен) → ответ админу с готовой нодой.
+  4. фоновый daemon-поток `_finalize_spawn`: `driver.wait_for_ipv4(external_id)` (поллинг до 600s) → проставить `host` + `is_active=True` → `set_autoprolong` (best-effort) → **`_wait_for_ssh`** (ждём, пока свежий VPS поднимет SSH, окно `NODE_SSH_WAIT_TIMEOUT`=480s — иначе bootstrap падает на `No route to host`) → bootstrap-task (`defer_to_reconciler=False`). При провале поллинга IP — нода `error`+`is_active=False` (external_id уже в строке → оператор сносит/переустанавливает). Перед `site.yml` воркер кладёт `provisioning`-ключ по root-паролю (`ssh_bootstrap.ensure_provisioning_key`, см. эпик Фаза 1.5). Reinstall идёт тем же путём через `_reinstall_finalize` (ждёт SSH после ребута).
 
 После этого воркер запускает `playbooks/site.yml` против этой ноды и ждёт успеха + health pass. Промоут `registering → active` делается в `ProvisioningOrchestrator._handle_task_outcome` (см. `components/provisioning.md`).
 
@@ -172,8 +173,8 @@ client ──TLS (Reality, RU :443)──▶ jump node (RU) ──WireGuard tunn
 
 **Jump-нода**:
 
-- `VPNNode.relay_config` = `{"wg_private_key": "...", "wg_address_v4": "10.77.0.2/24", "wg_endpoint": "<exit_ip>:51820", "wg_exit_public_key": "...", ...}`.
-- В `site.yml` (см. `infrastructure/ansible.md`) на неё выполняется роль `install_vless_reality` **плюс** `relay_jump_node` — последняя ставит WG-клиента и **патчит через jq** существующий `config.json` xray, добавляя `sockopt.interface: wg0` в freedom-outbound. Тем самым весь пользовательский трафик уходит в wg0, а SSH/ansible — через основной интерфейс.
+- Source of truth — таблица `relay_exit_links` (N:N, по одному `wgN` на линк). `VPNNode.relay_config` = legacy-форма, оставшаяся от эпохи одного `wg0`: `{"wg_private_key": "...", "wg_address_v4": "10.77.0.2/24", "wg_endpoint": "<exit_ip>:51820", "wg_exit_public_key": "...", ...}`.
+- В `site.yml` (см. `infrastructure/ansible.md`) на неё выполняются роли `install_vless_*` **плюс** `relay_jump_node` — последняя ставит WG-клиентов (по одному на линк) и **патчит через jq** существующие `config*.json` xray, добавляя `sockopt.interface: wgN` в freedom-outbound. Тем самым весь пользовательский трафик уходит в туннель, а SSH/ansible — через основной интерфейс.
 - Hysteria2 **не патчится** этим способом (UDP route через kernel routing table — комментарий в `relay_jump_node/tasks/main.yml`).
 
 **Exit-нода**:
@@ -185,7 +186,55 @@ client ──TLS (Reality, RU :443)──▶ jump node (RU) ──WireGuard tunn
   - `iptables -t nat POSTROUTING MASQUERADE` на `default_ipv4.interface`;
   - `iptables FORWARD ACCEPT` в обе стороны (in/out wg0).
 - **Не** ставит xray, shadow-tls, hysteria. **Не** живёт в `vpn_nodes` таблице (обычно) — это «inventory-only» машина, про которую БД ничего не знает. Её `ansible_host` прописан в group `wg_exit_nodes` статического inventory.
-- На момент написания группа `wg_exit_nodes` в `inventories/prod/hosts.yml` **пустая** — relay-cхема описана в коде, но в проде не работает. См. ⚠️ ниже.
+- ~~На момент написания группа `wg_exit_nodes` пустая~~ — **неверно с 21.04.2026**: в `inventories/prod/hosts.yml` 7 exit-хостов (TR/FR×2/UK×2/CZ/NL), relay-схема в проде работает и является нормой для РУ-нод.
+
+### RU-обход (split-tunnel на geoip:ru)
+
+Поверх обеих схем работает **разделение трафика по назначению**: запросы к РУ-зоне выходят с собственного IP ноды (direct), всё остальное идёт в туннель/exit. Это держит клиенту доступ к РУ-банкам/госуслугам (которые геоблочат зарубежные IP) и снижает внимание ТСПУ к подключению.
+
+Реализовано **server-side в xray** на двух протоколах — `vless_reality` ([install_vless_reality/templates/config.json.j2](../../infra/ansible/roles/install_vless_reality/templates/config.json.j2)) и `vless_xhttp` ([install_vless_xhttp/templates/config_xhttp.json.j2](../../infra/ansible/roles/install_vless_xhttp/templates/config_xhttp.json.j2)). В обоих `routing` (`domainStrategy: IPIfNonMatch`) два правила, стоящие **перед** per-user relay-fan-out (first-match-wins):
+
+```jsonc
+{ "domain": ["regexp:\\.ru$", "regexp:\\.su$", "regexp:\\.xn--p1ai$", "regexp:^(yandex|...|dtf)\\..+$"], "outboundTag": "direct-local" },
+{ "ip": ["geoip:ru", "geoip:private"], "outboundTag": "direct-local" }
+```
+
+`direct-local` — freedom-outbound **без** `sockopt.interface`, поэтому даже на relay-ноде РУ-трафик выходит с её родного (РУ) IP, а не уходит в WireGuard к exit'у. Список доменов — **намеренно самописный** (курированный список РУ-хостов), а не `geosite:category-ru`: зоны заданы regexp'ами (`\.ru$`, `\.su$`, `\.xn--p1ai$`, `.moscow`, `.tatar`, `.дети`, `.рус`), конкретные бренды и CDN — записями `domain:` (суффиксный матч: домен + все поддомены).
+
+> **Почему бренды — `domain:`, а не regexp (2026-07-28).** До этого стоял `regexp:^(yandex|mail|vk|ok|…)\..+$`, анкоренный на **первый лейбл**, а не на регистрируемый суффикс. Он ловил `mail.google.com`, `mail.proton.me`, `mail.yahoo.com`, `ok.google.com`, `hh.com` — они уходили напрямую с РУ-IP; для Proton это была жёсткая поломка (в РФ заблокирован → домен просто не открывался у юзера с включённым VPN). Обратная сторона того же якоря: `www.vk.com` / `m.vk.com` первым лейблом не матчились вовсе. Бренды в зоне `.ru` покрыты `\.ru$` и в списке не нужны — там только не-`.ru` зоны и CDN (`userapi.com`, `mycdn.me`, `yastatic.net`), на которые приходится основной объём байт. Паритет трёх шаблонов закреплён тестом `backend/tests/test_split_routing_parity.py`.
+
+`geoip.dat` (v2fly community, MIT) ставится обеими ролями в `/usr/local/share/xray/geoip.dat` (`get_url force:no` — один раз на bootstrap, идемпотентно на комбинированной ноде) и обновляется еженедельным `geoip-update.timer`; refresh-сервис делает `try-restart` обоих флаворов (`xray` и `xray-xhttp`) best-effort (`-` префикс — трогает только активные юниты). Без файла xray падает с `failed to load geoip` — поэтому обе роли валидируют рендер через `xray -test` до старта.
+
+**Почему именно так — 5 выстраданных правок** (рационал жил в сообщениях коммитов, не было отдельной доки — этот раздел её заменяет). Каждый пункт — отдельный fix после реального бага, проверенного по access-логам xray:
+
+1. **`direct-local` без `sockopt` отдельным outbound'ом** (`678fb3b`). На relay-ноде дефолтный `direct` outbound патчится `sockopt.interface = wgN` → весь «direct» трафик уходит в WG к exit'у. Первая версия правила слала `geoip:ru → direct` — и РУ-трафик послушно утекал на exit (2ip.ru с клиента показывал IP exit-ноды). Нужен **отдельный** freedom-outbound без sockopt = чистый egress через main-iface ноды.
+2. **`domainStrategy: IPIfNonMatch`** (`9353a76`). Дефолтный `AsIs` не резолвит domain-назначения в IP → правило `ip:[geoip:ru]` по domain-коннектам **никогда не матчит**. `IPIfNonMatch` резолвит domain в IP и делает второй проход по правилам — но **только если в первом не сматчилось НИ ОДНО правило**, включая fan-out по `user`. ⚠️ Практическое следствие (аудит 2026-07-28): у кредa с `exit_id` правило `{"user": […], "outboundTag": "direct-wgN"}` матчится в первом проходе всегда (email известен без резолва), поэтому второй проход не наступает и **geoip-подстраховка для него мертва** — работает только доменный список. У легаси-кредов без `exit_id` user-правила нет, и geoip отрабатывает. Отсюда «у одних работает, у других нет».
+3. **Секция `dns` (Yandex первым)** (`a6d7c58`). Без `dns` xray не резолвит domain→IP для routing'а, и `IPIfNonMatch` молча не срабатывает. Лог подтверждал: `accepted tcp:2ip.ru:443 [vless-reality -> direct-wg2]` (назначение — domain, geoip-правило не применилось). Порядок DNS: **Yandex `77.88.8.8` первым** — отдаёт РУ-IP для РУ-сайтов даже за CDN (foreign DNS часто возвращает Cloudflare). Сам DNS-трафик к 77.88.8.8 попадает под `geoip:ru → direct-local`.
+4. **Domain-правило ДО geoip-правила** (`48ae3bd`). Даже со всем выше geoip-путь оказался ненадёжен (в той Reality-сборке geoip.dat либо не грузился, либо `IPIfNonMatch` не резолвил sniffed-SNI до routing'а — в логах старта не было строк про geoip). Domain-правило матчит **прямо по sniffed SNI, без резолва** — покрывает `.ru/.su/.рф` + явный список `.com`-доменов РУ-гигантов. Geoip-правило остаётся **ниже как safety-net** для прямых IP-коннектов (когда клиент обходит sniffing).
+5. **Требует `sniffing.enabled: true` + `destOverride: [http, tls]`** на inbound — иначе пункт 4 (matching по SNI) не работает. Оба конфига (Reality и XHTTP) это имеют.
+
+> **XHTTP-специфика:** XHTTP-inbound слушает loopback за nginx (Stage-4 camo), но sniffing работает по **внутреннему** TLS-stream'у проксируемого коннекта, не по внешнему транспорту — поэтому RU-обход на XHTTP идентичен Reality. Reconcile relay-линков (`xray_reconcile.jq`/`xray_unpatch.jq`) ходит по маске `config*.json` — то есть по **всем трём** протоколам (маска появилась в `c926838`, апрель 2026; утверждение «только config.json» было неверным с тех пор). Трогает он только `direct-wg*` и `sockopt` у `direct`, а правила `direct-local` и RU-блок не затрагивает — обход переживает attach/detach.
+>
+> **Где это вообще работает:** RU-обход осмыслен только на **relay/РУ-нодах**, где `direct` уходит в WG (≠ `direct-local`). На standalone-зарубежной ноде `_primary` пуст → `direct` и `direct-local` оба egress'ят локально → правило безвредный no-op (РУ-сайты всё равно видят зарубежный IP, выгоды нет).
+>
+> **На direct-нодах split невозможен — закрывается клиентским правилом (2026-08-29).** У direct-нод без WG-туннеля (`vsin-nl-01`, `4vds-dk-01`) разделять нечего: весь трафик, включая РУ, выходит с IP самой ноды, и Wildberries/Яндекс/Тинькофф видят датский или голландский адрес. Это не редкий угол — диверс-раскладка кладёт лег на direct-ноду **43 из 52** активных устройств, а access-лог `4vds-dk-01` показал 137 соединений к WB, ушедших `direct-local` с датского IP; балансировщик `leastPing` выбирает лег по пингу и о географии не знает. Серверной правки тут не существует (туннеля нет), поэтому РУ-домены уводятся **на клиенте**: в Xray-JSON (`backend/app/services/xray_client_config.py`) есть правило `ru-direct` → outbound `direct` с тем же списком зон и доменов из роли `ru_direct_list` (копия `backend/app/services/ru_direct_list.py`, паритет с ролью и с рендером reality-шаблона держит `test_split_routing_parity.py`). Правило стоит между `private-direct` и балансировщиком и работает на любом леге, включая hy2 (где per-user split на ноде и не существует); `geoip:ru` на клиент не кладётся (зависимость от geoip.dat в клиентском ядре), IP-хвост по-прежнему ловят relay-ноды. Гейт — `SUB_XRAY_RU_DIRECT` (off / all / CSV саб-токенов), см. `docs/operations/env-reference.md`; постскриптум с находкой — в `docs/operations/ru_split_routing_audit_2026_07_28.md`.
+
+> **Матрица «протокол × split-tunnel» (2026-07-28).** Все четыре протокола на relay-ноде ходят одинаково: РУ — напрямую с самой ноды, остальное — через WG в зарубежный exit.
+>
+> | Протокол | Механизм RU-обхода | Привязка к WG | С какой даты |
+> |---|---|---|---|
+> | `vless_reality` | `routing.rules` → `direct-local` | `sockopt.interface` | 21.04.2026 |
+> | `vless_xhttp` | то же | то же | 05.06.2026 |
+> | `vless_ws_cdn` | то же | то же | **28.07.2026** |
+> | `hysteria2` | `acl.inline` → `local(...)` | `outbounds[].direct.bindDevice` | **28.07.2026** |
+>
+> Список РУ-зон и доменов — общий, из роли [`ru_direct_list`](../../infra/ansible/roles/ru_direct_list/defaults/main.yml); каждый шаблон рендерит его в свой синтаксис (xray: `regexp:`/`domain:`, hysteria: `suffix:`). Так правка физически не может приземлиться в один протокол и разъехаться с остальными — ровно это и происходило три раза подряд. Паритет проверяется `backend/tests/test_split_routing_parity.py`.
+>
+> **Почему hy2 понадобился отдельный механизм.** Это не xray, а самостоятельный демон: `routing.rules` ему не указ, и `sockopt.interface` он не использует. Ключевое — WG-маршрут на relay-ноде намеренно хуже основного (`relay_jump_node`: `Table = off` + PostUp с `metric 200`), поэтому в туннель попадает **только то, что процесс явно забиндил на интерфейс**. До 28.07.2026 hy2 не биндил ничего и выпускал весь трафик с российского IP — клиент показывал «подключено», РУ-сайты работали, а заблокированное оставалось заблокированным. Теперь `outbounds[0]` — `direct` с `bindDevice: wgN`, и он стоит **первым** намеренно: при неприменившемся ACL hysteria шлёт всё в первый outbound, то есть деградация идёт в сторону «РУ-сайты видят зарубежный IP», а не «VPN не работает». `geoip.dat` переиспользуется из `/usr/local/share/xray` (формат общий, второй копии и второго таймера не нужно).
+>
+> На нодах **без** relay-линков (зарубежные) секции `outbounds`/`acl` не рендерятся вовсе — там весь трафик и так выходит с IP самой ноды, что и требуется.
+>
+> Разбор того, как это сломалось и жило незамеченным, — в `operations/ru_split_routing_audit_2026_07_28.md`.
 
 ## Роли, запускаемые на ноде
 
@@ -311,7 +360,7 @@ for provider_id in [primary] + fallbacks:
 
 ## ⚠️ Неясные места
 
-- **`wg_exit_nodes` группа в `inventories/prod/hosts.yml` пустая.** Код роли `wg_exit_node` готов, `relay_jump_node` готова, но ни одна нода не описана — фактически relay-схема в проде не используется. Неясно, есть ли она хоть где-то в inventory вне git.
+- ~~**`wg_exit_nodes` группа пустая, relay-схема в проде не используется.**~~ **Снято 2026-07-28:** в инвентаре 7 exit-хостов, relay-схема — норма для РУ-нод. Открытый вопрос по ней теперь один: geoip-подстраховка мертва у кредов с `exit_id` (двухпроходный `IPIfNonMatch` — см. выше). У hysteria2 split-tunnel появился 28.07.2026; там geoip-правило живое, потому что ACL матчится одним проходом.
 - **`relay_config` у jump-ноды хранится как JSONB plaintext.** В отличие от паролей `VPNConfig.settings`, которые зашифрованы Fernet, WG-приватник jump-ноды лежит в БД в открытом виде. Компрометация дампа БД = компрометация туннеля.
 - **Health score агрегация не зафиксирована в одном месте.** Декремент/инкремент раскиданы по worker-тикам и handler'ам `HealthProbe`. Порог `MIN_HEALTHY_SCORE` — константа в `provisioning.py`, но откуда берётся «что именно декрементит» — читается только в коде, не в документе.
 - **Автовосстановления из `error` нет.** Нода, попавшая в error (единичный сбой API провайдера во время destroy, например), остаётся там до ручного вмешательства (`PATCH /api/nodes/{id}/status → active` или `destroy_node`). Нет self-heal'а, который бы через X часов попробовал снова.

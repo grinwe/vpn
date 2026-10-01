@@ -1,0 +1,141 @@
+---
+# Exit-side проверки WG-линка. Симметрично diagnose_relay_link, но
+# выполняется на EXIT-ноде. Запускается ВТОРЫМ play'ом из
+# playbooks/diagnose_relay_link.yml — только если в diag_check_types
+# присутствует хоть одна exit-side проверка.
+#
+# Key invariant: на jump-стороне peer-pubkey, который ищем = exit's
+# wg_public_key. На exit-стороне peer-pubkey = relay-client'а
+# wg_client_public_key (то, что лежит в RelayExitLink.wg_client_public_key).
+# Не путать: со стороны exit'а relay — это peer.
+
+- name: Initialize exit-side result accumulator
+  ansible.builtin.set_fact:
+    diag_exit_collected_checks: []
+    diag_exit_started_at: "{{ lookup('pipe', 'date -u +%Y-%m-%dT%H:%M:%SZ') }}"
+
+# ── peer_on_exit ────────────────────────────────────────────────────────
+# Reuse той же логики что peer_on_jump, но pubkey другой и iface — wg0
+# (общий serverside) вместо wgN на jump'е.
+- name: Collect wg show dump on exit (peer_on_exit)
+  ansible.builtin.command: "wg show {{ diag_wg_iface_on_exit }} dump"
+  register: diag_exit_wg_dump
+  changed_when: false
+  failed_when: false
+  when: "'peer_on_exit' in diag_check_types"
+  tags: peer_on_exit
+
+- name: "peer_on_exit :: filter peer-lines by client pubkey"
+  ansible.builtin.set_fact:
+    # Symmetric к peer_on_jump filter: regex_escape для base64-pubkey
+    # (содержит +/=), strict match на peer-line (8 полей) через
+    # leading `^<pubkey>\t` — header-line (4 поля, prefix priv_key)
+    # никогда не зацепит.
+    diag_exit_peer_lines: >-
+      {{ diag_exit_wg_dump.stdout_lines | default([])
+         | select('match', '^' ~ (diag_client_pubkey | regex_escape) ~ '\t')
+         | list }}
+  when: "'peer_on_exit' in diag_check_types"
+  tags: peer_on_exit
+
+- name: "peer_on_exit :: append result"
+  ansible.builtin.set_fact:
+    diag_exit_collected_checks: "{{ diag_exit_collected_checks + [diag_exit_peer_entry] }}"
+  vars:
+    diag_exit_peer_entry:
+      name: peer_on_exit
+      status: "{{ 'ok' if (diag_exit_peer_lines | length > 0) else 'fail' }}"
+      latency_ms: null
+      message: >-
+        {%- if (diag_exit_peer_lines | length > 0) -%}
+        client pubkey {{ diag_client_pubkey[:12] }}… present в {{ diag_wg_iface_on_exit }}
+        {%- else -%}
+        client pubkey {{ diag_client_pubkey[:12] }}… NOT FOUND в {{ diag_wg_iface_on_exit }} на exit'е (wg dump rc={{ diag_exit_wg_dump.rc | default(-1) }}) — bootstrap_exit не накатил peer-line, либо exit/relay рассинхрон ключей
+        {%- endif -%}
+      details:
+        wg_dump_rc: "{{ diag_exit_wg_dump.rc | default(-1) }}"
+        wg_dump_lines: "{{ diag_exit_wg_dump.stdout_lines | default([]) | length }}"
+        client_pubkey_prefix: "{{ diag_client_pubkey[:12] }}"
+        iface_on_exit: "{{ diag_wg_iface_on_exit }}"
+        stderr: "{{ (diag_exit_wg_dump.stderr | default(''))[:300] }}"
+  when: "'peer_on_exit' in diag_check_types"
+  tags: peer_on_exit
+
+# ── iptables_forward ───────────────────────────────────────────────────
+# Exit-нода должна форвардить пакеты из WG-туннеля наружу (через свой
+# uplink iface). Минимум — счётчики на FORWARD chain'е не нулевые когда
+# трафик идёт. Если ACCEPT-правил для wg0 нет вообще — kernel дропает
+# по default policy. iptables-nft + ufw легально живут параллельно, так
+# что мы НЕ ругаем на "правил мало" — просто фиксируем наличие/отсутствие
+# ACCEPT для wg0 и счётчики пакетов на этой chain'е.
+- name: "iptables_forward :: list FORWARD chain"
+  ansible.builtin.shell: |
+    set -o pipefail
+    iptables -L FORWARD -nv 2>/dev/null || nft list chain inet filter FORWARD 2>/dev/null || true
+  args:
+    executable: /bin/bash
+  register: diag_iptables_fwd
+  changed_when: false
+  failed_when: false
+  when: "'iptables_forward' in diag_check_types"
+  tags: iptables_forward
+
+- name: "iptables_forward :: count wg0 accept rules"
+  ansible.builtin.set_fact:
+    # Считаем строки FORWARD chain, где есть ACCEPT + ссылка на наш iface.
+    # Грубо, но достаточно: 0 совпадений == правила forwarding'а нет
+    # вообще, проблемы со связью почти гарантированы.
+    diag_fwd_accept_lines: >-
+      {{ diag_iptables_fwd.stdout_lines | default([])
+         | select('search', diag_wg_iface_on_exit) | select('search', '(?i)accept')
+         | list }}
+  when: "'iptables_forward' in diag_check_types"
+  tags: iptables_forward
+
+- name: "iptables_forward :: append result"
+  ansible.builtin.set_fact:
+    diag_exit_collected_checks: "{{ diag_exit_collected_checks + [diag_fwd_entry] }}"
+  vars:
+    diag_fwd_entry:
+      name: iptables_forward
+      status: >-
+        {%- if (diag_iptables_fwd.rc | default(-1)) != 0 and not (diag_iptables_fwd.stdout | default('')) -%}fail
+        {%- elif (diag_fwd_accept_lines | length > 0) -%}ok
+        {%- else -%}warn
+        {%- endif -%}
+      latency_ms: null
+      message: >-
+        {%- if (diag_iptables_fwd.rc | default(-1)) != 0 and not (diag_iptables_fwd.stdout | default('')) -%}
+        iptables -L FORWARD упал rc={{ diag_iptables_fwd.rc }}: {{ (diag_iptables_fwd.stderr | default(''))[:200] }}
+        {%- elif (diag_fwd_accept_lines | length > 0) -%}
+        FORWARD chain содержит {{ diag_fwd_accept_lines | length }} ACCEPT-правил для {{ diag_wg_iface_on_exit }} — forwarding в принципе разрешён
+        {%- else -%}
+        в FORWARD chain'е нет явного ACCEPT для {{ diag_wg_iface_on_exit }} — default policy решает. Если policy = DROP, трафик от relay не пройдёт. Проверь руками
+        {%- endif -%}
+      details:
+        rc: "{{ diag_iptables_fwd.rc | default(-1) }}"
+        accept_rules_count: "{{ diag_fwd_accept_lines | length }}"
+        accept_rule_samples: "{{ (diag_fwd_accept_lines | default([]))[:5] }}"
+        chain_lines_total: "{{ diag_iptables_fwd.stdout_lines | default([]) | length }}"
+        iface: "{{ diag_wg_iface_on_exit }}"
+  when: "'iptables_forward' in diag_check_types"
+  tags: iptables_forward
+
+# ── Финал: пишем exit-side JSON отдельным файлом на controller ──────────
+# Backend orchestrator склеит его с jump-side JSON в один task.result.checks.
+- name: Write exit-side diagnose result to controller
+  ansible.builtin.copy:
+    content: "{{ diag_exit_payload | to_nice_json }}"
+    dest: "{{ diag_result_file_exit }}"
+    mode: "0644"
+  vars:
+    diag_exit_payload:
+      side: exit
+      started_at: "{{ diag_exit_started_at }}"
+      finished_at: "{{ lookup('pipe', 'date -u +%Y-%m-%dT%H:%M:%SZ') }}"
+      iface_on_exit: "{{ diag_wg_iface_on_exit }}"
+      client_pubkey_prefix: "{{ diag_client_pubkey[:12] }}"
+      requested_checks: "{{ diag_check_types }}"
+      checks: "{{ diag_exit_collected_checks }}"
+  delegate_to: localhost
+  become: false

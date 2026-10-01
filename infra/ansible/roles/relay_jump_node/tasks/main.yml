@@ -34,15 +34,34 @@
     relay_wanted_ifaces: >-
       {{ (relay_wg_links | default([])) | map(attribute='interface') | list }}
 
+# CRITICAL: только backend-driven прогоны (relay_tunnel_apply / site.yml через
+# _collect_*_extra_vars) передают relay_wg_links — ВСЕГДА, даже пустой список
+# (= «у ноды ноль туннелей, снести»). Ручной `ansible-playbook site.yml
+# -l <relay>` НЕ передаёт её вовсе → undefined. Раньше `default([])` схлопывал
+# undefined в [] и disable-ветка молча рвала ЖИВОЙ туннель (подтверждено на
+# 4kmr: wg0 прожил 2м50с, снесён следующим прогоном без переменной). Поэтому:
+# undefined → роль no-op (туннели не трогаем); defined-[] → авторитетный
+# teardown; defined-непустой → enable. Бэкенд всегда defined (см.
+# provisioning.py _collect_site_extra_vars / _collect_relay_tunnel_extra_vars).
+- name: Skip relay role — relay_wg_links not provided (manual/partial run)
+  debug:
+    msg: >-
+      relay_jump_node: relay_wg_links undefined — пропуск, туннели не трогаем
+      (вероятно ручной site.yml без backend extra_vars).
+  when: relay_wg_links is not defined
+
 # ── ENABLE branch ────────────────────────────────────────────────
 - name: Relay enable — set up WG clients + patch Xray
-  when: relay_enabled | bool
+  when:
+    - relay_wg_links is defined
+    - relay_enabled | bool
   block:
     - name: Install WireGuard
       apt:
         name: [wireguard, wireguard-tools]
         state: present
         update_cache: yes
+        cache_valid_time: 3600
 
     - name: Render WireGuard client config per link
       template:
@@ -66,6 +85,67 @@
         label: "{{ item.item.interface }}"
       when: item.changed
 
+    # wg-quick@ — oneshot без Restart=, то есть упавший при загрузке туннель
+    # (аплинк ещё не поднялся, exit недоступен в этот момент) остаётся лежать
+    # навсегда, и никто его не поднимает: реконсайлер сходит на ноду только
+    # по изменениям в БД. Xray при этом продолжает биндиться на
+    # sockopt.interface=wgN и весь зарубежный трафик уходит в чёрную дыру.
+    # Аудит RU split-routing 2026-07-28.
+    - name: Ensure systemd drop-in directories
+      file:
+        path: "/etc/systemd/system/{{ item }}.d"
+        state: directory
+        mode: "0755"
+      loop:
+        - wg-quick@.service
+        - xray.service
+        - xray-xhttp.service
+        - xray-ws-cdn.service
+        - hysteria-server.service
+
+    - name: Install wg-quick restart drop-in
+      copy:
+        dest: /etc/systemd/system/wg-quick@.service.d/restart.conf
+        mode: "0644"
+        content: |
+          [Service]
+          Restart=on-failure
+          RestartSec=10
+      register: wg_restart_dropin
+
+    # Xray обязан стартовать ПОСЛЕ туннелей: SO_BINDTODEVICE на ещё не
+    # существующий интерфейс не срабатывает, а перезапускать себя xray не
+    # умеет. After= (не Requires=) намеренно: если туннель не поднялся,
+    # xray всё равно должен стартовать — иначе нода теряет и РУ-сегмент,
+    # который работает без всякого WG. Wants= подталкивает systemd поднять
+    # туннели, но их отказ не валит xray.
+    - name: Install xray→wg ordering drop-in
+      copy:
+        dest: "/etc/systemd/system/{{ item }}.service.d/wg-ordering.conf"
+        mode: "0644"
+        content: |
+          [Unit]
+          After={% for _l in relay_wg_links %}wg-quick@{{ _l.interface }}.service {% endfor %}
+
+          Wants={% for _l in relay_wg_links %}wg-quick@{{ _l.interface }}.service {% endfor %}
+
+      loop:
+        - xray
+        - xray-xhttp
+        - xray-ws-cdn
+        # hysteria тоже: с 2026-07-28 она биндится на wgN, а v2 проверяет
+        # девайс на СТАРТЕ (verifyDeviceName → net.InterfaceByName) и уходит
+        # в Fatal, если его нет. Без ordering после ребута демон падает и
+        # поднимается только Restart=on-failure'ом, теряя РУ-сегмент на эти
+        # секунды; с ordering стартует уже после туннелей.
+        - hysteria-server
+      register: xray_ordering_dropin
+
+    - name: Reload systemd after drop-in changes
+      systemd:
+        daemon_reload: yes
+      when: wg_restart_dropin.changed or xray_ordering_dropin.changed
+
     - name: Enable and start WireGuard client per link
       systemd:
         name: "wg-quick@{{ item.interface }}"
@@ -84,17 +164,24 @@
     # в бэкенде раз в 5 минут фиксирует latest-handshake по каждому
     # peer и красит индикатор в админке, так что «жив ли туннель»
     # видно без этого синхронного теста.
+    # Advisory, single-shot и ЖЁСТКО ограниченный по времени. Раньше тут были
+    # retries:3/delay:5 + curl без --max-time, а у command-модуля нет своего
+    # таймаута — на мёртвом туннеле curl залипал (connect/DNS через blackhole
+    # маршрут), и «advisory» проверка ВЕШАЛА весь play до 600s (подтверждено на
+    # 4kmr). failed_when:false спасал от падения, но не от зависания. Теперь
+    # `timeout 8` (внешний хард-стоп) + curl --max-time 8 баундят каждую пробу,
+    # retries убраны: авторитетный сигнал «жив ли туннель» даёт out-of-band
+    # health-тик (services/relay_link_health.py), а не этот синхронный curl.
     - name: Test tunnel connectivity per link (advisory)
-      command: curl -s --interface {{ item.interface }} --connect-timeout 5 https://ifconfig.me
+      command: >-
+        timeout 8 curl -s --interface {{ item.interface }}
+        --connect-timeout 5 --max-time 8 https://ifconfig.me
       loop: "{{ relay_wg_links }}"
       loop_control:
         label: "{{ item.interface }}"
       register: tunnel_test
       changed_when: false
       failed_when: false
-      retries: 3
-      delay: 5
-      until: tunnel_test.rc == 0
 
     - name: Report tunnel status per link
       debug:
@@ -203,17 +290,51 @@
         path: /etc/hysteria/config.yaml
       register: hy2_config
 
-    # Hysteria2 is UDP and typically not blocked — it keeps exiting
-    # directly. Moving it onto a tunnel would need policy routing.
-    - name: Note about Hysteria2 on relay nodes
-      debug:
-        msg: >-
-          Hysteria2 traffic exits directly (not through WG tunnel).
+    # Hysteria2 туннелируется с 2026-07-28 — комментарий «exits directly»,
+    # стоявший здесь, описывал состояние до фикса и был неверен с момента,
+    # когда hy2 реанимировали (22.07). Полный рендер конфига делает только
+    # install_hysteria2 в site.yml, а attach линка гоняет ЭТОТ плейбук —
+    # без реконсайла ниже новая РУ-нода (spawn → bootstrap без линков →
+    # админ цепляет exit) не получала split-секции вовсе.
+    - name: Load shared RU-direct domain list
+      include_role:
+        name: ru_direct_list
+        public: true
       when: hy2_config.stat.exists
 
+    - name: Stage Hysteria2 split-tunnel reconciler
+      copy:
+        src: reconcile_hy2_split.py
+        dest: /usr/local/sbin/reconcile_hy2_split.py
+        owner: root
+        group: root
+        mode: '0750'
+      when: hy2_config.stat.exists
+
+    - name: Reconcile Hysteria2 split-tunnel sections
+      ansible.builtin.command:
+        argv: [python3, /usr/local/sbin/reconcile_hy2_split.py]
+      environment:
+        HY2_CONFIG: /etc/hysteria/config.yaml
+        # Первичный интерфейс — тот же, что получает sockopt дефолтного
+        # `direct` у xray: у hysteria нет per-user routing, все её юзеры идут
+        # через один туннель.
+        HY2_BIND_DEV: "{{ (relay_wg_links | map(attribute='interface') | sort | first) }}"
+        HY2_RU_ZONES: "{{ ru_direct_list_zones | to_json }}"
+        HY2_RU_DOMAINS: "{{ ru_direct_list_domains | to_json }}"
+      register: hy2_reconcile
+      changed_when: "'changed' in hy2_reconcile.stdout"
+      when: hy2_config.stat.exists
+      notify: restart hysteria2 after relay change
+
 # ── DISABLE branch ───────────────────────────────────────────────
+# ТОЛЬКО при defined-but-empty relay_wg_links (бэкенд авторитетно говорит «у
+# этой ноды туннелей нет» — детач последнего линка / прямая нода). undefined
+# (ручной прогон) сюда НЕ попадает — туннели остаются нетронутыми.
 - name: Relay disable — tear every tunnel down + unpatch Xray
-  when: not (relay_enabled | bool)
+  when:
+    - relay_wg_links is defined
+    - not (relay_enabled | bool)
   block:
     - name: Enumerate WG configs for teardown
       find:
@@ -238,6 +359,24 @@
       loop: "{{ wg_configs_teardown.files }}"
       loop_control:
         label: "{{ item.path | basename }}"
+
+    # Нода перестала быть relay — снимаем ordering-drop-in, иначе xray на
+    # каждом старте тянет Wants= на wg-quick@wgN, которых больше нет.
+    - name: Remove xray→wg ordering drop-ins
+      file:
+        path: "/etc/systemd/system/{{ item }}.service.d/wg-ordering.conf"
+        state: absent
+      loop:
+        - xray
+        - xray-xhttp
+        - xray-ws-cdn
+        - hysteria-server
+      register: xray_ordering_removed
+
+    - name: Reload systemd after drop-in removal
+      systemd:
+        daemon_reload: yes
+      when: xray_ordering_removed.changed
 
     - name: Find existing xray configs (disable mode)
       find:
@@ -276,3 +415,33 @@
       changed_when: unpatch_result.rc == 0
       failed_when: unpatch_result.rc not in [0, 78]
       notify: restart all xray services
+
+    # Симметрично xray: снимаем split-секции и у hysteria. Оставленный
+    # bindDevice на удалённый интерфейс — не «трафик пойдёт мимо», а полный
+    # отказ: hysteria v2 проверяет девайс на старте (verifyDeviceName →
+    # net.InterfaceByName) и уходит в Fatal, то есть hy2 теряет и РУ-сегмент,
+    # который обслуживал до детача.
+    - name: Find hysteria2 config (disable mode)
+      stat:
+        path: /etc/hysteria/config.yaml
+      register: hy2_config_disable
+
+    - name: Stage Hysteria2 split-tunnel reconciler (disable mode)
+      copy:
+        src: reconcile_hy2_split.py
+        dest: /usr/local/sbin/reconcile_hy2_split.py
+        owner: root
+        group: root
+        mode: '0750'
+      when: hy2_config_disable.stat.exists
+
+    - name: Strip Hysteria2 split-tunnel sections
+      ansible.builtin.command:
+        argv: [python3, /usr/local/sbin/reconcile_hy2_split.py]
+      environment:
+        HY2_CONFIG: /etc/hysteria/config.yaml
+        HY2_BIND_DEV: ""
+      register: hy2_strip
+      changed_when: "'changed' in hy2_strip.stdout"
+      when: hy2_config_disable.stat.exists
+      notify: restart hysteria2 after relay change

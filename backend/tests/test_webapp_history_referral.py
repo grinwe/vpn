@@ -1,5 +1,4 @@
 """Tests for Stage 5.5/8 webapp endpoints: /transactions, /referral, /me."""
-import os
 from app import models
 from app.api_webapp import issue_token
 from app.config import get_settings
@@ -89,13 +88,14 @@ def test_referral_counters_reflect_invitees_and_bonuses(client, db_session):
     invitee_a.referred_by_id = owner.id
     invitee_b.referred_by_id = owner.id
     db_session.add_all([invitee_a, invitee_b])
-    # Two bonus credits to the owner.
+    db_session.flush()
+    # Two referral rewards to the owner.
     db_session.add(
         models.BalanceTransaction(
             user_id=owner.id,
             amount_kopecks=5000,
             kind=models.BalanceTxKind.bonus,
-            reference="ref-a",
+            reference=f"referral_payout:{invitee_a.id}",
         )
     )
     db_session.add(
@@ -103,7 +103,25 @@ def test_referral_counters_reflect_invitees_and_bonuses(client, db_session):
             user_id=owner.id,
             amount_kopecks=5000,
             kind=models.BalanceTxKind.bonus,
-            reference="ref-b",
+            reference=f"referral_payout:{invitee_b.id}",
+        )
+    )
+    # Собственный триал-бонус и подарок по чужой ссылке — не заработок
+    # (план триала 3 дня, Б2: раньше триальщик видел «заработано 150 ₽»).
+    db_session.add(
+        models.BalanceTransaction(
+            user_id=owner.id,
+            amount_kopecks=1500,
+            kind=models.BalanceTxKind.bonus,
+            reference=f"trial:{owner.id}",
+        )
+    )
+    db_session.add(
+        models.BalanceTransaction(
+            user_id=owner.id,
+            amount_kopecks=1500,
+            kind=models.BalanceTxKind.bonus,
+            reference=f"referral_signup:{owner.id}",
         )
     )
     db_session.commit()
@@ -113,6 +131,8 @@ def test_referral_counters_reflect_invitees_and_bonuses(client, db_session):
     data = res.json()
     assert data["invited_count"] == 2
     assert data["earned_kopecks"] == 10000
+    # Друг получит 3 дня триала + 3 дня подарка.
+    assert data["invitee_total_days"] == 6
 
 
 # ── Stage 8: sub_link_base_url surfaced via /me ────────────────────

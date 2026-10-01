@@ -7,6 +7,8 @@ returns 401 from inside ``provider.verify_webhook``).
 """
 from __future__ import annotations
 
+import asyncio
+
 from fastapi import APIRouter, Depends, Header, HTTPException, Request
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
@@ -16,10 +18,61 @@ from ..auth import optional_admin as optional_admin_token
 from ..auth import require_admin
 from ..rate_limit import limiter
 from ..services.payments import ProviderError, get_provider
+from ..services.payments.checkout import (
+    ProviderApiError,
+    checkout_pending_invoice,
+    report_provider_failure,
+    convert_for_provider,
+)
 from ._common import ADMIN_ACTOR_HEADER, _audit, _resolve_admin_actor, get_db, logger
 from .invoices import _mark_invoice_paid_core
 
 router = APIRouter()
+
+
+def _provider_invoice_id_from_event(event) -> str | None:
+    """Достать id счёта НА СТОРОНЕ провайдера из сырого события (аудит #117).
+
+    Внимание: ``event.external_id`` у всех драйверов — это НАШ внутренний
+    invoice id (round-trip через ``payload``), а в ``Payment.external_id``
+    лежит id счёта, выданный провайдером. При двойном checkout по одному
+    счёту создаётся несколько Payment-строк с разными provider external_id,
+    поэтому по ``event.external_id`` нужную строку не отличить. Ищем
+    provider invoice id в известных местах ``raw`` (best-effort): если не
+    нашли — вызывающий откатывается на «последнюю pending».
+    """
+    raw = getattr(event, "raw", None)
+    if not isinstance(raw, dict):
+        return None
+    # cryptobot: {"update_type": ..., "payload": {"invoice_id": <id провайдера>,
+    #             "payload": "<наш invoice id>"}}
+    # tribute:   {"name": "shop_order", "payload": {"uuid": <uuid заказа>, ...}}
+    inner = raw.get("payload")
+    if isinstance(inner, dict):
+        pid = inner.get("invoice_id") or inner.get("uuid")
+        if pid:
+            return str(pid)
+    # lava_top: {"eventType": ..., "contractId": <uuid контракта>, ...}
+    pid = raw.get("contractId")
+    if pid:
+        return str(pid)
+    return None
+
+
+def _norm_currency(currency: str | None) -> str:
+    """Нормализовать код валюты для сравнения (аудит #111).
+
+    Приводим к верхнему регистру и схлопываем синоним RUR→RUB, чтобы
+    сверка суммы вебхука не падала на косметическом различии кодов.
+    """
+    cur = (currency or "").upper()
+    return "RUB" if cur == "RUR" else cur
+
+
+# Конвертация переехала в services/payments/checkout.py вместе с единым
+# чекаутом (2026-07-29): здесь остаётся алиас — его импортируют
+# telegram_webhook и два аудит-теста.
+_convert_for_provider = convert_for_provider
 
 
 @router.post("/payments")
@@ -71,62 +124,99 @@ def checkout_invoice(
     invoice = db.get(models.Invoice, invoice_id)
     if not invoice:
         raise HTTPException(status_code=404, detail="Invoice not found")
+    # Ownership guard: бот передаёт telegram_id вызывающего, т.к. invoice_id
+    # в новом меню оплаты приходит из подделываемой callback_data. Без
+    # совпадения владельца — 403 (IDOR: чужой pending-счёт не чекаутится).
+    #
+    # Guard ОБЯЗАТЕЛЕН для не-админов: эндпоинт анонимный, и пока проверка
+    # висела на `if req_tg`, она снималась простым отсутствием поля в теле —
+    # то есть защищала только честного клиента (аудит 2026-07-25). Админ
+    # (валидный X-Admin-Token) по-прежнему чекаутит любой счёт.
+    req_tg = body.telegram_id if body else None
+    if admin_token is None:
+        if not req_tg:
+            raise HTTPException(
+                status_code=403,
+                detail="telegram_id is required for non-admin checkout",
+            )
+        if invoice.user is None or invoice.user.telegram_id != req_tg:
+            raise HTTPException(
+                status_code=403, detail="Invoice does not belong to this user"
+            )
+    elif req_tg and (invoice.user is None or invoice.user.telegram_id != req_tg):
+        raise HTTPException(status_code=403, detail="Invoice does not belong to this user")
     if invoice.status != models.InvoiceStatus.pending:
         raise HTTPException(status_code=400, detail="Invoice is not in pending state")
 
-    provider_name = (body.provider if body else None) or None
+    # Вся денежная цепочка (конвертация #108, Payment(pending), реюз
+    # pay_url + IntegrityError-дедуп #52) — в едином хелпере: копий было
+    # три, страница починки без Telegram стала бы четвёртой.
     try:
-        provider = get_provider(provider_name)
-    except ProviderError as exc:
-        raise HTTPException(status_code=503, detail=str(exc)) from exc
-
-    try:
-        provider_invoice = provider.create_invoice(
-            invoice_id=invoice.id,
-            amount=float(invoice.amount),
-            currency=invoice.currency,
-            description=f"Order #{invoice.id}",
+        result = checkout_pending_invoice(
+            db, invoice,
+            provider_name=(body.provider if body else None) or None,
             return_url=(body.return_url if body else None),
         )
+    except ProviderApiError as exc:
+        # Человеку — понятная фраза, админу — пуш с сырой ошибкой провайдера.
+        raise HTTPException(
+            status_code=502,
+            detail=report_provider_failure(
+                db, exc,
+                provider_name=(body.provider if body else None),
+                invoice_id=invoice.id,
+            ),
+        ) from exc
     except ProviderError as exc:
-        raise HTTPException(status_code=502, detail=f"payment provider error: {exc}") from exc
-
-    # Persist a Payment row — this is what the webhook will look up.
-    # subscription_id may be NULL for new_subscription invoices; the link
-    # back to the checkout is via invoice_id.
-    payment = models.Payment(
-        subscription_id=invoice.subscription_id,
-        invoice_id=invoice.id,
-        amount=invoice.amount,
-        currency=invoice.currency,
-        status=models.PaymentStatus.pending,
-        provider=provider.name,
-        external_id=provider_invoice.external_id,
-    )
-    db.add(payment)
-    try:
-        db.commit()
-    except IntegrityError:
-        # #52 — UNIQUE(provider, external_id) fired: the same provider
-        # invoice was already recorded (double-click, retry). Roll back
-        # and return the existing pay_url — idempotent from the caller's
-        # perspective.
-        db.rollback()
-        logger.info(
-            "Duplicate checkout for invoice %d provider %s external_id %s",
-            invoice.id,
-            provider.name,
-            provider_invoice.external_id,
-        )
+        # Конфигурация (нет провайдера / нет курса) — 503, как и раньше.
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
 
     return schemas.InvoiceCheckoutOut(
         invoice_id=invoice.id,
-        provider=provider.name,
-        external_id=provider_invoice.external_id,
-        pay_url=provider_invoice.pay_url,
-        amount=provider_invoice.amount,
-        currency=provider_invoice.currency,
+        provider=result.provider,
+        external_id=result.external_id,
+        pay_url=result.pay_url,
+        amount=result.amount,
+        currency=result.currency,
     )
+
+
+def _notify_credit_failed(provider_name: str, invoice_id: int, reason: str) -> None:
+    """Деньги пришли (подпись валидна), а зачисление упало — громче некуда.
+
+    Отдельная сессия: рабочая после падения может быть в аборте, а алерт
+    обязан уйти даже когда транзакция зачисления мертва. Дедуп по счёту —
+    провайдер ретраит вебхук каждую минуту, но новость одна.
+    """
+    from ..db import SessionLocal
+    from ..services.admin_notify import notify_admins
+
+    try:
+        session = SessionLocal()
+        try:
+            notify_admins(
+                session,
+                kind="payment_credit_failed",
+                text=(
+                    f"🔴 Деньги пришли, зачислить НЕ удалось: счёт #{invoice_id} "
+                    f"({provider_name}), причина: {reason[:160]}. Счёт висит в "
+                    f"pending — чинить причину, вебхук провайдер поретраит сам."
+                ),
+                dedup_key={"invoice_id": invoice_id},
+                extra={
+                    "invoice_id": invoice_id,
+                    "provider": provider_name,
+                    "reason": reason[:300],
+                },
+                window_sec=3600,
+                autocommit=True,
+            )
+        finally:
+            session.close()
+    except Exception:  # noqa: BLE001 — алерт не должен менять код ответа вебхука
+        logger.exception(
+            "payment_credit_failed: алерт по счёту %s не отправился", invoice_id
+        )
 
 
 @router.post("/payments/webhook/{provider_name}")
@@ -168,23 +258,238 @@ async def payment_webhook(
     except ValueError as exc:
         raise HTTPException(status_code=400, detail="webhook payload is not an invoice id") from exc
 
-    # Lock the invoice row and mark a Payment as paid if we have one.
-    pending_payment = (
-        db.query(models.Payment)
-        .filter(
-            models.Payment.invoice_id == invoice_id,
-            models.Payment.provider == provider.name,
-        )
-        .order_by(models.Payment.id.desc())
-        .first()
-    )
-    payment_id = pending_payment.id if pending_payment else None
+    # #199: вся работа с БД здесь синхронная (with_for_update на инвойс,
+    # choose_node, warm-pool), а эндпоинт — async: блокирующие вызовы
+    # вставали бы прямо в event loop и морозили ВСЕ запросы процесса
+    # (включая /api/sub/{token}), пока ждётся row-lock. Уводим их в
+    # threadpool через asyncio.to_thread.
+    def _process_paid_event() -> dict:
+        # #111: сверяем сумму и валюту вебхука с ожидаемой суммой счёта,
+        # прежде чем зачислять. Провайдер присылает сумму в СВОЕЙ валюте
+        # (XTR/USDT), а счёт хранится в рублях, поэтому сравниваем не с
+        # invoice.amount напрямую, а с тем же _convert_for_provider,
+        # которым сумма считалась при создании счёта в checkout. Иначе
+        # недоплата или ошибочно смэтченный платёж молча кредитуют баланс
+        # на полную сумму.
+        invoice = db.get(models.Invoice, invoice_id)
+        if invoice is None:
+            raise HTTPException(status_code=404, detail="Invoice not found")
 
-    result = _mark_invoice_paid_core(
-        db,
-        invoice_id,
-        actor=f"{provider.name}:webhook",
-        actor_type=models.AuditActor.system,
-        payment_id=payment_id,
-    )
-    return {"ok": True, "invoice_id": result.id, "status": result.status}
+        if event.amount is None:
+            # Сумму провайдер не прислал / не распарсили — это «сверить нечем».
+            # Зачисляем (подпись валидна, счёт наш), но ГРОМКО: раньше эта ветка
+            # была немой, и любой сбой парсинга суммы бесшумно снимал главную
+            # проверку денежного пути (аудит 2026-07-25).
+            from ..services.admin_notify import notify_admins
+
+            logger.warning(
+                "webhook %s invoice %d: сумма отсутствует — зачисляем БЕЗ сверки суммы",
+                provider.name, invoice_id,
+            )
+            notify_admins(
+                db,
+                kind="payment_amount_unverified",
+                text=(
+                    f"⚠️ Вебхук {provider.name} по счёту #{invoice_id} пришёл без "
+                    f"суммы — счёт зачислен БЕЗ сверки. Проверить вручную."
+                ),
+                dedup_key={"invoice_id": invoice_id},
+                extra={"invoice_id": invoice_id, "provider": provider.name},
+                autocommit=True,
+            )
+        else:
+            try:
+                expected_amount, expected_currency = _convert_for_provider(
+                    float(invoice.amount), invoice.currency, provider.name
+                )
+            except ProviderError as exc:
+                # Курс не задан (обычно он был на этапе checkout) — сверить
+                # не можем. Подпись вебхука валидна и счёт существует,
+                # поэтому зачисляем, но громко логируем для ручной сверки.
+                logger.warning(
+                    "webhook %s invoice %d: не удалось вычислить ожидаемую сумму для сверки: %s",
+                    provider.name,
+                    invoice_id,
+                    exc,
+                )
+                expected_amount = None
+                expected_currency = None
+
+            if expected_amount is not None:
+                # Допуск на копейки/дробное округление при конвертации.
+                eps = 0.01
+                underpaid = event.amount + eps < float(expected_amount)
+                currency_ok = event.currency is None or _norm_currency(
+                    event.currency
+                ) == _norm_currency(expected_currency)
+                if underpaid or not currency_ok:
+                    from ..services.admin_notify import notify_admins
+
+                    logger.warning(
+                        "webhook %s invoice %d: сумма/валюта не совпали "
+                        "(получено %s %s, ожидалось %s %s) — счёт НЕ зачислен",
+                        provider.name,
+                        invoice_id,
+                        event.amount,
+                        event.currency,
+                        expected_amount,
+                        expected_currency,
+                    )
+                    notify_admins(
+                        db,
+                        kind="payment_amount_mismatch",
+                        text=(
+                            f"⚠️ Вебхук {provider.name} по счёту #{invoice_id}: "
+                            f"сумма/валюта не совпали. Получено "
+                            f"{event.amount} {event.currency or '?'}, ожидалось "
+                            f"{expected_amount} {expected_currency}. Счёт оставлен pending."
+                        ),
+                        dedup_key={"invoice_id": invoice_id},
+                        extra={
+                            "invoice_id": invoice_id,
+                            "provider": provider.name,
+                            "got_amount": event.amount,
+                            "got_currency": event.currency,
+                            "expected_amount": float(expected_amount),
+                            "expected_currency": expected_currency,
+                        },
+                        autocommit=True,
+                    )
+                    raise HTTPException(
+                        status_code=409, detail="webhook amount/currency mismatch"
+                    )
+                # Переплата не блокирует зачисление (клиент заплатил не
+                # меньше), но фиксируем расхождение в логах для сверки.
+                if event.amount - eps > float(expected_amount):
+                    logger.warning(
+                        "webhook %s invoice %d: переплата — получено %s, "
+                        "ожидалось %s; зачисляем",
+                        provider.name,
+                        invoice_id,
+                        event.amount,
+                        expected_amount,
+                    )
+
+        # Lock the invoice row and mark a Payment as paid if we have one.
+        # #117: при двойном checkout по одному счёту существует несколько
+        # Payment-строк (каждая со своим provider external_id). Раньше брали
+        # просто последнюю по id — и paid мог получить НЕ та строка, которую
+        # реально оплатили, из-за чего сверка с провайдером по external_id
+        # расходилась. Теперь выбираем аккуратно:
+        #   1) среди pending-строк — ту, чей external_id совпал с provider
+        #      invoice id из события (если его удаётся извлечь из raw);
+        #   2) иначе — последнюю pending;
+        #   3) иначе (ретрай уже обработанного вебхука, pending-строк нет) —
+        #      последнюю любую, сохраняя прежнее поведение.
+        base_q = db.query(models.Payment).filter(
+            models.Payment.invoice_id == invoice_id,
+            # Семейство имён (lava_top / lava_top_sbp делят один вебхук-URL и
+            # один API-ключ): вебхук приходит на /webhook/lava_top, а строка
+            # СБП-платежа записана как lava_top_sbp.
+            models.Payment.provider.in_(getattr(provider, "family", (provider.name,))),
+        )
+        pending_payments = (
+            base_q.filter(models.Payment.status == models.PaymentStatus.pending)
+            .order_by(models.Payment.id.desc())
+            .all()
+        )
+        prov_ext_id = _provider_invoice_id_from_event(event)
+        pending_payment = None
+        # Пришёл ли платёж по контракту, которого у нас нет ни в одной строке
+        # (при известном id провайдера). Для уже оплаченного счёта это и есть
+        # вторая оплата.
+        unknown_contract = False
+        if prov_ext_id:
+            pending_payment = next(
+                (p for p in pending_payments if p.external_id == prov_ext_id), None
+            )
+            if pending_payment is None:
+                # Id провайдера известен, но среди pending его нет: это либо
+                # ретрай уже зачтённого платежа (строка paid) — берём ЕЁ, либо
+                # неизвестный контракт — тогда чужую строку не трогаем. Раньше
+                # здесь падали на «последнюю pending», и с двумя именами lava
+                # (lava_top / lava_top_sbp на одном счёте) ретрай помечал paid
+                # неоплаченную строку соседнего способа (ревью 2026-09-19).
+                pending_payment = (
+                    base_q.filter(models.Payment.external_id == prov_ext_id)
+                    .order_by(models.Payment.id.desc())
+                    .first()
+                )
+                unknown_contract = pending_payment is None
+        else:
+            # Id провайдера из события не извлёкся — прежнее поведение:
+            # последняя pending, иначе последняя любая (ретрай).
+            pending_payment = pending_payments[0] if pending_payments else None
+            if pending_payment is None:
+                pending_payment = base_q.order_by(models.Payment.id.desc()).first()
+        payment_id = pending_payment.id if pending_payment else None
+
+        # Детект двойной оплаты: счёт уже paid, но пришёл НОВЫЙ платёж —
+        # по ещё живой pending-строке (обычно другой способ из меню Stage 9b,
+        # оплаченный вторым) или по контракту, которого у нас нет вовсе.
+        # _mark_invoice_paid_core молча зачтёт его без повторного
+        # провижининга — деньги списаны дважды за один счёт, поэтому зовём
+        # оператора на возврат. Ретрай того же вебхука сюда не попадает: он
+        # матчит уже-paid строку по external_id.
+        if invoice.status == models.InvoiceStatus.paid and (
+            unknown_contract
+            or (
+                pending_payment is not None
+                and pending_payment.status == models.PaymentStatus.pending
+            )
+        ):
+            from ..services.admin_notify import notify_admins
+
+            logger.warning(
+                "webhook %s invoice %d: платёж по уже оплаченному счёту "
+                "(payment #%s) — вероятна двойная оплата, нужен возврат",
+                provider.name,
+                invoice_id,
+                payment_id,
+            )
+            notify_admins(
+                db,
+                kind="payment_double_paid",
+                text=(
+                    f"⚠️ Двойная оплата счёта #{invoice_id}: пришёл платёж "
+                    f"{provider.name} по уже оплаченному счёту. Проверьте и "
+                    f"верните лишнее."
+                ),
+                dedup_key={"invoice_id": invoice_id, "payment_id": payment_id},
+                extra={
+                    "invoice_id": invoice_id,
+                    "provider": provider.name,
+                    "payment_id": payment_id,
+                },
+                autocommit=True,
+            )
+
+        result = _mark_invoice_paid_core(
+            db,
+            invoice_id,
+            actor=f"{provider.name}:webhook",
+            actor_type=models.AuditActor.system,
+            payment_id=payment_id,
+        )
+        return {"ok": True, "invoice_id": result.id, "status": result.status}
+
+    try:
+        return await asyncio.to_thread(_process_paid_event)
+    except HTTPException as exc:
+        # 4xx — протокольные отказы (не наш счёт, сумма не сошлась: по ним
+        # уже есть свои алерты). 5xx — деньги пришли, зачислить НЕ СМОГЛИ:
+        # провайдер поретраит и бросит, а счёт молча зависнет в pending —
+        # ровно так четыре часа висел #65 (инцидент 2026-08-21).
+        if exc.status_code >= 500:
+            # to_thread: алерт открывает sync-сессию к БД, а падаем мы как
+            # раз когда БД плохо — прямой вызов заморозил бы event loop
+            # (тот же механизм, что #199 выше).
+            await asyncio.to_thread(
+                _notify_credit_failed, provider.name, invoice_id, str(exc.detail)
+            )
+        raise
+    except Exception as exc:  # noqa: BLE001
+        await asyncio.to_thread(
+            _notify_credit_failed, provider.name, invoice_id, repr(exc)
+        )
+        raise

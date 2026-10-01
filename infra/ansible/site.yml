@@ -6,15 +6,19 @@
     # Protocol roles: always included so they can clean up removed
     # protocols.  Each role handles its own gating internally and
     # stops+disables its services when the config vars are absent.
-    # ShadowTLS deprecated (0.2) / Hysteria2 deprecated (0.3): protocols
-    # are dead, no new configs are provisioned.  Left commented out for
-    # a release cycle before full deletion — uncomment if a legacy node
-    # needs cleanup.
+    # ShadowTLS deprecated (0.2) — мёртв, no new configs.
+    # Hysteria2 РЕАНИМИРОВАН 2026-07-22: UDP/QUIC переживает ТСПУ в жёстких
+    # регионах (Центральный ФО режет TCP-Reality), где VLESS не работает.
+    # См. docs/operations/regional_blocking_diag_2026_07.md. Роль сама no-op'ит
+    # на нодах без hysteria2_port, так что безопасна для всего флота.
     # - install_shadowtls_stack
-    # - install_hysteria2
+    - install_hysteria2
     - install_vless_reality
-    - install_vless_ws_cdn
     - install_vless_xhttp
+    # ws_cdn ПОСЛЕ xhttp: оба делят nginx :443, и ws_cdn гоняет `nginx -t`
+    # по всему дереву — пусть xhttp сначала выпустит/устаканит свой серт+vhost,
+    # иначе транзиентно-битый xhttp-vhost уронит nginx -t у ws_cdn.
+    - install_vless_ws_cdn
     # Relay: WG tunnel to foreign exit node. Patches Xray outbound with
     # sockopt.interface: wg0 so user traffic exits via the tunnel while
     # management traffic stays on the main interface. Role runs
@@ -37,6 +41,26 @@
     - role: install_sharing_enforcer
       tags: [sharing_enforcer]
     - check_node_health
+  post_tasks:
+    # Маркер «какой версией кода прошита нода». Пишется post_tasks, ПОСЛЕ всех
+    # ролей: если play упал посередине, маркер остаётся старым и честно
+    # показывает, что нода не догналась. Версия приезжает в extra_vars от
+    # бэкенда (_collect_site_extra_vars → vpn_release_version); при ручном
+    # прогоне ansible её нет — тогда маркер не трогаем, чтобы не затереть
+    # реальную версию строкой-заглушкой.
+    - name: Stamp node release marker
+      ansible.builtin.copy:
+        dest: /etc/vpn-node-release.json
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          {
+            "version": "{{ vpn_release_version }}",
+            "applied_at": "{{ ansible_date_time.iso8601 }}"
+          }
+      when: vpn_release_version | default('') | length > 0
+      tags: [release_marker]
 
 # ── WireGuard exit nodes (foreign, non-RU) ──────────────────────────
 - hosts: wg_exit_nodes
@@ -51,7 +75,7 @@
   roles:
     - db_host
 
-- hosts: vpn_nodes
+- hosts: vpn_nodes:wg_exit_nodes
   become: yes
   tags: [monitoring]
   roles:
@@ -74,3 +98,15 @@
   tags: [web, frontend]
   roles:
     - deploy_web_frontend
+
+# Mgmt-mirror — статичный nginx с upstream-ресурсами (geoip.dat,
+# Xray-linux-64-*.zip) для vpn-нод. Живёт на том же физическом сервере
+# что web/app, но в отдельном compose-стеке (отдельная роль с отдельным
+# жизненным циклом). При `site.yml --tags web` прокатается вместе с
+# остальной web-инфой. Точечный refresh — `--tags mirror`. См.
+# roles/mgmt_mirror и playbooks/mgmt_mirror.yml.
+- hosts: web
+  become: yes
+  tags: [web, mirror]
+  roles:
+    - mgmt_mirror

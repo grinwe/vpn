@@ -9,10 +9,24 @@ from __future__ import annotations
 import base64
 from datetime import datetime, timedelta
 
+import pytest
+
 from app import models
+from app.services import provisioning_throttle
 from app.services.provisioning import ProvisioningOrchestrator
 
 from .factories import make_config, make_node, make_plan, make_user
+
+
+@pytest.fixture(autouse=True)
+def _reset_cold_throttle():
+    """Cold-path троттл — глобальный in-memory bucket на процесс: после
+    провижининг-тяжёлых файлов (test_trial_activate_full, test_warm_pool,
+    test_config_ready_notify) бюджет исчерпан, и provision_subscription
+    здесь падал ColdPathThrottled в зависимости от порядка файлов."""
+    provisioning_throttle.reset_for_tests()
+    yield
+    provisioning_throttle.reset_for_tests()
 
 
 def _node_with_two_protocols(db):
@@ -58,13 +72,21 @@ def test_sub_link_returns_all_protocols_base64(client, db_session):
     user = make_user(db_session)
     plan = make_plan(db_session)
     orch = ProvisioningOrchestrator(db_session)
-    sub, _ = orch.provision_subscription(user, plan, node_id=node.id)
+    sub, task = orch.provision_subscription(user, plan, node_id=node.id)
+    # Провижн создаёт Device=pending и Credential.is_active=False; активация
+    # (device→active, creds.is_active=True) выполняется в _handle_task_outcome
+    # на успехе ansible. conftest глушит run_task_async, поэтому прогоняем
+    # исход apply-таски вручную — иначе эндпоинт отбросит неактивные креды и
+    # вернёт 503 вместо base64-выдачи всех протоколов.
+    orch._handle_task_outcome(task, success=True)
     db_session.refresh(sub)
 
     resp = client.get(f"/api/sub/{sub.sub_token}", headers={})
     assert resp.status_code == 200
     body = base64.b64decode(resp.text).decode()
-    lines = [line for line in body.splitlines() if line]
+    # Строки с `#` — директивы блока статуса (Happ читает их из тела, потому
+    # что в заголовке русский текст не уезжает). Сами ссылки — всё остальное.
+    lines = [line for line in body.splitlines() if line and not line.startswith("#")]
     assert len(lines) == 2
     assert any(line.startswith("ss://") for line in lines)
     assert any(line.startswith("vless://") for line in lines)

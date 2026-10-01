@@ -8,7 +8,7 @@ debit another month. If the wallet is short the sub is expired.
 Each mutation is row-locked (``SELECT ... FOR UPDATE``) so concurrent
 topups and charges can never race.
 
-Freeze: 1 per calendar year, ``FREEZE_DAYS`` days (default 14).
+Freeze: 1 per calendar year, ``FREEZE_DAYS`` days (default 7).
 ``expires_at += FREEZE_DAYS`` so the user doesn't lose paid time.
 Devices are revoked on freeze, re-provisioned on unfreeze. Early
 unfreeze is allowed but blocks further freezes until the next calendar
@@ -22,6 +22,7 @@ import os
 from datetime import datetime, timedelta
 
 from prometheus_client import Counter, Gauge
+from sqlalchemy import and_, or_
 from sqlalchemy.orm import Session
 
 from .. import models
@@ -32,9 +33,29 @@ logger = logging.getLogger(__name__)
 
 # ── Tunables ─────────────────────────────────────────────────────────
 
-FREEZE_DAYS = int(os.getenv("FREEZE_DAYS", "14"))
+FREEZE_DAYS = int(os.getenv("FREEZE_DAYS", "7"))
 REFERRAL_BONUS_KOPECKS = int(os.getenv("REFERRAL_BONUS_KOPECKS", "5000"))
-TRIAL_DURATION_DAYS = int(os.getenv("TRIAL_DURATION_DAYS", "30"))
+# Награда рефереру — в ДНЯХ подписки, начисляется когда приглашённый ВПЕРВЫЕ
+# заплатил (см. api/invoices.py).
+#
+# 10 дней = 50 ₽ по текущему прайсу (Solo 150 ₽ / 30 дней) — ровно та сумма,
+# которую платили фиксированной константой до перехода на дни. Экономика не
+# изменилась, но «10 дней подписки» звучит весомее, чем «50 ₽»: в этом и смысл
+# перехода на дни, а не в увеличении расходов. Месяц в подарок (150 ₽ при
+# платеже приглашённого 150 ₽) съедал бы первый платёж целиком.
+REFERRAL_REWARD_DAYS = int(os.getenv("REFERRAL_REWARD_DAYS", "10"))
+# Подарок приглашённому при активации триала — прибавляется к бесплатным дням
+# триала (3 + 3), а он ещё ничего не заплатил. Поэтому втрое меньше награды
+# реферера: щедрость здесь оплачивает фарм триалов, а не рост.
+REFERRAL_INVITEE_DAYS = int(os.getenv("REFERRAL_INVITEE_DAYS", "3"))
+# Видимые бесплатные дни триала: бонус = столько дней по цене дня Solo, и он
+# сразу тратится на подписку на эти дни (services/trial.py).
+TRIAL_DURATION_DAYS = int(os.getenv("TRIAL_DURATION_DAYS", "3"))
+# Скрытый запас сверх видимых дней: подписка живёт до now + дни + эти часы, а
+# списываем только за видимые дни. Счётчики (кабинет, Happ) округляют вниз и
+# показывают ровно «3 дня», а «истекает завтра» приходит в конце обещанного
+# срока, и пополнить можно, не теряя ссылку. 0 выключает.
+TRIAL_HIDDEN_HOURS = int(os.getenv("TRIAL_HIDDEN_HOURS", "24"))
 TRIAL_EXPIRY_WARN_DAYS = int(os.getenv("TRIAL_EXPIRY_WARN_DAYS", "3"))
 MIN_TOPUP_KOPECKS = int(os.getenv("MIN_TOPUP_KOPECKS", "10000"))
 EXTRA_DEVICE_MONTHLY_KOPECKS = int(os.getenv("EXTRA_DEVICE_KOPECKS_PER_MONTH", "10000"))
@@ -111,6 +132,41 @@ def plan_price_kopecks(plan: models.Plan) -> int:
     return int(round(float(plan.price) * 100))
 
 
+def _plan_months(plan: models.Plan | None) -> int:
+    """Число 30-дневных «месяцев» в периоде плана.
+
+    ``EXTRA_DEVICE_MONTHLY_KOPECKS`` — цена за календарный месяц, поэтому
+    доп. слоты на годовом плане стоят ``N * EXTRA * 12`` за весь период.
+    Единый источник множителя для renewal / change_plan / runway.
+    """
+    if plan is None:
+        return 1
+    return max(1, (plan.duration_days or 30) // 30)
+
+
+def total_renewal_cost_kopecks(sub: models.Subscription) -> int:
+    """Full kopecks that the next renewal will bill: plan + slots.
+
+    ``EXTRA_DEVICE_MONTHLY_KOPECKS`` is a *per calendar month* price, so
+    an annual plan with N slots prepays ``N * EXTRA * 12`` on renewal —
+    device-slots are scoped to the sub's period, not the calendar
+    month. Without this scaling a user with 2 slots on a yearly plan
+    would look like they only owe 2 × monthly_fee for the whole year,
+    and UI runway (``balance // renewal_cost``) would overstate by 11×.
+
+    Used by every surface that asks "can this wallet afford the next
+    renewal / how many renewals fit": webapp /me, bot /balance, worker
+    low-balance warning, legacy days_remaining.
+    """
+    plan = sub.plan
+    if plan is None:
+        return 0
+    base = plan_price_kopecks(plan)
+    slots = sub.extra_device_slots or 0
+    months = _plan_months(plan)
+    return base + slots * EXTRA_DEVICE_MONTHLY_KOPECKS * months
+
+
 def min_topup_kopecks(db: Session) -> int:
     """Dynamic minimum topup = cheapest visible plan price."""
     cheapest = (
@@ -155,15 +211,63 @@ def topup(
     return tx
 
 
+def days_to_kopecks(db: Session, days: int) -> int:
+    """Во сколько обходится подарок в ``days`` дней подписки.
+
+    Считаем по самому дешёвому видимому 30-дневному плану — тому же, на который
+    ориентируется триал. Так «30 дней в подарок» автоматически следует за
+    прайсом, а не застывает константой в коде.
+
+    Награда именно в днях, а не в рублях, — сознательный выбор: день стоит нам
+    маржи, а не выручки, и весь рынок (Paper VPN, FKey) платит рефералам
+    временем. Плюс фиксированная сумма в 50 ₽ обесценивалась при каждом
+    повышении прайса, а «месяц» читается одинаково всегда.
+    """
+    from .trial import _trial_plan  # локально: trial импортирует balance
+
+    plan = _trial_plan(db)
+    if plan is None or not plan.duration_days:
+        return 0
+    per_day = float(plan.price) * 100 / plan.duration_days
+    return int(round(per_day * max(0, days)))
+
+
 def referral_bonus(
-    db: Session, user_id: int, *, reference: str
+    db: Session,
+    user_id: int,
+    *,
+    reference: str,
+    days: int | None = None,
+    note: str = "referral bonus",
 ) -> models.BalanceTransaction:
-    """Credit ``REFERRAL_BONUS_KOPECKS`` as a ``kind=bonus`` topup."""
+    """Начислить реферальную награду как ``kind=bonus``.
+
+    ``days`` — размер подарка в днях подписки (конвертируется в копейки по
+    текущему прайсу). Без него падаем на легаси-константу
+    ``REFERRAL_BONUS_KOPECKS``: она осталась ради обратной совместимости с
+    прод-env, где сумма задана явно.
+    """
+    amount = days_to_kopecks(db, days) if days is not None else REFERRAL_BONUS_KOPECKS
+    if amount <= 0:
+        # Прайс не настроен (нет видимого 30-дневного плана) — оценить подарок в
+        # днях нечем. Падать здесь нельзя: реферер сделал свою работу, а мы
+        # лишили бы его награды из-за нашей же незаполненной таблицы планов.
+        # Поэтому фолбэк на легаси-сумму; ноль не пишем ни при каких раскладах —
+        # нулевая транзакция заняла бы reference и заблокировала выплату
+        # навсегда.
+        logger.warning(
+            "referral: подарок в днях (%s) не оценён — нет видимого 30-дневного "
+            "плана, начисляю легаси-сумму %s копеек",
+            days, REFERRAL_BONUS_KOPECKS,
+        )
+        amount = REFERRAL_BONUS_KOPECKS
+    if amount <= 0:
+        raise ValueError("referral reward is zero — nothing to credit")
     return topup(
-        db, user_id, REFERRAL_BONUS_KOPECKS,
+        db, user_id, amount,
         reference=reference,
         kind=models.BalanceTxKind.bonus,
-        note="referral bonus",
+        note=note,
     )
 
 
@@ -220,13 +324,21 @@ def activate_subscription(
     sub: models.Subscription,
     *,
     reference: str,
+    price_kopecks: int | None = None,
+    expires_at: datetime | None = None,
 ) -> int:
     """Debit ``plan.price`` from wallet, set ``expires_at``, ``auto_renew=True``.
 
     Called at subscription activation. Raises ``ValueError`` on insufficient
     balance (callers surface 402 with topup hint).
+
+    ``price_kopecks`` и ``expires_at`` нужны только триалу
+    (``services/trial.activate_trial_full``): списать ровно зачисленный бонус
+    (N дней по цене дня, а не цену плана) и поставить срок «N дней + скрытые
+    часы». Без них поведение прежнее: полная цена плана и
+    ``now + plan.duration_days``.
     """
-    price = plan_price_kopecks(sub.plan)
+    price = plan_price_kopecks(sub.plan) if price_kopecks is None else price_kopecks
     if price <= 0:
         raise ValueError(f"plan {sub.plan_id} has no price")
 
@@ -244,8 +356,10 @@ def activate_subscription(
         note=f"activate {sub.plan.name} (sub {sub.id})",
     )
 
-    sub.expires_at = utcnow() + timedelta(days=sub.plan.duration_days)
+    sub.expires_at = expires_at or utcnow() + timedelta(days=sub.plan.duration_days)
     sub.auto_renew = True
+    # Новый оплаченный период — шкала трафика начинает с нуля.
+    sub.traffic_used_bytes = 0
     # Clear V1 fields.
     sub.prepaid_kopecks = 0
     sub.next_charge_at = None
@@ -273,7 +387,11 @@ def renew_subscription(db: Session, sub: models.Subscription) -> bool:
 
     base_price = plan_price_kopecks(sub.plan)
     extra_slots = sub.extra_device_slots or 0
-    device_surcharge = extra_slots * EXTRA_DEVICE_MONTHLY_KOPECKS
+    # Доп. слоты — помесячная цена, масштабируем на длительность плана
+    # (годовой = ×12), как в total_renewal_cost_kopecks. Иначе слоты на
+    # годовом плане недосчитываются в 12 раз.
+    months = _plan_months(sub.plan)
+    device_surcharge = extra_slots * EXTRA_DEVICE_MONTHLY_KOPECKS * months
     price = base_price + device_surcharge
     if price <= 0:
         logger.warning("renew: plan %s has no price, skipping sub %s", sub.plan_id, sub.id)
@@ -301,6 +419,8 @@ def renew_subscription(db: Session, sub: models.Subscription) -> bool:
     # shorten the period if the tick fires a few hours late.
     base = sub.expires_at or utcnow()
     sub.expires_at = base + timedelta(days=sub.plan.duration_days)
+    # Новый оплаченный период — шкала трафика начинает с нуля.
+    sub.traffic_used_bytes = 0
     db.add(sub)
     db.flush()
 
@@ -334,6 +454,10 @@ def change_plan(
         total_days = old_plan.duration_days
         remaining_seconds = (sub.expires_at - now).total_seconds()
         remaining_days = max(remaining_seconds / 86400, 0)
+        # Кап: заморозка (expires_at += FREEZE_DAYS) растягивает остаток
+        # сверх duration_days → рефанд не должен превышать цену плана,
+        # иначе создаём деньги из воздуха в леджере.
+        remaining_days = min(remaining_days, total_days)
         refund = int(math.floor(old_price * remaining_days / total_days))
 
     user = _lock_user(db, sub.user_id)
@@ -367,6 +491,8 @@ def change_plan(
     sub.plan_id = new_plan.id
     sub.expires_at = now + timedelta(days=new_plan.duration_days)
     sub.auto_renew = True
+    # Смена плана оплачивает новый период — шкала трафика начинает с нуля.
+    sub.traffic_used_bytes = 0
 
     # Count live devices and set extra_device_slots for any that exceed
     # the new plan's bundle. This avoids "free" devices lingering after
@@ -376,8 +502,10 @@ def change_plan(
     overflow = max(live_devices - new_bundled, 0)
     sub.extra_device_slots = overflow
 
-    # Charge for overflow slots (pro-rated for the full new period = full price).
-    device_surcharge = overflow * EXTRA_DEVICE_MONTHLY_KOPECKS
+    # Charge for overflow slots (за весь период нового плана; помесячная
+    # цена × число месяцев, чтобы годовой план не недосчитывал слоты).
+    months = _plan_months(new_plan)
+    device_surcharge = overflow * EXTRA_DEVICE_MONTHLY_KOPECKS * months
     if device_surcharge > 0:
         if (user.balance_kopecks or 0) < device_surcharge:
             raise ValueError(
@@ -401,6 +529,154 @@ def change_plan(
         refund, new_price, device_surcharge, overflow, user.balance_kopecks,
     )
     return {"refunded_kopecks": refund, "charged_kopecks": new_price + device_surcharge}
+
+
+# ── Платил ли юзер / неоплаченный триал ─────────────────────────────
+
+def user_has_paid(db: Session, user_id: int) -> bool:
+    """Платил ли юзер хоть раз (или триального бонуса у него нет вовсе).
+
+    Правда, если есть хоть одно из:
+      * оплаченный счёт с суммой > 0 (карта, СБП, крипта, ручной mark paid);
+      * запись ``kind=topup`` (пополнение баланса);
+      * ручное зачисление ``adjust admin_topup:%`` > 0: так проводили оплаты
+        без счёта, пока lava лежал (24.08–19.09.2026);
+      * продление с баланса ``spend renew:%``;
+      * у юзера нет записи триального бонуса ``trial:{uid}``. Подписку без
+        бонуса можно было только купить или получить от админа, а юзеры,
+        восстановленные через ``generate_restore_sql.py``, журнала не имеют
+        вовсе (баланс пишется прямо в ``users.balance_kopecks``).
+
+    Последняя ветка безопасна только для заморозки и clawback-а: в clawback
+    попадают юзеры с ``trial_expires_at``, а он ставится вместе с
+    ``trial:{uid}``. В гейт предупреждения о конце триала функция не идёт:
+    она истинна после любого пополнения, например на 100 ₽, а продление за
+    150 ₽ оно не покрывает.
+    """
+    paid_invoice = (
+        db.query(models.Invoice.id)
+        .filter(
+            models.Invoice.user_id == user_id,
+            models.Invoice.status == models.InvoiceStatus.paid,
+            models.Invoice.amount > 0,
+        )
+        .first()
+    )
+    if paid_invoice is not None:
+        return True
+
+    tx = models.BalanceTransaction
+    paid_tx = (
+        db.query(tx.id)
+        .filter(
+            tx.user_id == user_id,
+            or_(
+                tx.kind == models.BalanceTxKind.topup,
+                and_(
+                    tx.kind == models.BalanceTxKind.adjust,
+                    tx.reference.like("admin_topup:%"),
+                    tx.amount_kopecks > 0,
+                ),
+                and_(
+                    tx.kind == models.BalanceTxKind.spend,
+                    tx.reference.like("renew:%"),
+                ),
+            ),
+        )
+        .first()
+    )
+    if paid_tx is not None:
+        return True
+
+    trial_bonus_row = (
+        db.query(tx.id)
+        .filter(tx.user_id == user_id, tx.reference == f"trial:{user_id}")
+        .first()
+    )
+    return trial_bonus_row is None
+
+
+def is_unpaid_trial(db: Session, sub: models.Subscription) -> bool:
+    """Подписка выдана на бесплатные дни, и за неё ещё не платили.
+
+    Триал = есть ``spend trial-full:{sub.id}`` (подписка куплена на
+    триальный бонус). Оплатой этой подписки считается любое из:
+      * продление с баланса ``spend renew:{sub.id}``;
+      * смена тарифа в кабинете ``spend change_plan:{sub.id}`` (sub.id тот же);
+      * оплаченный счёт с ``subscription_id = sub.id`` и суммой > 0:
+        продление картой или СБП (``?fix=1``, ``/renew``, ``/plans`` на тот же
+        тариф). Такая оплата строк в журнал не пишет, только сдвигает срок.
+
+    Без последних двух условий подписка, оплаченная картой или сменившая
+    тариф, навсегда осталась бы «триалом». Старые кабинетные триалы
+    (``activate:{sub.id}``, без ``trial-full``) сюда не попадают.
+    """
+    tx = models.BalanceTransaction
+    trial_spend = (
+        db.query(tx.id)
+        .filter(
+            tx.user_id == sub.user_id,
+            tx.kind == models.BalanceTxKind.spend,
+            tx.reference == f"trial-full:{sub.id}",
+        )
+        .first()
+    )
+    if trial_spend is None:
+        return False
+
+    paid_spend = (
+        db.query(tx.id)
+        .filter(
+            tx.user_id == sub.user_id,
+            tx.kind == models.BalanceTxKind.spend,
+            tx.reference.in_([f"renew:{sub.id}", f"change_plan:{sub.id}"]),
+        )
+        .first()
+    )
+    if paid_spend is not None:
+        return False
+
+    paid_invoice = (
+        db.query(models.Invoice.id)
+        .filter(
+            models.Invoice.subscription_id == sub.id,
+            models.Invoice.status == models.InvoiceStatus.paid,
+            models.Invoice.amount > 0,
+        )
+        .first()
+    )
+    return paid_invoice is None
+
+
+FREEZE_NEEDS_PAYMENT_DETAIL = "Заморозка станет доступна после первой оплаты"
+
+
+def freeze_allowed_by_payment(
+    db: Session, sub: models.Subscription, *, has_paid: bool | None = None
+) -> bool:
+    """Правило заморозки по оплате: юзер платил и эта подписка не неоплаченный
+    триал — либо на балансе уже лежит полная стоимость её продления.
+
+    Правило по подписке, а не по юзеру. Без ``is_unpaid_trial`` триальщик,
+    пополнивший баланс в первый день, заморозил бы сам триал: +FREEZE_DAYS к
+    сроку, и первое списание уехало бы на неделю. Исключение (решение
+    владельца 30.09.2026, user 1000058 с 1500 ₽ на балансе на триальной
+    подписке): кто уже положил деньги на продление, фактически купил — ему
+    заморозку показываем; цена лазейки — до FREEZE_DAYS дней платящему.
+    ``has_paid`` можно передать заранее посчитанным, когда подписок у юзера
+    несколько (кабинет, /me).
+
+    ``freeze_subscription`` это правило не проверяет: его зовёт только
+    ``webapp_freeze``, и проверка стоит там (сервис покрыт тестами без журнала).
+    """
+    if has_paid is None:
+        has_paid = user_has_paid(db, sub.user_id)
+    if not has_paid:
+        return False
+    if not is_unpaid_trial(db, sub):
+        return True
+    user = db.get(models.User, sub.user_id)
+    return bool(user) and (user.balance_kopecks or 0) >= total_renewal_cost_kopecks(sub)
 
 
 # ── Freeze / unfreeze (V2: 1 per year, 7 days) ──────────────────────
@@ -595,12 +871,34 @@ def sub_days_remaining(
 
 
 def days_remaining(user: models.User, plan: models.Plan, devices: int) -> int:
-    """V1 compat — how many months this balance can buy."""
-    price = plan_price_kopecks(plan)
-    if price <= 0:
+    """V1 compat — how many days this balance can buy at the sub level.
+
+    Picks the user's active sub on this plan so device-slot surcharge
+    is included via ``total_renewal_cost_kopecks``. Falls back to bare
+    plan price when there's no live sub yet (e.g. pre-activation
+    preview).
+    """
+    sub = next(
+        (
+            s
+            for s in (user.subscriptions or [])
+            if s.plan_id == plan.id
+            and s.status
+            in (
+                models.SubscriptionStatus.active,
+                models.SubscriptionStatus.frozen,
+            )
+        ),
+        None,
+    )
+    if sub is not None:
+        cost = total_renewal_cost_kopecks(sub)
+    else:
+        cost = plan_price_kopecks(plan)
+    if cost <= 0:
         return 0
-    months = (user.balance_kopecks or 0) // price
-    return months * (plan.duration_days or 30)
+    periods = (user.balance_kopecks or 0) // cost
+    return periods * (plan.duration_days or 30)
 
 
 def _daily_cost_kopecks(plan: models.Plan, device_count: int) -> int:

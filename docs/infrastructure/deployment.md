@@ -204,15 +204,33 @@ rsync --delete --exclude=.git --exclude=__pycache__ --exclude=admin/node_modules
 ### 6. Build + up
 
 ```yaml
-# deploy_app_stack/tasks/main.yml:119-128
+- name: Invalidate build marker when repo changed
+  file:
+    path: "{{ deploy_app_stack_dir }}/.built_ok"
+    state: absent
+  when: repo_sync.changed
+
+- name: Check build marker
+  stat:
+    path: "{{ deploy_app_stack_dir }}/.built_ok"
+  register: _build_marker
+
 - name: Build docker images
   command: docker compose build --no-cache
   when:
     - deploy_app_stack_build | bool
-    - repo_sync.changed
+    - not _build_marker.stat.exists
+
+- name: Record successful build marker
+  copy:
+    dest: "{{ deploy_app_stack_dir }}/.built_ok"
+    content: "built\n"
+  when:
+    - deploy_app_stack_build | bool
+    - not _build_marker.stat.exists
 ```
 
-`--no-cache` + гейт `repo_sync.changed` = пересборка **только** когда реально что-то синкнулось. Повторный запуск роли против неизменённого дерева практически бесплатен.
+Гейт билда — **крах-безопасный**. Раньше он висел прямо на `repo_sync.changed`, и это было не идемпотентно: если прогон падал ПОСЛЕ rsync, но ДО/ВО ВРЕМЯ build (обрыв сети до registry, OOM, Ctrl-C), повторный запуск видел `changed=false`, пропускал build и `up -d` молча поднимал старые образы (healthcheck при этом зелёный). Теперь «нужен rebuild» персистентен через файл-маркер `.built_ok`: rsync-изменение сбрасывает маркер, а записывается он **только** после успешного build (упавший build прерывает плей до задачи записи). Пока маркера нет — образы пересобираются, даже если дерево не менялось. Маркер добавлен в `--exclude` rsync, чтобы `--delete` его не стирал. Повторный запуск роли против неизменённого, успешно собранного дерева по-прежнему практически бесплатен.
 
 ```yaml
 - name: Bring the stack up
@@ -269,7 +287,32 @@ rsync --delete --exclude=.git --exclude=__pycache__ --exclude=admin/node_modules
 
 Prometheus + Grafana живут в отдельном `docker-compose.yml` под `/opt/vpn-monitoring` (роль `monitoring_stack`). Порты Prometheus/Grafana bind'ятся на `127.0.0.1` — доступ через SSH-tunnel (`ssh -L 3000:127.0.0.1:3000 root@45.14.244.140`). Это сознательный выбор: ничего дополнительного наружу не торчит, auth делегирован SSH'у.
 
-Prometheus scrape'ит `http://backend:8000/metrics` через docker network (сеть compose backend'а). Подробнее — вне скоупа этого документа, см. код роли.
+Prometheus scrape'ит `http://backend:8000/metrics` через docker network (сеть compose backend'а).
+
+**Node coverage.** Prometheus job'ы рендерятся из inventory: `vpn-nodes` (группа `vpn_nodes`, RU-relay) и `wg-exit-nodes` (группа `wg_exit_nodes`, non-RU exit). Monitoring play в `site.yml` запускается на объединении этих групп (`vpn_nodes:wg_exit_nodes`) — роль `node_exporter` ставит экспортёр на каждой ноде, firewall-правило открывает порт 9100 **только** для IP из `node_exporter_allowed_ips` (см. `group_vars/all.yml`). Добавили ноду в inventory — перекатили `--tags monitoring`, в `prometheus.yml` появится новая target'а.
+
+**Docker install идемпотентен.** Роль сначала проверяет `docker --version`; если Docker уже стоит (например, Docker CE из официального репо), `apt install docker.io` пропускается — иначе apt ломается на конфликте пакетов `docker.io` vs `docker-ce` + `containerd.io`.
+
+**Grafana datasource uid.** Provisioned datasource шаблон явно задаёт `uid: prometheus` — дашборды в `docs/dashboards/` ссылаются на `{ type: prometheus, uid: "prometheus" }`, без явного uid они отваливались с «Datasource prometheus was not found».
+
+**Дашборды** (`infra/ansible/roles/monitoring_stack/files/dashboards/`, авто-провижинятся в папке Grafana «VPN»):
+- `vpn-overview.json` — бэкенд: HTTP rate/errors, provisioning tasks, rollup статусы (Backend up, Relay fleet, Exit fleet).
+- `fleet.json` — относы: отдельные секции «Relay nodes (RU)» и «Exit nodes (WireGuard, non-RU)» с симметричными панелями CPU/Mem/Net/Disk по `job="vpn-nodes"` и `job="wg-exit-nodes"`.
+- `exits.json` — детальный разрез exit'ов: per-WG-interface RX/TX (`device=~"wg[0-9]+"`), physical egress RX/TX, CPU/Mem/Load/TCP established. Отдельно от `fleet.json` чтобы operationally следить за exit-перегрузкой (какой exit какими wgN-пирами качает больше).
+
+Файл `grafana-dashboards.yml` (provisioning provider) watch'ит `/var/lib/grafana/dashboards/` каждые 30 секунд — правка JSON + `--tags monitoring` → перезапуск контейнеров не нужен, Grafana подхватит.
+
+## Sub-link CDN proxy
+
+`Device.connection_uri` содержит «dynamic subscription URL» формата `<SUB_LINK_BASE_URL>/<sub_token>`. Если указать прямой `https://grinwer.online/api/sub/<token>` — RKN-блок основного домена уложит всех installed-клиентов. Поэтому фронт — отдельный «boring» домен на Cloudflare.
+
+Текущий рабочий конфиг:
+
+- **Домен:** `grn-ssync.pro` (CF-зона, Pro plan).
+- **Worker:** `v8-sub` — делает `fetch(https://grinwer.online/api/sub/${token})` и стримит ответ обратно. Код есть в CF Dashboard Workers; в репо не коммитим (короткий, держим ближе к инфре). Процедура правок/ротации landing'а — `operations/worker-v8-sub.md`.
+- **CF Protocol settings:** `HTTP/2 = off`, `HTTP/3 = off`. **Критично**: RKN DPI на мобильном 4G режет H2 stream после TLS-handshake — headers доходят, тело 584 байта теряется. HTTP/1.1 проскакивает. На Free-плане CF тумблер HTTP/2 заблокирован — нужен Pro.
+- **env:** `SUB_LINK_BASE_URL=https://grn-ssync.pro`. Зеркалится в backend и worker (см. `operations/env-reference.md`).
+- **Миграция существующих Device'ов:** **не делаем**. Старые строки с `https://grinwer.online/...` остаются; установленные клиенты продолжают работать до тех пор, пока домен не заблочат окончательно. Новые Device'ы (provisioning после деплоя env) получают новый URL. По жалобам — правим `connection_uri` вручную по `id`.
 
 ## Volumes и persistence
 

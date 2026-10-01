@@ -1,5 +1,140 @@
+import { useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { api, StatsOut } from "../api";
+
+type FunnelStep = {
+  key: string;
+  label: string;
+  /** null — шаг НЕизмерим (нет данных телеметрии). Это не то же, что 0. */
+  count: number | null;
+  denominator: number;
+  pct: number | null;
+  measurable: boolean;
+};
+type FunnelOut = {
+  days: number | null;
+  total: number;
+  /** Сколько юзеров когорты пришли после включения телеметрии (2026-07-25). */
+  telemetry_cohort: number;
+  steps: FunnelStep[];
+  losses: FunnelStep[];
+  trial_failures: number;
+};
+
+/** Полоска шага воронки. Ширина = доля от СВОЕГО знаменателя (у шага про
+ *  кабинет он свой — под-когорта с телеметрией).
+ *
+ *  Неизмеримый шаг рисуется словами «нет данных», а не нулевой/полной полосой:
+ *  отсутствие данных, поданное как результат, — это ложь, по которой принимают
+ *  решения (первая версия показывала «98.6% не открыли кабинет», хотя про 72 из
+ *  73 юзеров событий просто не существовало). */
+function FunnelBar({ step, tone }: { step: FunnelStep; tone: "step" | "loss" }) {
+  const bar = tone === "loss" ? "bg-red-800" : "bg-emerald-800";
+  if (!step.measurable)
+    return (
+      <div className="mb-2">
+        <div className="flex justify-between text-sm">
+          <span className="text-slate-400">{step.label}</span>
+          <span className="text-slate-500 italic">нет данных</span>
+        </div>
+        <div className="h-2 bg-slate-900 rounded mt-1 border border-dashed border-slate-700" />
+      </div>
+    );
+  return (
+    <div className="mb-2">
+      <div className="flex justify-between text-sm">
+        <span className="text-slate-300">{step.label}</span>
+        <span className="text-slate-400">
+          {step.count}
+          <span className="text-slate-500">
+            {" "}
+            ({step.pct}%
+            {step.denominator !== undefined && ` от ${step.denominator}`})
+          </span>
+        </span>
+      </div>
+      <div className="h-2 bg-slate-900 rounded mt-1 overflow-hidden">
+        <div
+          className={`h-full ${bar}`}
+          style={{ width: `${Math.min(step.pct ?? 0, 100)}%` }}
+        />
+      </div>
+    </div>
+  );
+}
+
+function OnboardingFunnel() {
+  const [days, setDays] = useState(7);
+  const { data, isLoading, error } = useQuery<FunnelOut>({
+    queryKey: ["onboarding-funnel", days],
+    queryFn: () => api.get(`/admin/onboarding-funnel?days=${days}`),
+  });
+
+  return (
+    <section className="mb-6">
+      <div className="flex items-center gap-3 mb-2">
+        <h2 className="text-xs uppercase text-slate-400">Онбординг новых юзеров</h2>
+        <div className="flex gap-1">
+          {[7, 30, 0].map((d) => (
+            <button
+              key={d}
+              onClick={() => setDays(d)}
+              className={`text-xs px-2 py-0.5 rounded ${
+                days === d ? "bg-slate-700 text-white" : "bg-slate-800 text-slate-400"
+              }`}
+            >
+              {d === 0 ? "всё время" : `${d} дн.`}
+            </button>
+          ))}
+        </div>
+      </div>
+      <div className="bg-slate-800 rounded-lg p-4 border border-slate-700">
+        {isLoading ? (
+          <div className="text-slate-400 text-sm">Загрузка…</div>
+        ) : error || !data ? (
+          <div className="text-red-400 text-sm">Ошибка: {String(error)}</div>
+        ) : data.total === 0 ? (
+          <div className="text-slate-400 text-sm">В окне нет новых юзеров.</div>
+        ) : (
+          <>
+            <div className="text-sm text-slate-400 mb-3">
+              Пришло в бота: <span className="text-white font-semibold">{data.total}</span>
+            </div>
+            {data.steps.slice(1).map((s) => (
+              <FunnelBar key={s.key} step={s} tone="step" />
+            ))}
+            <div className="text-xs uppercase text-slate-500 mt-4 mb-2">Где теряем</div>
+            {data.losses.map((s) => (
+              <FunnelBar key={s.key} step={s} tone="loss" />
+            ))}
+            {data.trial_failures > 0 && (
+              <div className="text-sm text-yellow-400 mt-3">
+                ⚠️ У {data.trial_failures} юзеров активация триала отказала — смотри
+                AuditLog «trial_activate_rejected».
+              </div>
+            )}
+            <div className="text-xs text-slate-500 mt-3">
+              {data.telemetry_cohort === 0 ? (
+                <>
+                  Про шаг «Открыли кабинет» данных нет: телеметрия пишется с
+                  2026-07-25, а все юзеры этой когорты пришли раньше. Шаги
+                  «триал / ссылка / оплата» считаются по состоянию БД и верны за
+                  всю историю.
+                </>
+              ) : (
+                <>
+                  «Открыли кабинет» считается по {data.telemetry_cohort} юзерам,
+                  пришедшим после включения телеметрии (2026-07-25); остальные
+                  шаги — по всей когорте из {data.total}.
+                </>
+              )}
+            </div>
+          </>
+        )}
+      </div>
+    </section>
+  );
+}
 
 function Card({
   title,
@@ -51,6 +186,8 @@ export default function Dashboard() {
         </button>
       </div>
 
+      <OnboardingFunnel />
+
       <section className="mb-6">
         <h2 className="text-xs uppercase text-slate-400 mb-2">Пользователи</h2>
         <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
@@ -58,6 +195,28 @@ export default function Dashboard() {
           <Card title="Активные подписки" value={data.subscriptions_active} tone="good" />
           <Card title="Всего подписок" value={data.subscriptions_total} />
           <Card title="Устройств активно" value={data.devices_active} />
+        </div>
+      </section>
+
+      <section className="mb-6">
+        <h2 className="text-xs uppercase text-slate-400 mb-2">
+          Активность за 24ч{" "}
+          <span className="normal-case text-slate-500">
+            (по реальному трафику нод)
+          </span>
+        </h2>
+        <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+          <Card
+            title="Юзеры (24ч)"
+            value={data.users_active_24h}
+            tone="good"
+          />
+          <Card title="Устройства (24ч)" value={data.devices_active_24h} />
+          <Card
+            title="Сироты активны (24ч)"
+            value={data.orphans_active_24h}
+            tone={data.orphans_active_24h > 0 ? "warn" : "default"}
+          />
         </div>
       </section>
 
