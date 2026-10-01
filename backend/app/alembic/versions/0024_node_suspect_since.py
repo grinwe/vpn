@@ -11,8 +11,6 @@ from __future__ import annotations
 from alembic import op
 from sqlalchemy import Column, DateTime
 
-from app.alembic._idempotent import has_column
-
 revision = "0024_node_suspect_since"
 down_revision = "0023_user_notification_prefs"
 branch_labels = None
@@ -20,8 +18,7 @@ depends_on = None
 
 
 def upgrade() -> None:
-    if not has_column("vpn_nodes", "suspect_since"):
-        op.add_column("vpn_nodes", Column("suspect_since", DateTime, nullable=True))
+    op.add_column("vpn_nodes", Column("suspect_since", DateTime, nullable=True))
 
 
 def downgrade() -> None:

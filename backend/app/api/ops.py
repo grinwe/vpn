@@ -28,15 +28,6 @@ from ._common import ADMIN_ACTOR_HEADER, _audit, _resolve_admin_actor, get_db
 router = APIRouter()
 
 
-@router.get("/version")
-def get_version() -> dict[str, str | None]:
-    """Версия выкаченного кода. Без авторизации — секрета тут нет, а фронтам
-    (и человеку через curl) она нужна, чтобы понять, какой билд отвечает."""
-    from ..version import version_info
-
-    return version_info()
-
-
 _TICK_INTERVAL_ENV = {
     "tick-pending-rescue": ("PENDING_RESCUE_INTERVAL", "60"),
     "tick-autoscale": ("AUTOSCALE_INTERVAL", "0"),
@@ -46,9 +37,6 @@ _TICK_INTERVAL_ENV = {
     "tick-traffic-stats": ("TRAFFIC_STATS_INTERVAL", "300"),
     "tick-relay-link-health": ("RELAY_LINK_HEALTH_INTERVAL", "300"),
     "tick-health-ping": ("USER_HEALTH_PING_INTERVAL", "1800"),
-    "tick-broadcast-dispatch": ("BROADCAST_DISPATCH_INTERVAL", "10"),
-    "tick-node-versions": ("NODE_VERSIONS_INTERVAL", "3600"),
-    "tick-xray-upstream": ("XRAY_UPSTREAM_INTERVAL", "21600"),
 }
 
 
@@ -298,84 +286,4 @@ def restart_workers(
     return schemas.WorkerRestartOut(
         signalled=signalled,
         failed=failed,
-    )
-
-
-@router.post("/ops/worker/scale", response_model=schemas.WorkerScaleOut)
-def scale_workers(
-    body: schemas.WorkerScaleRequest,
-    db: Session = Depends(get_db),
-    admin_token: str = Depends(require_admin),  # noqa: ARG001
-    admin_actor: str | None = Header(default=None, alias=ADMIN_ACTOR_HEADER),
-):
-    """Отскейлить число worker-контейнеров (1..20).
-
-    API-образ без ssh/ключа, поэтому реальный ``docker compose --scale``
-    делает worker по SSH на mgmt-хост (см. ``app.worker.run_scale_workers``
-    + ``scripts/workers.sh``). Энкьюим job в provisioning-очередь и коротко
-    ждём результат для синхронного фидбэка. Требует ≥1 живого воркера,
-    который подхватит job (для бампа вверх это всегда так).
-    """
-    import os
-    import time
-
-    queue = get_queue()
-    if queue is None:
-        raise HTTPException(status_code=503, detail="Redis queue unavailable")
-
-    n = body.replicas
-    actor, actor_type = _resolve_admin_actor(admin_actor)
-    _audit(
-        db,
-        actor,
-        "worker_scale",
-        "worker",
-        None,
-        actor_type=actor_type,
-        metadata={"replicas": n},
-    )
-
-    try:
-        job = queue.enqueue("app.worker.run_scale_workers", n, job_timeout=180)
-    except Exception as exc:  # noqa: BLE001
-        raise HTTPException(
-            status_code=503, detail=f"Failed to enqueue scale job: {exc}"
-        ) from exc
-
-    # Коротко ждём результат (скейл — секунды). Не дождались → enqueued,
-    # счётчик воркеров в виджете подтянется поллингом. Держим окно узким,
-    # чтобы не занимать надолго поток threadpool'а и DB-сессию запроса
-    # (env-кноб OPS_SCALE_WAIT_SECONDS, по умолчанию 5с).
-    try:
-        wait_seconds = float(os.getenv("OPS_SCALE_WAIT_SECONDS", "5"))
-    except ValueError:
-        wait_seconds = 5.0
-    deadline = time.monotonic() + wait_seconds
-    while time.monotonic() < deadline:
-        status = job.get_status(refresh=True)
-        if status == "finished":
-            res = job.result or {}
-            if res.get("ok"):
-                return schemas.WorkerScaleOut(
-                    replicas=n,
-                    status="applied",
-                    detail=((res.get("stdout") or "")[-400:]) or None,
-                )
-            return schemas.WorkerScaleOut(
-                replicas=n,
-                status="failed",
-                detail=(res.get("stderr") or "scale failed")[-400:],
-            )
-        if status == "failed":
-            return schemas.WorkerScaleOut(
-                replicas=n,
-                status="failed",
-                detail=(job.exc_info or "job failed")[-400:],
-            )
-        time.sleep(1)
-
-    return schemas.WorkerScaleOut(
-        replicas=n,
-        status="enqueued",
-        detail="job запущен, счётчик обновится поллингом виджета",
     )

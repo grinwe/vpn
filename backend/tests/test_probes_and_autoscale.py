@@ -54,8 +54,7 @@ def test_submit_probe_updates_node_health(client, db_session) -> None:
 
 
 def test_pool_autoscale_config_round_trip(client, db_session) -> None:
-    # У ServerPool нет колонки region — регион пула хранится в autoscale_region.
-    pool = models.ServerPool(name="eu-main")
+    pool = models.ServerPool(name="eu-main", region="eu")
     db_session.add(pool)
     db_session.commit()
     db_session.refresh(pool)

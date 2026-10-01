@@ -10,14 +10,6 @@
     "services": ["StatsService"]
   },
   "stats": {},
-  "dns": {
-    "servers": [
-      "77.88.8.8",
-      "8.8.8.8",
-      "1.1.1.1"
-    ],
-    "queryStrategy": "UseIP"
-  },
   "policy": {
     "levels": {
       "0": {
@@ -33,56 +25,11 @@
     }
   },
   "routing": {
-    "domainStrategy": "IPIfNonMatch",
     "rules": [
       {
         "type": "field",
         "inboundTag": ["api-in"],
         "outboundTag": "api"
-      },
-      {#- Приватные сети и loopback самой ноды — в blackhole, ПЕРВЫМ правилом
-          после api-in. Раньше geoip:private ехал в одном правиле с geoip:ru
-          на direct-local, то есть клиент мог достучаться до 127.0.0.1:10085
-          (gRPC StatsService: `statsquery -pattern 'user>>>'` перечисляет все
-          email'ы ноды и их трафик), до приватной сети ДЦ и до 169.254.169.254
-          (метадата-эндпоинт облака). Ни один из этих адресов клиенту не нужен.
-          Аудит RU split-routing 2026-07-28, находка В2. -#}
-      {
-        "type": "field",
-        "ip": ["geoip:private"],
-        "outboundTag": "block"
-      },
-      {#- RU-обход. Порядок правил несущий: всё, что ниже, — fan-out по user,
-          и он должен проигрывать RU-правилам (first-match-wins).
-
-          Бренд-regexp `^(yandex|mail|vk|...)\..+$` заменён на domain:-записи
-          (аудит 2026-07-28, находка В1): он анкорился на ПЕРВЫЙ лейбл, а не на
-          регистрируемый суффикс, поэтому ловил mail.google.com, mail.proton.me,
-          mail.yahoo.com, ok.google.com, hh.com, ria.city — они уходили напрямую
-          с РУ-IP. Для proton это была жёсткая поломка (в РФ заблокирован → домен
-          просто не открывался у юзера с включённым VPN). Обратная сторона того
-          же якоря: www.vk.com / m.vk.com первым лейблом НЕ матчились.
-          `domain:` в xray — это суффиксный матч (домен + все поддомены), то есть
-          он одновременно строже по TLD и шире по поддоменам.
-
-          Бренды в зоне .ru покрыты `\.ru$` и в списке не нужны — здесь только
-          не-.ru зоны и CDN, на которые приходится основной объём байт
-          (userapi.com/mycdn.me — фото и видео VK/OK при том, что «морда»
-          vk.com шла direct-local). -#}
-      {
-        "type": "field",
-        {#- Список — из роли ru_direct_list (единый на все 4 протокола).
-            Зоны рендерим regexp'ами, конкретные домены — `domain:`
-            (суффиксный матч: домен + все поддомены). -#}
-        "domain": {{ ((ru_direct_list_zones | map('regex_replace', '^(.*)$', 'regexp:\\\\.\\1$') | list)
-                    + (ru_direct_list_domains | map('regex_replace', '^(.*)$', 'domain:\\1') | list))
-                   | to_json }},
-        "outboundTag": "direct-local"
-      },
-      {
-        "type": "field",
-        "ip": ["geoip:ru"],
-        "outboundTag": "direct-local"
       }{% for _rule in _fan_out if _rule.emails %},
       {
         "type": "field",
@@ -103,7 +50,7 @@
     },
     {
       "tag": "vless-reality",
-      "listen": "{{ '127.0.0.1' if reality_stream_unify | default(false) else '0.0.0.0' }}",
+      "listen": "0.0.0.0",
       "port": {{ vless_reality_port | int }},
       "protocol": "vless",
       "settings": {
@@ -128,14 +75,9 @@
           ]
         }
       },
-      {#- quic в destOverride: без него для UDP/443 SNI не извлекается и
-          domain-правила RU-обхода на HTTP/3 не срабатывают — решает только
-          geoip:ru. Расходилось узко (РУ-домены на зарубежном CDN шли по TCP
-          напрямую, а по QUIC — через exit), но правится одним словом.
-          Аудит RU split-routing 2026-07-28, находка Б4. -#}
       "sniffing": {
         "enabled": true,
-        "destOverride": ["http", "tls", "quic"]
+        "destOverride": ["http", "tls"]
       }
     }
   ],
@@ -149,10 +91,6 @@
           "tcpKeepAliveInterval": 30
         }
       }{% endif %}
-    },
-    {
-      "protocol": "freedom",
-      "tag": "direct-local"
     }{% for _ob in _fan_out %},
     {
       "protocol": "freedom",

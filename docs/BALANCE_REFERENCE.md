@@ -47,9 +47,8 @@ plans.max_devices               ← bundled device cap (extras are surcharged)
 |-----|---------|--------|
 | `MAX_FREEZE_DAYS_PER_PERIOD` | `7` | Сколько дней блокирует один вызов `freeze_subscription` |
 | `FREEZE_YEAR_BUDGET_DAYS` | `30` | Жёсткий годовой cap на замороженные дни per subscription |
-| `REFERRAL_BONUS_KOPECKS` | `5000` | Легаси-сумма реферальных выплат: фолбэк, если дни не во что перевести (нет видимого 30-дневного плана). Сами выплаты в днях: `REFERRAL_INVITEE_DAYS` (3) приглашённому к триалу, `REFERRAL_REWARD_DAYS` (10) рефереру за первую оплату приглашённого |
-| `TRIAL_DURATION_DAYS` | `3` | Видимые бесплатные дни: бонус = столько дней по цене дня Solo, сразу тратится на подписку на эти дни (см. TRIAL_SYSTEM.md). До 2026-09-30 было `30` |
-| `TRIAL_HIDDEN_HOURS` | `24` | Скрытый запас сверх видимых дней: подписка на бесплатные дни живёт на столько часов дольше, списываем только за дни. `0` выключает |
+| `REFERRAL_BONUS_KOPECKS` | `5000` | Сумма обеих референс-выплат (рефералу и рефереру) |
+| `TRIAL_DURATION_DAYS` | `30` | Длина trial-окна (см. TRIAL_SYSTEM.md) |
 | `TRIAL_EXPIRY_WARN_DAYS` | `3` | За сколько дней до истечения worker шлёт warning |
 | `MIN_TOPUP_KOPECKS` | `10000` | Минимальный топап-инвойс (₽100) |
 | `EXTRA_DEVICE_KOPECKS_PER_MONTH` | `10000` | Доплата за устройство сверх `plan.max_devices` |
@@ -145,28 +144,25 @@ Unfreeze:
 
 `auto=True` в `unfreeze_subscription` — это просто audit-log маркер для worker'а, когда `frozen_until` истёк сам. Поведение идентично ручному.
 
-### Заморозка только после первой оплаты (с 2026-09-30)
-
-Правило **по подписке**, а не по юзеру: `balance.freeze_allowed_by_payment(db, sub)` = `user_has_paid(db, sub.user_id) AND NOT is_unpaid_trial(db, sub)` — либо подписка неоплаченный триал, но баланс уже покрывает полную стоимость её продления (решение владельца 30.09.2026, user 1000058: 1500 ₽ на балансе на триальной подписке; цена лазейки — до FREEZE_DAYS дней платящему). Проверяют его `can_freeze` в `/api/webapp/me` (кнопку прячет сервер) и `POST /api/webapp/subscriptions/{id}/freeze` (400 «Заморозка станет доступна после первой оплаты»). Это единственная точка входа в заморозку; сам `freeze_subscription` проверки не делает (и его тесты это закрепляют). Разморозка уже замороженных доступна всем. В боте кнопки «Заморозить» нет.
-
-- `user_has_paid(db, user_id)` — широкий: оплаченный счёт с суммой > 0, или строка `topup`, или `adjust admin_topup:%` > 0 (ручное зачисление, так проводили оплаты, пока lava лежал 24.08–19.09), или `spend renew:%`, или у юзера **нет** строки `trial:{uid}`. Последняя ветка покрывает восстановленных через `generate_restore_sql.py` (скрипт не переносит ни счета, ни журнал) и всех, кто получил подписку без триального бонуса. Используется только в заморозке и clawback, где эта ветка безопасна.
-- `is_unpaid_trial(db, sub)` — есть `spend trial-full:{sub.id}` и нет ни `spend renew:{sub.id}`, ни `spend change_plan:{sub.id}`, ни оплаченного `Invoice` с `subscription_id = sub.id` и суммой > 0 (продление картой или СБП строк в журнал не пишет). Без этого триальщик, пополнивший баланс в первый день, заморозил бы сам триал: +`FREEZE_DAYS` к сроку, и первое списание уехало бы с T+4 на T+11. После оплаты продления или смены тарифа подписка перестаёт быть триалом.
-- Старые кабинетные триалы (`activate:{id}`, без `trial-full`) без оплат отсекает `user_has_paid`. Миграции нет, всё считается по журналу.
-
 ## Topup → balance path
 
-Это правда единственная точка, где реальные деньги становятся балансом. Инвойс с `kind='topup'` создаётся через `POST /api/webapp/topup` (см. [WEBAPP_REFERENCE.md](WEBAPP_REFERENCE.md#post-apiwebapptopup)), провайдер отдаёт `pay_url`, юзер платит, webhook дергает `_mark_invoice_paid_core` в [api/invoices.py](../backend/app/api/invoices.py):
+Это правда единственная точка, где реальные деньги становятся балансом. Инвойс с `kind='topup'` создаётся через `POST /api/webapp/topup` (см. [WEBAPP_REFERENCE.md](WEBAPP_REFERENCE.md#post-apiwebapptopup)), провайдер отдаёт `pay_url`, юзер платит, webhook дергает `_mark_invoice_paid_core` в [api.py:1195](../backend/app/api.py#L1195):
 
 ```python
 if invoice.kind == "topup":
-    # 1. Награда рефереру, если это первая оплата приглашённого
-    _maybe_pay_referrer(db, invoice)
+    # 1. Referrer payout check (first real topup ever?)
+    if user.referred_by_id is not None:
+        prior = db.query(BalanceTransaction).filter_by(
+            user_id=user.id, kind=BalanceTxKind.topup).first()
+        if prior is None:
+            balance_svc.referral_bonus(db, user.referred_by_id,
+                                       reference=f"referral_payout:{user.id}")
     # 2. Actual topup
     balance_svc.topup(db, user.id, amount_kopecks=int(invoice.amount * 100),
                       reference=f"invoice:{invoice.id}", kind=BalanceTxKind.topup)
 ```
 
-Важно: **referrer payout проверяется ДО записи своего топапа**, чтобы условие «первая оплата» было однозначным. С 2026-09-30 тот же `_maybe_pay_referrer` зовёт и ветка счёта за тариф или продление (до пометки счёта paid): первая оплата приглашённого бывает не пополнением, а renewal-счётом картой или СБП. «Первая» = нет других оплаченных счетов с суммой > 0, строк `topup` и `adjust admin_topup:%` > 0. Дубль-защита — идемпотентный reference `referral_payout:{user_id}` плюс блокировка строки плательщика (`SELECT ... FOR UPDATE`) перед проверкой: два одновременных вебхука одного юзера сериализуются, второй видит оплату первого и награду не повторяет. Начисление в SAVEPOINT: сбой награды не валит платёж. Подробнее: [TRIAL_SYSTEM.md § Stage 3](TRIAL_SYSTEM.md#stage-3--referrer-payout-on-referees-first-payment-of-any-kind).
+Важно: **referrer payout проверяется ДО записи своего топапа**, чтобы условие «первый топап» было однозначным. Дубль-защита — идемпотентный reference `referral_payout:{user_id}`. Подробнее: [TRIAL_SYSTEM.md § Stage 3](TRIAL_SYSTEM.md#stage-3--referrer-payout-on-referees-first-real-topup).
 
 ## Activation: `activate_prepaid()` / `refund_prepaid()`
 
@@ -190,7 +186,7 @@ if invoice.kind == "topup":
 - Если после cap'а amount == 0 → возвращает non-persisted «пустую» транзакцию, чтобы caller не получил exception (но в ledger ничего не попадает).
 - Пишет `kind=adjust` с caller-provided `reference` и `note`.
 
-**Единственный текущий caller** — trial expiry clawback в worker'е ([worker.py Phase 3](../backend/app/worker.py)). С 2026-09-30 clawback пропускает платящих (`user_has_paid`) и снимает только непотраченную часть бонуса по журналу: `min(баланс, max(0, trial:{uid} + referral_signup:{uid} − |Σ всех spend юзера|))`. Для триалов, потративших бонус на подписку (все новые 3-дневные), сумма 0 и строка не пишется; чужие деньги, например `referral_payout`, не трогаются. Подробно — [TRIAL_SYSTEM.md § 3b](TRIAL_SYSTEM.md#3b-clawback-на-истечении). Админы пока ручные adjustments делают через psql (UI пока нет, см. [ADMIN_UI.md](ADMIN_UI.md) — отсутствует кнопка «adjust balance»).
+**Единственный текущий caller** — trial expiry clawback в worker'е ([worker.py Phase 3](../backend/app/worker.py)). Админы пока ручные adjustments делают через psql (UI пока нет, см. [ADMIN_UI.md](ADMIN_UI.md) — отсутствует кнопка «adjust balance»).
 
 ## Prometheus metrics
 

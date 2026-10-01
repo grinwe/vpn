@@ -61,37 +61,6 @@ def _table_set() -> set[str]:
     return set(inspect(engine).get_table_names())
 
 
-def _restore_head_or_reset(cfg: Config) -> None:
-    """Guarantee the shared session DB is back at ``head``.
-
-    This test tears the *shared* pytest-session database down to
-    ``base``. If any ``downgrade()`` chokes midway (exactly the bug this
-    test hunts for), the schema is left half-disassembled and every
-    later test in the session would cascade-fail with «relation does not
-    exist», burying the real failure. So we unconditionally rebuild head
-    in ``finally``: first try a plain re-``upgrade`` (works when the DB
-    is at some intact intermediate revision), and if that also fails —
-    because a partial downgrade left the schema inconsistent — fall back
-    to the same hard reset the session fixture uses (DROP SCHEMA +
-    ``run_migrations``).
-    """
-    from sqlalchemy import text
-
-    from app.db import engine
-    from app.migrations import run_migrations
-
-    try:
-        command.upgrade(cfg, "head")
-        return
-    except Exception:
-        pass
-    # Nuclear option: wipe the schema and re-migrate from zero.
-    with engine.begin() as conn:
-        conn.execute(text("DROP SCHEMA public CASCADE"))
-        conn.execute(text("CREATE SCHEMA public"))
-    run_migrations()
-
-
 def test_alembic_downgrade_upgrade_roundtrip() -> None:
     cfg = _alembic_config()
 
@@ -104,32 +73,23 @@ def test_alembic_downgrade_upgrade_roundtrip() -> None:
         "Schema looks empty at head — is the session fixture doing its job?"
     )
 
-    # The whole destructive round-trip runs inside try/finally so that a
-    # broken downgrade() (or a failed assertion) can never leave the
-    # shared session DB in a half-torn-down state — see
-    # ``_restore_head_or_reset``.
-    try:
-        # Walk all the way down. A broken downgrade() raises here and
-        # pytest reports which revision choked.
-        command.downgrade(cfg, "base")
-        tables_at_base = _table_set()
-        # Alembic itself keeps ``alembic_version`` around after downgrade
-        # to base; application tables should all be gone.
-        assert tables_at_base.issubset({"alembic_version"}), (
-            f"Tables survived downgrade to base: {tables_at_base - {'alembic_version'}}"
-        )
+    # Walk all the way down. A broken downgrade() raises here and
+    # pytest reports which revision choked.
+    command.downgrade(cfg, "base")
+    tables_at_base = _table_set()
+    # Alembic itself keeps ``alembic_version`` around after downgrade
+    # to base; application tables should all be gone.
+    assert tables_at_base.issubset({"alembic_version"}), (
+        f"Tables survived downgrade to base: {tables_at_base - {'alembic_version'}}"
+    )
 
-        # Climb back to head. Every upgrade() must be idempotent-friendly
-        # enough to run against a clean DB.
-        command.upgrade(cfg, "head")
-        snap_after_roundtrip = _schema_snapshot()
+    # Climb back to head. Every upgrade() must be idempotent-friendly
+    # enough to run against a clean DB.
+    command.upgrade(cfg, "head")
+    snap_after_roundtrip = _schema_snapshot()
 
-        assert snap_after_roundtrip == snap_at_head, (
-            "Schema drift after downgrade→upgrade round-trip.\n"
-            f"  before: {snap_at_head}\n"
-            f"  after:  {snap_after_roundtrip}"
-        )
-    finally:
-        # Whatever happened above, hand the DB back to the rest of the
-        # session at a clean head so no unrelated test fails downstream.
-        _restore_head_or_reset(cfg)
+    assert snap_after_roundtrip == snap_at_head, (
+        "Schema drift after downgrade→upgrade round-trip.\n"
+        f"  before: {snap_at_head}\n"
+        f"  after:  {snap_after_roundtrip}"
+    )

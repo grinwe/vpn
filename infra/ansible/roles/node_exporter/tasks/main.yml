@@ -20,64 +20,19 @@
   changed_when: false
   failed_when: false
 
-- name: Resolve node_exporter asset filename
-  ansible.builtin.set_fact:
-    _ne_asset: "node_exporter-{{ node_exporter_version }}.linux-amd64.tar.gz"
-
-# node_exporter качается с github, который у части RU-DC заблокирован
-# (SSL handshake timeout). Цепочка как у xray-core: сперва mgmt-mirror
-# (xray_mirror_url прокидывается site-run'ом), затем github fallback.
-- name: Download node_exporter from mgmt-mirror (best-effort)
+- name: Download node_exporter tarball
   ansible.builtin.get_url:
-    url: "{{ xray_mirror_url }}/node_exporter/{{ _ne_asset }}"
+    url: "https://github.com/prometheus/node_exporter/releases/download/v{{ node_exporter_version }}/node_exporter-{{ node_exporter_version }}.linux-amd64.tar.gz"
     dest: "/tmp/node_exporter-{{ node_exporter_version }}.tar.gz"
     mode: "0644"
-  when:
-    - node_exporter_version not in (node_exporter_installed.stdout | default(''))
-    - xray_mirror_url is defined
-    - (xray_mirror_url | default('') | length) > 0
-  failed_when: false
-
-- name: Tarball present after mirror attempt?
-  ansible.builtin.stat:
-    path: "/tmp/node_exporter-{{ node_exporter_version }}.tar.gz"
-  register: node_exporter_after_mirror
-
-- name: Download node_exporter from github (fallback)
-  ansible.builtin.get_url:
-    url: "https://github.com/prometheus/node_exporter/releases/download/v{{ node_exporter_version }}/{{ _ne_asset }}"
-    dest: "/tmp/node_exporter-{{ node_exporter_version }}.tar.gz"
-    mode: "0644"
-  when:
-    - node_exporter_version not in (node_exporter_installed.stdout | default(''))
-    - not node_exporter_after_mirror.stat.exists
-  failed_when: false
-
-- name: Final node_exporter tarball check
-  ansible.builtin.stat:
-    path: "/tmp/node_exporter-{{ node_exporter_version }}.tar.gz"
-  register: node_exporter_tarball
-
-# Advisory-мониторинг: если ни mirror, ни github не дали тарбол — НЕ
-# валим bootstrap. Нода обслуживает VPN и без node_exporter. Добавь версию
-# в mgmt-mirror (refresh-assets.sh) + перекатай — подтянется на след. прогоне.
-- name: Warn — node_exporter source unreachable, monitoring skipped
-  ansible.builtin.debug:
-    msg: >-
-      node_exporter {{ node_exporter_version }} недоступен ни с mgmt-mirror,
-      ни с github — мониторинг на этой ноде пропущен (не критично для VPN).
-  when:
-    - node_exporter_version not in (node_exporter_installed.stdout | default(''))
-    - not node_exporter_tarball.stat.exists
+  when: node_exporter_version not in (node_exporter_installed.stdout | default(''))
 
 - name: Extract binary
   ansible.builtin.unarchive:
     src: "/tmp/node_exporter-{{ node_exporter_version }}.tar.gz"
     dest: /tmp/
     remote_src: true
-  when:
-    - node_exporter_version not in (node_exporter_installed.stdout | default(''))
-    - node_exporter_tarball.stat.exists
+  when: node_exporter_version not in (node_exporter_installed.stdout | default(''))
 
 - name: Install binary
   ansible.builtin.copy:
@@ -87,22 +42,14 @@
     owner: root
     group: root
     remote_src: true
-  when:
-    - node_exporter_version not in (node_exporter_installed.stdout | default(''))
-    - node_exporter_tarball.stat.exists
+  when: node_exporter_version not in (node_exporter_installed.stdout | default(''))
   notify: restart node_exporter
-
-- name: Is node_exporter binary present?
-  ansible.builtin.stat:
-    path: /usr/local/bin/node_exporter
-  register: node_exporter_bin
 
 - name: Install systemd unit
   ansible.builtin.template:
     src: node_exporter.service.j2
     dest: /etc/systemd/system/node_exporter.service
     mode: "0644"
-  when: node_exporter_bin.stat.exists
   notify: restart node_exporter
 
 - name: Enable + start node_exporter
@@ -111,7 +58,6 @@
     enabled: true
     state: started
     daemon_reload: true
-  when: node_exporter_bin.stat.exists
 
 # ---------------------------------------------------------------------------
 # Firewall — allow only the monitoring host to scrape /metrics.
@@ -124,7 +70,6 @@
     iptables -C INPUT -p tcp -s {{ item }} --dport {{ node_exporter_port }} -j ACCEPT 2>/dev/null || \
       iptables -I INPUT -p tcp -s {{ item }} --dport {{ node_exporter_port }} -j ACCEPT
   loop: "{{ node_exporter_allowed_ips }}"
-  when: node_exporter_bin.stat.exists
   changed_when: false
 
 - name: Drop everything else on node_exporter port
@@ -136,7 +81,5 @@
     set -e
     iptables -C INPUT -p tcp --dport {{ node_exporter_port }} -j DROP 2>/dev/null || \
       iptables -A INPUT -p tcp --dport {{ node_exporter_port }} -j DROP
-  when:
-    - node_exporter_bin.stat.exists
-    - node_exporter_allowed_ips | length > 0
+  when: node_exporter_allowed_ips | length > 0
   changed_when: false

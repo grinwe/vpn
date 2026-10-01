@@ -8,72 +8,16 @@ deploy_web_frontend_letsencrypt_email: "adept38@gmail.com"
 # Zone → DNS → Edit on the grinwer.online zone. Stored in the vault.
 deploy_web_frontend_cloudflare_api_token: "{{ vault_cloudflare_api_token | default('') }}"
 
-# Зеркало саб-линка без CF: тот же /<token>, но клиент приходит на origin
-# напрямую (запись grwr.ink — DNS-only). Дубль, не замена: SUB_LINK_BASE_URL
-# и заголовки клиентам по-прежнему указывают на grn-ssync.pro, в интерфейс
-# этот адрес не выведен. Нужен, чтобы отличить бан домена от беды на CF.
-deploy_web_frontend_sub_mirror_domain: "grwr.ink"
-
 # App stack lives on the same host for now. Override any of the
 # deploy_app_stack_* defaults here; secrets come from vault.yml next
 # to this file.
 deploy_app_stack_dir: "/opt/vpn"
 deploy_app_stack_payment_provider: "cryptobot"
 
-# Public base URL for /<token> sub-links baked into Device.connection_uri.
-# Point at a CF-fronted proxy so an RKN block on grinwer.online doesn't
-# kill installed clients. Worker forwards /<token> to
-# <grinwer.online>/api/sub/<token>.
-deploy_app_stack_sub_link_base_url: "{{ vault_sub_link_base_url | default('') }}"
-# Резервный фронт саб-ссылки (если основной ляжет). Пусто = фолбэка нет.
-#
-# Включён на зеркало: Happ по заголовку `fallback-url` сам перекидывает
-# ИСТОЧНИК подписки на запасной домен, когда основной перестал открываться.
-# Это единственный механизм, который чинит УЖЕ УСТАНОВЛЕННЫЕ клиенты — сам
-# адрес у них давно вбит и удалённо мы его не меняем. Требует providerid
-# (Advanced-параметр), а он у нас задан: HAPP_PROVIDER_ID.
-# Работает только у Happ; Hiddify и v2rayTun этот заголовок не читают —
-# им помогает раскладка ниже.
-deploy_app_stack_sub_link_fallback_base_url: "https://{{ deploy_web_frontend_sub_mirror_domain }}"
-
-# Раскладка НОВЫХ ссылок по двум фронтам: доля токенов, которым выдаём
-# запасной домен вместо основного. Влияет только на то, что мы ПОКАЗЫВАЕМ и
-# записываем новым девайсам — оба домена отдают любой токен, поэтому уже
-# розданные ссылки продолжают работать и менять долю можно в любой момент.
-# 0 = вся раздача на основном (поведение до фичи).
-deploy_app_stack_sub_link_base_url_alt: "https://{{ deploy_web_frontend_sub_mirror_domain }}"
-deploy_app_stack_sub_link_alt_share: 50
-
-# --- Always-on тики: kill-switch'и держим здесь, а не только в коде -------
-# Аудит 2026-07-25: эти ручки существовали лишь как os.getenv-дефолты внутри
-# worker.py — в проде выключить взбесившийся тик было нечем, кроме правки
-# кода и деплоя. Значения ниже = те же дефолты, менять по месту.
-deploy_app_stack_cert_renewal_interval: 86400   # 0 — выключить тик
-deploy_app_stack_cert_renewal_days: 21          # порог near-expiry, держать < 30
-deploy_app_stack_cert_renewal_max_per_tick: 6
-deploy_app_stack_reality_dest_health_interval: 86400  # 0 — выключить тик
-deploy_app_stack_reality_dest_fail_threshold: 2
-# ВЫКЛ осознанно: воркер пробит dest из NL, а geo-чувствительные dest'ы
-# (гос-сайты) из-за границы отдают иначе → ротация по false-positive.
-deploy_app_stack_reality_dest_auto_rotate: 0
-deploy_app_stack_reality_dest_max_rotate_per_tick: 3
-deploy_app_stack_pending_rescue_force_age: 1800
-deploy_app_stack_pending_rescue_abandon_age: 86400
-deploy_app_stack_restore_hy2_after_reinstall: 1
-
 # #53 — TTL for the Telegram initData handshake at /api/webapp/auth.
 # 300s is Telegram's recommended validation window; keep short to
 # bound the replay window. NOT a secret — just a tunable.
 deploy_app_stack_webapp_init_data_ttl_seconds: 300
-
-# Provisioning reconciler — ВКЛючён в проде: правки нод сходятся через
-# desired-state reconcile-тик (debounce + coalesce) вместо немедленного
-# bootstrap'а на каждое действие. Миграция 0043 бэкфилит desired=reconciled=0,
-# поэтому включение НЕ триггерит mass-rebuild — реконсайлятся только ноды,
-# правленные после включения. Откат: "0" + redeploy (или RECONCILER_ENABLED=
-# на хосте). Тунаблы interval/debounce/cap/retry — дефолты из defaults/main.yml.
-# См. docs/operations/provisioning_reconciler_epic.md.
-deploy_app_stack_reconciler_enabled: "1"  # ВКЛ 2026-06-15: ручные bootstrap-эндпоинты (create_node/with_configs/rebootstrap/refresh-reality + spawn-finalize) теперь зовут defer_to_reconciler=False → немедленная таска, не дебаунсятся. Config-edit-сайты по-прежнему коалесятся реконсайлером. Откат: "0" + redeploy (или тег pre-reconciler-enable-*).
 
 # Controller-side path to the SSH private key used for provisioning
 # VPN nodes. Leave empty during initial bootstrap; set it once you
@@ -92,19 +36,6 @@ deploy_app_stack_admin_ids: "{{ vault_admin_ids | default('') }}"
 deploy_app_stack_telegram_stars_webhook_secret: "{{ vault_telegram_stars_webhook_secret | default('') }}"
 deploy_app_stack_webapp_jwt_secret: "{{ vault_webapp_jwt_secret | default('') }}"
 
-# Stage 9b — карты РФ/СБП: lava.top + Tribute (docs/PLAN_LAVA_TOP.md).
-# Секреты в vault.yml; email_domain и меню способов оплаты — открытые.
-# Меню в боте включается заполнением choices (например
-# "telegram_stars,lava_top,tribute,cryptobot"); пусто = старое поведение.
-# 2026-07-22: запуск со Stars + карта РФ (lava.top). Tribute добавится
-# сюда, когда будет создан магазин (сейчас shop-not-found).
-deploy_app_stack_payment_provider_choices: "telegram_stars,lava_top_sbp,lava_top"  # 2026-09-19: СБП и карта — две кнопки (lava закрыл карту у PAY2ME)
-deploy_app_stack_lava_top_api_key: "{{ vault_lava_top_api_key | default('') }}"
-deploy_app_stack_lava_top_offer_id: "{{ vault_lava_top_offer_id | default('') }}"
-deploy_app_stack_lava_top_webhook_secret: "{{ vault_lava_top_webhook_secret | default('') }}"
-deploy_app_stack_lava_top_email_domain: "{{ deploy_web_frontend_domain }}"
-deploy_app_stack_tribute_api_key: "{{ vault_tribute_api_key | default('') }}"
-
 # #62 — native Telegram webhook mode (replaces shared-secret forwarding).
 # Reuses vault_telegram_stars_webhook_secret for both legacy and native webhook.
 deploy_app_stack_telegram_webhook_secret_token: "{{ vault_telegram_stars_webhook_secret | default('') }}"
@@ -119,118 +50,3 @@ deploy_app_stack_bot_webhook_port: 8081
 # ~50 nodes from this single vantage point.
 deploy_app_stack_probe_agent_token: "{{ vault_probe_agent_token | default('') }}"
 deploy_app_stack_probe_agent_region: "eu-nl"
-
-# AI-агент (триаж + ops-планировщик). Ключ Claude лежит в vault как
-# vault_anthropic_api_key; без этой проводки env.j2 рендерил ANTHROPIC_API_KEY
-# пустым и агент молча отдавал 503. Флаг включает агента (read-only триаж +
-# dry-run планировщик; мутаций нет).
-deploy_app_stack_anthropic_api_key: "{{ vault_anthropic_api_key | default('') }}"
-deploy_app_stack_agent_enabled: 1
-deploy_app_stack_agent_model: "claude-sonnet-4-6"
-
-# Diverse N×M подписка (Phase A). 1 = однонодовое (инертно), 3 = флоу «3 ноды».
-# ВКЛючено 2026-06-12 после проверки HAPP Auto-фейловера. Новые subs получают до
-# N диверсных нод (best-effort: сколько тёплых бандлов на разных регионах);
-# existing subs не трогаются (их миграция — backfill, Фаза A.2, ещё нет).
-# Откат: вернуть 1 + прокат (или тег pre-diverse-sub-e84426a).
-deploy_app_stack_diverse_sub_nodes: 3
-# Набор эндпоинтов: legacy (как было) → 4x1 включается ЗДЕСЬ отдельным прогоном,
-# уже после того как код с миграцией 0065 уехал и подписка проверена.
-# docs/operations/subset_epic_2026_07_29.md
-deploy_app_stack_sub_leg_scheme: 4x1
-
-# Xray-JSON вместо списка ссылок: даёт фейловер ВНУТРИ сессии (ядро клиента
-# само пингует леги и уходит с упавшего), чего заголовок autoconnect не умеет —
-# он выбирает лучший лег только в момент подключения.
-# РАСКАТАНО на всех 2026-08-25 после обкатки на подписке владельца: автовыбор
-# подтверждён на живом устройстве, hy2-профиль тоже (ядро Happ читает finalmask
-# с salamander-обфускацией). Балансировщик пингует hy2 наравне с vless —
-# проверено: при мёртвых vless-легах трафик уходит на hysteria.
-# Откат: вернуть "off" + прокат (клиент вернётся к плоскому списку на рефреше,
-# переустанавливать ничего не нужно). Точка отката — тег
-# stable-2026-08-25-pre-xray-json-all.
-deploy_app_stack_sub_xray_json: "on"
-# Токены нужны только режиму allowlist; при "on" поле не читается, оставлено
-# пустым, чтобы не выглядело действующим ограничением.
-deploy_app_stack_sub_xray_json_tokens: ""
-# Кому из умеющих клиентов отдаём. Пусто = всем умеющим (Happ + v2rayTun).
-# Сужение до одного Happ держалось несколько часов 2026-08-25, пока v2rayTun
-# был непроверен; владелец подтвердил формат на живом устройстве в ОБОИХ
-# клиентах, и ограничение снято. Рычаг оставлен на случай, когда в список
-# умеющих добавится клиент, которого ещё никто не щупал.
-deploy_app_stack_sub_xray_json_clients: ""
-
-# Порт-хоппинг hy2 — РАСКАТАН НА ВСЕХ 2026-08-25.
-# Упирается в НОДУ, а не в клиента: пакет на порт из диапазона доедет только
-# там, где живо DNAT-правило `hy2-port-hopping` (UDP 20000:40000 → 443).
-# Правило отсутствовало на aeza-ru-01, ufo-ru-01, ufo-ru-03 — лежало в
-# /etc/iptables/rules.v4, но после ребута его некому было восстановить (не
-# установлен netfilter-persistent). Починено плейбуком playbooks/fix_hy2_dnat.yml;
-# после него DNAT и enabled-юнит подтверждены на 9 из 10 активных нод.
-# Не подтверждена только vsin-nl-01: у VDSina скруббинг режет SSH (известная
-# грабля). Если у кого-то там окажется hy2-лег без DNAT, деградация мягкая —
-# проба балансировщика исключит лег, автовыбор уйдёт на живой.
-# Откат: вернуть "off" + прокат. Диагностика: runbook §14.
-deploy_app_stack_sub_xray_hy2_hop: "all"
-
-# Клиентское правило ru-direct в Xray-JSON — ПИЛОТ на подписке владельца
-# (2026-08-29). РУ-зоны и домены (список роли ru_direct_list, копия в
-# backend/app/services/ru_direct_list.py) уходят с реального IP человека мимо
-# VPN, на любом леге.
-# Зачем, если split уже делает нода: на direct-нодах без WG-туннеля
-# (vsin-nl-01, 4vds-dk-01) разделять нечего — ВСЁ уходит с IP ноды, и когда
-# балансировщик сажает клиента на такой лег, Wildberries/Яндекс/Тинькофф видят
-# датский или голландский адрес и ломаются. Лег на direct-ноде есть у 43 из 52
-# активных устройств (диверс-раскладка), в access-логе 4vds-dk-01 — 137
-# соединений к WB direct-local с датского IP. hy2 per-user split не умеет вовсе.
-# Что проверять на телефоне владельца, выбрав лег direct-ноды (Дания/NL):
-#   2ip.ru показывает ДОМАШНИЙ IP (не IP ноды), wildberries.ru и ozon.ru
-#   открываются, зарубежные сайты показывают IP ноды. То же на hy2-леге.
-# На relay-нодах видимой разницы нет (там split уже делала нода).
-# Эффект — на рефреше сабы, переустанавливать ничего не нужно.
-# Откат: вернуть "off" + прокат. После пилота — "all".
-deploy_app_stack_sub_xray_ru_direct: "off"
-
-# Phase B — HAPP auto-select (subscription-autoconnect + lowestdelay) в заголовках
-# сабы. По умолчанию "off" (прод-поведение не меняется). Обкатка: выставить user_id
-# тест-юзера (CSV), проверить в HAPP, затем "all". Эффект — на рефреше сабы (≤6ч),
-# переимпорт не нужен. См. docs/operations/diverse_subscription_epic.md Фаза B.
-# РАСКАТАНО на всех 2026-06-13 после обкатки на user_id=1 (подтверждено: с включённым
-# в HAPP «Пинг при запуске» autoconnect садится на лучший пинг на старте). SINCE снят
-# → охватывает все девайсы. Откат: вернуть "off".
-deploy_app_stack_sub_happ_autoconnect: "all"
-# ISO-метка «только новые девайсы» (created_at >= метки). Пусто = без фильтра по дате.
-deploy_app_stack_sub_happ_autoconnect_since: ""
-# Provider ID из кабинета happ-proxy.com (привязан к домену саб-ссылки, т.е.
-# grn-ssync.pro). Без него Happ игнорирует весь Advanced-слой: sub-info-блок,
-# sub-expire-баннер, пуши об истечении. Autoconnect выше — НЕ Advanced,
-# работает и без providerid (обкатка 2026-06-13).
-deploy_app_stack_happ_provider_id: "{{ vault_happ_provider_id | default('') }}"
-# announce — Standard-строка статуса (работает без providerid).
-# auto = по клиенту (см. ниже); 1 = слать всем всегда; 0 = никогда.
-#
-# 2026-07-30, окончательно "auto". Механика проверена наблюдением на живых
-# подписках: sub-info активируется НЕ сразу (клиент валидирует providerid не
-# чаще раза в сутки, на каждой подписке отдельно), но доезжает до всех в
-# течение суток. Значит announce у Happ — временный дубль под блоком.
-#
-# ВАЖНО: "auto" ≠ "выключено". Для v2rayTun announce едет ВСЕГДА (см.
-# _announce_enabled в api_extensions.py): sub-info он не понимает вовсе, и
-# announce у него единственный способ показать статус и дать вход на
-# страницу. То есть auto = «Happ молчит, потому что у него есть блок;
-# v2rayTun говорит, потому что больше нечем».
-#
-# Цена: у только что добавленной подписки статуса нет до первой валидации
-# (до суток) — осознанный размен на отсутствие дубля. Если providerid
-# протухнет или Advanced-слой отвалится — сменить на "1" до починки.
-deploy_app_stack_sub_status_announce: "auto"
-
-# Страница «починить и продлить» без Telegram (эпик sub_fix_epic_2026_07_29).
-# Раскатка: сначала page=1 при entrypoints=off (проверить руками по ссылке),
-# затем entrypoints=support, потом pay=1 и entrypoints=all.
-deploy_app_stack_sub_fix_page: 1  # ВКЛ 2026-07-29: ступень 1 — страница отвечает, входы в клиенте ещё off
-deploy_app_stack_sub_fix_pay: 1  # ВКЛ 2026-07-29: продление картой (lava.top) прямо со страницы
-deploy_app_stack_sub_fix_entrypoints: "all"  # ВКЛ 2026-07-29: большая кнопка блока статуса «Не подключается?» ведёт на страницу (иконка поддержки оказалась слишком мелкой). sub-expire-кнопка уйдёт туда же, когда включим SUB_FIX_PAY
-deploy_app_stack_sub_fix_throttle_sec: 120
-deploy_app_stack_sub_fix_daily_max: 5
-deploy_app_stack_sub_fix_provider: "lava_top"

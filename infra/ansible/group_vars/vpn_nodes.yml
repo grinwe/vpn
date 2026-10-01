@@ -13,6 +13,7 @@ firewall_allowed_ports:
 # и ansible-прогон обратно её поднять не сможет.
 ssh_public_keys:
   - "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIE8IrzyHuBdSXDnBCE9XthETlDDrD4nsOqeubIt6oMkS provisioning@grinwer"
+domain_mask: "www.cloudflare.com"
 vless_enabled: true
 
 # Sharing enforcer daemon на ноде (install_sharing_enforcer role).

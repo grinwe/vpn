@@ -34,7 +34,6 @@
     name: [wireguard, wireguard-tools]
     state: present
     update_cache: yes
-    cache_valid_time: 3600
 
 # Many providers ship Ubuntu with UFW active and INPUT policy DROP,
 # allowing only SSH/HTTP(S). Without this rule, WG handshake packets

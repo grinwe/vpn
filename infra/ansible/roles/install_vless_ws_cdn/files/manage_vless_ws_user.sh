@@ -12,11 +12,6 @@ set -euo pipefail
 
 CONFIG="/usr/local/etc/xray/config_ws_cdn.json"
 INBOUND_TAG="vless-ws-cdn"
-# Сериализация параллельных вызовов через flock — тот же паттерн, что в
-# manage_vless_user.sh / manage_vless_xhttp_user.sh: без лока два
-# параллельных provision_device читают конфиг одновременно и запись
-# одного затирает юзера другого (lost update).
-LOCK="/var/lock/manage_vless_ws.lock"
 
 usage() { echo "Usage: $0 add <email> <uuid> | del <email>" >&2; exit 1; }
 
@@ -74,17 +69,14 @@ rewrite_routing() {
 cmd_add() {
   local email="$1" uuid="$2"
   local tmp; tmp=$(mktemp)
-  (
-    flock -w 30 200
-    jq --arg tag "${INBOUND_TAG}" --arg email "${email}" \
-       --arg uuid "${uuid}" \
-      '(.inbounds[] | select(.tag == $tag) | .settings.clients) |=
-        ((map(select(.email != $email))) + [{id: $uuid, email: $email}])' \
-      "${CONFIG}" >"${tmp}"
-    jq -e . "${tmp}" >/dev/null || { rm -f "${tmp}"; exit 1; }
-    mv "${tmp}" "${CONFIG}"; chmod 0640 "${CONFIG}"
-    rewrite_routing "${email}" "add"
-  ) 200>"${LOCK}"
+  jq --arg tag "${INBOUND_TAG}" --arg email "${email}" \
+     --arg uuid "${uuid}" \
+    '(.inbounds[] | select(.tag == $tag) | .settings.clients) |=
+      ((map(select(.email != $email))) + [{id: $uuid, email: $email}])' \
+    "${CONFIG}" >"${tmp}"
+  jq -e . "${tmp}" >/dev/null || { rm -f "${tmp}"; exit 1; }
+  mv "${tmp}" "${CONFIG}"; chmod 0640 "${CONFIG}"
+  rewrite_routing "${email}" "add"
   # NO_RESTART=1 skips the restart — caller restarts once after a batch.
   [[ "${NO_RESTART:-}" == "1" ]] || systemctl restart xray-ws-cdn
   echo "added ws-cdn user ${email}${EXIT_INTERFACE:+ via ${EXIT_INTERFACE}}"
@@ -93,16 +85,13 @@ cmd_add() {
 cmd_del() {
   local email="$1"
   local tmp; tmp=$(mktemp)
-  (
-    flock -w 30 200
-    jq --arg tag "${INBOUND_TAG}" --arg email "${email}" \
-      '(.inbounds[] | select(.tag == $tag) | .settings.clients) |=
-        map(select(.email != $email))' \
-      "${CONFIG}" >"${tmp}"
-    jq -e . "${tmp}" >/dev/null || { rm -f "${tmp}"; exit 1; }
-    mv "${tmp}" "${CONFIG}"; chmod 0640 "${CONFIG}"
-    rewrite_routing "${email}" "del"
-  ) 200>"${LOCK}"
+  jq --arg tag "${INBOUND_TAG}" --arg email "${email}" \
+    '(.inbounds[] | select(.tag == $tag) | .settings.clients) |=
+      map(select(.email != $email))' \
+    "${CONFIG}" >"${tmp}"
+  jq -e . "${tmp}" >/dev/null || { rm -f "${tmp}"; exit 1; }
+  mv "${tmp}" "${CONFIG}"; chmod 0640 "${CONFIG}"
+  rewrite_routing "${email}" "del"
   [[ "${NO_RESTART:-}" == "1" ]] || systemctl restart xray-ws-cdn
   echo "removed ws-cdn user ${email}"
 }

@@ -27,111 +27,18 @@
     fail_msg: >-
       install_hysteria2 requires hysteria2_port and hysteria2_domain.
 
-# hy2 — UDP/QUIC. bootstrap_node открывает только tcp 22/80/443, поэтому
-# UDP-порт hy2 надо открыть здесь, иначе на RU-хостах с restrictive INPUT
-# нода «здорова», а hy2 недоступен снаружи (и health-check это не заметит —
-# vpn_health_ports покрывает только TCP). Стиль/персист — как в bootstrap_node.
-- name: Ensure iptables ACCEPT for Hysteria2 UDP port at top of INPUT
-  ansible.builtin.iptables:
-    chain: INPUT
-    protocol: udp
-    destination_port: "{{ hysteria2_port | int }}"
-    jump: ACCEPT
-    action: insert
-    state: present
-  failed_when: false
-
-# Port-hopping: клиент шлёт UDP на случайные порты диапазона, мы DNAT'им весь
-# диапазон на hysteria2_port (:443, где реально слушает hysteria). Обход
-# ТСПУ-троттлинга по фикс-порту. Диапазон "start-end" (из config.settings.
-# port_hopping_range) → iptables хочет "start:end". DNAT в PREROUTING правит
-# dport ДО INPUT-фильтра, поэтому существующего ACCEPT на :443 достаточно —
-# отдельно диапазон в INPUT открывать не надо. Пусто = обычный одно-портовый hy2.
-# Сначала снимаем СТАРЫЕ правила хоппинга и только потом ставим актуальное:
-# правило матчится по диапазону, поэтому смена port_hopping_range (или его
-# отключение) оставляла прежний DNAT навсегда — а netfilter-persistent ниже
-# ещё и переживал его через ребут. Копились правила на все когда-либо
-# заданные диапазоны (аудит 2026-07-25). Ищем по comment'у, который сами же
-# и ставим; iptables-save|grep — потому что модуль iptables умеет удалять
-# только точно описанное правило.
-- name: Drop stale Hysteria2 port-hopping DNAT rules
-  ansible.builtin.shell: |
-    set -o pipefail
-    removed=0
-    # Актуальное правило (если хоппинг включён) не трогаем — иначе таска была
-    # бы вечно changed и на каждом прогоне пересоздавала DNAT.
-    keep_dport="{{ hysteria2_port_hopping_range | default('') | replace('-', ':') }}"
-    keep_dest=":{{ hysteria2_port | int }}"
-    while read -r rule; do
-      [ -n "$rule" ] || continue
-      if [ -n "$keep_dport" ] \
-         && [[ "$rule" == *"--dport $keep_dport "* ]] \
-         && [[ "$rule" == *"--to-destination $keep_dest"* ]]; then
-        continue
-      fi
-      # shellcheck disable=SC2086
-      if iptables -t nat -D PREROUTING ${rule#-A PREROUTING }; then
-        removed=$((removed + 1))
-      fi
-    done <<< "$(iptables-save -t nat | grep -F 'hy2-port-hopping' | grep '^-A PREROUTING' || true)"
-    echo "removed=$removed"
+- name: Install Hysteria2 from upstream
+  shell: |
+    set -euo pipefail
+    if command -v hysteria >/dev/null 2>&1; then
+      echo "hysteria already installed: $(hysteria version 2>&1 | head -n1)"
+      exit 0
+    fi
+    bash <(curl -fsSL https://get.hy2.sh/)
   args:
     executable: /bin/bash
-  register: _hy2_dnat_cleanup
-  changed_when: "'removed=0' not in _hy2_dnat_cleanup.stdout"
-  failed_when: false
-
-- name: Ensure Hysteria2 port-hopping DNAT (range → hysteria2_port)
-  ansible.builtin.iptables:
-    table: nat
-    chain: PREROUTING
-    protocol: udp
-    destination_port: "{{ hysteria2_port_hopping_range | replace('-', ':') }}"
-    jump: DNAT
-    to_destination: ":{{ hysteria2_port | int }}"
-    comment: hy2-port-hopping
-    action: append
-    state: present
-  when: hysteria2_port_hopping_range | default('') | length > 0
-  failed_when: false
-
-- name: Persist iptables rules across reboots (netfilter-persistent)
-  ansible.builtin.command: netfilter-persistent save
-  changed_when: false
-  failed_when: false
-
-- name: Ensure ufw allows Hysteria2 UDP port (no-op on inactive ufw)
-  community.general.ufw:
-    rule: allow
-    port: "{{ hysteria2_port | int }}"
-    proto: udp
-  failed_when: false
-
-# Установка/обновление самого бинаря вынесена в binary.yml: тот же файл
-# подключает playbooks/upgrade_hysteria.yml (точечный апгрейд без остальной
-# роли), поэтому логика доставки живёт в одном месте.
-- name: Install / refresh hysteria binary
-  ansible.builtin.include_tasks: binary.yml
-
-# Единый список РУ-зон/доменов для split-tunnel — тот же, что кормит три
-# xray-шаблона. Шаблон рендерит его в ACL-синтаксис hysteria (suffix:).
-# Без роли рендер упадёт на undefined.
-- name: Load shared RU-direct domain list
-  include_role:
-    name: ru_direct_list
-    # public: true — БЕЗ него defaults подключаемой роли не попадают в скоуп
-    # вызывающей (ansible.builtin.include_role: public=false по умолчанию), и
-    # рендер шаблона падает с AnsibleUndefinedVariable на КАЖДОЙ ноде.
-    public: true
-
-# geoip.dat: с 2026-07-28 ACL hysteria на relay-ноде ссылается на geoip:ru и
-# geoip:private, а файл берётся из /usr/local/share/xray (общий с xray, формат
-# один — v2ray geoip.dat). Роль идемпотентна (creates:-гард), на combo-нодах
-# это no-op. Ставим безусловно, а не только на relay: нода может стать relay
-# позже, и тогда файл уже будет на месте.
-- name: Provision geoip.dat fetcher + weekly refresh timer
-  include_role:
-    name: xray_geoip
+  register: hy2_install
+  changed_when: "'already installed' not in hy2_install.stdout"
 
 - name: Ensure Hysteria2 config directory
   file:
@@ -140,42 +47,6 @@
     owner: root
     group: root
     mode: '0750'
-
-# Сохраняем пер-юзерные учётки между прогонами роли — ровно как
-# install_vless_reality сохраняет clients из config.json. Шаблон рендерит
-# auth.userpass с нуля, т.е. КАЖДЫЙ прогон роли стирал всех юзеров ноды, а
-# компенсирующий resync_hy2 жил в бэкенде под `if success:` — падение play
-# ПОСЛЕ hy2-роли (а она с 2026-07-22 идёт первой среди протокольных, и сразу
-# за ней reality с громкими preflight-ассертами) оставляло hy2 мёртвым у всех
-# юзеров ноды до следующего успешного прогона. Теперь роль недеструктивна сама
-# по себе, в том числе при ручном прогоне мимо бэкенда (аудит 2026-07-25).
-- name: Check for existing Hysteria2 config
-  ansible.builtin.stat:
-    path: /etc/hysteria/config.yaml
-  register: hysteria2_existing_config
-
-- name: Slurp existing Hysteria2 config
-  ansible.builtin.slurp:
-    src: /etc/hysteria/config.yaml
-  register: hysteria2_existing_config_raw
-  when: hysteria2_existing_config.stat.exists
-
-- name: Extract existing Hysteria2 userpass entries
-  ansible.builtin.set_fact:
-    hysteria2_existing_userpass: >-
-      {{
-        (hysteria2_existing_config_raw.content | b64decode | from_yaml).auth.userpass
-        | default({})
-      }}
-  when: hysteria2_existing_config.stat.exists
-  # Битый/недописанный конфиг не должен ронять play: провалимся на пустую
-  # карту, а backend-resync до-льёт учётки после рендера (второй пояс).
-  ignore_errors: true
-
-- name: Default to empty userpass map on first bootstrap
-  ansible.builtin.set_fact:
-    hysteria2_existing_userpass: {}
-  when: hysteria2_existing_userpass is not defined
 
 - name: Render Hysteria2 server config
   template:
@@ -186,51 +57,6 @@
     mode: '0640'
     backup: yes
   notify: restart hysteria2
-
-# У hysteria нет `-test` (в отличие от xray), а сломанный конфиг виден только
-# как краш-луп в systemd — на volatile-journald RU-нодах причину потом не
-# восстановить. Проверяем то, что можно проверить статически: YAML парсится,
-# а на relay-ноде реально приехали split-tunnel секции с непустым bindDevice.
-# Без этой проверки опечатка в шаблоне выкатилась бы на весь флот молча.
-- name: Validate Hysteria2 config before starting
-  ansible.builtin.command:
-    argv:
-      - python3
-      - -c
-      - |
-        import os, sys, yaml
-        cfg = yaml.safe_load(open('/etc/hysteria/config.yaml')) or {}
-        if not cfg.get('auth', {}).get('userpass'):
-            sys.exit('hysteria config: пустой auth.userpass — будет краш-луп')
-        obs = {o.get('name') for o in cfg.get('outbounds') or []}
-        acl = cfg.get('acl', {}).get('inline') or []
-        if not obs and not acl:
-            sys.exit('hysteria config: нет ни outbounds, ни acl — приватные сети открыты клиенту')
-        if acl[0] != 'reject(geoip:private)':
-            sys.exit(f'hysteria config: первым ACL-правилом ждём reject(geoip:private), а не {acl[0]}')
-        used = {r.split('(', 1)[0] for r in acl} - {'reject'}
-        if not used <= obs:
-            sys.exit(f'hysteria config: ACL ссылается на несуществующие outbounds {used - obs}')
-        if 'tunnel' in obs:
-            # relay-нода: split-tunnel
-            if not {'tunnel', 'local'} <= obs:
-                sys.exit(f'hysteria config: ожидались outbounds tunnel+local, есть {obs}')
-            if cfg['outbounds'][0].get('name') != 'tunnel':
-                sys.exit('hysteria config: tunnel должен быть ПЕРВЫМ outbound (fail-safe)')
-            dev = cfg['outbounds'][0]['direct'].get('bindDevice')
-            if not dev:
-                sys.exit('hysteria config: у tunnel пустой bindDevice')
-            # hysteria v2 проверяет девайс на СТАРТЕ и уходит в Fatal, если его
-            # нет: ловим здесь, пока play ещё может сказать почему.
-            if not os.path.exists('/sys/class/net/' + dev):
-                sys.exit(f'hysteria config: bindDevice={dev} не существует на ноде')
-            if acl[-1] != 'tunnel(all)':
-                sys.exit(f'hysteria config: последнее ACL-правило должно быть tunnel(all), а не {acl[-1]}')
-        else:
-            # direct-нода: туннеля нет, но приватные сети всё равно закрыты
-            if acl[-1] != 'local(all)':
-                sys.exit(f'hysteria config: на direct-ноде последним ждём local(all), а не {acl[-1]}')
-  changed_when: false
 
 - name: Install Hysteria2 user management helper
   copy:

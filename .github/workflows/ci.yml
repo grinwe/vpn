@@ -2,17 +2,7 @@ name: CI
 
 on:
   pull_request:
-  # push гоняем только на основных ветках: коммиты в feature-ветку с
-  # открытым PR уже покрыты триггером pull_request, дублировать пайплайн
-  # (pytest+postgres, 4 docker build, ansible-lint) на каждый push смысла нет.
   push:
-    branches: [main, dev]
-
-# Отменяем устаревшие прогоны при серии пушей/пушей-в-PR: живым остаётся
-# только последний коммит на данной ветке/PR, старые сборки не доезжают впустую.
-concurrency:
-  group: ci-${{ github.ref }}
-  cancel-in-progress: true
 
 jobs:
   lint-test:
@@ -49,7 +39,7 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -r backend/requirements.txt -r backend/requirements-dev.txt pytest-cov ruff ansible ansible-lint
+          pip install -r backend/requirements.txt -r backend/requirements-dev.txt ruff ansible ansible-lint
       - name: Static analysis
         run: |
           ruff check backend bot probes
@@ -60,12 +50,8 @@ jobs:
         run: |
           python -m compileall backend bot probes
       - name: Integration tests (pytest + real postgres)
-        # --cov даёт видимость покрытия (term-missing показывает непокрытые
-        # строки прямо в логе). Жёсткий порог --cov-fail-under пока НЕ ставим:
-        # baseline снимаем с этого прогона и поднимаем планку по мере закрытия
-        # дыр (worker.py, api_webapp.py), чтобы CI не покраснел разом.
         run: |
-          cd backend && python -m pytest -v --cov=app --cov-report=term-missing tests/
+          cd backend && python -m pytest -v tests/
       - name: Build backend image
         run: docker build backend --tag backend:ci
       - name: Build worker image
@@ -74,33 +60,3 @@ jobs:
         run: docker build bot --tag bot:ci
       - name: Build probe image
         run: docker build probes --tag probe:ci
-
-  # Фронтенды (admin/ и webapp/) собираются отдельным job'ом: npm ci +
-  # `npm run build` (= tsc -b && vite build). Ловим TS-ошибки и битые
-  # импорты в React-коде на PR, а не в момент ansible-деплоя на прод.
-  frontend:
-    runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        app: [admin, webapp]
-    steps:
-      - uses: actions/checkout@v4
-      - name: Set up Node
-        uses: actions/setup-node@v4
-        with:
-          node-version: '20'
-          cache: npm
-          cache-dependency-path: ${{ matrix.app }}/package-lock.json
-      - name: Install dependencies
-        run: npm ci --no-audit --no-fund
-        working-directory: ${{ matrix.app }}
-      # Гейт хуков (react-hooks/rules-of-hooks = error): нарушение порядка
-      # хуков роняет весь React-экран в белый лист в рантайме, tsc его не
-      # ловит. Такой баг жил на проде 3.5 недели (Plans.tsx, 94b7ee5).
-      - name: Lint (react-hooks gate)
-        run: npm run lint
-        working-directory: ${{ matrix.app }}
-      - name: Type-check and build
-        run: npm run build
-        working-directory: ${{ matrix.app }}

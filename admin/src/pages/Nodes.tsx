@@ -1,60 +1,23 @@
-import { Fragment, useEffect, useState } from "react";
-import { Link, useSearchParams } from "react-router-dom";
-import {
-  keepPreviousData,
-  useMutation,
-  useQuery,
-  useQueryClient,
-} from "@tanstack/react-query";
+import { useEffect, useState } from "react";
+import { Link } from "react-router-dom";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   api,
   ApiError,
   NodeActiveUsersOut,
   NodeHealthOut,
   NodeHealthPingStatsOut,
-  NodeRefreshDestOut,
   NodeRelayLinkOut,
   NodeTrafficHistoryOut,
   ProvisioningTaskOut,
-  realityPoolForRegion,
   VPNConfigCreateIn,
   VPNConfigOut,
   VPNConfigProtocol,
   VPNConfigUpdateIn,
   VPNNodeCreateIn,
   VPNNodeOut,
-  refreshNodeRealityDest,
-  CloudProviderOut,
-  ProviderOfferings,
-  OfferingImage,
-  listCloudProviders,
-  getProviderOfferings,
-  spawnNode,
-  reinstallNode,
-  renewNode,
-  renewNodeCerts,
-  upgradeNodeXray,
-  upgradeNodeHysteria,
-  fetchVersionsOverview,
-  VersionsOverview,
-  updateNode,
-  listPools,
-  VPNNodeUpdateIn,
-  ServerPoolMini,
-  diagnosticsClose,
 } from "../api";
 import { HealthDots } from "../linkHealth";
-import { DiagnoseResult } from "../diagnoseResult";
-import {
-  diagnoseRelayLink,
-  disableNodeAutoDiagnose,
-  enableNodeAutoDiagnose,
-  diagnosticsDisable,
-  diagnosticsEnable,
-  diagnosticsMute,
-  DiagnoseCheckEntry,
-  DiagnoseMeta,
-} from "../api";
 import { WorkerHealthBadge } from "../workerHealth";
 
 // ── Tracked operation types ─────────────────────────────────────────
@@ -63,14 +26,9 @@ import { WorkerHealthBadge } from "../workerHealth";
 // is the full set to poll; the sub-arrays break down by phase.
 
 type TrackedOp = {
-  kind: "migration" | "bootstrap" | "resync" | "diagnose" | "diagnose_link" | "upgrade_xray" | "upgrade_hysteria";
+  kind: "migration" | "bootstrap" | "resync" | "diagnose";
   nodeId: number;
   nodeName: string;
-  // For kind=diagnose_link only — id of the RelayExitLink the diagnose was
-  // run against, so the banner can render the structured `checks` block
-  // out of task.result.checks (set by ansible role + orchestrator).
-  linkId?: number;
-  exitName?: string;
   taskIds: number[];
   revokeTaskIds: number[];
   deviceTaskIds: number[];
@@ -79,13 +37,6 @@ type TrackedOp = {
 };
 
 const LS_KEY = "vpn-admin-tracked-ops";
-
-// Grace-окно для задач, которых нет в ответе поллинга (не попали в срез
-// последних 500 — например, после массовой миграции создано >500 задач).
-// Пока op моложе этого порога, missing-задачи считаем pending (воркер ещё
-// мог их не создать). После порога — считаем «неизвестными» и терминальными,
-// иначе прогресс-баннер и поллинг зависают навсегда (см. audit #164).
-const MISSING_TASK_GRACE_MS = 30 * 60 * 1000;
 
 function loadTrackedOps(): TrackedOp[] {
   try {
@@ -132,232 +83,6 @@ function HealthBadge({ score, blocked }: { score: number | null; blocked: string
         </span>
       )}
     </span>
-  );
-}
-
-// Cert-бейдж: дней до истечения LE-серта (min по xhttp/ws-cdn конфигам ноды).
-// Пишет cert-renewal-тик внешней TLS-пробой. Пороги: >21д зелёный, 7-21д
-// жёлтый, <7д красный (тик авто-обновляет за CERT_RENEWAL_DAYS=21 до истечения,
-// так что красный = что-то мешает renewal → чинить). «—» = нет LE-сертов/не
-// пробовано.
-function CertBadge({ expiresAt }: { expiresAt: string | null }) {
-  if (!expiresAt)
-    return (
-      <span className="text-slate-600" title="LE-серт не пробован / нет xhttp·ws-cdn">
-        —
-      </span>
-    );
-  const days = Math.floor((new Date(expiresAt).getTime() - Date.now()) / 86400000);
-  const color = days > 21 ? "bg-emerald-700" : days >= 7 ? "bg-yellow-700" : "bg-red-700";
-  return (
-    <span
-      className={`text-xs px-1.5 py-0.5 rounded font-mono ${color}`}
-      title={`LE-серт истекает ${new Date(expiresAt).toLocaleString()}`}
-    >
-      {days}д
-    </span>
-  );
-}
-
-// Бейдж дрейфа версии xray: сверяет то, что реально стоит на ноде
-// (tick-node-versions снимает по SSH), с пином в роли xray_core. Отдельной
-// колонки намеренно нет — таблица уже упёрлась в ширину, поэтому бейдж живёт
-// в ячейке Cert, а подробности (версия нашего кода на ноде, когда опрашивали)
-// — в раскрытой строке.
-function XrayVersionBadge({
-  version,
-  pinned,
-  checkedAt,
-}: {
-  version: string | null;
-  pinned: string | null;
-  checkedAt: string | null;
-}) {
-  const strip = (v: string | null) => (v ? v.replace(/^v/, "") : null);
-  if (!version)
-    return (
-      <span
-        className="text-xs px-1 py-0.5 rounded bg-slate-800 text-slate-500"
-        title={
-          checkedAt
-            ? `Опрашивали ${new Date(checkedAt).toLocaleString()}, версию xray не прочитали`
-            : "Ноду ещё ни разу не опрашивали (tick-node-versions)"
-        }
-      >
-        xray —
-      </span>
-    );
-  const drift = !!pinned && strip(version) !== strip(pinned);
-  return (
-    <span
-      className={`text-xs px-1 py-0.5 rounded font-mono ${
-        drift ? "bg-yellow-700" : "bg-emerald-800"
-      }`}
-      title={
-        (drift
-          ? `На ноде ${version}, целевая версия ${pinned}`
-          : `xray ${version} — совпадает с пином`) +
-        (checkedAt ? `\nПроверено ${new Date(checkedAt).toLocaleString()}` : "")
-      }
-    >
-      {strip(version)}
-    </span>
-  );
-}
-
-// Панель версий в раскрытой строке ноды: что стоит по факту, что должно
-// стоять, какой версией нашего кода нода прошита и когда это выяснялось.
-// Кнопка «Обновить xray» гоняет только роль xray_core (~30-60с против 5-8
-// минут полного бутстрапа) — рестарт xray рвёт живые соединения примерно на
-// 100 мс, клиенты переподключаются сами.
-function NodeVersionsPanel({
-  node,
-  pinnedXray,
-  pinnedHysteria,
-  appVersion,
-  addOp,
-}: {
-  node: VPNNodeOut;
-  pinnedXray: string | null;
-  pinnedHysteria: string | null;
-  appVersion: string | null;
-  addOp: (op: TrackedOp) => void;
-}) {
-  const qc = useQueryClient();
-  const strip = (v: string | null) => (v ? v.replace(/^v/, "") : null);
-  const xrayDrift =
-    !!node.xray_version && !!pinnedXray &&
-    strip(node.xray_version) !== strip(pinnedXray);
-  const hy2Drift =
-    !!node.hysteria_version && !!pinnedHysteria &&
-    strip(node.hysteria_version) !== strip(pinnedHysteria);
-  const releaseDrift =
-    !!node.release_version && !!appVersion && node.release_version !== appVersion;
-
-  const upgrade = useMutation({
-    mutationFn: () => upgradeNodeXray(node.id),
-    onSuccess: (res) => {
-      addOp({
-        kind: "upgrade_xray",
-        nodeId: node.id,
-        nodeName: node.name,
-        taskIds: [res.task_id],
-        revokeTaskIds: [],
-        deviceTaskIds: [],
-        resyncTaskIds: [res.task_id],
-        startedAt: Date.now(),
-      });
-      qc.invalidateQueries({ queryKey: ["nodes"] });
-      qc.invalidateQueries({ queryKey: ["provisioning-tasks"] });
-    },
-    onError: (e) => alert(`Не удалось запустить апгрейд: ${String(e)}`),
-  });
-
-  const upgradeHy2 = useMutation({
-    mutationFn: () => upgradeNodeHysteria(node.id),
-    onSuccess: (res) => {
-      addOp({
-        kind: "upgrade_hysteria",
-        nodeId: node.id,
-        nodeName: node.name,
-        taskIds: [res.task_id],
-        revokeTaskIds: [],
-        deviceTaskIds: [],
-        resyncTaskIds: [res.task_id],
-        startedAt: Date.now(),
-      });
-      qc.invalidateQueries({ queryKey: ["nodes"] });
-      qc.invalidateQueries({ queryKey: ["provisioning-tasks"] });
-    },
-    onError: (e) => alert(`Не удалось запустить апгрейд: ${String(e)}`),
-  });
-
-  const row = (label: string, value: string | null, drift: boolean, hint: string) => (
-    <div className="flex items-baseline gap-2">
-      <span className="text-slate-400 w-32 shrink-0">{label}</span>
-      <span
-        className={`font-mono ${drift ? "text-yellow-400" : "text-slate-200"}`}
-        title={hint}
-      >
-        {value ?? "—"}
-      </span>
-    </div>
-  );
-
-  return (
-    <section className="rounded border border-slate-800 p-3">
-      <div className="flex items-center justify-between mb-2">
-        <h3 className="font-semibold">Версии</h3>
-        <div className="flex items-center gap-2">
-          <button
-            onClick={() => {
-              if (
-                !window.confirm(
-                  `Обновить xray на ${node.name} до ${pinnedXray ?? "целевой версии"}?\n` +
-                    "Рестарт ядра разорвёт активные соединения на ~100 мс.",
-                )
-              )
-                return;
-              upgrade.mutate();
-            }}
-            disabled={upgrade.isPending}
-            className="text-xs px-2 py-1 rounded bg-slate-800 hover:bg-slate-700 disabled:opacity-50"
-          >
-            {upgrade.isPending ? "Запускаю…" : "Обновить xray"}
-          </button>
-          {/* Отдельная кнопка, а не «обновить всё»: hy2 — другой демон, и его
-              рестарт рвёт QUIC-сессии заметнее, чем 100 мс у xray. На нодах без
-              hy2 прячем — обновлять там нечего. */}
-          {node.hysteria_version && (
-            <button
-              onClick={() => {
-                if (
-                  !window.confirm(
-                    `Обновить hysteria на ${node.name} до ${pinnedHysteria ?? "целевой версии"}?\n` +
-                      "Рестарт демона разорвёт активные QUIC-сессии.",
-                  )
-                )
-                  return;
-                upgradeHy2.mutate();
-              }}
-              disabled={upgradeHy2.isPending}
-              className="text-xs px-2 py-1 rounded bg-slate-800 hover:bg-slate-700 disabled:opacity-50"
-            >
-              {upgradeHy2.isPending ? "Запускаю…" : "Обновить hysteria"}
-            </button>
-          )}
-        </div>
-      </div>
-      <div className="text-sm space-y-1">
-        {row("xray на ноде", node.xray_version, xrayDrift, "Снимает tick-node-versions по SSH")}
-        {row("xray целевая", pinnedXray, false, "xray_core_version в роли; меняется коммитом")}
-        {row(
-          "hysteria на ноде",
-          node.hysteria_version,
-          hy2Drift,
-          "Отдельный демон hysteria-server — снимает тот же тик",
-        )}
-        {row(
-          "hysteria целевая",
-          pinnedHysteria,
-          false,
-          "hysteria2_version в роли install_hysteria2; меняется коммитом",
-        )}
-        {row(
-          "код на ноде",
-          node.release_version,
-          releaseDrift,
-          "Маркер /etc/vpn-node-release.json — пишется бутстрапом после успеха всех ролей",
-        )}
-        {row("код у нас", appVersion, false, "Файл VERSION в репозитории")}
-      </div>
-      <p className="text-xs text-slate-500 mt-2">
-        {node.versions_checked_at
-          ? `Проверено ${new Date(node.versions_checked_at).toLocaleString()}`
-          : "Ноду ещё ни разу не опрашивали (tick-node-versions, раз в час)"}
-        {releaseDrift && " · нода прошита старой версией кода — нужен полный бутстрап"}
-      </p>
-    </section>
   );
 }
 
@@ -415,264 +140,7 @@ function CooldownBadge({ until }: { until: string | null }) {
   );
 }
 
-// Reconciler-видимость: нода помечена dirty (desired > reconciled), но прогон
-// отложен на reconcile-тик. Без этого бейджа операторское действие при
-// включённом RECONCILER_ENABLED выглядит как «ничего не произошло» — таска
-// появляется только когда тик сойдёт ноду. due — когда тик её подхватит.
-function ReconcilePendingBadge({
-  pending,
-  due,
-}: {
-  pending: boolean;
-  due: string | null;
-}) {
-  if (!pending) return null;
-  const ms = due ? new Date(due).getTime() - Date.now() : 0;
-  const label = !due
-    ? "queued"
-    : ms > 0
-      ? `через ${Math.max(1, Math.round(ms / 1000))}s`
-      : "now";
-  return (
-    <span
-      className="text-xs px-1 py-0.5 rounded bg-amber-900 text-amber-300"
-      title={
-        due
-          ? `reconcile подхватит ноду ~${new Date(due).toLocaleString()}`
-          : "ноде нужен reconcile (поставлена в очередь тика)"
-      }
-    >
-      ⏳ reconcile {label}
-    </span>
-  );
-}
-
-function NodeMuteToggle({
-  nodeId,
-  disabledAt,
-}: {
-  nodeId: number;
-  disabledAt: string | null | undefined;
-}) {
-  const qc = useQueryClient();
-  const isDisabled = !!disabledAt;
-  const mutation = useMutation({
-    mutationFn: () =>
-      isDisabled
-        ? enableNodeAutoDiagnose(nodeId)
-        : disableNodeAutoDiagnose(nodeId),
-    onSuccess: () => {
-      // Без confirm-диалога — клик мгновенный. Эффект сразу виден через
-      // invalidate nodes-list query (и node-relay-links для согласованности).
-      qc.invalidateQueries({ queryKey: ["nodes"] });
-      qc.invalidateQueries({ queryKey: ["node-relay-links"] });
-    },
-    onError: (e: Error) => alert(`Не удалось переключить mute: ${e.message}`),
-  });
-  return (
-    <button
-      onClick={() => mutation.mutate()}
-      disabled={mutation.isPending}
-      title={
-        isDisabled
-          ? "Auto-trigger + Telegram-алёрты ноды отключены — клик включит"
-          : "Mute: отключает smart-диагностику ВСЕХ link'ов этой ноды + глушит Telegram-алёрты по этой ноде"
-      }
-      className={
-        "text-xs px-2 py-1 rounded disabled:opacity-50 " +
-        (isDisabled
-          ? "bg-emerald-700 hover:bg-emerald-600 text-white"
-          : "bg-slate-700 hover:bg-slate-600 text-slate-200")
-      }
-    >
-      {mutation.isPending ? "…" : isDisabled ? "🔔 unmute" : "🔕 mute"}
-    </button>
-  );
-}
-
-// Hard-stop ВСЕХ diagnose-тасок ноды (api/diagnostics.py disable/enable).
-// Отдельно от NodeMuteToggle: тот глушит smart-триггер+Telegram, этот —
-// полностью запрещает любую диагностику (ручную и авто) до явного enable.
-function NodeDiagnosticsToggle({
-  nodeId,
-  disabledAt,
-}: {
-  nodeId: number;
-  disabledAt: string | null | undefined;
-}) {
-  const qc = useQueryClient();
-  const isDisabled = !!disabledAt;
-  const mutation = useMutation({
-    mutationFn: () =>
-      isDisabled
-        ? diagnosticsEnable("node", nodeId)
-        : diagnosticsDisable("node", nodeId),
-    onSuccess: () => qc.invalidateQueries({ queryKey: ["nodes"] }),
-    onError: (e: Error) =>
-      alert(`Не удалось переключить диагностику: ${e.message}`),
-  });
-  return (
-    <button
-      onClick={() => mutation.mutate()}
-      disabled={mutation.isPending}
-      title={
-        isDisabled
-          ? "Диагностика ноды выключена (hard-stop всех diagnose-тасок) — клик включит"
-          : "Hard-stop: полностью запретить любую диагностику ноды (ручную и авто) до явного включения"
-      }
-      className={
-        "text-xs px-2 py-1 rounded disabled:opacity-50 " +
-        (isDisabled
-          ? "bg-emerald-700 hover:bg-emerald-600 text-white"
-          : "bg-slate-700 hover:bg-slate-600 text-slate-200")
-      }
-    >
-      {mutation.isPending
-        ? "…"
-        : isDisabled
-          ? "🛠 диагностика on"
-          : "🛠 диагностика off"}
-    </button>
-  );
-}
-
-// Глушит Telegram-алёрты ноды на 24ч (api/diagnostics.py mute, hours>0)
-// или снимает mute (hours=0). Состояние — n.alerts_muted_until.
-function NodeAlertsMuteToggle({
-  nodeId,
-  mutedUntil,
-}: {
-  nodeId: number;
-  mutedUntil: string | null | undefined;
-}) {
-  const qc = useQueryClient();
-  // mute активен только если until ещё в будущем.
-  const isMuted = !!mutedUntil && Date.parse(mutedUntil) > Date.now();
-  const mutation = useMutation({
-    mutationFn: () => diagnosticsMute("node", nodeId, isMuted ? 0 : 24),
-    onSuccess: () => qc.invalidateQueries({ queryKey: ["nodes"] }),
-    onError: (e: Error) => alert(`Не удалось переключить mute алёртов: ${e.message}`),
-  });
-  return (
-    <button
-      onClick={() => mutation.mutate()}
-      disabled={mutation.isPending}
-      title={
-        isMuted
-          ? `Telegram-алёрты заглушены до ${new Date(mutedUntil as string).toLocaleString()} — клик снимет mute`
-          : "Заглушить Telegram-алёрты ноды на 24 часа"
-      }
-      className={
-        "text-xs px-2 py-1 rounded disabled:opacity-50 " +
-        (isMuted
-          ? "bg-amber-700 hover:bg-amber-600 text-white"
-          : "bg-slate-700 hover:bg-slate-600 text-slate-200")
-      }
-    >
-      {mutation.isPending
-        ? "…"
-        : isMuted
-          ? "🔔 unmute алёрты"
-          : "🔕 alerts mute 24ч"}
-    </button>
-  );
-}
-
-function AutoDiagnoseBadge({
-  at,
-  taskId,
-  symptom,
-}: {
-  at: string;
-  taskId: number | null;
-  symptom: string | null;
-}) {
-  // Возраст последнего auto-trigger'а в человеко-читаемом виде.
-  // Backend tick — раз в 5 мин, debounce — 30 мин на link, так что
-  // практический диапазон тут — минуты-часы, не дни.
-  const ageMs = Date.now() - new Date(at).getTime();
-  const ageMin = Math.max(0, Math.round(ageMs / 60_000));
-  const label =
-    ageMin < 60 ? `${ageMin} мин назад` : `${Math.round(ageMin / 60)} ч назад`;
-  const tooltip = `Автодиагностика по симптому "${symptom ?? "?"}" в ${new Date(at).toLocaleString()}. Клик → задача в /tasks.`;
-  const badge = (
-    <span
-      title={tooltip}
-      className="inline-flex items-center gap-1 text-[10px] px-1.5 py-0.5 rounded bg-amber-900/60 border border-amber-700 text-amber-200"
-    >
-      ⚙ авто {label}
-    </span>
-  );
-  if (taskId) {
-    return (
-      <Link to={`/tasks?id=${taskId}`} className="hover:opacity-80">
-        {badge}
-      </Link>
-    );
-  }
-  return badge;
-}
-
-function LinkDiagnoseButton({
-  linkId,
-  exitName,
-  nodeId,
-  nodeName,
-  addOp,
-}: {
-  linkId: number;
-  exitName: string;
-  nodeId: number;
-  nodeName: string;
-  addOp: (op: TrackedOp) => void;
-}) {
-  const [busy, setBusy] = useState(false);
-  async function handleClick() {
-    if (busy) return;
-    setBusy(true);
-    try {
-      // V1: дефолтный набор check_types (роль возьмёт свои defaults).
-      // Multi-select UI добавим в V1.1 — сейчас один клик → весь набор.
-      const res = await diagnoseRelayLink(linkId);
-      addOp({
-        kind: "diagnose_link",
-        nodeId,
-        nodeName,
-        linkId,
-        exitName,
-        taskIds: [res.task_id],
-        revokeTaskIds: [],
-        deviceTaskIds: [],
-        resyncTaskIds: [],
-        startedAt: Date.now(),
-      });
-    } catch (e) {
-      alert(`Не удалось запустить diagnose: ${(e as Error).message}`);
-    } finally {
-      setBusy(false);
-    }
-  }
-  return (
-    <button
-      onClick={handleClick}
-      disabled={busy}
-      title="Прогнать read-only диагностику WG-линка: peer, handshake, ping, curl, xray-port"
-      className="text-[10px] px-2 py-0.5 rounded bg-indigo-700 hover:bg-indigo-600 disabled:opacity-50"
-    >
-      {busy ? "…" : "Диагностировать"}
-    </button>
-  );
-}
-
-function RelayLinksSection({
-  nodeId,
-  nodeName,
-  addOp,
-}: {
-  nodeId: number;
-  nodeName: string;
-  addOp: (op: TrackedOp) => void;
-}) {
+function RelayLinksSection({ nodeId }: { nodeId: number }) {
   const { data, isLoading, error } = useQuery<NodeRelayLinkOut[]>({
     queryKey: ["node-relay-links", nodeId],
     queryFn: () => api.get(`/nodes/${nodeId}/links`),
@@ -706,7 +174,6 @@ function RelayLinksSection({
             <th className="text-left py-1 px-2">Creds</th>
             <th className="text-left py-1 px-2">Public key</th>
             <th className="text-left py-1 px-2">Создан</th>
-            <th className="text-left py-1 px-2">Диагностика</th>
           </tr>
         </thead>
         <tbody>
@@ -726,22 +193,6 @@ function RelayLinksSection({
               <td className="py-1 px-2 text-slate-400">
                 {new Date(l.created_at).toLocaleString()}
               </td>
-              <td className="py-1 px-2 space-y-1">
-                <LinkDiagnoseButton
-                  linkId={l.link_id}
-                  exitName={l.exit_name}
-                  nodeId={nodeId}
-                  nodeName={nodeName}
-                  addOp={addOp}
-                />
-                {l.last_auto_diagnose_at && (
-                  <AutoDiagnoseBadge
-                    at={l.last_auto_diagnose_at}
-                    taskId={l.last_auto_diagnose_task_id ?? null}
-                    symptom={l.last_auto_diagnose_symptom ?? null}
-                  />
-                )}
-              </td>
             </tr>
           ))}
         </tbody>
@@ -749,10 +200,7 @@ function RelayLinksSection({
       <p className="text-slate-500 mt-2">
         Это relay-нода: трафик клиентов туннелируется через wgN в соответствующий
         exit. Распределение creds по линкам — least-loaded (см. G.4 в{" "}
-        <code>docs/RELAY_ROADMAP.md</code>). Кнопка «Диагностировать» —
-        read-only прогон <code>diagnose_relay_link.yml</code>: peer на jump,
-        handshake age, ping/curl через WG, xray port. Прогресс и результат —
-        в баннере наверху страницы.
+        <code>docs/RELAY_ROADMAP.md</code>).
       </p>
     </div>
   );
@@ -825,81 +273,13 @@ function statusColor(status: string) {
 }
 
 export default function Nodes() {
-  // Какая нода показывает меню действий (одна за раз — иначе на узком экране
-  // выпадашки наезжают друг на друга).
-  const [actionsFor, setActionsFor] = useState<number | null>(null);
-  useEffect(() => {
-    if (actionsFor === null) return;
-    const onKey = (e: KeyboardEvent) => e.key === "Escape" && setActionsFor(null);
-    // Клик мимо меню закрывает его: иначе выпадашка живёт до повторного тапа
-    // по «⋯», перекрывая соседние строки.
-    const onClick = () => setActionsFor(null);
-    window.addEventListener("keydown", onKey);
-    window.addEventListener("click", onClick);
-    return () => {
-      window.removeEventListener("keydown", onKey);
-      window.removeEventListener("click", onClick);
-    };
-  }, [actionsFor]);
   const [createOpen, setCreateOpen] = useState(false);
-  const [orderOpen, setOrderOpen] = useState(false);
-  // Раскрытая нода живёт в URL (?node=<id>), а не в локальном state — тогда
-  // авто-refetch списка и F5/навигация не схлопывают открытую карточку
-  // (раньше каждый poll выглядел так, будто «вкладки прыгают»).
-  const [searchParams, setSearchParams] = useSearchParams();
-  const expandedNodeId = searchParams.has("node")
-    ? Number(searchParams.get("node"))
-    : null;
-  const setExpandedNodeId = (id: number | null) => {
-    setSearchParams(
-      (prev) => {
-        const next = new URLSearchParams(prev);
-        if (id == null) next.delete("node");
-        else next.set("node", String(id));
-        return next;
-      },
-      { replace: true },
-    );
-  };
+  const [expandedNodeId, setExpandedNodeId] = useState<number | null>(null);
   const [trackedOps, setTrackedOps] = useState<TrackedOp[]>(loadTrackedOps);
   const [migrateToModal, setMigrateToModal] = useState<
     { from_id: number; from_name: string } | null
   >(null);
-  const [refreshDestModal, setRefreshDestModal] = useState<{
-    node_id: number;
-    node_name: string;
-    node_region: string | null;
-  } | null>(null);
-  const [editNode, setEditNode] = useState<VPNNodeOut | null>(null);
   const qc = useQueryClient();
-
-  // Пулы для дропдауна правки ноды (id+name). Может быть пусто, если пулы
-  // ещё не заведены — тогда в форме только «— без пула —».
-  const pools = useQuery<ServerPoolMini[]>({
-    queryKey: ["pools"],
-    queryFn: listPools,
-  });
-
-  const updateNodeMut = useMutation({
-    mutationFn: ({ id, payload }: { id: number; payload: VPNNodeUpdateIn }) =>
-      updateNode(id, payload),
-    onSuccess: () => {
-      qc.invalidateQueries({ queryKey: ["nodes"] });
-      setEditNode(null);
-    },
-    onError: (e: Error) => {
-      const extra =
-        e instanceof ApiError && typeof e.detail === "string"
-          ? `\n\n${e.detail}`
-          : e instanceof ApiError &&
-              typeof e.detail === "object" &&
-              e.detail &&
-              "detail" in e.detail
-            ? `\n\n${(e.detail as { detail?: string }).detail}`
-            : "";
-      alert(`Не удалось сохранить: ${e.message}${extra}`);
-    },
-  });
 
   // Sync tracked ops from localStorage whenever the component mounts
   // or regains focus (navigate away → back). The storage event fires
@@ -923,53 +303,11 @@ export default function Nodes() {
     setTrackedOps(loadTrackedOps());
   }
 
-  // Один общий поллинг задач на ВСЕ баннеры прогресса. Раньше каждый
-  // OperationProgressBanner поднимал свой useQuery с уникальным ключом и
-  // безусловным refetchInterval=3с — N баннеров давали N параллельных
-  // запросов по 500 задач (с полными ansible-логами в result) часами,
-  // даже когда всё давно завершилось. Теперь запрос один, и интервал
-  // отключается, когда все отслеживаемые задачи в терминальном статусе
-  // (тот же приём, что в BatchProgressDrawer в Exits.tsx).
-  const trackedTasksQuery = useQuery<ProvisioningTaskOut[]>({
-    queryKey: ["provisioning-tasks", "tracked-ops"],
-    queryFn: () => api.get("/provisioning/tasks?limit=500"),
-    enabled: trackedOps.length > 0,
-    retry: false,
-    refetchInterval: (q) => {
-      if (q.state.error) return false;
-      const tasks = q.state.data;
-      if (!tasks) return 3_000;
-      const statusById = new Map(tasks.map((t) => [t.id, t.status]));
-      // Задача «живая», пока она pending/running или ещё не попала в
-      // окно последних 500 (воркер не успел её создать/подхватить). Но
-      // missing-задачу держим «живой» только внутри grace-окна — иначе
-      // задача, навсегда выпавшая из среза last-500, крутила бы поллинг
-      // бесконечно (audit #164).
-      const now = Date.now();
-      const live = trackedOps.some((op) => {
-        const withinGrace = now - op.startedAt <= MISSING_TASK_GRACE_MS;
-        return op.taskIds.some((id) => {
-          const st = statusById.get(id);
-          if (st === "pending" || st === "running") return true;
-          if (st === undefined) return withinGrace;
-          return false;
-        });
-      });
-      return live ? 3_000 : false;
-    },
-  });
-
   const setActive = useMutation({
     mutationFn: ({ id, is_active }: { id: number; is_active: boolean }) =>
       api.post<VPNNodeOut>(`/nodes/${id}/active`, { is_active }),
     onSuccess: () => qc.invalidateQueries({ queryKey: ["nodes"] }),
     onError: (e: Error) => alert(`Не удалось изменить флаг: ${e.message}`),
-  });
-
-  const closeIncident = useMutation({
-    mutationFn: (id: number) => diagnosticsClose("node", id),
-    onSuccess: () => qc.invalidateQueries({ queryKey: ["nodes"] }),
-    onError: (e: Error) => alert(`Не удалось закрыть инцидент: ${e.message}`),
   });
 
   const resync = useMutation({
@@ -1172,113 +510,60 @@ export default function Nodes() {
     onError: (e: Error) => alert(`Не удалось запустить bootstrap: ${e.message}`),
   });
 
-  // Перезагрузка сервера без захода в панель хостера: cloud-нода → hard-reboot
-  // через API провайдера (даже если зависла), иначе/при сбое — graceful по SSH.
-  const reboot = useMutation({
-    mutationFn: (node: { id: number; name: string }) =>
-      api
-        .post<{ node_id: number; method: string }>(`/nodes/${node.id}/reboot`, {})
-        .then((res) => ({ ...res, nodeName: node.name })),
-    onSuccess: (res) => {
-      alert(
-        `Нода #${res.node_id} (${res.nodeName}): команда reboot отправлена ` +
-          `(${res.method === "api" ? "API хостера" : "SSH"}). Поднимется через ~1 мин.`,
-      );
-      qc.invalidateQueries({ queryKey: ["nodes"] });
-    },
-    onError: (e: Error) => alert(`Не удалось перезагрузить: ${e.message}`),
-  });
-
-  // Переустановка ОС через API провайдера (только cloud-ноды). IP сохраняется,
-  // поэтому reality-ключи и sub-токены остаются валидны; после reinstall бэк
-  // сам перекатывает site.yml.
-  const reinstall = useMutation({
-    mutationFn: (args: { id: number; image: string | null }) =>
-      reinstallNode(args.id, args.image),
-    onSuccess: () => {
-      qc.invalidateQueries({ queryKey: ["nodes"] });
-      qc.invalidateQueries({ queryKey: ["provisioning-tasks"] });
-    },
-    onError: (e: Error) => alert(`Не удалось переустановить ОС: ${e.message}`),
-  });
-
-  // Ручное продление аренды cloud-ноды (autoprolong делает это автоматически;
-  // кнопка — на случай выключенного autoprolong / форс-продления).
-  const renew = useMutation({
-    mutationFn: (id: number) => renewNode(id),
-    onSuccess: () => alert("Нода продлена у провайдера."),
-    onError: (e: Error) => alert(`Не удалось продлить: ${e.message}`),
-  });
-
   // Smart delete: walk the 409 → migrate → delete path so admins can
   // remove a node without poking migrate first. Cloud-provisioned nodes
   // still go through /destroy (teardown playbook + VPS deprovision);
   // only raw DB rows take the migrate-then-delete branch.
-  // «Удалить из панели» — ВСЕГДА убирает ЗАПИСЬ ноды (DELETE). Хостер НЕ трогается
-  // (для этого отдельная кнопка «уничтожить у хостера»). 409 active_subs →
-  // предложить переселить-и-удалить; 409 live_vm → у cloud-ноды живой VPS, спросить
-  // и удалить запись через force (VPS при этом НЕ уничтожается).
   const deleteNode = useMutation({
-    mutationFn: async (node: { id: number; name: string }) => {
-      const tryDelete = (force = false) =>
+    mutationFn: async (node: { id: number; name: string; provider_id: number | null }) => {
+      if (node.provider_id) {
+        return api.post<{ node_id: number }>(`/nodes/${node.id}/destroy`, {});
+      }
+
+      const tryDelete = () =>
         api.del<{
           node_id: number;
           deleted: boolean;
           warm_credentials_deleted?: number;
           bound_credentials_detached?: number;
-        }>(`/nodes/${node.id}${force ? "?force=true" : ""}`);
+        }>(`/nodes/${node.id}`);
 
       try {
         return await tryDelete();
       } catch (err) {
         if (!(err instanceof ApiError) || err.status !== 409) throw err;
-        const detail = err.detail as
-          | { error?: string; active_subs?: number; message?: string }
-          | string;
-        if (typeof detail !== "object") throw err;
+        const detail = err.detail as { error?: string; active_subs?: number } | string;
+        if (typeof detail !== "object" || detail.error !== "active_subs") throw err;
 
-        if (detail.error === "active_subs") {
-          const n = detail.active_subs ?? 0;
-          const confirmed = window.confirm(
-            `На ноде "${node.name}" ещё ${n} активных подписок.\n\n` +
-              `Перенести их на другие ноды (как при обычном переселении), а затем удалить?\n\n` +
-              `OK — перенести и удалить.\nОтмена — ничего не делать.`,
+        const n = detail.active_subs ?? 0;
+        const confirmed = window.confirm(
+          `На ноде "${node.name}" ещё ${n} активных/замороженных подписок.\n\n` +
+            `Перенести их на другие ноды (как при обычном переселении), а затем удалить?\n\n` +
+            `OK — перенести и удалить.\nОтмена — ничего не делать.`,
+        );
+        if (!confirmed) throw new Error("отменено пользователем");
+
+        // /migrate kicks off per-sub migrations synchronously at DB level
+        // (subscription.node_id flips immediately), so on return the node
+        // has zero active subs and DELETE can proceed. The device task
+        // fan-out continues in background — doesn't block node removal.
+        const mig = await api.post<{
+          node_id: number;
+          migrated_subscriptions: number[];
+          task_ids: number[];
+          considered_count: number;
+          no_target_count: number;
+        }>(`/nodes/${node.id}/migrate`, {});
+        if (mig.no_target_count > 0 && mig.migrated_subscriptions.length === 0) {
+          throw new Error(
+            `Не удалось выбрать целевую ноду ни для одной из ${mig.considered_count} ` +
+              `подписок — все остальные ноды в cooldown/unhealthy/вне пула. ` +
+              `Разберись с остальными нодами и повтори.`,
           );
-          if (!confirmed) throw new Error("отменено пользователем");
-
-          // /migrate flips subscription.node_id synchronously at DB level, so on
-          // return the node has zero active subs and DELETE can proceed.
-          const mig = await api.post<{
-            node_id: number;
-            migrated_subscriptions: number[];
-            task_ids: number[];
-            considered_count: number;
-            no_target_count: number;
-          }>(`/nodes/${node.id}/migrate`, {});
-          if (mig.no_target_count > 0 && mig.migrated_subscriptions.length === 0) {
-            throw new Error(
-              `Не удалось выбрать целевую ноду ни для одной из ${mig.considered_count} ` +
-                `подписок — все остальные ноды в cooldown/unhealthy/вне пула. ` +
-                `Разберись с остальными нодами и повтори.`,
-            );
-          }
-          qc.invalidateQueries({ queryKey: ["user-subs"] });
-          qc.invalidateQueries({ queryKey: ["provisioning-tasks"] });
-          return tryDelete();
         }
-
-        if (detail.error === "live_vm") {
-          const ok = window.confirm(
-            `У ноды "${node.name}" возможно ещё ЖИВОЙ VPS у хостера.\n\n` +
-              `Удалить ТОЛЬКО запись из панели? VPS НЕ будет уничтожен — для этого ` +
-              `жми «уничтожить у хостера».\n\n` +
-              `OK — удалить запись (force).\nОтмена — ничего.`,
-          );
-          if (!ok) throw new Error("отменено пользователем");
-          return tryDelete(true);
-        }
-
-        throw err;
+        qc.invalidateQueries({ queryKey: ["user-subs"] });
+        qc.invalidateQueries({ queryKey: ["provisioning-tasks"] });
+        return tryDelete();
       }
     },
     onSuccess: (res) => {
@@ -1300,24 +585,6 @@ export default function Nodes() {
           : "";
       alert(`Не удалось удалить: ${e.message}${extra}`);
     },
-  });
-
-  // «Уничтожить у хостера» — только VPS у провайдера (destroy_server) + нода →
-  // disabled. ЗАПИСЬ в панели остаётся (убрать отдельно «удалить из панели»).
-  const destroyAtHoster = useMutation({
-    mutationFn: (node: { id: number }) =>
-      api.post<{ node_id: number; status: string }>(
-        `/nodes/${node.id}/destroy`,
-        {},
-      ),
-    onSuccess: () => {
-      qc.invalidateQueries({ queryKey: ["nodes"] });
-      alert(
-        "VPS уничтожен у хостера, нода → disabled. Запись осталась в панели — " +
-          "убери отдельно кнопкой «удалить из панели».",
-      );
-    },
-    onError: (e: Error) => alert(`Не удалось уничтожить у хостера: ${e.message}`),
   });
 
   const diagnose = useMutation({
@@ -1342,51 +609,6 @@ export default function Nodes() {
       });
     },
     onError: (e: Error) => alert(`Не удалось запустить диагностику: ${e.message}`),
-  });
-
-  const renewCerts = useMutation({
-    mutationFn: (id: number) => renewNodeCerts(id),
-    onSuccess: (res) => {
-      qc.invalidateQueries({ queryKey: ["provisioning-tasks"] });
-      qc.invalidateQueries({ queryKey: ["nodes"] });
-      alert(`Re-issue LE-сертов запущен (task #${res.task_id})`);
-    },
-    onError: (e: Error) =>
-      alert(`Не удалось запустить обновление сертов: ${e.message}`),
-  });
-
-  const refreshRealityDest = useMutation({
-    mutationFn: (args: {
-      node_id: number;
-      node_name: string;
-      sni: string | null;
-    }) =>
-      refreshNodeRealityDest(args.node_id, { sni: args.sni }).then(
-        (res) => ({ ...res, node_name: args.node_name }),
-      ),
-    onSuccess: (res: NodeRefreshDestOut & { node_name: string }) => {
-      qc.invalidateQueries({ queryKey: ["nodes"] });
-      qc.invalidateQueries({ queryKey: ["node-configs", res.node_id] });
-      qc.invalidateQueries({ queryKey: ["provisioning-tasks"] });
-      qc.invalidateQueries({ queryKey: ["user-subs"] });
-      setRefreshDestModal(null);
-      const failedNote =
-        res.failed_subs.length > 0
-          ? `\n\n⚠ Проваленные подписки (${res.failed_subs.length}): ${res.failed_subs.slice(0, 10).join(", ")}${res.failed_subs.length > 10 ? "…" : ""}`
-          : "";
-      alert(
-        `Reality dest на «${res.node_name}» обновлён: ${res.old_sni} → ${res.new_sni}.\n` +
-          `Затронуто активных подписок: ${res.sub_count}, задач в фоне: ${res.task_ids.length}.` +
-          failedNote,
-      );
-    },
-    onError: (e: Error) => {
-      const extra =
-        e instanceof ApiError && typeof e.detail === "object" && e.detail
-          ? `\n\nДетали: ${JSON.stringify(e.detail, null, 2)}`
-          : "";
-      alert(`Не удалось обновить Reality dest: ${e.message}${extra}`);
-    },
   });
 
   const setStatus = useMutation({
@@ -1450,33 +672,12 @@ export default function Nodes() {
   const { data, isLoading, error, refetch, isFetching } = useQuery<VPNNodeOut[]>({
     queryKey: ["nodes"],
     queryFn: () => api.get("/nodes"),
-    // Во время бутстрапа хочется, чтобы статус обновлялся быстро — раз в
-    // 5 секунд. Но когда все ноды в устойчивом состоянии (active/disabled),
-    // частый poll только перерисовывает таблицу зря — тогда опрашиваем раз
-    // в 30с. Быстрый режим включаем только при наличии transient-нод.
+    // Во время бутстрапа хочется, чтобы статус обновлялся быстро —
+    // раз в 5 секунд, а не раз в 20. После перехода в active это
+    // всё равно стабильный poll, нагрузка символическая.
     // При ошибке глушим авто-refetch, чтобы не долбить 500 раз в 5 сек —
     // пусть юзер явно нажмёт «Повторить».
-    refetchInterval: (q) => {
-      if (q.state.error) return false;
-      const transient = q.state.data?.some(
-        (n) => n.status === "registering" || n.status === "draining",
-      );
-      return transient ? 5_000 : 30_000;
-    },
-    // Фоновые refetch'и не должны ронять таблицу в loading-ветку и
-    // ремоунтить строки — данные обновляются на месте, без мигания.
-    placeholderData: keepPreviousData,
-    retry: false,
-  });
-
-  // Пин версии xray — один запрос на страницу (не на строку): бейджу в каждой
-  // строке нужно с чем сравнивать версию ноды. Обновляется редко, поэтому
-  // отдельный интервал вместо общего поллинга нод.
-  const versionsOverview = useQuery<VersionsOverview>({
-    queryKey: ["versions-overview"],
-    queryFn: fetchVersionsOverview,
-    staleTime: 60_000,
-    refetchInterval: 300_000,
+    refetchInterval: (q) => (q.state.error ? false : 5_000),
     retry: false,
   });
 
@@ -1537,13 +738,6 @@ export default function Nodes() {
           >
             {createOpen ? "Отмена" : "+ Добавить ноду"}
           </button>
-          <button
-            className="px-3 py-1.5 rounded bg-sky-600 hover:bg-sky-500 text-sm font-semibold"
-            onClick={() => setOrderOpen((v) => !v)}
-            title="Заказать VPS у облачного провайдера (4vps) и сразу раскатать инфру"
-          >
-            {orderOpen ? "Отмена" : "☁ Заказать в облаке"}
-          </button>
         </div>
       </div>
 
@@ -1552,8 +746,6 @@ export default function Nodes() {
           onDone={() => setCreateOpen(false)}
         />
       )}
-
-      {orderOpen && <OrderCloudNodeForm onDone={() => setOrderOpen(false)} />}
 
       {migrateToModal && data && (
         <MigrateToModal
@@ -1573,64 +765,28 @@ export default function Nodes() {
         />
       )}
 
-      {refreshDestModal && (
-        <RefreshRealityDestModal
-          nodeId={refreshDestModal.node_id}
-          nodeName={refreshDestModal.node_name}
-          nodeRegion={refreshDestModal.node_region}
-          pending={refreshRealityDest.isPending}
-          onCancel={() => setRefreshDestModal(null)}
-          onSubmit={(sni) =>
-            refreshRealityDest.mutate({
-              node_id: refreshDestModal.node_id,
-              node_name: refreshDestModal.node_name,
-              sni,
-            })
-          }
-        />
-      )}
-
-      {editNode && (
-        <EditNodeModal
-          node={editNode}
-          pools={pools.data ?? []}
-          pending={updateNodeMut.isPending}
-          onCancel={() => setEditNode(null)}
-          onSubmit={(payload) =>
-            updateNodeMut.mutate({ id: editNode.id, payload })
-          }
-        />
-      )}
-
       {trackedOps.map((op) => (
         <OperationProgressBanner
           key={`${op.kind}-${op.nodeId}-${op.startedAt}`}
           op={op}
-          tasks={trackedTasksQuery.data}
           onDismiss={() => removeOp(op)}
         />
       ))}
 
-      <div className="overflow-x-auto -mx-3 px-3 md:mx-0 md:px-0">
-        {/* min-w только с lg: там видны все 14 колонок. На телефоне колонок
-            остаётся 5 (Имя/Статус/Health/Юзеры/Активна + действия), и таблица
-            должна помещаться в экран, а не требовать скролла. */}
-        <table className="w-full text-sm lg:min-w-[1100px]">
+      <table className="w-full text-sm">
         <thead className="text-left text-slate-400 border-b border-slate-700">
           <tr>
             <th className="py-2 w-8"></th>
-            <th className="hidden lg:table-cell">ID</th>
+            <th>ID</th>
             <th>Имя</th>
-            <th className="hidden lg:table-cell">Регион</th>
-            <th className="hidden lg:table-cell">Host</th>
-            <th className="hidden lg:table-cell">Pool</th>
+            <th>Регион</th>
+            <th>Host</th>
+            <th>Pool</th>
             <th>Статус</th>
             <th>Health</th>
-            <th className="hidden md:table-cell">WG</th>
-            <th>Юзеры</th>
-            <th className="hidden lg:table-cell">Cert</th>
+            <th>WG</th>
             <th>Активна</th>
-            <th className="hidden md:table-cell">SSH · обновлено</th>
+            <th>SSH · обновлено</th>
             <th></th>
           </tr>
         </thead>
@@ -1638,17 +794,18 @@ export default function Nodes() {
           {data?.map((n) => {
             const expanded = expandedNodeId === n.id;
             return (
-              <Fragment key={n.id}>
+              <>
                 <tr
+                  key={n.id}
                   className="border-b border-slate-800 cursor-pointer hover:bg-slate-800/40"
                   onClick={() => setExpandedNodeId(expanded ? null : n.id)}
                 >
                   <td className="py-2 text-slate-500">{expanded ? "▼" : "▶"}</td>
-                  <td className="hidden lg:table-cell">{n.id}</td>
+                  <td>{n.id}</td>
                   <td className="font-mono">{n.name}</td>
-                  <td className="hidden lg:table-cell">{n.region}</td>
-                  <td className="font-mono text-slate-400 hidden lg:table-cell">{n.host}</td>
-                  <td className="hidden lg:table-cell">{n.pool_id ?? "—"}</td>
+                  <td>{n.region}</td>
+                  <td className="font-mono text-slate-400">{n.host}</td>
+                  <td>{n.pool_id ?? "—"}</td>
                   <td onClick={(e) => e.stopPropagation()}>
                     <select
                       value={n.status}
@@ -1681,95 +838,22 @@ export default function Nodes() {
                     </select>
                   </td>
                   <td>
-                    <div className="flex flex-col gap-0.5">
-                      <HealthBadge
-                        score={n.health_score}
-                        blocked={n.blocked_regions}
-                      />
-                      {n.diagnose_incident_open_at && (
-                        <span className="inline-flex items-center gap-1">
-                          <span
-                            className="text-[10px] px-1 py-0.5 rounded bg-red-900 text-red-300"
-                            title={`Открыт diagnose-инцидент с ${new Date(n.diagnose_incident_open_at).toLocaleString()}`}
-                          >
-                            🔴 инцидент
-                          </span>
-                          <button
-                            disabled={closeIncident.isPending}
-                            onClick={(e) => {
-                              e.stopPropagation();
-                              if (
-                                confirm(
-                                  `Закрыть diagnose-инцидент ноды #${n.id} (${n.name})?\n\n` +
-                                    "Красный бейдж снимется, серия падений сбросится. " +
-                                    "Если нода реально недоступна, тик откроет инцидент " +
-                                    "заново через NODE_ALERT_CONFIRM_MIN.",
-                                )
-                              )
-                                closeIncident.mutate(n.id);
-                            }}
-                            title="Вручную закрыть инцидент (в отличие от ack — снимает бейдж)"
-                            className="text-[10px] px-1 py-0.5 rounded bg-slate-700 hover:bg-slate-600 text-slate-200 disabled:opacity-50"
-                          >
-                            ✕ закрыть
-                          </button>
-                        </span>
-                      )}
-                      {n.last_probe_status && (
-                        <span
-                          className="text-[10px] px-1 py-0.5 rounded bg-slate-800 text-slate-400 font-mono"
-                          title={
-                            n.last_probe_at
-                              ? `Последний probe: ${new Date(n.last_probe_at).toLocaleString()}`
-                              : undefined
-                          }
-                        >
-                          probe: {n.last_probe_status}
-                        </span>
-                      )}
-                    </div>
+                    <HealthBadge score={n.health_score} blocked={n.blocked_regions} />
                   </td>
-                  <td className="hidden md:table-cell">
+                  <td>
                     <HealthDots
                       links={n.exit_links}
                       peerLabel={(l) => `${l.exit_name} · ${l.wg_interface_name}`}
                       peerKey={(l) => `${l.exit_id}-${l.wg_interface_name}`}
-                      activeUsers={n.active_users}
                     />
-                  </td>
-                  <td
-                    title="Назначено юзеров (держат активный cred на ноде, diverse-корректно) · зелёным — онлайн в последнем traffic-замере"
-                  >
-                    <span className="font-semibold text-slate-200">
-                      {n.assigned_users}
-                    </span>
-                    {n.active_users > 0 && (
-                      <span className="ml-1 text-[10px] text-emerald-400">
-                        ● {n.active_users}
-                      </span>
-                    )}
-                  </td>
-                  <td className="hidden lg:table-cell">
-                    <span className="inline-flex items-center gap-1">
-                      <CertBadge expiresAt={n.cert_expires_at} />
-                      <XrayVersionBadge
-                        version={n.xray_version}
-                        pinned={versionsOverview.data?.xray.pinned ?? null}
-                        checkedAt={n.versions_checked_at}
-                      />
-                    </span>
                   </td>
                   <td>
                     <span className="inline-flex items-center gap-1">
                       <span>{n.is_active ? "✓" : "✕"}</span>
                       <CooldownBadge until={n.cooldown_until} />
-                      <ReconcilePendingBadge
-                        pending={n.reconcile_pending}
-                        due={n.reconcile_due_at}
-                      />
                     </span>
                   </td>
-                  <td className="hidden md:table-cell">
+                  <td>
                     <div className="flex flex-col gap-0.5">
                       <SSHStatusBadge lastSshAt={n.last_ssh_at} />
                       <span className="text-[10px] text-slate-500">
@@ -1777,37 +861,8 @@ export default function Nodes() {
                       </span>
                     </div>
                   </td>
-                  <td className="relative" onClick={(e) => e.stopPropagation()}>
-                    {/* 18 контролов в один ряд распирали таблицу шире экрана —
-                        именно они, а не сама таблица, ломали вёрстку на
-                        телефоне и обрезали шапку на десктопе. Прячем их в
-                        меню: строка ноды становится читаемой, а действия
-                        по-прежнему в один тап. */}
-                    <button
-                      onClick={() =>
-                        setActionsFor((v) => (v === n.id ? null : n.id))
-                      }
-                      aria-label="Действия"
-                      aria-expanded={actionsFor === n.id}
-                      className={`text-xs px-2 py-1 rounded lg:hidden ${
-                        actionsFor === n.id
-                          ? "bg-slate-600"
-                          : "bg-slate-800 hover:bg-slate-700"
-                      }`}
-                    >
-                      ⋯
-                    </button>
-                    <div
-                      // На широком экране действия всегда на виду — лишний
-                      // клик по «⋯» ради того, что и так помещается, только
-                      // замедляет работу. Меню остаётся там, где место реально
-                      // кончается: на телефоне и планшете.
-                      className={`lg:static lg:z-auto lg:flex lg:w-auto lg:max-w-none lg:flex-nowrap lg:rounded-none lg:border-0 lg:bg-transparent lg:p-0 lg:shadow-none lg:mt-0 ${
-                        actionsFor === n.id
-                          ? "absolute right-1 top-full mt-1 z-30 w-[540px] max-w-[88vw] rounded-lg border border-slate-700 bg-slate-900 p-2 shadow-xl shadow-black/40 flex flex-wrap gap-1"
-                          : "hidden"
-                      }`}
-                    >
+                  <td onClick={(e) => e.stopPropagation()}>
+                    <div className="flex gap-1">
                       <button
                         disabled={setActive.isPending}
                         onClick={() => {
@@ -1868,62 +923,6 @@ export default function Nodes() {
                         bootstrap
                       </button>
                       <button
-                        disabled={reboot.isPending}
-                        onClick={() => {
-                          if (
-                            confirm(
-                              `Перезагрузить ноду #${n.id} (${n.name})?\n\n` +
-                                `Cloud-нода → hard-reboot через API хостера (работает даже если зависла). Иначе/при сбое — graceful по SSH. Клиенты переподключатся за ~1 мин.`,
-                            )
-                          )
-                            reboot.mutate({ id: n.id, name: n.name });
-                        }}
-                        className="text-xs px-2 py-1 rounded bg-amber-700 hover:bg-amber-600 disabled:opacity-50"
-                        title="Перезагрузить сервер: API хостера (hard) или SSH (graceful) — без захода в панель"
-                      >
-                        ↻ reboot
-                      </button>
-                      {n.provider_id && (
-                        <button
-                          disabled={reinstall.isPending}
-                          onClick={() => {
-                            const img = prompt(
-                              `Переустановить ОС на cloud-ноде #${n.id} (${n.name})?\n\n` +
-                                `Хостер сотрёт диск и поставит ОС заново; IP сохраняется (reality-ключи и sub-токены остаются валидны), после чего бэк перекатит site.yml.\n\n` +
-                                `ID образа (ostempl) — пусто = дефолт провайдера:`,
-                              "",
-                            );
-                            if (img === null) return; // отмена
-                            reinstall.mutate({
-                              id: n.id,
-                              image: img.trim() || null,
-                            });
-                          }}
-                          className="text-xs px-2 py-1 rounded bg-rose-800 hover:bg-rose-700 disabled:opacity-50"
-                          title="Переустановить ОС через API провайдера (только cloud-ноды)"
-                        >
-                          reinstall OS
-                        </button>
-                      )}
-                      {n.provider_id && (
-                        <button
-                          disabled={renew.isPending}
-                          onClick={() => {
-                            if (
-                              confirm(
-                                `Продлить аренду ноды #${n.id} (${n.name}) у провайдера?\n\n` +
-                                  `Спишет с баланса. Обычно продление автоматическое (autoprolong) — нужно лишь если оно выключено.`,
-                              )
-                            )
-                              renew.mutate(n.id);
-                          }}
-                          className="text-xs px-2 py-1 rounded bg-slate-700 hover:bg-slate-600 disabled:opacity-50"
-                          title="Продлить аренду через API провайдера (списывает с баланса)"
-                        >
-                          renew
-                        </button>
-                      )}
-                      <button
                         disabled={resync.isPending}
                         onClick={() => {
                           if (
@@ -1964,110 +963,36 @@ export default function Nodes() {
                         диагностика
                       </button>
                       <button
-                        disabled={renewCerts.isPending}
-                        onClick={() => {
-                          if (
-                            confirm(
-                              `Перевыпустить LE-серты на «${n.name}» ` +
-                                `(certbot webroot force-renewal + reload nginx)?`,
-                            )
-                          )
-                            renewCerts.mutate(n.id);
-                        }}
-                        className="text-xs px-2 py-1 rounded bg-sky-700 hover:bg-sky-600 disabled:opacity-50"
-                        title="Ручной re-issue LE-сертов (xhttp/ws-cdn). Дополняет авто-renewal cert-тика."
-                      >
-                        обновить серты
-                      </button>
-                      <NodeMuteToggle
-                        nodeId={n.id}
-                        disabledAt={n.auto_diagnose_disabled_at}
-                      />
-                      <NodeDiagnosticsToggle
-                        nodeId={n.id}
-                        disabledAt={n.diagnostics_disabled_at}
-                      />
-                      <NodeAlertsMuteToggle
-                        nodeId={n.id}
-                        mutedUntil={n.alerts_muted_until}
-                      />
-                      <button
-                        onClick={() => setEditNode(n)}
-                        className="text-xs px-2 py-1 rounded bg-slate-700 hover:bg-slate-600"
-                        title="Править имя / регион / пул ноды (без re-bootstrap)"
-                      >
-                        ✎ правка
-                      </button>
-                      <button
-                        disabled={refreshRealityDest.isPending}
-                        onClick={() =>
-                          setRefreshDestModal({ node_id: n.id, node_name: n.name, node_region: n.region })
-                        }
-                        className="text-xs px-2 py-1 rounded bg-indigo-700 hover:bg-indigo-600 disabled:opacity-50"
-                        title="Сменить Reality SNI/dest и перепровижинить активные подписки ноды"
-                      >
-                        обновить reality dest
-                      </button>
-                      {n.provider_id != null && (
-                        <button
-                          disabled={destroyAtHoster.isPending}
-                          onClick={() => {
-                            if (
-                              confirm(
-                                `Уничтожить VPS ноды #${n.id} (${n.name}) У ХОСТЕРА?\n\n` +
-                                  "VM будет удалена через API провайдера (деньги перестанут " +
-                                  "капать). Запись в панели останется — убери её отдельно " +
-                                  "кнопкой «удалить из панели».",
-                              )
-                            )
-                              destroyAtHoster.mutate({ id: n.id });
-                          }}
-                          className="text-xs px-2 py-1 rounded bg-orange-800 hover:bg-orange-700 disabled:opacity-50"
-                          title="Уничтожить VM у провайдера (хостер). Запись в панели не трогает."
-                        >
-                          уничтожить у хостера
-                        </button>
-                      )}
-                      <button
                         disabled={deleteNode.isPending}
                         onClick={() => {
                           if (
                             confirm(
-                              `Удалить ЗАПИСЬ ноды #${n.id} (${n.name}) из панели?\n\n` +
-                                "Хостер НЕ трогается" +
+                              `Удалить ноду #${n.id} (${n.name})?\n\n` +
                                 (n.provider_id
-                                  ? " (если VPS ещё жив — сначала «уничтожить у хостера», " +
-                                    "иначе осиротеет платный сервер)."
-                                  : ".") +
-                                "\n\nЕсли на ноде есть подписки — будет предложено " +
-                                "переселить их и удалить.",
+                                  ? "Cloud-нода — VM будет уничтожена через API провайдера."
+                                  : "Manual-нода — запись будет удалена из БД." +
+                                    "\n\nЕсли на ноде есть подписки — будет " +
+                                    "предложено переселить их и удалить ноду.") +
+                                "",
                             )
                           )
-                            deleteNode.mutate({ id: n.id, name: n.name });
+                            deleteNode.mutate({
+                              id: n.id,
+                              name: n.name,
+                              provider_id: n.provider_id,
+                            });
                         }}
                         className="text-xs px-2 py-1 rounded bg-red-800 hover:bg-red-700 disabled:opacity-50"
-                        title="Убрать запись ноды из панели (хостер не трогается)"
                       >
-                        удалить из панели
+                        удалить
                       </button>
                     </div>
                   </td>
                 </tr>
                 {expanded && (
                   <tr className="border-b border-slate-800 bg-slate-900/60">
-                    <td colSpan={14} className="p-3 md:p-4 space-y-4">
-                      <NodeVersionsPanel
-                        node={n}
-                        pinnedXray={versionsOverview.data?.xray.pinned ?? null}
-                        pinnedHysteria={versionsOverview.data?.hysteria.pinned ?? null}
-                        appVersion={versionsOverview.data?.app_version ?? null}
-                        addOp={addOp}
-                      />
-                      <RelayLinksSection
-                        nodeId={n.id}
-                        nodeName={n.name}
-                        addOp={addOp}
-                      />
+                    <td colSpan={12} className="p-4 space-y-4">
+                      <RelayLinksSection nodeId={n.id} />
                       <NodeHealth nodeId={n.id} />
                       <NodeActiveUsers nodeId={n.id} />
                       <NodeTrafficChart nodeId={n.id} />
@@ -2076,19 +1001,18 @@ export default function Nodes() {
                     </td>
                   </tr>
                 )}
-              </Fragment>
+              </>
             );
           })}
           {data && data.length === 0 && (
             <tr>
-              <td colSpan={14} className="py-4 text-slate-500 text-center">
+              <td colSpan={12} className="py-4 text-slate-500 text-center">
                 Нод нет
               </td>
             </tr>
           )}
         </tbody>
       </table>
-        </div>
 
       <p className="text-xs text-slate-500 mt-4">
         После создания ноды бэкенд автоматически ставит таску на bootstrap
@@ -2201,588 +1125,7 @@ function MigrateToModal({
   );
 }
 
-// ── Refresh Reality dest modal ──────────────────────────────────────
-// Меняет sni/dest у vless_reality конфига ноды + перепровижинит все
-// активные подписки (revoke старого Device + cold reprovision нового).
-// Клиенты подхватят новый URI через sub-refresh (окно деградации 1-2
-// реконнекта). "auto" = _pick_reality_sni по пулу на бэке.
-
-function EditNodeModal({
-  node,
-  pools,
-  pending,
-  onCancel,
-  onSubmit,
-}: {
-  node: VPNNodeOut;
-  pools: ServerPoolMini[];
-  pending: boolean;
-  onCancel: () => void;
-  onSubmit: (payload: VPNNodeUpdateIn) => void;
-}) {
-  const [name, setName] = useState(node.name);
-  const [region, setRegion] = useState(node.region);
-  const [poolId, setPoolId] = useState<number | null>(node.pool_id);
-
-  const nameValid = /^[a-z0-9][a-z0-9-]{0,62}$/.test(name.trim());
-  const dirty =
-    name.trim() !== node.name ||
-    region.trim() !== node.region ||
-    poolId !== node.pool_id;
-
-  function submit() {
-    const payload: VPNNodeUpdateIn = {};
-    if (name.trim() !== node.name) payload.name = name.trim();
-    if (region.trim() !== node.region) payload.region = region.trim();
-    if (poolId !== node.pool_id) payload.pool_id = poolId;
-    onSubmit(payload);
-  }
-
-  return (
-    <div
-      className="fixed inset-0 bg-black/60 flex items-center justify-center z-50"
-      onClick={onCancel}
-    >
-      <div
-        className="bg-slate-800 border border-slate-700 rounded-lg p-6 max-w-lg w-full mx-4"
-        onClick={(e) => e.stopPropagation()}
-      >
-        <h2 className="text-lg font-semibold mb-1">Править ноду #{node.id}</h2>
-        <p className="text-sm text-slate-400 mb-4">
-          Имя / регион / пул — <span className="font-semibold">без re-bootstrap</span>:
-          ansible коннектится по{" "}
-          <code className="font-mono">host={node.host}</code>, имя — это alias
-          инвентаря. host/ssh_port тут не меняются (это reinstall/renew).
-        </p>
-
-        <label className="block text-sm mb-1">Имя (inventory-хост)</label>
-        <input
-          className="w-full bg-slate-900 border border-slate-600 rounded px-2 py-1.5 mb-1 font-mono"
-          value={name}
-          onChange={(e) => setName(e.target.value)}
-          placeholder="ru-msk-01"
-        />
-        {!nameValid && (
-          <div className="text-xs text-amber-400 mb-2">
-            Только [a-z0-9-], начинается с буквы/цифры, до 63 символов (как
-            ru-pq-01).
-          </div>
-        )}
-
-        <label className="block text-sm mb-1 mt-2">
-          Регион (дисплей + фильтр choose_node)
-        </label>
-        <input
-          className="w-full bg-slate-900 border border-slate-600 rounded px-2 py-1.5 mb-3"
-          value={region}
-          onChange={(e) => setRegion(e.target.value)}
-          placeholder="ru-msk"
-        />
-
-        <label className="block text-sm mb-1">Пул</label>
-        <select
-          className="w-full bg-slate-900 border border-slate-600 rounded px-2 py-1.5 mb-4"
-          value={poolId ?? ""}
-          onChange={(e) =>
-            setPoolId(e.target.value === "" ? null : Number(e.target.value))
-          }
-        >
-          <option value="">— без пула —</option>
-          {pools.map((p) => (
-            <option key={p.id} value={p.id}>
-              #{p.id} · {p.name}
-            </option>
-          ))}
-        </select>
-        {pools.length === 0 && (
-          <div className="text-xs text-slate-500 -mt-3 mb-4">
-            Пулов нет — заведение пулов пока отдельно (вне этой формы).
-          </div>
-        )}
-
-        <div className="flex justify-end gap-2">
-          <button
-            className="px-3 py-1.5 rounded bg-slate-700 hover:bg-slate-600 text-sm"
-            onClick={onCancel}
-            disabled={pending}
-          >
-            Отмена
-          </button>
-          <button
-            className="px-3 py-1.5 rounded bg-indigo-700 hover:bg-indigo-600 text-sm disabled:opacity-50"
-            disabled={pending || !dirty || !nameValid || !region.trim()}
-            onClick={submit}
-          >
-            {pending ? "Сохраняем…" : "Сохранить"}
-          </button>
-        </div>
-      </div>
-    </div>
-  );
-}
-
-function RefreshRealityDestModal({
-  nodeId,
-  nodeName,
-  nodeRegion,
-  pending,
-  onCancel,
-  onSubmit,
-}: {
-  nodeId: number;
-  nodeName: string;
-  nodeRegion: string | null;
-  pending: boolean;
-  onCancel: () => void;
-  onSubmit: (sni: string | null) => void;
-}) {
-  type Mode = "auto" | "pool" | "custom";
-  // Пул suggestion'ов по стране ноды (не плоский РУ) — фолбэк РУ, как на бэке.
-  const pool = realityPoolForRegion(nodeRegion);
-  const [mode, setMode] = useState<Mode>("auto");
-  const [poolChoice, setPoolChoice] = useState<string>(pool[0]);
-  const [custom, setCustom] = useState<string>("");
-
-  const resolvedSni =
-    mode === "auto" ? null : mode === "pool" ? poolChoice : custom.trim();
-  const submitDisabled =
-    pending || (mode === "custom" && !custom.trim());
-
-  return (
-    <div
-      className="fixed inset-0 bg-black/60 flex items-center justify-center z-50"
-      onClick={onCancel}
-    >
-      <div
-        className="bg-slate-800 border border-slate-700 rounded-lg p-6 max-w-lg w-full mx-4"
-        onClick={(e) => e.stopPropagation()}
-      >
-        <h2 className="text-lg font-semibold mb-3">
-          Обновить Reality dest на «{nodeName}»
-        </h2>
-        <p className="text-sm text-slate-400 mb-2">
-          На ноде #{nodeId} обновится sni/dest у vless_reality конфига, и все
-          активные подписки будут перепровижинены с новым UUID + новым sni.
-        </p>
-        <p className="text-sm text-red-400 mb-4">
-          Окно деградации: клиенты, уже подключённые к ноде, увидят 1-2
-          реконнекта. Sub-refresh у клиента (~каждые 6ч или при reject) подтянет
-          новый URI — fix сам.
-        </p>
-
-        <div className="space-y-2 mb-4">
-          <label className="flex items-center gap-2 text-sm">
-            <input
-              type="radio"
-              name="refresh-mode"
-              checked={mode === "auto"}
-              onChange={() => setMode("auto")}
-              disabled={pending}
-            />
-            <span>
-              Авто-выбор из пула{" "}
-              <span className="text-slate-500">
-                (бэк возьмёт наименее используемый SNI)
-              </span>
-            </span>
-          </label>
-          <label className="flex items-center gap-2 text-sm">
-            <input
-              type="radio"
-              name="refresh-mode"
-              checked={mode === "pool"}
-              onChange={() => setMode("pool")}
-              disabled={pending}
-            />
-            <span>Явно из пула:</span>
-            <select
-              className="bg-slate-900 border border-slate-600 rounded px-2 py-1 text-sm disabled:opacity-50"
-              value={poolChoice}
-              onChange={(e) => setPoolChoice(e.target.value)}
-              disabled={pending || mode !== "pool"}
-            >
-              {pool.map((sni) => (
-                <option key={sni} value={sni}>
-                  {sni}
-                </option>
-              ))}
-            </select>
-          </label>
-          <label className="flex items-center gap-2 text-sm">
-            <input
-              type="radio"
-              name="refresh-mode"
-              checked={mode === "custom"}
-              onChange={() => setMode("custom")}
-              disabled={pending}
-            />
-            <span>Свой домен:</span>
-            <input
-              type="text"
-              placeholder="example.com"
-              className="flex-1 bg-slate-900 border border-slate-600 rounded px-2 py-1 text-sm font-mono disabled:opacity-50"
-              value={custom}
-              onChange={(e) => setCustom(e.target.value)}
-              disabled={pending || mode !== "custom"}
-            />
-          </label>
-        </div>
-
-        <div className="flex justify-end gap-2">
-          <button
-            className="px-3 py-1.5 rounded bg-slate-700 hover:bg-slate-600 text-sm"
-            onClick={onCancel}
-            disabled={pending}
-          >
-            Отмена
-          </button>
-          <button
-            className="px-3 py-1.5 rounded bg-indigo-700 hover:bg-indigo-600 text-sm disabled:opacity-50"
-            disabled={submitDisabled}
-            onClick={() => {
-              const label =
-                mode === "auto" ? "авто-выбор из пула" : `sni = ${resolvedSni}`;
-              if (
-                confirm(
-                  `Сменить Reality dest на ноде #${nodeId} (${nodeName})?\n\n` +
-                    `Режим: ${label}.\n\n` +
-                    `Все активные подписки ноды будут перепровижинены. Клиенты увидят 1-2 реконнекта.`,
-                )
-              )
-                onSubmit(resolvedSni);
-            }}
-          >
-            {pending ? "Обновляем…" : "Обновить"}
-          </button>
-        </div>
-      </div>
-    </div>
-  );
-}
-
 // ── Create Node form ────────────────────────────────────────────────
-// Composite: node + N configs + ОДИН bootstrap. До: POST /nodes →
-// bootstrap → N × (POST /configs → bootstrap) = N+1 task. Сейчас:
-// POST /nodes/with-configs → один bootstrap, видящий сразу полный
-// набор протоколов в первом site.yml-проходе.
-
-type CreatableProto =
-  | "vless-reality"
-  | "vless-ws-cdn"
-  | "vless-xhttp"
-  | "hysteria2";
-// hysteria2 ПОСЛЕДНИМ в списке — в этом же порядке конфиги уезжают в
-// /nodes/with-configs, а ensure_hysteria2_config переиспользует LE-серт уже
-// созданного xhttp/ws-cdn фронта (свой ACME у hy2 на combo-ноде дерётся с
-// nginx за :80/:443). Бэкенд дополнительно пересортировывает payload, но
-// порядок здесь держим осмысленным.
-const CREATE_PROTOS: CreatableProto[] = [
-  "vless-reality",
-  "vless-ws-cdn",
-  "vless-xhttp",
-  "hysteria2",
-];
-
-interface ProtoDraft {
-  enabled: boolean;
-  port: number;
-  sni: string;
-  fallback: string;
-}
-
-const PROTO_DEFAULTS: Record<CreatableProto, ProtoDraft> = {
-  // sni/fallback ПУСТЫЕ намеренно: бэкенд сам возьмёт домен из регионального
-  // пула REALITY_DEST_POOLS по стране ДЦ и распределит наименее используемый
-  // (pick_reality_sni), а dest выведет как <sni>:443. Хардкод www.asus.com
-  // жил здесь с 0.1 и давно разошёлся с проданными: на флоте ozon/ya/wb/
-  // kinopoisk/avito/rbc/yandex, а пул ротировали 2026-07-22 после
-  // регионального DPI в Яр/Туле.
-  //
-  // Порт 9443 — это порт, который xray слушает на LOOPBACK: нода за
-  // nginx stream ssl_preread, клиент ходит на :443 (443-унификация).
-  // Ставить сюда 443 нельзя — nginx уже держит 0.0.0.0:443.
-  "vless-reality": {
-    enabled: false,
-    port: 9443,
-    sni: "",
-    fallback: "",
-  },
-  "vless-ws-cdn": { enabled: false, port: 443, sni: "", fallback: "" },
-  "vless-xhttp": { enabled: false, port: 443, sni: "", fallback: "" },
-  // UDP/QUIC на том же :443. sni пустой — бэкенд подставит домен xhttp/ws-cdn
-  // вместе с его сертификатом.
-  hysteria2: { enabled: false, port: 443, sni: "", fallback: "" },
-};
-
-type NodeTemplate = "full" | "reality" | "custom";
-const TEMPLATE_ENABLED: Record<NodeTemplate, Set<CreatableProto>> = {
-  full: new Set<CreatableProto>([
-    "vless-reality",
-    "vless-ws-cdn",
-    "vless-xhttp",
-    "hysteria2",
-  ]),
-  reality: new Set<CreatableProto>(["vless-reality"]),
-  custom: new Set<CreatableProto>(),
-};
-
-// Заказ ноды у облачного провайдера (4vps): провайдер → live offerings
-// (ДЦ/тарифы/образы) → spawn. Дегрейд: если offerings пустые (провайдер без
-// list-методов или без токена) — поля становятся текст-инпутами, форма всё
-// равно рабочая. spawn_node заказывает VPS, ждёт IP, заводит VPNNode и катит
-// site.yml (SSH-ключ инжектит аккаунтный ключ 4vps — см. hoster_api_epic.md).
-function OrderCloudNodeForm({ onDone }: { onDone: () => void }) {
-  const qc = useQueryClient();
-  const providersQ = useQuery<CloudProviderOut[]>({
-    queryKey: ["cloud-providers"],
-    queryFn: listCloudProviders,
-  });
-  const [providerId, setProviderId] = useState<number | null>(null);
-  const [name, setName] = useState("");
-  const [dc, setDc] = useState("");
-  const [plan, setPlan] = useState("");
-  const [image, setImage] = useState("");
-  const [poolId, setPoolId] = useState("");
-  const [err, setErr] = useState<string | null>(null);
-
-  useEffect(() => {
-    if (providerId == null && providersQ.data?.length) {
-      const actives = providersQ.data.filter((p) => p.is_active);
-      // Ноды по умолчанию — на РУ-провайдере (4vps-ru): сами ноды РУ-расходники,
-      // зарубежные серверы идут в exit'ы (см. Exits → заказ в облаке).
-      const pick =
-        actives.find((p) => p.name.toLowerCase().includes("ru")) ??
-        actives[0] ??
-        providersQ.data[0];
-      setProviderId(pick.id);
-    }
-  }, [providersQ.data, providerId]);
-
-  const offeringsQ = useQuery<ProviderOfferings>({
-    queryKey: ["provider-offerings", providerId],
-    queryFn: () => getProviderOfferings(providerId as number),
-    enabled: providerId != null,
-  });
-
-  const datacenters = offeringsQ.data?.datacenters ?? [];
-  const plans = offeringsQ.data?.plans ?? [];
-  const selectedPlan = plans.find((p) => String(p.id) === plan);
-  const images: OfferingImage[] =
-    selectedPlan?.images?.length
-      ? selectedPlan.images
-      : offeringsQ.data?.images ?? [];
-
-  // Когда список ОС подгрузился — авто-выбираем Ubuntu 22.04 (иначе ostempl
-  // уезжает пустым → бэкенд подставляет строку "ubuntu-22.04", которую 4vps
-  // не понимает: ему нужен числовой id образа, см. list_images).
-  useEffect(() => {
-    if (!image && images.length) {
-      const pick =
-        images.find((im) => /ubuntu\s*22\.04/i.test(im.name)) ??
-        images.find((im) => /ubuntu/i.test(im.name)) ??
-        images[0];
-      if (pick?.id != null) setImage(String(pick.id));
-    }
-  }, [images.length, image]);
-
-  const mutation = useMutation({
-    mutationFn: () =>
-      spawnNode({
-        provider_id: providerId as number,
-        name: name.trim() || null,
-        region: dc.trim(),
-        plan: plan.trim(),
-        image: image.trim() || null,
-        pool_id: poolId ? Number(poolId) : null,
-      }),
-    onSuccess: () => {
-      qc.invalidateQueries({ queryKey: ["nodes"] });
-      qc.invalidateQueries({ queryKey: ["provisioning-tasks"] });
-      onDone();
-    },
-    onError: (e: Error) =>
-      setErr(e instanceof ApiError ? `${e.status}: ${e.message}` : e.message),
-  });
-
-  function submit(e: React.FormEvent) {
-    e.preventDefault();
-    setErr(null);
-    if (providerId == null) return setErr("выбери провайдера");
-    // имя необязательно: пусто → бэкенд сгенерит «<хостер>-<cc>-<NN>»
-    if (!dc.trim()) return setErr("укажи дата-центр");
-    if (!plan.trim()) return setErr("укажи тариф");
-    mutation.mutate();
-  }
-
-  const inputCls =
-    "bg-slate-800 border border-slate-700 rounded px-2 py-1";
-
-  return (
-    <form
-      onSubmit={submit}
-      className="mb-4 p-4 rounded border border-sky-800 bg-slate-900/60 flex flex-col gap-4 text-sm"
-    >
-      <div className="text-sky-300 text-xs font-semibold">
-        ☁ Заказать ноду у облачного провайдера
-      </div>
-      <div className="grid grid-cols-2 gap-3">
-        <label className="flex flex-col">
-          <span className="text-slate-400 text-xs mb-1">Провайдер</span>
-          <select
-            className={inputCls}
-            value={providerId ?? ""}
-            onChange={(e) => {
-              setProviderId(e.target.value ? Number(e.target.value) : null);
-              setDc("");
-              setPlan("");
-              setImage("");
-            }}
-          >
-            <option value="">— выбери —</option>
-            {(providersQ.data ?? []).map((p) => (
-              <option key={p.id} value={p.id} disabled={!p.is_active}>
-                {p.name} ({p.kind}){p.is_active ? "" : " — выкл"}
-              </option>
-            ))}
-          </select>
-        </label>
-        <label className="flex flex-col">
-          <span className="text-slate-400 text-xs mb-1">
-            Имя (пусто → авто «хостер-cc-NN»)
-          </span>
-          <input
-            className={`${inputCls} font-mono`}
-            placeholder="авто, или вручную: vdsina-ru-01"
-            value={name}
-            onChange={(e) => setName(e.target.value)}
-          />
-        </label>
-
-        <label className="flex flex-col">
-          <span className="text-slate-400 text-xs mb-1">
-            Дата-центр {offeringsQ.isFetching ? "(загрузка…)" : ""}
-          </span>
-          {datacenters.length ? (
-            <select
-              className={inputCls}
-              value={dc}
-              onChange={(e) => setDc(e.target.value)}
-            >
-              <option value="">— выбери —</option>
-              {datacenters.map((d) => (
-                <option key={String(d.id)} value={String(d.id)}>
-                  {d.name} {d.flag ? `[${d.flag}]` : ""} (id {d.id})
-                </option>
-              ))}
-            </select>
-          ) : (
-            <input
-              className={`${inputCls} font-mono`}
-              placeholder="id датацентра"
-              value={dc}
-              onChange={(e) => setDc(e.target.value)}
-            />
-          )}
-        </label>
-
-        <label className="flex flex-col">
-          <span className="text-slate-400 text-xs mb-1">Тариф</span>
-          {plans.length ? (
-            <select
-              className={inputCls}
-              value={plan}
-              onChange={(e) => {
-                setPlan(e.target.value);
-                setImage("");
-              }}
-            >
-              <option value="">— выбери —</option>
-              {plans.map((p) => (
-                <option key={String(p.id)} value={String(p.id)}>
-                  {p.name}
-                  {p.price != null ? ` — ${p.price}₽` : ""}
-                  {p.cpu ? ` · ${p.cpu}vCPU` : ""}
-                  {p.ram_mib ? ` · ${Math.round(p.ram_mib / 1024)}G` : ""}
-                </option>
-              ))}
-            </select>
-          ) : (
-            <input
-              className={`${inputCls} font-mono`}
-              placeholder="id тарифа"
-              value={plan}
-              onChange={(e) => setPlan(e.target.value)}
-            />
-          )}
-        </label>
-
-        <label className="flex flex-col">
-          <span className="text-slate-400 text-xs mb-1">
-            ОС {selectedPlan && !images.length ? "(нет образов у тарифа)" : ""}
-          </span>
-          {images.length ? (
-            <select
-              className={inputCls}
-              value={image}
-              onChange={(e) => setImage(e.target.value)}
-            >
-              <option value="">— дефолт провайдера —</option>
-              {images.map((im) => (
-                <option key={String(im.id)} value={String(im.id)}>
-                  {im.name} (id {im.id})
-                </option>
-              ))}
-            </select>
-          ) : (
-            <input
-              className={`${inputCls} font-mono`}
-              placeholder="ostempl id (необязательно)"
-              value={image}
-              onChange={(e) => setImage(e.target.value)}
-            />
-          )}
-        </label>
-
-        <label className="flex flex-col">
-          <span className="text-slate-400 text-xs mb-1">
-            Pool id (необязательно)
-          </span>
-          <input
-            className={`${inputCls} font-mono`}
-            placeholder="напр. 1"
-            value={poolId}
-            onChange={(e) => setPoolId(e.target.value)}
-          />
-        </label>
-      </div>
-
-      {offeringsQ.error && (
-        <div className="text-amber-400 text-xs">
-          Не удалось загрузить offerings провайдера (
-          {offeringsQ.error instanceof ApiError
-            ? offeringsQ.error.message
-            : String(offeringsQ.error)}
-          ). Можно ввести id вручную.
-        </div>
-      )}
-      {err && <div className="text-red-400 text-xs">{err}</div>}
-
-      <div className="flex items-center gap-3">
-        <button
-          type="submit"
-          disabled={mutation.isPending}
-          className="px-4 py-1.5 rounded bg-sky-600 hover:bg-sky-500 text-sm font-semibold disabled:opacity-50"
-        >
-          {mutation.isPending ? "Заказываем…" : "Заказать и развернуть"}
-        </button>
-        <span className="text-slate-500 text-xs">
-          заказ спишет средства у провайдера; нода появится как
-          registering → active
-        </span>
-      </div>
-    </form>
-  );
-}
 
 function CreateNodeForm({ onDone }: { onDone: () => void }) {
   const qc = useQueryClient();
@@ -2794,41 +1137,11 @@ function CreateNodeForm({ onDone }: { onDone: () => void }) {
     pool_id: null,
     notes: null,
   });
-  const [template, setTemplate] = useState<NodeTemplate>("full");
-  const [protos, setProtos] = useState<Record<CreatableProto, ProtoDraft>>(
-    () => {
-      const init: Record<CreatableProto, ProtoDraft> = {
-        "vless-reality": { ...PROTO_DEFAULTS["vless-reality"] },
-        "vless-ws-cdn": { ...PROTO_DEFAULTS["vless-ws-cdn"] },
-        "vless-xhttp": { ...PROTO_DEFAULTS["vless-xhttp"] },
-        hysteria2: { ...PROTO_DEFAULTS["hysteria2"] },
-      };
-      // дефолт = шаблон "full"
-      for (const p of TEMPLATE_ENABLED["full"]) init[p].enabled = true;
-      return init;
-    },
-  );
   const [err, setErr] = useState<string | null>(null);
 
-  function applyTemplate(t: NodeTemplate) {
-    setTemplate(t);
-    const en = TEMPLATE_ENABLED[t];
-    setProtos((prev) => {
-      const next = { ...prev };
-      for (const p of CREATE_PROTOS) next[p] = { ...next[p], enabled: en.has(p) };
-      return next;
-    });
-  }
-
-  function patchProto(p: CreatableProto, patch: Partial<ProtoDraft>) {
-    setProtos((prev) => ({ ...prev, [p]: { ...prev[p], ...patch } }));
-  }
-
   const mutation = useMutation({
-    mutationFn: (payload: {
-      node: VPNNodeCreateIn;
-      configs: VPNConfigCreateIn[];
-    }) => api.post<VPNNodeOut>("/nodes/with-configs", payload),
+    mutationFn: (payload: VPNNodeCreateIn) =>
+      api.post<VPNNodeOut>("/nodes", payload),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["nodes"] });
       onDone();
@@ -2845,227 +1158,75 @@ function CreateNodeForm({ onDone }: { onDone: () => void }) {
       setErr("name, region и host обязательны");
       return;
     }
-    const configs: VPNConfigCreateIn[] = CREATE_PROTOS.filter(
-      (p) => protos[p].enabled,
-    ).map((p) => {
-      const d = protos[p];
-      const cfg: VPNConfigCreateIn = {
-        name: `${form.name}-${p}`,
-        protocol: p,
-        port: d.port,
-      };
-      if (d.sni) cfg.sni = d.sni;
-      // Fallback используется только REALITY; для остальных пустое
-      // поле = NULL, бэк не пишет fallback колонку.
-      if (p === "vless-reality" && d.fallback) cfg.fallback = d.fallback;
-      return cfg;
-    });
-    mutation.mutate({ node: form, configs });
+    mutation.mutate(form);
   }
-
-  const enabledCount = CREATE_PROTOS.filter((p) => protos[p].enabled).length;
 
   return (
     <form
       onSubmit={submit}
-      className="mb-4 p-4 rounded border border-slate-700 bg-slate-900/60 flex flex-col gap-4 text-sm"
+      className="mb-4 p-4 rounded border border-slate-700 bg-slate-900/60 grid grid-cols-2 gap-3 text-sm"
     >
-      {/* Node fields */}
-      <div className="grid grid-cols-2 gap-3">
-        <label className="flex flex-col">
-          <span className="text-slate-400 text-xs mb-1">Имя (уникальное, kebab-case)</span>
-          <input
-            className="bg-slate-800 border border-slate-700 rounded px-2 py-1 font-mono"
-            placeholder="fr-pq-01"
-            value={form.name}
-            onChange={(e) => setForm({ ...form, name: e.target.value })}
-          />
-        </label>
-        <label className="flex flex-col">
-          <span className="text-slate-400 text-xs mb-1">Регион</span>
-          <input
-            className="bg-slate-800 border border-slate-700 rounded px-2 py-1"
-            placeholder="eu-west"
-            value={form.region}
-            onChange={(e) => setForm({ ...form, region: e.target.value })}
-          />
-        </label>
-        <label className="flex flex-col">
-          <span className="text-slate-400 text-xs mb-1">Host (IP или DNS)</span>
-          <input
-            className="bg-slate-800 border border-slate-700 rounded px-2 py-1 font-mono"
-            placeholder="185.234.64.186"
-            value={form.host}
-            onChange={(e) => setForm({ ...form, host: e.target.value })}
-          />
-        </label>
-        <label className="flex flex-col">
-          <span className="text-slate-400 text-xs mb-1">SSH port</span>
-          <input
-            type="number"
-            className="bg-slate-800 border border-slate-700 rounded px-2 py-1 font-mono"
-            value={form.ssh_port}
-            onChange={(e) => setForm({ ...form, ssh_port: Number(e.target.value) })}
-          />
-        </label>
-        <label className="flex flex-col">
-          <span className="text-slate-400 text-xs mb-1">Pool ID (опционально)</span>
-          <input
-            type="number"
-            className="bg-slate-800 border border-slate-700 rounded px-2 py-1 font-mono"
-            value={form.pool_id ?? ""}
-            onChange={(e) =>
-              setForm({
-                ...form,
-                pool_id: e.target.value ? Number(e.target.value) : null,
-              })
-            }
-          />
-        </label>
-        <label className="flex flex-col">
-          <span className="text-slate-400 text-xs mb-1">Заметка (опционально)</span>
-          <input
-            className="bg-slate-800 border border-slate-700 rounded px-2 py-1"
-            placeholder="PQ Hosting, Paris"
-            value={form.notes ?? ""}
-            onChange={(e) => setForm({ ...form, notes: e.target.value || null })}
-          />
-        </label>
-      </div>
-
-      {/* Protocols section */}
-      <div className="border-t border-slate-800 pt-3">
-        <div className="flex items-center justify-between mb-2">
-          <span className="text-slate-300 font-semibold text-xs">
-            Протоколы ({enabledCount} выбрано) — будут установлены первым же
-            bootstrap'ом
-          </span>
-          <label className="flex items-center gap-2 text-xs">
-            <span className="text-slate-400">Шаблон:</span>
-            <select
-              value={template}
-              onChange={(e) => applyTemplate(e.target.value as NodeTemplate)}
-              className="bg-slate-800 border border-slate-700 rounded px-2 py-1"
-            >
-              <option value="full">
-                Полный стек (reality+ws+xhttp+hy2)
-              </option>
-              <option value="reality">Reality only</option>
-              <option value="custom">Custom (ничего по умолчанию)</option>
-            </select>
-          </label>
-        </div>
-
-        <div className="flex flex-col gap-2">
-          {CREATE_PROTOS.map((p) => {
-            const d = protos[p];
-            const isReality = p === "vless-reality";
-            return (
-              <div
-                key={p}
-                className={`p-2 rounded border ${d.enabled ? "border-slate-700 bg-slate-900" : "border-slate-800 bg-slate-950/60 opacity-60"}`}
-              >
-                <label className="flex items-center gap-2 mb-2 cursor-pointer">
-                  <input
-                    type="checkbox"
-                    checked={d.enabled}
-                    onChange={(e) =>
-                      patchProto(p, { enabled: e.target.checked })
-                    }
-                  />
-                  <span className="font-mono text-xs">{p}</span>
-                  {isReality && (
-                    <span
-                      className="text-[10px] text-emerald-500/80"
-                      title="Ключи, SNI и dest бэкенд подбирает сам. SNI берётся из регионального пула по стране ДЦ (наименее используемый — чтобы блокировка одного домена не выкосила весь флот), dest = <sni>:443. Порт 9443 — это loopback-порт xray за nginx stream: клиент подключается на :443. Вписывать сюда 443 нельзя — его держит nginx."
-                    >
-                      (keypair + SNI: auto; :9443 — loopback за nginx, клиент на :443)
-                    </span>
-                  )}
-                  {p === "vless-xhttp" && (
-                    <span
-                      className="text-[10px] text-emerald-500/80"
-                      title="Пусто sni → бэкенд авто-создаёт CF-поддомен <rand>.wgse.info (CF-fronted, общий Origin CA, без LE/HTTP-01). Впишешь домен → классический direct+LE."
-                    >
-                      (sni пусто = авто CF)
-                    </span>
-                  )}
-                  {p === "vless-ws-cdn" && (
-                    <span
-                      className="text-[10px] text-emerald-500/80"
-                      title="бэкенд авто-создаёт CF-поддомен <rand>.wgse.info и проставляет sni — заполнять не нужно. Делит :443 с xhttp, разводятся по SNI."
-                    >
-                      (sni: auto = CF поддомен)
-                    </span>
-                  )}
-                  {p === "hysteria2" && (
-                    <span
-                      className="text-[10px] text-emerald-500/80"
-                      title="UDP/QUIC на :443 (не конфликтует с TCP-протоколами на том же порту). Пустой sni → бэкенд возьмёт домен и LE-серт уже созданного xhttp/ws-cdn фронта этой ноды: своего ACME у hy2 на combo-ноде быть не может, он дерётся с nginx за :80/:443. Obfs-пароль, лимиты полосы и port-hopping генерятся автоматически."
-                    >
-                      (UDP; sni + серт берутся у xhttp/ws-cdn)
-                    </span>
-                  )}
-                </label>
-                {d.enabled && (
-                  <div className="grid grid-cols-3 gap-2 text-xs">
-                    <label className="flex flex-col">
-                      <span className="text-slate-500 mb-0.5">Порт</span>
-                      <input
-                        type="number"
-                        className="bg-slate-800 border border-slate-700 rounded px-2 py-1 font-mono"
-                        value={d.port}
-                        onChange={(e) =>
-                          patchProto(p, { port: Number(e.target.value) })
-                        }
-                      />
-                    </label>
-                    <label className="flex flex-col">
-                      <span className="text-slate-500 mb-0.5">
-                        SNI / fake domain
-                      </span>
-                      {p === "vless-ws-cdn" ? (
-                        <span className="px-2 py-1 rounded bg-slate-800/60 border border-slate-700 text-slate-500 italic">
-                          авто (CF поддомен)
-                        </span>
-                      ) : (
-                        <input
-                          className="bg-slate-800 border border-slate-700 rounded px-2 py-1 font-mono"
-                          placeholder={
-                            isReality
-                              ? "пусто → авто из пула по региону"
-                              : "пусто → авто CF-поддомен"
-                          }
-                          value={d.sni}
-                          onChange={(e) => patchProto(p, { sni: e.target.value })}
-                        />
-                      )}
-                    </label>
-                    {isReality && (
-                      <label className="flex flex-col">
-                        <span className="text-slate-500 mb-0.5">
-                          Fallback (REALITY dest)
-                        </span>
-                        <input
-                          className="bg-slate-800 border border-slate-700 rounded px-2 py-1 font-mono"
-                          placeholder="пусто → <sni>:443"
-                          value={d.fallback}
-                          onChange={(e) =>
-                            patchProto(p, { fallback: e.target.value })
-                          }
-                        />
-                      </label>
-                    )}
-                  </div>
-                )}
-              </div>
-            );
-          })}
-        </div>
-      </div>
-
-      {err && <div className="text-red-400 text-xs">{err}</div>}
-      <div className="flex gap-2 justify-end">
+      <label className="flex flex-col">
+        <span className="text-slate-400 text-xs mb-1">Имя (уникальное, kebab-case)</span>
+        <input
+          className="bg-slate-800 border border-slate-700 rounded px-2 py-1 font-mono"
+          placeholder="fr-pq-01"
+          value={form.name}
+          onChange={(e) => setForm({ ...form, name: e.target.value })}
+        />
+      </label>
+      <label className="flex flex-col">
+        <span className="text-slate-400 text-xs mb-1">Регион</span>
+        <input
+          className="bg-slate-800 border border-slate-700 rounded px-2 py-1"
+          placeholder="eu-west"
+          value={form.region}
+          onChange={(e) => setForm({ ...form, region: e.target.value })}
+        />
+      </label>
+      <label className="flex flex-col">
+        <span className="text-slate-400 text-xs mb-1">Host (IP или DNS)</span>
+        <input
+          className="bg-slate-800 border border-slate-700 rounded px-2 py-1 font-mono"
+          placeholder="185.234.64.186"
+          value={form.host}
+          onChange={(e) => setForm({ ...form, host: e.target.value })}
+        />
+      </label>
+      <label className="flex flex-col">
+        <span className="text-slate-400 text-xs mb-1">SSH port</span>
+        <input
+          type="number"
+          className="bg-slate-800 border border-slate-700 rounded px-2 py-1 font-mono"
+          value={form.ssh_port}
+          onChange={(e) => setForm({ ...form, ssh_port: Number(e.target.value) })}
+        />
+      </label>
+      <label className="flex flex-col">
+        <span className="text-slate-400 text-xs mb-1">Pool ID (опционально)</span>
+        <input
+          type="number"
+          className="bg-slate-800 border border-slate-700 rounded px-2 py-1 font-mono"
+          value={form.pool_id ?? ""}
+          onChange={(e) =>
+            setForm({
+              ...form,
+              pool_id: e.target.value ? Number(e.target.value) : null,
+            })
+          }
+        />
+      </label>
+      <label className="flex flex-col">
+        <span className="text-slate-400 text-xs mb-1">Заметка (опционально)</span>
+        <input
+          className="bg-slate-800 border border-slate-700 rounded px-2 py-1"
+          placeholder="PQ Hosting, Paris"
+          value={form.notes ?? ""}
+          onChange={(e) => setForm({ ...form, notes: e.target.value || null })}
+        />
+      </label>
+      {err && <div className="col-span-2 text-red-400 text-xs">{err}</div>}
+      <div className="col-span-2 flex gap-2 justify-end">
         <button
           type="button"
           onClick={onDone}
@@ -3078,9 +1239,7 @@ function CreateNodeForm({ onDone }: { onDone: () => void }) {
           disabled={mutation.isPending}
           className="px-3 py-1.5 rounded bg-emerald-600 hover:bg-emerald-500 text-sm font-semibold disabled:opacity-50"
         >
-          {mutation.isPending
-            ? "Создаём…"
-            : `Создать + bootstrap (${enabledCount} протокол${enabledCount === 1 ? "" : "а"})`}
+          {mutation.isPending ? "Создаём…" : "Создать + bootstrap"}
         </button>
       </div>
     </form>
@@ -3094,7 +1253,6 @@ function NodeConfigs({ nodeId, nodeHost }: { nodeId: number; nodeHost: string })
   const [addOpen, setAddOpen] = useState(false);
   const [editingId, setEditingId] = useState<number | null>(null);
   const [deleteErr, setDeleteErr] = useState<string | null>(null);
-  const [batchMode, setBatchMode] = useState(false);
 
   const { data, isLoading } = useQuery<VPNConfigOut[]>({
     queryKey: ["node-configs", nodeId],
@@ -3128,41 +1286,15 @@ function NodeConfigs({ nodeId, nodeHost }: { nodeId: number; nodeHost: string })
         <div className="text-xs uppercase tracking-wide text-slate-400">
           Конфиги протоколов
         </div>
-        <div className="flex gap-2">
-          {!batchMode && (
-            <>
-              <button
-                onClick={() => {
-                  setBatchMode(true);
-                  setAddOpen(false);
-                  setEditingId(null);
-                }}
-                disabled={!data || data.length === 0}
-                title="Открыть все configs на правку + добавить/удалить пачкой, потом один bootstrap"
-                className="px-2 py-1 rounded bg-blue-700 hover:bg-blue-600 text-xs disabled:opacity-50"
-              >
-                🛠 Batch правки
-              </button>
-              <button
-                onClick={() => setAddOpen((v) => !v)}
-                className="px-2 py-1 rounded bg-slate-700 hover:bg-slate-600 text-xs"
-              >
-                {addOpen ? "Отмена" : "+ Добавить конфиг"}
-              </button>
-            </>
-          )}
-        </div>
+        <button
+          onClick={() => setAddOpen((v) => !v)}
+          className="px-2 py-1 rounded bg-slate-700 hover:bg-slate-600 text-xs"
+        >
+          {addOpen ? "Отмена" : "+ Добавить конфиг"}
+        </button>
       </div>
 
-      {batchMode && data && (
-        <BatchEditConfigsForm
-          nodeId={nodeId}
-          configs={data}
-          onDone={() => setBatchMode(false)}
-        />
-      )}
-
-      {!batchMode && addOpen && (
+      {addOpen && (
         <AddConfigForm
           nodeId={nodeId}
           nodeHost={nodeHost}
@@ -3170,16 +1302,16 @@ function NodeConfigs({ nodeId, nodeHost }: { nodeId: number; nodeHost: string })
         />
       )}
 
-      {!batchMode && isLoading && <div className="text-slate-500 text-xs">Загрузка…</div>}
-      {!batchMode && data && data.length === 0 && !addOpen && (
+      {isLoading && <div className="text-slate-500 text-xs">Загрузка…</div>}
+      {data && data.length === 0 && !addOpen && (
         <div className="text-slate-500 text-xs">
           Нет конфигов — добавь хотя бы один, иначе нода не сможет выдавать подписки.
         </div>
       )}
-      {!batchMode && deleteErr && (
+      {deleteErr && (
         <div className="text-red-400 text-xs mb-2">{deleteErr}</div>
       )}
-      {!batchMode && data && data.length > 0 && (
+      {data && data.length > 0 && (
         <table className="w-full text-xs">
           <thead className="text-left text-slate-500">
             <tr>
@@ -3195,18 +1327,11 @@ function NodeConfigs({ nodeId, nodeHost }: { nodeId: number; nodeHost: string })
             {data.map((c) => {
               const isEditing = editingId === c.id;
               return (
-                // key на внешнем Fragment — иначе анонимный <> не принимает
-                // key и React рендерит список без ключей (audit #172): при
-                // удалении конфига раскрытая форма редактирования «переезжает».
-                <Fragment key={c.id}>
-                  <tr className="border-t border-slate-800">
+                <>
+                  <tr key={c.id} className="border-t border-slate-800">
                     <td className="py-1 font-mono">{c.name}</td>
                     <td className="font-mono text-slate-300">{c.protocol}</td>
-                    <td className="font-mono">
-                      {c.settings?.public_port
-                        ? `${String(c.settings.public_port)} (xray ${c.port})`
-                        : c.port}
-                    </td>
+                    <td className="font-mono">{c.port}</td>
                     <td className="font-mono text-slate-400">{c.sni ?? "—"}</td>
                     <td>{c.is_enabled ? "✓" : "✕"}</td>
                     <td className="text-right space-x-1">
@@ -3230,7 +1355,7 @@ function NodeConfigs({ nodeId, nodeHost }: { nodeId: number; nodeHost: string })
                     </td>
                   </tr>
                   {isEditing && (
-                    <tr className="border-t border-slate-800 bg-slate-950/60">
+                    <tr key={`${c.id}-edit`} className="border-t border-slate-800 bg-slate-950/60">
                       <td colSpan={6} className="p-2">
                         <EditConfigForm
                           nodeId={nodeId}
@@ -3240,7 +1365,7 @@ function NodeConfigs({ nodeId, nodeHost }: { nodeId: number; nodeHost: string })
                       </td>
                     </tr>
                   )}
-                </Fragment>
+                </>
               );
             })}
           </tbody>
@@ -3332,19 +1457,15 @@ function EditConfigForm({
         <span className="text-slate-400 mb-1">SNI / fake domain</span>
         <input
           className="bg-slate-800 border border-slate-700 rounded px-2 py-1 font-mono"
-          placeholder="xhttp: пусто = авто CF-поддомен"
           value={form.sni ?? ""}
-          onChange={(e) => setForm({ ...form, sni: e.target.value })}
+          onChange={(e) => setForm({ ...form, sni: e.target.value || null })}
         />
-        <span className="text-[10px] text-slate-500 mt-0.5">
-          xhttp: очисти поле и сохрани → перейдёт в CF-fronted (wgse.info).
-        </span>
       </label>
       <label className="flex flex-col">
         <span className="text-slate-400 mb-1">Fallback (REALITY dest)</span>
         <input
           className="bg-slate-800 border border-slate-700 rounded px-2 py-1 font-mono"
-          placeholder="пусто → <sni>:443"
+          placeholder="www.asus.com:443"
           value={form.fallback ?? ""}
           onChange={(e) =>
             setForm({ ...form, fallback: e.target.value || null })
@@ -3388,417 +1509,6 @@ function EditConfigForm({
           className="px-2 py-1 rounded bg-emerald-600 hover:bg-emerald-500 font-semibold disabled:opacity-50"
         >
           {mutation.isPending ? "Сохраняем…" : "Сохранить + bootstrap"}
-        </button>
-      </div>
-    </form>
-  );
-}
-
-// ── Batch edit configs ─────────────────────────────────────────────
-// Открыть все configs на правку сразу + позволить add/delete в одном
-// заходе → submit делает все API-вызовы с ?defer_bootstrap=true и в
-// конце один POST /nodes/{id}/bootstrap. Без этого редактирование 3
-// configs давало 3 bootstrap-таски (по одной на PUT).
-
-interface BatchEditRow {
-  // Существующий config (id != null) либо новый (id == null).
-  id: number | null;
-  protocol: string;
-  // Snapshot оригинала для diff'а (undefined для добавленных).
-  original: VPNConfigOut | null;
-  name: string;
-  port: number;
-  sni: string;
-  fallback: string | null;
-  public_key: string | null;
-  is_enabled: boolean;
-  toDelete: boolean;
-}
-
-function configToRow(c: VPNConfigOut): BatchEditRow {
-  return {
-    id: c.id,
-    protocol: c.protocol,
-    original: c,
-    name: c.name,
-    port: c.port,
-    sni: c.sni ?? "",
-    fallback: c.fallback ?? null,
-    public_key: c.public_key ?? null,
-    is_enabled: c.is_enabled,
-    toDelete: false,
-  };
-}
-
-function BatchEditConfigsForm({
-  nodeId,
-  configs,
-  onDone,
-}: {
-  nodeId: number;
-  configs: VPNConfigOut[];
-  onDone: () => void;
-}) {
-  const qc = useQueryClient();
-  const [rows, setRows] = useState<BatchEditRow[]>(() =>
-    configs.map(configToRow),
-  );
-  const [addProto, setAddProto] = useState<CreatableProto>("vless-reality");
-  const [err, setErr] = useState<string | null>(null);
-  const [progress, setProgress] = useState<{
-    done: number;
-    total: number;
-    current: string | null;
-    failures: { label: string; error: string }[];
-  } | null>(null);
-
-  // Какие protocols ещё можно добавить (т.е. не присутствуют в rows
-  // в not-deleted state'е).
-  const existingProtos = new Set(
-    rows.filter((r) => !r.toDelete).map((r) => r.protocol),
-  );
-  const addableProtos = (["vless-reality", "vless-ws-cdn", "vless-xhttp"] as CreatableProto[])
-    .filter((p) => !existingProtos.has(p));
-
-  function patchRow(idx: number, patch: Partial<BatchEditRow>) {
-    setRows((prev) => prev.map((r, i) => (i === idx ? { ...r, ...patch } : r)));
-  }
-
-  function addNew() {
-    const d = PROTO_DEFAULTS[addProto];
-    setRows((prev) => [
-      ...prev,
-      {
-        id: null,
-        protocol: addProto,
-        original: null,
-        name: `${addProto}-${Date.now() % 100000}`,
-        port: d.port,
-        sni: d.sni,
-        fallback: addProto === "vless-reality" ? d.fallback : null,
-        public_key: null,
-        is_enabled: true,
-        toDelete: false,
-      },
-    ]);
-    if (addableProtos.length > 1) {
-      const next = addableProtos.find((p) => p !== addProto);
-      if (next) setAddProto(next);
-    }
-  }
-
-  function diffRow(r: BatchEditRow): Partial<VPNConfigUpdateIn> | null {
-    if (!r.original) return null;
-    const o = r.original;
-    const patch: Partial<VPNConfigUpdateIn> = {};
-    if (r.name !== o.name) patch.name = r.name;
-    if (r.port !== o.port) patch.port = r.port;
-    // Очистка sni шлём как "" (явный сброс), НЕ null — бэк трактует null как
-    // «не трогать» (PATCH), а "" у xhttp = «переведи в CF-fronted».
-    if ((r.sni || "") !== (o.sni ?? "")) patch.sni = r.sni || "";
-    if ((r.fallback || null) !== (o.fallback ?? null))
-      patch.fallback = r.fallback || null;
-    if ((r.public_key || null) !== (o.public_key ?? null))
-      patch.public_key = r.public_key || null;
-    if (r.is_enabled !== o.is_enabled) patch.is_enabled = r.is_enabled;
-    return Object.keys(patch).length > 0 ? patch : null;
-  }
-
-  async function submit(e: React.FormEvent) {
-    e.preventDefault();
-    setErr(null);
-
-    const toDelete = rows.filter((r) => r.id != null && r.toDelete);
-    const toEdit = rows
-      .filter((r) => r.id != null && !r.toDelete)
-      .map((r) => ({ r, patch: diffRow(r) }))
-      .filter((x) => x.patch !== null) as { r: BatchEditRow; patch: Partial<VPNConfigUpdateIn> }[];
-    const toAdd = rows.filter((r) => r.id == null && !r.toDelete);
-
-    const totalOps = toDelete.length + toEdit.length + toAdd.length;
-    if (totalOps === 0) {
-      setErr("Никаких изменений — нечего сохранять");
-      return;
-    }
-
-    const failures: { label: string; error: string }[] = [];
-    setProgress({ done: 0, total: totalOps + 1, current: null, failures });
-    let done = 0;
-    const bump = (label: string) => {
-      done++;
-      setProgress({
-        done,
-        total: totalOps + 1,
-        current: label,
-        failures,
-      });
-    };
-    const recordError = (label: string, e: unknown) => {
-      const msg =
-        e instanceof ApiError
-          ? `${e.status}: ${e.message}`
-          : e instanceof Error
-            ? e.message
-            : String(e);
-      failures.push({ label, error: msg });
-    };
-
-    // Параллелим однотипные ops, между группами держим барьеры —
-    // меньше всего хочется чтобы PUT прошёл, а DELETE упал на FK
-    // и оставил inconsistent state. С defer=true это не приводит к
-    // лишним bootstrap'ам.
-    await Promise.all(
-      toDelete.map(async (r) => {
-        try {
-          await api.del(
-            `/nodes/${nodeId}/configs/${r.id}?defer_bootstrap=true`,
-          );
-        } catch (e) {
-          recordError(`delete ${r.protocol}`, e);
-        }
-        bump(`delete ${r.protocol}`);
-      }),
-    );
-    await Promise.all(
-      toEdit.map(async ({ r, patch }) => {
-        try {
-          await api.put(
-            `/nodes/${nodeId}/configs/${r.id}?defer_bootstrap=true`,
-            patch,
-          );
-        } catch (e) {
-          recordError(`edit ${r.protocol}`, e);
-        }
-        bump(`edit ${r.protocol}`);
-      }),
-    );
-    await Promise.all(
-      toAdd.map(async (r) => {
-        try {
-          const payload: VPNConfigCreateIn = {
-            name: r.name,
-            protocol: r.protocol as VPNConfigProtocol,
-            port: r.port,
-          };
-          if (r.sni) payload.sni = r.sni;
-          if (r.fallback) payload.fallback = r.fallback;
-          if (r.public_key) payload.public_key = r.public_key;
-          await api.post(
-            `/nodes/${nodeId}/configs?defer_bootstrap=true`,
-            payload,
-          );
-        } catch (e) {
-          recordError(`add ${r.protocol}`, e);
-        }
-        bump(`add ${r.protocol}`);
-      }),
-    );
-
-    // Если все ops провалились — не палим bootstrap (нечего применять).
-    // total=totalOps (без +1 за незапущенный bootstrap), чтобы done===total
-    // и состояние стало терминальным: иначе «Отмена» (disabled при done<total)
-    // и submit остались бы заблокированы навсегда — форма-тупик (audit #166).
-    if (failures.length === totalOps) {
-      setProgress({ done, total: totalOps, current: null, failures });
-      setErr(
-        `Все ${totalOps} оп. провалились — bootstrap не запущен. Поправь и попробуй заново.`,
-      );
-      return;
-    }
-
-    try {
-      await api.post(`/nodes/${nodeId}/bootstrap`, {});
-      bump("bootstrap kicked");
-    } catch (e) {
-      recordError("bootstrap", e);
-      bump("bootstrap");
-    }
-
-    qc.invalidateQueries({ queryKey: ["node-configs", nodeId] });
-    qc.invalidateQueries({ queryKey: ["nodes"] });
-    qc.invalidateQueries({ queryKey: ["provisioning-tasks"] });
-
-    if (failures.length === 0) {
-      onDone();
-    } else {
-      setErr(
-        `Готово, но ${failures.length} оп. провалилось: ` +
-          failures.map((f) => `${f.label}: ${f.error}`).join("; "),
-      );
-    }
-  }
-
-  return (
-    <form
-      onSubmit={submit}
-      className="mb-3 p-3 rounded border border-blue-900/60 bg-blue-950/20"
-    >
-      <div className="text-xs text-blue-200 mb-2">
-        Batch-режим: правки накапливаются локально, отправляются одной
-        пачкой с <span className="font-mono">?defer_bootstrap=true</span>,
-        в конце — один общий <span className="font-mono">POST /bootstrap</span>.
-      </div>
-
-      <table className="w-full text-xs mb-3">
-        <thead className="text-left text-slate-500">
-          <tr>
-            <th className="py-1 w-28">Протокол</th>
-            <th className="w-32">Имя</th>
-            <th className="w-16">Порт</th>
-            <th>SNI</th>
-            <th>Fallback</th>
-            <th className="w-16">Enabled</th>
-            <th className="w-10"></th>
-          </tr>
-        </thead>
-        <tbody>
-          {rows.map((r, idx) => {
-            const isReality = r.protocol === "vless-reality";
-            return (
-              <tr
-                key={`${r.id ?? "new"}-${idx}`}
-                className={`border-t border-slate-800 ${r.toDelete ? "line-through opacity-50" : ""}`}
-              >
-                <td className="py-1 font-mono">
-                  {r.protocol}
-                  {r.id == null && (
-                    <span className="text-[10px] text-emerald-400 ml-1">NEW</span>
-                  )}
-                </td>
-                <td>
-                  <input
-                    className="bg-slate-800 border border-slate-700 rounded px-1 py-0.5 font-mono w-full"
-                    value={r.name}
-                    disabled={r.toDelete}
-                    onChange={(e) => patchRow(idx, { name: e.target.value })}
-                  />
-                </td>
-                <td>
-                  <input
-                    type="number"
-                    className="bg-slate-800 border border-slate-700 rounded px-1 py-0.5 font-mono w-full"
-                    value={r.port}
-                    disabled={r.toDelete}
-                    onChange={(e) =>
-                      patchRow(idx, { port: Number(e.target.value) })
-                    }
-                  />
-                </td>
-                <td>
-                  <input
-                    className="bg-slate-800 border border-slate-700 rounded px-1 py-0.5 font-mono w-full"
-                    value={r.sni}
-                    disabled={r.toDelete}
-                    onChange={(e) => patchRow(idx, { sni: e.target.value })}
-                  />
-                </td>
-                <td>
-                  <input
-                    className="bg-slate-800 border border-slate-700 rounded px-1 py-0.5 font-mono w-full disabled:opacity-40"
-                    value={r.fallback ?? ""}
-                    disabled={r.toDelete || !isReality}
-                    placeholder={isReality ? "domain:443" : "—"}
-                    onChange={(e) =>
-                      patchRow(idx, { fallback: e.target.value || null })
-                    }
-                  />
-                </td>
-                <td className="text-center">
-                  <input
-                    type="checkbox"
-                    checked={r.is_enabled}
-                    disabled={r.toDelete}
-                    onChange={(e) =>
-                      patchRow(idx, { is_enabled: e.target.checked })
-                    }
-                  />
-                </td>
-                <td className="text-right">
-                  {r.id != null ? (
-                    <button
-                      type="button"
-                      onClick={() => patchRow(idx, { toDelete: !r.toDelete })}
-                      title={r.toDelete ? "Восстановить" : "Удалить"}
-                      className={`px-1.5 py-0.5 rounded text-[11px] ${r.toDelete ? "bg-slate-700 hover:bg-slate-600" : "bg-red-900 hover:bg-red-800"}`}
-                    >
-                      {r.toDelete ? "↺" : "🗑"}
-                    </button>
-                  ) : (
-                    <button
-                      type="button"
-                      onClick={() =>
-                        setRows((prev) => prev.filter((_, i) => i !== idx))
-                      }
-                      title="Убрать из batch'а"
-                      className="px-1.5 py-0.5 rounded text-[11px] bg-slate-700 hover:bg-slate-600"
-                    >
-                      ✕
-                    </button>
-                  )}
-                </td>
-              </tr>
-            );
-          })}
-        </tbody>
-      </table>
-
-      {addableProtos.length > 0 && (
-        <div className="flex items-center gap-2 text-xs mb-2">
-          <select
-            value={addProto}
-            onChange={(e) => setAddProto(e.target.value as CreatableProto)}
-            className="bg-slate-800 border border-slate-700 rounded px-2 py-1"
-          >
-            {addableProtos.map((p) => (
-              <option key={p} value={p}>
-                {p}
-              </option>
-            ))}
-          </select>
-          <button
-            type="button"
-            onClick={addNew}
-            className="px-2 py-1 rounded bg-slate-700 hover:bg-slate-600"
-          >
-            + добавить в batch
-          </button>
-        </div>
-      )}
-
-      {progress && (
-        <div className="text-xs text-slate-400 mb-2">
-          Прогресс: {progress.done}/{progress.total}
-          {progress.current && ` — ${progress.current}`}
-          {progress.failures.length > 0 && (
-            <div className="text-red-400 mt-1">
-              Ошибок: {progress.failures.length}
-              {progress.failures.map((f, i) => (
-                <div key={i} className="font-mono text-[10px]">
-                  {f.label}: {f.error}
-                </div>
-              ))}
-            </div>
-          )}
-        </div>
-      )}
-
-      {err && <div className="text-red-400 text-xs mb-2">{err}</div>}
-
-      <div className="flex justify-end gap-2">
-        <button
-          type="button"
-          onClick={onDone}
-          disabled={progress != null && progress.done < progress.total}
-          className="px-3 py-1 rounded bg-slate-700 hover:bg-slate-600 text-xs"
-        >
-          Отмена
-        </button>
-        <button
-          type="submit"
-          disabled={progress != null && progress.done < progress.total}
-          className="px-3 py-1 rounded bg-emerald-600 hover:bg-emerald-500 text-xs font-semibold disabled:opacity-50"
-        >
-          Сохранить всё + 1 bootstrap
         </button>
       </div>
     </form>
@@ -3888,24 +1598,12 @@ function NodeActiveUsers({ nodeId }: { nodeId: number }) {
                   </td>
                   <td>
                     {u.device_id ? (
-                      // Маршрута /subscriptions в админке нет — раньше ссылка
-                      // проваливалась в catch-all и редиректила на Dashboard
-                      // (audit #165). Девайс принадлежит юзеру, поэтому ведём
-                      // на реальный /users, отфильтрованный по telegram_id;
-                      // если tg неизвестен (orphan) — просто текст без ссылки.
-                      u.user_telegram_id ? (
-                        <Link
-                          to={`/users?telegram_id=${encodeURIComponent(u.user_telegram_id)}`}
-                          className="text-blue-400 hover:underline"
-                          title="Открыть юзера этого девайса в разделе Users"
-                        >
-                          {u.device_name ?? `#${u.device_id}`}
-                        </Link>
-                      ) : (
-                        <span className="text-slate-300">
-                          {u.device_name ?? `#${u.device_id}`}
-                        </span>
-                      )
+                      <Link
+                        to={`/subscriptions?device_id=${u.device_id}`}
+                        className="text-blue-400 hover:underline"
+                      >
+                        {u.device_name ?? `#${u.device_id}`}
+                      </Link>
                     ) : (
                       <span className="text-slate-500">—</span>
                     )}
@@ -3940,22 +1638,10 @@ function formatBytes(bytes: number): string {
   return `${(bytes / 1024 / 1024 / 1024).toFixed(2)} GB`;
 }
 
-/** Периоды графика. 720 ч = 30 суток — ровно столько держит
- *  TRAFFIC_SAMPLE_RETENTION_DAYS, дальше в БД данных нет. */
-const CHART_RANGES: { label: string; hours: number }[] = [
-  { label: "24ч", hours: 24 },
-  { label: "7д", hours: 168 },
-  { label: "30д", hours: 720 },
-];
-
 function NodeTrafficChart({ nodeId }: { nodeId: number }) {
-  const [hours, setHours] = useState(24);
   const { data, isLoading, error } = useQuery<NodeTrafficHistoryOut>({
-    // hours ОБЯЗАН быть в ключе: иначе react-query отдаст кэш предыдущего
-    // периода и переключатель будет молча показывать старые данные.
-    queryKey: ["node-traffic-history", nodeId, hours],
-    queryFn: () =>
-      api.get(`/nodes/${nodeId}/traffic-history?hours=${hours}&max_points=400`),
+    queryKey: ["node-traffic-history", nodeId],
+    queryFn: () => api.get(`/nodes/${nodeId}/traffic-history?hours=24`),
     refetchInterval: 60_000,
   });
 
@@ -4019,38 +1705,18 @@ function NodeTrafficChart({ nodeId }: { nodeId: number }) {
 
   // Vertical gridlines every 6 hours
   const gridTimes: number[] = [];
-  // Шаг сетки под период: на 30 днях шестичасовые деления давали бы 120 линий
-  // и нечитаемую кашу подписей.
-  const stepHours = hours <= 24 ? 6 : hours <= 168 ? 24 : 24 * 5;
-  const step = stepHours * 60 * 60 * 1000;
+  const step = 6 * 60 * 60 * 1000;
   for (let t = Math.ceil(fromMs / step) * step; t <= toMs; t += step) {
     gridTimes.push(t);
   }
 
   return (
     <div className="rounded border border-slate-700 p-3 text-xs">
-      <div className="flex flex-wrap items-center gap-2 justify-between mb-2">
-        <div className="flex items-center gap-2">
-          <div className="text-xs uppercase tracking-wide text-slate-400">
-            Трафик и юзеры
-          </div>
-          <div className="flex gap-1">
-            {CHART_RANGES.map((r) => (
-              <button
-                key={r.hours}
-                onClick={() => setHours(r.hours)}
-                className={`text-[11px] px-2 py-0.5 rounded ${
-                  hours === r.hours
-                    ? "bg-slate-600 text-white"
-                    : "bg-slate-800 text-slate-400 hover:bg-slate-700"
-                }`}
-              >
-                {r.label}
-              </button>
-            ))}
-          </div>
+      <div className="flex items-center justify-between mb-2">
+        <div className="text-xs uppercase tracking-wide text-slate-400">
+          Трафик и юзеры за 24ч
         </div>
-        <div className="flex flex-wrap gap-x-4 gap-y-1 text-[11px] text-slate-500">
+        <div className="flex gap-4 text-[11px] text-slate-500">
           <span>
             <span className="inline-block w-3 h-0.5 bg-emerald-400 align-middle mr-1" />
             active_users (max {maxUsers})
@@ -4061,33 +1727,19 @@ function NodeTrafficChart({ nodeId }: { nodeId: number }) {
           </span>
         </div>
       </div>
-      {/* Высота ФИКСИРОВАННАЯ. С сохранением пропорций (xMidYMid meet + h-auto)
-          график масштабировался вместе с шириной окна: на 1900px он вырастал
-          до ~320px и занимал пол-экрана. Для спарклайна важна ширина, а высота
-          должна оставаться постоянной, поэтому здесь осознанный non-uniform
-          растяг. */}
       <svg
         viewBox={`0 0 ${W} ${H}`}
         preserveAspectRatio="none"
-        className="w-full h-[120px] md:h-[150px]"
-        role="img"
-        aria-label={`Трафик и активные юзеры за ${
-          CHART_RANGES.find((r) => r.hours === hours)?.label ?? ""
-        }`}
+        className="w-full"
+        style={{ height: H }}
       >
         {/* X-axis grid */}
         {gridTimes.map((t) => {
           const x = padL + ((t - fromMs) / spanMs) * plotW;
-          const label =
-            hours <= 24
-              ? new Date(t).toLocaleTimeString([], {
-                  hour: "2-digit",
-                  minute: "2-digit",
-                })
-              : new Date(t).toLocaleDateString([], {
-                  day: "2-digit",
-                  month: "2-digit",
-                });
+          const label = new Date(t).toLocaleTimeString([], {
+            hour: "2-digit",
+            minute: "2-digit",
+          });
           return (
             <g key={t}>
               <line
@@ -4172,20 +1824,19 @@ function NodeTrafficChart({ nodeId }: { nodeId: number }) {
 // Дефолты под каждый протокол — совпадают с тем, что ставит ansible
 // по дефолту (см. install_vless_reality/defaults). Если операторы
 // начнут менять порты в ролях — синхронизировать здесь.
-// shadowtls+shadowsocks убран из UI (0.2) — роль отключена и split-tunnel
-// там никто не делал. hysteria2 возвращён 2026-07-28: он снова активен в
-// site.yml и с той же даты умеет split-tunnel на relay-нодах (bindDevice +
-// acl), то есть больше не выпускает трафик мимо туннеля.
-type CreatableProtocol = Exclude<VPNConfigProtocol, "shadowtls+shadowsocks">;
+// shadowtls+shadowsocks убран из UI (0.2), hysteria2 убран (0.3).
+// Легаси-типы остаются в VPNConfigProtocol для строк со старых нод.
+type CreatableProtocol = Exclude<
+  VPNConfigProtocol,
+  "shadowtls+shadowsocks" | "hysteria2"
+>;
 const PROTOCOL_DEFAULTS: Record<
   CreatableProtocol,
   { port: number; sni: string; name: string }
 > = {
-  // sni пустой → бэкенд возьмёт из регионального пула (см. PROTO_DEFAULTS).
-  "vless-reality": { port: 9443, sni: "", name: "vless-reality" },
+  "vless-reality": { port: 9443, sni: "www.asus.com", name: "vless-reality" },
   "vless-ws-cdn": { port: 443, sni: "", name: "vless-ws-cdn" },
   "vless-xhttp": { port: 443, sni: "", name: "vless-xhttp" },
-  hysteria2: { port: 443, sni: "", name: "hysteria2" },
 };
 
 function AddConfigForm({
@@ -4271,18 +1922,12 @@ function AddConfigForm({
       </label>
       <label className="flex flex-col">
         <span className="text-slate-400 mb-1">SNI / fake domain</span>
-        {protocol === "vless-ws-cdn" ? (
-          <span className="px-2 py-1 rounded bg-slate-800/60 border border-slate-700 text-slate-500 italic">
-            авто (CF поддомен wgse.info) — не заполнять
-          </span>
-        ) : (
-          <input
-            className="bg-slate-800 border border-slate-700 rounded px-2 py-1 font-mono"
-            placeholder="www.cloudflare.com"
-            value={form.sni ?? ""}
-            onChange={(e) => setForm({ ...form, sni: e.target.value || null })}
-          />
-        )}
+        <input
+          className="bg-slate-800 border border-slate-700 rounded px-2 py-1 font-mono"
+          placeholder="www.cloudflare.com"
+          value={form.sni ?? ""}
+          onChange={(e) => setForm({ ...form, sni: e.target.value || null })}
+        />
       </label>
       <div className="col-span-2 text-slate-500 text-[11px]">
         Host ноды: <span className="font-mono">{nodeHost}</span>. Для
@@ -4316,43 +1961,35 @@ const KIND_LABELS: Record<string, string> = {
   bootstrap: "Bootstrap",
   resync: "Resync",
   diagnose: "Диагностика",
-  diagnose_link: "Диагностика link",
-  upgrade_xray: "Апгрейд xray",
-  upgrade_hysteria: "Апгрейд hysteria",
 };
 
 function OperationProgressBanner({
   op,
-  tasks,
   onDismiss,
 }: {
   op: TrackedOp;
-  // Данные общего поллинга со страницы (один запрос на все баннеры),
-  // см. trackedTasksQuery в NodesPage.
-  tasks: ProvisioningTaskOut[] | undefined;
   onDismiss: () => void;
 }) {
+  const { data } = useQuery<ProvisioningTaskOut[]>({
+    queryKey: ["provisioning-tasks", "tracked-op", op.kind, op.nodeId, op.startedAt],
+    queryFn: () => api.get("/provisioning/tasks?limit=500"),
+    refetchInterval: 3_000,
+    retry: false,
+  });
+
   const idSet = new Set(op.taskIds);
-  const related = (tasks ?? []).filter((t) => idSet.has(t.id));
+  const related = (data ?? []).filter((t) => idSet.has(t.id));
   const seen = new Set(related.map((t) => t.id));
   const missing = op.taskIds.filter((id) => !seen.has(id));
 
-  // После grace-окна missing-задачи (вне среза last-500) больше не считаем
-  // pending, а помечаем «unknown» и терминальными — иначе done<total никогда
-  // не сойдётся, баннер вечно «в процессе», поллинг не гаснет (audit #164).
-  const pastGrace = Date.now() - op.startedAt > MISSING_TASK_GRACE_MS;
-
   const counts = {
-    pending:
-      related.filter((t) => t.status === "pending").length +
-      (pastGrace ? 0 : missing.length),
+    pending: related.filter((t) => t.status === "pending").length + missing.length,
     running: related.filter((t) => t.status === "running").length,
     success: related.filter((t) => t.status === "success").length,
     failed: related.filter((t) => t.status === "failed").length,
-    unknown: pastGrace ? missing.length : 0,
   };
   const total = op.taskIds.length;
-  const done = counts.success + counts.failed + counts.unknown;
+  const done = counts.success + counts.failed;
   const allDone = done === total && total > 0;
   const pct = total === 0 ? 0 : Math.round((done / total) * 100);
 
@@ -4440,83 +2077,7 @@ function OperationProgressBanner({
         {counts.failed > 0 && (
           <span className="text-red-400">failed: {counts.failed}</span>
         )}
-        {counts.unknown > 0 && (
-          <span
-            className="text-amber-400"
-            title="Задачи вне окна последних 500 — статус неизвестен (op старше 30 мин). Смотри детали в /tasks."
-          >
-            unknown: {counts.unknown}
-          </span>
-        )}
       </div>
-      {op.kind === "diagnose_link" && (
-        <DiagnoseLinkResultPane op={op} task={related[0]} />
-      )}
-    </div>
-  );
-}
-
-// Структурированный блок результата под progress-bar для kind=diagnose_link.
-// Показывает карточки `checks` из task.result. Пока task ещё running —
-// отображает spinner-аналог; после completion — раскладку DiagnoseResult.
-function DiagnoseLinkResultPane({
-  op,
-  task,
-}: {
-  op: TrackedOp;
-  task: ProvisioningTaskOut | undefined;
-}) {
-  if (!task) {
-    return (
-      <div className="mt-3 text-xs text-slate-400 italic">
-        Ждём, когда воркер подхватит таску #{op.taskIds[0]}…
-      </div>
-    );
-  }
-  if (task.status === "pending" || task.status === "running") {
-    return (
-      <div className="mt-3 text-xs text-slate-400 italic">
-        Прогоняется ansible на ноде {op.nodeName}
-        {op.exitName ? ` (link → ${op.exitName})` : ""}…
-      </div>
-    );
-  }
-  const result = (task.result ?? {}) as {
-    checks?: DiagnoseCheckEntry[];
-    diagnose_meta?: DiagnoseMeta;
-    stdout?: string;
-    stderr?: string;
-    returncode?: number;
-  };
-  const checks = result.checks ?? [];
-  return (
-    <div className="mt-3 space-y-2">
-      <div className="text-xs text-slate-300">
-        Link → <span className="font-mono">{op.exitName ?? `exit#${op.linkId}`}</span>
-        {result.diagnose_meta && (
-          <span className="text-slate-500">
-            {" "}· iface {result.diagnose_meta.wg_interface}
-          </span>
-        )}
-      </div>
-      <DiagnoseResult checks={checks} meta={result.diagnose_meta} />
-      {(result.stdout || result.stderr) && (
-        <details className="text-xs text-slate-400">
-          <summary className="cursor-pointer hover:text-slate-200">
-            raw ansible stdout / stderr (для отладки)
-          </summary>
-          {result.stdout && (
-            <pre className="mt-1 bg-black/40 p-2 rounded font-mono text-[10px] overflow-x-auto whitespace-pre-wrap text-slate-300">
-              {result.stdout}
-            </pre>
-          )}
-          {result.stderr && (
-            <pre className="mt-1 bg-black/40 p-2 rounded font-mono text-[10px] overflow-x-auto whitespace-pre-wrap text-red-300">
-              {result.stderr}
-            </pre>
-          )}
-        </details>
-      )}
     </div>
   );
 }

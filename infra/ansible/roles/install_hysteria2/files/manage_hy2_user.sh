@@ -9,51 +9,34 @@ CONFIG="/etc/hysteria/config.yaml"
 
 usage() { echo "Usage: $0 add <username> <password> | del <username>" >&2; exit 1; }
 
-# NO_RESTART=1 — не рестартить сервис после правки (батч-ресинк из
-# resync_node_hy2.yml добавляет десятки юзеров подряд и рестартит ОДИН раз в
-# конце; иначе systemd StartLimitBurst (5 за 10s) прибьёт hysteria-server).
-_maybe_restart() {
-  if [[ "${NO_RESTART:-0}" == "1" ]]; then
-    echo "NO_RESTART=1 — skip hysteria-server restart"
-    return 0
-  fi
-  systemctl restart hysteria-server
-}
-
-# Имя/пароль передаём через окружение, а НЕ подстановкой в текст python-скрипта:
-# значение с кавычкой или переводом строки иначе выполнялось бы как код (root на
-# ноде). Наши секреты — token_urlsafe, но зависеть от этого нельзя (аудит
-# 2026-07-25).
 cmd_add() {
   local user="$1" pass="$2"
   # Use python3 to safely edit YAML
-  HY2_CONFIG="${CONFIG}" HY2_USER="${user}" HY2_PASS="${pass}" python3 -c "
-import os, yaml
-path = os.environ['HY2_CONFIG']
-with open(path) as f:
-    cfg = yaml.safe_load(f) or {}
+  python3 -c "
+import yaml, sys
+with open('${CONFIG}') as f:
+    cfg = yaml.safe_load(f)
 up = cfg.setdefault('auth', {}).setdefault('userpass', {})
-up[os.environ['HY2_USER']] = os.environ['HY2_PASS']
-with open(path, 'w') as f:
+up['${user}'] = '${pass}'
+with open('${CONFIG}', 'w') as f:
     yaml.dump(cfg, f, default_flow_style=False)
   "
-  _maybe_restart
+  systemctl restart hysteria-server
   echo "added hy2 user ${user}"
 }
 
 cmd_del() {
   local user="$1"
-  HY2_CONFIG="${CONFIG}" HY2_USER="${user}" python3 -c "
-import os, yaml
-path = os.environ['HY2_CONFIG']
-with open(path) as f:
-    cfg = yaml.safe_load(f) or {}
+  python3 -c "
+import yaml
+with open('${CONFIG}') as f:
+    cfg = yaml.safe_load(f)
 up = cfg.get('auth', {}).get('userpass', {})
-up.pop(os.environ['HY2_USER'], None)
-with open(path, 'w') as f:
+up.pop('${user}', None)
+with open('${CONFIG}', 'w') as f:
     yaml.dump(cfg, f, default_flow_style=False)
   "
-  _maybe_restart
+  systemctl restart hysteria-server
   echo "removed hy2 user ${user}"
 }
 

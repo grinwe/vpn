@@ -2,7 +2,7 @@
   "title": "VPN Service Overview",
   "uid": "vpn-overview",
   "schemaVersion": 39,
-  "version": 2,
+  "version": 1,
   "refresh": "30s",
   "time": { "from": "now-6h", "to": "now" },
   "timepicker": {},
@@ -93,54 +93,6 @@
           "mappings": [
             { "type": "value", "options": { "0": { "text": "DOWN", "color": "red" }, "1": { "text": "UP", "color": "green" } } }
           ]
-        },
-        "overrides": []
-      },
-      "datasource": { "type": "prometheus", "uid": "prometheus" }
-    },
-    {
-      "id": 6,
-      "type": "stat",
-      "title": "Relay fleet (up / total)",
-      "gridPos": { "h": 6, "w": 6, "x": 6, "y": 16 },
-      "targets": [
-        { "expr": "sum(up{job=\"vpn-nodes\"})", "refId": "A", "legendFormat": "up" },
-        { "expr": "count(up{job=\"vpn-nodes\"})", "refId": "B", "legendFormat": "total" }
-      ],
-      "fieldConfig": {
-        "defaults": {
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              { "color": "red", "value": null },
-              { "color": "yellow", "value": 1 },
-              { "color": "green", "value": 3 }
-            ]
-          }
-        },
-        "overrides": []
-      },
-      "datasource": { "type": "prometheus", "uid": "prometheus" }
-    },
-    {
-      "id": 7,
-      "type": "stat",
-      "title": "Exit fleet (up / total)",
-      "gridPos": { "h": 6, "w": 6, "x": 12, "y": 16 },
-      "targets": [
-        { "expr": "sum(up{job=\"wg-exit-nodes\"})", "refId": "A", "legendFormat": "up" },
-        { "expr": "count(up{job=\"wg-exit-nodes\"})", "refId": "B", "legendFormat": "total" }
-      ],
-      "fieldConfig": {
-        "defaults": {
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              { "color": "red", "value": null },
-              { "color": "yellow", "value": 1 },
-              { "color": "green", "value": 5 }
-            ]
-          }
         },
         "overrides": []
       },

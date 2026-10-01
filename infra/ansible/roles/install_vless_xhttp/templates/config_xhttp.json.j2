@@ -10,14 +10,6 @@
     "services": ["StatsService"]
   },
   "stats": {},
-  "dns": {
-    "servers": [
-      "77.88.8.8",
-      "8.8.8.8",
-      "1.1.1.1"
-    ],
-    "queryStrategy": "UseIP"
-  },
   "policy": {
     "levels": {
       "0": {
@@ -31,37 +23,11 @@
     }
   },
   "routing": {
-    "domainStrategy": "IPIfNonMatch",
     "rules": [
       {
         "type": "field",
         "inboundTag": ["api-in"],
         "outboundTag": "api"
-      },
-      {#- RU-блок держать в паритете с install_vless_reality/templates/config.json.j2
-          и install_vless_ws_cdn/templates/config_ws_cdn.json.j2 — полное
-          обоснование каждого куска там. Историческая болезнь этого проекта:
-          правки RU-обхода приземляются в один протокол за раз (reality 21.04,
-          xhttp только 05.06, ws-cdn не получал их никогда). -#}
-      {
-        "type": "field",
-        "ip": ["geoip:private"],
-        "outboundTag": "block"
-      },
-      {
-        "type": "field",
-        {#- Список — из роли ru_direct_list (единый на все 4 протокола).
-            Зоны рендерим regexp'ами, конкретные домены — `domain:`
-            (суффиксный матч: домен + все поддомены). -#}
-        "domain": {{ ((ru_direct_list_zones | map('regex_replace', '^(.*)$', 'regexp:\\\\.\\1$') | list)
-                    + (ru_direct_list_domains | map('regex_replace', '^(.*)$', 'domain:\\1') | list))
-                   | to_json }},
-        "outboundTag": "direct-local"
-      },
-      {
-        "type": "field",
-        "ip": ["geoip:ru"],
-        "outboundTag": "direct-local"
       }{% for _rule in _fan_out if _rule.emails %},
       {
         "type": "field",
@@ -82,8 +48,8 @@
     },
     {
       "tag": "vless-xhttp",
-      "listen": "127.0.0.1",
-      "port": {{ vless_xhttp_internal_port | int }},
+      "listen": "0.0.0.0",
+      "port": {{ vless_xhttp_port | int }},
       "protocol": "vless",
       "settings": {
         "clients": {{ vless_xhttp_existing_clients | default([]) | to_json }},
@@ -92,19 +58,24 @@
       "streamSettings": {
         "network": "xhttp",
         "xhttpSettings": {
-          {#- host НЕ рендерим. xray-xhttp ЭНФОРСИТ Host (xhttp/hub.go:
-              host != "" && request.Host != host → HTTP 404). Любой клиент,
-              у кого в сохранённом config_text вшит старый/иной host= (а после
-              DR это весь флот), ловит 404 → xhttp ложится целиком. Домен для
-              DR-восстановления берём из nginx server_name
-              (scripts/grab_xhttp_domains.sh), отсюда он НЕ нужен. -#}
           "path": "{{ vless_xhttp_path | default('/xh') }}",
           "mode": "{{ vless_xhttp_mode | default('auto') }}"
+        },
+        "security": "tls",
+        "tlsSettings": {
+          "serverName": "{{ vless_xhttp_domain }}",
+          "certificates": [
+            {
+              "certificateFile": "{{ _xhttp_cert_path }}",
+              "keyFile": "{{ _xhttp_key_path }}"
+            }
+          ],
+          "alpn": ["h2", "http/1.1"]
         }
       },
       "sniffing": {
         "enabled": true,
-        "destOverride": ["http", "tls", "quic"]
+        "destOverride": ["http", "tls"]
       }
     }
   ],
@@ -118,10 +89,6 @@
           "tcpKeepAliveInterval": 30
         }
       }{% endif %}
-    },
-    {
-      "protocol": "freedom",
-      "tag": "direct-local"
     }{% for _ob in _fan_out %},
     {
       "protocol": "freedom",

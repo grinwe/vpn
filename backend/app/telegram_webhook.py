@@ -7,8 +7,7 @@ shared ``TELEGRAM_STARS_WEBHOOK_SECRET``.
 
 Update routing
 --------------
-* ``pre_checkout_query`` (XTR) -- validate the invoice (exists, still
-  pending, Stars amount matches) and answer via Bot API (audit #2).
+* ``pre_checkout_query`` (XTR) -- answer OK directly via Bot API.
   Must respond within 10 s or Telegram cancels the payment.
 * ``message.successful_payment`` (XTR) -- mark the invoice paid in the
   DB (same pipeline as the admin ``mark_paid`` route).
@@ -44,7 +43,6 @@ from .api._common import get_db
 from .api.invoices import _mark_invoice_paid_core
 from .config import get_settings
 from .rate_limit import limiter
-from .services.admin_notify import notify_admins
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -95,81 +93,6 @@ def _forward_to_bot(body: bytes, bot_url: str) -> None:
         logger.exception("Failed to forward update to bot at %s", bot_url)
 
 
-# ── pre_checkout validation (аудит #2) ───────────────────────────────
-
-
-def _expected_stars_amount(invoice: models.Invoice) -> int | None:
-    """Ожидаемая сумма счёта в Stars — зеркалит путь его создания.
-
-    * ``kind=topup``: ``Invoice.amount`` всегда хранится в рублях
-      (``api_webapp.webapp_topup``), даже при ``currency="XTR"`` —
-      конвертируем так же, как при выпуске ссылки (``_rub_to_stars``).
-    * RUB-инвойсы (бот-флоу): конвертация повторяет
-      ``api/payments._convert_for_provider`` → ``_rub_to_stars``.
-    * XTR-инвойсы (webapp checkout): ``amount`` уже в звёздах, провайдер
-      лишь округляет вверх (``TelegramStarsProvider.create_invoice``).
-
-    Если курс ``WEBAPP_STARS_PER_RUB`` сменился после выпуска ссылки,
-    старая ссылка отклонится на pre_checkout — это осознанно: цена в
-    ней устарела, пользователь пересоздаёт заказ по актуальной.
-
-    Возвращает ``None``, если сумму посчитать не удалось (битые данные)
-    — тогда проверка суммы пропускается, остальные проверки остаются.
-    """
-    try:
-        amount = float(invoice.amount or 0)
-    except (TypeError, ValueError):
-        return None
-    currency = (invoice.currency or "").upper()
-    if invoice.kind == "topup" or currency in ("RUB", "RUR"):
-        # Ленивый импорт: api_webapp тянет за собой app.api — держим
-        # его вне module-level, как в api/payments._convert_for_provider.
-        from .api_webapp import _rub_to_stars
-
-        return _rub_to_stars(amount)
-    return max(1, int(amount + 0.999))
-
-
-def _validate_pre_checkout(db: Session, pcq: dict) -> tuple[bool, str | None]:
-    """Проверить инвойс перед подтверждением pre_checkout (аудит #2).
-
-    Telegram списывает Stars сразу после ``ok=True``, поэтому
-    подтверждаем только существующий pending-инвойс с совпадающей
-    суммой. Иначе отвечаем ``ok=False`` — checkout отменяется и деньги
-    пользователя не списываются «в никуда» (раньше failed/битый инвойс
-    проходил pre_checkout, а successful_payment падал уже после оплаты).
-    """
-    try:
-        invoice_id = int(pcq.get("invoice_payload"))
-    except (TypeError, ValueError):
-        logger.warning(
-            "pre_checkout: non-int invoice_payload %r",
-            pcq.get("invoice_payload"),
-        )
-        return False, "Счёт не найден — создайте заказ заново"
-
-    invoice = db.get(models.Invoice, invoice_id)
-    if invoice is None:
-        logger.warning("pre_checkout: invoice %d not found", invoice_id)
-        return False, "Счёт не найден — создайте заказ заново"
-    if invoice.status == models.InvoiceStatus.paid:
-        return False, "Счёт уже оплачен"
-    if invoice.status != models.InvoiceStatus.pending:
-        return False, "Счёт отменён — создайте заказ заново"
-
-    expected = _expected_stars_amount(invoice)
-    total = pcq.get("total_amount")
-    if expected is not None and total != expected:
-        logger.warning(
-            "pre_checkout: amount mismatch for invoice %d: got %r, expected %d",
-            invoice_id,
-            total,
-            expected,
-        )
-        return False, "Сумма счёта устарела — создайте заказ заново"
-    return True, None
-
-
 # ── Webhook endpoint ─────────────────────────────────────────────────
 
 
@@ -211,16 +134,11 @@ async def tg_webhook(request: Request, db: Session = Depends(get_db)):
                 error_message="Unsupported currency",
             )
             return {"ok": True}
-        # Аудит #2: подтверждаем только существующий pending-инвойс с
-        # совпадающей суммой — иначе Telegram спишет Stars, а
-        # successful_payment упрётся в 400 и деньги уйдут «в никуда».
-        ok, error_message = _validate_pre_checkout(db, pcq)
         await asyncio.to_thread(
             _answer_pre_checkout_query,
             settings.bot_token,
             query_id,
-            ok=ok,
-            error_message=error_message,
+            ok=True,
         )
         return {"ok": True}
 
@@ -261,56 +179,11 @@ async def tg_webhook(request: Request, db: Session = Depends(get_db)):
                 payment_id=payment_id,
             )
         except HTTPException as exc:
-            # Аудит #209: Stars уже списаны, а инвойс не оплачен — такое
-            # нельзя глотать warning'ом: подписка не создана, повторного
-            # апдейта от Telegram не будет. Логируем error, алертим
-            # админов (dedup по invoice_id) и на инфраструктурных сбоях
-            # (5xx, например упавший провижининг) отвечаем не-200, чтобы
-            # Telegram ретраил вебхук.
-            logger.error(
+            logger.warning(
                 "mark_invoice_paid failed for invoice %d: %s",
                 invoice_id,
                 exc.detail,
-                exc_info=True,
             )
-            # Сессия после сбоя может держать полусделанные изменения
-            # (mark_paid коммитит поэтапно) — откатываем, чтобы алерт
-            # не закоммитил их заодно.
-            db.rollback()
-            tg_user_id = (msg.get("from") or {}).get("id")
-            try:
-                notify_admins(
-                    db,
-                    kind="stars_payment_failed",
-                    text=(
-                        "⚠️ Оплата Telegram Stars не зачислена: "
-                        f"инвойс #{invoice_id}, "
-                        f"telegram_id={tg_user_id}, "
-                        f"сумма={sp.get('total_amount')}⭐.\n"
-                        f"Ошибка: {exc.detail}\n"
-                        "Звёзды с пользователя списаны — нужен ручной "
-                        "разбор (mark_paid или рефанд)."
-                    ),
-                    dedup_key={"invoice_id": invoice_id},
-                    extra={
-                        "telegram_id_user": tg_user_id,
-                        "status_code": exc.status_code,
-                    },
-                    autocommit=True,
-                )
-            except Exception:  # noqa: BLE001 — алерт не должен ронять ветку
-                logger.exception(
-                    "notify_admins(stars_payment_failed) failed for invoice %d",
-                    invoice_id,
-                )
-            if exc.status_code >= 500:
-                # Восстановимый сбой — не-200 заставит Telegram
-                # повторить апдейт; mark_paid идемпотентен для уже
-                # оплаченных инвойсов, дубль безопасен.
-                raise HTTPException(
-                    status_code=500,
-                    detail="Stars payment processing failed",
-                ) from exc
         return {"ok": True}
 
     # ── Everything else -> forward to bot ──

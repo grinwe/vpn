@@ -8,12 +8,10 @@ subscription.
 from __future__ import annotations
 
 import logging
-import uuid
-from typing import Any, Literal
+from typing import Any
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query
-from pydantic import BaseModel, Field
-from sqlalchemy import and_, func, or_
+from sqlalchemy import and_, or_
 from sqlalchemy.orm import Session
 
 from .. import models, schemas
@@ -77,10 +75,6 @@ def list_tasks(
     offset: int = Query(default=0, ge=0),
     status_filter: str | None = Query(default=None, alias="status"),
     target_type: str | None = None,
-    batch_id: uuid.UUID | None = Query(
-        default=None,
-        description="Filter tasks to ones created by a batch-attach (UUID)",
-    ),
     telegram_id: str | None = Query(
         default=None,
         description="Filter tasks to ones owned by this telegram_id (via device→sub→user chain)",
@@ -98,8 +92,6 @@ def list_tasks(
             raise HTTPException(status_code=400, detail="Invalid status") from exc
     if target_type:
         query = query.filter(models.ProvisioningTask.target_type == target_type)
-    if batch_id is not None:
-        query = query.filter(models.ProvisioningTask.batch_id == batch_id)
 
     if telegram_id:
         # Narrow by telegram_id: collect the device/subscription ids
@@ -179,58 +171,6 @@ def delete_task(
     return None
 
 
-@router.get(
-    "/provisioning/batches/{batch_id}",
-    response_model=schemas.BatchSummary,
-)
-def get_batch(
-    batch_id: uuid.UUID,
-    db: Session = Depends(get_db),
-    admin_token: str = Depends(require_admin),
-):
-    """Сводка по batch-attach: всего task'ов + breakdown статусов + список.
-
-    Drawer-sidebar в UI POLL'ит этот endpoint раз в 2-3 секунды пока
-    есть pending/running в status_counts. Когда всё success/failed —
-    polling останавливается, юзер видит финальный результат.
-
-    404 если batch_id не существует — это и невалидный UUID шаблон, и
-    легитимный «никаких задач не создано» (например тут же удалили).
-    """
-    tasks = (
-        db.query(models.ProvisioningTask)
-        .filter(models.ProvisioningTask.batch_id == batch_id)
-        .order_by(models.ProvisioningTask.created_at.asc())
-        .all()
-    )
-    if not tasks:
-        raise HTTPException(status_code=404, detail="Batch not found")
-
-    counts_rows = (
-        db.query(
-            models.ProvisioningTask.status, func.count(models.ProvisioningTask.id)
-        )
-        .filter(models.ProvisioningTask.batch_id == batch_id)
-        .group_by(models.ProvisioningTask.status)
-        .all()
-    )
-    status_counts = {row[0].value: int(row[1]) for row in counts_rows}
-
-    tg_map = _enrich_task_telegram(db, tasks)
-    task_dtos: list[schemas.ProvisioningTaskOut] = []
-    for t in tasks:
-        dto = schemas.ProvisioningTaskOut.from_orm(t)
-        dto.telegram_id = tg_map.get(t.id)
-        task_dtos.append(dto)
-
-    return schemas.BatchSummary(
-        batch_id=batch_id,
-        total=len(tasks),
-        status_counts=status_counts,
-        tasks=task_dtos,
-    )
-
-
 @router.get("/provisioning/tasks/{task_id}", response_model=schemas.ProvisioningTaskOut)
 def get_task(task_id: int, db: Session = Depends(get_db)):
     task = db.get(models.ProvisioningTask, task_id)
@@ -252,9 +192,8 @@ def execute_task(
     if not task:
         raise HTTPException(status_code=404, detail="Task not found")
     orchestrator = ProvisioningOrchestrator(db)
-    # requeue_task маршрутизирует node-bootstrap через coalesce (иначе можно
-    # дважды задиспатчить или воскресить терминальную строку → IntegrityError).
-    task = orchestrator.requeue_task(task)
+    node = db.get(models.VPNNode, task.target_id) if task.target_type == "node" else None
+    orchestrator.run_task_async(task, node=node)
     db.refresh(task)
     return schemas.ProvisioningTaskOut.from_orm(task)
 
@@ -283,66 +222,15 @@ def rerun_task(
             detail="Task is currently running; wait for it to finish",
         )
     orchestrator = ProvisioningOrchestrator(db)
-    # node-bootstrap reruns идут через coalesce (resurrect терминальной строки
-    # в pending → коллизия с uq_active_node_bootstrap → 500). Возвращаемая
-    # таска может быть свежей coalesced-таской.
-    task = orchestrator.requeue_task(task)
+    orchestrator.reset_failed_task(task)
+    orchestrator.run_task_async(task, node=None)
     db.refresh(task)
     return schemas.ProvisioningTaskOut.from_orm(task)
-
-
-@router.post(
-    "/provisioning/tasks/{task_id}/cancel",
-    response_model=schemas.ProvisioningTaskOut,
-)
-def cancel_task(
-    task_id: int,
-    db: Session = Depends(get_db),
-    admin_token: str = Depends(require_admin),
-):
-    """Phase 1: отмена таски. pending → помечаем cancelled сразу + снимаем
-    RQ-джобу. running → ставим cancel_requested_at; раннер на ближайшем poll'е
-    SIGTERM'нет ansible, и worker пометит cancelled. Терминальные — no-op."""
-    from ..queue import cancel_task_job
-    from ..time_utils import utcnow
-
-    task = db.get(models.ProvisioningTask, task_id)
-    if not task:
-        raise HTTPException(status_code=404, detail="Task not found")
-    if task.status in (
-        models.ProvisioningTaskStatus.success,
-        models.ProvisioningTaskStatus.failed,
-        models.ProvisioningTaskStatus.cancelled,
-    ):
-        return schemas.ProvisioningTaskOut.from_orm(task)  # idempotent
-
-    task.cancel_requested_at = utcnow()
-    if task.status == models.ProvisioningTaskStatus.pending:
-        # Ещё не стартовала — снимаем сразу + дропаем RQ-джобу (worker'у
-        # пре-старт проверка тоже бы помогла, но так чище и быстрее).
-        cancel_task_job(task_id)
-        task.status = models.ProvisioningTaskStatus.cancelled
-        task.finished_at = utcnow()
-        task.error_message = "cancelled before start"
-    db.add(task)
-    db.commit()
-    db.refresh(task)
-    return schemas.ProvisioningTaskOut.from_orm(task)
-
-
-class BatchTasksRequest(BaseModel):
-    # ids ограничены по образцу BatchBanRequest в users.py: min 1 (пустой
-    # батч бессмыслен) и max 500 (иначе неограниченный список крутит тысячи
-    # одиночных db.get в цикле и держит соединение БД). Literal на action
-    # заменяет ручную проверку и отдаёт 422 при мусоре вместо 500 посреди
-    # батча (нетиповой id больше не доедет до db.get).
-    ids: list[int] = Field(min_length=1, max_length=500)
-    action: Literal["delete", "rerun"]
 
 
 @router.post("/provisioning/tasks/batch")
 def batch_tasks(
-    body: BatchTasksRequest,
+    body: dict,
     db: Session = Depends(get_db),
     admin_token: str = Depends(require_admin),
     admin_actor: str | None = Header(default=None, alias=ADMIN_ACTOR_HEADER),
@@ -351,8 +239,13 @@ def batch_tasks(
 
     Body: ``{ "ids": [1,2,3], "action": "delete" | "rerun" }``
     """
-    ids = body.ids
-    action = body.action
+    ids = body.get("ids", [])
+    action = body.get("action", "")
+    if not ids or action not in ("delete", "rerun"):
+        raise HTTPException(
+            status_code=400,
+            detail="ids (list) and action (delete|rerun) required",
+        )
 
     actor, actor_type = _resolve_admin_actor(admin_actor)
     results: dict[str, list[int]] = {"ok": [], "skipped": [], "not_found": []}
@@ -375,15 +268,9 @@ def batch_tasks(
             if task.status == models.ProvisioningTaskStatus.running:
                 results["skipped"].append(tid)
                 continue
-            try:
-                orchestrator.requeue_task(task)
-                results["ok"].append(tid)
-            except Exception:  # noqa: BLE001
-                # Одна коллизия не должна отравлять весь батч (poisoned txn):
-                # откатываем и продолжаем со следующим id.
-                db.rollback()
-                logger.exception("batch rerun: task %s failed", tid)
-                results["skipped"].append(tid)
+            orchestrator.reset_failed_task(task)
+            orchestrator.run_task_async(task, node=None)
+            results["ok"].append(tid)
 
     db.commit()
     _audit(

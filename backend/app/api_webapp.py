@@ -21,7 +21,6 @@ import logging
 import os
 import time
 from datetime import datetime
-from typing import Literal
 from urllib.parse import parse_qsl
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Request
@@ -30,17 +29,10 @@ from sqlalchemy.orm import Session
 
 from . import models, schemas
 from .api import _subscriptions_for_user
-from .api._common import _audit
 from .config import get_settings
 from .db import SessionLocal
 from .rate_limit import limiter
-from .services import sub_links
-from .services.payments.base import ProviderError
-from .services.payments.checkout import (
-    ProviderApiError,
-    checkout_pending_invoice,
-    report_provider_failure,
-)
+from .services.payments.base import ProviderError, get_provider
 
 logger = logging.getLogger(__name__)
 
@@ -205,33 +197,11 @@ def webapp_auth(request: Request, body: AuthRequest, db: Session = Depends(get_d
         .filter(models.User.telegram_id == telegram_id)
         .one_or_none()
     )
-    created_here = user is None
     if user is None:
         user = models.User(telegram_id=telegram_id)
         db.add(user)
         db.commit()
         db.refresh(user)
-
-    # Онбординг-телеметрия (роадмап E0.1): единственная точка, где видно, что
-    # человек РЕАЛЬНО открыл кабинет. До этого воронка обрывалась на /start:
-    # нельзя было отличить «не дошёл до Mini App» от «открыл и ушёл», а это
-    # разные проблемы с разными фиксами. Пишем на каждый /auth (он же обмен
-    # initData на JWT, т.е. фактически «открыл приложение»); первое открытие
-    # ищется как MIN(created_at) по этому action.
-    try:
-        _audit(
-            db,
-            f"tg:{telegram_id}",
-            "webapp_open",
-            "user",
-            user.id,
-            metadata={"first_seen_here": created_here},
-            actor_type=models.AuditActor.user,
-        )
-    except Exception:  # noqa: BLE001
-        # Телеметрия не имеет права мешать входу в кабинет.
-        db.rollback()
-        logger.exception("webapp_open audit failed for user %s", user.id)
 
     token = issue_token(user.id, settings.webapp_jwt_secret, settings.webapp_jwt_ttl_seconds)
     return AuthResponse(
@@ -258,20 +228,6 @@ class BalanceInfo(BaseModel):
     # change in the Plan table auto-propagates without a deploy.
     trial_available: bool
     trial_amount_kopecks: int
-    # Устаревший флаг второго шага «купить план на бонус» из браузера.
-    # Теперь ``/trial/activate`` сам выдаёт подписку на бесплатные дни, и
-    # флаг ВСЕГДА False: старый закэшированный бандл, увидев его, не пойдёт
-    # в ``/subscriptions/activate`` (это смена тарифа, он отозвал бы только
-    # что выданную подписку или ответил бы «Already on plan»), а просто
-    # обновит ``/me``. Поле держим в схеме ради таких бандлов.
-    trial_autoactivate_allowed: bool = False
-    # Бесплатные дни для баннера: всем (3) и сверху по приглашению (0 или 3).
-    trial_days: int = 0
-    trial_referral_days: int = 0
-    # Живая подписка уже есть: тап по баннеру даст только деньги на баланс
-    # (пойдут на продление), подписку не выдаст. Кабинет показывает честный
-    # баннер «Подарок: N ₽ на баланс» вместо «Забери N дней бесплатно».
-    trial_bonus_only: bool = False
 
 
 class DeviceSummary(BaseModel):
@@ -280,9 +236,6 @@ class DeviceSummary(BaseModel):
     status: str
     sub_token: str | None
     created_at: datetime | None
-    # Готовый URL с доменом как у бота (sub_links.sub_url_for) — только у
-    # подписок с link_token (с 0070); у старых фронт строит URL по-старому.
-    sub_url: str | None = None
 
 
 class SubscriptionWebAppExtra(BaseModel):
@@ -309,20 +262,8 @@ class SubscriptionWebAppExtra(BaseModel):
     # device still fits in the already-paid envelope (e.g. user had
     # bought a slot then removed a device).
     next_extra_fee_kopecks: int
-    # Renewal period derived from ``plan.duration_days`` (>=365 → year,
-    # else month). Frontend uses it to pick the "₽/год" vs "₽/мес"
-    # label and the correct amount from ``total_per_period_kopecks``.
-    period: Literal["month", "year"]
-    # What the user will be charged on the next renewal. For monthly
-    # plans: ``price + slots * EXTRA_DEVICE_MONTHLY_KOPECKS``. For
-    # annual: ``price + slots * EXTRA_DEVICE_MONTHLY_KOPECKS * 12``
-    # (device-slots are prepaid for the whole year on activation). This
-    # is the honest "N ₽/period" number the UI should show.
-    total_per_period_kopecks: int
-    # Deprecated alias of ``total_per_period_kopecks``, kept for ~2
-    # releases because Telegram caches the WebApp bundle aggressively
-    # and old clients still read this field. New code must use
-    # ``total_per_period_kopecks``.
+    # Total monthly cost including extra device surcharge. UI should
+    # display this instead of plan_price_kopecks when showing "N ₽/мес".
     total_monthly_kopecks: int
     devices: list[DeviceSummary]
 
@@ -365,9 +306,6 @@ def _build_subscription_extras(
 
     extras: list[SubscriptionWebAppExtra] = []
     min_days: int | None = None
-    # Заморозка только после первой оплаты (правило по подписке, см.
-    # balance.freeze_allowed_by_payment). «Платил ли» считаем один раз на юзера.
-    has_paid = balance_svc.user_has_paid(db, user.id) if subs else False
     for sub in subs:
         plan = sub.plan
         live_device_rows = (
@@ -400,7 +338,6 @@ def _build_subscription_extras(
             sub.status == models.SubscriptionStatus.active
             and sub.auto_renew
             and not already_froze
-            and balance_svc.freeze_allowed_by_payment(db, sub, has_paid=has_paid)
         )
 
         bundled = (plan.max_devices if plan else 1) or 1
@@ -413,10 +350,6 @@ def _build_subscription_extras(
             balance_svc.prorated_extra_device_fee(sub)
             if plan and live_devices + 1 > capacity
             else 0
-        )
-        period: Literal["month", "year"] = "year" if duration >= 365 else "month"
-        total_per_period = (
-            balance_svc.total_renewal_cost_kopecks(sub) if plan else price
         )
         extras.append(
             SubscriptionWebAppExtra(
@@ -433,9 +366,7 @@ def _build_subscription_extras(
                 extra_device_slots=slots,
                 extra_device_monthly_kopecks=balance_svc.EXTRA_DEVICE_MONTHLY_KOPECKS,
                 next_extra_fee_kopecks=next_extra_fee,
-                period=period,
-                total_per_period_kopecks=total_per_period,
-                total_monthly_kopecks=total_per_period,
+                total_monthly_kopecks=price + slots * balance_svc.EXTRA_DEVICE_MONTHLY_KOPECKS,
                 devices=[
                     DeviceSummary(
                         id=d.id,
@@ -443,11 +374,6 @@ def _build_subscription_extras(
                         status=d.status.value,
                         sub_token=d.sub_token,
                         created_at=getattr(d, "created_at", None),
-                        sub_url=(
-                            sub_links.sub_url_for(d.sub_token)
-                            if sub.link_token and d.sub_token
-                            else None
-                        ),
                     )
                     for d in live_device_rows
                 ],
@@ -457,17 +383,11 @@ def _build_subscription_extras(
         if days_left is not None and sub.status == models.SubscriptionStatus.active:
             # Total runway = current period remaining + future renewals
             # the balance can cover (only if auto_renew is on).
-            # Renewal cost includes the device-slot surcharge — see
-            # balance.total_renewal_cost_kopecks. Pre-fix this used bare
-            # plan price, so users with paid slots saw an inflated
-            # runway (e.g. 532 дн вместо ~120 дн при 2 слотах).
             runway = days_left
-            if sub.auto_renew and plan:
-                renewal_cost = balance_svc.total_renewal_cost_kopecks(sub)
-                if renewal_cost > 0:
-                    balance = user.balance_kopecks or 0
-                    future_renewals = balance // renewal_cost
-                    runway += future_renewals * duration
+            if sub.auto_renew and price > 0:
+                balance = user.balance_kopecks or 0
+                future_renewals = balance // price
+                runway += future_renewals * duration
             min_days = runway if min_days is None else min(min_days, runway)
 
     return extras, min_days
@@ -509,12 +429,6 @@ def webapp_me(
     from .services import trial as trial_svc
     trial_available = user.trial_activated_at is None
     trial_amount = trial_svc.trial_amount_kopecks(db) if trial_available else 0
-    trial_days, trial_referral_days = trial_svc.trial_days_for(db, user)
-    # Живая подписка: тап по баннеру даст только бонус на баланс (см.
-    # webapp_activate_trial). ``subs`` выше уже отфильтрован от
-    # blocked/expired, но статус проверяем явно: нужен именно факт «есть
-    # active/frozen подписка», как в самой активации.
-    has_live_sub = any(s.status in ("active", "frozen") for s in subs)
 
     balance = BalanceInfo(
         balance_kopecks=balance_kopecks,
@@ -523,10 +437,6 @@ def webapp_me(
         has_active_balance_sub=any(e.plan_price_kopecks > 0 for e in extras),
         trial_available=trial_available,
         trial_amount_kopecks=trial_amount,
-        trial_autoactivate_allowed=False,
-        trial_days=trial_days,
-        trial_referral_days=trial_referral_days,
-        trial_bonus_only=trial_available and has_live_sub,
     )
     user_out = schemas.UserOut(
         id=user.id,
@@ -699,22 +609,11 @@ def webapp_checkout(
     # Pricing: send what the bot will actually charge the user. For
     # Stars, we convert RUB → ⭐ here so the Invoice.amount matches the
     # number Telegram will display. For other providers we keep RUB.
-    #
-    # Продление считаем со слотами (total_renewal_cost_kopecks): /me уже
-    # показывает цену с доплатой за extra_device_slots, а счёт выставлялся на
-    # голый plan.price — человек платил меньше, чем видел на экране, и меньше,
-    # чем списал бы баланс-путь за тот же период (ревью 2026-07-29).
-    if is_renewal and target_subscription is not None:
-        from .services import balance as balance_svc  # ленивый, как в /me
-
-        price_rub = balance_svc.total_renewal_cost_kopecks(target_subscription) / 100
-    else:
-        price_rub = float(plan.price)
     if body.provider == "telegram_stars":
-        amount = float(_rub_to_stars(price_rub))
+        amount = float(_rub_to_stars(float(plan.price)))
         currency = "XTR"
     else:
-        amount = float(price_rub)
+        amount = float(plan.price)
         currency = "RUB"
 
     invoice = models.Invoice(
@@ -729,28 +628,41 @@ def webapp_checkout(
     db.commit()
     db.refresh(invoice)
 
-    # Единый чекаут (services/payments/checkout.py): конвертация здесь не
-    # нужна — Invoice.amount уже в валюте провайдера (XTR/RUB), и хелпер
-    # такие суммы пропускает как есть. Описание нейтральное («Order #N»,
-    # Stage 9d) — задаёт сам хелпер.
     try:
-        result = checkout_pending_invoice(db, invoice, provider_name=body.provider)
-    except ProviderApiError as exc:
-        raise HTTPException(
-            status_code=502,
-            detail=report_provider_failure(
-                db, exc, provider_name=body.provider, invoice_id=invoice.id
-            ),
-        )
+        provider = get_provider(body.provider)
     except ProviderError as exc:
         raise HTTPException(status_code=503, detail=str(exc))
 
+    try:
+        provider_invoice = provider.create_invoice(
+            invoice_id=invoice.id,
+            amount=amount,
+            currency=currency,
+            # Stage 9d: neutral description — bank compliance scanners flag
+            # the literal "VPN" in payment metadata. Plan name is intentionally
+            # omitted so acquirers see only an opaque order id.
+            description=f"Order #{invoice.id}",
+        )
+    except ProviderError as exc:
+        raise HTTPException(status_code=502, detail=f"payment provider error: {exc}")
+
+    payment = models.Payment(
+        invoice_id=invoice.id,
+        amount=invoice.amount,
+        currency=invoice.currency,
+        status=models.PaymentStatus.pending,
+        provider=provider.name,
+        external_id=provider_invoice.external_id,
+    )
+    db.add(payment)
+    db.commit()
+
     return CheckoutResponse(
         invoice_id=invoice.id,
-        provider=result.provider,
-        pay_url=result.pay_url,
-        amount=result.amount,
-        currency=result.currency,
+        provider=provider.name,
+        pay_url=provider_invoice.pay_url,
+        amount=provider_invoice.amount,
+        currency=provider_invoice.currency,
     )
 
 
@@ -879,30 +791,39 @@ def webapp_topup(
     db.commit()
     db.refresh(invoice)
 
-    # Единый чекаут; сумму для провайдера передаём явно (override): в
-    # topup-инвойсе amount по контракту в рублях (хук начисляет копейки),
-    # и вывести из него XTR-сумму хелпер не может.
     try:
-        result = checkout_pending_invoice(
-            db, invoice, provider_name=body.provider,
-            pay_amount=amount, pay_currency=currency,
-        )
-    except ProviderApiError as exc:
-        raise HTTPException(
-            status_code=502,
-            detail=report_provider_failure(
-                db, exc, provider_name=body.provider, invoice_id=invoice.id
-            ),
-        )
+        provider = get_provider(body.provider)
     except ProviderError as exc:
         raise HTTPException(status_code=503, detail=str(exc))
 
+    try:
+        provider_invoice = provider.create_invoice(
+            invoice_id=invoice.id,
+            amount=amount,
+            currency=currency,
+            # Stage 9d: neutral description (no "VPN" / no "topup" literal).
+            description=f"Order #{invoice.id}",
+        )
+    except ProviderError as exc:
+        raise HTTPException(status_code=502, detail=f"payment provider error: {exc}")
+
+    payment = models.Payment(
+        invoice_id=invoice.id,
+        amount=amount_rub,
+        currency=currency,
+        status=models.PaymentStatus.pending,
+        provider=provider.name,
+        external_id=provider_invoice.external_id,
+    )
+    db.add(payment)
+    db.commit()
+
     return TopupResponse(
         invoice_id=invoice.id,
-        provider=result.provider,
-        pay_url=result.pay_url,
-        amount=result.amount,
-        currency=result.currency,
+        provider=provider.name,
+        pay_url=provider_invoice.pay_url,
+        amount=provider_invoice.amount,
+        currency=provider_invoice.currency,
     )
 
 
@@ -914,36 +835,7 @@ class TrialActivateWebAppResponse(BaseModel):
     trial_amount_kopecks: int
     referral_bonus_kopecks: int
     balance_kopecks: int
-    # Конец бесплатных дней. None у бонус-онли (живая подписка, таймера нет)
-    # и на историческом пути (старый бонус 150 ₽ потрачен на месяц).
-    trial_expires_at: str | None = None
-    # Выданная подписка. Всё None, если у юзера уже была живая подписка и
-    # тап дал только бонус на баланс: кабинет тогда просто обновляет /me.
-    subscription_id: int | None = None
-    sub_token: str | None = None
-    # Готовый URL (домен как у бота) — экран «Готово» показывает ровно его.
-    sub_url: str | None = None
-    expires_at: datetime | None = None
-    # Бесплатные дни (3) и дни по приглашению (0 или 3). None на
-    # историческом пути.
-    trial_days: int | None = None
-    referral_days: int | None = None
-
-
-def _issued_sub_link(sub: models.Subscription) -> tuple[str | None, str | None]:
-    """``(sub_token, sub_url)`` только что выданной подписки для ответа ЛК.
-
-    Отдаём per-device токен основного устройства, чтобы QR/ссылка вели на
-    его конфиги, а не на всю подписку. link_token — то же, что покажут бот и
-    карточка кабинета (sub_links); fallback на первое устройство/токен
-    подписки — на всякий случай. Общий для покупки плана и бесплатных дней.
-    """
-    primary_device = next((d for d in sub.devices if d.sub_token), None)
-    token = sub.link_token or (
-        primary_device.sub_token if primary_device else sub.sub_token
-    )
-    url = sub_links.sub_url_for(token) if sub.link_token and token else None
-    return token, url
+    trial_expires_at: str
 
 
 @webapp_router.post("/trial/activate", response_model=TrialActivateWebAppResponse)
@@ -953,215 +845,33 @@ def webapp_activate_trial(
     user: models.User = Depends(require_webapp_user),
     db: Session = Depends(get_db),
 ):
-    """Бесплатные дни из кабинета: бонус и сразу подписка на них.
+    """Grant the one-time trial bonus to the authenticated WebApp user.
 
-    Нет живой подписки — :func:`services.trial.activate_trial_full`, тот же
-    сервис, что у бота (``/api/trial/activate_full``), поэтому пути не
-    разъедутся: подписка на N дней, ссылка прямо в ответе. Раньше кабинет
-    делал второй шаг «купить план на бонус» из браузера.
-
-    Живая подписка есть — только бонус на баланс (``set_expiry=False``):
-    деньги пойдут на продление, таймера триала нет, поэтому ни ложного
-    «бесплатные дни скоро закончатся», ни возврата бонуса.
-
-    Коды: 409 — триал уже забран или уже использован, либо появилась живая
-    подписка; 503 — нет плана для триала или холодный путь перегружен
-    (``Retry-After``); 402 — не хватило баланса (исторический путь).
+    Thin wrapper around :func:`services.trial.activate_trial` — the
+    admin-token entrypoint in ``api_extensions.py`` shares the same
+    service function, so WebApp and bot paths can't drift. Returns
+    409 on a repeat tap so the UI knows to hide the banner.
     """
     from .services import trial as trial_svc
-    from .services.provisioning_throttle import ColdPathThrottled
-
-    user_id = user.id
-
-    # Онбординг-телеметрия (роадмап E0.2): фиксируем ИСХОД, а не только успех.
-    # Без этого «тапнул, но ничего не получил» неотличимо от «не тапал»: до
-    # 2026-07-25 провал активации в webapp уходил в console.warn и нигде не
-    # оседал, хотя это ровно то место, где юзер уходит навсегда.
-    def _reject(reason: str, status_code: int, detail: str, headers=None):
-        # Сначала rollback, потом аудит: _audit коммитит, а отказы live /
-        # throttled / provision_failed случаются уже после flush бонуса и
-        # trial_activated_at. Без rollback аудит закоммитил бы бонус.
-        db.rollback()
-        _audit(db, f"user:{user_id}", "trial_activate_rejected", "user", user_id,
-               metadata={"reason": reason, "source": "webapp"},
-               actor_type=models.AuditActor.user)
-        return HTTPException(status_code=status_code, detail=detail, headers=headers)
-
-    # Гонка двойного тапа: блокируем строку юзера до выбора ветки.
-    db.refresh(user, with_for_update=True)
-    has_live_sub = (
-        db.query(models.Subscription.id)
-        .filter(
-            models.Subscription.user_id == user_id,
-            models.Subscription.status.in_(
-                [
-                    models.SubscriptionStatus.active,
-                    models.SubscriptionStatus.frozen,
-                ]
-            ),
-        )
-        .first()
-        is not None
-    )
-
-    if has_live_sub:
-        try:
-            bonus = trial_svc.activate_trial(db, user_id, set_expiry=False)
-        except trial_svc.TrialAlreadyActivated:
-            raise _reject("already_activated", 409, "Trial already activated")
-        except trial_svc.NoTrialPlan:
-            # Не ошибка юзера: в БД нет видимого 30-дневного плана, т.е.
-            # оффер физически невыполним, а баннер при этом мог показываться.
-            raise _reject("no_trial_plan", 503, "No trial plan configured")
-        _audit(db, f"user:{user_id}", "trial_activated", "user", user_id,
-               metadata={
-                   "amount_kopecks": bonus.trial_amount_kopecks,
-                   "trial_days": bonus.trial_days,
-                   "referral_days": bonus.referral_days,
-                   "full": False,
-               },
-               actor_type=models.AuditActor.user, commit=False)
-        db.commit()
-        return TrialActivateWebAppResponse(
-            trial_amount_kopecks=bonus.trial_amount_kopecks,
-            referral_bonus_kopecks=bonus.referral_bonus_kopecks,
-            balance_kopecks=bonus.balance_kopecks,
-            trial_expires_at=None,
-            trial_days=bonus.trial_days,
-            referral_days=bonus.referral_days,
-        )
 
     try:
-        result = trial_svc.activate_trial_full(db, user, source="webapp")
-    except trial_svc.TrialLiveSubscription:
-        raise _reject("live", 409, "User already has a live subscription")
-    except trial_svc.TrialAlreadyUsed:
-        raise _reject("already_used", 409, "Trial already used")
+        result = trial_svc.activate_trial(db, user.id)
+    except trial_svc.TrialAlreadyActivated:
+        raise HTTPException(status_code=409, detail="Trial already activated")
     except trial_svc.NoTrialPlan:
-        raise _reject("no_trial_plan", 503, "No trial plan configured")
-    except ColdPathThrottled as exc:
-        # Наплыв триальщиков мимо warm-пула: честный 503 с Retry-After,
-        # кабинет скажет «попробуй через пару минут».
-        raise _reject(
-            "throttled", 503, "provisioning is busy, retry later",
-            headers={"Retry-After": str(exc.retry_after_seconds)},
-        )
-    except RuntimeError as exc:
-        raise _reject("provision_failed", 409, str(exc))
-    except ValueError as exc:
-        raise _reject("insufficient", 402, str(exc))
-
-    sub = result.sub
-    _audit(db, f"user:{user_id}", "trial_activated", "user", user_id,
-           metadata={
-               "amount_kopecks": result.trial_amount_kopecks,
-               "trial_days": result.trial_days,
-               "referral_days": result.referral_days,
-               "full": True,
-               "subscription_id": sub.id,
-               "plan_id": result.plan.id,
-               "hidden_hours": result.hidden_hours,
-               "charged_kopecks": result.charged_kopecks,
-           },
-           actor_type=models.AuditActor.user, commit=False)
+        raise HTTPException(status_code=503, detail="No trial plan configured")
     db.commit()
-    db.refresh(user)
-    db.refresh(sub)
-
-    token, url = _issued_sub_link(sub)
-    # На историческом пути таймер триала не трогается (там старая дата или
-    # NULL), поэтому отдаём его только для бесплатных дней.
-    trial_expires = (
-        user.trial_expires_at
-        if result.trial_days is not None and user.trial_expires_at
-        else None
-    )
     return TrialActivateWebAppResponse(
         trial_amount_kopecks=result.trial_amount_kopecks,
         referral_bonus_kopecks=result.referral_bonus_kopecks,
-        balance_kopecks=user.balance_kopecks or 0,
-        trial_expires_at=trial_expires.isoformat() if trial_expires else None,
-        subscription_id=sub.id,
-        sub_token=token,
-        sub_url=url,
-        expires_at=sub.expires_at,
-        trial_days=result.trial_days,
-        referral_days=result.referral_days,
+        balance_kopecks=result.balance_kopecks,
+        trial_expires_at=result.trial_expires_at.isoformat(),
     )
-
-
-# ── Хелперы prorated-рефанда для single-sub активации ───────────────
-# Живут здесь (а не в services/balance.py), потому что нужны только
-# webapp-флоу «купить план поверх действующей подписки». Расчёт — тот
-# же, что в balance.change_plan: floor(price * remaining / duration).
-
-def _prorated_sub_refund_kopecks(sub: models.Subscription) -> int:
-    """Остаток по подписке в копейках (0, если возвращать нечего).
-
-    remaining_days капится duration_days плана, чтобы «удлинённый»
-    expires_at (freeze добавляет FREEZE_DAYS) не дал рефанд больше
-    цены плана.
-    """
-    import math
-
-    from .services import balance as balance_svc
-
-    plan = sub.plan
-    if plan is None:
-        return 0
-    price = balance_svc.plan_price_kopecks(plan)
-    now = utcnow_aware()
-    if price <= 0 or not sub.expires_at or sub.expires_at <= now:
-        return 0
-    total_days = plan.duration_days or 1
-    remaining_days = (sub.expires_at - now).total_seconds() / 86400
-    remaining_days = min(max(remaining_days, 0.0), float(total_days))
-    return int(math.floor(price * remaining_days / total_days))
-
-
-def _refund_subscription_remainder(
-    db: Session,
-    sub: models.Subscription,
-    *,
-    reference: str,
-    note: str | None = None,
-) -> int:
-    """Кредитует prorated-остаток подписки в кошелёк (kind=refund).
-
-    Возвращает сумму в копейках (0 — если рефандить нечего). Пишет
-    через balance._record_tx, который только flush-ит без commit —
-    коммит на вызывающем, поэтому блок «refund + charge» в
-    webapp_activate остаётся атомарным.
-    """
-    from .services import balance as balance_svc
-
-    user = balance_svc._lock_user(db, sub.user_id)
-    # Под блокировкой перечитываем подписку: параллельный запрос мог
-    # уже рефанднуть и заблокировать её — второй рефанд не пишем.
-    db.refresh(sub)
-    if sub.status not in (
-        models.SubscriptionStatus.active,
-        models.SubscriptionStatus.frozen,
-    ):
-        return 0
-    refund = _prorated_sub_refund_kopecks(sub)
-    if refund <= 0:
-        return 0
-    balance_svc._record_tx(
-        db, user,
-        amount_kopecks=refund,
-        kind=models.BalanceTxKind.refund,
-        reference=reference,
-        note=note,
-    )
-    return refund
 
 
 class ActivateResponse(BaseModel):
     subscription_id: int
     sub_token: str | None
-    # Готовый URL (домен как у бота) — экран «Готово» показывает ровно его.
-    sub_url: str | None = None
     expires_at: datetime
     balance_kopecks: int
     plan_price_kopecks: int
@@ -1224,14 +934,6 @@ def webapp_activate(
             status_code=400, detail="Plan has no price configured"
         )
 
-    # Гонка двойной активации (двойной тап / ретрай сети): весь блок
-    # «проверить existing_subs → провижининг → списание» — read-then-act.
-    # Берём FOR UPDATE-блокировку на строку users ДО проверки, чтобы
-    # параллельный запрос ждал здесь и увидел уже созданную подписку
-    # (получит 400 «Already on plan»), а не активировал вторую и не
-    # списал деньги дважды. refresh заодно перечитывает баланс.
-    db.refresh(user, with_for_update=True)
-
     # Single-sub invariant: every active/frozen sub must be terminated
     # before the new one goes live. We look across *any* plan (not
     # just "different plan") so the 400 below fires for same-plan
@@ -1261,7 +963,7 @@ def webapp_activate(
     # a ₽300 refund pending on their old sub can still switch to a
     # ₽250 plan.
     refund_estimate = sum(
-        _prorated_sub_refund_kopecks(s) for s in existing_subs
+        balance_svc.prorated_sub_refund_kopecks(s) for s in existing_subs
     )
     projected_balance = (user.balance_kopecks or 0) + refund_estimate
     if projected_balance < plan_price:
@@ -1280,12 +982,7 @@ def webapp_activate(
 
     orchestrator = ProvisioningOrchestrator(db)
     try:
-        # notify_config_ready=False: ЛК показывает ссылку сразу в ответе
-        # (TrialSuccess / SubscriptionCard), warm-пуш с той же ссылкой через
-        # 10 с был бы дублем. Cold-путь пуш шлёт по-прежнему.
-        sub, _task = orchestrator.provision_subscription(
-            user, plan, notify_config_ready=False
-        )
+        sub, _task = orchestrator.provision_subscription(user, plan)
     except RuntimeError as exc:
         raise HTTPException(status_code=409, detail=str(exc))
 
@@ -1298,7 +995,7 @@ def webapp_activate(
     try:
         for old in existing_subs:
             old_name = old.plan.name if old.plan else "?"
-            refunded_total += _refund_subscription_remainder(
+            refunded_total += balance_svc.refund_subscription_remainder(
                 db, old,
                 reference=f"switch:{sub.id}:{old.id}",
                 note=f"switch {old_name} -> {plan.name}",
@@ -1335,12 +1032,18 @@ def webapp_activate(
     db.refresh(user)
     db.refresh(sub)
 
-    token, url = _issued_sub_link(sub)
+    # Return the primary device's per-device sub_token so the QR/link
+    # exposes only that device's credentials (not the entire subscription).
+    # Falls back to the subscription-level token for safety.
+    primary_device = next(
+        (d for d in sub.devices if d.sub_token),
+        None,
+    )
+    token = primary_device.sub_token if primary_device else sub.sub_token
 
     return ActivateResponse(
         subscription_id=sub.id,
         sub_token=token,
-        sub_url=url,
         expires_at=sub.expires_at,
         balance_kopecks=user.balance_kopecks or 0,
         plan_price_kopecks=plan_price,
@@ -1419,13 +1122,6 @@ def webapp_change_plan(
 ):
     """Switch plan with proration: refund remaining old, charge full new."""
     from .services import balance as balance_svc
-
-    # Та же защита от гонки, что в webapp_activate: блокируем строку
-    # users до чтения подписки, чтобы два параллельных change_plan не
-    # прошли оба преflight и не списали/рефанднули дважды. Второй
-    # запрос дождётся коммита первого и получит 400 «Already on this
-    # plan» по свежему plan_id.
-    db.refresh(user, with_for_update=True)
 
     sub = db.get(models.Subscription, subscription_id)
     if not sub or sub.user_id != user.id:
@@ -1589,14 +1285,6 @@ def webapp_freeze(
     if not sub or sub.user_id != user.id:
         raise HTTPException(status_code=404, detail="Subscription not found")
 
-    # Единственная точка входа в заморозку. Кнопку прячет can_freeze в /me, а
-    # здесь то же правило для прямого вызова и старого бандла: неоплаченный
-    # триал заморозкой растянул бы бесплатные дни на неделю.
-    if not balance_svc.freeze_allowed_by_payment(db, sub):
-        raise HTTPException(
-            status_code=400, detail=balance_svc.FREEZE_NEEDS_PAYMENT_DETAIL
-        )
-
     try:
         balance_svc.freeze_subscription(db, sub)
     except RuntimeError as exc:
@@ -1688,11 +1376,6 @@ def webapp_cancel_subscription(
 class AddDeviceResponse(BaseModel):
     subscription_id: int
     device_id: int
-    # Ссылка НОВОГО устройства: бот шлёт её сразу, а не «ту же из /config» —
-    # та ведёт на primary, и второй телефон сел бы на чужой логин.
-    sub_token: str | None = None
-    # Тот же URL, что кабинет покажет в строке этого устройства (домен!).
-    sub_url: str | None = None
     device_count: int
     extra_device_slots: int
     charged_kopecks: int
@@ -1733,16 +1416,7 @@ def webapp_add_device(
     from .services import balance as balance_svc
     from .services.provisioning import ProvisioningOrchestrator
 
-    # FOR UPDATE-блокировка строки подписки на весь запрос: два
-    # параллельных add_device (даблклик) сериализуются на этом локе,
-    # поэтому second-запрос читает уже инкрементированный
-    # extra_device_slots и не затирает чужое списание.
-    sub = (
-        db.query(models.Subscription)
-        .filter(models.Subscription.id == subscription_id)
-        .with_for_update()
-        .first()
-    )
+    sub = db.get(models.Subscription, subscription_id)
     if not sub or sub.user_id != user.id:
         raise HTTPException(status_code=404, detail="Subscription not found")
     if sub.status != models.SubscriptionStatus.active:
@@ -1812,9 +1486,10 @@ def webapp_add_device(
             )
             db.commit()
             raise HTTPException(status_code=402, detail=str(exc))
-        # Слот уже проинкрементирован внутри charge_extra_device
-        # (services/balance.py) — не перезаписываем current_slots + 1,
-        # иначе конкурентная покупка второго слота была бы затёрта.
+        # Persist the bought slot — this is what makes subsequent
+        # renewals include the surcharge.
+        sub.extra_device_slots = current_slots + 1
+        db.add(sub)
 
     db.commit()
     db.refresh(user)
@@ -1823,12 +1498,6 @@ def webapp_add_device(
     return AddDeviceResponse(
         subscription_id=sub.id,
         device_id=device.id,
-        sub_token=device.sub_token,
-        sub_url=(
-            sub_links.cabinet_url_for(sub, device.sub_token)
-            if device.sub_token
-            else None
-        ),
         device_count=new_device_count,
         extra_device_slots=sub.extra_device_slots or 0,
         charged_kopecks=charged,
@@ -1919,18 +1588,7 @@ def webapp_remove_device(
         )
 
     orchestrator = ProvisioningOrchestrator(db)
-    was_link_holder = bool(sub.link_token) and device.sub_token == sub.link_token
     orchestrator.revoke_device(device, reason="user_removed", background=True)
-
-    # Юзер удалил устройство, чью ссылку показывает бот: фиксируем замену сразу
-    # (link_token_for выберет живое), иначе выбор пересчитывался бы на каждый
-    # /config и после failover выбранного «переползал» бы на другое устройство.
-    if was_link_holder:
-        db.refresh(sub)
-        chosen = sub_links.link_token_for(sub)
-        if chosen and chosen != sub.sub_token:
-            sub.link_token = chosen
-            db.add(sub)
 
     # Free a paid slot if the removed device was in the overflow zone.
     bundled = (sub.plan.max_devices if sub.plan else 1) or 1
@@ -2006,12 +1664,8 @@ class ReferralInfoResponse(BaseModel):
     code: str | None
     bonus_kopecks: int
     invited_count: int
-    # Только награды за приглашённых (referral_payout:*), без своего
-    # триал-бонуса и подарка по чужой ссылке.
     earned_kopecks: int
     share_url: str | None
-    # Сколько бесплатных дней получит друг по этой ссылке (3 + 3).
-    invitee_total_days: int = 0
 
 
 @webapp_router.get("/referral", response_model=ReferralInfoResponse)
@@ -2024,7 +1678,6 @@ def webapp_referral(
     import secrets
 
     from .services import balance as balance_svc
-    from .services import trial as trial_svc
 
     code_row = (
         db.query(models.ReferralCode)
@@ -2054,14 +1707,11 @@ def webapp_referral(
         .filter(models.User.referred_by_id == user.id)
         .count()
     )
-    # Раньше считали все kind=bonus, и туда попадал собственный триал-бонус:
-    # триальщик видел «заработано 150 ₽», никого не пригласив.
     earned = (
         db.query(models.BalanceTransaction)
         .filter(
             models.BalanceTransaction.user_id == user.id,
             models.BalanceTransaction.kind == models.BalanceTxKind.bonus,
-            models.BalanceTransaction.reference.like("referral_payout:%"),
         )
         .with_entities(models.BalanceTransaction.amount_kopecks)
         .all()
@@ -2081,108 +1731,45 @@ def webapp_referral(
         invited_count=invited,
         earned_kopecks=earned_total,
         share_url=share_url,
-        invitee_total_days=trial_svc.invitee_total_days(code_row),
     )
 
 
-class WebappRepairResponse(BaseModel):
-    """Единый ответ починки для кабинета.
-
-    Тот же контракт, что у бота (``client_control.ReportBrokenResponse``:
-    ``action`` + report_id / new_node_name / retry_after_sec / device_name /
-    scope), плюс поля старого ``HealthPingReportResponse``: бандл кабинета
-    кэшируется вебвью Telegram, и старый фронт ещё какое-то время читает
-    ``migrated`` / ``target_node_name``.
-    """
-
-    ok: bool = True
-    action: str
-    report_id: int | None = None
-    new_node_name: str | None = None
-    new_node_region: str | None = None
-    task_id: int | None = None
-    retry_after_sec: int | None = None
-    device_name: str | None = None
-    scope: Literal["device", "subscription"] = "device"
-    # ── совместимость со старым фронтом ──
-    migrated: bool = False
-    subscription_id: int | None = None
-    node_id: int | None = None
-    target_node_name: str | None = None
+class HealthPingReportResponse(BaseModel):
+    ok: bool
+    subscription_id: int | None
+    node_id: int | None
 
 
-def _repair_response(outcome, *, sub_id: int | None, node_id: int | None = None):
-    from .api.client_control import outcome_response
-
-    base = outcome_response(outcome)
-    return WebappRepairResponse(
-        **base.model_dump(),
-        migrated=outcome.repaired,
-        subscription_id=sub_id,
-        node_id=node_id,
-        target_node_name=outcome.new_node_name,
-    )
-
-
-class RepairDeviceMini(BaseModel):
-    id: int
-    name: str
-    status: str
-
-
-class RepairStateResponse(BaseModel):
-    """Пре-чек перед кнопкой «VPN не работает» — зеркало бот-эндпоинта
-    devices-by-telegram: живые устройства первой активной подписки и сколько
-    ждать по единой политике повторов. Фронт по нему решает, показывать ли
-    пикер устройств, и не спрашивает «какое?», если действие всё равно будет
-    отклонено."""
-
-    devices: list[RepairDeviceMini]
-    retry_after_sec: int | None = None
-    wait_reason: Literal["throttled", "daily_limit"] | None = None
-    subscription_id: int | None = None
-
-
-@webapp_router.get("/repair-state", response_model=RepairStateResponse)
-def webapp_repair_state(
+@webapp_router.post("/health-ping-report", response_model=HealthPingReportResponse)
+def webapp_health_ping_report(
     user: models.User = Depends(require_webapp_user),
     db: Session = Depends(get_db),
 ):
-    from .api.client_control import repair_state_for_user
+    """User pressed 'VPN doesn't work' in the webapp.
 
-    state = repair_state_for_user(db, user)
-    return RepairStateResponse(
-        devices=[
-            RepairDeviceMini(id=d.device_id, name=d.name, status=d.status)
-            for d in state.devices
-        ],
-        retry_after_sec=state.retry_after_sec,
-        wait_reason=state.wait_reason,
-        subscription_id=state.subscription_id,
+    Records a self-reported bad answer in AuditLog so the admin
+    `/health-pings` dashboard picks it up alongside prompted ones
+    (from the scheduled bot ping). We attach it to the user's first
+    active subscription if they have one, so per-node aggregation
+    works; if not, we still persist the complaint without node_id.
+
+    No rate-limit beyond the standard SlowAPI middleware — users
+    clicking their own 'SOS' button are the ones we *want* to hear
+    from. Legitimate spam is handled client-side (5-min disable
+    after click).
+    """
+    sub = (
+        db.query(models.Subscription)
+        .filter(
+            models.Subscription.user_id == user.id,
+            models.Subscription.status == models.SubscriptionStatus.active,
+        )
+        .order_by(models.Subscription.id.asc())
+        .first()
     )
+    node_id = sub.node_id if sub else None
+    sub_id = sub.id if sub else None
 
-
-def _health_ping_audit(
-    db: Session,
-    user: models.User,
-    *,
-    sub_id: int | None,
-    node_id: int | None,
-    scope: str,
-    device_id: int | None = None,
-) -> None:
-    """Строка «человек ответил, что плохо» — отдельно от жалобы-триггера
-    лестницы (``complaint_received`` пишет ядро): на ней стоит воронка
-    health-ping'а и админ-дашборд ``/health-pings``."""
-    extra = {
-        "telegram_id": user.telegram_id,
-        "answer": "bad",
-        "node_id": node_id,
-        "source": "self_reported",
-        "scope": scope,
-    }
-    if device_id is not None:
-        extra["device_id"] = device_id
     db.add(
         models.AuditLog(
             actor=str(user.id),
@@ -2190,199 +1777,13 @@ def _health_ping_audit(
             action="health_ping_response",
             target_type="subscription",
             target_id=sub_id,
-            extra=extra,
+            extra={
+                "telegram_id": user.telegram_id,
+                "answer": "bad",
+                "node_id": node_id,
+                "source": "self_reported",
+            },
         )
     )
-    # commit, не flush: у ядра свои откаты (no_target делает rollback), и
-    # строка опроса не должна пропасть вместе с полусделанной починкой.
     db.commit()
-
-
-def _repair_device(
-    db: Session, user: models.User, device_id: int, *, source: str
-) -> WebappRepairResponse:
-    """Per-device починка через общее ядро (то же, что бот и страница)."""
-    from .api.client_control import COMPLAINT_DEDUP_SEC
-    from .services import self_repair
-
-    device = db.get(models.Device, device_id)
-    if device is None or device.user_id != user.id:
-        # Anti-forge — тот же исход, что у бота (ядро отвечает no_subscription),
-        # а не 404: фронт показывает единый честный текст.
-        return _repair_response(
-            self_repair.RepairOutcome(action="no_subscription"), sub_id=None
-        )
-    sub_id = device.subscription_id
-    # Нода устройства — для админ-дашборда /health-pings (агрегация по нодам):
-    # primary-нода устройства, иначе нода подписки.
-    node_id = (
-        device.config.node_id
-        if device.config is not None
-        else (device.subscription.node_id if device.subscription else None)
-    )
-    _health_ping_audit(
-        db, user, sub_id=sub_id, node_id=node_id, scope="device", device_id=device.id
-    )
-    outcome = self_repair.handle_broken_device(
-        db,
-        device.id,
-        user=user,
-        dedup_sec=COMPLAINT_DEDUP_SEC,
-        source=source,
-    )
-    db.commit()
-    return _repair_response(outcome, sub_id=sub_id, node_id=node_id)
-
-
-def _repair_subscription(
-    db: Session, user: models.User, *, source: str
-) -> WebappRepairResponse:
-    """«Все мои устройства» — whole-sub перенос через общее ядро."""
-    from .api.client_control import COMPLAINT_DEDUP_SEC
-    from .services import self_repair
-
-    sub = self_repair.first_active_subscription(db, user)
-    sub_id = sub.id if sub else None
-    node_id = sub.node_id if sub else None
-    _health_ping_audit(db, user, sub_id=sub_id, node_id=node_id, scope="subscription")
-    outcome = self_repair.handle_broken_subscription(
-        db,
-        sub,
-        user=user,
-        dedup_sec=COMPLAINT_DEDUP_SEC,
-        source=source,
-    )
-    db.commit()
-    return _repair_response(outcome, sub_id=sub_id, node_id=node_id)
-
-
-class ReportBrokenDeviceRequest(BaseModel):
-    device_id: int
-
-
-@webapp_router.post("/report-broken-device", response_model=WebappRepairResponse)
-def webapp_report_broken_device(
-    body: ReportBrokenDeviceRequest,
-    user: models.User = Depends(require_webapp_user),
-    db: Session = Depends(get_db),
-):
-    """«ЭТО устройство не работает» — один шаг лестницы для устройства.
-
-    Работу делает общее ядро ``services/self_repair.py`` — то же самое, что у
-    бота и у страницы на саб-домене: жалоба → единый троттл и суточный
-    потолок → лестница (перетасовка протоколов → перенос → дубль).
-    Anti-forge (устройство принадлежит юзеру) и защиту от двойного тапа
-    (FOR UPDATE) тоже делает ядро. Ответ — единый ``action``, как у бота.
-    """
-    return _repair_device(db, user, body.device_id, source="webapp_report_broken")
-
-
-@webapp_router.post("/report-broken", response_model=WebappRepairResponse)
-def webapp_report_broken(
-    user: models.User = Depends(require_webapp_user),
-    db: Session = Depends(get_db),
-):
-    """«Все мои устройства не работают» — перенос всей подписки.
-
-    Зеркало бот-кнопки «🔁 Все мои устройства» (admin report-broken): то же
-    ядро ``handle_broken_subscription`` — жалоба, единый троттл, whole-sub
-    миграция с user-wide баном старой ноды.
-    """
-    return _repair_subscription(db, user, source="webapp_report_broken")
-
-
-@webapp_router.post("/health-ping-report", response_model=WebappRepairResponse)
-def webapp_health_ping_report(
-    user: models.User = Depends(require_webapp_user),
-    db: Session = Depends(get_db),
-):
-    """Совместимость со старым бандлом кабинета (кэш вебвью Telegram).
-
-    До унификации (2026-09-12) кнопка «VPN не работает» при одном устройстве
-    шла сюда и получала whole-sub миграцию мимо лестницы. Теперь эндпоинт
-    ведёт себя как новая кнопка: ровно одно живое устройство → per-device
-    ядро, иначе → перенос всей подписки. Новый фронт сюда не ходит.
-    """
-    from .services import self_repair
-
-    sub = self_repair.first_active_subscription(db, user)
-    live = self_repair.live_devices(sub)
-    if len(live) == 1:
-        return _repair_device(db, user, live[0].id, source="webapp_report_broken")
-    return _repair_subscription(db, user, source="webapp_report_broken")
-
-
-class WebappSetOperatorRequest(BaseModel):
-    report_id: int
-    operator: str
-
-
-def _own_report(db: Session, user: models.User, report_id: int) -> models.OperatorNodeReport:
-    """Репорт обязан принадлежать ЭТОМУ юзеру (anti-forge: чужой report_id
-    не прокатит)."""
-    report = db.get(models.OperatorNodeReport, report_id)
-    if report is None or report.user_id != user.id:
-        raise HTTPException(status_code=404, detail="Report not found")
-    return report
-
-
-@webapp_router.post("/report-operator")
-def webapp_set_operator(
-    body: WebappSetOperatorRequest,
-    user: models.User = Depends(require_webapp_user),
-    db: Session = Depends(get_db),
-):
-    """Юзер выбрал свой мобильный оператор после «VPN не работает» →
-    проставляем его на OperatorNodeReport (operator-routing P1, см.
-    operator_routing_roadmap.md). Карьер вне таксономии → unknown.
-    """
-    from .api.client_control import _OPERATORS
-
-    report = _own_report(db, user, body.report_id)
-    report.operator = body.operator if body.operator in _OPERATORS else "unknown"
-    db.commit()
-    return {"report_id": report.id, "operator": report.operator}
-
-
-class WebappReportIdRequest(BaseModel):
-    report_id: int
-
-
-@webapp_router.post("/report-still-broken")
-def webapp_report_still_broken(
-    body: WebappReportIdRequest,
-    user: models.User = Depends(require_webapp_user),
-    db: Session = Depends(get_db),
-):
-    """«Всё равно не работает» после починки → target-нода тоже fail.
-
-    Зеркало бот-кнопки (admin report-still-broken): самый весомый негативный
-    сигнал для матрицы оператор×нода. Раньше из кабинета outcome=fail не
-    возникал никогда.
-    """
-    report = _own_report(db, user, body.report_id)
-    report.outcome = "fail"
-    report.resolved_at = utcnow_aware()
-    from .services.repair_alerts import alert_repair_not_fixed
-
-    alert_repair_not_fixed(db, report, reason="fail")
-    db.commit()
-    return {"report_id": report.id, "outcome": report.outcome}
-
-
-@webapp_router.post("/report-ok")
-def webapp_report_ok(
-    body: WebappReportIdRequest,
-    user: models.User = Depends(require_webapp_user),
-    db: Session = Depends(get_db),
-):
-    """«Всё работает» после починки → target-нода ok. Явно разрешённый
-    исход (ok/fail) не перетираем — апгрейдим только pending/inconclusive;
-    идемпотентно к двойному тапу (как admin report-ok)."""
-    report = _own_report(db, user, body.report_id)
-    if report.outcome in ("ok", "fail"):
-        return {"report_id": report.id, "outcome": report.outcome}
-    report.outcome = "ok"
-    report.resolved_at = utcnow_aware()
-    db.commit()
-    return {"report_id": report.id, "outcome": report.outcome}
+    return HealthPingReportResponse(ok=True, subscription_id=sub_id, node_id=node_id)

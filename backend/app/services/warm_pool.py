@@ -19,23 +19,15 @@ Ansible:
   1. ``unassign_bundle`` — flips ``assigned → revoked`` in DB only.
      The user's access stops working at xray's next config reload, but
      that's deferred to the worker.
-  2. ``physical_revoke_credential_bundle`` — runs Ansible ``state=absent``
-     for the bundle and deletes the rows. Driven by the periodic sweep
-     ``run_warm_pool_revoke_sweep`` (see ``app.worker``), which picks up
-     every ``revoked`` bundle — both user-unassigned ones and those left
-     by ``invalidate_node_warm_pool`` — and physically removes them from
-     the node. Without that sweep revoked identities pile up forever both
-     in xray's config and as ``revoked`` rows in the DB.
+  2. ``physical_revoke_credential_bundle`` — RQ job that runs Ansible
+     ``state=absent`` for the bundle and deletes the rows.
 
 The atomic assignment uses ``SELECT ... FOR UPDATE SKIP LOCKED LIMIT 1``
-over the *anchor rows* of the warm pool — the lowest-id row of each
-bundle (``MIN(id) GROUP BY access_username``). Restricting the candidate
-set to one row per bundle is load-bearing: sibling rows of one bundle
-have adjacent ids, so a naive "lowest warm id" pick would let worker B
-skip a locked anchor and grab a *sibling* of the same bundle as its own
-anchor — then A waits on B's row and B waits on A's row: a deadlock.
-Anchoring on the per-bundle minimum guarantees two workers always land on
-two different bundles, so no cross-bundle lock wait can form.
+on a single anchor row of the bundle (lowest id). Bundles have unique
+``access_username`` values per node, so locking the anchor is enough to
+exclude other workers from grabbing the same bundle's siblings — no two
+workers can ever pick the same bundle even if they hit the table at the
+exact same instant.
 """
 from __future__ import annotations
 
@@ -69,24 +61,6 @@ WARM_POOL_BATCH_PER_TICK = int(os.getenv("WARM_POOL_BATCH_PER_TICK", "3"))
 # Master switch — set to "0" if the operator wants to bypass the pool
 # entirely (e.g. for emergency debugging). Cold path stays alive forever.
 WARM_POOL_ENABLED = os.getenv("WARM_POOL_ENABLED", "1").lower() not in {"0", "false", "no"}
-
-# How many revoked bundles the physical-revoke sweep processes per tick.
-# Same throttling rationale as WARM_POOL_BATCH_PER_TICK — one Ansible run
-# per bundle, don't stampede a node.
-WARM_POOL_REVOKE_BATCH_PER_TICK = int(os.getenv("WARM_POOL_REVOKE_BATCH_PER_TICK", "5"))
-# After this many consecutive Ansible failures the sweep stops retrying a
-# bundle and logs it for manual review, so a permanently-broken node
-# (dead SSH, decommissioned box) doesn't get hammered every tick forever.
-WARM_POOL_REVOKE_MAX_ATTEMPTS = int(os.getenv("WARM_POOL_REVOKE_MAX_ATTEMPTS", "5"))
-
-# Process-local failure counter for the revoke sweep, keyed by
-# (node_id, access_username). Best-effort back-off only: it resets on
-# worker restart (a restart is exactly when a stuck node might recover, so
-# retrying then is fine) and, like _warmer_semaphore, only constrains one
-# worker process. A durable counter would need a Credential column — see
-# the audit note; deliberately kept in-memory to avoid a schema change.
-_revoke_attempts: dict[tuple[int, str], int] = {}
-_revoke_attempts_lock = threading.Lock()
 
 # Concurrency cap on warmer Ansible runs — same idea as the orchestrator
 # semaphore, but separate so warming doesn't starve user-facing
@@ -158,7 +132,6 @@ def _build_credential_text(
         _build_vless_reality_credential,
         _build_vless_ws_cdn_credential,
         _build_vless_xhttp_credential,
-        _hy2_auth,
     )
 
     if cfg.protocol == models.VPNConfigProtocol.shadowtls_ss:
@@ -170,67 +143,12 @@ def _build_credential_text(
     if cfg.protocol == models.VPNConfigProtocol.vless_xhttp:
         return _build_vless_xhttp_credential(node, cfg, user_uuid)
     if cfg.protocol == models.VPNConfigProtocol.hysteria2:
-        # Пара username:password — нода на auth.type: userpass матчит именно её.
-        return _build_hysteria2_credential(node, cfg, _hy2_auth(username, password))
+        return _build_hysteria2_credential(node, cfg, password)
     logger.warning("warm_pool: unsupported protocol %s on node %s", cfg.protocol, node.id)
     return None
 
 
 # ── Warming (writes) ─────────────────────────────────────────────────
-
-def _best_effort_remove_identity(
-    node: models.VPNNode,
-    username: str,
-    protocols_payload: list[dict[str, Any]],
-) -> None:
-    """Компенсация провала warm-прогрева: снять identity с ноды.
-
-    Если ``provision_device.yml`` со ``state=present`` упал (rc≠0) или
-    бросил исключение, часть протоколов могла уже залиться на ноду. В БД
-    строк ещё нет (их пишем только после успеха), поэтому убрать огрызок
-    можно только тем же плейбуком со ``state=absent`` по тому же username.
-
-    Best-effort: любые ошибки только логируем — БД не трогаем, вызывающий
-    всё равно вернёт ``None``. Вызывать ТОЛЬКО после освобождения
-    ``_warmer_semaphore`` (внутри снова его берём).
-    """
-    payload = {
-        "username": username,
-        "protocols": [
-            {"proto": p["proto"], "port": p.get("port")} for p in protocols_payload
-        ],
-        "state": "absent",
-        "reason": "warm_pool warm failure cleanup",
-    }
-    inventory = None
-    _warmer_semaphore.acquire()
-    try:
-        inventory = build_inventory_for_node(node)
-        run_playbook(
-            "playbooks/provision_device.yml",
-            inventory,
-            limit=node.name,
-            extra_vars=payload,
-        )
-        logger.info(
-            "warm_pool: compensating absent for %s on node %s (warm failure cleanup)",
-            username, node.id,
-        )
-    except Exception:  # noqa: BLE001
-        # Компенсация — best-effort; если и она упала, огрызок подберёт
-        # ручной разбор / следующий resync. Не эскалируем.
-        logger.exception(
-            "warm_pool: compensating absent failed for %s on node %s",
-            username, node.id,
-        )
-    finally:
-        _warmer_semaphore.release()
-        if inventory is not None:
-            try:
-                inventory.unlink()
-            except OSError:
-                pass
-
 
 def warm_one_bundle(db: Session, node: models.VPNNode) -> int | None:
     """Provision one warm credential bundle on ``node``.
@@ -301,8 +219,6 @@ def warm_one_bundle(db: Session, node: models.VPNNode) -> int | None:
         payload["exit_interface"] = exit_iface
 
     inventory = None
-    result = None
-    ansible_error = False
     _warmer_semaphore.acquire()
     try:
         with WARM_PROVISION_SECONDS.labels(node=node.name).time():
@@ -315,7 +231,7 @@ def warm_one_bundle(db: Session, node: models.VPNNode) -> int | None:
             )
     except Exception:  # noqa: BLE001
         logger.exception("warm_pool: ansible run failed for node %s", node.id)
-        ansible_error = True
+        return None
     finally:
         _warmer_semaphore.release()
         if inventory is not None:
@@ -324,17 +240,11 @@ def warm_one_bundle(db: Session, node: models.VPNNode) -> int | None:
             except OSError:
                 pass
 
-    if ansible_error or result is None or result.returncode != 0:
-        if result is not None and result.returncode != 0:
-            logger.error(
-                "warm_pool: ansible non-zero (%s) for node %s: %s",
-                result.returncode, node.id, (result.stderr or "")[:300],
-            )
-        # Плейбук мог залить часть протоколов до падения. Строк в БД ещё
-        # нет — но identity на ноде может уже быть, снимаем её best-effort,
-        # иначе на флапающей ноде мусорные клиенты xray копятся с каждым
-        # warm-тиком (username каждый раз новый, удалить их некому).
-        _best_effort_remove_identity(node, username, protocols_payload)
+    if result.returncode != 0:
+        logger.error(
+            "warm_pool: ansible non-zero (%s) for node %s: %s",
+            result.returncode, node.id, (result.stderr or "")[:300],
+        )
         return None
 
     # Ansible succeeded — only NOW persist the rows. If we wrote them
@@ -423,35 +333,19 @@ def try_assign_bundle(
     transaction; we only ``flush`` here so the caller can roll us back
     cleanly if its own follow-up work fails.
 
-    Race-safety: locks one *anchor row per bundle* — the lowest id of
-    each ``access_username`` group — with ``FOR UPDATE SKIP LOCKED``.
-    Restricting candidates to per-bundle minimums is what prevents a
-    deadlock: if we simply locked "the lowest warm id on the node", a
-    second worker could SKIP LOCKED past a locked anchor and grab a
-    *sibling* of that same bundle (adjacent id) as its own anchor, after
-    which each worker would block on the other's row. Anchoring on the
-    per-bundle minimum guarantees two workers always pick two distinct
-    bundles. The siblings of the chosen anchor are then locked explicitly
-    under that same transaction.
+    Race-safety: locks the lowest-id warm row on the node with
+    ``FOR UPDATE SKIP LOCKED``. Two parallel callers see different
+    anchor rows because each anchor's ``access_username`` is unique to
+    its bundle. The siblings of the chosen anchor are then locked
+    explicitly under that same transaction.
     """
     if not WARM_POOL_ENABLED:
         return None
 
-    from sqlalchemy import func
-
-    # Anchor candidates: the first (lowest-id) row of every warm bundle
-    # on the node. Grouping by ``access_username`` collapses each bundle
-    # to a single lockable row so parallel callers never contend on
-    # sibling rows of the same bundle (see docstring — deadlock guard).
-    anchor_ids = (
-        db.query(func.min(models.Credential.id))
-        .filter(models.Credential.node_id == node_id)
-        .filter(models.Credential.pool_state == models.CredentialPoolState.warm)
-        .group_by(models.Credential.access_username)
-    )
     anchor = (
         db.query(models.Credential)
-        .filter(models.Credential.id.in_(anchor_ids))
+        .filter(models.Credential.node_id == node_id)
+        .filter(models.Credential.pool_state == models.CredentialPoolState.warm)
         .order_by(models.Credential.id.asc())
         .with_for_update(skip_locked=True)
         .first()
@@ -462,9 +356,9 @@ def try_assign_bundle(
     # Lock the rest of the bundle. ``with_for_update`` here is a real
     # lock (not skip-locked) — we want to wait, briefly, if a parallel
     # worker is in the same transaction touching a row from this same
-    # bundle. With the per-bundle anchor above two workers can never pick
-    # the same bundle, but the explicit lock keeps the bundle consistent
-    # even if a future refactor changes anchor selection.
+    # bundle. That cannot actually happen given the unique-username
+    # invariant, but the explicit lock makes it safe even if a future
+    # refactor breaks that invariant.
     bundle = (
         db.query(models.Credential)
         .filter(models.Credential.node_id == node_id)
@@ -628,73 +522,3 @@ def invalidate_node_warm_pool(db: Session, node_id: int, *, reason: str = "confi
     db.commit()
     logger.info("warm_pool: invalidated %d warm credentials on node %s (%s)", len(creds), node_id, reason)
     return len(creds)
-
-
-def run_warm_pool_revoke_sweep(
-    db: Session, batch_limit: int | None = None
-) -> dict[str, bool]:
-    """Stage 2 driver: physically remove revoked warm bundles from nodes.
-
-    Finds every distinct ``(node_id, access_username)`` still sitting in
-    ``pool_state=revoked`` — both bundles unassigned by a user and those
-    dropped by :func:`invalidate_node_warm_pool` — and runs
-    :func:`physical_revoke_credential_bundle` for each, up to
-    ``batch_limit`` per tick. Without this sweep revoked identities never
-    leave the node (extra xray clients) and their rows accumulate forever.
-
-    Meant to be called from a periodic worker tick (see ``app.worker``,
-    alongside ``run_warm_pool_check``). Returns a ``{"node:username":
-    ok}`` summary for the tick's audit trail.
-
-    A bundle that fails Ansible stays ``revoked`` and is retried next tick
-    (``physical_revoke_credential_bundle`` is idempotent). After
-    ``WARM_POOL_REVOKE_MAX_ATTEMPTS`` consecutive failures it is skipped
-    and logged for manual review so a dead node isn't hammered forever.
-    """
-    if not WARM_POOL_ENABLED:
-        return {}
-
-    limit = batch_limit if batch_limit is not None else WARM_POOL_REVOKE_BATCH_PER_TICK
-
-    pending = (
-        db.query(models.Credential.node_id, models.Credential.access_username)
-        .filter(models.Credential.pool_state == models.CredentialPoolState.revoked)
-        .filter(models.Credential.access_username.isnot(None))
-        .filter(models.Credential.node_id.isnot(None))
-        .distinct()
-        .all()
-    )
-
-    summary: dict[str, bool] = {}
-    processed = 0
-    for node_id, username in pending:
-        if processed >= limit:
-            break
-        key = (node_id, username)
-        with _revoke_attempts_lock:
-            if _revoke_attempts.get(key, 0) >= WARM_POOL_REVOKE_MAX_ATTEMPTS:
-                # Уже сдались по этому бандлу — не трогаем до перезапуска
-                # воркера / ручного разбора, не тратим бюджет тика.
-                continue
-        processed += 1
-        try:
-            ok = physical_revoke_credential_bundle(db, node_id, username)
-        except Exception:  # noqa: BLE001
-            logger.exception(
-                "warm_pool: revoke sweep crashed on %s (node %s)", username, node_id
-            )
-            ok = False
-        summary[f"{node_id}:{username}"] = ok
-        with _revoke_attempts_lock:
-            if ok:
-                _revoke_attempts.pop(key, None)
-            else:
-                attempts = _revoke_attempts.get(key, 0) + 1
-                _revoke_attempts[key] = attempts
-                if attempts >= WARM_POOL_REVOKE_MAX_ATTEMPTS:
-                    logger.error(
-                        "warm_pool: bundle %s on node %s failed physical revoke "
-                        "%d times — giving up, needs manual review",
-                        username, node_id, attempts,
-                    )
-    return summary
